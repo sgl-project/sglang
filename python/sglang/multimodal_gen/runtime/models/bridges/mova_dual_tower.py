@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -77,23 +80,6 @@ def compute_rope_cos_sin(
     sin = emb.sin().to(dtype=dtype)
 
     return cos, sin
-
-
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-@torch.compile(fullgraph=True)
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-    """Applies Rotary Position Embedding to the query and key tensors."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 class PerFrameAttentionPooling(nn.Module):
@@ -259,20 +245,44 @@ class ConditionalCrossAttention(nn.Module):
         if x_freqs is not None:
             x_cos, x_sin = x_freqs
             q_view = rearrange(q, "b l (h d) -> b l h d", d=self.head_dim)
-            x_cos = x_cos.to(q_view.dtype).to(q_view.device)
-            x_sin = x_sin.to(q_view.dtype).to(q_view.device)
-            q_view, _ = apply_rotary_pos_emb(
-                q_view, q_view, x_cos, x_sin, unsqueeze_dim=2
+            x_cos = x_cos.to(q_view.dtype).to(q_view.device).squeeze(0)
+            x_sin = x_sin.to(q_view.dtype).to(q_view.device).squeeze(0)
+            # FlashInfer expects cos_sin_cache with shape [seqlen, head_dim],
+            # where the first half is cos and the second half is sin, each with
+            # head_dim//2 elements. Since compute_rope_cos_sin duplicates the
+            # frequencies (cat((freqs, freqs))), we only take the first half.
+            half_dim = self.head_dim // 2
+            cos_sin_cache = torch.cat(
+                [
+                    x_cos[:, :half_dim].to(dtype=torch.float32).contiguous(),
+                    x_sin[:, :half_dim].to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            q_view, _ = apply_flashinfer_rope_qk_inplace(
+                q_view, q_view.clone(), cos_sin_cache, is_neox=True
             )
             q = rearrange(q_view, "b l h d -> b l (h d)")
 
         if y_freqs is not None:
             y_cos, y_sin = y_freqs
             k_view = rearrange(k, "b l (h d) -> b l h d", d=self.head_dim)
-            y_cos = y_cos.to(k_view.dtype).to(k_view.device)
-            y_sin = y_sin.to(k_view.dtype).to(k_view.device)
-            _, k_view = apply_rotary_pos_emb(
-                k_view, k_view, y_cos, y_sin, unsqueeze_dim=2
+            y_cos = y_cos.to(k_view.dtype).to(k_view.device).squeeze(0)
+            y_sin = y_sin.to(k_view.dtype).to(k_view.device).squeeze(0)
+            # FlashInfer expects cos_sin_cache with shape [seqlen, head_dim],
+            # where the first half is cos and the second half is sin, each with
+            # head_dim//2 elements. Since compute_rope_cos_sin duplicates the
+            # frequencies (cat((freqs, freqs))), we only take the first half.
+            half_dim = self.head_dim // 2
+            cos_sin_cache = torch.cat(
+                [
+                    y_cos[:, :half_dim].to(dtype=torch.float32).contiguous(),
+                    y_sin[:, :half_dim].to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            k_view, _ = apply_flashinfer_rope_qk_inplace(
+                k_view, k_view.clone(), cos_sin_cache, is_neox=True
             )
             k = rearrange(k_view, "b l h d -> b l (h d)")
 
