@@ -24,7 +24,9 @@ class LowConfidence(DllmAlgorithm):
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], None, bool
+    ]:
         batch_size = forward_batch.batch_size
         # Here, the forward_batch full logits contains all the blocks
         # such as [dllm_block_size * batch_size, hidden_size]

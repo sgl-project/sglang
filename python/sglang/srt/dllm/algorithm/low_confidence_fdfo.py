@@ -10,12 +10,13 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class LowConfidenceFDFO(DllmAlgorithm):
-    """Low Confidence Stream algorithm for DLLM using top-2 logit difference as confidence."""
+    """Low Confidence algorithm for DLLM. Requiring first done first out mode"""
+
+    requires_fdfo_mode: bool = True
 
     def __init__(self, config: DllmConfig) -> None:
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
-        self.first_done_first_out_mode = True
 
     def _pick_tokens(
         self, forward_batch: ForwardBatch, full_logits: torch.Tensor
@@ -46,9 +47,8 @@ class LowConfidenceFDFO(DllmAlgorithm):
         )
         x = torch.where(block_mask_index, x, input_ids)
         input_ids = torch.where(transfer_index, x, input_ids)
-      
-        forward_batch.input_ids = input_ids.view(-1)
 
+        forward_batch.input_ids = input_ids.view(-1)
 
     def _post_forward_process(
         self, forward_batch: ForwardBatch, full_logits: torch.Tensor
@@ -62,32 +62,42 @@ class LowConfidenceFDFO(DllmAlgorithm):
                 f"but input_ids shape {forward_batch.input_ids.shape[0]} / "
                 f"block_size {self.block_size} = {expected_batch_size}"
             )
-        
+
         # Compute mask counts per block BEFORE _pick_tokens modifies input_ids
         # Convert mask counts to CPU once to avoid multiple D2H transfers
-        mask_counts_cpu = (forward_batch.input_ids == self.mask_id).view(batch_size, self.block_size).sum(dim=1).tolist()
-        
+        mask_counts_cpu = (
+            (forward_batch.input_ids == self.mask_id)
+            .view(batch_size, self.block_size)
+            .sum(dim=1)
+            .tolist()
+        )
+
         # Update input_ids based on confidence
         self._pick_tokens(forward_batch, full_logits)
-        
+
         # Build output token IDs list with decode markers
         # Reshape and convert to CPU list in one operation
-        next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size).tolist()
-        
+        next_token_ids = forward_batch.input_ids.view(
+            batch_size, self.block_size
+        ).tolist()
+
         next_token_ids_list = []
         accept_length_per_req_cpu = []
         for i in range(batch_size):
             next_token_ids_list.append(next_token_ids[i])
-            accept_length_per_req_cpu.append(self.block_size if mask_counts_cpu[i] == 0 else 0)
-        
-        return next_token_ids_list, accept_length_per_req_cpu
+            accept_length_per_req_cpu.append(
+                self.block_size if mask_counts_cpu[i] == 0 else 0
+            )
 
+        return next_token_ids_list, accept_length_per_req_cpu
 
     def run(
         self,
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
-    ) -> Tuple[Union[LogitsProcessorOutput, torch.Tensor], List[List[int]], bool]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, torch.Tensor], List[List[int]], List[int], bool
+    ]:
         # Forward pass through the model (no preprocessing needed)
         # each block may contain mask or finished tokens
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
@@ -98,7 +108,12 @@ class LowConfidenceFDFO(DllmAlgorithm):
             forward_batch, logits_output.full_logits
         )
 
-        return logits_output, next_token_ids_list, accept_length_per_req_cpu, can_run_cuda_graph
+        return (
+            logits_output,
+            next_token_ids_list,
+            accept_length_per_req_cpu,
+            can_run_cuda_graph,
+        )
 
 
 Algorithm = LowConfidenceFDFO

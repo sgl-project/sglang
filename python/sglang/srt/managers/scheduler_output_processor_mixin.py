@@ -337,14 +337,18 @@ class SchedulerOutputProcessorMixin:
 
         for idx in range(batch.batch_size()):
             req = batch.reqs[idx]
-            next_token_ids:list = result.next_token_ids[idx]
+            next_token_ids: list = result.next_token_ids[idx]
             len_cur_tokens = len(next_token_ids)
 
             assert len_cur_tokens == block_size
             if result.accept_length_per_req_cpu[idx] == 0:
                 req.dllm_incomplete_ids = next_token_ids
                 # release current kv cache since they are incomplete
-                old_prefix_len = len(req.prefix_indices) if hasattr(req, 'prefix_indices') and req.prefix_indices is not None else 0
+                old_prefix_len = (
+                    len(req.prefix_indices)
+                    if hasattr(req, "prefix_indices") and req.prefix_indices is not None
+                    else 0
+                )
                 new_fill_len = len(req.fill_ids)
                 if new_fill_len > old_prefix_len:
                     kv_indices_to_free = self.req_to_token_pool.req_to_token[
@@ -352,20 +356,21 @@ class SchedulerOutputProcessorMixin:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices_to_free)
                 continue
-            
+
             req.dllm_incomplete_ids = []
             len_input = len(req.origin_input_ids)
             len_fill = len(req.fill_ids)
-            if (len_fill < len_input):
-                continue # prefill
+            if len_fill <= len_input:
+                continue  # Since model is only filled with input ids, we are still on prefill stage.
 
             if len_fill - len_cur_tokens < len_input:
-                next_token_ids = next_token_ids[len_input-len_fill:] # avoid mix input and output
+                next_token_ids = next_token_ids[
+                    len_input - len_fill :
+                ]  # avoid mix input and output
             self.num_generated_tokens += len_cur_tokens
 
-            finished=False
+            finished = False
             for next_token_id in next_token_ids:
-                # dllm_debug_print(f"Trying to append output_ids on {idx=} with {next_token_id=}")
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
@@ -410,7 +415,6 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
-
 
     def process_batch_result_decode(
         self: Scheduler,
