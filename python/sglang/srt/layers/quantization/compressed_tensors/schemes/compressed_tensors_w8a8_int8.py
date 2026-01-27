@@ -22,8 +22,7 @@ from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import is_cuda
 
-__all__ = ["CompressedTensorsW8A8Int8",
-           "NPUCompressedTensorsW8A8Int8"]
+__all__ = ["CompressedTensorsW8A8Int8", "NPUCompressedTensorsW8A8Int8"]
 
 _is_cuda = is_cuda()
 if _is_cuda:
