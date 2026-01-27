@@ -125,6 +125,14 @@ python3 -m sglang.launch_server \
   --reasoning-parser deepseek-v3
 ```
 
+## NVFP4 Checkpoint
+
+To launch deepseek v3.2 [NVFP4 checkpoint](https://huggingface.co/nvidia/DeepSeek-V3.2-NVFP4) on Blackwell devices, the user needs to specify the quantization method as `modelopt_fp4`, and moe runner backend as one of `flashinfer_trtllm`(recommended), `flashinfer_cutlass` and `flashinfer_cutedsl`. Any other usage (parallelism, reasoning parser, ...) is the same as FP8 checkpoint.
+
+An example launching command can be:
+```bash
+python -m sglang.launch_server --model nvidia/DeepSeek-V3.2-NVFP4 --tp 4 --quantization modelopt_fp4 --moe-runner-backend flashinfer_trtllm --tool-call-parser deepseekv32  --reasoning-parser deepseek-v3
+```
 
 ## PD Disaggregation
 
