@@ -811,7 +811,11 @@ class AscendAttnBackend(AttentionBackend):
                 ):
                     causal = False
 
-                if layer.qk_head_dim <= 128 and causal and forward_batch.encoder_lens is None:
+                if (
+                    layer.qk_head_dim <= 128
+                    and causal
+                    and forward_batch.encoder_lens is None
+                ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                         attn_output = torch.empty(
@@ -1557,7 +1561,7 @@ class AscendAttnBackend(AttentionBackend):
                     is_cross_attention=layer.is_cross_attention,
                     scaling=layer.scaling,
                     enable_gqa=use_gqa,
-                    causal=False
+                    causal=False,
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:

@@ -4,7 +4,7 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 
-class AscendTorchNativeAttnBackend():
+class AscendTorchNativeAttnBackend:
     def __init__(self):
         pass
 
