@@ -102,10 +102,6 @@ class TestReturnRoutedExperts(CustomTestCase):
         cls.reference_results = cls._collect_results(cls.reference_args)
 
     @classmethod
-    @unittest.skip(
-        "Skipped: /generate endpoint has 8.85% mismatch vs 5% threshold. "
-        "OpenAI endpoints pass. See https://github.com/sgl-project/sglang/actions/runs/21357076155/job/61466908809"
-    )
     def test_return_routed_experts(cls):
         cls._run_endpoint_test("/generate")
 
