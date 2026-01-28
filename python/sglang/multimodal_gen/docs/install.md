@@ -42,7 +42,13 @@ docker run --gpus all \
     --env "HF_TOKEN=<secret>" \
     --ipc=host \
     lmsysorg/sglang:dev \
-    sglang generate --model-path black-forest-labs/FLUX.1-dev \
-    --prompt "A logo With Bold Large text: SGL Diffusion" \
-    --save-output
+    zsh -c '\
+        echo "Installing diffusion dependencies..." && \
+        pip install -e "python[diffusion]" && \
+        echo "Starting SGLang-Diffusion..." && \
+        sglang generate \
+            --model-path black-forest-labs/FLUX.1-dev \
+            --prompt "A logo With Bold Large text: SGL Diffusion" \
+            --save-output \
+    '
 ```
