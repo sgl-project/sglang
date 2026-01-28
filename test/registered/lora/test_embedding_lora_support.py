@@ -34,7 +34,7 @@ from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestC
 MODEL_PATH = "meta-llama/Llama-2-7b-hf"
 LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"
 LORA_BACKEND = "triton"
-SIMILARITY_THRESHOLD = 0.99
+SIMILARITY_THRESHOLD = 0.9999
 
 
 class TestEmbeddingLoraSupport(unittest.TestCase):
@@ -171,6 +171,11 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
             sim = self.cosine_similarity(hf_emb, sgl_emb)
             similarities.append(sim)
             print(f"  Text {i}: cosine similarity = {sim:.6f}")
+            self.assertGreater(
+                sim,
+                SIMILARITY_THRESHOLD,
+                f"Text {i} similarity {sim:.6f} below threshold {SIMILARITY_THRESHOLD}",
+            )
 
         avg_similarity = np.mean(similarities)
         print(f"  Average similarity: {avg_similarity:.6f}")
