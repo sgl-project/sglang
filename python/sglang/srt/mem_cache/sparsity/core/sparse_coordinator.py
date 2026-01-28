@@ -79,6 +79,20 @@ class RequestTrackers:
             device=device,
         )
 
+        stride_per_block = self.topk_tokens_cnt * page_size + 1
+        self.transfer_tasks_src = torch.full(
+            (max_pool_size * stride_per_block,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.transfer_tasks_dst = torch.full(
+            (max_pool_size * stride_per_block,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+
     def _reset_state(self, idx: int) -> None:
         """Reset all tensor states for a request slot."""
         self.req_to_tokens_host[idx].fill_(-1)
