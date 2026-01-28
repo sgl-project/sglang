@@ -509,12 +509,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size
-        # get image_latent_ids right after scale & shift
-        image_latent_ids = _prepare_image_ids([latent_condition])
-        image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
-        image_latent_ids = image_latent_ids.to(get_local_torch_device())
-        batch.condition_image_latent_ids = image_latent_ids
-
         # latent: (1, 128, 32, 32)
         packed = self.maybe_pack_latents(
             latent_condition, None, batch
@@ -525,6 +519,11 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latents = packed.unsqueeze(0)  # (1, N*1024, 128)
         image_latents = image_latents.repeat(batch_size, 1, 1)
         return image_latents
+
+    def prepare_condition_image_latent_ids(self, image_latents, batch):
+        image_latent_ids = _prepare_image_ids(image_latents)
+        image_latent_ids = image_latent_ids.repeat(batch.batch_size, 1, 1)
+        batch.condition_image_latent_ids = image_latent_ids.to(get_local_torch_device())
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
