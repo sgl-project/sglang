@@ -225,7 +225,7 @@ class AscendAttnBackend(AttentionBackend):
                 "Glm4MoeLiteForCausalLM"
                 in model_runner.model_config.hf_config.architectures
             ):
-                self.prefill_use_mha = True
+                self.prefill_use_mha_fia = True
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
         self.native_attn = TorchNativeAttnBackend(model_runner)
@@ -754,7 +754,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
             )
-        forward_mha = not self.use_mla or getattr(self, "prefill_use_mha", False)
+        forward_mha = not self.use_mla or getattr(self, "prefill_use_mha_fia", False)
         if forward_mha:
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -780,7 +780,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 return attn_out
 
-            if self.use_fia:
+            if self.use_fia or getattr(self, "prefill_use_mha_fia", False):
                 """FIA will support multi-bs in the later version of CANN"""
                 q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 attn_output = torch.empty(
