@@ -1432,7 +1432,6 @@ class CompressedTensorsWNA16TritonMoEMethod(CompressedTensorsWNA16MoEMethod):
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
             self.moe_runner_config.activation == "silu"
