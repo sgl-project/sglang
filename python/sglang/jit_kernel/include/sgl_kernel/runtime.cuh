@@ -12,6 +12,9 @@ namespace host::runtime {
 template <typename T>
 inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic_smem = 0) -> uint32_t {
   int num_blocks_per_sm = 0;
+  // Ensure CUDA device context is set before querying occupancy
+  int current_device;
+  RuntimeDeviceCheck(cudaGetDevice(&current_device));
   RuntimeDeviceCheck(
       cudaOccupancyMaxActiveBlocksPerMultiprocessor(&num_blocks_per_sm, kernel, block_dim, dynamic_smem));
   return static_cast<uint32_t>(num_blocks_per_sm);
@@ -19,6 +22,14 @@ inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic
 
 // Return the number of SMs for the given device
 inline auto get_sm_count(int device_id) -> uint32_t {
+  // Set the CUDA device context before querying device attributes
+  // This is necessary when CUDA_VISIBLE_DEVICES is set, as the device_id
+  // is a logical device ID and requires a context to be set first
+  int current_device;
+  RuntimeDeviceCheck(cudaGetDevice(&current_device));
+  if (current_device != device_id) {
+    RuntimeDeviceCheck(cudaSetDevice(device_id));
+  }
   int sm_count;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
   return static_cast<uint32_t>(sm_count);
@@ -26,6 +37,14 @@ inline auto get_sm_count(int device_id) -> uint32_t {
 
 // Return the Major compute capability for the given device
 inline auto get_cc_major(int device_id) -> int {
+  // Set the CUDA device context before querying device attributes
+  // This is necessary when CUDA_VISIBLE_DEVICES is set, as the device_id
+  // is a logical device ID and requires a context to be set first
+  int current_device;
+  RuntimeDeviceCheck(cudaGetDevice(&current_device));
+  if (current_device != device_id) {
+    RuntimeDeviceCheck(cudaSetDevice(device_id));
+  }
   int cc_major;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
   return cc_major;
