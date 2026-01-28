@@ -54,6 +54,9 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsMxInt4MoEMethod,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -253,6 +256,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
+            routing_method_type=routing_method_type,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -688,6 +692,7 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(self.quant_method, Fp8MoEMethod)
             or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+            or isinstance(self.quant_method, CompressedTensorsMxInt4MoEMethod)
         ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
@@ -1140,6 +1145,7 @@ class FlashInferFusedMoE(FusedMoE):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
         correction_bias = topk_config.correction_bias
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
         if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
             # lazy import
@@ -1170,6 +1176,7 @@ class FlashInferFusedMoE(FusedMoE):
                     local_expert_offset=self.moe_ep_rank * self.num_local_experts,
                     local_num_experts=self.num_local_experts,
                     routing_method_type=self.routing_method_type,
+                    routed_scaling_factor=routed_scaling_factor,
                     tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 )
 
