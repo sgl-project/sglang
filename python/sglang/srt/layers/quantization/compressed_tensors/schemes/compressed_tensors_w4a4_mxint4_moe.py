@@ -74,6 +74,10 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsScheme):
             )
         self._cache_permute_indices = {}
 
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 100
+
     def create_weights(
         self,
         layer: torch.nn.Module,
