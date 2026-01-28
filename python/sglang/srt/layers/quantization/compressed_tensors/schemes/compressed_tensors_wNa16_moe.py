@@ -25,10 +25,16 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
+        StandardCombineInput,
+    )
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        fused_marlin_moe,
     )
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
     )
+
 
 __all__ = ["CompressedTensorsWNA16MoE", "NPUCompressedTensorsW4A16Int4DynamicMoE"]
 
@@ -355,11 +361,6 @@ class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
-        )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         assert (
             self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
@@ -429,7 +430,6 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         self.num_experts = num_experts
         if (
