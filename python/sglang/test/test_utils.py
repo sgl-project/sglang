@@ -204,7 +204,7 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
@@ -593,6 +593,12 @@ def _try_enable_offline_mode_if_cache_complete(
     from sglang.srt.utils import find_local_repo_dir
 
     other_args = other_args or []
+
+    # Skip offline mode for LoRA scenarios (dynamic adapter loading may need online access)
+    is_lora_enabled = "--enable-lora" in other_args or "--lora-paths" in other_args
+    if is_lora_enabled:
+        print(f"CI_OFFLINE: LoRA enabled, skip offline mode - {model_name_or_path}")
+        return None
 
     # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
     if env.get("HF_HUB_OFFLINE") == "1":
@@ -1489,6 +1495,10 @@ def run_bench_one_batch(model, other_args):
         command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    prefill_latency = None
+    decode_throughput = None
+    decode_latency = None
+
     try:
         stdout, stderr = process.communicate()
         output = stdout.decode(errors="backslashreplace")
@@ -1510,6 +1520,12 @@ def run_bench_one_batch(model, other_args):
             decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
+
+    if prefill_latency is None or decode_throughput is None or decode_latency is None:
+        raise RuntimeError(
+            f"Failed to parse benchmark output. "
+            f"prefill_latency={prefill_latency}, decode_throughput={decode_throughput}, decode_latency={decode_latency}"
+        )
 
     return prefill_latency, decode_throughput, decode_latency
 
@@ -1646,6 +1662,7 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
+    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1673,6 +1690,7 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
     )
 
     # Launch a thread to stream the output

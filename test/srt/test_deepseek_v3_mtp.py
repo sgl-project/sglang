@@ -82,10 +82,7 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{avg_spec_accept_length=:.2f}\n"
             )
             self.assertGreater(metrics["accuracy"], 0.935)
-            if is_in_amd_ci():
-                self.assertGreater(avg_spec_accept_length, 2.8)
-            else:
-                self.assertGreater(avg_spec_accept_length, 2.9)
+            self.assertGreater(avg_spec_accept_length, 2.8)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -99,10 +96,7 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            if is_in_amd_ci():
-                self.assertGreater(acc_length, 2.8)
-            else:
-                self.assertGreater(acc_length, 2.9)
+            self.assertGreater(acc_length, 2.8)
             if is_in_amd_ci():
                 self.assertGreater(speed, 15)
             else:

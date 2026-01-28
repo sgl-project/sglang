@@ -449,8 +449,8 @@ impl std::fmt::Debug for PolicyRegistry {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_policy_registry_basic() {
+    #[tokio::test]
+    async fn test_policy_registry_basic() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         // First worker of a model sets the policy
@@ -476,8 +476,8 @@ mod tests {
         assert_eq!(*counts.get("gpt-4").unwrap(), 1);
     }
 
-    #[test]
-    fn test_policy_registry_cleanup() {
+    #[tokio::test]
+    async fn test_policy_registry_cleanup() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         // Add workers
@@ -496,8 +496,8 @@ mod tests {
         assert_eq!(registry.get_worker_counts().get("llama-3"), None);
     }
 
-    #[test]
-    fn test_default_policy() {
+    #[tokio::test]
+    async fn test_default_policy() {
         let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
         // No hint, no template - uses default

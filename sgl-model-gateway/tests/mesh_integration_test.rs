@@ -372,13 +372,13 @@ async fn test_rate_limit_window_reset() {
     manager.sync_rate_limit_inc(GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string(), 50);
     let value_before = manager.get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY);
     // Value may be None if not owner, or Some if owner
-    if value_before.is_some() {
-        assert!(value_before.unwrap() > 0);
+    if let Some(val) = value_before {
+        assert!(val > 0);
 
         // Reset counter
         manager.reset_global_rate_limit_counter();
         let value_after = manager.get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY);
         // Should be reset
-        assert!(value_after.is_none() || value_after.unwrap() <= 0);
+        assert!(value_after.is_none() || value_after.unwrap_or(0) <= 0);
     }
 }
