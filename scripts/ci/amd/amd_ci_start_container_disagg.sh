@@ -192,7 +192,7 @@ docker run -dt --user root \
   -v /sys/class/net:/sys/class/net:ro \
   -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
   -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro \
-  $LIBIONIC_MOUNT \
+  -v /usr/lib/x86_64-linux-gnu:/host_sys_libs:ro \
   $CACHE_VOLUME \
   --privileged \
   --network=host \
