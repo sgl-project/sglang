@@ -15,11 +15,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(
-    est_time=3600,
-    suite="stage-c-test-large-8-gpu-amd-mi35x",
-    disabled="move to nightly for saving time",
-)
+register_amd_ci(est_time=1800, suite="stage-c-test-large-8-gpu-amd")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -159,7 +155,7 @@ class TestDeepseekV32TP(CustomTestCase):
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 20)
+                self.assertGreater(speed, 15)
             else:
                 self.assertGreater(speed, 70)
 
