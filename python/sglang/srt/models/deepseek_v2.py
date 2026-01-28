@@ -2305,21 +2305,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # Use PP-aware is_last_layer to ensure correct layer_output_mode at PP boundaries
-        pp_is_last_layer = is_nextn or is_pp_last_layer(
-            self.layer_id,
-            self.config.num_hidden_layers,
-            pp_group.rank_in_group,
-            pp_group.world_size,
-        )
-
         if self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
                 allow_reduce_scatter=True,
-                is_last_layer=pp_is_last_layer,
+                is_last_layer=(
+                    is_nextn
+                    or is_pp_last_layer(
+                        self.layer_id,
+                        self.config.num_hidden_layers,
+                        pp_group.rank_in_group,
+                        pp_group.world_size,
+                    )
+                ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
         else:
@@ -2328,7 +2328,15 @@ class DeepseekV2DecoderLayer(nn.Module):
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
                 allow_reduce_scatter=True,
-                is_last_layer=pp_is_last_layer,
+                is_last_layer=(
+                    is_nextn
+                    or is_pp_last_layer(
+                        self.layer_id,
+                        self.config.num_hidden_layers,
+                        pp_group.rank_in_group,
+                        pp_group.world_size,
+                    )
+                ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
