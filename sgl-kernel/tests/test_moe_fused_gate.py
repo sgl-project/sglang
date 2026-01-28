@@ -53,10 +53,14 @@ def biased_grouped_topk_impl(
 
     if num_fused_shared_experts > 0:
         topk_ids = torch.empty(
-            (num_token, topk), dtype=routed_topk_ids.dtype, device=routed_topk_ids.device
+            (num_token, topk),
+            dtype=routed_topk_ids.dtype,
+            device=routed_topk_ids.device,
         )
         topk_weights = torch.empty(
-            (num_token, topk), dtype=routed_topk_weights.dtype, device=routed_topk_weights.device
+            (num_token, topk),
+            dtype=routed_topk_weights.dtype,
+            device=routed_topk_weights.device,
         )
         topk_ids[:, :topk_excluding_shared] = routed_topk_ids
         topk_weights[:, :topk_excluding_shared] = routed_topk_weights
@@ -80,7 +84,9 @@ def biased_grouped_topk_impl(
             topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights / topk_weights_sum
         if apply_routed_scaling_factor_on_output:
-            scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+            scale = (
+                1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+            )
             topk_weights *= scale
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
