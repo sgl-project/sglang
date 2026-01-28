@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
+    METADATA_COOKIE_SLOT,
     DisaggregationMode,
     KVClassType,
     MetadataBuffers,
@@ -43,6 +45,7 @@ from sglang.srt.disaggregation.utils import (
     get_kv_class,
     is_mla_backend,
     kv_to_page_indices,
+    metadata_cookie_from_rid,
     poll_and_all_reduce,
     prepare_abort,
 )
@@ -715,6 +718,13 @@ class DecodeTransferQueue:
         self.scheduler = scheduler
         self.tree_cache = tree_cache
         self.spec_algorithm = scheduler.spec_algorithm
+        self._test_inject_metadata_corruption = get_int_env_var(
+            "SGLANG_PD_TEST_INJECT_METADATA_CORRUPTION", 0
+        )
+        self._test_inject_restore_delay_ms = get_int_env_var(
+            "SGLANG_PD_TEST_INJECT_METADATA_RESTORE_DELAY_MS", 0
+        )
+        self._metadata_corruption_injected = set()
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -722,7 +732,7 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -735,6 +745,34 @@ class DecodeTransferQueue:
             output_topk_index,
             output_hidden_states,
         ) = self.metadata_buffers.get_buf(idx)
+
+        if (
+            self._test_inject_metadata_corruption
+            and decode_req.req.rid not in self._metadata_corruption_injected
+        ):
+            original_token = int(output_id[0].item())
+            original_cookie = int(output_id[METADATA_COOKIE_SLOT].item())
+            output_id[0] = original_token ^ 1
+            output_id[METADATA_COOKIE_SLOT] = original_cookie ^ 0x7FFFFFFF
+            self._metadata_corruption_injected.add(decode_req.req.rid)
+
+            def _restore():
+                if self._test_inject_restore_delay_ms > 0:
+                    time.sleep(self._test_inject_restore_delay_ms / 1000.0)
+                output_id[0] = original_token
+                output_id[METADATA_COOKIE_SLOT] = original_cookie
+
+            threading.Thread(target=_restore, daemon=True).start()
+
+        expected_cookie = metadata_cookie_from_rid(decode_req.req.rid)
+        if output_id[METADATA_COOKIE_SLOT].item() != expected_cookie:
+            logger.debug(
+                "Decode metadata cookie mismatch for rid=%s (expected=%s, got=%s)",
+                decode_req.req.rid,
+                expected_cookie,
+                output_id[METADATA_COOKIE_SLOT].item(),
+            )
+            return False
 
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
@@ -765,6 +803,7 @@ class DecodeTransferQueue:
             auto_next_anon=True,
         )
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+        return True
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -800,9 +839,9 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                self._commit_transfer_to_req(decode_req)
-                indices_to_remove.add(i)
-                transferred_reqs.append(decode_req.req)
+                if self._commit_transfer_to_req(decode_req):
+                    indices_to_remove.add(i)
+                    transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
