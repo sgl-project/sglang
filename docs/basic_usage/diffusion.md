@@ -17,7 +17,7 @@ python3 -m sglang.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-**Full model list:** [Diffusion Models](../supported_models/diffusion_models.md)
+**Full model list:** [Diffusion Models](../supported_models/image_generation/diffusion_models.md)
 
 ---
 
@@ -35,4 +35,4 @@ python3 -m sglang.launch_server \
   --host 0.0.0.0 --port 30000
 ```
 
-**Full model list:** [Diffusion Language Models](../supported_models/diffusion_language_models.md)
+**Full model list:** [Diffusion Language Models](../supported_models/text_generation/diffusion_language_models.md)
