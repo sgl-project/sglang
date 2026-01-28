@@ -196,6 +196,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         sft_format: str = "deepseek",
         mask_prompt: bool = True,
         ignore_id: int = -100,
+        ocr2_mode: bool = False,
         **kwargs,
     ):
 
@@ -243,6 +244,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         self.sft_format = sft_format
         self.mask_prompt = mask_prompt
         self.ignore_id = ignore_id
+        self.ocr2_mode = ocr2_mode
 
         super().__init__(
             tokenizer,
@@ -481,15 +483,27 @@ class DeepseekOCRProcessor(ProcessorMixin):
                 (self.base_size // self.patch_size) / self.downsample_ratio
             )
 
-            tokenized_image = (
-                [self.image_token_id] * num_queries_base + [self.image_token_id]
-            ) * num_queries_base
-            tokenized_image += [self.image_token_id]
-            if num_width_tiles > 1 or num_height_tiles > 1:
-                tokenized_image += (
-                    [self.image_token_id] * (num_queries * num_width_tiles)
-                    + [self.image_token_id]
-                ) * (num_queries * num_height_tiles)
+            if self.ocr2_mode:
+                tokenized_image = []
+                if num_width_tiles > 1 or num_height_tiles > 1:
+                    tokenized_image += [self.image_token_id] * (
+                        num_queries * num_width_tiles * num_queries * num_height_tiles
+                    )
+                tokenized_image += [self.image_token_id] * (
+                    num_queries_base * num_queries_base
+                )
+                # One extra token for the view separator.
+                tokenized_image += [self.image_token_id]
+            else:
+                tokenized_image = (
+                    [self.image_token_id] * num_queries_base + [self.image_token_id]
+                ) * num_queries_base
+                tokenized_image += [self.image_token_id]
+                if num_width_tiles > 1 or num_height_tiles > 1:
+                    tokenized_image += (
+                        [self.image_token_id] * (num_queries * num_width_tiles)
+                        + [self.image_token_id]
+                    ) * (num_queries * num_height_tiles)
             tokenized_str += tokenized_image
 
             images_seq_mask += [True] * len(tokenized_image)
