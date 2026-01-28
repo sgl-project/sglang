@@ -2544,6 +2544,7 @@ class LocalSerializedTensor:
     def get(self, rank: int):
         return MultiprocessingSerializer.deserialize(self.values[rank])
 
+
 def unwrap_ipc_tensors(
     named_tensors: List[Tuple[str, torch.Tensor]], tp_rank: int, device: torch.device
 ) -> List[Tuple[str, torch.Tensor]]:
