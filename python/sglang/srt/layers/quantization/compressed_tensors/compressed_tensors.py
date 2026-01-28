@@ -29,23 +29,29 @@ from compressed_tensors.quantization import (
 )
 from pydantic import BaseModel
 
+from sglang.srt.layers.moe import MoeRunnerConfig, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
-    CompressedTensorsMoEMethod,
-)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
+    CompressedTensorsMxInt4MoE,
     CompressedTensorsScheme,
     CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
+    CompressedTensorsWNA16MoE,
+    NPUCompressedTensorsW4A8Int8DynamicMoE,
+    NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
+    NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -60,6 +66,10 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
     from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
@@ -169,7 +179,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
+            layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+            return CompressedTensorsFusedMoEMethod(self)
         return None
 
     @property
@@ -597,6 +608,72 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         raise NotImplementedError("No compressed-tensors compatible scheme was found.")
 
+    def get_moe_scheme(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[CompressedTensorsScheme]:
+        """
+        compressed-tensors supports non uniform in the following way:
+
+        targets of config_groups: There can be N config_groups which each
+            have a quantization scheme. Each config_group has a list of targets
+            which can be a full layer_name, a regex for a layer_name, or
+            an nn.Module name.
+
+        Detect whether a layer_name is found in any target and
+        use the quantization scheme corresponding to the matched target
+        to select the CompressedTensorsScheme used for infernece.
+        """
+
+        weight_quant = self.target_scheme_map["Linear"].get("weights")
+        input_quant = self.target_scheme_map["Linear"].get("input_activations")
+
+        if self._is_wNa16_group_channel(weight_quant, input_quant):
+            if not _is_npu:
+                if (
+                    self._is_mxint4a16(weight_quant, input_quant)
+                    and get_moe_runner_backend().is_flashinfer_trtllm()
+                ):
+                    logger.info_once(
+                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
+                    )
+                    return CompressedTensorsMxInt4MoE(self)
+                else:
+                    logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
+                    return CompressedTensorsWNA16MoE(self)
+            else:
+                if (
+                    self._is_dynamic_token_w4(weight_quant, input_quant)
+                    and input_quant is None
+                ):
+                    logger.info_once("Using NPUCompressedTensorsW4A16Int4DynamicMoE")
+                    return NPUCompressedTensorsW4A16Int4DynamicMoE(self)
+        elif self._is_fp4a4_nvfp4(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW4A4Nvfp4MoE")
+            return CompressedTensorsW4A4Nvfp4MoE()
+        elif self._is_fp8_w8a8(weight_quant, input_quant):
+            logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
+            return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
+        elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
+            if _is_npu:
+                logger.info_once("Using NPUCompressedTensorsW8A8Int8DynamicMoE")
+                return NPUCompressedTensorsW8A8Int8DynamicMoE(weight_quant, input_quant)
+            else:
+                raise NotImplementedError(
+                    f"The W8A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                )
+        elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
+            if _is_npu:
+                logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
+                return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            else:
+                raise NotImplementedError(
+                    f"The W4A8Int8 Fused MoE scheme is implemented only for NPU for now."
+                )
+        else:
+            raise RuntimeError(
+                f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
+            )
+
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
     ) -> Optional[CompressedTensorsScheme]:
@@ -812,3 +889,68 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, x, bias=bias)
+
+
+class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
+
+    def __init__(self, quantization_config: CompressedTensorsConfig):
+        self.quantization_config = quantization_config
+        self.quant_config = quantization_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.scheme.process_weights_after_loading(layer)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """
+        Use the CompressedTensorsScheme associated with each layer to create
+        the necessary parameters for the layer. See LinearMethodBase for param
+        details
+        """
+        layer.scheme.create_weights(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            params_dtype=params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        return layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        """
+        Use the output of create_weights and the CompressedTensorsScheme
+        associated with the layer to apply the forward pass with the
+        layer input.  See LinearMethodBase for param details
+
+        """
+
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights(layer, dispatch_output)
+
+    def apply_weights_with_router_logits(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_weights_with_router_logits(layer, dispatch_output)
