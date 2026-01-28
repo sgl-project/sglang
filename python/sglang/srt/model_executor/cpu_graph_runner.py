@@ -597,6 +597,7 @@ class CPUGraphRunner:
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
         self.recapture_if_needed(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
         output = self.graphs[forward_batch.batch_size](
             forward_batch.input_ids,
             forward_batch.positions,

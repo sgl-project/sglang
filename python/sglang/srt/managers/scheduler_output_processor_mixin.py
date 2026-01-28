@@ -361,7 +361,20 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        if result.debug_event is not None:
+            logger.debug(
+                f"[DEBUG] waiting for debug_event ({id(result.debug_event)}) for {batch.batch_size()=}, {batch.forward_mode=}"
+            )
+            debug_tensor = result.debug_tensor
+            logger.debug(f"{debug_tensor['input_ids'].tolist()=}")
+            logger.debug(f"{debug_tensor['positions'].tolist()=}")
+            logger.debug(f"{debug_tensor['seq_lens'].tolist()=}")
+            logger.debug(f"{debug_tensor['req_pool_indices'].tolist()=}")
+            logger.debug(f"{debug_tensor['out_cache_loc'].tolist()=}")
+            result.debug_event.synchronize()
+
         if result.copy_done is not None:
+            logger.debug(f"[DEBUG] waiting for copy_done event")
             result.copy_done.synchronize()
 
         logits_output, next_token_ids, can_run_cuda_graph = (

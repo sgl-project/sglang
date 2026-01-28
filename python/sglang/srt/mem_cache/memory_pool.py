@@ -152,9 +152,12 @@ class ReqToTokenPool:
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
+        logger.debug(f"Alloc ReqToTokenPool indices: {select_index}")
+
         return select_index
 
     def free(self, free_index: Union[int, List[int]]):
+        logger.debug(f"Free ReqToTokenPool indices: {free_index}")
         if isinstance(free_index, (int,)):
             self.free_slots.append(free_index)
         else:

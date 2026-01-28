@@ -145,8 +145,11 @@ class GraphInputBuffers:
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[torch.Tensor]:
         if bs != raw_bs:
+            self.input_ids.fill_(0)
+            self.req_pool_indices.fill_(0)
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.positions.fill_(0)
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
