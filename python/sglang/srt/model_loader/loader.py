@@ -107,6 +107,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
+    get_local_ip_auto,
     is_npu,
     is_pin_memory_available,
     rank0_log,
@@ -2141,7 +2142,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
-        instance_ip = socket.gethostbyname(socket.gethostname())
+        instance_ip = get_local_ip_auto()
         start_build_group_tic = time.time()
         client.build_group(
             gpu_id=device_config.gpu_id,

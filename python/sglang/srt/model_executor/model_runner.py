@@ -871,7 +871,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
             if self.tp_rank == 0:
-                instance_ip = socket.gethostbyname(socket.gethostname())
+                instance_ip = get_local_ip_auto()
                 t = threading.Thread(
                     target=trigger_init_weights_send_group_for_remote_instance_request,
                     args=(
