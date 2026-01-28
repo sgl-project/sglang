@@ -72,7 +72,17 @@ class InternVLProcessor(BaseMultimodalProcessor):
             tokenizer = self._processor
         self.tokenizer = tokenizer
 
-        llm_arch = hf_config.llm_config.architectures[0]
+        # Support both InternVL (llm_config) and InternS1 (text_config).
+        # Different multimodal models use different field names for the text backbone:
+        # - InternVL uses: hf_config.llm_config
+        # - InternS1 uses: hf_config.text_config
+        # - Some store architectures at top-level
+        text_cfg = (
+            getattr(hf_config, "llm_config", None)
+            or getattr(hf_config, "text_config", None)
+            or hf_config
+        )
+        llm_arch = (getattr(text_cfg, "architectures", []) or [None])[0]
         self.llm_arch = llm_arch
         video_token_map = {
             "Qwen2ForCausalLM": "<|video_pad|>",
@@ -121,9 +131,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             getattr(server_args, "context_length", None)
             or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
-            or getattr(
-                getattr(hf_config, "llm_config", None), "max_position_embeddings", None
-            )
+            or getattr(text_cfg, "max_position_embeddings", None)
             or self.CONTEXT_FALLBACK
         )
 
