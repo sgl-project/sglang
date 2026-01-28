@@ -12,59 +12,59 @@
 //!
 //! ## Header
 //! - `X-SMG-Routing-Key`: The routing key for sticky session routing
+//!
+//! ## Redis Backend
+//! When `--redis-url` is provided, uses Redis for distributed routing state.
+//! Otherwise uses local DashMap. This enables consistent routing across
+//! multiple router instances.
 
 use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use dashmap::{mapref::entry::Entry, DashMap};
 use rand::Rng;
-use tracing::info;
+use redis::{AsyncCommands, Expiry};
+use tracing::{debug, info, warn};
 
 use super::{
     get_healthy_worker_indices, utils::PeriodicTask, LoadBalancingPolicy, SelectWorkerInfo,
 };
 use crate::{
-    config::ManualAssignmentMode, core::Worker, observability::metrics::Metrics,
+    config::{ManualAssignmentMode, RetryConfig},
+    core::{
+        retry::{MaxRetriesExceeded, RetryExecutor},
+        Worker,
+    },
+    observability::metrics::Metrics,
     routers::header_utils::extract_routing_key,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecutionBranch {
-    NoHealthyWorkers,
-    OccupiedHit,
-    OccupiedMiss,
-    Vacant,
-    NoRoutingId,
-}
-
-impl ExecutionBranch {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::NoHealthyWorkers => "no_healthy_workers",
-            Self::OccupiedHit => "occupied_hit",
-            Self::OccupiedMiss => "occupied_miss",
-            Self::Vacant => "vacant",
-            Self::NoRoutingId => "no_routing_id",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RoutingId(String);
-
-impl RoutingId {
-    fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
-
 const MAX_CANDIDATE_WORKERS: usize = 2;
+const REDIS_KEY_MIDFIX_DEFAULT: &str = "smg:manual_policy:";
+
+// ------------------------------------ API layer ---------------------------------------
+
+#[derive(Debug)]
+pub struct ManualPolicy {
+    backend: Backend,
+    assignment_mode: ManualAssignmentMode,
+}
+
+impl Default for ManualPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ManualConfig {
     pub eviction_interval_secs: u64,
     pub max_idle_secs: u64,
     pub assignment_mode: ManualAssignmentMode,
+    /// Redis URL for distributed routing table (uses local DashMap if None)
+    pub redis_url: Option<String>,
+    /// Optional prefix for Redis keys (for test isolation)
+    pub redis_key_prefix: Option<String>,
 }
 
 impl Default for ManualConfig {
@@ -73,35 +73,40 @@ impl Default for ManualConfig {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_url: None,
+            redis_key_prefix: None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-struct Node {
-    candi_worker_urls: Vec<String>,
-    last_access: Instant,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionBranch {
+    NoHealthyWorkers,
+    NoRoutingId,
+    OccupiedHit,
+    OccupiedMiss,
+    Vacant,
+    RedisPoolGetException,
+    RedisGetexException,
+    RedisCasRace,
+    RedisCasException,
+    RedisBackendMaxRetriesExceeded,
 }
 
-impl Node {
-    fn push_bounded(&mut self, url: String) {
-        while self.candi_worker_urls.len() >= MAX_CANDIDATE_WORKERS {
-            self.candi_worker_urls.remove(0);
+impl ExecutionBranch {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoHealthyWorkers => "no_healthy_workers",
+            Self::NoRoutingId => "no_routing_id",
+            Self::OccupiedHit => "occupied_hit",
+            Self::OccupiedMiss => "occupied_miss",
+            Self::Vacant => "vacant",
+            Self::RedisPoolGetException => "redis_pool_get_exception",
+            Self::RedisGetexException => "redis_getex_exception",
+            Self::RedisCasRace => "redis_cas_race",
+            Self::RedisCasException => "redis_cas_exception",
+            Self::RedisBackendMaxRetriesExceeded => "redis_backend_max_retries_exceeded",
         }
-        self.candi_worker_urls.push(url);
-    }
-}
-
-#[derive(Debug)]
-pub struct ManualPolicy {
-    routing_map: Arc<DashMap<RoutingId, Node>>,
-    assignment_mode: ManualAssignmentMode,
-    _eviction_task: Option<PeriodicTask>,
-}
-
-impl Default for ManualPolicy {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -111,9 +116,198 @@ impl ManualPolicy {
     }
 
     pub fn with_config(config: ManualConfig) -> Self {
+        let backend = Backend::from_config(&config);
+        Self {
+            backend,
+            assignment_mode: config.assignment_mode,
+        }
+    }
+
+    async fn select_worker_impl(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> (Option<usize>, ExecutionBranch) {
+        let healthy_indices = get_healthy_worker_indices(workers);
+        if healthy_indices.is_empty() {
+            return (None, ExecutionBranch::NoHealthyWorkers);
+        }
+
+        if let Some(routing_id) = extract_routing_key(info.headers) {
+            let (idx, branch) = self
+                .backend
+                .select_by_routing_id(routing_id, workers, &healthy_indices, self.assignment_mode)
+                .await;
+            return (
+                idx.or_else(|| Some(random_select(&healthy_indices))),
+                branch,
+            );
+        }
+
+        (
+            Some(random_select(&healthy_indices)),
+            ExecutionBranch::NoRoutingId,
+        )
+    }
+
+    #[cfg(test)]
+    fn local_backend(&self) -> Option<&LocalBackend> {
+        self.backend.as_local()
+    }
+
+    /// Iterate over all stored candidate URLs. Used for testing.
+    pub async fn iter_urls(
+        &self,
+    ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.backend.iter_urls().await
+    }
+}
+
+#[async_trait]
+impl LoadBalancingPolicy for ManualPolicy {
+    async fn select_worker(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        let (result, branch) = self.select_worker_impl(workers, info).await;
+        Metrics::record_worker_manual_policy_branch(branch.as_str());
+        if let Some(len) = self.backend.len() {
+            Metrics::set_manual_policy_cache_entries(len);
+        }
+        result
+    }
+
+    fn name(&self) -> &'static str {
+        "manual"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// ------------------------------------ base backend ---------------------------------------
+
+#[derive(Debug)]
+enum Backend {
+    Local(LocalBackend),
+    Redis(RedisBackend),
+}
+
+impl Backend {
+    fn from_config(config: &ManualConfig) -> Self {
+        if let Some(redis_url) = &config.redis_url {
+            let key_prefix = format!(
+                "{}:{REDIS_KEY_MIDFIX_DEFAULT}",
+                config.redis_key_prefix.as_deref().unwrap_or("")
+            );
+            info!(
+                "ManualPolicy creating Redis backend: url={}, key_prefix={}",
+                redis_url, key_prefix
+            );
+            let backend = RedisBackend::new(redis_url, config.max_idle_secs, key_prefix)
+                .expect("redis_url is set but failed to connect to Redis");
+            Backend::Redis(backend)
+        } else {
+            info!("ManualPolicy using local DashMap backend");
+            Backend::Local(LocalBackend::new(config))
+        }
+    }
+
+    async fn select_by_routing_id(
+        &self,
+        routing_id: &str,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
+    ) -> (Option<usize>, ExecutionBranch) {
+        match self {
+            Backend::Local(b) => {
+                let (idx, branch) =
+                    b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode);
+                (Some(idx), branch)
+            }
+            Backend::Redis(b) => {
+                b.select_by_routing_id(routing_id, workers, healthy_indices, assignment_mode)
+                    .await
+            }
+        }
+    }
+
+    fn len(&self) -> Option<usize> {
+        match self {
+            Backend::Local(b) => Some(b.len()),
+            Backend::Redis(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    fn as_local(&self) -> Option<&LocalBackend> {
+        match self {
+            Backend::Local(b) => Some(b),
+            Backend::Redis(_) => None,
+        }
+    }
+
+    async fn iter_urls(
+        &self,
+    ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Backend::Local(b) => Ok(b.iter_urls()),
+            Backend::Redis(b) => b.iter_urls().await,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct CandidateWorkerUrls(Vec<String>);
+
+impl CandidateWorkerUrls {
+    fn push_bounded(&mut self, url: String) {
+        while self.0.len() >= MAX_CANDIDATE_WORKERS {
+            self.0.remove(0);
+        }
+        self.0.push(url);
+    }
+
+    fn serialize(&self) -> String {
+        self.0.join(",")
+    }
+
+    fn deserialize(data: &str) -> Self {
+        Self(
+            data.split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+        )
+    }
+
+    fn urls(&self) -> &[String] {
+        &self.0
+    }
+}
+
+// ------------------------------------ local backend ---------------------------------------
+
+#[derive(Debug)]
+struct LocalBackend {
+    routing_map: Arc<DashMap<String, LocalNode>>,
+    _eviction_task: Option<PeriodicTask>,
+}
+
+#[derive(Debug, Clone)]
+struct LocalNode {
+    candidates: CandidateWorkerUrls,
+    last_access: Instant,
+}
+
+impl LocalBackend {
+    fn new(config: &ManualConfig) -> Self {
         use std::time::Duration;
 
-        let routing_map = Arc::new(DashMap::<RoutingId, Node>::new());
+        let routing_map = Arc::new(DashMap::<String, LocalNode>::new());
 
         let eviction_task = if config.eviction_interval_secs > 0 && config.max_idle_secs > 0 {
             let routing_map_clone = Arc::clone(&routing_map);
@@ -146,45 +340,38 @@ impl ManualPolicy {
 
         Self {
             routing_map,
-            assignment_mode: config.assignment_mode,
             _eviction_task: eviction_task,
-        }
-    }
-
-    fn select_new_worker(&self, workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-        match self.assignment_mode {
-            ManualAssignmentMode::Random => random_select(healthy_indices),
-            ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
-            ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
         }
     }
 
     fn select_by_routing_id(
         &self,
-        workers: &[Arc<dyn Worker>],
         routing_id: &str,
+        workers: &[Arc<dyn Worker>],
         healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
     ) -> (usize, ExecutionBranch) {
-        let routing_id = RoutingId::new(routing_id);
-
-        match self.routing_map.entry(routing_id) {
+        match self.routing_map.entry(routing_id.to_string()) {
             Entry::Occupied(mut entry) => {
                 let node = entry.get_mut();
                 node.last_access = Instant::now();
                 if let Some(idx) =
-                    find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
+                    find_healthy_worker(node.candidates.urls(), workers, healthy_indices)
                 {
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
-                    let selected_idx = self.select_new_worker(workers, healthy_indices);
-                    node.push_bounded(workers[selected_idx].url().to_string());
+                    let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+                    node.candidates
+                        .push_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
             Entry::Vacant(entry) => {
-                let selected_idx = self.select_new_worker(workers, healthy_indices);
-                entry.insert(Node {
-                    candi_worker_urls: vec![workers[selected_idx].url().to_string()],
+                let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+                let mut candidates = CandidateWorkerUrls::default();
+                candidates.push_bounded(workers[selected_idx].url().to_string());
+                entry.insert(LocalNode {
+                    candidates,
                     last_access: Instant::now(),
                 });
                 (selected_idx, ExecutionBranch::Vacant)
@@ -192,48 +379,211 @@ impl ManualPolicy {
         }
     }
 
-    fn select_worker_impl(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
-    ) -> (Option<usize>, ExecutionBranch) {
-        let healthy_indices = get_healthy_worker_indices(workers);
-        if healthy_indices.is_empty() {
-            return (None, ExecutionBranch::NoHealthyWorkers);
-        }
+    fn len(&self) -> usize {
+        self.routing_map.len()
+    }
 
-        if let Some(routing_id) = extract_routing_key(info.headers) {
-            let (idx, branch) = self.select_by_routing_id(workers, routing_id, &healthy_indices);
-            return (Some(idx), branch);
-        }
+    #[cfg(test)]
+    fn get_last_access(&self, routing_id: &str) -> Option<Instant> {
+        self.routing_map.get(routing_id).map(|e| e.last_access)
+    }
 
-        (
-            Some(random_select(&healthy_indices)),
-            ExecutionBranch::NoRoutingId,
-        )
+    #[cfg(test)]
+    fn has_eviction_task(&self) -> bool {
+        self._eviction_task.is_some()
+    }
+
+    fn iter_urls(&self) -> Vec<Vec<String>> {
+        self.routing_map
+            .iter()
+            .map(|e| e.candidates.urls().to_vec())
+            .collect()
     }
 }
 
-#[async_trait]
-impl LoadBalancingPolicy for ManualPolicy {
-    async fn select_worker(
+// ------------------------------------ redis backend ---------------------------------------
+
+#[derive(Debug)]
+struct RedisBackend {
+    pool: deadpool_redis::Pool,
+    ttl_secs: u64,
+    key_prefix: String,
+}
+
+impl RedisBackend {
+    fn new(
+        url: &str,
+        ttl_secs: u64,
+        key_prefix: String,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let cfg = deadpool_redis::Config::from_url(url);
+        let pool = cfg.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+        Ok(Self {
+            pool,
+            ttl_secs,
+            key_prefix,
+        })
+    }
+
+    async fn select_by_routing_id(
         &self,
+        routing_id: &str,
         workers: &[Arc<dyn Worker>],
-        info: &SelectWorkerInfo<'_>,
-    ) -> Option<usize> {
-        let (result, branch) = self.select_worker_impl(workers, info);
-        Metrics::record_worker_manual_policy_branch(branch.as_str());
-        Metrics::set_manual_policy_cache_entries(self.routing_map.len());
-        result
+        healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
+    ) -> (Option<usize>, ExecutionBranch) {
+        let retry_config = RetryConfig {
+            max_retries: 5,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 500,
+            backoff_multiplier: 2.0,
+            jitter_factor: 0.2,
+        };
+
+        let result = RetryExecutor::execute_with_retry(
+            &retry_config,
+            |_attempt| {
+                self.select_one_attempt(routing_id, workers, healthy_indices, assignment_mode)
+            },
+            |(idx, _branch), _attempt| idx.is_none(),
+            |(_idx, branch), _delay, _attempt| {
+                Metrics::record_manual_policy_attempt_error(branch.as_str())
+            },
+            || warn!("Max retries exceeded for routing_id={}", routing_id),
+        )
+        .await;
+
+        match result {
+            Ok((idx, branch)) => (idx, branch),
+            Err(MaxRetriesExceeded { .. }) => {
+                (None, ExecutionBranch::RedisBackendMaxRetriesExceeded)
+            }
+        }
     }
 
-    fn name(&self) -> &'static str {
-        "manual"
+    async fn select_one_attempt(
+        &self,
+        routing_id: &str,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+        assignment_mode: ManualAssignmentMode,
+    ) -> (Option<usize>, ExecutionBranch) {
+        let key = format!("{}{}", self.key_prefix, routing_id);
+
+        let mut conn = match self.pool.get().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("Redis pool.get exception: {}", e);
+                return (None, ExecutionBranch::RedisPoolGetException);
+            }
+        };
+
+        let old_data: Option<String> = match conn.get_ex(&key, Expiry::EX(self.ttl_secs)).await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!("Redis getex exception: key={}, error={}", key, e);
+                return (None, ExecutionBranch::RedisGetexException);
+            }
+        };
+        debug!("Redis getex: key={}, old_data={:?}", key, old_data);
+        let old_candidates = old_data.as_deref().map(CandidateWorkerUrls::deserialize);
+
+        if let Some(ref old_candidates) = old_candidates {
+            if let Some(idx) = find_healthy_worker(old_candidates.urls(), workers, healthy_indices)
+            {
+                debug!("OccupiedHit: key={}, idx={}", key, idx);
+                return (Some(idx), ExecutionBranch::OccupiedHit);
+            }
+        }
+
+        let selected_idx = select_new_worker(workers, healthy_indices, assignment_mode);
+        let new_url = workers[selected_idx].url();
+
+        let (new_candidates, branch) = if let Some(mut candidates) = old_candidates {
+            candidates.push_bounded(new_url.to_string());
+            (candidates, ExecutionBranch::OccupiedMiss)
+        } else {
+            (
+                CandidateWorkerUrls(vec![new_url.to_string()]),
+                ExecutionBranch::Vacant,
+            )
+        };
+        let new_data = new_candidates.serialize();
+
+        match redis_cas(
+            &mut conn,
+            &key,
+            old_data.as_deref(),
+            &new_data,
+            self.ttl_secs,
+        )
+        .await
+        {
+            Ok(true) => {
+                debug!("CAS success: key={}, new_data={}", key, new_data);
+                (Some(selected_idx), branch)
+            }
+            Ok(false) => {
+                debug!(
+                    "CAS race: key={}, old_data={:?}, new_data={}",
+                    key, old_data, new_data
+                );
+                (None, ExecutionBranch::RedisCasRace)
+            }
+            Err(e) => {
+                warn!("Redis cas exception: key={}, error={}", key, e);
+                (None, ExecutionBranch::RedisCasException)
+            }
+        }
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    async fn iter_urls(
+        &self,
+    ) -> Result<Vec<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut conn = self.pool.get().await?;
+        let pattern = format!("{}*", self.key_prefix);
+        let keys: Vec<String> = conn.keys(&pattern).await?;
+
+        let mut result = Vec::new();
+        for key in &keys {
+            if let Some(data) = conn.get::<_, Option<String>>(key).await? {
+                result.push(CandidateWorkerUrls::deserialize(&data).urls().to_vec());
+            }
+        }
+        Ok(result)
     }
+}
+
+// ------------------------------------ utils ---------------------------------------
+
+async fn redis_cas(
+    conn: &mut deadpool_redis::Connection,
+    key: &str,
+    expected: Option<&str>,
+    new_value: &str,
+    ttl_secs: u64,
+) -> Result<bool, redis::RedisError> {
+    static CAS_SCRIPT: std::sync::LazyLock<redis::Script> = std::sync::LazyLock::new(|| {
+        redis::Script::new(
+            r#"
+local old = redis.call('GET', KEYS[1])
+local expected = ARGV[1]
+local match = (expected == '' and old == false) or (old == expected)
+if not match then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+return 1
+"#,
+        )
+    });
+
+    let result: i32 = CAS_SCRIPT
+        .key(key)
+        .arg(expected.unwrap_or(""))
+        .arg(new_value)
+        .arg(ttl_secs)
+        .invoke_async(conn)
+        .await?;
+    Ok(result == 1)
 }
 
 fn find_healthy_worker(
@@ -259,6 +609,18 @@ fn random_select(healthy_indices: &[usize]) -> usize {
     let mut rng = rand::rng();
     let random_idx = rng.random_range(0..healthy_indices.len());
     healthy_indices[random_idx]
+}
+
+fn select_new_worker(
+    workers: &[Arc<dyn Worker>],
+    healthy_indices: &[usize],
+    assignment_mode: ManualAssignmentMode,
+) -> usize {
+    match assignment_mode {
+        ManualAssignmentMode::Random => random_select(healthy_indices),
+        ManualAssignmentMode::MinLoad => min_load_select(workers, healthy_indices),
+        ManualAssignmentMode::MinGroup => min_group_select(workers, healthy_indices),
+    }
 }
 
 fn select_min_by<K, V, F>(indices: &[K], get_value: F) -> K
@@ -305,10 +667,12 @@ fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> u
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
+
+    // ========================================================================
+    // Test Helpers
+    // ========================================================================
 
     fn create_workers(urls: &[&str]) -> Vec<Arc<dyn Worker>> {
         urls.iter()
@@ -328,314 +692,54 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn test_manual_consistent_routing() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+    // ========================================================================
+    // Unit Tests
+    // ========================================================================
 
-        let headers = headers_with_routing_key("user-123");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(
-                result,
-                Some(first_idx),
-                "Same routing_id should route to same worker"
-            );
-            assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        }
-    }
-
-    #[test]
-    fn test_manual_different_routing_ids() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        let mut distribution = HashMap::new();
-        for i in 0..100 {
-            let headers = headers_with_routing_key(&format!("user-{}", i));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::Vacant);
-            *distribution.entry(result.unwrap()).or_insert(0) += 1;
-        }
-
-        assert!(
-            distribution.len() > 1,
-            "Should distribute across multiple workers"
-        );
-    }
-
-    #[test]
-    fn test_manual_fallback_random() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let mut counts = HashMap::new();
-        for _ in 0..100 {
-            let info = SelectWorkerInfo::default();
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::NoRoutingId);
-            if let Some(idx) = result {
-                *counts.entry(idx).or_insert(0) += 1;
-            }
-        }
-
-        assert_eq!(counts.len(), 2, "Random fallback should use all workers");
-    }
-
-    #[test]
-    fn test_manual_with_unhealthy_workers() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        workers[0].set_healthy(false);
-
-        let headers = headers_with_routing_key("test-routing-id");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, Some(1), "Should only select healthy worker");
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(result, Some(1), "Should only select healthy worker");
-            assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        }
-    }
-
-    #[test]
-    fn test_manual_no_healthy_workers() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000"]);
-
-        workers[0].set_healthy(false);
-        let headers = headers_with_routing_key("test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, None);
-        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
-    }
-
-    #[test]
-    fn test_manual_empty_routing_id() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let mut counts = HashMap::new();
-        for _ in 0..100 {
-            let headers = headers_with_routing_key("");
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::NoRoutingId);
-            if let Some(idx) = result {
-                *counts.entry(idx).or_insert(0) += 1;
-            }
-        }
-
-        assert_eq!(
-            counts.len(),
-            2,
-            "Empty routing_id should use random fallback"
-        );
-    }
-
-    #[test]
-    fn test_manual_remaps_when_worker_becomes_unhealthy() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let headers = headers_with_routing_key("sticky-user");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        workers[first_idx].set_healthy(false);
-
-        let (new_result, branch) = policy.select_worker_impl(&workers, &info);
-        let new_idx = new_result.unwrap();
-        assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
-        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-
-        for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(
-                result,
-                Some(new_idx),
-                "Should consistently route to new worker"
-            );
-            assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        }
-    }
-
-    #[test]
-    fn test_manual_empty_workers() {
-        let policy = ManualPolicy::new();
-        let workers: Vec<Arc<dyn Worker>> = vec![];
-        let headers = headers_with_routing_key("test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, None);
-        assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
-    }
-
-    #[test]
-    fn test_manual_single_worker() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000"]);
-
-        let headers = headers_with_routing_key("single-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(result, Some(0));
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(result, Some(0));
-            assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        }
-    }
-
-    #[test]
-    fn test_manual_worker_recovery() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        let headers = headers_with_routing_key("recovery-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        workers[first_idx].set_healthy(false);
-
-        let (second_result, branch) = policy.select_worker_impl(&workers, &info);
-        let second_idx = second_result.unwrap();
-        assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-
-        workers[first_idx].set_healthy(true);
-
-        let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(
-            after_recovery,
-            Some(first_idx),
-            "Should return to original worker after recovery since it's first in candidate list"
-        );
-        assert_eq!(branch, ExecutionBranch::OccupiedHit);
-    }
-
-    #[test]
-    fn test_manual_max_candidate_workers_eviction() {
-        let policy = ManualPolicy::new();
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        let headers = headers_with_routing_key("eviction-test");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::Vacant);
-
-        workers[first_idx].set_healthy(false);
-
-        let (second_result, branch) = policy.select_worker_impl(&workers, &info);
-        let second_idx = second_result.unwrap();
-        assert_ne!(second_idx, first_idx);
-        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-
-        workers[second_idx].set_healthy(false);
-
-        let remaining_idx = (0..3).find(|&i| i != first_idx && i != second_idx).unwrap();
-        let (third_result, branch) = policy.select_worker_impl(&workers, &info);
-        assert_eq!(
-            third_result,
-            Some(remaining_idx),
-            "Should select the only remaining healthy worker"
-        );
-        assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-
-        workers[first_idx].set_healthy(true);
-
-        let (idx_after_restore, branch) = policy.select_worker_impl(&workers, &info);
-        assert_ne!(
-            idx_after_restore,
-            Some(first_idx),
-            "First worker should be evicted from candidates due to MAX_CANDIDATE_WORKERS=2"
-        );
-        assert_eq!(branch, ExecutionBranch::OccupiedHit);
-    }
-
-    #[test]
-    fn test_manual_policy_name() {
+    #[tokio::test]
+    async fn test_unit_policy_name() {
         let policy = ManualPolicy::new();
         assert_eq!(policy.name(), "manual");
     }
 
-    #[test]
-    fn test_manual_routing_info_push_bounded() {
-        let mut info = Node {
-            candi_worker_urls: vec!["http://w1:8000".to_string()],
-            last_access: Instant::now(),
-        };
+    #[tokio::test]
+    async fn test_unit_candidate_worker_urls_push_bounded() {
+        let mut candidates = CandidateWorkerUrls::default();
+        candidates.push_bounded("http://w1:8000".to_string());
 
-        info.push_bounded("http://w2:8000".to_string());
-        assert_eq!(info.candi_worker_urls.len(), 2);
-        assert_eq!(info.candi_worker_urls[0], "http://w1:8000");
-        assert_eq!(info.candi_worker_urls[1], "http://w2:8000");
+        candidates.push_bounded("http://w2:8000".to_string());
+        assert_eq!(candidates.urls().len(), 2);
+        assert_eq!(candidates.urls()[0], "http://w1:8000");
+        assert_eq!(candidates.urls()[1], "http://w2:8000");
 
-        info.push_bounded("http://w3:8000".to_string());
-        assert_eq!(info.candi_worker_urls.len(), 2);
+        candidates.push_bounded("http://w3:8000".to_string());
+        assert_eq!(candidates.urls().len(), 2);
         assert_eq!(
-            info.candi_worker_urls[0], "http://w2:8000",
+            candidates.urls()[0],
+            "http://w2:8000",
             "Oldest entry should be removed"
         );
-        assert_eq!(info.candi_worker_urls[1], "http://w3:8000");
+        assert_eq!(candidates.urls()[1], "http://w3:8000");
     }
 
-    #[test]
-    fn test_manual_find_healthy_worker_priority() {
+    #[tokio::test]
+    async fn test_unit_candidate_worker_urls_serialize_deserialize() {
+        let mut candidates = CandidateWorkerUrls::default();
+        candidates.push_bounded("http://w1:8000".to_string());
+        candidates.push_bounded("http://w2:8000".to_string());
+
+        let serialized = candidates.serialize();
+        assert_eq!(serialized, "http://w1:8000,http://w2:8000");
+
+        let deserialized = CandidateWorkerUrls::deserialize(&serialized);
+        assert_eq!(deserialized.urls(), candidates.urls());
+
+        let empty = CandidateWorkerUrls::deserialize("");
+        assert!(empty.urls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_unit_find_healthy_worker_priority() {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
 
         let urls = vec![
@@ -668,8 +772,8 @@ mod tests {
         assert_eq!(result, None, "Should return None when no healthy workers");
     }
 
-    #[test]
-    fn test_manual_find_worker_index_by_url() {
+    #[tokio::test]
+    async fn test_unit_find_worker_index_by_url() {
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
 
         assert_eq!(
@@ -687,26 +791,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_manual_config_default() {
+    #[tokio::test]
+    async fn test_unit_config_default() {
         let config = ManualConfig::default();
         assert_eq!(config.eviction_interval_secs, 60);
         assert_eq!(config.max_idle_secs, 4 * 3600);
     }
 
-    #[test]
-    fn test_manual_with_disabled_eviction() {
+    // ========================================================================
+    // Local-backend-only Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_local_backend_disabled_eviction() {
         let config = ManualConfig {
             eviction_interval_secs: 0,
             max_idle_secs: 3600,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_url: None,
+            redis_key_prefix: None,
         };
         let policy = ManualPolicy::with_config(config);
-        assert!(policy._eviction_task.is_none());
+        assert!(!policy.local_backend().unwrap().has_eviction_task());
     }
 
-    #[test]
-    fn test_manual_last_access_updates() {
+    #[tokio::test]
+    async fn test_local_backend_last_access_updates() {
         let policy = ManualPolicy::new();
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
         let headers = headers_with_routing_key("test-key");
@@ -714,41 +824,51 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        let routing_id = RoutingId::new("test-key");
 
-        // Vacant: first access
-        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        let (result, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::Vacant);
         let first_idx = result.unwrap();
-        let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
+        let access_after_vacant = policy
+            .local_backend()
+            .unwrap()
+            .get_last_access("test-key")
+            .unwrap();
         assert!(access_after_vacant.elapsed().as_millis() < 100);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // OccupiedHit: same worker still healthy
-        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
+        let access_after_hit = policy
+            .local_backend()
+            .unwrap()
+            .get_last_access("test-key")
+            .unwrap();
         assert!(access_after_hit > access_after_vacant);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        // OccupiedMiss: worker becomes unhealthy
         workers[first_idx].set_healthy(false);
-        let (_, branch) = policy.select_worker_impl(&workers, &info);
+        let (_, branch) = policy.select_worker_impl(&workers, &info).await;
         assert_eq!(branch, ExecutionBranch::OccupiedMiss);
-        let access_after_miss = policy.routing_map.get(&routing_id).unwrap().last_access;
+        let access_after_miss = policy
+            .local_backend()
+            .unwrap()
+            .get_last_access("test-key")
+            .unwrap();
         assert!(access_after_miss > access_after_hit);
     }
 
-    #[test]
-    fn test_manual_ttl_eviction_logic() {
+    #[tokio::test]
+    async fn test_local_backend_ttl_eviction() {
         use std::time::Duration;
 
         let config = ManualConfig {
-            eviction_interval_secs: 2,
-            max_idle_secs: 2,
+            eviction_interval_secs: 1,
+            max_idle_secs: 1,
             assignment_mode: ManualAssignmentMode::Random,
+            redis_url: None,
+            redis_key_prefix: None,
         };
         let policy = ManualPolicy::with_config(config);
         let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
@@ -758,224 +878,12 @@ mod tests {
             headers: Some(&headers),
             ..Default::default()
         };
-        policy.select_worker_impl(&workers, &info);
+        policy.select_worker_impl(&workers, &info).await;
 
-        assert_eq!(policy.routing_map.len(), 1);
+        assert_eq!(policy.local_backend().unwrap().len(), 1);
 
-        std::thread::sleep(Duration::from_secs(4));
+        std::thread::sleep(Duration::from_secs(3));
 
-        assert_eq!(policy.routing_map.len(), 0);
-    }
-
-    #[test]
-    fn test_min_group_select_distributes_evenly() {
-        let config = ManualConfig {
-            assignment_mode: ManualAssignmentMode::MinGroup,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        for i in 0..9 {
-            let routing_key = format!("key-{}", i);
-            let headers = headers_with_routing_key(&routing_key);
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert!(result.is_some());
-            assert_eq!(branch, ExecutionBranch::Vacant);
-
-            let selected_idx = result.unwrap();
-            workers[selected_idx]
-                .worker_routing_key_load()
-                .increment(&routing_key);
-        }
-
-        let distribution: HashMap<_, usize> = policy
-            .routing_map
-            .iter()
-            .map(|e| e.candi_worker_urls.first().unwrap().clone())
-            .fold(HashMap::new(), |mut acc, url| {
-                *acc.entry(url).or_default() += 1;
-                acc
-            });
-
-        assert_eq!(distribution.len(), 3, "Should use all 3 workers");
-        for count in distribution.values() {
-            assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys");
-        }
-    }
-
-    #[test]
-    fn test_min_group_select_prefers_worker_with_fewer_routing_keys() {
-        let config = ManualConfig {
-            assignment_mode: ManualAssignmentMode::MinGroup,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        workers[0].worker_routing_key_load().increment("existing-1");
-        workers[0].worker_routing_key_load().increment("existing-2");
-        workers[1].worker_routing_key_load().increment("existing-3");
-
-        assert_eq!(workers[0].worker_routing_key_load().value(), 2);
-        assert_eq!(workers[1].worker_routing_key_load().value(), 1);
-        assert_eq!(workers[2].worker_routing_key_load().value(), 0);
-
-        let headers = headers_with_routing_key("new-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-        let (result, _) = policy.select_worker_impl(&workers, &info);
-        let selected_idx = result.unwrap();
-
-        assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
-    }
-
-    #[test]
-    fn test_min_load_select_prefers_worker_with_fewer_requests() {
-        let config = ManualConfig {
-            assignment_mode: ManualAssignmentMode::MinLoad,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        workers[0].increment_load();
-        workers[0].increment_load();
-        workers[1].increment_load();
-
-        assert_eq!(workers[0].load(), 2);
-        assert_eq!(workers[1].load(), 1);
-        assert_eq!(workers[2].load(), 0);
-
-        let headers = headers_with_routing_key("new-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-        let (result, _) = policy.select_worker_impl(&workers, &info);
-        let selected_idx = result.unwrap();
-
-        assert_eq!(selected_idx, 2, "Should select worker with 0 load");
-    }
-
-    #[test]
-    fn test_min_group_sticky_after_assignment() {
-        let config = ManualConfig {
-            assignment_mode: ManualAssignmentMode::MinGroup,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        workers[0].worker_routing_key_load().increment("key-0");
-        workers[1].worker_routing_key_load().increment("key-1");
-        workers[1].worker_routing_key_load().increment("key-2");
-
-        let headers = headers_with_routing_key("new-key");
-        let info = SelectWorkerInfo {
-            headers: Some(&headers),
-            ..Default::default()
-        };
-
-        let (first_result, branch) = policy.select_worker_impl(&workers, &info);
-        let first_idx = first_result.unwrap();
-        assert_eq!(branch, ExecutionBranch::Vacant);
-        assert_eq!(
-            first_idx, 0,
-            "Should select worker 0 (has 1 routing key vs 2)"
-        );
-
-        for _ in 0..10 {
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(
-                result,
-                Some(first_idx),
-                "Same routing key should route to same worker"
-            );
-            assert_eq!(branch, ExecutionBranch::OccupiedHit);
-        }
-    }
-
-    #[test]
-    fn test_random_mode_does_not_consider_load() {
-        let config = ManualConfig {
-            assignment_mode: ManualAssignmentMode::Random,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        workers[0].worker_routing_key_load().increment("key-1");
-        workers[0].worker_routing_key_load().increment("key-2");
-        workers[0].worker_routing_key_load().increment("key-3");
-
-        let mut selected_worker_0 = false;
-        for i in 0..50 {
-            let headers = headers_with_routing_key(&format!("test-{}", i));
-            let info = SelectWorkerInfo {
-                headers: Some(&headers),
-                ..Default::default()
-            };
-            let (result, _) = policy.select_worker_impl(&workers, &info);
-            if result == Some(0) {
-                selected_worker_0 = true;
-                break;
-            }
-        }
-        assert!(
-            selected_worker_0,
-            "Random mode should sometimes select worker 0 despite higher load"
-        );
-    }
-
-    fn assert_no_routing_key_uses_random(
-        assignment_mode: ManualAssignmentMode,
-        setup_load: impl Fn(&[Arc<dyn Worker>]),
-    ) {
-        let config = ManualConfig {
-            assignment_mode,
-            ..Default::default()
-        };
-        let policy = ManualPolicy::with_config(config);
-        let workers = create_workers(&["http://w1:8000", "http://w2:8000"]);
-        setup_load(&workers);
-
-        let mut selected_worker_0 = false;
-        for _ in 0..50 {
-            let info = SelectWorkerInfo::default();
-            let (result, branch) = policy.select_worker_impl(&workers, &info);
-            assert_eq!(branch, ExecutionBranch::NoRoutingId);
-            if result == Some(0) {
-                selected_worker_0 = true;
-                break;
-            }
-        }
-        assert!(
-            selected_worker_0,
-            "Should randomly select worker 0 despite higher load"
-        );
-    }
-
-    #[test]
-    fn test_no_routing_key_uses_random_even_with_min_load_mode() {
-        assert_no_routing_key_uses_random(ManualAssignmentMode::MinLoad, |workers| {
-            workers[0].increment_load();
-            workers[0].increment_load();
-        });
-    }
-
-    #[test]
-    fn test_no_routing_key_uses_random_even_with_min_group_mode() {
-        assert_no_routing_key_uses_random(ManualAssignmentMode::MinGroup, |workers| {
-            workers[0].worker_routing_key_load().increment("k1");
-            workers[0].worker_routing_key_load().increment("k2");
-        });
+        assert_eq!(policy.local_backend().unwrap().len(), 0);
     }
 }

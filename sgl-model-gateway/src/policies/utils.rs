@@ -78,8 +78,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_periodic_task_executes() {
+    #[tokio::test]
+    async fn test_periodic_task_executes() {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = Arc::clone(&counter);
 
@@ -94,8 +94,8 @@ mod tests {
         // Task will be stopped on drop
     }
 
-    #[test]
-    fn test_periodic_task_responds_to_shutdown() {
+    #[tokio::test]
+    async fn test_periodic_task_responds_to_shutdown() {
         let task = PeriodicTask::spawn(60, "test", || {
             // Long interval task
         });

@@ -562,7 +562,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let worker_api_key = Arc::new(worker.api_key().clone());
         let is_streaming = ctx.is_streaming();
 
-        let response = RetryExecutor::execute_response_with_retry(
+        let response = RetryExecutor::execute_with_retry_or_last(
             &self.retry_config,
             |_attempt| {
                 let client = client.clone();
@@ -659,7 +659,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 }
             },
             |res, _attempt| is_retryable_status(res.status()),
-            |delay, attempt| {
+            |_output, delay, attempt| {
                 Metrics::record_worker_retry(
                     metrics_labels::BACKEND_EXTERNAL,
                     metrics_labels::ENDPOINT_CHAT,

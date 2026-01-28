@@ -173,35 +173,35 @@ fn bench_concurrent(c: &mut Criterion) {
                     let policy = Arc::new(ManualPolicy::new());
                     let workers: Arc<Vec<Arc<dyn Worker>>> = Arc::new(create_workers(16));
 
-                    rt.block_on(async {
-                        let handles: Vec<_> = (0..threads)
-                            .map(|t| {
-                                let policy = Arc::clone(&policy);
-                                let workers = Arc::clone(&workers);
-                                tokio::spawn(async move {
-                                    for i in 0..500 {
-                                        let key = if i % 5 == 0 {
-                                            format!("thread{}_user{}", t, i)
-                                        } else {
-                                            format!("shared_user{}", i % 50)
-                                        };
-                                        let mut headers = http::HeaderMap::new();
-                                        headers.insert("x-smg-routing-key", key.parse().unwrap());
-                                        let info = SelectWorkerInfo {
-                                            headers: Some(&headers),
-                                            ..Default::default()
-                                        };
-                                        let _ =
-                                            black_box(policy.select_worker(&workers, &info).await);
-                                    }
-                                })
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let policy = Arc::clone(&policy);
+                            let workers = Arc::clone(&workers);
+                            thread::spawn(move || {
+                                let rt = Runtime::new().unwrap();
+                                for i in 0..500 {
+                                    let key = if i % 5 == 0 {
+                                        format!("thread{}_user{}", t, i)
+                                    } else {
+                                        format!("shared_user{}", i % 50)
+                                    };
+                                    let mut headers = http::HeaderMap::new();
+                                    headers.insert("x-smg-routing-key", key.parse().unwrap());
+                                    let info = SelectWorkerInfo {
+                                        headers: Some(&headers),
+                                        ..Default::default()
+                                    };
+                                    let _ = black_box(
+                                        rt.block_on(policy.select_worker(&workers, &info)),
+                                    );
+                                }
                             })
-                            .collect();
+                        })
+                        .collect();
 
-                        for h in handles {
-                            h.await.unwrap();
-                        }
-                    });
+                    for h in handles {
+                        h.join().unwrap();
+                    }
                 });
             },
         );

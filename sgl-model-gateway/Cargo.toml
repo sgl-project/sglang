@@ -140,6 +140,8 @@ opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
 tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
+paste = "1.0"
+libc = "0.2"
 
 [[bench]]
 name = "consistent_hash_bench"

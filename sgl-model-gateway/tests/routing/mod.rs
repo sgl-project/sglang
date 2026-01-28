@@ -3,7 +3,9 @@
 pub mod cache_aware_backward_compat_test;
 pub mod header_forwarding_test;
 pub mod load_balancing_test;
-pub mod manual_routing_test;
+pub mod manual_routing_high_level_common_test;
+pub mod manual_routing_low_level_common_test;
+pub mod manual_routing_low_level_redis_backend_test;
 pub mod payload_size_test;
 pub mod pd_routing_test;
 pub mod policy_registry_integration;
