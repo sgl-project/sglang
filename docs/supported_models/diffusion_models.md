@@ -1,5 +1,8 @@
 # Diffusion Models
 
+>
+> This page covers **image and video generation**. For **text generation** using diffusion LLMs (e.g., LLaDA2.0), see [Diffusion Language Models](diffusion_language_models.md).
+
 SGLang Diffusion is an inference framework for accelerated image and video generation using diffusion models. It provides an end-to-end unified pipeline with optimized kernels from sgl-kernel and an efficient scheduler loop.
 
 ## Key Features
