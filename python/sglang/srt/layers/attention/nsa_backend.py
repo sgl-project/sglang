@@ -1591,7 +1591,8 @@ class NativeSparseAttnBackend(
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
-        q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        batch_size=cache_seqlens.shape[0]
+        q_all = q_all.view(batch_size, -1, layer.tp_q_head_num, layer.head_dim)
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
@@ -1599,7 +1600,7 @@ class NativeSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
-        indices = page_table_1.unsqueeze(1)
+        indices = page_table_1.view(batch_size,-1,self.nsa_index_topk)
         assert (
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
