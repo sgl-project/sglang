@@ -320,8 +320,13 @@ def get_config(
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
-        for key, val in text_config.__dict__.items():
-            if not hasattr(config, key) and getattr(text_config, key, None) is not None:
+        items = (
+            text_config.items()
+            if hasattr(text_config, "items")
+            else vars(text_config).items()
+        )
+        for key, val in items:
+            if not hasattr(config, key) and val is not None:
                 setattr(config, key, val)
 
     if config.model_type in _CONFIG_REGISTRY:
