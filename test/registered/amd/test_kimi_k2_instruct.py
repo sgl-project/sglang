@@ -11,12 +11,13 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd")
 
 KIMI_K2_MODEL_PATH = "moonshotai/Kimi-K2-Instruct-0905"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -88,7 +89,10 @@ class TestKimiK2Instruct0905(CustomTestCase):
                 f"### test_bs_1_speed (Kimi-K2-Instruct-0905)\n"
                 f"{speed=:.2f} token/s\n"
             )
-            self.assertGreater(speed, 45)
+            if is_in_amd_ci():
+                self.assertGreater(speed, 30)
+            else:
+                self.assertGreater(speed, 45)
 
 
 if __name__ == "__main__":

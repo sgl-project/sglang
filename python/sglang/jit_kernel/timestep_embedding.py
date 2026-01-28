@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import functools
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@functools.cache
+@cache_once
 def _jit_timestep_embedding_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     return load_jit(

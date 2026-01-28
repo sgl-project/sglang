@@ -238,31 +238,6 @@ class LayerNorm(CustomOp):
         return s
 
 
-class ScaleResidual(nn.Module):
-    """
-    Applies gated residual connection.
-    """
-
-    def __init__(self, prefix: str = ""):
-        super().__init__()
-
-    def forward(
-        self, residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
-    ) -> torch.Tensor:
-        """Apply gated residual connection."""
-        # x.shape: [batch_size, seq_len, inner_dim]
-        if gate.dim() == 4:
-            # gate.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = gate.shape[1]
-            frame_seqlen = x.shape[1] // num_frames
-            return residual + (
-                x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
-            ).flatten(1, 2)
-        else:
-            # gate.shape: [batch_size, 1, inner_dim]
-            return residual + x * gate
-
-
 # adapted from Diffusers: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/normalization.py
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy

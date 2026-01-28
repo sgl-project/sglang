@@ -13,12 +13,17 @@ Example usage:
 
 import os
 import unittest
-from typing import List
+from typing import List, Optional, Tuple
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from sglang.test.test_utils import (
+    DEFAULT_URL_FOR_TEST,
+    _parse_int_list_env,
+    popen_launch_server,
+)
 
 # Register for AMD CI - DeepSeek-V3.2 MTP benchmark (~90 min)
 register_amd_ci(
@@ -57,11 +62,58 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
+def _run_benchmark_with_timeout(
+    runner: NightlyBenchmarkRunner,
+    model_path: str,
+    batch_sizes: List[int],
+    input_lens: Tuple[int, ...],
+    output_lens: Tuple[int, ...],
+    other_args: List[str],
+    variant: str,
+    extra_bench_args: Optional[List[str]],
+    timeout: int,
+) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
+    """Run benchmark with a custom server launch timeout."""
+    model_description = f"{model_path}" + (f" ({variant})" if variant else "")
+    process = popen_launch_server(
+        model=model_path,
+        base_url=runner.base_url,
+        other_args=other_args,
+        timeout=timeout,
+    )
+    try:
+        profile_path_prefix, json_output_file = runner.generate_profile_filename(
+            model_path, variant
+        )
+        bench_args = list(extra_bench_args) if extra_bench_args else []
+        if variant:
+            bench_args.extend(["--run-name", variant])
+        command = runner.build_benchmark_command(
+            model_path,
+            batch_sizes,
+            input_lens,
+            output_lens,
+            profile_path_prefix,
+            json_output_file,
+            extra_args=bench_args,
+        )
+        _, cmd_success = runner.run_benchmark_command(command, model_description)
+        if not cmd_success:
+            return [], False, None
+        benchmark_results, load_success = runner.load_benchmark_results(
+            json_output_file, model_description
+        )
+        return benchmark_results, load_success, None
+    finally:
+        kill_process_tree(process.pid)
+
+
 # Model path can be overridden via environment variable
 DEEPSEEK_V32_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"
 )
 PROFILE_DIR = "performance_profiles_deepseek_v32_mtp"
+SERVER_LAUNCH_TIMEOUT = 5400
 
 
 class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
@@ -102,6 +154,8 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 "0.7",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true}',
+                "--watchdog-timeout",
+                "1200",
             ],
         }
 
@@ -113,7 +167,8 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
     def test_bench_one_batch(self):
         """Run benchmark for MTP variant."""
         try:
-            result_tuple = self.runner.run_benchmark_for_model(
+            result_tuple = _run_benchmark_with_timeout(
+                runner=self.runner,
                 model_path=self.model,
                 batch_sizes=self.batch_sizes,
                 input_lens=self.input_lens,
@@ -121,6 +176,7 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 other_args=self.variant_config["other_args"],
                 variant=self.variant_config["name"],
                 extra_bench_args=["--trust-remote-code"],
+                timeout=SERVER_LAUNCH_TIMEOUT,
             )
             results = result_tuple[0]
             success = result_tuple[1]

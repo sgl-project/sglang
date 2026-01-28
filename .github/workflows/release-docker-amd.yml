@@ -16,7 +16,7 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        gpu_arch: ['gfx942', 'gfx942-rocm700', 'gfx950']
+        gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -56,8 +56,6 @@ jobs:
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-            rocm_tag="rocm630-mi30x"
-          elif [ "${{ matrix.gpu_arch }}" = "gfx942-rocm700" ]; then
             rocm_tag="rocm700-mi30x"
           elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
             rocm_tag="rocm700-mi35x"

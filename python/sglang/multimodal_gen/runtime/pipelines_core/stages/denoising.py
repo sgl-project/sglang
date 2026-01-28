@@ -742,7 +742,10 @@ class DenoisingStage(PipelineStage):
         # reset offload managers with prefetching first layer for next forward
         for dit in filter(None, [self.transformer, self.transformer_2]):
             if isinstance(dit, OffloadableDiTMixin):
-                dit.prepare_for_next_denoise()
+                # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
+                # TODO: should be make this an option?
+                for manager in dit.layerwise_offload_managers:
+                    manager.release_all()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
