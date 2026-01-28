@@ -575,9 +575,27 @@ def setup_jit_kernel(
     actual_max_len,
 ):
     """Setup state for JIT kernel."""
-    from sglang.jit_kernel.sparse import load_cache_to_device_buffer_mla
+    from sglang.jit_kernel.sparse import (
+        _jit_sparse_module,
+        load_cache_to_device_buffer_mla,
+    )
 
     request_pool_size = max(batch_size * 2, 256)
+
+    # Pre-calculate item_size_bytes to pre-compile the module
+    actual_feature_dim = host_pool.kv_buffer[layer_id].shape[-1]
+    dtype_size = host_pool.dtype.itemsize
+    item_size_bytes = actual_feature_dim * dtype_size
+    kernel_block_size = 512 if top_k >= 1024 else 256
+
+    # Pre-compile the JIT module before any benchmark to avoid compilation during timing
+    print(
+        f"   Pre-compiling JIT module (item_size={item_size_bytes}, block_size={kernel_block_size})..."
+    )
+    _ = _jit_sparse_module(
+        item_size_bytes, kernel_block_size, top_k, top_k, is_mla=True
+    )
+    print(f"   JIT module compiled and cached")
 
     device_buffer_tokens = torch.full(
         (request_pool_size, num_layers, top_k), -1, dtype=torch.int32, device="cuda"
@@ -613,16 +631,17 @@ def setup_jit_kernel(
         (batch_size, top_k), -1, dtype=torch.int32, device="cuda"
     )
     bitmap = torch.full((batch_size, max_seq_len), -1, dtype=torch.int16, device="cuda")
-    
-    # Transfer task buffers for high-performance parallel transfer
-    max_transfer_tasks = batch_size * top_k * page_size
+
+    tasks_per_block = top_k * page_size
+    stride_per_block = tasks_per_block + 1
+    max_transfer_tasks = batch_size * stride_per_block
     transfer_tasks_src = torch.full(
         (max_transfer_tasks,), -1, dtype=torch.int64, device="cuda"
     )
     transfer_tasks_dst = torch.full(
         (max_transfer_tasks,), -1, dtype=torch.int64, device="cuda"
     )
-    
+
     lru_slots = (
         torch.arange(top_k, dtype=torch.int16, device="cuda")
         .unsqueeze(0)
@@ -670,11 +689,6 @@ def setup_jit_kernel(
     # For debugging: also create GPU version to compare
     # host_cache_gpu = host_pool.kv_buffer[layer_id].cuda()
 
-    # Calculate item_size_bytes from actual tensor shape and dtype
-    actual_feature_dim = host_pool.kv_buffer[layer_id].shape[-1]
-    dtype_size = host_pool.dtype.itemsize
-    item_size_bytes = actual_feature_dim * dtype_size
-
     # Calculate expected miss count
     overlap_count = sum(
         len(
@@ -687,8 +701,6 @@ def setup_jit_kernel(
     miss_count = total_tokens - overlap_count
     miss_ratio = miss_count / total_tokens
     data_transfer_size_mb = (miss_count * item_size_bytes) / (1024 * 1024)
-
-    kernel_block_size = 512 if top_k >= 1024 else 256
     print(f"   JIT kernel state initialized:")
     print(f"     - block_size={kernel_block_size}, item_size_bytes={item_size_bytes}")
     print(f"     - feature_dim={actual_feature_dim}, dtype_size={dtype_size}")

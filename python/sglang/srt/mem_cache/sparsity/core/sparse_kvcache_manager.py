@@ -155,7 +155,7 @@ class SparseKVCacheManager:
                 sparse_mask=sparse_mask,
                 seq_lens=seq_lens,
                 transfer_tasks_src=self.req_states.transfer_tasks_src,
-                transfer_tasks_dst=self.req_states.transfer_tasks_dst,                
+                transfer_tasks_dst=self.req_states.transfer_tasks_dst,
                 page_size=page_size,
                 layer_id=layer_id,
                 item_size_bytes=self.mem_pool_host.token_stride_size,

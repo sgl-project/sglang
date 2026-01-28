@@ -79,20 +79,19 @@ class RequestTrackers:
             device=device,
         )
 
-        max_transfer_tasks = self.topk_tokens_cnt * max_pool_size
+        stride_per_block = self.topk_tokens_cnt * page_size + 1
         self.transfer_tasks_src = torch.full(
-            (max_transfer_tasks,),
+            (max_pool_size * stride_per_block,),
             -1,
             dtype=torch.int64,
             device=device,
         )
         self.transfer_tasks_dst = torch.full(
-            (max_transfer_tasks,),
+            (max_pool_size * stride_per_block,),
             -1,
             dtype=torch.int64,
             device=device,
         )
-
 
     def _reset_state(self, idx: int) -> None:
         """Reset all tensor states for a request slot."""
@@ -506,6 +505,10 @@ class SparseCoordinator:
 
             if len(free_indices) > 0:
                 tree_cache.token_to_kv_pool_allocator.free(free_indices)
+
+            logger.info(
+                f"Token-wise truncated req {req.req_pool_idx}: allocated={allocated_len} -> {kv_keep_len}, freed [{free_start}:{allocated_len}]"
+            )
         else:
             raise ValueError(f"Invalid topk mode: {self.algorithm.topk_mode()}")
 
@@ -588,7 +591,39 @@ class SparseCoordinator:
                 ),
                 out_cache_loc[non_truncated_indices],
             )
+
+        # Allocate index_k tokens if using NSA hybrid pool
+        from sglang.srt.disaggregation.decode import NSADecodeReqToTokenPool
+
+        if isinstance(batch.req_to_token_pool, NSADecodeReqToTokenPool):
+            self._alloc_for_nsa_index_k(batch, token_per_req, seq_lens_next, locs)
+
         return out_cache_loc
+
+    def _alloc_for_nsa_index_k(
+        self, batch: "ScheduleBatch", token_per_req: int, seq_lens_next, locs
+    ):
+        """Allocate index_k tokens for NSA decode."""
+        allocator = batch.tree_cache.token_to_kv_pool_allocator
+        index_k_last_loc = batch.req_to_token_pool.req_to_nsa_index_k[
+            batch.req_pool_indices, batch.seq_lens - 1
+        ]
+
+        out_index_cache_loc = allocator.alloc_decode_for_index_k(
+            seq_lens_next, batch.seq_lens_cpu + token_per_req, index_k_last_loc
+        )
+
+        if out_index_cache_loc is None:
+            error_msg = (
+                f"Decode out of memory for index_k. Try to lower your batch size.\n"
+                f"Try to allocate {len(seq_lens_next) * token_per_req} tokens.\n"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        batch.req_to_token_pool.write_index_token(
+            (batch.req_pool_indices, locs), out_index_cache_loc.to(torch.int32)
+        )
 
     def get_hierarchical_sparse_truncated_len(self) -> Optional[int]:
         return self.states.device_buffer_cnt
