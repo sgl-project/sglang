@@ -1439,7 +1439,26 @@ class DeepseekOCRForCausalLM(nn.Module):
                 f"Only 2D tile_tag is supported currently, got: {self.tile_tag}"
             )
 
-        if self.is_ocr2:
+        if not self.is_ocr2:
+            if self.text_config.topk_method == "noaux_tc":
+                self.model = DeepseekV3ForCausalLM(
+                    config=config.text_config,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "language"),
+                )
+            elif not self.text_config.use_mla:
+                self.model = DeepseekForCausalLM(
+                    config=config.text_config,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "language"),
+                )
+            else:
+                self.model = DeepseekV2ForCausalLM(
+                    config=config.text_config,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "language"),
+                )
+        else:
             # OCR2 language_config uses non-MLA attention (qk_* dims are 0).
             # Use the non-MLA Deepseek model to avoid MLA-specific assumptions.
             self.model = DeepseekForCausalLM(
@@ -1447,34 +1466,16 @@ class DeepseekOCRForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
             )
-        elif self.text_config.topk_method == "noaux_tc":
-            self.model = DeepseekV3ForCausalLM(
-                config=config.text_config,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "language"),
-            )
-        elif not self.text_config.use_mla:
-            self.model = DeepseekForCausalLM(
-                config=config.text_config,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "language"),
-            )
-        else:
-            self.model = DeepseekV2ForCausalLM(
-                config=config.text_config,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "language"),
-            )
 
-        if self.is_ocr2:
+        if not self.is_ocr2:
+            self.sam_model = build_sam_vit_b()
+            self.vision_model = build_clip_l()
+        else:
             projector_input_dim = getattr(self.projector_config, "input_dim", 896)
             self.sam_model = build_sam_vit_b(net_3_out_channels=projector_input_dim)
             self.qwen2_model = build_qwen2_decoder_as_encoder(
                 hidden_dimension=projector_input_dim
             )
-        else:
-            self.sam_model = build_sam_vit_b()
-            self.vision_model = build_clip_l()
 
         self.projector = MlpProjector(
             projector_type=self.projector_config.projector_type,
@@ -1485,13 +1486,81 @@ class DeepseekOCRForCausalLM(nn.Module):
             downsample_ratio=self.projector_config.downsample_ratio,
         )
 
+    @staticmethod
+    def _collect_mm_flag(
+        items: List[MultimodalDataItem], flag_name: str
+    ) -> Optional[List[bool]]:
+        values = []
+        for item in items:
+            value = getattr(item, flag_name, None)
+            if value is None:
+                return None
+            values.append(bool(value))
+        return values
+
+    def _encode_ocr2_features(self, images: torch.Tensor) -> torch.Tensor:
+        features = self.sam_model(images)
+        features = self.qwen2_model(features)
+        features = self.projector(features)
+        return features.view(-1, features.shape[-1])
+
+    def _encode_ocr1_features(self, images: torch.Tensor) -> torch.Tensor:
+        features_1 = self.sam_model(images)
+        features_2 = self.vision_model(images, features_1)
+        features = torch.cat(
+            (
+                features_2[:, 1:],
+                features_1.flatten(2).permute(0, 2, 1),
+            ),
+            dim=-1,
+        )
+        return self.projector(features)
+
+    def _format_ocr1_global_features(self, features: torch.Tensor) -> torch.Tensor:
+        _, hw, n_dim = features.shape
+        h = w = int(hw**0.5)
+        features = features.view(h, w, n_dim)
+        features = torch.cat(
+            [features, self.image_newline[None, None, :].expand(h, 1, n_dim)],
+            dim=1,
+        )
+        return features.view(-1, n_dim)
+
+    def _format_ocr1_local_features(
+        self, features: torch.Tensor, crop_shape: torch.Tensor
+    ) -> torch.Tensor:
+        _, hw2, n_dim2 = features.shape
+        h2 = w2 = int(hw2**0.5)
+        width_crop_num, height_crop_num = int(crop_shape[0]), int(crop_shape[1])
+        features = (
+            features.view(height_crop_num, width_crop_num, h2, w2, n_dim2)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(height_crop_num * h2, width_crop_num * w2, n_dim2)
+        )
+        features = torch.cat(
+            [
+                features,
+                self.image_newline[None, None, :].expand(
+                    height_crop_num * h2, 1, n_dim2
+                ),
+            ],
+            dim=1,
+        )
+        return features.view(-1, n_dim2)
+
     def _parse_and_validate_image_input(self, **kwargs: object):
 
         pixel_values = kwargs.pop("pixel_values", None)
         images_spatial_crop = kwargs.pop("images_spatial_crop", None)
         images_crop = kwargs.pop("images_crop", None)
+        has_images = kwargs.pop("has_images", None)
 
-        if pixel_values is None or torch.sum(pixel_values).item() == 0:
+        if pixel_values is None:
+            return None
+        if has_images is not None:
+            if not has_images:
+                return None
+        elif torch.sum(pixel_values).item() == 0:
             return None
 
         if pixel_values is not None:
@@ -1520,6 +1589,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         pixel_values: torch.Tensor,
         images_crop: torch.Tensor,
         images_spatial_crop: torch.Tensor,
+        has_local_crops: Optional[List[bool]] = None,
     ) -> NestedTensors:
 
         # Pixel_values (global view): [n_image, batch_size, 3, height, width]
@@ -1529,26 +1599,25 @@ class DeepseekOCRForCausalLM(nn.Module):
 
         images_in_this_batch = []
 
-        if self.is_ocr2:
+        if not self.is_ocr2:
             with torch.no_grad():
                 for jdx in range(images_spatial_crop.size(0)):
                     patches = images_crop[jdx][0].to(torch.bfloat16)
                     image_ori = pixel_values[jdx]
+                    crop_shape = images_spatial_crop[jdx][0]
+                    use_local_crops = (
+                        has_local_crops[jdx]
+                        if has_local_crops is not None
+                        else torch.sum(patches).item() != 0
+                    )
 
-                    if torch.sum(patches).item() != 0:
-                        local_features_1 = self.sam_model(patches)
-                        local_features_2 = self.qwen2_model(local_features_1)
-                        local_features = self.projector(local_features_2)
+                    global_features = self._encode_ocr1_features(image_ori)
+                    global_features = self._format_ocr1_global_features(global_features)
 
-                        global_features_1 = self.sam_model(image_ori)
-                        global_features_2 = self.qwen2_model(global_features_1)
-                        global_features = self.projector(global_features_2)
-
-                        local_features = local_features.view(
-                            -1, local_features.shape[-1]
-                        )
-                        global_features = global_features.view(
-                            -1, global_features.shape[-1]
+                    if use_local_crops:
+                        local_features = self._encode_ocr1_features(patches)
+                        local_features = self._format_ocr1_local_features(
+                            local_features, crop_shape
                         )
                         global_local_features = torch.cat(
                             [
@@ -1559,12 +1628,6 @@ class DeepseekOCRForCausalLM(nn.Module):
                             dim=0,
                         )
                     else:
-                        global_features_1 = self.sam_model(image_ori)
-                        global_features_2 = self.qwen2_model(global_features_1)
-                        global_features = self.projector(global_features_2)
-                        global_features = global_features.view(
-                            -1, global_features.shape[-1]
-                        )
                         global_local_features = torch.cat(
                             [global_features, self.view_seperator[None, :]], dim=0
                         )
@@ -1577,104 +1640,20 @@ class DeepseekOCRForCausalLM(nn.Module):
             for jdx in range(images_spatial_crop.size(0)):
                 patches = images_crop[jdx][0].to(torch.bfloat16)
                 image_ori = pixel_values[jdx]
-                crop_shape = images_spatial_crop[jdx][0]
+                use_local_crops = (
+                    has_local_crops[jdx]
+                    if has_local_crops is not None
+                    else torch.sum(patches).item() != 0
+                )
 
-                if torch.sum(patches).item() != 0:
-                    local_features_1 = self.sam_model(patches)
-                    local_features_2 = self.vision_model(patches, local_features_1)
-
-                    local_features = torch.cat(
-                        (
-                            local_features_2[:, 1:],
-                            local_features_1.flatten(2).permute(0, 2, 1),
-                        ),
-                        dim=-1,
-                    )
-                    local_features = self.projector(local_features)
-
-                    global_features_1 = self.sam_model(image_ori)
-                    global_features_2 = self.vision_model(image_ori, global_features_1)
-                    global_features = torch.cat(
-                        (
-                            global_features_2[:, 1:],
-                            global_features_1.flatten(2).permute(0, 2, 1),
-                        ),
-                        dim=-1,
-                    )
-                    global_features = self.projector(global_features)
-
-                    _, hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
-
-                    _2, hw2, n_dim2 = local_features.shape
-                    h2 = w2 = int(hw2**0.5)
-
-                    width_crop_num, height_crop_num = int(crop_shape[0]), int(
-                        crop_shape[1]
-                    )
-
-                    global_features = global_features.view(h, w, n_dim)
-
-                    global_features = torch.cat(
-                        [
-                            global_features,
-                            self.image_newline[None, None, :].expand(h, 1, n_dim),
-                        ],
-                        dim=1,
-                    )
-
-                    global_features = global_features.view(-1, n_dim)
-
-                    local_features = (
-                        local_features.view(
-                            height_crop_num, width_crop_num, h2, w2, n_dim2
-                        )
-                        .permute(0, 2, 1, 3, 4)
-                        .reshape(height_crop_num * h2, width_crop_num * w2, n_dim2)
-                    )
-                    local_features = torch.cat(
-                        [
-                            local_features,
-                            self.image_newline[None, None, :].expand(
-                                height_crop_num * h2, 1, n_dim2
-                            ),
-                        ],
-                        dim=1,
-                    )
-                    local_features = local_features.view(-1, n_dim2)
-
+                global_features = self._encode_ocr2_features(image_ori)
+                if use_local_crops:
+                    local_features = self._encode_ocr2_features(patches)
                     global_local_features = torch.cat(
                         [local_features, global_features, self.view_seperator[None, :]],
                         dim=0,
                     )
-
                 else:
-                    global_features_1 = self.sam_model(image_ori)
-                    global_features_2 = self.vision_model(image_ori, global_features_1)
-                    global_features = torch.cat(
-                        (
-                            global_features_2[:, 1:],
-                            global_features_1.flatten(2).permute(0, 2, 1),
-                        ),
-                        dim=-1,
-                    )
-                    global_features = self.projector(global_features)
-
-                    _, hw, n_dim = global_features.shape
-                    h = w = int(hw**0.5)
-
-                    global_features = global_features.view(h, w, n_dim)
-
-                    global_features = torch.cat(
-                        [
-                            global_features,
-                            self.image_newline[None, None, :].expand(h, 1, n_dim),
-                        ],
-                        dim=1,
-                    )
-
-                    global_features = global_features.view(-1, n_dim)
-
                     global_local_features = torch.cat(
                         [global_features, self.view_seperator[None, :]], dim=0
                     )
@@ -1689,6 +1668,7 @@ class DeepseekOCRForCausalLM(nn.Module):
             if self.is_ocr2
             else self.vision_model.dtype
         )
+        has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
         pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
             target_dtype
         )
@@ -1711,6 +1691,7 @@ class DeepseekOCRForCausalLM(nn.Module):
             pixel_values=pixel_values,
             images_crop=images_crop,
             images_spatial_crop=images_spatial_crop,
+            has_local_crops=has_local_crops,
         )
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
 

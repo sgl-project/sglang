@@ -361,6 +361,13 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
         target_ids = torch.LongTensor(masked_tokenized_str)
 
+        has_images = len(images_list) > 0
+        has_local_crops = False
+        if len(images_spatial_crop) > 0:
+            has_local_crops = any(
+                crop[0] > 1 or crop[1] > 1 for crop in images_spatial_crop
+            )
+
         if len(images_list) == 0:
             images = torch.zeros((1, 3, self.image_size, self.image_size))
         else:
@@ -378,6 +385,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
             images_seq_mask=images_seq_mask,
             images_spatial_crop=images_spatial_crop,
         )
+        prepare.has_images = has_images
+        prepare.has_local_crops = has_local_crops
 
         return prepare
 
