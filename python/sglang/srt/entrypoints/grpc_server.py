@@ -601,7 +601,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )  # Can be 0, don't use 'or None'
 
         # Create request
-        return TokenizedGenerateReqInput(
+        tokenized_req = TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
@@ -623,6 +623,20 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
         )
+
+        if getattr(grpc_req, "need_wait_for_image", False):
+            if self.mm_receiver:
+                tokenized_req.need_wait_for_image = True
+                if not tokenized_req.num_items_assigned:
+                    tokenized_req.num_items_assigned = [
+                        1 for _ in self.mm_receiver.encode_urls
+                    ]
+            else:
+                logger.warning(
+                    "need_wait_for_image set but MM receiver is not initialized"
+                )
+
+        return tokenized_req
 
     def _convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest

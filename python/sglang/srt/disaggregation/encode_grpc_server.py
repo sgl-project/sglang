@@ -137,7 +137,8 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 logger.info(f"embedding_port = {embedding_ports}")
                 if not embedding_ports:
                     # Dynamic endpoint discovery
-                    await self.encoder.send_with_url(req_id=request.req_id)
+                    # Don't block the Encode RPC on receiver registration.
+                    asyncio.create_task(self.encoder.send_with_url(req_id=request.req_id))
                 else:
                     # Send to specified ports
                     tasks = []
