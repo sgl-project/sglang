@@ -475,6 +475,20 @@ class WorkloadGenerator:
         self.pbar.close()
 
         duration = self.finished_time - self.start_time
+        sorted_ttft = sorted(self.performance_metrics["ttft"])
+        sorted_latency = sorted(self.performance_metrics["latency"])
+
+        def percentile(sorted_vals, q):
+            if not sorted_vals:
+                return 0.0
+            idx = int(q * len(sorted_vals))
+            if idx >= len(sorted_vals):
+                idx = len(sorted_vals) - 1
+            return sorted_vals[idx]
+
+        def max_or_zero(sorted_vals):
+            return sorted_vals[-1] if sorted_vals else 0.0
+
         performance_data = {
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
@@ -493,20 +507,16 @@ class WorkloadGenerator:
                 ),
                 "average_ttft": sum(self.performance_metrics["ttft"])
                 / len(self.performance_metrics["ttft"]),
-                "p90_ttft": sorted(self.performance_metrics["ttft"])[
-                    int(0.9 * len(self.performance_metrics["ttft"]))
-                ],
-                "median_ttft": sorted(self.performance_metrics["ttft"])[
-                    len(self.performance_metrics["ttft"]) // 2
-                ],
+                "p90_ttft": percentile(sorted_ttft, 0.9),
+                "p99_ttft": percentile(sorted_ttft, 0.99),
+                "median_ttft": percentile(sorted_ttft, 0.5),
+                "max_ttft": max_or_zero(sorted_ttft),
                 "average_latency": sum(self.performance_metrics["latency"])
                 / len(self.performance_metrics["latency"]),
-                "p90_latency": sorted(self.performance_metrics["latency"])[
-                    int(0.9 * len(self.performance_metrics["latency"]))
-                ],
-                "median_latency": sorted(self.performance_metrics["latency"])[
-                    len(self.performance_metrics["latency"]) // 2
-                ],
+                "p90_latency": percentile(sorted_latency, 0.9),
+                "p99_latency": percentile(sorted_latency, 0.99),
+                "median_latency": percentile(sorted_latency, 0.5),
+                "max_latency": max_or_zero(sorted_latency),
                 "input_token_throughput": sum(self.performance_metrics["prompt_len"])
                 / duration,
                 "output_token_throughput": sum(
@@ -554,12 +564,16 @@ class WorkloadGenerator:
         )
         print(f"  Average TTFT: {performance_data['summary']['average_ttft']:.2f}")
         print(f"  P90 TTFT: {performance_data['summary']['p90_ttft']:.2f}")
+        print(f"  P99 TTFT: {performance_data['summary']['p99_ttft']:.2f}")
         print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
+        print(f"  Max TTFT: {performance_data['summary']['max_ttft']:.2f}")
         print(
             f"  Average latency: {performance_data['summary']['average_latency']:.2f}"
         )
         print(f"  P90 latency: {performance_data['summary']['p90_latency']:.2f}")
+        print(f"  P99 latency: {performance_data['summary']['p99_latency']:.2f}")
         print(f"  Median latency: {performance_data['summary']['median_latency']:.2f}")
+        print(f"  Max latency: {performance_data['summary']['max_latency']:.2f}")
         print(
             f"  Input token throughput: {performance_data['summary']['input_token_throughput']:.2f} tokens per second"
         )

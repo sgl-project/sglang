@@ -36,8 +36,6 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             0.8,
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "w8a8_int8",
             "--tp-size",
             4,
             "--disable-radix-cache",

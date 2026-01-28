@@ -23,10 +23,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
-    align,
-    direct_register_custom_op,
+    ceil_align,
     get_bool_env_var,
     get_device_core_count,
     get_device_name,
@@ -34,8 +33,8 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     log_info_on_rank0,
-    supports_custom_op,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -43,11 +42,21 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import (
-        sgl_per_tensor_quant_fp8,
-        sgl_per_token_group_quant_fp8,
-        sgl_per_token_quant_fp8,
+    from sgl_kernel import sgl_per_token_quant_fp8
+
+    from sglang.jit_kernel.per_tensor_quant_fp8 import (
+        per_tensor_quant_fp8 as sgl_per_tensor_quant_fp8,
     )
+
+    # Temporary
+    try:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        enable_sgl_per_token_group_quant_8bit = True
+    except ImportError:
+        from sgl_kernel import sgl_per_token_group_quant_fp8
+
+        enable_sgl_per_token_group_quant_8bit = False
 
 if _is_hip:
     if _use_aiter:
@@ -61,7 +70,7 @@ if _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         try:
-            import vllm._C
+            import vllm._C  # noqa: F401
         except ImportError:
             raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
 
@@ -84,32 +93,16 @@ else:
     fp8_max = torch.finfo(fp8_dtype).max
 fp8_min = -fp8_max
 
-if supports_custom_op():
 
-    def deep_gemm_fp8_fp8_bf16_nt(
-        A: torch.Tensor,
-        As: torch.Tensor,
-        B: torch.Tensor,
-        Bs: torch.Tensor,
-        C: torch.Tensor,
-    ) -> None:
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
-
-    def deep_gemm_fp8_fp8_bf16_nt_fake(
-        A: torch.Tensor,
-        As: torch.Tensor,
-        B: torch.Tensor,
-        Bs: torch.Tensor,
-        C: torch.Tensor,
-    ) -> None:
-        return
-
-    direct_register_custom_op(
-        op_name="deep_gemm_fp8_fp8_bf16_nt",
-        op_func=deep_gemm_fp8_fp8_bf16_nt,
-        mutates_args=["C"],
-        fake_impl=deep_gemm_fp8_fp8_bf16_nt_fake,
-    )
+@register_custom_op(mutates_args=["C"])
+def deep_gemm_fp8_fp8_bf16_nt(
+    A: torch.Tensor,
+    As: torch.Tensor,
+    B: torch.Tensor,
+    Bs: torch.Tensor,
+    C: torch.Tensor,
+) -> None:
+    deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
 @triton.jit
@@ -436,8 +429,8 @@ def create_per_token_group_quant_fp8_output_scale(
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
         x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = align(x_s_mn, 4)
-        aligned_k = align(x_s_k, 4)
+        aligned_mn = ceil_align(x_s_mn, 4)
+        aligned_k = ceil_align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
         return torch.empty(
             (*x_batch, aligned_k // 4, aligned_mn),
@@ -453,7 +446,7 @@ def create_per_token_group_quant_fp8_output_scale(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
                 device=device,
                 dtype=torch.float32,
-            ).permute(-1, -2)[: x_shape[-2], :]
+            ).transpose(-1, -2)[: x_shape[-2], :]
         else:
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
@@ -477,6 +470,7 @@ def sglang_per_token_group_quant_fp8(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ):
     assert (
         x.shape[-1] % group_size == 0
@@ -496,9 +490,26 @@ def sglang_per_token_group_quant_fp8(
     )
 
     if x.shape[0] > 0:
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
-        )
+        # Temporary
+        if enable_sgl_per_token_group_quant_8bit:
+            sgl_per_token_group_quant_8bit(
+                x,
+                x_q,
+                x_s,
+                group_size,
+                eps,
+                fp8_min,
+                fp8_max,
+                scale_ue8m0,
+                fuse_silu_and_mul,
+                masked_m,
+                enable_v2=enable_v2,
+            )
+        else:
+            assert not enable_v2
+            sgl_per_token_group_quant_fp8(
+                x, x_q, x_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+            )
 
     return x_q, x_s
 
@@ -514,6 +525,7 @@ def sglang_per_token_group_quant_8bit(
     scale_ue8m0: bool = False,
     fuse_silu_and_mul: bool = False,
     masked_m: Optional[torch.Tensor] = None,
+    enable_v2: Optional[bool] = None,
 ):
     from sglang.srt.layers.quantization.int8_kernel import (
         sglang_per_token_group_quant_int8,
@@ -529,6 +541,7 @@ def sglang_per_token_group_quant_8bit(
             group_size=group_size,
             eps=eps,
             dtype=dst_dtype,
+            enable_v2=enable_v2,
         )
 
     return sglang_per_token_group_quant_fp8(
@@ -540,6 +553,7 @@ def sglang_per_token_group_quant_8bit(
         scale_ue8m0=scale_ue8m0,
         fuse_silu_and_mul=fuse_silu_and_mul,
         masked_m=masked_m,
+        enable_v2=enable_v2,
     )
 
 
@@ -692,6 +706,7 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    needs_masking: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -717,20 +732,25 @@ def _w8a8_block_fp8_matmul(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    scale_step_k = BLOCK_SIZE_K // group_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if needs_masking:
+            a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
 
-        k_start = k * BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
@@ -777,6 +797,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    needs_masking: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -802,94 +823,111 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
+    scale_step_k = BLOCK_SIZE_K // group_k
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     # manually unroll to 4 iterations
     UNROLL_FACTOR = 4
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K * UNROLL_FACTOR)):
         # 1st iteration
-        a = tl.load(
-            a_ptrs,
-            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
-            other=0.0,
-        )
+        if needs_masking:
+            a = tl.load(
+                a_ptrs,
+                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
 
-        k_start = (k * UNROLL_FACTOR) * BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
 
         # 2nd iteration
-        a = tl.load(
-            a_ptrs,
-            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
-            other=0.0,
-        )
+        if needs_masking:
+            a = tl.load(
+                a_ptrs,
+                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 1) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
 
-        k_start = k_start + BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
 
         # 3rd iteration
-        a = tl.load(
-            a_ptrs,
-            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
-            other=0.0,
-        )
+        if needs_masking:
+            a = tl.load(
+                a_ptrs,
+                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 2) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
 
-        k_start = k_start + BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
 
         # 4th iteration
-        a = tl.load(
-            a_ptrs,
-            mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptrs,
-            mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
-            other=0.0,
-        )
+        if needs_masking:
+            a = tl.load(
+                a_ptrs,
+                mask=offs_k[None, :] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - (k * UNROLL_FACTOR + 3) * BLOCK_SIZE_K,
+                other=0.0,
+            )
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
 
-        k_start = k_start + BLOCK_SIZE_K
-        offs_ks = k_start // group_k
-        a_s = tl.load(As_ptrs + offs_ks * stride_As_k)
-        b_s = tl.load(Bs_ptrs + offs_ks * stride_Bs_k)
+        a_s = tl.load(As_ptrs)
+        b_s = tl.load(Bs_ptrs)
 
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
+        As_ptrs += scale_step_k * stride_As_k
+        Bs_ptrs += scale_step_k * stride_Bs_k
 
     if C.dtype.element_ty == tl.bfloat16:
         c = accumulator.to(tl.bfloat16)
@@ -1030,10 +1068,7 @@ def w8a8_block_fp8_matmul_deepgemm(
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    if supports_custom_op():
-        torch.ops.sglang.deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
-    else:
-        deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
+    deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 
     return C
 
@@ -1084,6 +1119,8 @@ def w8a8_block_fp8_matmul_triton(
             "num_stages": 3,
         }
 
+    needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
+
     def grid(META):
         return (
             triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -1113,6 +1150,7 @@ def w8a8_block_fp8_matmul_triton(
         Bs.stride(1),
         Bs.stride(0),
         **config,
+        needs_masking=needs_masking,
     )
 
     return C
@@ -1804,3 +1842,25 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+
+
+if _is_cuda:
+    if enable_sgl_per_token_group_quant_8bit:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_8bit")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
+
+    else:
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_group_quant_fp8")
+        def _(
+            input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
+        ):
+            return
+
+    @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+    def _(input, output_q, output_s):
+        return

@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
 
 import torch
 
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -24,7 +28,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class MoeRunnerConfig:
-
     # MoE parameters
     num_experts: Optional[int] = None
     num_local_experts: Optional[int] = None
@@ -34,9 +37,11 @@ class MoeRunnerConfig:
     top_k: Optional[int] = None
     num_fused_shared_experts: Optional[int] = None
     params_dtype: Optional[torch.dtype] = None
+    routing_method_type: Optional[RoutingMethodType] = None
 
     # Runner configuration
     activation: str = "silu"
+    is_gated: bool = True
     apply_router_weight_on_input: bool = False
     inplace: bool = True
     no_combine: bool = False
@@ -47,7 +52,6 @@ class MoeRunnerConfig:
 
 @dataclass
 class RunnerInput(ABC):
-
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
@@ -57,7 +61,6 @@ class RunnerInput(ABC):
 
 
 class RunnerOutput(ABC):
-
     @property
     @abstractmethod
     def runner_backend(self) -> MoeRunnerBackend: ...
@@ -74,7 +77,6 @@ class MoeQuantInfo(ABC):
 
 
 class MoeRunnerCore(ABC):
-
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
@@ -93,7 +95,6 @@ class MoeRunnerCore(ABC):
 
 
 class FusedOpPool:
-
     _fused_funcs: dict[str, Callable] = {}
 
     @classmethod
@@ -121,7 +122,6 @@ class FusedOpPool:
 
 
 class PermuteMethodPool:
-
     _pre_permute_methods: dict[
         Tuple[DispatchOutputFormat, MoeRunnerBackend], Callable
     ] = {}
@@ -250,9 +250,8 @@ def register_pre_permute(
     def decorator(
         permute_func: Callable[
             [DispatchOutput, MoeQuantInfo, MoeRunnerConfig, dict], RunnerInput
-        ]
+        ],
     ) -> Callable:
-
         PermuteMethodPool.register_pre_permute(
             dispatch_output_name, runner_backend_name, permute_func
         )
@@ -276,7 +275,7 @@ def register_post_permute(
     def decorator(
         permute_func: Callable[
             [RunnerOutput, MoeQuantInfo, MoeRunnerConfig, dict], CombineInput
-        ]
+        ],
     ) -> Callable:
         PermuteMethodPool.register_post_permute(
             runner_backend_name, combine_input_name, permute_func

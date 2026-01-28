@@ -161,16 +161,16 @@ class StorageBackendFactory:
         if backend_name == "file":
             return backend_class(storage_config)
         elif backend_name == "nixl":
-            return backend_class()
+            return backend_class(storage_config)
         elif backend_name == "mooncake":
-            backend = backend_class(storage_config)
+            backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
         elif backend_name == "hf3fs":
             # Calculate bytes_per_page based on memory pool layout
-            if mem_pool_host.layout == "page_first":
+            if mem_pool_host.layout in ["page_first", "page_first_direct"]:
                 bytes_per_page = (
                     mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
                 )

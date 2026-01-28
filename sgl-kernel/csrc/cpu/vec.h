@@ -47,19 +47,15 @@ convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorize
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
-#define CVT_FP16_TO_FP32(a) _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
+#define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
 
 // this doesn't handle NaN.
 inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {
   const __m512i x = _mm512_cvtepu8_epi16(fp8_vec);
-
-  const __m512i mant = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x07)), 4);
-  const __m512i raw_exp = _mm512_srli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x78)), 3);
-  const __m512i exp = _mm512_slli_epi16(_mm512_add_epi16(raw_exp, _mm512_set1_epi16(120)), 7);
-  const __m512i nonsign = _mm512_or_si512(exp, mant);
-
-  const __m512i sign = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x80)), 8);
-  const __m512i combined = _mm512_or_si512(nonsign, sign);
+  __m512i combined = _mm512_add_epi16(x, _mm512_set1_epi16(0x0780));
+  combined = _mm512_slli_epi16(combined, 4);
+  combined = _mm512_and_si512(combined, _mm512_set1_epi16(0x87f0));
+  combined = _mm512_add_epi16(combined, _mm512_set1_epi16(0x3c00));
 
   const __mmask32 is_nonzero = _mm512_cmpneq_epi16_mask(x, _mm512_setzero_si512());
   return (__m512bh)_mm512_maskz_mov_epi16(is_nonzero, combined);
@@ -124,6 +120,30 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
   return cvt_e4m3_bf16_intrinsic_with_denorm(a);
 #endif
 }
+
+// faster version of float8_e4m3fn conversion to bfloat16
+//
+// we mapped cuda implementation from below link and vectorized with avx512:
+// https://github.com/thu-pacman/chitu/blob/1ed2078ec26581ebdca05b7306d4385f86edaa7c/csrc/cuda/marlin/marlin_gemm/dequant.h#L387
+//
+inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
+  const __m512i mask0 = _mm512_set1_epi16(0x80);  // sign bit
+  const __m512i mask1 = _mm512_set1_epi16(0x7F);  // exponent and mantissa
+  const __m512i mask2 = _mm512_set1_epi16(0x4000);
+
+  __m512i x = _mm512_cvtepu8_epi16(a);
+  __m512i vsign = _mm512_and_si512(x, mask0);
+  vsign = _mm512_slli_epi16(vsign, 8);
+
+  __m512i vexp_and_mant = _mm512_and_si512(x, mask1);
+  vexp_and_mant = _mm512_slli_epi16(vexp_and_mant, 4);
+
+  // _MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C: 0b11111110
+  return (__m512bh)(_mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
+}
+
+// bias for conversion of fp8 to bf16 1/256 in float32
+#define kFP8_BIAS 0x3b800000
 
 #endif
 

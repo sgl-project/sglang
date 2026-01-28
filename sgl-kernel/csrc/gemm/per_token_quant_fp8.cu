@@ -48,13 +48,14 @@ __global__ void per_token_quant_fp8_kernel(
 
   float warp_max = warpReduceMax(max_value);
 
-  __shared__ float scale;
-  scale = warp_max / FP8_E4M3_MAX;
+  // NOTE: one CTA has multiple warps (each warp handles one token), so `scale`
+  // must be per-warp/per-thread (register) instead of a single shared variable.
+  const float scale = warp_max / FP8_E4M3_MAX;
   // Broadcast scale
   if (lane_id == 0) {
     token_scale[0] = scale;
   }
-  float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
+  const float scale_inv = (scale == 0.f) ? 0.f : 1.0f / scale;
 
   //
   // Pass-2: quantize and write back
@@ -170,13 +171,14 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   const auto input_sizes = input.sizes();
   const int64_t num_tokens = input_sizes[0];
   const int64_t hidden_dim = input_sizes[1];
-  TORCH_CHECK(hidden_dim % 8 == 0, "Hidden dimension must be divisible by 8, but got ", hidden_dim);
+  TORCH_CHECK(hidden_dim % 4 == 0, "Hidden dimension must be divisible by 4, but got ", hidden_dim);
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   const int TOKENS_PER_CTA = 8;
   const bool use_warp_kernel = (num_tokens >= sm_count * 2 * TOKENS_PER_CTA);
   const bool use_vec16 = (hidden_dim % 16 == 0);
+  const bool use_vec8 = (hidden_dim % 8 == 0);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
     if (use_warp_kernel) {
@@ -192,8 +194,15 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
-      } else {
+      } else if (use_vec8) {
         per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 8><<<grid, block, 0, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+      } else {
+        per_token_quant_fp8_kernel<scalar_t, __nv_fp8_e4m3, TOKENS_PER_CTA, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),
@@ -213,8 +222,15 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
             static_cast<float*>(output_s.data_ptr()),
             hidden_dim,
             num_tokens);
-      } else {
+      } else if (use_vec8) {
         per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 8><<<grid, block, 0, stream>>>(
+            static_cast<const scalar_t*>(input.data_ptr()),
+            static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
+            static_cast<float*>(output_s.data_ptr()),
+            hidden_dim,
+            num_tokens);
+      } else {
+        per_token_quant_fp8_small_batch_kernel<scalar_t, __nv_fp8_e4m3, 4><<<grid, block, 0, stream>>>(
             static_cast<const scalar_t*>(input.data_ptr()),
             static_cast<__nv_fp8_e4m3*>(output_q.data_ptr()),
             static_cast<float*>(output_s.data_ptr()),

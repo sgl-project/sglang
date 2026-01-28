@@ -373,14 +373,20 @@ class Gemma3RotaryEmbedding(nn.Module):
         # BC: "rope_type" was originally "type"
         if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
             self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type")
+                "rope_type", config.rope_scaling.get("type", "default")
             )
+
         else:
             self.rope_type = "default"
+
+        if self.rope_type is None:
+            self.rope_type = "default"
+
         self.max_seq_len_cached = config.max_position_embeddings
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
+
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)

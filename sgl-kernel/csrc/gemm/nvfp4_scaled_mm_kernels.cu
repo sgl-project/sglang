@@ -17,6 +17,8 @@ limitations under the License.
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
 
+#include "utils.h"
+
 // clang-format off
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -37,7 +39,20 @@ limitations under the License.
 
 using namespace cute;
 
-#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+// Helper function for next power of 2
+inline uint32_t next_pow_2(uint32_t x) {
+  if (x == 0) return 1;
+  x--;
+  x |= x >> 1;
+  x |= x >> 2;
+  x |= x >> 4;
+  x |= x >> 8;
+  x |= x >> 16;
+  return x + 1;
+}
+
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || \
+    defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 // Config(half_t/bfloat16_t) for M <= 128
 template <typename T>
 struct KernelConfigM128 {
@@ -101,6 +116,19 @@ struct KernelConfigFp32 {
 };
 const dim3 KernelConfigFp32::preferred_cluster = dim3(1, 4, 1);
 const dim3 KernelConfigFp32::fallback_cluster = dim3(1, 2, 1);
+
+// SM120 specific configurations
+struct sm120_fp4_config_M256 {
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using PerSmTileShape_MNK = Shape<_128, _128, _128>;
+};
+
+struct sm120_fp4_config_default {
+  using ClusterShape = Shape<_1, _1, _1>;
+  using MmaTileShape = Shape<_256, _128, _128>;
+  using PerSmTileShape_MNK = Shape<_256, _128, _128>;
+};
 
 template <typename KernelConfig>
 struct Fp4GemmSm100 {
@@ -181,6 +209,70 @@ struct Fp4GemmSm100 {
   using LayoutC = decltype(cute::make_layout(make_shape(0, 0, 0), StrideC{}));
   using StrideD = typename Gemm::GemmKernel::StrideD;
   using LayoutD = decltype(cute::make_layout(make_shape(0, 0, 0), StrideD{}));
+};
+
+// SM120 specific GEMM template
+template <typename Config, typename OutType>
+struct Fp4GemmSm120 {
+  using ElementA = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  using LayoutATag = cutlass::layout::RowMajor;
+  static constexpr int AlignmentA = 32;
+
+  using ElementB = cutlass::nv_float4_t<cutlass::float_e2m1_t>;
+  using LayoutBTag = cutlass::layout::ColumnMajor;
+  static constexpr int AlignmentB = 32;
+
+  using ElementD = OutType;
+  using ElementC = OutType;
+  using LayoutCTag = cutlass::layout::RowMajor;
+  using LayoutDTag = cutlass::layout::RowMajor;
+  static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
+  static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
+
+  using ElementAccumulator = float;
+  using ArchTag = cutlass::arch::Sm120;
+  using OperatorClass = cutlass::arch::OpClassBlockScaledTensorOp;
+
+  using MmaTileShape = typename Config::MmaTileShape;
+  using ClusterShape = typename Config::ClusterShape;
+  using PerSmTileShape_MNK = typename Config::PerSmTileShape_MNK;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      PerSmTileShape_MNK,
+      ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator,
+      ElementAccumulator,
+      ElementC,
+      LayoutCTag,
+      AlignmentC,
+      ElementD,
+      LayoutDTag,
+      AlignmentD,
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      ArchTag,
+      OperatorClass,
+      ElementA,
+      LayoutATag,
+      AlignmentA,
+      ElementB,
+      LayoutBTag,
+      AlignmentB,
+      ElementAccumulator,
+      MmaTileShape,
+      ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+          sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+
+  using GemmKernel =
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 };
 
 template <typename T>
@@ -267,6 +359,85 @@ void runGemm(
   CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
 }
 
+// SM120 specific args_from_options function
+template <typename Gemm>
+typename Gemm::Arguments args_from_options_sm120(
+    at::Tensor& D,
+    at::Tensor const& A,
+    at::Tensor const& B,
+    at::Tensor const& A_sf,
+    at::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int M,
+    int N,
+    int K) {
+  using ElementA = typename Gemm::ElementA;
+  using ElementB = typename Gemm::ElementB;
+  using ElementD = typename Gemm::ElementD;
+  using ElementSFA = cutlass::float_ue4m3_t;
+  using ElementSFB = cutlass::float_ue4m3_t;
+  using ElementCompute = float;
+
+  using StrideA = typename Gemm::GemmKernel::StrideA;
+  using StrideB = typename Gemm::GemmKernel::StrideB;
+  using StrideC = typename Gemm::GemmKernel::StrideC;
+  using StrideD = typename Gemm::GemmKernel::StrideD;
+
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {M, K, 1});
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {M, N, 1});
+
+  auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(M, N, K, 1));
+  auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(M, N, K, 1));
+
+  typename Gemm::Arguments arguments{
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {M, N, K, 1},
+      {static_cast<ElementA const*>(A.data_ptr()),
+       stride_A,
+       static_cast<ElementB const*>(B.data_ptr()),
+       stride_B,
+       static_cast<ElementSFA const*>(A_sf.data_ptr()),
+       layout_SFA,
+       static_cast<ElementSFB const*>(B_sf.data_ptr()),
+       layout_SFB},
+      {{}, static_cast<ElementD const*>(D.data_ptr()), stride_D, static_cast<ElementD*>(D.data_ptr()), stride_D}};
+  auto& fusion_args = arguments.epilogue.thread;
+  fusion_args.alpha_ptr = static_cast<ElementCompute const*>(alpha.data_ptr());
+
+  return arguments;
+}
+
+// SM120 specific runGemm function
+template <typename Gemm>
+void runGemmSm120(
+    at::Tensor& D,
+    at::Tensor const& A,
+    at::Tensor const& B,
+    at::Tensor const& A_sf,
+    at::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream) {
+  Gemm gemm;
+
+  auto arguments = args_from_options_sm120<Gemm>(D, A, B, A_sf, B_sf, alpha, M, N, K);
+
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+  auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(A.device());
+  auto workspace = torch::empty(workspace_size, workspace_options);
+
+  CUTLASS_CHECK(gemm.can_implement(arguments));
+
+  CUTLASS_CHECK(gemm.initialize(arguments, workspace.data_ptr(), stream));
+
+  CUTLASS_CHECK(gemm.run(arguments, workspace.data_ptr(), stream));
+}
+
 // Dispatch function to select appropriate config based on M
 template <typename OutType>
 void cutlassFp4GemmDispatch(
@@ -308,6 +479,49 @@ void cutlassFp4GemmDispatch<float>(
   runGemm<Fp4GemmSm100<KernelConfigFp32>>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
 }
 
+// SM120 specific dispatch functions
+void cutlass_fp4_bf16_gemm_dispatch_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
+  if (mp2 <= 256) {
+    runGemmSm120<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::bfloat16_t>::Gemm>(
+        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  } else {
+    runGemmSm120<Fp4GemmSm120<sm120_fp4_config_default, cutlass::bfloat16_t>::Gemm>(
+        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  }
+}
+
+void cutlass_fp4_f16_gemm_dispatch_sm120(
+    torch::Tensor& D,
+    torch::Tensor const& A,
+    torch::Tensor const& B,
+    torch::Tensor const& A_sf,
+    torch::Tensor const& B_sf,
+    torch::Tensor const& alpha,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream) {
+  uint32_t const mp2 = std::max(static_cast<uint32_t>(16), next_pow_2(m));
+  if (mp2 <= 256) {
+    runGemmSm120<Fp4GemmSm120<sm120_fp4_config_M256, cutlass::half_t>::Gemm>(
+        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  } else {
+    runGemmSm120<Fp4GemmSm120<sm120_fp4_config_default, cutlass::half_t>::Gemm>(
+        D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  }
+}
+
 #else
 template <typename T>
 void cutlassFp4GemmDispatch(
@@ -326,7 +540,12 @@ void cutlassFp4GemmDispatch(
       "Unsupported CUTLASS version. Set VLLM_CUTLASS_SRC_DIR to "
       "a CUTLASS 3.8 source directory to enable support.");
 }
-#endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+#endif  // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) ||
+        // defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+
+// Undefine macros from utils.h to redefine with custom signatures
+#undef CHECK_CONTIGUOUS
+#undef CHECK_INPUT
 
 #define CHECK_TYPE(x, st, m) TORCH_CHECK(x.scalar_type() == st, "Inconsistency of Tensor type:", m)
 #define CHECK_TH_CUDA(x, m) TORCH_CHECK(x.is_cuda(), m, "must be a CUDA tensor")
@@ -339,7 +558,7 @@ void cutlassFp4GemmDispatch(
 constexpr auto FLOAT4_E2M1X2 = at::ScalarType::Byte;
 constexpr auto SF_DTYPE = at::ScalarType::Float8_e4m3fn;
 
-void cutlass_scaled_fp4_mm_sm100a(
+void cutlass_scaled_fp4_mm_sm100a_sm120a(
     torch::Tensor& D,
     torch::Tensor const& A,
     torch::Tensor const& B,
@@ -441,13 +660,28 @@ void cutlass_scaled_fp4_mm_sm100a(
   at::cuda::CUDAGuard device_guard{(char)A.get_device()};
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(A.get_device());
 
-  if (out_dtype == at::ScalarType::Half) {
-    cutlassFp4GemmDispatch<cutlass::half_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-  } else if (out_dtype == at::ScalarType::BFloat16) {
-    cutlassFp4GemmDispatch<cutlass::bfloat16_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
-  } else if (out_dtype == at::ScalarType::Float) {
-    cutlassFp4GemmDispatch<float>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+  // Check SM version and dispatch accordingly
+  auto sm_version = getSMVersion();
+
+  if (sm_version == 120) {
+    // Use SM120 specific dispatch
+    if (out_dtype == at::ScalarType::Half) {
+      cutlass_fp4_f16_gemm_dispatch_sm120(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    } else if (out_dtype == at::ScalarType::BFloat16) {
+      cutlass_fp4_bf16_gemm_dispatch_sm120(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    } else {
+      TORCH_CHECK(false, "Unsupported output data type of nvfp4 mm sm120 (", out_dtype, ")");
+    }
   } else {
-    TORCH_CHECK(false, "Unsupported output data type of nvfp4 mm");
+    // Use SM100 dispatch for other architectures
+    if (out_dtype == at::ScalarType::Half) {
+      cutlassFp4GemmDispatch<cutlass::half_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    } else if (out_dtype == at::ScalarType::BFloat16) {
+      cutlassFp4GemmDispatch<cutlass::bfloat16_t>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    } else if (out_dtype == at::ScalarType::Float) {
+      cutlassFp4GemmDispatch<float>(D, A, B, A_sf, B_sf, alpha, m, n, k, stream);
+    } else {
+      TORCH_CHECK(false, "Unsupported output data type of nvfp4 mm");
+    }
   }
 }

@@ -14,12 +14,6 @@ from sglang.srt.layers.attention.fla.utils import check_shared_mem, input_guard
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
-@triton.heuristics(
-    {
-        "HAS_SCALE": lambda args: args["scale"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 # @triton.autotune(
 #     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
 #     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
@@ -74,19 +68,13 @@ def chunk_local_cumsum_scalar_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.heuristics(
-    {
-        "HAS_SCALE": lambda args: args["scale"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.autotune(
     configs=[
         triton.Config({"BS": BS}, num_warps=num_warps)
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
     ],
-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_vector_kernel(
@@ -202,6 +190,8 @@ def chunk_local_cumsum_scalar(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        HAS_SCALE=scale is not None,
+        IS_VARLEN=cu_seqlens is not None,
         num_warps=8,
         num_stages=3,
     )
@@ -253,6 +243,8 @@ def chunk_local_cumsum_vector(
         BT=BT,
         HEAD_FIRST=head_first,
         REVERSE=reverse,
+        HAS_SCALE=scale is not None,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return g
 

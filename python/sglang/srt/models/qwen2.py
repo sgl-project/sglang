@@ -49,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
 Qwen2Config = None
@@ -89,6 +90,9 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        if get_global_server_args().rl_on_policy_target is not None:
+            x = x.bfloat16()
+
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -273,8 +277,13 @@ class Qwen2Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
+                params_dtype=(
+                    torch.float32
+                    if get_global_server_args().rl_on_policy_target is not None
+                    else None
+                ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -295,7 +304,19 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                    override_orig_dtype=torch.float32,
+                    fp32_residual=True,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -319,6 +340,7 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -434,20 +456,6 @@ class Qwen2ForCausalLM(nn.Module):
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
-
-        # perform weight tying for PP
-        if self.pp_group.world_size > 1 and config.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.last_rank
-                )
-            else:
-                emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
-                    dtype=next(self.model.parameters()).dtype,
-                    src=self.pp_group.first_rank,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -567,22 +575,21 @@ class Qwen2ForCausalLM(nn.Module):
             ):
                 continue
 
+            if name == "model.embed_tokens.weight":
+                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
+                    if "lm_head.weight" in params_dict:
+                        param = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
-                    # Handle pp weight tying here
-                    # find the embed_tokens.weight in the weights
-                    embed_token_weights = next(
-                        filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
-                    )[1]
-                    loaded_weight = embed_token_weights
-                else:
-                    continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
 

@@ -66,6 +66,7 @@ class SeparatorStyle(IntEnum):
     QWEN2_AUDIO = auto()
     GEMMA3 = auto()
     MPT = auto()
+    PADDLE_OCR = auto()
 
 
 @dataclasses.dataclass
@@ -101,6 +102,7 @@ class Conversation:
     stop_token_ids: Optional[int] = None
 
     audio_data: Optional[List[str]] = None
+    image_token_at_prefix: bool = False
 
     def get_prompt(self) -> str:
         """Get the prompt for generation."""
@@ -374,6 +376,24 @@ class Conversation:
                     ret += role + "\n"
 
             return ret
+        elif self.sep_style == SeparatorStyle.PADDLE_OCR:
+            ret = system_prompt
+            for role, message in self.messages:
+                if message:
+                    ret += role + ": "
+                    if role == self.roles[0]:
+                        if self.image_token in message:
+                            ret += message.replace(
+                                self.image_token + "\n", self.image_token
+                            )
+                        else:
+                            ret += message
+                        ret += "\n"
+                    else:
+                        ret += message + self.sep
+                else:
+                    ret += role + ": "  # must be end with a space
+            return ret
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -445,6 +465,7 @@ class Conversation:
             image_token=self.image_token,
             video_token=self.video_token,
             audio_token=self.audio_token,
+            image_token_at_prefix=self.image_token_at_prefix,
         )
 
     def dict(self):
@@ -489,11 +510,11 @@ def chat_template_exists(template_name: str) -> bool:
 
 
 def generate_embedding_convs(
-    texts: List[str], images: List[str], template_name: str
+    texts: List[str], images: List[str], videos: List[str], template_name: str
 ) -> List[Conversation]:
     conv_template = chat_templates[template_name].copy()
     convs = []
-    for text, image in zip(texts, images):
+    for text, image, video in zip(texts, images, videos):
         conv = Conversation(
             name=conv_template.name,
             system_template=conv_template.system_template,
@@ -512,6 +533,7 @@ def generate_embedding_convs(
             image_token=conv_template.image_token,
             video_token=conv_template.video_token,
             audio_token=conv_template.audio_token,
+            image_token_at_prefix=conv_template.image_token_at_prefix,
         )
         real_content = ""
 
@@ -522,6 +544,8 @@ def generate_embedding_convs(
                 else conv.image_token
             )
             real_content += image_token
+        if video is not None:
+            real_content += conv.video_token
         if text is not None:
             real_content += text
         conv.append_message(conv.roles[0], real_content)
@@ -578,6 +602,7 @@ def generate_chat_conv(
         image_token=conv.image_token,
         audio_token=conv.audio_token,
         video_token=conv.video_token,
+        image_token_at_prefix=conv.image_token_at_prefix,
     )
 
     if isinstance(request.messages, str):
@@ -627,7 +652,7 @@ def generate_chat_conv(
                         real_content += content.text
                     elif content.type == "image_url":
                         # NOTE: works for llava and intervl2_5
-                        if conv.name in ["internvl-2-5"]:
+                        if conv.image_token_at_prefix:
                             real_content = image_token + real_content
                         else:
                             real_content += image_token
@@ -820,6 +845,7 @@ register_conv_template(
         sep="<|im_end|>\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
         image_token="<IMG_CONTEXT>",
+        image_token_at_prefix=True,
     )
 )
 
@@ -835,6 +861,33 @@ register_conv_template(
         stop_str=["<|im_end|>"],
         image_token="<|vision_start|><|image_pad|><|vision_end|>",
         video_token="<|vision_start|><|video_pad|><|vision_end|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="deepseek-ocr",
+        system_message="",
+        system_template="",
+        roles=("", ""),
+        sep="",
+        sep_style=SeparatorStyle.NO_COLON_SINGLE,
+        stop_str=["<｜end▁of▁sentence｜>"],
+        image_token="<image>",
+        image_token_at_prefix=True,
+    )
+)
+
+register_conv_template(
+    Conversation(
+        name="paddle-ocr",
+        system_message="",
+        system_template="<|begin_of_sentence|>{system_message}",
+        roles=("User", "Assistant"),
+        sep="<|end_of_sentence|>",
+        sep_style=SeparatorStyle.PADDLE_OCR,
+        stop_str=["<|end_of_sentence|>"],
+        image_token="<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
     )
 )
 
@@ -960,6 +1013,19 @@ register_conv_template(
     )
 )
 
+register_conv_template(
+    Conversation(
+        name="points-v15-chat",
+        system_message="",
+        system_template="",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
+        video_token="<|vision_start|><|video_pad|><|vision_end|>",
+    )
+)
 
 MODEL_TYPE_TO_TEMPLATE = {
     "internvl_chat": "internvl-2-5",
@@ -968,7 +1034,16 @@ MODEL_TYPE_TO_TEMPLATE = {
     "phi4mm": "phi-4-mm",
     "minicpmv": "minicpmv",
     "minicpmo": "minicpmo",
+    "deepseek-ocr": "deepseek-ocr",
+    "paddleocr_vl": "paddle-ocr",
 }
+
+
+@register_conv_template_matching_function
+def match_points_v15_chat(model_path: str):
+    # reference: https://github.com/sgl-project/sglang/issues/12791
+    if re.search(r"\bpoints\b", model_path, re.IGNORECASE):
+        return "points-v15-chat"
 
 
 def get_model_type(model_path: str) -> Optional[str]:
@@ -1036,5 +1111,21 @@ def match_minicpm(model_path: str):
 def match_phi_4_mm(model_path: str):
     if "phi-4-multimodal" in model_path.lower():
         return "phi-4-mm"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_deepseek_ocr(model_path: str):
+    if "deepseek-ocr" in model_path.lower():
+        return "deepseek-ocr"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
+@register_conv_template_matching_function
+def match_paddle_ocr(model_path: str):
+    if "paddleocr" in model_path.lower():
+        return "paddle-ocr"
     model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)

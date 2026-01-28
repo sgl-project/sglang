@@ -91,6 +91,7 @@ class ChatCompletionSampler(SamplerBase):
         model: Optional[str] = None,
         system_message: Optional[str] = None,
         temperature: float = 0.0,
+        top_p: float = 1.0,
         reasoning_effort: Optional[str] = None,
         max_tokens: int = 2048,
         extra_body: Optional[Dict[str, Any]] = None,
@@ -103,6 +104,7 @@ class ChatCompletionSampler(SamplerBase):
         self.model = model
         self.system_message = system_message
         self.temperature = temperature
+        self.top_p = top_p
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
@@ -144,11 +146,12 @@ class ChatCompletionSampler(SamplerBase):
                     model=self.model,
                     messages=message_list,
                     temperature=self.temperature,
+                    top_p=self.top_p,
                     max_tokens=self.max_tokens,
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,
                 )
-                return response.choices[0].message.content
+                return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)
@@ -161,7 +164,9 @@ class ChatCompletionSampler(SamplerBase):
                 )
                 time.sleep(exception_backoff)
                 trial += 1
-            # unknown error shall throw exception
+        # If all retries are exhausted, return empty string instead of None
+        print(f"All retry attempts exhausted for request. Returning empty response.")
+        return ""
 
 
 QUERY_TEMPLATE_MULTICHOICE = """
@@ -261,7 +266,7 @@ def format_multichoice_question(row):
 def check_equality(sampler: SamplerBase, expr1: str, expr2: str):
     prompt = EQUALITY_TEMPLATE % {"expression1": expr1, "expression2": expr2}
     response = sampler([dict(content=prompt, role="user")])
-    return response.lower().strip() == "yes"
+    return (response or "").lower().strip() == "yes"
 
 
 def _compute_stat(values: list, stat: str):
@@ -290,6 +295,9 @@ def aggregate_results(
     htmls = []
     convos = []
     for single_eval_result in single_eval_results:
+        # Skip None results
+        if single_eval_result is None:
+            continue
         for name, value in single_eval_result.metrics.items():
             name2values[name].append(value)
         if single_eval_result.score is not None:
