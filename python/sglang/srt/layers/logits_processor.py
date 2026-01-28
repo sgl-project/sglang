@@ -268,6 +268,7 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        self.multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -286,23 +287,112 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Check if multi-item scoring is enabled via server args (only for prefill-only requests)
-        multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
-        if multi_item_delimiter is not None and logits_metadata.is_prefill_only:
+        # Multi-item scoring only for prefill-only requests.   
+        if self.multi_item_delimiter is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
-                input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
+                input_ids, hidden_states, lm_head, logits_metadata, self.multi_item_delimiter
             )
 
+        # Diffusion LLM only.
         if logits_metadata.forward_mode.is_dllm_extend():
-            assert self.return_full_logits
-            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
-            return LogitsProcessorOutput(
-                full_logits=full_logits,
-                next_token_logits=None,
-            )
+            return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
+        ) = self._get_pruned_states(
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            logits_metadata,
+        )
+
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        del hidden_states
+
+        if not logits_metadata.extend_return_logprob:
+            # Compute logits for both input and sampled tokens.
+            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            sampled_logits = (
+                logits[sample_indices] if sample_indices is not None else logits
+            )
+
+            # Decode mode or extend mode without return_logprob.
+            return LogitsProcessorOutput(
+                next_token_logits=sampled_logits,
+                hidden_states=hidden_states_to_store,
+            )
+
+        # Start to process input logprobs
+        # Normalize the logprob w/o temperature, top-p
+        self._expand_metadata_for_logprobs(logits_metadata, pruned_states.device)
+
+        # Determine whether to use chunked or non-chunked logits processing.
+        # Skip chunking if:
+        # 1. Chunking is disabled
+        # 2. Total count is below chunk size threshold
+        # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
+        should_skip_chunking = (
+            not self.enable_logprobs_chunk
+            or pruned_states.shape[0] <= self.logprobs_chunk_size
+            or self.do_tensor_parallel_all_gather_dp_attn
+        )
+
+        if should_skip_chunking:
+            # Compute logits for both input and sampled tokens.
+            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            sampled_logits = (
+                logits[sample_indices] if sample_indices is not None else logits
+            )
+            input_logits = logits[input_logprob_indices]
+            del logits
+
+            logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
+        else:
+            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
+                pruned_states,
+                sample_indices,
+                input_logprob_indices,
+                token_to_seq_idx,
+                lm_head,
+                logits_metadata,
+            )
+
+        return LogitsProcessorOutput(
+            next_token_logits=sampled_logits,
+            hidden_states=hidden_states_to_store,
+            input_token_logprobs=logprobs_result.input_token_logprobs,
+            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
+            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
+            input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+        )
+
+    def _get_pruned_states(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_before_norm: Optional[torch.Tensor],
+        aux_hidden_states: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+    ):
         pruned_states_before_norm: Optional[torch.Tensor] = None
+        aux_pruned_states = None
+        token_to_seq_idx = []
+
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -371,7 +461,6 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
-            token_to_seq_idx = []
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
                 zip(
@@ -422,12 +511,26 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices, device=pruned_states.device, dtype=torch.int64
             )
 
-        full_logits = (
-            self._get_logits(hidden_states, lm_head, logits_metadata)
-            if self.return_full_logits
-            else None
+        return (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            input_logprob_indices,
+            token_to_seq_idx,
         )
 
+    def _get_hidden_states_to_store(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_before_norm: Optional[torch.Tensor],
+        aux_hidden_states: Optional[torch.Tensor],
+        pruned_states: torch.Tensor,
+        pruned_states_before_norm: Optional[torch.Tensor],
+        aux_pruned_states: Any,
+        sample_indices: Optional[torch.Tensor],
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[torch.Tensor]:
         hidden_states_to_store: Optional[torch.Tensor] = None
         hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -463,32 +566,19 @@ class LogitsProcessor(nn.Module):
             else:
                 assert False, "Should never reach"
 
-        del hidden_states
-
         if hidden_states_to_store_before_norm is not None:
             # NOTE: when hidden_states_before_norm is provided, we always
             # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
+        
+        return hidden_states_to_store
 
-        if not logits_metadata.extend_return_logprob:
-            # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-            sampled_logits = (
-                logits[sample_indices] if sample_indices is not None else logits
-            )
-
-            # Decode mode or extend mode without return_logprob.
-            return LogitsProcessorOutput(
-                full_logits=full_logits,
-                next_token_logits=sampled_logits,
-                hidden_states=hidden_states_to_store,
-            )
-
-        # Start to process input logprobs
-        # Normalize the logprob w/o temperature, top-p
+    def _expand_metadata_for_logprobs(
+        self, logits_metadata: LogitsMetadata, device: torch.device
+    ):
         pruned_lens = torch.tensor(
             logits_metadata.extend_logprob_pruned_lens_cpu,
-            device=pruned_states.device,
+            device=device,
         )
         if logits_metadata.temp_scaled_logprobs:
             logits_metadata.temperature = torch.repeat_interleave(
@@ -500,49 +590,6 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.top_p,
                 pruned_lens,
             )
-
-        # Determine whether to use chunked or non-chunked logits processing.
-        # Skip chunking if:
-        # 1. Chunking is disabled
-        # 2. Total count is below chunk size threshold
-        # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
-        should_skip_chunking = (
-            not self.enable_logprobs_chunk
-            or pruned_states.shape[0] <= self.logprobs_chunk_size
-            or self.do_tensor_parallel_all_gather_dp_attn
-        )
-
-        if should_skip_chunking:
-            # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-            sampled_logits = (
-                logits[sample_indices] if sample_indices is not None else logits
-            )
-
-            input_logits = logits[input_logprob_indices]
-            del logits
-
-            logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
-        else:
-            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
-                pruned_states,
-                sample_indices,
-                input_logprob_indices,
-                token_to_seq_idx,
-                lm_head,
-                logits_metadata,
-            )
-
-        return LogitsProcessorOutput(
-            full_logits=full_logits,
-            next_token_logits=sampled_logits,
-            hidden_states=hidden_states_to_store,
-            input_token_logprobs=logprobs_result.input_token_logprobs,
-            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
-            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
-            input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
-        )
 
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
         input_logprobs = compute_temp_top_p_normalized_logprobs(
@@ -898,6 +945,19 @@ class LogitsProcessor(nn.Module):
         else:
             logits = logits[:, : self.config.vocab_size].float()
         return logits
+
+    def _get_dllm_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> LogitsProcessorOutput:
+        assert self.return_full_logits
+        full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+        return LogitsProcessorOutput(
+            full_logits=full_logits,
+            next_token_logits=None,
+        )
 
     def compute_logprobs_for_multi_item_scoring(
         self,
