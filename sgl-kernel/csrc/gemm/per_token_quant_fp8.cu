@@ -197,7 +197,7 @@ __global__ void per_token_quant_fp8_small_batch_kernel(
   }
 }
 
-template <bool USE_SMEM, typename scalar_t>
+template <bool USE_SMEM, typename scalar_t, int TOKENS_PER_CTA>
 static inline void launch_per_token_quant_fp8_warp_kernel(
     const dim3& grid,
     const dim3& block,
@@ -274,10 +274,10 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
       dim3 block(THREADS);
 
       if (use_smem) {
-        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/true, scalar_t>(
+        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/true, scalar_t, TOKENS_PER_CTA>(
             grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
       } else {
-        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/false, scalar_t>(
+        launch_per_token_quant_fp8_warp_kernel</*USE_SMEM=*/false, scalar_t, TOKENS_PER_CTA>(
             grid, block, dynamicSmemSz, stream, use_vec16, use_vec8, input, output_q, output_s, hidden_dim, num_tokens);
       }
     } else {
