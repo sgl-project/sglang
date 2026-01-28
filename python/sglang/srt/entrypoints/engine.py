@@ -881,6 +881,63 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
+@dataclasses.dataclass
+class SchedulerLaunchResult:
+    """Unified result from launching schedulers (mp or Ray mode).
+
+    This abstraction hides the mode-specific details, providing a common interface
+    for both multiprocessing and Ray-based scheduler launching.
+    """
+
+    scheduler_infos: List[Dict]
+
+    # Ray mode fields
+    _actors: Optional[List] = None
+    _event_loop_refs: Optional[List] = None
+
+    # mp mode fields
+    _procs: Optional[List] = None
+    _pipe_readers: Optional[List] = None
+
+    @property
+    def actors(self) -> Optional[List]:
+        """Ray actors (None for mp mode). Exposed for Engine to store."""
+        return self._actors
+
+    @property
+    def event_loop_refs(self) -> Optional[List]:
+        """Ray event loop ObjectRefs (None for mp mode). Exposed for Engine to store."""
+        return self._event_loop_refs
+
+    def wait_for_ready(self) -> None:
+        """Wait for schedulers to be ready (mp mode only, no-op for Ray).
+
+        In Ray mode, schedulers are already ready when this object is created
+        (ray.get() was called during launch). In mp mode, we need to wait for
+        pipe messages from the subprocesses.
+        """
+        if self._procs is not None and self._pipe_readers is not None:
+            # mp mode: wait for pipe messages
+            infos = _wait_for_scheduler_ready(self._pipe_readers, self._procs)
+            self.scheduler_infos.extend(infos)
+
+    def wait_for_completion(self) -> None:
+        """Block until all schedulers terminate (used for non-zero rank nodes)."""
+        if self._actors is not None:
+            import ray
+
+            try:
+                ray.get(self._event_loop_refs)
+            except Exception as e:
+                logger.error(f"Ray scheduler actor terminated with error: {e}")
+        elif self._procs is not None:
+            for proc in self._procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                )
+
+
 def _wait_for_scheduler_ready(
     scheduler_pipe_readers: List,
     scheduler_procs: List,
@@ -910,8 +967,14 @@ def _launch_schedulers(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
-):
-    """Launch schedulers using Ray actors or mp.Process."""
+) -> SchedulerLaunchResult:
+    """Launch schedulers using Ray actors or mp.Process.
+
+    Returns:
+        SchedulerLaunchResult that abstracts the mode-specific details.
+        For Ray mode, scheduler_infos is already populated.
+        For mp mode, call result.wait_for_ready() to populate scheduler_infos.
+    """
     if server_args.use_ray:
         return _launch_scheduler_ray_actors(server_args, port_args)
     else:
@@ -946,8 +1009,13 @@ def _launch_scheduler_processes_mp(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
-):
-    """Launch scheduler processes using multiprocessing."""
+) -> SchedulerLaunchResult:
+    """Launch scheduler processes using multiprocessing.
+
+    Returns:
+        SchedulerLaunchResult with _procs and _pipe_readers set.
+        scheduler_infos will be empty; call result.wait_for_ready() to populate it.
+    """
     scheduler_procs = []
 
     if server_args.dp_size == 1:
@@ -1008,18 +1076,22 @@ def _launch_scheduler_processes_mp(
         proc.start()
         scheduler_procs.append(proc)
 
-    return scheduler_procs, scheduler_pipe_readers
+    return SchedulerLaunchResult(
+        scheduler_infos=[],
+        _procs=scheduler_procs,
+        _pipe_readers=scheduler_pipe_readers,
+    )
 
 
 def _launch_scheduler_ray_actors(
     server_args: ServerArgs,
     port_args: PortArgs,
-):
+) -> SchedulerLaunchResult:
     """Launch scheduler processes as Ray actors.
 
     Returns:
-        Tuple of (scheduler_actors, scheduler_infos) where scheduler_infos
-        contains the initialization info from each actor.
+        SchedulerLaunchResult with scheduler_infos already populated (Ray actors
+        are ready once __init__ completes, so no separate wait_for_ready needed).
     """
     import uuid
 
@@ -1088,8 +1160,11 @@ def _launch_scheduler_ray_actors(
     # Keep refs to detect when actors terminate
     event_loop_refs = [actor.run_event_loop.remote() for actor in scheduler_actors]
 
-    # Return actors, infos, and event loop refs
-    return scheduler_actors, scheduler_infos, event_loop_refs
+    return SchedulerLaunchResult(
+        scheduler_infos=scheduler_infos,
+        _actors=scheduler_actors,
+        _event_loop_refs=event_loop_refs,
+    )
 
 
 def _launch_workers(
@@ -1126,64 +1201,45 @@ def _launch_workers(
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
-    # Launch scheduler processes
+    # Launch schedulers (unified interface for both mp and Ray modes)
     scheduler_result = _launch_schedulers(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
     )
 
-    if server_args.use_ray:
-        # Ray mode: result is (actors, infos, event_loop_refs)
-        scheduler_actors, scheduler_infos, event_loop_refs = scheduler_result
-        scheduler_procs = None
-        scheduler_pipe_readers = None
-    else:
-        # mp mode: result is (procs, pipe_readers)
-        scheduler_procs, scheduler_pipe_readers = scheduler_result
-        scheduler_actors = None
-        event_loop_refs = None
-
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        if not server_args.use_ray:
-            scheduler_infos = _wait_for_scheduler_ready(
-                scheduler_pipe_readers, scheduler_procs
-            )
+        # Wait for schedulers to be ready (no-op for Ray, waits for pipe in mp mode)
+        scheduler_result.wait_for_ready()
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
             return (
                 None,
                 None,
-                scheduler_infos,
+                scheduler_result.scheduler_infos,
                 port_args,
-                scheduler_actors,
-                event_loop_refs,
+                scheduler_result.actors,
+                scheduler_result.event_loop_refs,
             )
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
         )
 
-        if server_args.use_ray:
-            # For Ray mode, wait for event loops to complete (they shouldn't normally)
-            # Use the existing event_loop_refs instead of calling run_event_loop again
-            import ray
-
-            try:
-                ray.get(event_loop_refs)
-            except Exception as e:
-                logger.error(f"Ray scheduler actor terminated with error: {e}")
-        else:
-            for proc in scheduler_procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-                )
-        return None, None, scheduler_infos, port_args, scheduler_actors, event_loop_refs
+        # Wait for schedulers to terminate (they shouldn't normally)
+        scheduler_result.wait_for_completion()
+        return (
+            None,
+            None,
+            scheduler_result.scheduler_infos,
+            port_args,
+            scheduler_result.actors,
+            scheduler_result.event_loop_refs,
+        )
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -1205,20 +1261,19 @@ def _launch_workers(
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
         template_manager = None
 
-    # Wait for the model to finish loading
-    if not server_args.use_ray:
-        scheduler_infos = _wait_for_scheduler_ready(
-            scheduler_pipe_readers, scheduler_procs
-        )
+    # Wait for the model to finish loading (no-op for Ray, waits for pipe in mp mode)
+    scheduler_result.wait_for_ready()
 
     # Get back some info from scheduler to tokenizer_manager
-    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+    tokenizer_manager.max_req_input_len = scheduler_result.scheduler_infos[0][
+        "max_req_input_len"
+    ]
 
     return (
         tokenizer_manager,
         template_manager,
-        scheduler_infos,
+        scheduler_result.scheduler_infos,
         port_args,
-        scheduler_actors,
-        event_loop_refs,
+        scheduler_result.actors,
+        scheduler_result.event_loop_refs,
     )
