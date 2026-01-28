@@ -870,14 +870,17 @@ class FlashAttentionBackend(AttentionBackend):
                 window_size = (-1, -1)
 
             if forward_batch.forward_mode.is_context_parallel_extend() and self.attn_cp_size > 1:
-                q_prev, q_next = torch.split(q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim), 2, dim=0)
+                q_prev, q_next = torch.chunk(q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim), 2, dim=0)
+                # TODO: should fix with multi-batch
+                cu_seqlens_q_split = cu_seqlens_q // 2
+                
                 result_prev = flash_attn_with_kvcache(
                     q=q_prev,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
                     cache_seqlens=forward_batch.attn_cp_metadata.kv_len_prev_tensor,
-                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_q=cu_seqlens_q_split,
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_prev,  # int, not tensor
                     softmax_scale=layer.scaling,
@@ -890,13 +893,14 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                
                 result_next = flash_attn_with_kvcache(
                     q=q_next,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
                     cache_seqlens=forward_batch.attn_cp_metadata.kv_len_next_tensor,
-                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_q=cu_seqlens_q_split,
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_next,  # int, not tensor
                     softmax_scale=layer.scaling,
@@ -909,7 +913,9 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
-                result = result_prev + result_next
+
+                result = torch.concat([result_prev, result_next], dim=0)
+
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
