@@ -1132,11 +1132,25 @@ def _launch_scheduler_ray_actors(
             )
             moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-            # Create Ray actor with GPU resource request
+            # Create Ray actor with fractional GPU resource request.
+            # Using num_gpus=1/tp_size allows all actors to run on the same GPU pool
+            # while ensuring Ray doesn't clear CUDA_VISIBLE_DEVICES.
+            # Each actor will use its assigned gpu_id via torch.cuda.set_device().
             # Use unique instance_id to prevent name collisions across multiple SGLang instances
+            #
+            # CRITICAL: Set CUDA_VISIBLE_DEVICES via runtime_env to ensure all GPUs are
+            # visible for NCCL communication.
+            tp_size = server_args.tp_size
+            base_gpu = server_args.base_gpu_id
+            visible_gpus = ",".join(str(base_gpu + i) for i in range(tp_size))
             actor = SchedulerActor.options(
-                num_gpus=1,
+                num_gpus=0,  # Don't request GPU resources; let Ray inherit CUDA_VISIBLE_DEVICES
                 name=f"sglang_scheduler_{instance_id}_pp{pp_rank}_tp{tp_rank}",
+                runtime_env={
+                    "env_vars": {
+                        "CUDA_VISIBLE_DEVICES": visible_gpus,
+                    }
+                },
             ).remote(
                 server_args=server_args,
                 port_args=port_args,

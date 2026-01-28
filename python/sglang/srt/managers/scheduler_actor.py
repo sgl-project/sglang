@@ -52,8 +52,27 @@ def create_scheduler_actor_class():
             pp_rank: int,
             dp_rank: Optional[int],
         ):
-            import faulthandler
+            # CRITICAL: Set CUDA_VISIBLE_DEVICES FIRST, before any imports that
+            # might initialize CUDA. Ray with num_gpus=0 clears this env var.
             import os
+
+            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if not cuda_visible or cuda_visible.strip() == "":
+                # Calculate visible GPUs based on tp_size
+                tp_size = server_args.tp_size
+                base_gpu = server_args.base_gpu_id
+                visible_gpus = ",".join(str(base_gpu + i) for i in range(tp_size))
+                os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
+                logger.info(
+                    f"[SchedulerActor TP{tp_rank}] Set CUDA_VISIBLE_DEVICES={visible_gpus}"
+                )
+            else:
+                logger.info(
+                    f"[SchedulerActor TP{tp_rank}] CUDA_VISIBLE_DEVICES already set: {cuda_visible}"
+                )
+
+            # Now import other modules (some may initialize CUDA)
+            import faulthandler
 
             import setproctitle
 
@@ -99,6 +118,9 @@ def create_scheduler_actor_class():
                 numa_bind_to_node(numa_node[gpu_id])
 
             # Create scheduler (this loads the model into GPU)
+            # Note: We use num_gpus=0 in actor options so all GPUs are visible,
+            # allowing NCCL to communicate between actors. Each actor uses its
+            # assigned gpu_id via torch.cuda.set_device().
             self.scheduler = Scheduler(
                 server_args,
                 port_args,
@@ -114,7 +136,12 @@ def create_scheduler_actor_class():
 
         def get_info(self) -> Dict[str, Any]:
             """Return scheduler initialization info for handshake."""
-            return self.scheduler.get_init_info()
+            # Access attributes directly for compatibility with different sglang versions
+            return {
+                "status": "ready",
+                "max_total_num_tokens": self.scheduler.max_total_num_tokens,
+                "max_req_input_len": self.scheduler.max_req_input_len,
+            }
 
         def run_event_loop(self) -> None:
             """
