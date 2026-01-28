@@ -842,6 +842,12 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      
+      - name: Debug RDMA Driver Dependencies
+        run: |
+          echo "=== Debugging Ionic Driver Dependencies ==="
+          echo "Checking what libraries libionic-rdmav34.so is missing..."
+          docker exec ci_sglang ldd /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so
 
       - name: Setup RDMA in Container
         run: |
