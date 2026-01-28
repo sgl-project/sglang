@@ -30,6 +30,9 @@ The `load_jit` utility function in `python/sglang/jit_kernel/utils.py` loads and
 To export a C++ function (e.g., `cpp_func`), pass `cuda_wrappers=[("func", "cpp_func")]` to `load_jit`.
 The function can then be called in Python as `module.func`.
 
+For caching compiled modules, prefer `sglang.jit_kernel.utils.cache_once` over `functools.lru_cache`.
+`functools.lru_cache` is not compatible with `torch.compile`.
+
 ### C++ Utilities
 
 The following C++ utilities are available:
@@ -216,19 +219,17 @@ Create a new file at [jit_kernel/add_constant.py](../../python/sglang/jit_kernel
 
 ```python
 from __future__ import annotations
-
-import functools
 from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import load_jit, make_cpp_args
+from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@functools.cache
+@cache_once
 def _jit_add_constant_module(constant: int) -> Module:
     args = make_cpp_args(constant)  # pass all the template argument
     return load_jit(
@@ -255,4 +256,4 @@ Finally, import and use the kernel like a regular Python function:
 from sglang.jit_kernel.add_constant import add_constant
 ```
 
-For a complete, runnable example, refer to [test_add_constant.py](../../python/sglang/jit_kernel/test_add_constant.py).
+For a complete, runnable example, refer to [test_add_constant.py](../../python/sglang/jit_kernel/tests/test_add_constant.py).
