@@ -122,7 +122,7 @@ class DecodeReqToTokenPool:
             len(chunked) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].already_computed > 0 for i in chunked
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
         ), "request has req_pool_idx but is not chunked"
 
         need_size = len(reqs) - len(chunked)

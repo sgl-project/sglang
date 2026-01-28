@@ -339,7 +339,6 @@ def alloc_for_extend(
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
 
-    bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
