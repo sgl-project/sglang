@@ -956,11 +956,11 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             weights = self._project_and_scale_head_gates(x)
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+            )
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
-                query, key = self._get_q_k_bf16(
-                    q_lora, x, positions, False, forward_batch=forward_batch
-                )
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
             current_stream.wait_stream(self.alt_stream)
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
