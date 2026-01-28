@@ -973,6 +973,10 @@ jobs:
         run: |
           echo "=== Verify RDMA in container ==="
           docker exec -u root ci_sglang bash -c '
+            echo "Patching missing ionic library..."
+            cp -n /host_sys_libs/libionic.so* /usr/lib/x86_64-linux-gnu/ || true
+            cp -n /host_sys_libs/libnl-3.so* /usr/lib/x86_64-linux-gnu/ || true
+            cp -n /host_sys_libs/libmnl.so* /usr/lib/x86_64-linux-gnu/ || true
             echo "=== Verification ==="
             echo "Device nodes:"
             ls -la /dev/infiniband/
