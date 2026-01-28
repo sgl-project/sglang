@@ -148,7 +148,6 @@ class Sampler(nn.Module):
             self._attach_logprobs_to_output(
                 logits_output,
                 logprobs,
-                return_logprob,
                 top_logprobs_nums,
                 token_ids_logprobs,
                 sampling_info,
@@ -158,50 +157,6 @@ class Sampler(nn.Module):
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
         return batch_next_token_ids
-
-    def _sync_token_ids_across_tp(
-        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
-    ):
-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
-            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
-            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
-            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
-            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
-            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
-            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
-
-            torch.distributed.all_reduce(
-                batch_next_token_ids,
-                op=dist.ReduceOp.MIN,
-                group=self.tp_sync_group,
-            )
-
-    def _attach_logprobs_to_output(
-        self,
-        logits_output: LogitsProcessorOutput,
-        logprobs: torch.Tensor,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
-        sampling_info: SamplingBatchInfo,
-        batch_next_token_ids: torch.Tensor,
-    ):
-        # Attach logprobs to logits_output (in-place modification)
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
-
-        if any(x is not None for x in token_ids_logprobs):
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
-
-        logits_output.next_token_logprobs = logprobs[
-            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
-            batch_next_token_ids,
-        ]
 
     def _sample_from_probs(
         self,
@@ -257,6 +212,50 @@ class Sampler(nn.Module):
                     f"Invalid sampling backend: {get_global_server_args().sampling_backend}"
                 )
         return batch_next_token_ids
+
+    def _sync_token_ids_across_tp(
+        self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+    ):
+        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+            # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
+            # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
+            # the last all-reduce, the last lm_head matmul, and all sampling kernels.
+            # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
+            # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
+            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
+
+            torch.distributed.all_reduce(
+                batch_next_token_ids,
+                op=dist.ReduceOp.MIN,
+                group=self.tp_sync_group,
+            )
+
+    def _attach_logprobs_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logprobs: torch.Tensor,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+        sampling_info: SamplingBatchInfo,
+        batch_next_token_ids: torch.Tensor,
+    ):
+        # Attach logprobs to logits_output (in-place modification)
+        if any(x > 0 for x in top_logprobs_nums):
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+
+        if any(x is not None for x in token_ids_logprobs):
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+
+        logits_output.next_token_logprobs = logprobs[
+            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+            batch_next_token_ids,
+        ]
 
     def compute_logprobs_only(
         self,

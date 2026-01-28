@@ -268,7 +268,9 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        self.multi_item_delimiter = get_global_server_args().multi_item_scoring_delimiter
+        self.multi_item_delimiter = (
+            get_global_server_args().multi_item_scoring_delimiter
+        )
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -287,10 +289,14 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Multi-item scoring only for prefill-only requests.   
+        # Multi-item scoring only for prefill-only requests.
         if self.multi_item_delimiter is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
-                input_ids, hidden_states, lm_head, logits_metadata, self.multi_item_delimiter
+                input_ids,
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                self.multi_item_delimiter,
             )
 
         # Diffusion LLM only.
@@ -524,10 +530,10 @@ class LogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         hidden_states_before_norm: Optional[torch.Tensor],
-        aux_hidden_states: Optional[torch.Tensor],
+        aux_hidden_states: Optional[List[torch.Tensor]],
         pruned_states: torch.Tensor,
         pruned_states_before_norm: Optional[torch.Tensor],
-        aux_pruned_states: Any,
+        aux_pruned_states: Optional[List[torch.Tensor]],
         sample_indices: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ) -> Optional[torch.Tensor]:
@@ -570,7 +576,7 @@ class LogitsProcessor(nn.Module):
             # NOTE: when hidden_states_before_norm is provided, we always
             # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
-        
+
         return hidden_states_to_store
 
     def _expand_metadata_for_logprobs(
@@ -820,7 +826,9 @@ class LogitsProcessor(nn.Module):
             else:
                 logits = tensor_model_parallel_all_gather(logits)
 
-        logits = self._scatter_dp_attn_logits(logits, local_hidden_states, logits_metadata)
+        logits = self._scatter_dp_attn_logits(
+            logits, local_hidden_states, logits_metadata
+        )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
