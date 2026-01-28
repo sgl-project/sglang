@@ -134,7 +134,11 @@ def fp4_gemm(
     fp4_backend = get_fp4_gemm_runner_backend()
     if enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-        backend = fp4_backend.get_flashinfer_backend()
+        backend = (
+            fp4_backend.get_flashinfer_backend()
+            if not fp4_backend.is_auto()
+            else "cutlass"
+        )
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
