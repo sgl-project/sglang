@@ -248,6 +248,17 @@ def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
         )
 
 
+def _ensure_llama_flash_attention2_compat() -> None:
+    """Ensure LlamaFlashAttention2 symbol exists for remote code compatibility."""
+    try:
+        from transformers.models.llama import modeling_llama
+    except Exception:
+        return
+    if not hasattr(modeling_llama, "LlamaFlashAttention2"):
+        if hasattr(modeling_llama, "LlamaAttention"):
+            modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -274,6 +285,7 @@ def get_config(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
     else:
+        _ensure_llama_flash_attention2_compat()
         try:
             config = AutoConfig.from_pretrained(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
@@ -537,6 +549,7 @@ def get_processor(
             **kwargs,
         )
     else:
+        _ensure_llama_flash_attention2_compat()
         config = AutoConfig.from_pretrained(
             tokenizer_name,
             trust_remote_code=trust_remote_code,
