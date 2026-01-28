@@ -349,7 +349,7 @@ def get_config(
     elif config.model_type in _CONFIG_REGISTRY:
         model_type = config.model_type
         if model_type == "deepseek_vl_v2":
-            if _is_deepseek_ocr_model(config):
+            if _is_deepseek_ocr_model(config) or _is_deepseek_ocr2_model(config):
                 model_type = "deepseek-ocr"
         config_class = _CONFIG_REGISTRY[model_type]
         config = config_class.from_pretrained(model, revision=revision)
@@ -359,6 +359,7 @@ def get_config(
             config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         elif _is_deepseek_ocr2_model(config):
             _override_v_head_dim_if_zero(config)
+            config.update({"architectures": ["DeepseekOCRForCausalLM"]})
 
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
@@ -585,6 +586,9 @@ def get_processor(
         config.model_type = "deepseek-ocr"
         config.update({"architectures": ["DeepseekOCRForCausalLM"]})
     elif _is_deepseek_ocr2_model(config):
+        # Temporary hack for load deepseek-ocr2
+        config.model_type = "deepseek-ocr"
+        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
         _override_v_head_dim_if_zero(config)
 
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
