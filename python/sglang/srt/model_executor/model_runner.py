@@ -2558,8 +2558,11 @@ def unwrap_ipc_tensors(
     for name, tensor in named_tensors:
         if isinstance(tensor, LocalSerializedTensor):
             ipc_tensor = tensor.get(tp_rank)
-            result.append((name, ipc_tensor.to(device)))
+            tensor_on_device = ipc_tensor.to(device)
+            # Explicitly delete the tensor created from the IPC handle to trigger
+            # garbage collection and release the handle.
             del ipc_tensor
         else:
-            result.append((name, tensor.to(device)))
+            tensor_on_device = tensor.to(device)
+        result.append((name, tensor_on_device))
     return result
