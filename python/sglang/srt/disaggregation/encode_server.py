@@ -400,12 +400,12 @@ class MMEncoder:
         else:
             new_mm_data = mm_data.copy_without_embedding()
             if new_mm_data.error_msg is not None:
-                socket.send_multipart([pickle.dumps(new_mm_data)])
-                return
-
-            embedding_tensor = TensorWrapper(mm_data.embedding)
-            serialized_data = pickle.dumps(new_mm_data)
-            buffer = embedding_tensor.__buffer__()
+                buffer = None
+                serialized_data = pickle.dumps(new_mm_data)
+            else:
+                embedding_tensor = TensorWrapper(mm_data.embedding)
+                serialized_data = pickle.dumps(new_mm_data)
+                buffer = embedding_tensor.__buffer__()
 
         # Use thread pool executor for parallel ZMQ send operations
         def send_with_socket():
