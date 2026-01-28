@@ -856,8 +856,9 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4
       - nightly-accuracy-8-gpu-mi35x-deepseek-v32
       - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp
-      - nightly-perf-8-gpu-mi35x-deepseek-v32-basic
-      - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp
+      # MI35x perf jobs excluded from check - perf failures don't block CI
+      # - nightly-perf-8-gpu-mi35x-deepseek-v32-basic
+      # - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed

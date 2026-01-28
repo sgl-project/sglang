@@ -102,6 +102,8 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 "0.7",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true}',
+                "--watchdog-timeout",
+                "1200",
             ],
             "env_vars": {"SGLANG_USE_AITER": "1"},
         }

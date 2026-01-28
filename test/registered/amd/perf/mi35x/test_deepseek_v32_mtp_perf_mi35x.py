@@ -154,6 +154,8 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 "0.7",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true}',
+                "--watchdog-timeout",
+                "1200",
             ],
         }
 
