@@ -35,6 +35,7 @@ Its core features include:
    basic_usage/native_api.ipynb
    basic_usage/deepseek_ocr.md
    basic_usage/sampling_params.md
+   basic_usage/diffusion.md
    basic_usage/popular_model_usage.rst
 
 .. toctree::
