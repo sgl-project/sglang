@@ -1126,6 +1126,75 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+        import os
+
+        if os.environ.get("HPC_OPS") == "1":
+            import hpc
+
+            from sglang.srt.distributed import get_moe_expert_parallel_rank
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            x_q, x_scale = sglang_per_token_group_quant_fp8(x, 128)
+            rank_ep = get_moe_expert_parallel_rank()
+
+            w13_weight_scale_inv = layer.w13_weight_scale_inv
+            w2_weight_scale_inv = layer.w2_weight_scale_inv
+            hidden_size = layer.w2_weight.shape[1]
+            intermediate_size = layer.w2_weight.shape[2]
+            # Pad weight scales if needed to align to 4
+            expected_w13_last_dim = ((hidden_size // 128 + 3) // 4) * 4
+            actual_w13_last_dim = w13_weight_scale_inv.shape[2]
+            if (
+                actual_w13_last_dim % 4 != 0
+                or actual_w13_last_dim < expected_w13_last_dim
+            ):
+                # Need to pad: either not aligned to 4, or smaller than expected
+                num_expert_local, num_blocks_intermediate, num_blocks_hidden = (
+                    w13_weight_scale_inv.shape
+                )
+                w13_weight_scale_inv_padded = torch.zeros(
+                    (num_expert_local, num_blocks_intermediate, expected_w13_last_dim),
+                    dtype=w13_weight_scale_inv.dtype,
+                    device=w13_weight_scale_inv.device,
+                )
+                w13_weight_scale_inv_padded[:, :, :num_blocks_hidden] = (
+                    w13_weight_scale_inv
+                )
+                w13_weight_scale_inv = w13_weight_scale_inv_padded
+
+            expected_w2_last_dim = ((intermediate_size // 128 + 3) // 4) * 4
+            actual_w2_last_dim = w2_weight_scale_inv.shape[2]
+            if actual_w2_last_dim % 4 != 0 or actual_w2_last_dim < expected_w2_last_dim:
+                # Need to pad: either not aligned to 4, or smaller than expected
+                num_expert_local, num_blocks_hidden, num_blocks_intermediate = (
+                    w2_weight_scale_inv.shape
+                )
+                w2_weight_scale_inv_padded = torch.zeros(
+                    (num_expert_local, num_blocks_hidden, expected_w2_last_dim),
+                    dtype=w2_weight_scale_inv.dtype,
+                    device=w2_weight_scale_inv.device,
+                )
+                w2_weight_scale_inv_padded[:, :, :num_blocks_intermediate] = (
+                    w2_weight_scale_inv
+                )
+                w2_weight_scale_inv = w2_weight_scale_inv_padded
+
+            my = hpc.fuse_moe_blockwise_fp8(
+                x_q,
+                x_scale,
+                layer.w13_weight,
+                w13_weight_scale_inv,
+                layer.w2_weight,
+                w2_weight_scale_inv,
+                dispatch_output.topk_output.topk_ids,
+                dispatch_output.topk_output.topk_weights,
+                rank_ep,
+                layer.num_local_experts,
+            )
+            # logger.info(f"my shape: {my.shape} num_local_experts: {layer.num_local_experts}")
+            return StandardCombineInput(hidden_states=my)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
