@@ -32,7 +32,6 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     rotary_embedding,
     silu_and_mul,
-    timestep_embedding,
 )
 from sgl_kernel.expert_specialization import (
     es_fp8_blockwise_scaled_grouped_mm,

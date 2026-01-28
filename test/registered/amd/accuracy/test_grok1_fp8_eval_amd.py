@@ -140,6 +140,7 @@ class TestGrok1FP8EvalAMD(unittest.TestCase):
             )
             passed = acc >= self.accuracy_threshold
             status = "✅ PASS" if passed else "❌ FAIL"
+            print(f"  accuracy={acc:.3f} threshold={self.accuracy_threshold} {status}")
 
             summary = f"### GROK1-FP8 (MI300X)\n\n"
             summary += f"| Model | Accuracy | Threshold | Status |\n"

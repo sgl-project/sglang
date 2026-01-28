@@ -55,7 +55,6 @@ sources = [
     "csrc/kvcacheio/transfer.cu",
     "csrc/memory/weak_ref_tensor.cpp",
     "csrc/elementwise/pos_enc.cu",
-    "csrc/sgl_diffusion/elementwise/timestep_embedding.cu",
 ]
 
 cxx_flags = ["-O3"]

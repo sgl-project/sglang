@@ -379,6 +379,9 @@ impl RateLimitStore {
     pub fn get_owners(&self, key: &str) -> Vec<String> {
         let ring = self.hash_ring.read();
         ring.get_owners(key)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Get or create counter (only if this node is an owner)
@@ -441,8 +444,11 @@ impl RateLimitStore {
 
         for key in counters.keys() {
             let owners = ring.get_owners(key);
-            // Check if any owner has failed
-            if owners.iter().any(|owner| failed_nodes.contains(owner)) {
+
+            if owners
+                .iter()
+                .any(|&owner| failed_nodes.iter().any(|f| f == owner))
+            {
                 // Check if we are now an owner
                 if ring.is_owner(key, &self.self_name) {
                     affected_keys.push(key.clone());

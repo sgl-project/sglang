@@ -7,6 +7,7 @@ import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
+from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
@@ -45,6 +46,8 @@ _BUFFER_OFFSET = 0
 
 _EXTRA_PRE_TOKENS = 0  # pre chunk extra token (0 for the moment)
 _EXTRA_POST_TOKENS = 0  # post chunk extra token (0 for the moment)
+
+_is_default_tensor_transport = None
 
 
 def init_feature_buffer(device):
@@ -1485,3 +1488,93 @@ def get_new_expanded_mm_items(original_mm_items):
         else:
             expanded_mm_items.append(item)
     return expanded_mm_items
+
+
+class ShmPointerMMData:
+    """
+    Wraps a tensor to be sent via a shared memory handle.
+    This acts as a "pointer" to the tensor data across process boundaries.
+    """
+
+    def __init__(self, tensor: torch.Tensor):
+        self.cpu_tensor = tensor.cpu().contiguous()
+        self.shape = self.cpu_tensor.shape
+        self.dtype = self.cpu_tensor.dtype
+
+        nbytes = self.cpu_tensor.numel() * self.cpu_tensor.element_size()
+
+        self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
+
+        try:
+            shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
+
+            shm_view[:] = self.cpu_tensor.view(torch.uint8).numpy().flatten()
+        finally:
+            self.shm.close()
+
+    def __getstate__(self):
+        return {
+            "shm_name": self.shm.name,
+            "shape": self.shape,
+            "dtype": self.dtype,
+        }
+
+    def __setstate__(self, state):
+        self.shm_name = state["shm_name"]
+
+        shm_handle = shared_memory.SharedMemory(name=self.shm_name)
+        try:
+            self.tensor = (
+                torch.frombuffer(shm_handle.buf, dtype=state["dtype"])
+                .reshape(state["shape"])
+                .clone()
+            )
+        finally:
+            shm_handle.close()
+            shm_handle.unlink()
+
+
+def _get_is_default_transport():
+    global _is_default_tensor_transport
+    if _is_default_tensor_transport is None:
+        from sglang.srt.managers.tokenizer_manager import (
+            _determine_tensor_transport_mode,
+        )
+
+        _is_default_tensor_transport = (
+            _determine_tensor_transport_mode(get_global_server_args()) == "default"
+        )
+    return _is_default_tensor_transport
+
+
+def wrap_shm_features(obj):
+    """
+    Scan the object for multimodal tensors and wrap them in SHM pointers.
+    """
+    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+        return obj
+
+    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        mm_items = obj.mm_inputs.get("mm_items", [])
+        for item in mm_items:
+            if (
+                hasattr(item, "feature")
+                and isinstance(item.feature, torch.Tensor)
+                and item.feature.is_cpu
+            ):
+                item.feature = ShmPointerMMData(item.feature)
+    return obj
+
+
+def unwrap_shm_features(obj):
+    """
+    Restore ShmPointerMMData wrappers back into standard torch.Tensors.
+    """
+    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+        return obj
+    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+        mm_items = obj.mm_inputs.get("mm_items", [])
+        for item in mm_items:
+            if isinstance(item.feature, ShmPointerMMData):
+                item.feature = item.feature.tensor
+    return obj
