@@ -41,36 +41,47 @@ def biased_grouped_topk_impl(
     tmp_scores = scores_for_choice.masked_fill(
         ~score_mask.bool(), float("-inf")
     )  # [n, e]
-    _, topk_ids = torch.topk(
-        tmp_scores,
-        k=topk,
-        dim=-1,
-        sorted=(True if num_fused_shared_experts > 0 else False),
-    )
-    topk_weights = scores.gather(1, topk_ids)
 
-    if num_fused_shared_experts:
-        topk_ids[:, -1] = torch.randint(
-            low=num_experts,
-            high=num_experts + num_fused_shared_experts,
-            size=(topk_ids.size(0),),
-            dtype=topk_ids.dtype,
-            device=topk_ids.device,
+    topk_excluding_shared = topk - num_fused_shared_experts
+    _, routed_topk_ids = torch.topk(
+        tmp_scores,
+        k=topk_excluding_shared,
+        dim=-1,
+        sorted=False,
+    )
+    routed_topk_weights = scores.gather(1, routed_topk_ids)
+
+    if num_fused_shared_experts > 0:
+        topk_ids = torch.empty(
+            (num_token, topk), dtype=routed_topk_ids.dtype, device=routed_topk_ids.device
         )
-        if routed_scaling_factor is not None:
-            topk_weights[:, -1] = (
-                topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
-            )
+        topk_weights = torch.empty(
+            (num_token, topk), dtype=routed_topk_weights.dtype, device=routed_topk_weights.device
+        )
+        topk_ids[:, :topk_excluding_shared] = routed_topk_ids
+        topk_weights[:, :topk_excluding_shared] = routed_topk_weights
+
+        scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+        routed_sum = routed_topk_weights.sum(dim=-1, keepdim=True)
+
+        for i in range(num_fused_shared_experts):
+            topk_ids[:, topk_excluding_shared + i] = num_experts + i
+            topk_weights[:, topk_excluding_shared + i] = routed_sum[:, 0] / scale
+    else:
+        topk_ids = routed_topk_ids
+        topk_weights = routed_topk_weights
 
     if renormalize:
-        topk_weights_sum = (
-            topk_weights.sum(dim=-1, keepdim=True)
-            if num_fused_shared_experts == 0
-            else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-        )
+        if num_fused_shared_experts > 0:
+            topk_weights_sum = topk_weights[:, :topk_excluding_shared].sum(
+                dim=-1, keepdim=True
+            )
+        else:
+            topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
         topk_weights = topk_weights / topk_weights_sum
         if apply_routed_scaling_factor_on_output:
-            topk_weights *= routed_scaling_factor
+            scale = 1.0 if routed_scaling_factor is None else float(routed_scaling_factor)
+            topk_weights *= scale
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     return topk_weights, topk_ids
@@ -116,7 +127,7 @@ def biased_grouped_topk(
         (512, 16, 8, 16),
     ],
 )
-@pytest.mark.parametrize("num_fused_shared_experts", [0])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1, 2])
 @pytest.mark.parametrize("apply_routed_scaling_factor_on_output", [False, True])
 def test_moe_fused_gate_combined(
     seq_length, params, num_fused_shared_experts, apply_routed_scaling_factor_on_output
