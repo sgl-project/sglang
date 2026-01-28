@@ -1775,7 +1775,9 @@ def _get_signal_file_path(model_name_or_path: str, cache_dir: Optional[str]) -> 
     return f"/tmp/sglang_download_complete_{key_hash}"
 
 
-def _wait_for_signal_file(signal_path: str, timeout: int = 600, poll_interval: float = 0.5) -> bool:
+def _wait_for_signal_file(
+    signal_path: str, timeout: int = 600, poll_interval: float = 0.5
+) -> bool:
     """
     Wait for a signal file to be created by rank 0.
 
@@ -1864,7 +1866,7 @@ def ci_download_with_validation_and_retry(
 
     # Determine rank from environment variables (works before distributed init)
     rank = _get_rank_from_env()
-    is_rank_0 = (rank == 0)
+    is_rank_0 = rank == 0
 
     # Generate signal file path for coordination
     signal_file = _get_signal_file_path(model_name_or_path, cache_dir)
