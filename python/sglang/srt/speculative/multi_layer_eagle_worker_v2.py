@@ -42,7 +42,9 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     select_top_k_tokens,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import empty_context, fast_topk, is_npu
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunnerOutput
@@ -171,17 +173,27 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Create attn backends
         self.draft_extend_attn_backend_list = []
         for step in range(self.speculative_num_steps):
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
-            )
-
-            self.draft_extend_attn_backend_list.append(
-                FlashAttentionBackend(
-                    model_runner=self.draft_runner_list[step],
-                    skip_prefill=False,
-                    speculative_step_id=step,
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
+                    AscendAttnBackend,
                 )
-            )
+
+                self.draft_extend_attn_backend_list.append(
+                    AscendAttnBackend(model_runner=self.draft_runner_list[step])
+                )
+            else:              
+                from sglang.srt.layers.attention.flashattention_backend import (
+                    FlashAttentionBackend,
+                )
+
+                self.draft_extend_attn_backend_list.append(
+                    FlashAttentionBackend(
+                        model_runner=self.draft_runner_list[step],
+                        skip_prefill=False,
+                        speculative_step_id=step,
+                    )
+                )
+                
             self.draft_runner_list[step].attn_backend = (
                 self.draft_extend_attn_backend_list[-1]
             )
