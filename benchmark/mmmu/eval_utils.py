@@ -265,7 +265,7 @@ def get_sampling_params(eval_args):
 
 
 # ----------- Process Multi-choice -------------
-def parse_multi_choice_response(response, all_choices, index2ans):
+def parse_multi_choice_response(response, all_choices, index2answer):
     """
     Parse the prediction from the generated response.
     Return the predicted index e.g., A, B, C, D.
@@ -274,13 +274,13 @@ def parse_multi_choice_response(response, all_choices, index2ans):
         response = response.strip(char)
     response = " " + response + " "  # add space to avoid partial match
 
-    index_ans = True
-    ans_with_brack = False
+    index_answer = True
+    answer_with_brack = False
     candidates = []
     for choice in all_choices:  # e.g., (A) (B) (C) (D)
         if f"({choice})" in response:
             candidates.append(choice)
-            ans_with_brack = True
+            answer_with_brack = True
 
     if len(candidates) == 0:
         for choice in all_choices:  # e.g., A B C D
@@ -289,17 +289,17 @@ def parse_multi_choice_response(response, all_choices, index2ans):
 
     # if all above doesn't get candidates, check if the content is larger than 5 tokens and try to parse the example
     if len(candidates) == 0 and len(response.split()) > 5:
-        for index, ans in index2ans.items():
-            if ans.lower() in response.lower():
+        for index, answer in index2answer.items():
+            if answer.lower() in response.lower():
                 candidates.append(index)
-                index_ans = False  # it's content ans.
+                index_answer = False  # it's content answer.
 
     if len(candidates) == 0:  # still not get answer, randomly choose one.
         pred_index = random.choice(all_choices)
     elif len(candidates) > 1:
         start_indexes = []
-        if index_ans:
-            if ans_with_brack:
+        if index_answer:
+            if answer_with_brack:
                 for can in candidates:
                     index = response.rfind(f"({can})")
                     start_indexes.append(index)  # -1 will be ignored anyway
@@ -310,7 +310,7 @@ def parse_multi_choice_response(response, all_choices, index2ans):
                     start_indexes.append(index)
         else:
             for can in candidates:
-                index = response.lower().rfind(index2ans[can].lower())
+                index = response.lower().rfind(index2answer[can].lower())
                 start_indexes.append(index)
         # get the last one
         pred_index = candidates[np.argmax(start_indexes)]
@@ -499,10 +499,10 @@ def eval_open(gold_i, pred_i):
     else:
         norm_answers = normalize_str(gold_i)
     for pred in pred_i:  # pred is already normalized in parse response phase
-        if isinstance(pred, str):  # if it's a string, then find if ans in the pred_i
-            for norm_ans in norm_answers:
+        if isinstance(pred, str):  # if it's a string, then find if answer in the pred_i
+            for norm_answer in norm_answers:
                 # only see if the string answer in the string pred
-                if isinstance(norm_ans, str) and norm_ans in pred:
+                if isinstance(norm_answer, str) and norm_answer in pred:
                     if not correct:
                         correct = True
                     break
@@ -558,14 +558,14 @@ def process_result(response, sample, answer_dict, out_samples):
     if response is None:
         return
     if sample["question_type"] == "multiple-choice":
-        pred_ans = parse_multi_choice_response(
-            response, sample["all_choices"], sample["index2ans"]
+        pred_answer = parse_multi_choice_response(
+            response, sample["all_choices"], sample["index2answer"]
         )
     else:  # open question
-        pred_ans = response
+        pred_answer = response
 
     out_samples[sample["id"]] = {
-        "pred_ans": pred_ans,
+        "pred_answer": pred_answer,
         "original_response": sample["original_response"],
         "ground_truth": sample["answer"],
         "question_type": sample["question_type"],
@@ -591,7 +591,7 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
         if isinstance(parsed_pred, str):
             parsed_pred = parsed_pred
         elif isinstance(parsed_pred, dict):
-            parsed_pred = parsed_pred["pred_ans"]
+            parsed_pred = parsed_pred["pred_answer"]
         else:
             raise ValueError(f"Unknown type of parsed_pred: {type(parsed_pred)}")
         category = "_".join(data_id.split("_")[1:-1])

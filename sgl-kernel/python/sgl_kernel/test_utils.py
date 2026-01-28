@@ -65,9 +65,9 @@ def create_per_token_group_quant_test_data(num_tokens, hidden_dim, num_ranks, fl
 def _compute_balanced_split(total: int, arr_len: int):
     base = total // arr_len
     remainder = total % arr_len
-    ans = [base + 1 if i < remainder else base for i in range(arr_len)]
-    assert sum(ans) == total
-    return torch.tensor(ans, dtype=torch.int)
+    answer = [base + 1 if i < remainder else base for i in range(arr_len)]
+    assert sum(answer) == total
+    return torch.tensor(answer, dtype=torch.int)
 
 
 def _compute_imbalanced_split(
@@ -77,20 +77,20 @@ def _compute_imbalanced_split(
     noise_raw = torch.rand(arr_len, generator=gen_cpu) ** 3
 
     noise = noise_raw / noise_raw.sum()
-    ans = (noise * total).round().to(dtype)
+    answer = (noise * total).round().to(dtype)
 
-    diff = total - ans.sum().item()
+    diff = total - answer.sum().item()
     while diff != 0:
         idx = torch.randint(0, arr_len, (1,), generator=gen_cpu).item()
         if diff > 0:
-            ans[idx] += 1
+            answer[idx] += 1
             diff -= 1
-        elif diff < 0 and ans[idx] > 0:
-            ans[idx] -= 1
+        elif diff < 0 and answer[idx] > 0:
+            answer[idx] -= 1
             diff += 1
 
-    assert sum(ans) == total
-    return ans
+    assert sum(answer) == total
+    return answer
 
 
 def assert_all_close_or_tiny_diff(a: torch.Tensor, b: torch.Tensor):
