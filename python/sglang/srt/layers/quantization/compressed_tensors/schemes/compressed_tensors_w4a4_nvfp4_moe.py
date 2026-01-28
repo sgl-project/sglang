@@ -22,7 +22,7 @@ from sglang.srt.layers.quantization.utils import (
     reorder_w1w3_to_w3w1,
     swizzle_blockscale,
 )
-from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
+from sglang.srt.utils import next_power_of_2, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +32,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
-        StandardCombineInput,
     )
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-    from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
-    from sglang.srt.layers.moe.utils import RoutingMethodType
-
-if is_flashinfer_available():
-        from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
 
 
 class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsScheme):
@@ -68,6 +61,8 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         layer.params_dtype = params_dtype
 
@@ -317,6 +312,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsScheme):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
+        from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -348,6 +346,10 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsScheme):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
+
+        from sglang.srt.layers.moe.utils import RoutingMethodType
 
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
