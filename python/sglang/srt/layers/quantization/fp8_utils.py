@@ -15,6 +15,9 @@ from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    rocm_aiter_swizzle_hipb_fp8_gemm,
+)
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
@@ -1083,21 +1086,34 @@ def apply_fp8_ptpc_linear(
     # View input as 2D matrix for fp8 methods
     input_2d = input.view(-1, input.shape[-1])
 
-    # weight is transposed (K, N)
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-
     q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
 
-    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
-    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
+    # per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
+    # per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
 
-    if not (per_tensor_weights and per_tensor_activations):
+    if _is_hip and get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_FP8HIPB"):
+        # weight is transposed (K, N)
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+        output = rocm_aiter_swizzle_hipb_fp8_gemm(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            None,
+            out_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )
+
+    else:
         # weight is in (N, K)
         output_shape = [*input.shape[:-1], weight.shape[0]]
-
-    output = aiter.gemm_a8w8_bpreshuffle(
-        q_input, weight, x_scale, weight_scale, None, input.dtype
-    )
+        output = aiter.gemm_a8w8_bpreshuffle(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            None,
+            dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        )
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
