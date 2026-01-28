@@ -323,10 +323,10 @@ class SamplingParams:
         if self.guidance_scale is None:
             try:
                 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
-                    Hunyuan3DPipelineConfig,
+                    Hunyuan3D2PipelineConfig,
                 )
 
-                if isinstance(pipeline_config, Hunyuan3DPipelineConfig):
+                if isinstance(pipeline_config, Hunyuan3D2PipelineConfig):
                     self.guidance_scale = pipeline_config.shape_guidance_scale
                 else:
                     self.guidance_scale = 1.0

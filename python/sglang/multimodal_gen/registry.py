@@ -30,8 +30,9 @@ if TYPE_CHECKING:
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
+    Hunyuan3D2PipelineConfig,
+    Hunyuan3D21PipelineConfig,
     HunyuanConfig,
-    Hunyuan3DPipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -73,7 +74,6 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -475,16 +475,25 @@ def _register_configs():
         ],
     )
 
+    from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
     from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
         Hunyuan3DPipeline,
     )
 
+    # Hunyuan3D-2.0
     register_configs(
-        sampling_param_cls=SamplingParams,
-        pipeline_config_cls=Hunyuan3DPipelineConfig,
+        sampling_param_cls=Hunyuan3DSamplingParams,
+        pipeline_config_cls=Hunyuan3D2PipelineConfig,
+        pipeline_cls=Hunyuan3DPipeline,
+        hf_model_paths=["tencent/Hunyuan3D-2"],
+    )
+
+    # Hunyuan3D-2.1
+    register_configs(
+        sampling_param_cls=Hunyuan3DSamplingParams,
+        pipeline_config_cls=Hunyuan3D21PipelineConfig,
         pipeline_cls=Hunyuan3DPipeline,
         hf_model_paths=["tencent/Hunyuan3D-2.1"],
-        model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
     )
 
     # Wan
@@ -658,6 +667,18 @@ def _register_configs():
         pipeline_config_cls=GlmImagePipelineConfig,
         model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
     )
+
+
+_NON_DIFFUSERS_MODEL_DETECTORS: List[Callable[[str], bool]] = [
+    lambda path: "hunyuan3d" in path.lower(),
+]
+
+
+def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
+    for detector in _NON_DIFFUSERS_MODEL_DETECTORS:
+        if detector(model_path):
+            return True
+    return False
 
 
 _register_configs()

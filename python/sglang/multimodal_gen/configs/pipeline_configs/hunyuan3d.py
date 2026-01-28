@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
+from typing import Optional
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -8,34 +10,62 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 
 
 @dataclass
-class Hunyuan3DPipelineConfig(PipelineConfig):
+class Hunyuan3D2PipelineConfig(PipelineConfig):
     """Pipeline configuration for Hunyuan3D image-to-mesh generation."""
+
+    shape_subfolder: str = "hunyuan3d-dit-v2-0"
+    vae_subfolder: str = "hunyuan3d-vae-v2-0"
+    paint_subfolder: str = "hunyuan3d-paint-v2-0"
+    delight_subfolder: str = "hunyuan3d-delight-v2-0"
 
     task_type: ModelTaskType = ModelTaskType.I2M
 
-    # Local code repo path (for hy3dshape/hy3dpaint imports).
-    hunyuan3d_repo_path: str = (
-        "python/sglang/multimodal_gen/runtime/models/hunyuan3d"
-    )
-
     # Shape model configuration
-    shape_model_path: str | None = None
-    shape_subfolder: str = "hunyuan3d-dit-v2-1"
+    shape_model_path: Optional[str] = None
+
     shape_use_safetensors: bool = False
-    shape_variant: str | None = "fp16"
+    shape_variant: Optional[str] = "fp16"
     shape_num_inference_steps: int = 50
     shape_guidance_scale: float = 5.0
     shape_box_v: float = 1.01
     shape_octree_resolution: int = 384
     shape_mc_level: float = 0.0
-    shape_mc_algo: str | None = None
+    shape_mc_algo: Optional[str] = None
     shape_num_chunks: int = 8000
     shape_output_type: str = "trimesh"
 
+    # VAE configuration
+
+    vae_enable_flashvdm: bool = True
+    vae_flashvdm_topk_mode: str = "mean"
+
+    # Conditioner configuration
+    conditioner_type: str = "dino"  # 'dino' or 'dino_mv'
+    conditioner_model: str = "facebook/dinov2-large"
+    conditioner_image_size: int = 518
+
     # Paint model configuration
-    paint_enable: bool = False
-    paint_model_path: str | None = None
+    paint_enable: bool = True
+    paint_model_path: Optional[str] = None
+
+    paint_num_inference_steps: int = 15
+    paint_guidance_scale: float = 3.0
     paint_max_num_view: int = 6
     paint_resolution: int = 512
+    paint_texture_size: int = 4096
     paint_use_remesh: bool = True
+    paint_use_super_resolution: bool = True
     paint_save_glb: bool = True
+    paint_turbo_mode: bool = False  # Enable turbo mode for faster inference
+
+    # Output configuration
+    output_format: str = "glb"  # 'obj' or 'glb'
+
+
+@dataclass
+class Hunyuan3D21PipelineConfig(Hunyuan3D2PipelineConfig):
+    """Pipeline configuration for Hunyuan3D-2.1."""
+
+    shape_subfolder: str = "hunyuan3d-dit-v2-1"
+    vae_subfolder: str = "hunyuan3d-vae-v2-1"
+    paint_subfolder: str = "hunyuan3d-paintpbr-v2-1"
