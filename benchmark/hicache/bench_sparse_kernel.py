@@ -396,6 +396,7 @@ def run_unified_benchmark(
     num_iterations: int,
     test_layer_id: int,
     diff_ratio: float = 0.20,
+    use_cuda_graph: bool = True,
 ):
     print(f"\n========== {kernel_name} Benchmark ==========")
     print(f"Batch Size: {batch_size}")
@@ -466,19 +467,24 @@ def run_unified_benchmark(
     torch.cuda.synchronize()
     print("   Warmup complete")
 
-    # CUDA Graph Capture
-    print("\n[5] Capturing CUDA Graph...")
-    reset_fn(context, 0)
+    # CUDA Graph Capture (optional)
+    graph = None
+    if use_cuda_graph:
+        print("\n[5] Capturing CUDA Graph...")
+        reset_fn(context, 0)
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        kernel_executor(context)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            kernel_executor(context)
 
-    torch.cuda.synchronize()
-    print("   CUDA Graph captured")
+        torch.cuda.synchronize()
+        print("   CUDA Graph captured")
+    else:
+        print("\n[5] Skipping CUDA Graph capture (use_cuda_graph=False)")
 
     # Benchmark
-    print(f"\n[6] Benchmark CUDA Graph Replay ({num_iterations} iterations)...")
+    mode_str = "CUDA Graph Replay" if use_cuda_graph else "Direct Kernel Execution"
+    print(f"\n[6] Benchmark {mode_str} ({num_iterations} iterations)...")
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     elapsed_times = []
@@ -496,7 +502,10 @@ def run_unified_benchmark(
         torch.cuda.synchronize()
 
         start_event.record()
-        graph.replay()
+        if use_cuda_graph:
+            graph.replay()
+        else:
+            kernel_executor(context)
         end_event.record()
         torch.cuda.synchronize()
 
@@ -604,6 +613,16 @@ def setup_jit_kernel(
         (batch_size, top_k), -1, dtype=torch.int32, device="cuda"
     )
     bitmap = torch.full((batch_size, max_seq_len), -1, dtype=torch.int16, device="cuda")
+    
+    # Transfer task buffers for high-performance parallel transfer
+    max_transfer_tasks = batch_size * top_k * page_size
+    transfer_tasks_src = torch.full(
+        (max_transfer_tasks,), -1, dtype=torch.int64, device="cuda"
+    )
+    transfer_tasks_dst = torch.full(
+        (max_transfer_tasks,), -1, dtype=torch.int64, device="cuda"
+    )
+    
     lru_slots = (
         torch.arange(top_k, dtype=torch.int16, device="cuda")
         .unsqueeze(0)
@@ -702,6 +721,8 @@ def setup_jit_kernel(
         "page_table": page_table,
         "bitmap": bitmap,
         "lru_slots": lru_slots,
+        "transfer_tasks_src": transfer_tasks_src,
+        "transfer_tasks_dst": transfer_tasks_dst,
         "prev_top_k_result": prev_top_k_result,
         "req_pool_indices": req_pool_indices,
         "sparse_mask": torch.ones(batch_size, dtype=torch.bool, device="cuda"),
@@ -749,7 +770,8 @@ def execute_jit_kernel(context):
         req_pool_indices=context["req_pool_indices"],
         sparse_mask=context["sparse_mask"],
         seq_lens=context["seq_lens"],
-        # lru_slots=context['lru_slots'],
+        transfer_tasks_src=context["transfer_tasks_src"],
+        transfer_tasks_dst=context["transfer_tasks_dst"],
         page_size=context["page_size"],
         layer_id=context["layer_id"],
         item_size_bytes=context["item_size_bytes"],
@@ -838,6 +860,7 @@ def benchmark_jit_kernel_with_graph(
     num_iterations: int,
     test_layer_id: int,
     diff_ratio: float = 0.20,
+    use_cuda_graph: bool = True,
 ):
     """Benchmark JIT kernel using unified runner."""
     return run_unified_benchmark(
@@ -856,6 +879,7 @@ def benchmark_jit_kernel_with_graph(
         num_iterations=num_iterations,
         test_layer_id=test_layer_id,
         diff_ratio=diff_ratio,
+        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -895,6 +919,12 @@ def main():
         help="Ratio of different tokens between prev and curr top-k (0.0 to 1.0)",
     )
     parser.add_argument(
+        "--use_cuda_graph",
+        action="store_true",
+        default=False,
+        help="Use CUDA Graph for kernel execution (default: False, direct execution)",
+    )
+    parser.add_argument(
         "--test_mode",
         type=str,
         default="jit",
@@ -927,6 +957,7 @@ def main():
             num_iterations=args.num_iterations,
             test_layer_id=args.test_layer_id,
             diff_ratio=args.diff_ratio,
+            use_cuda_graph=args.use_cuda_graph,
         )
     print("\nDone!")
 

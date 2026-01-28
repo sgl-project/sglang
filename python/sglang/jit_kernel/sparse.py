@@ -42,6 +42,8 @@ def load_cache_to_device_buffer_mla(
     req_pool_indices: torch.Tensor,
     sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
+    transfer_tasks_src: torch.Tensor,
+    transfer_tasks_dst: torch.Tensor,
     page_size: int,
     layer_id: int,
     item_size_bytes: int,
@@ -62,9 +64,12 @@ def load_cache_to_device_buffer_mla(
         device_buffer: Device K buffer data
         top_k_device_locs: Output device locations for top-k tokens, shape (bs, num_top_k)
         page_table: Page table for memory management
+        diff_map: Diff map for tracking token changes
         req_pool_indices: Request pool indices
         sparse_mask: Sparse mask to enable/disable sparse attention per request
         seq_lens: Sequence lengths for each request
+        transfer_tasks_src: Transfer task source indices buffer
+        transfer_tasks_dst: Transfer task destination indices buffer
         page_size: Page size for memory management
         layer_id: Current layer ID
         item_size_bytes: Size of each cache item in bytes
@@ -103,6 +108,8 @@ def load_cache_to_device_buffer_mla(
         req_pool_indices,
         sparse_mask,
         seq_lens,
+        transfer_tasks_src,
+        transfer_tasks_dst,
         page_size,
         layer_id,
         item_size_bytes,
@@ -124,6 +131,8 @@ def load_cache_to_device_buffer(
     req_pool_indices: torch.Tensor,
     sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
+    transfer_tasks_src: torch.Tensor,
+    transfer_tasks_dst: torch.Tensor,
     page_size: int,
     layer_id: int,
     item_size_bytes: int,
@@ -146,9 +155,12 @@ def load_cache_to_device_buffer(
         device_buffer_v: Device V buffer data
         top_k_device_locs: Output device locations for top-k tokens, shape (bs, num_top_k)
         page_table: Page table for memory management
+        diff_map: Diff map for tracking token changes
         req_pool_indices: Request pool indices
         sparse_mask: Sparse mask to enable/disable sparse attention per request
         seq_lens: Sequence lengths for each request
+        transfer_tasks_src: Transfer task source indices buffer
+        transfer_tasks_dst: Transfer task destination indices buffer
         page_size: Page size for memory management
         layer_id: Current layer ID
         item_size_bytes: Size of each cache item in bytes
@@ -184,6 +196,8 @@ def load_cache_to_device_buffer(
         req_pool_indices,
         sparse_mask,
         seq_lens,
+        transfer_tasks_src,
+        transfer_tasks_dst,
         page_size,
         layer_id,
         item_size_bytes,

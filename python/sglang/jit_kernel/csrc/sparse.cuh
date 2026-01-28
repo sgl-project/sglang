@@ -8,6 +8,112 @@
 
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <stdexcept>
+#include <string>
+
+namespace device::warp {
+
+template <typename T, std::size_t N>
+struct device_vec {
+  T data[N];
+};
+
+namespace details {
+
+template <std::size_t kUnit>
+inline constexpr auto get_mem_package() {
+  if constexpr (kUnit == 16) {
+    return uint4{};
+  } else if constexpr (kUnit == 8) {
+    return uint2{};
+  } else if constexpr (kUnit == 4) {
+    return uint1{};
+  } else {
+    static_assert(kUnit == 16 || kUnit == 8 || kUnit == 4, "Unsupported memory package size");
+  }
+}
+
+template <std::size_t kBytes, std::size_t kUnit>
+using mem_package_t = decltype(get_mem_package<kUnit>());
+
+__always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+  uint32_t tmp;
+  asm volatile("ld.global.cs.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
+  return uint1{tmp};
+}
+
+__always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+  uint32_t tmp0, tmp1;
+  asm volatile("ld.global.cs.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
+  return uint2{tmp0, tmp1};
+}
+
+__always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+  uint32_t tmp0, tmp1, tmp2, tmp3;
+  asm volatile("ld.global.cs.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
+  return uint4{tmp0, tmp1, tmp2, tmp3};
+}
+
+__always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+  uint32_t tmp = value.x;
+  asm volatile("st.global.cs.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+}
+
+__always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+  uint32_t tmp0 = value.x;
+  uint32_t tmp1 = value.y;
+  asm volatile("st.global.cs.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+}
+
+__always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+  uint32_t tmp0 = value.x;
+  uint32_t tmp1 = value.y;
+  uint32_t tmp2 = value.z;
+  uint32_t tmp3 = value.w;
+  asm volatile("st.global.cs.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+}
+
+}  // namespace details
+
+template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads>
+__always_inline __device__ auto load_vec(const void* __restrict__ src) {
+  using Package = details::mem_package_t<kBytes, kUnit>;
+  constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
+  constexpr auto kLoopCount = kBytes / kBytesPerLoop;
+  static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
+
+  const auto src_packed = static_cast<const Package*>(src);
+  const auto lane_id = threadIdx.x % kThreads;
+  device_vec<Package, kLoopCount> vec;
+
+#pragma unroll kLoopCount
+  for (std::size_t i = 0; i < kLoopCount; ++i) {
+    const auto j = i * kThreads + lane_id;
+    vec.data[i] = details::load_nc(src_packed + j);
+  }
+
+  return vec;
+}
+
+template <std::size_t kBytes, std::size_t kUnit, std::size_t kThreads, typename Tp>
+__always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec) {
+  using Package = details::mem_package_t<kBytes, kUnit>;
+  constexpr auto kBytesPerLoop = sizeof(Package) * kThreads;
+  constexpr auto kLoopCount = kBytes / kBytesPerLoop;
+  static_assert(kBytes % kBytesPerLoop == 0, "kBytes must be multiple of 128 bytes");
+  static_assert(std::is_same_v<Tp, device_vec<Package, kLoopCount>>);
+
+  const auto dst_packed = static_cast<Package*>(dst);
+  const auto lane_id = threadIdx.x % kThreads;
+
+#pragma unroll kLoopCount
+  for (std::size_t i = 0; i < kLoopCount; ++i) {
+    const auto j = i * kThreads + lane_id;
+    details::store_nc(dst_packed + j, vec.data[i]);
+  }
+}
+
+}  // namespace device::warp
 
 namespace {
 
@@ -70,6 +176,54 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
   return accumulator;
 }
 
+// High-performance transfer kernel using vectorized warp-level load/store
+template <std::size_t kItemSize, int BLOCK_SIZE>
+__global__ void parallel_transfer_kernel(
+    int64_t* __restrict__ transfer_tasks_src,
+    int64_t* __restrict__ transfer_tasks_dst,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    int64_t total_tasks,
+    bool is_mla) {
+  constexpr int WARP_THREADS = WARP_SIZE;
+  constexpr int kGranularity = 128 / WARP_THREADS;
+  
+  const int task_id = blockIdx.x * (BLOCK_SIZE / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+  
+  if (task_id >= total_tasks) return;
+  
+  const int64_t src_loc = transfer_tasks_src[task_id];
+  const int64_t dst_loc = transfer_tasks_dst[task_id];
+  
+  if (src_loc < 0 || dst_loc < 0) return;
+  
+  const int64_t src_offset = src_loc * kItemSize;
+  const int64_t dst_offset = dst_loc * kItemSize;
+  
+  const auto src_k = static_cast<const char*>(host_cache_k) + src_offset;
+  const auto dst_k = static_cast<char*>(device_buffer_k) + dst_offset;
+  
+  const auto vec_k = device::warp::load_vec<kItemSize, kGranularity, WARP_THREADS>(src_k);
+  device::warp::store_vec<kItemSize, kGranularity, WARP_THREADS>(dst_k, vec_k);
+  
+  if (!is_mla) {
+    const auto src_v = static_cast<const char*>(host_cache_v) + src_offset;
+    const auto dst_v = static_cast<char*>(device_buffer_v) + dst_offset;
+    const auto vec_v = device::warp::load_vec<kItemSize, kGranularity, WARP_THREADS>(src_v);
+    device::warp::store_vec<kItemSize, kGranularity, WARP_THREADS>(dst_v, vec_v);
+  }
+  
+  // Reset task entries after transfer
+  // TODO：Optimize this
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  if (lane_id == 0) {
+    transfer_tasks_src[task_id] = -1;
+    transfer_tasks_dst[task_id] = -1;
+  }
+}
+
 // Each block processes one request
 // IndexT: type for req_pool_indices and seq_lens (int32_t or int64_t), The cuda graph mode requires int32_t
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename IndexT>
@@ -88,6 +242,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     const IndexT* __restrict__ req_pool_indices,
     const bool* __restrict__ sparse_mask,
     const IndexT* __restrict__ seq_lens,
+    int64_t* __restrict__ transfer_tasks_src,
+    int64_t* __restrict__ transfer_tasks_dst,
     int64_t buffer_stride_0,
     int64_t buffer_stride_1,
     int64_t host_stride,
@@ -290,28 +446,18 @@ __global__ void load_cache_to_device_buffer_kernel(
     __syncthreads();
   }
 
-  // Transfer missed items from host cache to device buffer with paging support
-  for (int miss_idx = warp_id; miss_idx < s_total_misses; miss_idx += NUM_WARPS) {
+  // Collect transfer tasks to global queue
+  for (int miss_idx = tid; miss_idx < s_total_misses; miss_idx += BLOCK_SIZE) {
     const int32_t miss_token = s_missed_tokens[miss_idx];
     const int evict_slot = s_evictable_slots[miss_idx];
-
-#pragma unroll
+    
     for (int page_offset = 0; page_offset < page_size; page_offset++) {
-      const int64_t src_offset = my_host_cache_locs[miss_token * page_size + page_offset] * item_size_bytes;
-      const int64_t dst_offset = (my_device_buffer_locs[evict_slot] * page_size + page_offset) * item_size_bytes;
-
-      transfer_item_warp(
-          lane_id,
-          static_cast<const char*>(host_cache_k) + src_offset,
-          static_cast<char*>(device_buffer_k) + dst_offset,
-          item_size_bytes);
-      if constexpr (!IsMLA) {
-        transfer_item_warp(
-            lane_id,
-            static_cast<const char*>(host_cache_v) + src_offset,
-            static_cast<char*>(device_buffer_v) + dst_offset,
-            item_size_bytes);
-      }
+      const int64_t src_loc = my_host_cache_locs[miss_token * page_size + page_offset];
+      const int64_t dst_loc = my_device_buffer_locs[evict_slot] * page_size + page_offset;
+      
+      const int task_idx = (bid * NUM_TOP_K * page_size) + (miss_idx * page_size) + page_offset;
+      transfer_tasks_src[task_idx] = src_loc;
+      transfer_tasks_dst[task_idx] = dst_loc;
     }
   }
 }
@@ -332,6 +478,8 @@ void load_cache_to_device_buffer_impl(
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView sparse_mask,
     tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView transfer_tasks_src,
+    tvm::ffi::TensorView transfer_tasks_dst,
     int64_t page_size,
     int64_t layer_id,
     int64_t item_size_bytes) {
@@ -349,7 +497,6 @@ void load_cache_to_device_buffer_impl(
   const int64_t* host_cache_locs_ptr = static_cast<const int64_t*>(host_cache_locs.data_ptr());
   const int32_t* device_buffer_locs_ptr = static_cast<const int32_t*>(device_buffer_locs.data_ptr());
   const void* host_cache_k_ptr = host_cache_k.data_ptr();
-  // For V cache: set to nullptr if MLA mode OR if tensor is empty (ndim == 0)
   const void* host_cache_v_ptr = (IsMLA || host_cache_v.ndim() == 0) ? nullptr : host_cache_v.data_ptr();
   void* device_buffer_k_ptr = device_buffer_k.data_ptr();
   void* device_buffer_v_ptr = (IsMLA || device_buffer_v.ndim() == 0) ? nullptr : device_buffer_v.data_ptr();
@@ -362,7 +509,12 @@ void load_cache_to_device_buffer_impl(
 
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
-  // Launch kernel with batch size as grid dimension
+  // Get transfer task buffer pointers
+  int64_t* transfer_tasks_src_ptr = static_cast<int64_t*>(transfer_tasks_src.data_ptr());
+  int64_t* transfer_tasks_dst_ptr = static_cast<int64_t*>(transfer_tasks_dst.data_ptr());
+  const int64_t max_transfer_tasks = transfer_tasks_src.shape()[0];
+
+  // Kernel 1: Determine hits/misses and collect transfer tasks
   LaunchKernel(bs, BLOCK_SIZE, device)(
       load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, IndexT>,
       top_k_tokens_ptr,
@@ -379,6 +531,8 @@ void load_cache_to_device_buffer_impl(
       req_pool_indices_ptr,
       sparse_mask_ptr,
       seq_lens_ptr,
+      transfer_tasks_src_ptr,
+      transfer_tasks_dst_ptr,
       buffer_stride_0,
       buffer_stride_1,
       host_stride,
@@ -387,6 +541,36 @@ void load_cache_to_device_buffer_impl(
       page_size,
       layer_id,
       item_size_bytes);
+
+  // Kernel 2: High-performance parallel transfer with runtime dispatch
+  constexpr int TRANSFER_BLOCK_SIZE = 256;
+  constexpr int WARPS_PER_BLOCK = TRANSFER_BLOCK_SIZE / WARP_SIZE;
+  const int64_t num_transfer_blocks = (max_transfer_tasks + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+  
+  if (num_transfer_blocks > 0) {
+#define LAUNCH_TRANSFER_KERNEL(ITEM_SIZE) \
+    LaunchKernel(num_transfer_blocks, TRANSFER_BLOCK_SIZE, device)( \
+        parallel_transfer_kernel<ITEM_SIZE, TRANSFER_BLOCK_SIZE>, \
+        transfer_tasks_src_ptr, transfer_tasks_dst_ptr, \
+        host_cache_k_ptr, host_cache_v_ptr, \
+        device_buffer_k_ptr, device_buffer_v_ptr, \
+        max_transfer_tasks, IsMLA)
+
+    switch (item_size_bytes) {
+      case 128: LAUNCH_TRANSFER_KERNEL(128); break;
+      case 256: LAUNCH_TRANSFER_KERNEL(256); break;
+      case 512: LAUNCH_TRANSFER_KERNEL(512); break;
+      case 1024: LAUNCH_TRANSFER_KERNEL(1024); break;
+      case 1152: LAUNCH_TRANSFER_KERNEL(1152); break;
+      case 2048: LAUNCH_TRANSFER_KERNEL(2048); break;
+      case 4096: LAUNCH_TRANSFER_KERNEL(4096); break;
+      case 8192: LAUNCH_TRANSFER_KERNEL(8192); break;
+      case 16384: LAUNCH_TRANSFER_KERNEL(16384); break;
+      default:
+        throw std::runtime_error("Unsupported item_size_bytes: " + std::to_string(item_size_bytes));
+    }
+#undef LAUNCH_TRANSFER_KERNEL
+  }
 }
 
 // Public launcher that dispatches based on tensor dtype
@@ -406,6 +590,8 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView sparse_mask,
     tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView transfer_tasks_src,
+    tvm::ffi::TensorView transfer_tasks_dst,
     int64_t page_size,
     int64_t layer_id,
     int64_t item_size_bytes) {
@@ -430,6 +616,8 @@ void load_cache_to_device_buffer(
         req_pool_indices,
         sparse_mask,
         seq_lens,
+        transfer_tasks_src,
+        transfer_tasks_dst,
         page_size,
         layer_id,
         item_size_bytes);
@@ -449,6 +637,8 @@ void load_cache_to_device_buffer(
         req_pool_indices,
         sparse_mask,
         seq_lens,
+        transfer_tasks_src,
+        transfer_tasks_dst,
         page_size,
         layer_id,
         item_size_bytes);
