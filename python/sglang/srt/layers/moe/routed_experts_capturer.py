@@ -33,15 +33,28 @@ class _RoutedExpertsDeviceCache:
         num_hidden_layers: int,
         num_experts_per_tok: int,
         num_fused_shared_experts: int,
+        context_len: int,
         device: str,
     ) -> None:
+        server_args = get_global_server_args()
+        chunked_prefill_size = server_args.chunked_prefill_size
+        # chunked_prefill_size <= 0 means disabled
+        # Use max(max_prefill_tokens, context_len) as a conservative limit
+        # because a single request can exceed max_prefill_tokens when chunked prefill is disabled
+        if chunked_prefill_size <= 0:
+            buffer_size = max(
+                server_args.max_prefill_tokens * server_args.dp_size,
+                context_len * server_args.dp_size,
+                max_running_requests,
+            )
+        else:
+            buffer_size = max(
+                chunked_prefill_size * server_args.dp_size,
+                max_running_requests,
+            )
         self.buffer = torch.zeros(
             (
-                max(
-                    get_global_server_args().chunked_prefill_size
-                    * get_global_server_args().dp_size,
-                    max_running_requests,
-                ),
+                buffer_size,
                 num_hidden_layers,
                 num_experts_per_tok + num_fused_shared_experts,
             ),
@@ -178,6 +191,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             num_hidden_layers=self.num_hidden_layers,
             num_experts_per_tok=self.num_experts_per_tok,
             num_fused_shared_experts=self.num_fused_shared_experts,
+            context_len=model_config.context_len,
             device=device,
         )
 
