@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -47,6 +49,10 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+if _is_npu:
+    import torch_npu
+
+    NPU_FORMAT_FRACTAL_NZ = 29
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
@@ -230,6 +236,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
+        if _is_npu:
+            for weight_name in ["w13_weight", "w2_weight"]:
+                weight = getattr(layer, weight_name)
+                origin_data = weight.data
+                weight.data = torch_npu.npu_format_cast(
+                    origin_data, NPU_FORMAT_FRACTAL_NZ
+                )
+                origin_data.untyped_storage().resize_(0)
+            if layer.w13_weight.shape[-1] == layer.hidden_size:
+                layer.w13_weight.data = layer.w13_weight.transpose(1, 2)
+                layer.w2_weight.data = layer.w2_weight.transpose(1, 2)
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
@@ -460,7 +478,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        import torch_npu
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -473,30 +490,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_ids = topk_ids.to(torch.int32)
         num_experts = layer.num_experts
         top_k = layer.top_k
-        row_idx_len = num_tokens * top_k
-        row_idx = (
-            torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-            .view(top_k, -1)
-            .permute(1, 0)
-            .contiguous()
-        )
 
-        hidden_states, expanded_row_idx, expanded_expert_idx = (
-            torch_npu.npu_moe_init_routing(
-                x, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+
+        hidden_states, expanded_row_idx, expert_tokens, _ = (
+            torch_npu.npu_moe_init_routing_v2(
+                x,
+                topk_ids,
+                active_num=num_tokens * top_k,
+                expert_num=num_experts,
+                expert_tokens_num_type=1,
+                expert_tokens_num_flag=True,
+                active_expert_range=[0, num_experts],
+                quant_mode=-1,
             )
         )
-
-        expert_tokens = torch_npu.npu_moe_compute_expert_tokens(
-            expanded_expert_idx, num_experts
-        )
-
         expert_tokens = expert_tokens.to(torch.int64)
         w13_bias = [layer.w13_weight_bias] if self.with_bias else None
         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
-        if layer.w13_weight.shape[-1] == layer.hidden_size:
-            w13 = layer.w13_weight.transpose(1, 2)
-            w2 = layer.w2_weight.transpose(1, 2)
 
         # gmm1: gate_up_proj
         hidden_states = torch_npu.npu_grouped_matmul(
@@ -504,7 +516,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             weight=[w13],
             bias=w13_bias,
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=original_dtype,
@@ -528,7 +540,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             weight=[w2],
             bias=w2_bias,
             split_item=2,
-            group_list_type=0,
+            group_list_type=1,
             group_type=0,
             group_list=expert_tokens,
             output_dtype=original_dtype,
@@ -542,6 +554,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             scales=topk_weights,
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=topk_ids,
+            drop_pad_mode=2,
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)
