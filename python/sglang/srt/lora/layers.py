@@ -602,6 +602,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_a_weights = None
         self.down_lora_b_weights = None
         self._lora_runner = None
+        self.max_lora_rank = 0  # Will be set by LoRAManager
 
     def set_lora_info(
         self,
@@ -641,6 +642,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_ranks = batch_info.lora_ranks  # [num_loras]
         scalings = batch_info.scalings  # [num_loras]
 
+        # Use global max LoRA rank set by LoRAManager
+        max_lora_rank = self.max_lora_rank
+
         # Create adapter_enabled tensor for the current batch
         # All LoRAs in the batch are enabled by definition
         adapter_enabled = torch.ones(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
@@ -666,6 +670,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_ranks=lora_ranks,
             lora_scalings=scalings,
             adapter_enabled=adapter_enabled,
+            max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
         )
 

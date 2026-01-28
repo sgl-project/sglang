@@ -70,6 +70,7 @@ class LoRAInfo:
     lora_ranks: torch.Tensor  # [num_loras]
     lora_scalings: torch.Tensor  # [num_loras]
     adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
+    max_lora_rank: int  # Maximum LoRA rank across all adapters
 
     num_experts: int
 
@@ -430,15 +431,15 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # Output shape: [M, top_k, gate_up_dim]
         # Hidden_states shape: [M, hidden_dim] (handles token duplication internally)
 
+        # Skip LoRA computation if no LoRA adapters have non-zero rank
+        if lora_info.max_lora_rank == 0:
+            return
+
         # Create num_tokens_post_padded tensor for vLLM kernel
         # It expects shape (max_loras,) with the same value for each LoRA
         num_loras = len(lora_info.lora_ranks)
         num_tokens_post_padded_formatted = num_tokens_post_padded.expand(num_loras)
-        actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
-
-        # Skip LoRA computation if no LoRA adapters have non-zero rank
-        if actual_max_lora_rank == 0:
-            return
+        actual_max_lora_rank = lora_info.max_lora_rank
 
         lora_a_stacked = [lora_info.gate_up_lora_a_weights]
         lora_b_stacked = [lora_info.gate_up_lora_b_weights]
@@ -497,15 +498,16 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         # Data format adaptation for vLLM kernel
         num_dispatched_down = lora_info.token_ids.shape[0]
+
+        # Skip LoRA computation if no LoRA adapters have non-zero rank
+        if lora_info.max_lora_rank == 0:
+            return
+
         # Create num_tokens_post_padded tensor for vLLM kernel
         # It expects shape (max_loras,) with the same value for each LoRA
         num_loras = len(lora_info.lora_ranks)
         num_tokens_post_padded_formatted = num_tokens_post_padded.expand(num_loras)
-        actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
-
-        # Skip LoRA computation if no LoRA adapters have non-zero rank
-        if actual_max_lora_rank == 0:
-            return
+        actual_max_lora_rank = lora_info.max_lora_rank
 
         # Handle multi-LoRA: stack weights for all loaded LoRAs
         # lora_info.down_lora_a_weights shape: [num_loras, num_experts, max_rank, intermediate_dim]

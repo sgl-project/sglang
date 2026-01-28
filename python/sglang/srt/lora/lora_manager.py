@@ -354,6 +354,7 @@ class LoRAManager:
                         down_lora_a_weights=down_a,
                         down_lora_b_weights=down_b,
                     )
+                    module.max_lora_rank = self.max_lora_rank
                     continue
 
                 target_module = get_target_module_name(
