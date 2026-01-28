@@ -254,8 +254,8 @@ class MooncakeTransferEngine:
     def get_session_id(self):
         return self.session_id
 
-    def get_engine_ptr(self):
-        return self.engine.get_engine_ptr()
+    def get_engine(self):
+        return self.engine.get_engine()
 
 
 def init_mooncake_transfer_engine(
