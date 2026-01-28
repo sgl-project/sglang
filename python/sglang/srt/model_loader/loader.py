@@ -335,6 +335,9 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config=model_config,
             )
 
+    counter_before_loading_weights: float = 0.0
+    counter_after_loading_weights: float = 0.0
+
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
         extra_config = load_config.model_loader_extra_config
@@ -544,6 +547,9 @@ class DefaultModelLoader(BaseModelLoader):
                 filtered_weights.append((source.prefix + new_name, tensor))
             return tuple(filtered_weights)
 
+        if self.counter_before_loading_weights == 0.0:
+            logger.info("Beginning to load weights")
+            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -663,6 +669,11 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        self.counter_after_loading_weights = time.perf_counter()
+        logger.info(
+            "Loading weights took %.2f seconds",
+            self.counter_after_loading_weights - self.counter_before_loading_weights,
+        )
         return model.eval()
 
     @staticmethod

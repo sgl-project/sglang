@@ -1339,6 +1339,21 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
+        elif nsa_impl == "trtllm":
+            assert forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend(
+                include_v2=True
+            ), "TRT-LLM NSA only supports target_verify/draft_extend; normal extend untested."
+            if q_rope is not None:
+                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+            # Use expanded seq_lens for per-token decode in target_verify/draft_extend.
+            return self._forward_trtllm(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                metadata=metadata,
+                sm_scale=layer.scaling,
+                seq_lens=metadata.nsa_cache_seqlens_int32,
+            )
         else:
             raise ValueError(f"Unsupported {nsa_impl = }")
 
@@ -1468,6 +1483,7 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 metadata=metadata,
                 sm_scale=layer.scaling,
+                seq_lens=metadata.cache_seqlens_int32,
             )
 
         else:
@@ -1736,6 +1752,7 @@ class NativeSparseAttnBackend(
         page_table_1: torch.Tensor,
         metadata: NSAMetadata,
         sm_scale: float,
+        seq_lens: torch.Tensor,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
@@ -1755,7 +1772,7 @@ class NativeSparseAttnBackend(
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
-            seq_lens=metadata.cache_seqlens_int32,
+            seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=sm_scale,
