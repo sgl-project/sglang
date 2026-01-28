@@ -432,6 +432,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         )
         actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
 
+        # Skip LoRA computation if no LoRA adapters have non-zero rank
+        if actual_max_lora_rank == 0:
+            return
+
         lora_a_stacked = [lora_info.gate_up_lora_a_weights]
         lora_b_stacked = [lora_info.gate_up_lora_b_weights]
 
@@ -492,6 +496,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             [num_dispatched_down], dtype=torch.int32, device=intermediate_input.device
         )
         actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
+
+        # Skip LoRA computation if no LoRA adapters have non-zero rank
+        if actual_max_lora_rank == 0:
+            return
 
         # Handle multi-LoRA: stack weights for all loaded LoRAs
         # lora_info.down_lora_a_weights shape: [num_loras, num_experts, max_rank, intermediate_dim]
