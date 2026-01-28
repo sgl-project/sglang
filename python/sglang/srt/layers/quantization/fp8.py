@@ -1126,10 +1126,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
-        import os
 
-        if os.environ.get("HPC_OPS") == "1":
-            import hpc
+        if get_moe_runner_backend().is_hpc_ops():
+
+            try:
+                import hpc
+            except ImportError:
+                raise ImportError(
+                    "hpc_ops import failed, please install hpc_ops package from https://github.com/Tencent/hpc-ops"
+                )
 
             from sglang.srt.distributed import (
                 get_moe_expert_parallel_rank,
@@ -1171,7 +1176,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             expected_w2_last_dim = ((intermediate_size // 128 + 3) // 4) * 4
             actual_w2_last_dim = w2_weight_scale_inv.shape[2]
             if actual_w2_last_dim % 4 != 0 or actual_w2_last_dim < expected_w2_last_dim:
-                # Need to pad: either not aligned to 4, or smaller than expected
+                # Need to pad: either not aligned to 4
                 num_expert_local, num_blocks_hidden, num_blocks_intermediate = (
                     w2_weight_scale_inv.shape
                 )
@@ -1195,7 +1200,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     topk_ids,
                 )
 
-            my = hpc.fuse_moe_blockwise_fp8(
+            output = hpc.fuse_moe_blockwise_fp8(
                 x_q,
                 x_scale,
                 layer.w13_weight,
@@ -1207,10 +1212,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 rank_ep,
                 layer.num_local_experts,
             )
-            # logger.info(f"topk_ids: {topk_ids} topk_ids shape: {topk_ids.shape}")
 
-            # logger.info(f"my shape: {my.shape} num_local_experts: {layer.num_local_experts}")
-            return StandardCombineInput(hidden_states=my)
+            return StandardCombineInput(hidden_states=output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
