@@ -665,6 +665,34 @@ class FusedMoE(torch.nn.Module):
     ) -> None:
         tp_rank = self.moe_tp_rank
 
+        # Special case for GGUF weights
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+
+        if is_gguf_weight_type:
+            # Store weight type for this expert
+            param.weight_type = loaded_weight.item()
+            return
+
+        if is_gguf_weight:
+            output_dim = getattr(param, "output_dim", None)
+            if self.moe_tp_size > 1:
+                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
+                    shard_size = loaded_weight.size(0) // self.moe_tp_size
+                    start_idx = tp_rank * shard_size
+                    loaded_weight = loaded_weight.narrow(
+                        0, start_idx, shard_size
+                    ).clone()
+
+            # Store in data_container with expert/shard info
+            if not hasattr(param, "expert_data_map"):
+                param.expert_data_map = {}
+
+            key = (expert_id, shard_id)
+            param.expert_data_map[key] = loaded_weight
+            param.data_container.append(loaded_weight)
+            return
+
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
@@ -1104,6 +1132,62 @@ class FusedMoE(torch.nn.Module):
             # TODO: remove this branch after MoE refactor
             self.down_gemm_overlap_args = None
             self.meta_overlap_args = None
+
+    def materialize_gguf_weights(self) -> None:
+        """Process weights after loading, especially for GGUF quantization.
+
+        This materializes GGUF UninitializedParameters from their data_containers.
+        """
+        from torch.nn.parameter import UninitializedParameter
+
+        for name, param in list(self.named_parameters()):
+            is_gguf_weight = getattr(param, "is_gguf_weight", False)
+
+            if is_gguf_weight and isinstance(param, UninitializedParameter):
+                data_container = getattr(param, "data_container", [])
+                expert_data_map = getattr(param, "expert_data_map", {})
+                tensor_shape = getattr(param, "tensor_shape", None)
+
+                if data_container and tensor_shape:
+                    # Determine the structure from expert_data_map
+                    num_experts = tensor_shape[0]
+
+                    # Collect weights by expert
+                    expert_weights = {}
+                    for (expert_id, shard_id), weight in expert_data_map.items():
+                        if expert_id not in expert_weights:
+                            expert_weights[expert_id] = {}
+                        expert_weights[expert_id][shard_id] = weight
+
+                    # Build the full tensor
+                    if "w13" in name:
+                        # w13 is gate+up fused
+                        weight_list = []
+                        for e in range(num_experts):
+                            if e in expert_weights:
+                                w1 = expert_weights[e].get("w1")
+                                w3 = expert_weights[e].get("w3")
+
+                                if w1 is not None and w3 is not None:
+                                    fused = torch.cat([w1, w3], dim=0)
+                                    weight_list.append(fused)
+
+                        if weight_list:
+                            stacked = torch.stack(weight_list, dim=0)
+                            param.materialize(stacked.shape, dtype=stacked.dtype)
+                            param.data.copy_(stacked)
+                    elif "w2" in name:
+                        # w2 is down projection
+                        weight_list = []
+                        for e in range(num_experts):
+                            if e in expert_weights and "w2" in expert_weights[e]:
+                                w2_weight = expert_weights[e]["w2"]
+                                weight_list.append(w2_weight)
+
+                        if weight_list:
+                            stacked = torch.stack(weight_list, dim=0)
+                            param.materialize(stacked.shape, dtype=stacked.dtype)
+                            param.data.copy_(stacked)
 
 
 class FlashInferFusedMoE(FusedMoE):

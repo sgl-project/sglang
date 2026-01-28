@@ -571,6 +571,7 @@ class Qwen2MoeModel(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 use_attn_tp_group=is_dp_attention_enabled(),
+                quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
