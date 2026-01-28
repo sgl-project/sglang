@@ -7,7 +7,10 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
+from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
+from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
@@ -23,7 +26,12 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=350, suite="stage-b-test-large-2-gpu")
 
 
-class TestDPAttentionDP2TP2(CustomTestCase):
+class TestDPAttentionDP2TP2(
+    CustomTestCase,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMixin,
+    TestRegexConstrainedMixin,
+):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -63,7 +71,12 @@ class TestDPAttentionDP2TP2(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
-class TestDPRetract(CustomTestCase):
+class TestDPRetract(
+    CustomTestCase,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMixin,
+    TestRegexConstrainedMixin,
+):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -98,7 +111,12 @@ class TestDPRetract(CustomTestCase):
             self.assertIsNone(self.process.poll())
 
 
-class TestDPAttentionDP2TP2DeepseekV3MTP(CustomTestCase):
+class TestDPAttentionDP2TP2DeepseekV3MTP(
+    CustomTestCase,
+    TestJSONConstrainedMixin,
+    TestEBNFConstrainedMixin,
+    TestRegexConstrainedMixin,
+):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA

@@ -33,7 +33,8 @@ __global__ void timestep_embedding_kernel(
   if (row_idx >= batch_size) {
     return;
   }
-  float t_val = castToFloat(__ldg(&t_ptr[row_idx]));
+  // Use the portable LDG helper (maps to __ldg on CUDA, plain load on ROCm/HIP).
+  float t_val = castToFloat(SGLANG_LDG(&t_ptr[row_idx]));
   float* output_batch_base_ptr = output_ptr + row_idx * dim;
 
   // Calculate half dimension

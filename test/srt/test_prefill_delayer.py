@@ -14,7 +14,6 @@ import torch
 import torch.multiprocessing as mp
 
 from sglang.bench_serving import run_benchmark
-from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -502,32 +501,36 @@ def _launch_server(
 ):
     os.environ["SGLANG_PREFILL_DELAYER_DEBUG_LOG"] = "1"
 
-    with envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.override(
-        prefill_delayer
-    ), envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.override(
-        max_delay_passes
-    ), envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.override(
-        token_usage_low_watermark
-    ):
-        return popen_launch_server(
-            model,
-            base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                WORLD_SIZE,
-                "--enable-dp-attention",
-                "--dp",
-                WORLD_SIZE,
-                "--chunked-prefill-size",
-                "131072",
-                "--mem-fraction-static",
-                "0.6",
-                "--enable-metrics",
-                *(other_args or []),
-            ],
-        )
+    return popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=[
+            "--trust-remote-code",
+            "--tp",
+            WORLD_SIZE,
+            "--enable-dp-attention",
+            "--dp",
+            WORLD_SIZE,
+            "--chunked-prefill-size",
+            "131072",
+            "--mem-fraction-static",
+            "0.6",
+            "--enable-metrics",
+            *(["--enable-prefill-delayer"] if prefill_delayer else []),
+            "--prefill-delayer-max-delay-passes",
+            str(max_delay_passes),
+            *(
+                [
+                    "--prefill-delayer-token-usage-low-watermark",
+                    str(token_usage_low_watermark),
+                ]
+                if token_usage_low_watermark is not None
+                else []
+            ),
+            *(other_args or []),
+        ],
+    )
 
 
 def _print_prefill_delayer_metrics(base_url: str, expect_metrics: bool) -> str:

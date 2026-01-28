@@ -102,14 +102,15 @@ ${PROJ_ROOT}/csrc/allreduce/deterministic_all_reduce.hip
 ${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
 ${PROJ_ROOT}/csrc/common_extension_rocm.cc
 ${PROJ_ROOT}/csrc/elementwise/activation.hip
+${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
 ${PROJ_ROOT}/csrc/elementwise/topk.hip
 ${PROJ_ROOT}/csrc/grammar/apply_token_bitmask_inplace_hip.hip
+${PROJ_ROOT}/csrc/kvcacheio/transfer.hip
 ${PROJ_ROOT}/csrc/moe/moe_align_kernel.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_softmax_kernels.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_sigmoid_kernels.hip
+${PROJ_ROOT}/csrc/sgl_diffusion/elementwise/timestep_embedding.hip
 ${PROJ_ROOT}/csrc/speculative/eagle_utils.hip
-${PROJ_ROOT}/csrc/kvcacheio/transfer.hip
-${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
 )
 set_source_files_properties(
   ${SOURCES}

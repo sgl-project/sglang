@@ -296,14 +296,7 @@ def load_dict(file_path):
 def get_diffusers_component_config(
     model_path: str,
 ) -> dict[str, Any]:
-    """Gets a configuration of a submodule for the given diffusers model.
-
-    Args:
-        model_path: the path of the submodule (can be local path or HuggingFace model ID)
-
-    Returns:
-        The loaded configuration.
-    """
+    """Gets a configuration of a submodule for the given diffusers model."""
 
     # Download from HuggingFace Hub if path doesn't exist locally
     if not os.path.exists(model_path):

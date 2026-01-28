@@ -40,13 +40,10 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.use_nan_detection = get_global_server_args().enable_nan_detection
-        tp_group = (
-            get_attention_tp_group() if is_dp_attention_enabled() else get_tp_group()
-        )
-        self.tp_rank = tp_group.rank_in_group
-        self.tp_size = tp_group.world_size
-        self.tp_root_rank = tp_group.ranks[0]
-        self.tp_sync_group = tp_group.device_group
+        self.tp_sync_group = get_tp_group().device_group
+
+        if is_dp_attention_enabled():
+            self.tp_sync_group = get_attention_tp_group().device_group
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -208,21 +205,13 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             ]
 
-        if sampling_info.grammars:
-            if self.tp_size > 1:
-                # Grammar-aware sampling only runs on TP rank 0
-                # We broadcast its choice to keep ranks in sync.
-                dist.broadcast(
-                    batch_next_token_ids,
-                    src=self.tp_root_rank,
-                    group=self.tp_sync_group,
-                )
-        elif SYNC_TOKEN_IDS_ACROSS_TP:
+        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
             # the last all-reduce, the last lm_head matmul, and all sampling kernels.
             # These kernels are deterministic in most cases, but there are some rare instances where they are not deterministic.
             # In such cases, enable this env variable to prevent hanging due to TP ranks becoming desynchronized.
+            # When using xgrammar, this becomes more likely so we also do the sync when grammar is used.
 
             torch.distributed.all_reduce(
                 batch_next_token_ids,
