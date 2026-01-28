@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import pickle
 import random
 import threading
@@ -68,6 +69,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 
 
 def _grpc_encode_request(target, encode_request):
+    timeout_secs = int(os.getenv("SGLANG_ENCODER_GRPC_TIMEOUT_SECS", "60"))
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
@@ -82,7 +84,7 @@ def _grpc_encode_request(target, encode_request):
                     encode_request["embedding_port"]
                 ),
             ),
-            timeout=1800,
+            timeout=timeout_secs,
         )
         return response
     finally:
@@ -90,6 +92,7 @@ def _grpc_encode_request(target, encode_request):
 
 
 def _grpc_send_request(target, request_json):
+    timeout_secs = int(os.getenv("SGLANG_ENCODER_GRPC_TIMEOUT_SECS", "60"))
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
@@ -101,10 +104,11 @@ def _grpc_send_request(target, request_json):
                 session_id=request_json["session_id"],
                 buffer_address=request_json["buffer_address"],
             ),
-            timeout=1800,
+            timeout=timeout_secs,
         )
     finally:
         channel.close()
+
 
 class EmbeddingData:
     def __init__(
@@ -355,7 +359,6 @@ class MMReceiverBase(ABC):
 
 
 class MMReceiverHTTP(MMReceiverBase):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -607,9 +610,7 @@ class MMReceiverHTTP(MMReceiverBase):
                             msg = err_data.get("message", "Unknown encoder error")
                         except Exception:
                             msg = await response.text()
-                        logger.error(
-                            f"Encoder returned error {response.status}: {msg}"
-                        )
+                        logger.error(f"Encoder returned error {response.status}: {msg}")
                         return
                 response_json_list_unsort.extend(
                     [await response.json() for response in responses]
