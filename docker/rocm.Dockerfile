@@ -1,29 +1,18 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
+
 # Default base images
-ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
-ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 942 with rocm630 and args
+# Base image 942 with rocm700 and args
 FROM $BASE_IMAGE_942 AS gfx942
-ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="1"
-ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="1"
-ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.4"
-
-# ===============================
-# Base image 942 and args
-FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -109,7 +98,7 @@ RUN cd aiter \
         fi
 
 # -----------------------
-# Triton
+# Triton (TODO: remove this after Triton is no longer needed)
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         pip uninstall -y triton \
      && git clone ${TRITON_REPO} \
