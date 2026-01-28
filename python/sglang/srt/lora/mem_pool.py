@@ -169,15 +169,23 @@ class LoRAMemoryPool:
                 "num_local_experts",
                 getattr(self.base_hf_config, "num_experts", 0),
             )
-            # Allocate all MoE buffers with the same maximum rank dimension
-            # to ensure consistent kernel compilation. The maximum stacking factor is 2.
-            max_rank_dim = (
-                max_lora_dim * 2
-            )  # Accommodate maximum stacking (gate_up_proj)
+            # # Allocate all MoE buffers with the same maximum rank dimension
+            # # to ensure consistent kernel compilation. The maximum stacking factor is 2.
+            # max_rank_dim = (
+            #     max_lora_dim * 2
+            # )  # Accommodate maximum stacking (gate_up_proj)
+            # return (
+            #     self.max_loras_per_batch,
+            #     num_experts,
+            #     max_rank_dim,
+            #     input_dim,
+            # )
+            if self.is_moe_module(module_name):
+                c = get_stacked_multiply(module_name)  # gate_up_proj_moe=2, down_proj_moe=1
             return (
                 self.max_loras_per_batch,
                 num_experts,
-                max_rank_dim,
+                max_lora_dim * c,  # according to the actual module to allocate
                 input_dim,
             )
         else:
