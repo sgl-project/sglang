@@ -306,11 +306,12 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         self.linear_attn = RadixLinearAttention(
             layer_id=layer_id,
-            num_qk_heads=self.num_k_heads // self.attn_tp_size,
+            num_q_heads=self.num_k_heads // self.attn_tp_size,
+            num_k_heads=self.num_k_heads // self.attn_tp_size,
             num_v_heads=self.num_v_heads // self.attn_tp_size,
-            head_qk_dim=self.head_k_dim,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            attention_tp_size=self.attn_tp_size,
             conv_weights=self.conv1d.weight.squeeze(1),
             bias=self.conv1d.bias,
             activation=self.activation,
@@ -793,7 +794,7 @@ class Qwen3NextModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         def get_layer(idx: int, prefix: str):

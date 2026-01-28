@@ -23,8 +23,7 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
-if _is_npu:
-    import custom_ops  # noqa: F401
+if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -957,11 +956,11 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             weights = self._project_and_scale_head_gates(x)
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+            )
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
-                query, key = self._get_q_k_bf16(
-                    q_lora, x, positions, False, forward_batch=forward_batch
-                )
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
             current_stream.wait_stream(self.alt_stream)
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -1113,6 +1112,7 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
@@ -1136,6 +1136,9 @@ class Indexer(MultiPlatformOp):
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
+                q_lora = (
+                    (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+                )
                 q = self.wq_b(q_lora)[
                     0
                 ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
@@ -1154,6 +1157,7 @@ class Indexer(MultiPlatformOp):
                 q.record_stream(self.alt_stream)
                 q_rope_event = self.alt_stream.record_event()
         else:
+            q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
             q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
             q_pe, q_nope = torch.split(
@@ -1272,6 +1276,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv,
                 block_table,
             )
+            return topk_indices
         else:
             block_table = (
                 block_table[: actual_seq_lengths_q.size()[0]]
@@ -1279,7 +1284,7 @@ class Indexer(MultiPlatformOp):
                 else block_table
             )
 
-            topk_indices = torch.ops.custom.npu_lightning_indexer(
+            topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
@@ -1293,8 +1298,7 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-
-        return topk_indices
+            return topk_indices[0]
 
     def do_npu_cp_balance_indexer(
         self,
@@ -1317,7 +1321,7 @@ class Indexer(MultiPlatformOp):
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        topk_indices_prev = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,
             key=past_key_states,
             weights=weights_prev,
@@ -1333,7 +1337,7 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        topk_indices_next = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_next = torch_npu.npu_lightning_indexer(
             query=q_next,
             key=past_key_states,
             weights=weights_next,
@@ -1349,4 +1353,4 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev, topk_indices_next
+        return topk_indices_prev[0], topk_indices_next[0]
