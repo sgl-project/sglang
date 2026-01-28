@@ -400,6 +400,12 @@
                     </select>
                 </div>
                 <div class="filter-group">
+                    <label>Input/Output Length</label>
+                    <select id="io-len-filter" onchange="updateCharts()">
+                        <option value="all">All Lengths</option>
+                    </select>
+                </div>
+                <div class="filter-group">
                     <label>Batch Size</label>
                     <select id="batch-filter" onchange="updateCharts()">
                         <option value="all">All Batch Sizes</option>
