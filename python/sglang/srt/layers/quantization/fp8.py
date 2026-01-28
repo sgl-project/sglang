@@ -102,6 +102,25 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
 
+from torch.utils._python_dispatch import TorchDispatchMode
+class CopyNumelCounter(TorchDispatchMode):
+    """
+    Tracks total number of elements modified with `copy_`. Useful for keeping
+    track of weight loading where underlying weights can be arbitrarily
+    transformed (such as with `narrow`) before calling copy.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.copied_numel = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if kwargs is None:
+            kwargs = {}
+        out = func(*args, **kwargs)
+        if func == torch.ops.aten.copy_.default:
+            self.copied_numel += args[0].numel()
+        return out
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -135,6 +154,9 @@ class Fp8Config(QuantizationConfig):
                 )
         self.weight_block_size = weight_block_size
 
+        if not is_checkpoint_fp8_serialized:
+            logger.info("Quantizing model to FP8 on the fly during loading.")
+
     @classmethod
     def get_name(cls) -> str:
         return "fp8"
@@ -163,6 +185,7 @@ class Fp8Config(QuantizationConfig):
             # hack for ministral
             ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
+
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
@@ -189,7 +212,6 @@ class Fp8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
 
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
@@ -230,6 +252,9 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
+
+        if self.block_quant and not self.is_checkpoint_fp8_serialized:
+            raise ValueError(f"block_quant={self.block_quant} is not supported along online quantization (is_checkpoint_fp8_serialized={self.is_checkpoint_fp8_serialized}).")
 
     def validate_block_quant_shapes(
         self,
@@ -288,7 +313,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
-        weight_loader = extra_weight_attrs.get("weight_loader")
+        original_weight_loader = extra_weight_attrs.get("weight_loader")
 
         if self.block_quant:
             block_n, block_k = self.quant_config.weight_block_size
@@ -305,6 +330,16 @@ class Fp8LinearMethod(LinearMethodBase):
         weight_dtype = (
             torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
         )
+
+        # Wrap weight loader for online quantization if checkpoint is not fp8 serialized
+        if not self.is_checkpoint_fp8_serialized:
+            layer.weight_scale = None
+            layer._loaded_numel = 0
+
+            weight_loader = self.get_weight_loader(layer, original_weight_loader)
+        else:
+            weight_loader = original_weight_loader
+
         weight = ModelWeightParameter(
             data=torch.empty(
                 output_size_per_partition, input_size_per_partition, dtype=weight_dtype
@@ -315,10 +350,9 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        # If checkpoint is serialized fp8, load them.
-        # Otherwise, wait until process_weights_after_loading.
-        if self.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALE
+        if not self.is_checkpoint_fp8_serialized:
+            layer.input_scale = None
+        else:
             if self.block_quant:
                 if hasattr(self.quant_config, "activation_scheme"):
                     assert self.quant_config.activation_scheme == "dynamic"
@@ -338,30 +372,92 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
+                # If checkpoint is serialized fp8, load the scales.
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
+                    weight_loader=(
+                        weight_loader if self.is_checkpoint_fp8_serialized
+                        else None
+                    ),
                 )
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale", scale)
 
-            # INPUT ACTIVATION SCALE
-            if (
-                hasattr(self.quant_config, "activation_scheme")
-                and self.quant_config.activation_scheme == "static"
-            ) or (
-                hasattr(self.quant_config, "linear_activation_scheme")
-                and self.quant_config.linear_activation_scheme == "static"
-            ):
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
+                # INPUT ACTIVATION SCALE
+                if (
+                    hasattr(self.quant_config, "activation_scheme")
+                    and self.quant_config.activation_scheme == "static"
+                ) or (
+                    hasattr(self.quant_config, "linear_activation_scheme")
+                    and self.quant_config.linear_activation_scheme == "static"
+                ):
+                    if not self.is_checkpoint_fp8_serialized:
+                        raise ValueError(
+                            "Static activation scheme is only supported with fp8 serialized checkpoints."
+                        )
+                    scale = PerTensorScaleParameter(
+                        data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                        weight_loader=weight_loader,
+                    )
 
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("input_scale", scale)
-            else:
-                layer.register_parameter("input_scale", None)
+                    scale[:] = torch.finfo(torch.float32).min
+                    layer.register_parameter("input_scale", scale)
+                else:
+                    layer.register_parameter("input_scale", None)
+
+    def get_weight_loader(self, layer, original_weight_loader):
+        def online_fp8_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            shard_id: int | None = None,
+        ):
+            # Move to device for faster quantization
+            loaded_weight = loaded_weight.to(param.device)
+
+            kwargs = {}
+            if shard_id is not None:
+                kwargs["loaded_shard_id"] = shard_id
+            
+            # In case TP>1, the weight loader logic uses narrow so we can not directly rely on param.shape or loaded_weight.shape.
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                # Loads the quantized weight.
+                original_weight_loader(
+                    param,
+                    loaded_weight,
+                    **kwargs
+                )
+            
+            layer._loaded_numel += copy_numel_counter.copied_numel
+            target_loaded_numel = layer.weight.numel()
+
+            assert layer._loaded_numel <= target_loaded_numel, f"target_loaded_numel={target_loaded_numel}, layer._loaded_numel={layer._loaded_numel}"
+
+            if layer._loaded_numel == target_loaded_numel:
+                full_loaded_weight = layer.weight
+
+                if (
+                    self.cutlass_fp8_supported
+                    or self.use_marlin
+                    or (_use_aiter and self.use_aiter_fp8_per_token)
+                ):
+                    # apply per-channel quantization default as
+                    # cutlass sgl-kernel and marlin only support per-channel scale
+                    qweight, weight_scale = per_token_group_quant_fp8(
+                        full_loaded_weight, loaded_weight.shape[-1]
+                    )
+                    weight_scale = weight_scale.t().contiguous()
+                    if _use_aiter and self.use_aiter_fp8_per_token:
+                        self.use_per_token_if_dynamic = True
+                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
+                else:
+                    # per-tensor quantization
+                    qweight, weight_scale = input_to_float8(full_loaded_weight)
+
+                layer.weight_scale = weight_scale
+                layer.weight = torch.nn.Parameter(qweight, requires_grad=False)
+
+        return online_fp8_weight_loader
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -418,39 +514,16 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
         else:
-            layer.weight = Parameter(layer.weight.data, requires_grad=False)
-
-            # If checkpoint not serialized fp8, quantize the weights.
             if not self.is_checkpoint_fp8_serialized:
-                if (
-                    self.cutlass_fp8_supported
-                    or self.use_marlin
-                    or (_use_aiter and self.use_aiter_fp8_per_token)
-                ):
-                    # apply per-channel quantization default as
-                    # cutlass sgl-kernel and marlin only support per-channel scale
-                    qweight, weight_scale = per_token_group_quant_fp8(
-                        layer.weight, layer.weight.shape[-1]
-                    )
-                    weight_scale = weight_scale.t().contiguous()
-                    if _use_aiter and self.use_aiter_fp8_per_token:
-                        self.use_per_token_if_dynamic = True
-                        qweight = shuffle_weight(qweight.contiguous(), (16, 16))
-                else:
-                    # per-tensor quantization
-                    qweight, weight_scale = input_to_float8(layer.weight)
+                assert layer.weight_scale is not None
+                layer.weight.data = layer.weight.data.t()
 
-                # Update the layer with the new values.
-                layer.weight = Parameter(qweight.t(), requires_grad=False)
-                layer.weight_scale = Parameter(weight_scale, requires_grad=False)
-                layer.input_scale = None
+            layer.weight = Parameter(layer.weight.data, requires_grad=False)
+            layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
 
             # If checkpoint is fp8, handle that there are N scales for N
             # shards in a fused module
-            else:
-                layer.weight_scale = Parameter(
-                    layer.weight_scale.data, requires_grad=False
-                )
+            if self.is_checkpoint_fp8_serialized:
                 if (
                     hasattr(self.quant_config, "activation_scheme")
                     and self.quant_config.activation_scheme == "static"
