@@ -20,16 +20,36 @@ inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic
   return static_cast<uint32_t>(num_blocks_per_sm);
 }
 
+// RAII guard to temporarily set CUDA device and restore it on scope exit
+struct ScopedDeviceGuard {
+  int original_device;
+  bool needs_restore;
+
+  explicit ScopedDeviceGuard(int target_device) : needs_restore(false) {
+    RuntimeDeviceCheck(cudaGetDevice(&original_device));
+    if (original_device != target_device) {
+      RuntimeDeviceCheck(cudaSetDevice(target_device));
+      needs_restore = true;
+    }
+  }
+
+  ~ScopedDeviceGuard() {
+    if (needs_restore) {
+      RuntimeDeviceCheck(cudaSetDevice(original_device));
+    }
+  }
+
+  // Non-copyable, non-movable
+  ScopedDeviceGuard(const ScopedDeviceGuard&) = delete;
+  ScopedDeviceGuard& operator=(const ScopedDeviceGuard&) = delete;
+};
+
 // Return the number of SMs for the given device
 inline auto get_sm_count(int device_id) -> uint32_t {
   // Set the CUDA device context before querying device attributes
   // This is necessary when CUDA_VISIBLE_DEVICES is set, as the device_id
   // is a logical device ID and requires a context to be set first
-  int current_device;
-  RuntimeDeviceCheck(cudaGetDevice(&current_device));
-  if (current_device != device_id) {
-    RuntimeDeviceCheck(cudaSetDevice(device_id));
-  }
+  ScopedDeviceGuard guard(device_id);
   int sm_count;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
   return static_cast<uint32_t>(sm_count);
@@ -40,11 +60,7 @@ inline auto get_cc_major(int device_id) -> int {
   // Set the CUDA device context before querying device attributes
   // This is necessary when CUDA_VISIBLE_DEVICES is set, as the device_id
   // is a logical device ID and requires a context to be set first
-  int current_device;
-  RuntimeDeviceCheck(cudaGetDevice(&current_device));
-  if (current_device != device_id) {
-    RuntimeDeviceCheck(cudaSetDevice(device_id));
-  }
+  ScopedDeviceGuard guard(device_id);
   int cc_major;
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
   return cc_major;
