@@ -6,10 +6,13 @@ import triton.testing
 from flashinfer import rmsnorm as fi_rmsnorm
 from sgl_kernel import rmsnorm
 
-from sglang.jit_kernel.benchmark.utils import is_in_ci
+from sglang.jit_kernel.benchmark.utils import (
+    DEFAULT_DEVICE,
+    DEFAULT_DTYPE,
+    get_benchmark_range,
+    run_benchmark,
+)
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
-
-IS_CI = is_in_ci()
 
 
 def sglang_aot_rmsnorm(
@@ -44,15 +47,14 @@ def torch_impl_rmsnorm(
     input.copy_(input.float() * norm * weight.float())
 
 
-DTYPE = torch.bfloat16
-DEVICE = "cuda"
-
-if IS_CI:
-    BS_LIST = [16]
-    HIDDEN_SIZE_LIST = [512, 2048]
-else:
-    BS_LIST = [2**n for n in range(0, 14)]
-    HIDDEN_SIZE_LIST = [1536, 3072, 4096, 5120, 8192]
+BS_LIST = get_benchmark_range(
+    full_range=[2**n for n in range(0, 14)],
+    ci_range=[16],
+)
+HIDDEN_SIZE_LIST = get_benchmark_range(
+    full_range=[1536, 3072, 4096, 5120, 8192],
+    ci_range=[512, 2048],
+)
 
 LINE_VALS = ["aot", "jit", "fi", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
@@ -75,8 +77,10 @@ configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
     )
 )
 def benchmark(hidden_size: int, batch_size: int, provider: str):
-    input = torch.randn((batch_size, hidden_size), dtype=DTYPE, device=DEVICE)
-    weight = torch.randn(hidden_size, dtype=DTYPE, device=DEVICE)
+    input = torch.randn(
+        (batch_size, hidden_size), dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE
+    )
+    weight = torch.randn(hidden_size, dtype=DEFAULT_DTYPE, device=DEFAULT_DEVICE)
     FN_MAP = {
         "aot": sglang_aot_rmsnorm,
         "jit": sglang_jit_rmsnorm,
@@ -84,9 +88,7 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
         "torch": torch_impl_rmsnorm,
     }
     fn = lambda: FN_MAP[provider](input.clone(), weight)
-    quantiles = [0.5, 0.2, 0.8]
-    ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(fn, quantiles=quantiles)  # type: ignore
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+    return run_benchmark(fn)
 
 
 if __name__ == "__main__":
