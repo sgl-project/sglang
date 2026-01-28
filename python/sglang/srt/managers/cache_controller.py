@@ -507,11 +507,11 @@ class HiCacheController:
             return host_indices, device_indices
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
-                device_indices = device_indices.cpu()
+                device_indices = device_indices.to("cpu", non_blocking=True)
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
-                return host_indices, device_indices.cpu()
+                return host_indices, device_indices.to("cpu", non_blocking=True)
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:
