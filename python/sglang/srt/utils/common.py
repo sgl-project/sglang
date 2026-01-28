@@ -185,6 +185,15 @@ def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
 
 
+@lru_cache(maxsize=1)
+def is_musa() -> bool:
+    try:
+        import torchada  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.version, "musa") and torch.version.musa is not None
+
+
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
@@ -1043,6 +1052,24 @@ def assert_pkg_version(pkg: str, min_version: str, message: str):
             f"{pkg} with minimum required version {min_version} is not installed. "
             + message
         )
+
+
+def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
+    """
+    Check if a package is installed and meets the minimum version requirement.
+
+    Args:
+        pkg: Package name (distribution name, e.g., "flashinfer-python")
+        min_version: Minimum version required (e.g., "0.6.2")
+
+    Returns:
+        True if package is installed and version >= min_version, False otherwise
+    """
+    try:
+        installed_version = version(pkg)
+        return pkg_version.parse(installed_version) >= pkg_version.parse(min_version)
+    except PackageNotFoundError:
+        return False
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -2708,6 +2735,14 @@ def has_hf_quant_config(model_path: str) -> bool:
         return False
 
 
+def get_quantization_config(hf_config) -> str | None:
+    """Extract quantization method from HuggingFace config."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if quantization_config is not None:
+        return quantization_config.get("quant_method")
+    return None
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
@@ -2862,6 +2897,7 @@ def is_fa3_default_architecture(hf_config):
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "MixtralForCausalLM",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
@@ -2870,7 +2906,10 @@ def is_fa3_default_architecture(hf_config):
         "Glm4MoeForCausalLM",
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
+        "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
+        "StepVLForConditionalGeneration",
+        "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
 
