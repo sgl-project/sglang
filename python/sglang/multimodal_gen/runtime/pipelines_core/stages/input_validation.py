@@ -138,7 +138,7 @@ class InputValidationStage(PipelineStage):
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.info("resized img height: %s, img width: %s", img.height, img.width)
+            logger.debug("resized img height: %s, img width: %s", img.height, img.width)
 
             # center-crop
             x1 = (img.width - ow) // 2
@@ -182,13 +182,6 @@ class InputValidationStage(PipelineStage):
     ) -> Req:
         """
         Validate and prepare inputs.
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The validated batch information.
         """
 
         self._generate_seeds(batch, server_args)

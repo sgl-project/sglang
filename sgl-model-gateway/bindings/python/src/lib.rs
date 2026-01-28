@@ -348,6 +348,7 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     max_idle_secs: u64,
+    assignment_mode: String,
     max_payload_size: usize,
     dp_aware: bool,
     api_key: Option<String>,
@@ -390,6 +391,7 @@ struct Router {
     health_check_timeout_secs: u64,
     health_check_interval_secs: u64,
     health_check_endpoint: String,
+    disable_health_check: bool,
     enable_igw: bool,
     queue_size: usize,
     queue_timeout_secs: u64,
@@ -457,6 +459,12 @@ impl Router {
                 PolicyType::Manual => ConfigPolicyConfig::Manual {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_idle_secs: self.max_idle_secs,
+                    assignment_mode: match self.assignment_mode.as_str() {
+                        "random" => config::ManualAssignmentMode::Random,
+                        "min_load" => config::ManualAssignmentMode::MinLoad,
+                        "min_group" => config::ManualAssignmentMode::MinGroup,
+                        other => panic!("Unknown assignment mode: {}", other),
+                    },
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
@@ -499,6 +507,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -582,6 +592,7 @@ impl Router {
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
+                disable_health_check: self.disable_health_check,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -640,6 +651,7 @@ impl Router {
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         max_idle_secs = 14400,
+        assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
         dp_aware = false,
         api_key = None,
@@ -682,6 +694,7 @@ impl Router {
         health_check_timeout_secs = 5,
         health_check_interval_secs = 60,
         health_check_endpoint = String::from("/health"),
+        disable_health_check = false,
         enable_igw = false,
         queue_size = 100,
         queue_timeout_secs = 60,
@@ -724,6 +737,7 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         max_idle_secs: u64,
+        assignment_mode: String,
         max_payload_size: usize,
         dp_aware: bool,
         api_key: Option<String>,
@@ -766,6 +780,7 @@ impl Router {
         health_check_timeout_secs: u64,
         health_check_interval_secs: u64,
         health_check_endpoint: String,
+        disable_health_check: bool,
         enable_igw: bool,
         queue_size: usize,
         queue_timeout_secs: u64,
@@ -821,6 +836,7 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             max_idle_secs,
+            assignment_mode,
             max_payload_size,
             dp_aware,
             api_key,
@@ -863,6 +879,7 @@ impl Router {
             health_check_timeout_secs,
             health_check_interval_secs,
             health_check_endpoint,
+            disable_health_check,
             enable_igw,
             queue_size,
             queue_timeout_secs,
@@ -919,6 +936,8 @@ impl Router {
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
+                router_selector: HashMap::new(),
+                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             })
         } else {
             None
@@ -953,6 +972,7 @@ impl Router {
                     .control_plane_auth
                     .as_ref()
                     .map(|c| c.to_auth_control_plane_config()),
+                mesh_server_config: None,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
