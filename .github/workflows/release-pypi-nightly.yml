@@ -14,6 +14,11 @@ on:
         description: 'Specific commit SHA to build (leave empty for latest)'
         required: false
         type: string
+      cuda_version:
+        description: 'CUDA version (e.g., 129 or 130)'
+        required: false
+        default: '129'
+        type: string
 
 concurrency:
   group: release-pypi-nightly-${{ github.ref }}
@@ -142,6 +147,7 @@ jobs:
           python3 scripts/update_nightly_whl_index.py \
             --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
             --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }} \
+            --cuda-version ${{ inputs.cuda_version || '129' }} \
             --build-date ${{ needs.build-nightly-wheel.outputs.build_date }}
 
       - name: Push wheel index

@@ -210,6 +210,7 @@ class BaseMultimodalProcessor(ABC):
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
             "block_sizes": Modality.IMAGE,
+            "grid_thws": Modality.IMAGE,  # for kimi k2.5
             # Audio-related attributes
             "audio_features": Modality.AUDIO,
             "audio_feature_lens": Modality.AUDIO,

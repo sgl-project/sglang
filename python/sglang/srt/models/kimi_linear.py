@@ -315,11 +315,12 @@ class KimiDeltaAttention(nn.Module):
 
         self.linear_attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_qk_heads=self.num_k_heads // self.attn_tp_size,
+            num_q_heads=self.num_k_heads // self.attn_tp_size,
+            num_k_heads=self.num_k_heads // self.attn_tp_size,
             num_v_heads=self.num_v_heads // self.attn_tp_size,
-            head_qk_dim=self.head_k_dim,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            attention_tp_size=self.attn_tp_size,
             conv_weights=conv_weights,
             bias=bias,
             A_log=self.A_log,
@@ -340,7 +341,6 @@ class KimiDeltaAttention(nn.Module):
 
         forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
 
-        beta = self.b_proj(hidden_states)[0].float()
         # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
         beta = self.b_proj(hidden_states)[0].float()
         if not forward_batch.forward_mode.is_decode():

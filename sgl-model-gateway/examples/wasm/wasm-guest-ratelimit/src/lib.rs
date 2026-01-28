@@ -19,11 +19,11 @@ wit_bindgen::generate!({
 
 use std::cell::RefCell;
 
-use exports::sgl::router::{
+use exports::sgl::model_gateway::{
     middleware_on_request::Guest as OnRequestGuest,
     middleware_on_response::Guest as OnResponseGuest,
 };
-use sgl::router::middleware_types::{Action, Request, Response};
+use sgl::model_gateway::middleware_types::{Action, Request, Response};
 
 /// Main middleware implementation
 struct Middleware;
@@ -87,7 +87,7 @@ thread_local! {
 fn get_identifier(req: &Request) -> String {
     // Helper function to find header value
     let find_header_value =
-        |headers: &[sgl::router::middleware_types::Header], name: &str| -> Option<String> {
+        |headers: &[sgl::model_gateway::middleware_types::Header], name: &str| -> Option<String> {
             headers
                 .iter()
                 .find(|h| h.name.eq_ignore_ascii_case(name))

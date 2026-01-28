@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import ClassVar, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -614,9 +614,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
-    # Constant: alloc length per decode step
-    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
-
     # The inputs for decode
     # shape: (b, topk)
     topk_p: torch.Tensor = None

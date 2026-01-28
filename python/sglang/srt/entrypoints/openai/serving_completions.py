@@ -242,19 +242,34 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         input_top_logprobs = None
 
                     n_prev_token = n_prev_tokens.get(index, 0)
-                    logprobs = to_openai_style_logprobs(
-                        input_token_logprobs=input_token_logprobs,
-                        input_top_logprobs=input_top_logprobs,
-                        output_token_logprobs=content["meta_info"][
-                            "output_token_logprobs"
-                        ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"].get(
-                            "output_top_logprobs", []
-                        )[n_prev_token:],
-                    )
-                    n_prev_tokens[index] = len(
+                    total_output_logprobs = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
+                    output_logprobs_slice = content["meta_info"][
+                        "output_token_logprobs"
+                    ][n_prev_token:]
+                    finish_reason_for_logprobs = content["meta_info"]["finish_reason"]
+
+                    # When finish_reason is set and all logprobs have been sent,
+                    # any remaining text is just buffered text being flushed by the
+                    # detokenizer (it holds back text at word boundaries). Return None
+                    # for logprobs since no new tokens were generated for this text.
+                    if (
+                        len(output_logprobs_slice) == 0
+                        and finish_reason_for_logprobs is not None
+                        and input_token_logprobs is None
+                    ):
+                        logprobs = None
+                    else:
+                        logprobs = to_openai_style_logprobs(
+                            input_token_logprobs=input_token_logprobs,
+                            input_top_logprobs=input_top_logprobs,
+                            output_token_logprobs=output_logprobs_slice,
+                            output_top_logprobs=content["meta_info"].get(
+                                "output_top_logprobs", []
+                            )[n_prev_token:],
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
 
                 # Generate delta
                 delta = text[len(stream_buffer) :]
