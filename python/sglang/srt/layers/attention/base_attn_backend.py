@@ -87,7 +87,24 @@ class AttentionBackend(ABC):
         **kwargs,
     ):
         """Run forward on an attention layer."""
-        if forward_batch.forward_mode.is_idle():
+        pod_enabled = (
+            hasattr(self, "use_pod")
+            and self.use_pod
+            and hasattr(self, "forward_metadata_pod")
+            and self.forward_metadata_pod is not None
+        )
+
+        if pod_enabled:
+            return self.forward_pod(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        elif forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         elif forward_batch.forward_mode.is_decode():
             return self.forward_decode(
@@ -144,6 +161,18 @@ class AttentionBackend(ABC):
         """Run a forward for extend."""
         raise NotImplementedError()
 
+    def forward_pod(
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            layer: RadixAttention,
+            forward_batch: ForwardBatch,
+            save_kv_cache: bool = True,
+        ):
+            """Run a forward for POD (Prefill-Optimized Decoding) mode."""
+            raise NotImplementedError()
+            
     def forward_mixed(
         self,
         q: torch.Tensor,

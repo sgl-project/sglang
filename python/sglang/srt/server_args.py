@@ -444,6 +444,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    enable_flashinfer_pod: bool = False
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -3668,6 +3669,12 @@ class ServerArgs:
             default=ServerArgs.disable_flashinfer_autotune,
             action="store_true",
             help="Disable FlashInfer autotuning.",
+        )
+        parser.add_argument(
+            "--enable-flashinfer-pod",
+            action="store_true",
+            default=ServerArgs.enable_flashinfer_pod,
+            help="Enable FlashInfer POD mode.",
         )
 
         # Speculative decoding

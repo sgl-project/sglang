@@ -1,0 +1,17 @@
+cd /workspace/pod/sglang/python
+python -m pip install -e . -v \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple \
+  --extra-index-url https://pypi.nvidia.com 
+
+code /usr/local/lib/python3.12/dist-packages/flashinfer/data/include/flashinfer/attention/batch_pod.cuh
+替换成/workspace/batch_pod.cu
+code /usr/local/lib/python3.12/dist-packages/flashinfer/data/csrc/batch_pod.cu
+添加头文件
+#include <cassert>
+rm -rf ~/.cache/flashinfer/
+
+测试一下代码输出，如果正常吐字就没有问题
+代码第一次运行速度会比较慢，可以稍微等一下
+cd /workspace/pod/sglang/
+python test.py
+

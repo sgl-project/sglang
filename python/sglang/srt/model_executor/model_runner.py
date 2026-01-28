@@ -313,6 +313,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        self.use_pod = server_args.enable_flashinfer_pod and server_args.enable_mixed_chunk
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -2222,6 +2223,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             **kwargs,
         )
 
+    def forward_pod(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors=None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        if not skip_attn_backend_init:
+            self.attn_backend.init_forward_metadata(forward_batch)
+        kwargs = {}
+        if self.support_pp:
+            kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+        return self.model.forward(
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch,
+            **kwargs,
+        )
+
     def forward_split_prefill(
         self,
         forward_batch: ForwardBatch,
@@ -2343,7 +2362,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
-        if forward_batch.forward_mode.is_decode():
+        if self.use_pod :
+            ret = self.forward_pod(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_mixed():
+            ret = self.forward_extend(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        elif forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

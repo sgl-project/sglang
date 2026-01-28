@@ -1789,11 +1789,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for r in running_batch.reqs
             ]
         )
+        prefill_token_count = self.extend_num_tokens
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
-        self.is_prefill_only = False
+        self.is_prefill_only = Falses
+
+        self.decode_start_or_none = prefill_token_count
+        self.decoding_reqs = running_batch.reqs
 
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
@@ -1944,6 +1948,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.decode_start_or_none = None
+        self.decoding_reqs = None
         bs = len(self.reqs)
 
         if self.is_spec_v2:
@@ -2234,6 +2240,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            decode_start_or_none=getattr(self, 'decode_start_or_none', None),
+            decoding_reqs=getattr(self, 'decoding_reqs', None),
         )
 
     def copy(self):
@@ -2412,3 +2420,7 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For POD mode
+    decode_start_or_none: Optional[int] = None
+    decoding_reqs: Optional[List[Req]] = None

@@ -375,6 +375,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # For POD mode
+    decode_start_or_none: Optional[int] = None
+    decoding_reqs: Optional[List] = None
+
     @classmethod
     def init_new(
         cls,
