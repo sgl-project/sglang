@@ -205,7 +205,7 @@ class FastWan2_2_TI2V_5B_Config(Wan2_2_TI2V_5B_Config):
 
 
 @dataclass
-class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
+class Wan2_2_T2V_A14B_Config(WanT2V720PConfig):
     flow_shift: float | None = 12.0
     boundary_ratio: float | None = 0.875
 
@@ -214,7 +214,7 @@ class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
 
 
 @dataclass
-class Wan2_2_I2V_A14B_Config(WanI2V480PConfig):
+class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
     flow_shift: float | None = 5.0
     boundary_ratio: float | None = 0.900
 
