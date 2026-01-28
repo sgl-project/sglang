@@ -123,7 +123,6 @@ cp pyproject_cpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 uv pip install --upgrade pip setuptools
 uv pip install .
-uv pip install torch==2.9.0 torchvision==0.24.0 torchaudio==2.9.0 torchao==0.14.1 triton==3.5.0 --force-reinstall
 
 # Build the CPU backend kernels
 cd ../sgl-kernel
@@ -187,8 +186,7 @@ Notes:
 2. The flag `--tp 6` specifies that tensor parallelism will be applied using 6 ranks (TP6).
     The number of TP specified is how many TP ranks will be used during the execution.
     On a CPU platform, a TP rank means a sub-NUMA cluster (SNC).
-    Usually we can get the SNC information (How many available) from the Operating System.
-    Users can specify TP to be no more than the total available SNCs in current system.
+    Usually we can get the SNC information (How many available) from the Operating System with e.g. `lscpu` command.
 
     If the specified TP rank number differs from the total SNC count,
     the system will automatically utilize the first `n` SNCs.
