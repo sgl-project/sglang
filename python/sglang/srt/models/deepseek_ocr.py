@@ -1440,7 +1440,9 @@ class DeepseekOCRForCausalLM(nn.Module):
             )
 
         if self.is_ocr2:
-            self.model = DeepseekV2ForCausalLM(
+            # OCR2 language_config uses non-MLA attention (qk_* dims are 0).
+            # Use the non-MLA Deepseek model to avoid MLA-specific assumptions.
+            self.model = DeepseekForCausalLM(
                 config=config.text_config,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "language"),
