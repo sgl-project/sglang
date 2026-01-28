@@ -136,7 +136,7 @@ class AttentionInputs:
         if self.hidden_states_ is not None:
             return self.hidden_states_
         self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not _use_ag_after_qlora:
             self.hidden_states_ = self.tp_all_gather_hidden_states(
                 self.hidden_states_, self.forward_batch
             )
