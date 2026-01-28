@@ -39,7 +39,7 @@ dependencies = [
   "openai-harmony==0.0.4",
   "openai==2.6.1",
   "orjson",
-  "outlines==0.1.11",
+  "outlines",
   "packaging",
   "partial_json_parser",
   "pillow",
