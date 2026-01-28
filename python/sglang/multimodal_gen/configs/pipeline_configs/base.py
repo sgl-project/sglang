@@ -213,6 +213,9 @@ class PipelineConfig:
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
 
+    # Offload parameters
+    model_offload: bool = False
+
     # Compilation
     # enable_torch_compile: bool = False
 
@@ -480,6 +483,15 @@ class PipelineConfig:
             type=parse_int_list,
             default=PipelineConfig.dmd_denoising_steps,
             help="Comma-separated list of denoising steps (e.g., '1000,757,522')",
+        )
+
+        # Offload parameters
+        parser.add_argument(
+            f"--{prefix_with_dot}model-offload",
+            action=StoreBoolean,
+            dest=f"{prefix_with_dot.replace('-', '_')}model_offload",
+            default=PipelineConfig.model_offload,
+            help="Enable model offloading to CPU",
         )
 
         # Add VAE configuration arguments

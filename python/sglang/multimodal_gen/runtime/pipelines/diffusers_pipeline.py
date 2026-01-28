@@ -471,6 +471,9 @@ class DiffusersPipeline(ComposedPipelineBase):
         # Apply attention backend if specified
         self._apply_attention_backend(pipe, server_args)
 
+        # Apply model offloading if specified
+        self._apply_offload(pipe, server_args)
+
         # Apply cache-dit acceleration if configured
         pipe = self._apply_cache_dit(pipe, server_args)
 
@@ -542,6 +545,27 @@ class DiffusersPipeline(ComposedPipelineBase):
                         component_name,
                         e,
                     )
+
+    def _apply_offload(self, pipe: Any, server_args: ServerArgs) -> None:
+        """Apply model offloading strategies from pipeline config."""
+        config = server_args.pipeline_config
+        if config is None:
+            return
+
+        # Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance.
+        # https://huggingface.co/docs/diffusers/optimization/memory#model-offloading
+        if getattr(config, "model_offload", False):
+            if hasattr(pipe, "enable_model_cpu_offload") and hasattr(
+                pipe, "reset_device_map"
+            ):
+                pipe.reset_device_map()
+                pipe.enable_model_cpu_offload()
+                logger.info("Enabled model CPU offload")
+            else:
+                logger.warning(
+                    "Pipeline does not support model CPU offload: %s",
+                    type(pipe).__name__,
+                )
 
     def _apply_cache_dit(self, pipe: Any, server_args: ServerArgs) -> Any:
         """Enable cache-dit for diffusers pipeline if configured."""
