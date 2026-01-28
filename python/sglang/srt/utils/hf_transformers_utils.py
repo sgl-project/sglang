@@ -230,11 +230,11 @@ def _load_mistral_large_3_for_causal_LM(
 def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
     # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
-    return (
-        getattr(config, "auto_map", None) is not None
-        and config.auto_map.get("AutoModel")
-        == "modeling_deepseekocr.DeepseekOCRForCausalLM"
-    )
+    auto_map = getattr(config, "auto_map", None) or {}
+    return auto_map.get("AutoModel") in {
+        "modeling_deepseekocr.DeepseekOCRForCausalLM",
+        "modeling_deepseekocr2.DeepseekOCR2ForCausalLM",
+    }
 
 
 def _override_deepseek_ocr_v_head_dim(config: DeepseekVLV2Config) -> None:
@@ -322,6 +322,7 @@ def get_config(
 
         if _is_deepseek_ocr_model(config):
             _override_deepseek_ocr_v_head_dim(config)
+            config.update({"architectures": ["DeepseekOCRForCausalLM"]})
 
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
         setattr(config, "_name_or_path", model)
@@ -545,6 +546,7 @@ def get_processor(
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"
+        config.update({"architectures": ["DeepseekOCRForCausalLM"]})
 
     # fix: for Qwen2-VL and Sarashina2Vision models, inject default 'size' if not provided.
     if config.model_type in {"qwen2_vl", "sarashina2_vision"}:
