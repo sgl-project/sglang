@@ -748,7 +748,11 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
-            if save_kv_cache and k is not None:
+            if (
+                save_kv_cache
+                and k is not None
+                and v is not None
+            ):
                 # support cross attention
                 cache_loc = (
                     forward_batch.out_cache_loc
@@ -813,6 +817,7 @@ class AscendAttnBackend(AttentionBackend):
                 ):
                     causal = False
 
+                # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
                 if (
                     layer.qk_head_dim <= 128
                     and causal
@@ -865,7 +870,8 @@ class AscendAttnBackend(AttentionBackend):
                     q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-                    self.native_attn.run_sdpa_forward_extend(
+                    # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
+                    attn_output = self.native_attn.run_sdpa_forward_extend(
                         q_,
                         o_,
                         k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
@@ -880,6 +886,9 @@ class AscendAttnBackend(AttentionBackend):
                         scaling=layer.scaling,
                         enable_gqa=use_gqa,
                         causal=causal,
+                    )
+                    attn_output = attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             num_token_padding = q.shape[0]
@@ -1448,7 +1457,11 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             # In cross attention layer, when there is no vision input,the values of k and v is None
-            if save_kv_cache and k is not None:
+            if (
+                save_kv_cache
+                and k is not None
+                and v is not None
+            ):
                 # support cross attention
                 cache_loc = (
                     forward_batch.out_cache_loc
@@ -1504,6 +1517,7 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
+            # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             elif forward_batch.encoder_lens is None:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
@@ -1551,7 +1565,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-                self.native_attn.run_sdpa_forward_decode(
+                attn_output = self.native_attn.run_sdpa_forward_decode(
                     q_,
                     o_,
                     k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
