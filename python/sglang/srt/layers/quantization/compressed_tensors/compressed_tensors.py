@@ -37,9 +37,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 
-# from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
-#     CompressedTensorsMoEMethod,
-# )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsMxInt4MoE,
@@ -183,8 +180,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
-            scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
-            layer.scheme = scheme
+            layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             return CompressedTensorsFusedMoEMethod(self)
         return None
 
@@ -919,7 +915,6 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
-        # weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
             layer=layer,
             num_experts=num_experts,
