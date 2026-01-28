@@ -1,17 +1,14 @@
 import itertools
-import os
 
 import torch
 import triton
 import triton.testing
 from flashinfer import fused_add_rmsnorm as fi_fused_add_rmsnorm
 
+from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.norm import fused_add_rmsnorm as jit_fused_add_rmsnorm
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 
 def sglang_jit_fused_add_rmsnorm(
