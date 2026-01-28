@@ -33,7 +33,7 @@ envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.set(True)
 # Force enable deep gemm
 envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(True)
 # Force enable mha chunked kv for DeepSeek V3 to avoid missing kv_b_proj DeepGEMM case
-os.environ["SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD"] = "0"
+envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.set(0)
 
 
 @dataclasses.dataclass

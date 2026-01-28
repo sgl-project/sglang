@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+from datasets import load_dataset
 from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
@@ -45,9 +46,16 @@ def main(args):
     call_generate = get_call_generate(args)
 
     # Read data
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    filename = download_and_cache_file(url)
-    lines = list(read_jsonl(filename))
+    if args.platinum:
+        print("Loading GSM8K Platinum dataset from HuggingFace...")
+        dataset = load_dataset("madrylab/gsm8k-platinum", "main", split="test")
+        lines = [
+            {"question": item["question"], "answer": item["answer"]} for item in dataset
+        ]
+    else:
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        filename = download_and_cache_file(url)
+        lines = list(read_jsonl(filename))
 
     # Construct prompts
     num_questions = args.num_questions
@@ -128,7 +136,7 @@ def main(args):
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "gsm8k",
+            "task": "gsm8k-platinum" if args.platinum else "gsm8k",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),
@@ -147,5 +155,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument(
+        "--platinum",
+        action="store_true",
+        help="Use GSM8K Platinum dataset (drop-in replacement with corrected labels)",
+    )
     args = add_common_other_args_and_parse(parser)
     main(args)

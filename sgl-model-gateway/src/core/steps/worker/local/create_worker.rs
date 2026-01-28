@@ -5,12 +5,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tracing::debug;
 
-use super::discover_dp::DpInfo;
 use crate::{
     app_context::AppContext,
     core::{
-        BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, DPAwareWorkerBuilder,
-        HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
+        circuit_breaker::CircuitBreakerConfig,
+        model_card::ModelCard,
+        steps::workflow_data::LocalWorkerWorkflowData,
+        worker::{HealthConfig, RuntimeType, WorkerType},
+        BasicWorkerBuilder, ConnectionMode, DPAwareWorkerBuilder, Worker, UNKNOWN_MODEL_ID,
     },
     protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
@@ -27,13 +29,22 @@ use crate::{
 pub struct CreateLocalWorkerStep;
 
 #[async_trait]
-impl StepExecutor for CreateLocalWorkerStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let connection_mode: Arc<ConnectionMode> = context.get_or_err("connection_mode")?;
-        let discovered_labels: Arc<HashMap<String, String>> =
-            context.get_or_err("discovered_labels")?;
+impl StepExecutor<LocalWorkerWorkflowData> for CreateLocalWorkerStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
+        let app_context = context
+            .data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let connection_mode =
+            context.data.connection_mode.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("connection_mode".to_string())
+            })?;
+        let discovered_labels = &context.data.discovered_labels;
 
         // Check if worker already exists
         if app_context
@@ -57,25 +68,25 @@ impl StepExecutor for CreateLocalWorkerStep {
         }
 
         // Merge: discovered labels first, then config labels (config takes precedence)
-        let mut final_labels = discovered_labels.as_ref().clone();
+        let mut final_labels = discovered_labels.clone();
         for (key, value) in &config_labels {
             final_labels.insert(key.clone(), value.clone());
         }
 
-        // Determine model_id: config > served_model_name > model_path > "unknown"
+        // Determine model_id: config > served_model_name > model_path > UNKNOWN_MODEL_ID
         let model_id = config
             .model_id
             .clone()
             .or_else(|| final_labels.get("served_model_name").cloned())
             .or_else(|| final_labels.get("model_path").cloned())
-            .unwrap_or_else(|| "unknown".to_string());
+            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
-        if model_id != "unknown" {
+        if model_id != UNKNOWN_MODEL_ID {
             debug!("Using model_id: {}", model_id);
         }
 
         // Create ModelCard
-        let model_card = build_model_card(&model_id, &config, &final_labels);
+        let model_card = build_model_card(&model_id, config, &final_labels);
 
         debug!(
             "Creating worker {} with {} discovered + {} config = {} final labels",
@@ -86,41 +97,39 @@ impl StepExecutor for CreateLocalWorkerStep {
         );
 
         // Parse worker type
-        let worker_type = parse_worker_type(&config);
+        let worker_type = parse_worker_type(config);
 
         // Get runtime type (for gRPC workers)
-        let runtime_type = determine_runtime_type(&connection_mode, context, &config);
+        let runtime_type = determine_runtime_type(connection_mode, &context.data, config);
 
         // Build circuit breaker config
-        let circuit_breaker_config = build_circuit_breaker_config(&app_context);
+        let circuit_breaker_config = build_circuit_breaker_config(app_context);
 
         // Build health config
-        let health_config = build_health_config(&app_context);
+        let health_config = build_health_config(app_context, config);
 
         // Normalize URL
-        let normalized_url = normalize_url(&config.url, &connection_mode);
+        let normalized_url = normalize_url(&config.url, connection_mode);
 
         if normalized_url != config.url {
             debug!(
                 "Normalized worker URL: {} -> {} ({:?})",
-                config.url,
-                normalized_url,
-                connection_mode.as_ref()
+                config.url, normalized_url, connection_mode
             );
         }
 
         // Create workers - always output as Vec for unified downstream handling
         let workers = if config.dp_aware {
             create_dp_aware_workers(
-                context,
+                &context.data,
                 &normalized_url,
                 model_card,
                 worker_type,
-                &connection_mode,
+                connection_mode,
                 runtime_type,
                 circuit_breaker_config,
                 health_config,
-                &config,
+                config,
                 &final_labels,
             )?
         } else {
@@ -128,17 +137,18 @@ impl StepExecutor for CreateLocalWorkerStep {
                 &normalized_url,
                 model_card,
                 worker_type,
-                &connection_mode,
+                connection_mode,
                 runtime_type,
                 circuit_breaker_config,
                 health_config,
-                &config,
+                config,
                 &final_labels,
             )
         };
 
-        context.set("workers", workers);
-        context.set("labels", final_labels);
+        // Update workflow data
+        context.data.actual_workers = Some(workers);
+        context.data.final_labels = final_labels;
         Ok(StepResult::Success)
     }
 
@@ -175,6 +185,40 @@ fn build_model_card(
         }
     }
 
+    // Parse classification model id2label mapping
+    // The proto field is id2label_json: JSON string like {"0": "negative", "1": "positive"}
+    if let Some(id2label_json) = labels.get("id2label_json") {
+        if !id2label_json.is_empty() {
+            // Parse JSON: keys are string indices, values are label names
+            if let Ok(string_map) = serde_json::from_str::<HashMap<String, String>>(id2label_json) {
+                // Convert string keys ("0", "1") to u32 keys (0, 1)
+                let id2label: HashMap<u32, String> = string_map
+                    .into_iter()
+                    .filter_map(|(k, v)| k.parse::<u32>().ok().map(|idx| (idx, v)))
+                    .collect();
+
+                if !id2label.is_empty() {
+                    card = card.with_id2label(id2label);
+                    debug!("Parsed id2label with {} classes", card.num_labels);
+                }
+            }
+        }
+    }
+    // Fallback: if num_labels is set but id2label wasn't parsed, create default labels
+    // Match logic in serving_classify.py::_get_id2label_mapping
+    else if let Some(num_labels_str) = labels.get("num_labels") {
+        if let Ok(num_labels) = num_labels_str.parse::<u32>() {
+            if num_labels > 0 {
+                // Create default mapping: {0: "LABEL_0", 1: "LABEL_1", ...}
+                let id2label: HashMap<u32, String> = (0..num_labels)
+                    .map(|i| (i, format!("LABEL_{}", i)))
+                    .collect();
+                card = card.with_id2label(id2label);
+                debug!("Created default id2label with {} classes", num_labels);
+            }
+        }
+    }
+
     card
 }
 
@@ -194,14 +238,14 @@ fn parse_worker_type(config: &WorkerConfigRequest) -> WorkerType {
 
 fn determine_runtime_type(
     connection_mode: &ConnectionMode,
-    context: &WorkflowContext,
+    data: &LocalWorkerWorkflowData,
     config: &WorkerConfigRequest,
 ) -> RuntimeType {
     if !matches!(connection_mode, ConnectionMode::Grpc { .. }) {
         return RuntimeType::Sglang;
     }
 
-    if let Some(detected_runtime) = context.get::<String>("detected_runtime_type") {
+    if let Some(ref detected_runtime) = data.detected_runtime_type {
         match detected_runtime.as_str() {
             "vllm" => RuntimeType::Vllm,
             _ => RuntimeType::Sglang,
@@ -226,7 +270,7 @@ fn build_circuit_breaker_config(app_context: &AppContext) -> CircuitBreakerConfi
     }
 }
 
-fn build_health_config(app_context: &AppContext) -> HealthConfig {
+fn build_health_config(app_context: &AppContext, config: &WorkerConfigRequest) -> HealthConfig {
     let cfg = &app_context.router_config.health_check;
     HealthConfig {
         timeout_secs: cfg.timeout_secs,
@@ -234,6 +278,7 @@ fn build_health_config(app_context: &AppContext) -> HealthConfig {
         endpoint: cfg.endpoint.clone(),
         failure_threshold: cfg.failure_threshold,
         success_threshold: cfg.success_threshold,
+        disable_health_check: cfg.disable_health_check || config.disable_health_check,
     }
 }
 
@@ -250,7 +295,7 @@ fn normalize_url(url: &str, connection_mode: &ConnectionMode) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn create_dp_aware_workers(
-    context: &WorkflowContext,
+    data: &LocalWorkerWorkflowData,
     normalized_url: &str,
     model_card: ModelCard,
     worker_type: WorkerType,
@@ -261,7 +306,10 @@ fn create_dp_aware_workers(
     config: &WorkerConfigRequest,
     final_labels: &HashMap<String, String>,
 ) -> Result<Vec<Arc<dyn Worker>>, WorkflowError> {
-    let dp_info: Arc<DpInfo> = context.get_or_err("dp_info")?;
+    let dp_info = data
+        .dp_info
+        .as_ref()
+        .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
 
     debug!(
         "Creating {} DP-aware workers for {} (dp_size: {})",
@@ -287,7 +335,11 @@ fn create_dp_aware_workers(
         }
 
         let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-        worker.set_healthy(false);
+        if health_config.disable_health_check {
+            worker.set_healthy(true);
+        } else {
+            worker.set_healthy(false);
+        }
         workers.push(worker);
 
         debug!(
@@ -311,6 +363,8 @@ fn create_single_worker(
     config: &WorkerConfigRequest,
     final_labels: &HashMap<String, String>,
 ) -> Vec<Arc<dyn Worker>> {
+    let health_check_disabled = health_config.disable_health_check;
+
     let mut builder = BasicWorkerBuilder::new(normalized_url.to_string())
         .model(model_card)
         .worker_type(worker_type)
@@ -327,7 +381,11 @@ fn create_single_worker(
     }
 
     let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-    worker.set_healthy(false);
+    if health_check_disabled {
+        worker.set_healthy(true);
+    } else {
+        worker.set_healthy(false);
+    }
 
     debug!(
         "Created worker object for {} ({:?}) with {} labels",

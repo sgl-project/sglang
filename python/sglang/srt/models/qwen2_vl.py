@@ -48,7 +48,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_numpy
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -392,6 +392,9 @@ class Qwen2VisionTransformer(nn.Module):
         position_embeddings = (emb.cos(), emb.sin())
         # compute cu_seqlens
         cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
 
         # transformers
         x = x.unsqueeze(1)

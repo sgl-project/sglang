@@ -16,7 +16,7 @@ from sglang.srt.server_args import ServerArgs
 def start_disagg_service(
     server_args: ServerArgs,
 ):
-    # Start kv boostrap server on prefill
+    # Start kv bootstrap server on prefill
     disagg_mode = DisaggregationMode(server_args.disaggregation_mode)
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
@@ -34,7 +34,7 @@ def start_disagg_service(
         )
         if is_create_store:
             try:
-                from mf_adapter import create_config_store
+                from memfabric_hybrid import create_config_store
 
                 ascend_url = os.getenv("ASCEND_MF_STORE_URL")
                 create_config_store(ascend_url)

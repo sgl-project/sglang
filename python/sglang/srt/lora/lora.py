@@ -74,44 +74,55 @@ class LoRAAdapter(nn.Module):
         self.embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
-    # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
         # Get normalized target modules for filtering
+        for name, loaded_weight in loader._get_weights_iterator(
+            DefaultModelLoader.Source(
+                model_path, revision=revision, fall_back_to_pt=True
+            )
+        ):
+            self._process_weight(name, loaded_weight)
+
+        self._normalize_weights()
+
+    def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
+        for name, tensor in tensors.items():
+            self._process_weight(name, tensor)
+
+        self._normalize_weights()
+
+    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules
         )
 
-        for name, loaded_weight in loader._get_weights_iterator(
-            DefaultModelLoader.Source(
-                model_path, revision=revision, fall_back_to_pt=True
-            )
-        ):
-            layer_id = get_layer_id(name)
-            if layer_id is not None:
-                self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            elif "embed_tokens" in name or "lm_head" in name:
-                # Check if this module is declared in target_modules before loading
-                module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
-                if module_name in normalized_target_modules:
-                    self.embedding_layers[name] = loaded_weight.cpu()
-                else:
-                    logger.debug(
-                        f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
-                    )
-            elif "input_embeddings" in name or "output_embeddings" in name:
-                # added/extra token emb
-                self.added_tokens_embeddings[name] = loaded_weight.cpu()
-                assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
-                    f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                    f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+        layer_id = get_layer_id(name)
+        if layer_id is not None:
+            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+        elif "embed_tokens" in name or "lm_head" in name:
+            # Check if this module is declared in target_modules before loading
+            module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
+            if module_name in normalized_target_modules:
+                self.embedding_layers[name] = loaded_weight.cpu()
+            else:
+                logger.debug(
+                    f"Skipping {name} as '{module_name}' is not in adapter's target_modules: {self.config.target_modules}"
                 )
+        elif "input_embeddings" in name or "output_embeddings" in name:
+            # added/extra token emb
+            self.added_tokens_embeddings[name] = loaded_weight.cpu()
+            assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
+                f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
+                f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+            )
 
+    def _normalize_weights(self):
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
@@ -197,3 +208,14 @@ class LoRAAdapter(nn.Module):
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def pin_weights_in_cpu(self):
+        for layer in self.layers:
+            for name, weight in layer.weights.items():
+                layer.weights[name] = weight.pin_memory()
+
+        for name, weight in self.embedding_layers.items():
+            self.embedding_layers[name] = weight.pin_memory()
+
+        for name, weight in self.added_tokens_embeddings.items():
+            self.added_tokens_embeddings[name] = weight.pin_memory()

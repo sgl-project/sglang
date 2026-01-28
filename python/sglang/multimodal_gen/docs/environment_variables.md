@@ -1,7 +1,11 @@
-## Cache-DiT Acceleration
+## Caching Acceleration
 
-These variables configure cache-dit caching acceleration for Diffusion Transformer (DiT) models.
-See [cache-dit documentation](cache_dit.md) for details.
+These variables configure caching acceleration for Diffusion Transformer (DiT) models.
+SGLang supports multiple caching strategies - see [caching documentation](cache/caching.md) for an overview.
+
+### Cache-DiT Configuration
+
+See [cache-dit documentation](cache/cache_dit.md) for detailed configuration.
 
 | Environment Variable                | Default | Description                              |
 |-------------------------------------|---------|------------------------------------------|
@@ -17,3 +21,16 @@ See [cache-dit documentation](cache_dit.md) for details.
 | `SGLANG_CACHE_DIT_SCM_POLICY`       | dynamic | SCM caching policy                       |
 | `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set | Custom SCM compute bins                  |
 | `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set | Custom SCM cache bins                    |
+
+## Cloud Storage
+
+These variables configure S3-compatible cloud storage for automatically uploading generated images and videos.
+
+| Environment Variable            | Default | Description                                            |
+|---------------------------------|---------|--------------------------------------------------------|
+| `SGLANG_CLOUD_STORAGE_TYPE`     | not set | Set to `s3` to enable cloud storage                    |
+| `SGLANG_S3_BUCKET_NAME`         | not set | The name of the S3 bucket                              |
+| `SGLANG_S3_ENDPOINT_URL`        | not set | Custom endpoint URL (for MinIO, OSS, etc.)             |
+| `SGLANG_S3_REGION_NAME`         | us-east-1 | AWS region name                                      |
+| `SGLANG_S3_ACCESS_KEY_ID`       | not set | AWS Access Key ID                                      |
+| `SGLANG_S3_SECRET_ACCESS_KEY`   | not set | AWS Secret Access Key                                  |

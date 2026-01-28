@@ -22,14 +22,15 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -38,13 +39,15 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    qkv, _ = attn.to_qkv(hidden_states)
-    query, key, value = qkv.chunk(3, dim=-1)
+    query, _ = attn.to_q(hidden_states)
+    key, _ = attn.to_k(hidden_states)
+    value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -80,14 +83,18 @@ class Flux2FeedForward(nn.Module):
         dim_out = dim_out or dim
 
         # Flux2SwiGLU will reduce the dimension by half
-        self.linear_in = nn.Linear(dim, inner_dim * 2, bias=bias)
+        self.linear_in = ColumnParallelLinear(
+            dim, inner_dim * 2, bias=bias, gather_output=True
+        )
         self.act_fn = Flux2SwiGLU()
-        self.linear_out = nn.Linear(inner_dim, dim_out, bias=bias)
+        self.linear_out = ColumnParallelLinear(
+            inner_dim, dim_out, bias=bias, gather_output=True
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.linear_in(x)
+        x, _ = self.linear_in(x)
         x = self.act_fn(x)
-        x = self.linear_out(x)
+        x, _ = self.linear_out(x)
         return x
 
 
@@ -120,25 +127,52 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Use ReplicatedLinear for fused QKV projections
-        self.to_qkv = ReplicatedLinear(query_dim, self.inner_dim * 3, bias=bias)
+        self.to_q = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
+        self.to_k = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
+        self.to_v = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
 
         # QK Norm
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.to_out = torch.nn.ModuleList([])
-        self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
+        self.to_out.append(
+            ColumnParallelLinear(
+                self.inner_dim, self.out_dim, bias=out_bias, gather_output=True
+            )
+        )
         self.to_out.append(torch.nn.Dropout(dropout))
 
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim * 3, bias=added_proj_bias
+            self.add_q_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
             )
-            self.to_add_out = torch.nn.Linear(self.inner_dim, query_dim, bias=out_bias)
+            self.add_k_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
+            )
+            self.add_v_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
+            )
+            self.to_add_out = ColumnParallelLinear(
+                self.inner_dim, query_dim, bias=out_bias, gather_output=True
+            )
 
         self.attn = USPAttention(
             num_heads=num_heads,
@@ -162,16 +196,28 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        query, key = apply_qk_norm(
+            q=query,
+            k=key,
+            q_norm=self.norm_q,
+            k_norm=self.norm_k,
+            head_dim=self.head_dim,
+            allow_inplace=True,
+        )
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
+            encoder_query, encoder_key = apply_qk_norm(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
@@ -179,11 +225,15 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=True
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=True
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
 
         hidden_states = self.attn(query, key, value)
@@ -199,9 +249,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 ],
                 dim=1,
             )
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states, _ = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
@@ -252,10 +302,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.mlp_mult_factor = mlp_mult_factor
 
         # Fused QKV projections + MLP input projection
-        self.to_qkv_mlp_proj = torch.nn.Linear(
+        self.to_qkv_mlp_proj = ColumnParallelLinear(
             self.query_dim,
             self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
             bias=bias,
+            gather_output=True,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
@@ -264,8 +315,11 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused attention output projection + MLP output projection
-        self.to_out = torch.nn.Linear(
-            self.inner_dim + self.mlp_hidden_dim, self.out_dim, bias=out_bias
+        self.to_out = ColumnParallelLinear(
+            self.inner_dim + self.mlp_hidden_dim,
+            self.out_dim,
+            bias=out_bias,
+            gather_output=True,
         )
 
         self.attn = USPAttention(
@@ -284,7 +338,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         **kwargs,
     ) -> torch.Tensor:
         # Parallel in (QKV + MLP in) projection
-        hidden_states = self.to_qkv_mlp_proj(hidden_states)
+        hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
             [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
@@ -303,11 +357,15 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=True
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=True
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
         hidden_states = self.attn(query, key, value)
         hidden_states = hidden_states.flatten(2, 3)
@@ -318,7 +376,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
 
         # Concatenate and parallel output projection
         hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        hidden_states = self.to_out(hidden_states)
+        hidden_states, _ = self.to_out(hidden_states)
 
         return hidden_states
 
@@ -504,7 +562,11 @@ class Flux2TransformerBlock(nn.Module):
 
 class Flux2TimestepGuidanceEmbeddings(nn.Module):
     def __init__(
-        self, in_channels: int = 256, embedding_dim: int = 6144, bias: bool = False
+        self,
+        in_channels: int = 256,
+        embedding_dim: int = 6144,
+        bias: bool = False,
+        guidance_embeds: bool = True,
     ):
         super().__init__()
 
@@ -515,24 +577,32 @@ class Flux2TimestepGuidanceEmbeddings(nn.Module):
             in_channels=in_channels, time_embed_dim=embedding_dim, sample_proj_bias=bias
         )
 
-        self.guidance_embedder = TimestepEmbedding(
-            in_channels=in_channels, time_embed_dim=embedding_dim, sample_proj_bias=bias
-        )
+        if guidance_embeds:
+            self.guidance_embedder = TimestepEmbedding(
+                in_channels=in_channels,
+                time_embed_dim=embedding_dim,
+                sample_proj_bias=bias,
+            )
+        else:
+            self.guidance_embedder = None
 
-    def forward(self, timestep: torch.Tensor, guidance: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, timestep: torch.Tensor, guidance: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(
             timesteps_proj.to(timestep.dtype)
         )  # (N, D)
 
-        guidance_proj = self.time_proj(guidance)
-        guidance_emb = self.guidance_embedder(
-            guidance_proj.to(guidance.dtype)
-        )  # (N, D)
-
-        time_guidance_emb = timesteps_emb + guidance_emb
-
-        return time_guidance_emb
+        if guidance is not None and self.guidance_embedder is not None:
+            guidance_proj = self.time_proj(guidance)
+            guidance_emb = self.guidance_embedder(
+                guidance_proj.to(guidance.dtype)
+            )  # (N, D)
+            time_guidance_emb = timesteps_emb + guidance_emb
+            return time_guidance_emb
+        else:
+            return timesteps_emb
 
 
 class Flux2Modulation(nn.Module):
@@ -540,14 +610,16 @@ class Flux2Modulation(nn.Module):
         super().__init__()
         self.mod_param_sets = mod_param_sets
 
-        self.linear = nn.Linear(dim, dim * 3 * self.mod_param_sets, bias=bias)
+        self.linear = ColumnParallelLinear(
+            dim, dim * 3 * self.mod_param_sets, bias=bias, gather_output=True
+        )
         self.act_fn = nn.SiLU()
 
     def forward(
         self, temb: torch.Tensor
     ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
         mod = self.act_fn(temb)
-        mod = self.linear(mod)
+        mod, _ = self.linear(mod)
 
         if mod.ndim == 2:
             mod = mod.unsqueeze(1)
@@ -566,7 +638,11 @@ class Flux2PosEmbed(nn.Module):
             rope_theta=theta,
             use_real=False,
             repeat_interleave_real=False,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_mps() or current_platform.is_musa()
+                else torch.float64
+            ),
         )
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -577,7 +653,7 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class Flux2Transformer2DModel(CachableDiT):
+class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Flux 2.
 
@@ -602,8 +678,10 @@ class Flux2Transformer2DModel(CachableDiT):
         axes_dims_rope: Tuple[int, ...] = config.axes_dims_rope
         rope_theta: int = config.rope_theta
         eps: float = config.eps
+        guidance_embeds: bool = getattr(config, "guidance_embeds", True)
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+        self.guidance_embeds = guidance_embeds
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
         self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
@@ -613,6 +691,7 @@ class Flux2Transformer2DModel(CachableDiT):
             in_channels=timestep_guidance_channels,
             embedding_dim=self.inner_dim,
             bias=False,
+            guidance_embeds=guidance_embeds,
         )
 
         # 3. Modulation (double stream and single stream blocks share modulation parameters, resp.)
@@ -629,9 +708,11 @@ class Flux2Transformer2DModel(CachableDiT):
         )
 
         # 4. Input projections
-        self.x_embedder = nn.Linear(in_channels, self.inner_dim, bias=False)
-        self.context_embedder = nn.Linear(
-            joint_attention_dim, self.inner_dim, bias=False
+        self.x_embedder = ColumnParallelLinear(
+            in_channels, self.inner_dim, bias=False, gather_output=True
+        )
+        self.context_embedder = ColumnParallelLinear(
+            joint_attention_dim, self.inner_dim, bias=False, gather_output=True
         )
 
         # 5. Double Stream Transformer Blocks
@@ -672,11 +753,14 @@ class Flux2Transformer2DModel(CachableDiT):
             eps=eps,
             bias=False,
         )
-        self.proj_out = nn.Linear(
-            self.inner_dim, patch_size * patch_size * self.out_channels, bias=False
+        self.proj_out = ColumnParallelLinear(
+            self.inner_dim,
+            patch_size * patch_size * self.out_channels,
+            bias=False,
+            gather_output=True,
         )
 
-        self.gradient_checkpointing = False
+        self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
 
     def forward(
         self,
@@ -714,7 +798,8 @@ class Flux2Transformer2DModel(CachableDiT):
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype)
-        guidance = guidance.to(hidden_states.dtype)
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype)
 
         temb = self.time_guidance_embed(timestep, guidance)
 
@@ -723,8 +808,8 @@ class Flux2Transformer2DModel(CachableDiT):
         single_stream_mod = self.single_stream_modulation(temb)[0]
 
         # 2. Input projection for image (hidden_states) and conditioning text (encoder_hidden_states)
-        hidden_states = self.x_embedder(hidden_states)
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+        hidden_states, _ = self.x_embedder(hidden_states)
+        encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
         # 3. Calculate RoPE embeddings from image and text tokens
         # NOTE: the below logic means that we can't support batched inference with images of different resolutions or
@@ -756,7 +841,7 @@ class Flux2Transformer2DModel(CachableDiT):
 
         # 6. Output layers
         hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+        output, _ = self.proj_out(hidden_states)
 
         return output
 

@@ -10,13 +10,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
+from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
     norm_infer,
     rms_norm_fn,
+    triton_one_pass_rms_norm,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
@@ -70,7 +80,12 @@ class RMSNorm(CustomOp):
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
         else:
-            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
+            if x.shape[-1] <= 128:
+                out = triton_one_pass_rms_norm(
+                    x, self.weight.data, self.variance_epsilon
+                )
+            else:
+                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -221,31 +236,6 @@ class LayerNorm(CustomOp):
         s = f"hidden_size={self.weight.data.size(0)}"
         s += f", eps={self.variance_epsilon}"
         return s
-
-
-class ScaleResidual(nn.Module):
-    """
-    Applies gated residual connection.
-    """
-
-    def __init__(self, prefix: str = ""):
-        super().__init__()
-
-    def forward(
-        self, residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
-    ) -> torch.Tensor:
-        """Apply gated residual connection."""
-        # x.shape: [batch_size, seq_len, inner_dim]
-        if gate.dim() == 4:
-            # gate.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = gate.shape[1]
-            frame_seqlen = x.shape[1] // num_frames
-            return residual + (
-                x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
-            ).flatten(1, 2)
-        else:
-            # gate.shape: [batch_size, 1, inner_dim]
-            return residual + x * gate
 
 
 # adapted from Diffusers: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/normalization.py
@@ -421,3 +411,57 @@ class LayerNormScaleShift(nn.Module):
             output = output.to(x.dtype)
 
         return output
+
+
+def apply_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: "RMSNorm",
+    k_norm: "RMSNorm",
+    head_dim: int,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply QK normalization for query and key tensors.
+
+    Uses JIT fused inplace kernel when available, falls back to standard RMSNorm.
+    """
+
+    batch_size = q.size(0)
+    q_eps = q_norm.variance_epsilon
+    k_eps = k_norm.variance_epsilon
+    # Only try fused path on CUDA and when it won't introduce implicit copies.
+    if (
+        _is_cuda
+        and allow_inplace
+        and (q_eps == k_eps)
+        and can_use_fused_inplace_qknorm(head_dim, q.dtype)
+    ):
+        fused_inplace_qknorm(
+            q=q.view(batch_size, -1, head_dim),
+            k=k.view(batch_size, -1, head_dim),
+            q_weight=q_norm.weight,
+            k_weight=k_norm.weight,
+            head_dim=head_dim,
+            eps=q_eps,
+        )
+        return q, k
+
+    q_shape = q.shape
+    k_shape = k.shape
+    q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
+    k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
+    return q_out, k_out
+
+
+def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
+    tp_rank = get_tensor_model_parallel_rank()
+    tp_size = get_tensor_model_parallel_world_size()
+    src_dtype = x.dtype
+    weight = norm.weight.tensor_split(tp_size)[tp_rank].float()
+    x_fp32 = x.float()
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    variance = get_tp_group().all_reduce(
+        variance, op=torch._C._distributed_c10d.ReduceOp.AVG
+    )
+    output = x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * weight
+    return output.to(dtype=src_dtype)

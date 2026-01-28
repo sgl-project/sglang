@@ -54,7 +54,7 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         [b, h, s_local, d] -> [b, h_local, s_global, d]
 
     If heads are at dim=2 (input is [b, s_local, h, d]), set head_dim=2, and the
-    function returns [b, s_global, h+local, d], preserving the original
+    function returns [b, s_global, h_local, d], preserving the original
     head/sequence dim ordering.
 
     Args:

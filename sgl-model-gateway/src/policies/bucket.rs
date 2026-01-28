@@ -5,12 +5,16 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use rand::Rng;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{get_healthy_worker_indices, BucketConfig, LoadBalancingPolicy};
+use super::{
+    get_healthy_worker_indices, normalize_model_key, BucketConfig, LoadBalancingPolicy,
+    SelectWorkerInfo,
+};
 use crate::core::Worker;
 
 #[derive(Debug)]
@@ -79,13 +83,7 @@ impl BucketPolicy {
         // Group workers by model
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in prefill_workers {
-            // Use "default" for unknown/empty model_ids for backward compatibility
-            let model_id = worker.model_id();
-            let model_key = if model_id.is_empty() || model_id == "unknown" {
-                "default"
-            } else {
-                model_id
-            };
+            let model_key = normalize_model_key(worker.model_id());
             model_workers
                 .entry(model_key.to_string())
                 .or_default()
@@ -118,12 +116,7 @@ impl BucketPolicy {
     }
 
     pub fn add_prefill_url(&self, worker: &dyn Worker) {
-        let model_id = worker.model_id();
-        let model_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
-        } else {
-            model_id
-        };
+        let model_key = normalize_model_key(worker.model_id());
         let bucket = self
             .buckets
             .entry(model_key.to_string())
@@ -166,12 +159,7 @@ impl BucketPolicy {
     }
 
     pub fn remove_prefill_url(&self, worker: &dyn Worker) {
-        let model_id = worker.model_id();
-        let model_key = if model_id.is_empty() || model_id == "unknown" {
-            "default"
-        } else {
-            model_id
-        };
+        let model_key = normalize_model_key(worker.model_id());
 
         if let Some(bucket_entry) = self.buckets.get(model_key) {
             let bucket = bucket_entry.value();
@@ -216,11 +204,12 @@ impl BucketPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for BucketPolicy {
-    fn select_worker(
+    async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
+        info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -228,19 +217,14 @@ impl LoadBalancingPolicy for BucketPolicy {
             return None;
         }
 
-        let char_count = match request_text {
+        let char_count = match info.request_text {
             None => 0,
             Some(text) => text.chars().count(),
         };
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
-        let first_model = workers[healthy_indices[0]].model_id();
-        let model_key = if first_model.is_empty() || first_model == "unknown" {
-            "default"
-        } else {
-            first_model
-        };
+        let model_key = normalize_model_key(workers[healthy_indices[0]].model_id());
 
         let bucket = self
             .buckets
@@ -643,14 +627,35 @@ mod tests {
         // === Phase S1: Construct bucket boundaries ===
         // Requests len =33 -> Bucket 1(expected range: 0-33)
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(33)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         // Two requests len =34 ->load balancing
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(34)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(34)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(34)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(34)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(11)).await;
@@ -678,13 +683,34 @@ mod tests {
         // === Phase S2: Validate load balancing ===
         // Three consecutive len=33 requests (Should route to different buckets)
         let idx_1 = policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(33)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         let idx_2 = policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(33)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         let idx_3 = policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(33)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(33)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         assert_eq!(idx_1, 0, "Should not trigger load balancing");
         assert_ne!(idx_2, idx_3, "Should trigger load balancing");
@@ -702,15 +728,36 @@ mod tests {
 
         // Create load difference below absolute threshold(20 + 8 = 28 < 30)
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap(); // worker1: 20
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(8)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(8)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap(); // worker1: 8
 
         // Next request should not use bucket scheduling (no load balancing)
         let idx = policy
-            .select_worker(&prefill_workers, Some("request"))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some("request"),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         assert_eq!(
             idx, 0,
@@ -729,18 +776,46 @@ mod tests {
         // Create load difference (but relative threshold not met)
         // Max/Min ratio = 15/5 = 3.0
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(15)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap(); // worker1: 15
         policy
-            .select_worker(&prefill_workers, Some("short"))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some("short"),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap(); // worker2: 5
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap(); // worker3: 10
 
         // Next request should use bucket scheduling (load balancing)
         let idx = policy
-            .select_worker(&prefill_workers, Some("request"))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some("request"),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         assert_eq!(
             idx, 0,
@@ -807,22 +882,64 @@ mod tests {
         // ===Phase S1: Initial requests to trigger boundary adjustment ===
         // Send requests with lengths: [5, 10, 15, 20, 24, 26] (total = 100)
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(5)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(5)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(15)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(24)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(24)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(26)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(26)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -852,22 +969,64 @@ mod tests {
         // ===Phase S2: Second set of  requests to trigger boundary adjustment ===
         // Send requests with lengths: [10, 20, 30, 40, 45, 57] (total = 202)
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(30)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(30)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(40)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(40)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(45)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(45)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(57)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(57)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -952,7 +1111,14 @@ mod tests {
 
         // Send requests with char_count 20
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -979,7 +1145,14 @@ mod tests {
         }
 
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(7)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(7)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1062,22 +1235,64 @@ mod tests {
         }
 
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(5)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(5)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(15)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(15)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(24)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(24)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(26)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(26)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1104,22 +1319,64 @@ mod tests {
         }
 
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(10)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(10)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(20)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(20)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(30)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(30)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(32)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(32)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(45)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(45)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
         policy
-            .select_worker(&prefill_workers, Some(&*"a".repeat(55)))
+            .select_worker(
+                &prefill_workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&*"a".repeat(55)),
+                    ..Default::default()
+                },
+            )
+            .await
             .unwrap();
 
         tokio::time::sleep(Duration::from_secs(4)).await;

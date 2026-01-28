@@ -6,8 +6,8 @@ import torch
 import torch.utils.benchmark as benchmark
 from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
+from sglang.srt.layers.attention.flashinfer_backend import should_use_tensor_core
 from sglang.srt.layers.attention.triton_ops.decode_attention import decode_attention_fwd
-from sglang.srt.utils import should_use_tensor_core
 
 
 def benchmark_forward(

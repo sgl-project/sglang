@@ -23,6 +23,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -30,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -39,12 +43,16 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    GetLoadsReqInput,
+    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
@@ -198,6 +206,12 @@ class TokenizerCommunicatorMixin:
         self.clear_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.attach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.detach_hicache_storage_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.profile_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -215,6 +229,9 @@ class TokenizerCommunicatorMixin:
         )
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
+        )
+        self.get_loads_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
         )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
@@ -275,6 +292,14 @@ class TokenizerCommunicatorMixin:
                     self.clear_hicache_storage_communicator.handle_recv,
                 ),
                 (
+                    AttachHiCacheStorageReqOutput,
+                    self.attach_hicache_storage_communicator.handle_recv,
+                ),
+                (
+                    DetachHiCacheStorageReqOutput,
+                    self.detach_hicache_storage_communicator.handle_recv,
+                ),
+                (
                     FlushCacheReqOutput,
                     self.flush_cache_communicator.handle_recv,
                 ),
@@ -302,6 +327,10 @@ class TokenizerCommunicatorMixin:
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
                 ),
+                (
+                    GetLoadsReqOutput,
+                    self.get_loads_communicator.handle_recv,
+                ),
             ]
         )
 
@@ -314,6 +343,57 @@ class TokenizerCommunicatorMixin:
         return (await self.clear_hicache_storage_communicator(ClearHiCacheReqInput()))[
             0
         ]
+
+    async def attach_hicache_storage(
+        self: TokenizerManager,
+        hicache_storage_backend: str,
+        hicache_storage_backend_extra_config_json: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
+    ) -> AttachHiCacheStorageReqOutput:
+        """Attach (enable) HiCache storage backend at runtime."""
+        results = await self.attach_hicache_storage_communicator(
+            AttachHiCacheStorageReqInput(
+                hicache_storage_backend=hicache_storage_backend,
+                hicache_storage_backend_extra_config_json=hicache_storage_backend_extra_config_json,
+                hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+                hicache_write_policy=hicache_write_policy,
+            )
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = AttachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            # Keep tokenizer side server_info consistent with scheduler side.
+            self.server_args.hicache_storage_backend = hicache_storage_backend
+            if hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    hicache_storage_backend_extra_config_json
+                )
+            if hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    hicache_storage_prefetch_policy
+                )
+            if hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = hicache_write_policy
+        return out
+
+    async def detach_hicache_storage(
+        self: TokenizerManager,
+    ) -> DetachHiCacheStorageReqOutput:
+        """Detach (disable) HiCache storage backend at runtime."""
+        results = await self.detach_hicache_storage_communicator(
+            DetachHiCacheStorageReqInput()
+        )
+
+        all_success, all_message = _Communicator.merge_results(results)
+        out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
+        # TODO: partial rollback if failed
+        if all_success:
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+        return out
 
     async def start_profile(
         self: TokenizerManager,
@@ -617,6 +697,76 @@ class TokenizerCommunicatorMixin:
                 error_message=str(e),
             )
 
+    async def load_lora_adapter_from_tensors(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterFromTensorsReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        self.auto_create_handle_loop()
+
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError(
+                    "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                )
+
+            assert (
+                self.server_args.dp_size == 1
+            ), "dp_size must be 1 for dynamic lora loading"
+            logger.info(
+                "Start load Lora adapter from tensors. Lora name=%s",
+                obj.lora_name,
+            )
+
+            async with self.lora_update_lock:
+                new_adapter = LoRARef(
+                    lora_name=obj.lora_name,
+                    lora_path="__tensor__",
+                    pinned=obj.pinned,
+                )
+                obj.lora_id = new_adapter.lora_id
+                result = (await self.update_lora_adapter_communicator(obj))[0]
+
+                if result.success:
+                    await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        unload_result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_lora_name]
+
+                return result
+        except ValueError as e:
+            return LoadLoRAAdapterFromTensorsReqOutput(
+                success=False,
+                error_message=str(e),
+            )
+
     async def unload_lora_adapter(
         self: TokenizerManager,
         obj: UnloadLoRAAdapterReqInput,
@@ -715,6 +865,33 @@ class TokenizerCommunicatorMixin:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
 
+    async def get_loads(
+        self: TokenizerManager,
+        include: Optional[List[str]] = None,
+        dp_rank: Optional[int] = None,
+    ) -> List[GetLoadsReqOutput]:
+        """
+        Get comprehensive load metrics for /v1/loads endpoint.
+
+        Args:
+            include: List of sections to include. Options: core, memory, spec, lora, disagg, queues, all
+            dp_rank: Optional filter for specific DP rank
+
+        Returns:
+            List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
+        """
+        req = GetLoadsReqInput(
+            include=include if include else ["all"],
+            dp_rank=dp_rank,
+        )
+        results = await self.get_loads_communicator(req)
+
+        # Filter by dp_rank if specified
+        if dp_rank is not None:
+            results = [r for r in results if r.dp_rank == dp_rank]
+
+        return results
+
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
     ):
@@ -736,44 +913,6 @@ class TokenizerCommunicatorMixin:
         self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
     ):
         await self.send_to_scheduler.send_pyobj(obj)
-
-    def get_log_request_metadata(self):
-        max_length = None
-        skip_names = None
-        out_skip_names = None
-        if self.log_requests:
-            if self.log_requests_level == 0:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                    "sampling_params",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 1:
-                max_length = 1 << 30
-                skip_names = {
-                    "text",
-                    "input_ids",
-                    "input_embeds",
-                    "image_data",
-                    "audio_data",
-                    "lora_path",
-                }
-                out_skip_names = {"text", "output_ids", "embedding"}
-            elif self.log_requests_level == 2:
-                max_length = 2048
-            elif self.log_requests_level == 3:
-                max_length = 1 << 30
-            else:
-                raise ValueError(
-                    f"Invalid --log-requests-level: {self.log_requests_level=}"
-                )
-        return max_length, skip_names, out_skip_names
 
     def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
         """Update weight version if provided."""

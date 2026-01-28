@@ -1,3 +1,4 @@
+import time
 from typing import List, Optional
 
 from sglang.test.accuracy_test_runner import (
@@ -115,6 +116,10 @@ def run_combined_tests(
                 all_passed = False
                 model_result["errors"].append(perf_result.error)
 
+            # Wait for GPU memory and port cleanup
+            print("\nWaiting 20 seconds for resource cleanup...")
+            time.sleep(20)
+
         # Run accuracy test
         if run_accuracy:
             acc_result: AccuracyTestResult = run_accuracy_test(
@@ -126,6 +131,10 @@ def run_combined_tests(
             if not acc_result.passed:
                 all_passed = False
                 model_result["errors"].append(acc_result.error)
+
+            # Wait for GPU memory and port cleanup
+            print("\nWaiting 20 seconds for resource cleanup...")
+            time.sleep(20)
 
         all_results.append(model_result)
 

@@ -8,8 +8,8 @@ from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -30,7 +30,7 @@ OFFLINE_MODE = False
 # Change the path below when OFFLINE_MODE is True.
 OFFLINE_PATH_DICT = {
     DEFAULT_MODEL_NAME_FOR_TEST: "/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct",
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3: "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
+    DEFAULT_DRAFT_MODEL_EAGLE3: "/shared/public/elr-models/jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B",
     DEFAULT_MODEL_NAME_FOR_TEST_MLA: "/shared/public/sharing/deepseek/dsv3-test/snapshots/",
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN: "/shared/public/sharing/deepseek/dsv3-test-NextN/snapshots/",
     GSM_DATASET_PATH: "/shared/public/data/gsm8k/test.jsonl",
@@ -39,9 +39,7 @@ OFFLINE_PATH_DICT = {
 
 if OFFLINE_MODE:
     DEFAULT_MODEL_NAME_FOR_TEST = OFFLINE_PATH_DICT[DEFAULT_MODEL_NAME_FOR_TEST]
-    DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = OFFLINE_PATH_DICT[
-        DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3
-    ]
+    DEFAULT_DRAFT_MODEL_EAGLE3 = OFFLINE_PATH_DICT[DEFAULT_DRAFT_MODEL_EAGLE3]
     DEFAULT_MODEL_NAME_FOR_TEST_MLA = OFFLINE_PATH_DICT[DEFAULT_MODEL_NAME_FOR_TEST_MLA]
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = OFFLINE_PATH_DICT[
         DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN
@@ -117,8 +115,8 @@ class BaseFlashAttentionTest(CustomTestCase):
         self.assertGreater(metrics[metric_key], self.accuracy_threshold)
 
         if self.speculative_decode:
-            server_info = requests.get(self.base_url + "/get_server_info")
-            avg_spec_accept_length = server_info.json()["internal_states"][0][
+            server_info = requests.get(self.base_url + "/server_info").json()
+            avg_spec_accept_length = server_info["internal_states"][0][
                 "avg_spec_accept_length"
             ]
             print(f"{avg_spec_accept_length=}")
@@ -154,7 +152,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-draft-model-path",
-                DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+                DEFAULT_DRAFT_MODEL_EAGLE3,
                 "--speculative-num-steps",
                 "3",
                 "--speculative-eagle-topk",
@@ -188,7 +186,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
                 "--speculative-algorithm",
                 "EAGLE3",
                 "--speculative-draft-model-path",
-                DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
+                DEFAULT_DRAFT_MODEL_EAGLE3,
                 "--speculative-num-steps",
                 "5",
                 "--speculative-eagle-topk",
