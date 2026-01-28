@@ -493,6 +493,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
+            completion_tokens_details={"reasoning_tokens": num_reasoning_tokens},
             reasoning_tokens=num_reasoning_tokens,
         )
         if self.enable_prompt_tokens_details and num_cached_tokens:

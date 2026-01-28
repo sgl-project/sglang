@@ -195,6 +195,16 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
+                    # update reasoning tokens
+                    if (
+                        req.require_reasoning
+                        and self.tokenizer
+                        and hasattr(self.tokenizer, "think_end_id")
+                    ):
+                        req.update_reasoning_tokens(
+                            next_token_id, self.tokenizer.think_end_id
+                        )
+
                     trace_slice(
                         RequestStage.PREFILL_FORWARD,
                         req.rid,
@@ -467,6 +477,14 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
+
+            # update reasoning tokens
+            if (
+                req.require_reasoning
+                and self.tokenizer
+                and hasattr(self.tokenizer, "think_end_id")
+            ):
+                req.update_reasoning_tokens(next_token_id, self.tokenizer.think_end_id)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -847,6 +865,7 @@ class SchedulerOutputProcessorMixin:
         spaces_between_special_tokens = []
         no_stop_trim = []
         prompt_tokens = []
+        reasoning_tokens = []
         completion_tokens = []
         cached_tokens = []
         spec_verify_ct = []
@@ -959,6 +978,7 @@ class SchedulerOutputProcessorMixin:
                 )
                 no_stop_trim.append(req.sampling_params.no_stop_trim)
                 prompt_tokens.append(len(req.origin_input_ids))
+                reasoning_tokens.append(req.reasoning_tokens)
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
                 retraction_counts.append(req.retraction_count)
@@ -1092,6 +1112,7 @@ class SchedulerOutputProcessorMixin:
                     spaces_between_special_tokens=spaces_between_special_tokens,
                     no_stop_trim=no_stop_trim,
                     prompt_tokens=prompt_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     input_token_logprobs_val=input_token_logprobs_val,
