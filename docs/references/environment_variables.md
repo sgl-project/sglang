@@ -92,6 +92,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_USE_AITER` | Use AITER optimize implementation | `false` |
 | `SGLANG_MOE_PADDING` | Enable MoE padding (sets padding size to 128 if value is `1`, often set to `1` in Docker builds) | `0` |
 | `SGLANG_CUTLASS_MOE` (deprecated) | Use Cutlass FP8 MoE kernel on Blackwell GPUs (deprecated, use --moe-runner-backend=cutlass) | `false` |
+| `SGLANG_CUTLASS_MOE_USE_ES` | Use Expert Specialization in CUTLASS FP8 MoE kernel on Hopper | `false` |
 
 ## Quantization
 
