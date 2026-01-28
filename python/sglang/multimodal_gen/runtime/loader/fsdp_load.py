@@ -6,7 +6,6 @@
 # Copyright 2024 The TorchTune Authors.
 # Copyright 2025 The sglang-diffusion Authors.
 
-import contextlib
 from collections.abc import Callable, Generator
 from itertools import chain
 from typing import Any
@@ -26,6 +25,7 @@ from torch.nn.modules.module import _IncompatibleKeys
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
+    set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -44,34 +44,6 @@ def _make_param_like(
     new_param.__dict__.update(actual_param.__dict__)
     new_param.requires_grad = False
     return new_param
-
-
-# TODO(PY): move this to utils elsewhere
-@contextlib.contextmanager
-def set_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
-    """
-    Context manager to set torch's default dtype.
-
-    Args:
-        dtype (torch.dtype): The desired default dtype inside the context manager.
-
-    Returns:
-        ContextManager: context manager for setting default dtype.
-
-    Example:
-        >>> with set_default_dtype(torch.bfloat16):
-        >>>     x = torch.tensor([1, 2, 3])
-        >>>     x.dtype
-        torch.bfloat16
-
-
-    """
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(old_dtype)
 
 
 # TODO(PY): add compile option
@@ -107,7 +79,7 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_dtype(default_dtype), torch.device("meta"):
+    with set_default_torch_dtype(default_dtype), torch.device("meta"):
         model = model_cls(**init_params)
 
     # Check if we should use FSDP
