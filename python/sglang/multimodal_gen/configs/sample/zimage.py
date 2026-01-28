@@ -18,6 +18,7 @@ class ZImageTurboSamplingParams(SamplingParams):
     # fps: int = 24
 
     guidance_scale: float = 0.0
+    cfg_normalization: float | bool = False
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
@@ -40,3 +41,4 @@ class ZImageSamplingParams(SamplingParams):
     num_frames: int = 1
     negative_prompt: str = " "
     guidance_scale: float = 5.0
+    cfg_normalization: float | bool = True
