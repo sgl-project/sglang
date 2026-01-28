@@ -89,7 +89,6 @@ def init_mooncake_custom_mem_pool(
     return enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type
 
 
-
 def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
     """
     Check if custom memory pool is enabled without importing allocators.
@@ -98,6 +97,7 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
         Tuple of (enable_custom_mem_pool, custom_mem_pool_type)
     """
     custom_mem_pool_type = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+
     if custom_mem_pool_type is not None:
         # Handle boolean True as NVLINK
         if custom_mem_pool_type.lower() == "true":
