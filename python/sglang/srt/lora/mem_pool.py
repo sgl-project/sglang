@@ -99,8 +99,7 @@ class LoRAMemoryPool:
             EMPTY_SLOT
         ] * self.max_loras_per_batch
 
-        self.base_model: torch.nn.Module = base_model
-        self.init_buffers()
+        self.init_buffers(base_model)
 
     def can_support(self, config: Union[LoRAConfig, Iterable[LoRAConfig]]) -> bool:
         """
@@ -122,13 +121,6 @@ class LoRAMemoryPool:
             return _can_support(config)
         else:
             return all(_can_support(x) for x in config)
-
-    def update_added_tokens_size(self, new_added_tokens_size: int):
-        if new_added_tokens_size <= self.lora_added_tokens_size:
-            return
-
-        self.lora_added_tokens_size = new_added_tokens_size
-        self.init_buffers()
 
     def get_lora_A_shape(
         self,
@@ -207,8 +199,8 @@ class LoRAMemoryPool:
             max_lora_dim,
         )
 
-    def init_buffers(self):
-        device = next(self.base_model.parameters()).device
+    def init_buffers(self, base_model: torch.nn.Module):
+        device = next(base_model.parameters()).device
 
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
@@ -221,7 +213,7 @@ class LoRAMemoryPool:
                     torch.empty(
                         get_lora_shape_fn(
                             module_name,
-                            self.base_model,
+                            base_model,
                             self.max_lora_rank,
                             idx,
                         ),
@@ -241,7 +233,7 @@ class LoRAMemoryPool:
                 buffer[module_name] = torch.empty(
                     get_lora_shape_fn(
                         module_name,
-                        self.base_model,
+                        base_model,
                         self.max_lora_rank,
                         0,
                     ),

@@ -134,9 +134,12 @@ class LoRAManager:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
 
-            memory_pool = getattr(self, "memory_pool", None)
-            if memory_pool:
-                memory_pool.update_added_tokens_size(new_adapter.lora_added_tokens_size)
+            if (
+                new_adapter.lora_added_tokens_size > 0
+                and self.lora_added_tokens_size == 0
+            ):
+                self.lora_added_tokens_size = new_adapter.lora_added_tokens_size
+                self.init_memory_pool()
 
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter

@@ -1554,7 +1554,10 @@ class TestLoRADynamicUpdate(CustomTestCase):
             self.assertEqual(len(adapter_models), 1)
             self.assertEqual(adapter_models[0]["id"], "adapter2")
 
-        # Test that we correctly handle loading a new adapter that adds tokens to the vocabulary
+    def test_update_lora_added_tokens_size(self):
+        """
+        Test that we correctly handle loading a new adapter that adds tokens to the vocabulary
+        """
         added_tokens_model = "Qwen/Qwen3-0.6B"
         added_tokens_adapter = "YoussefHosni/Qwen3-0.6b-2B-Token-arabic-LoRA-finetuned"
 
@@ -1592,6 +1595,12 @@ class TestLoRADynamicUpdate(CustomTestCase):
             self.assertEqual(adapter_models[0]["id"], "added_tokens_adapter")
             self.assertEqual(adapter_models[0]["root"], added_tokens_adapter)
             self.assertIsNotNone(adapter_models[0]["parent"])
+
+            result = session.forward(
+                prompts=[PROMPTS[0]],
+                lora_paths=["added_tokens_adapter"],
+            )
+            print(f"Got output from added_tokens_adapter: {result}")
 
 
 if __name__ == "__main__":
