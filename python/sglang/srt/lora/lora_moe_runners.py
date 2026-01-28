@@ -69,6 +69,7 @@ class LoRAInfo:
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
     lora_scalings: torch.Tensor  # [num_loras]
+    adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
 
     num_experts: int
 
@@ -212,6 +213,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             dtype=hidden_states.dtype,
         )
 
+        # output shape: [M, top_k, N] and in original token order since we do not pass in c_sorted=True. If we
+        # want to get the output in sorted order by expert, we can pass in c_sorted=True.
+        # TODO: determine whether we should pass in c_sorted=True. That will make it less readable and different from base run method.
+        # but we won't have to scatter the lora delta to the correct positions before adding them to this base output.
         invoke_fused_moe_kernel(
             hidden_states,
             w13,
@@ -244,6 +249,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             hidden_states=hidden_states,
             intermediate_cache=intermediate_cache1,
             topk_ids=topk_ids,
+            topk_weights=topk_weights,
             lora_info=lora_info,
         )
 
@@ -299,6 +305,12 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
+
+        # output shape: [M, hidden_dim] and in original token order since we do not pass in c_sorted=True. If we
+        # want to get the output in sorted order by expert, we can pass in c_sorted=True. We use  no_combine=False because the next
+        # LoRA computation requires input to be [M, hidden_dim]
+        # TODO: determine whether we should pass in c_sorted=True. That will make it less readable and different from base run method.
+        # but we won't have to scatter the lora delta to the correct positions before adding them to this base output.
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
@@ -328,9 +340,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             block_shape=block_shape,
         )
 
-        # ============================================================
+         # ============================================================
         # Stage 3.5: Add LoRA down delta BEFORE final reduction
         # ============================================================
+        # intermediate_cache2 is in the original token order and token-major order.
         self._add_lora_down_delta(
             intermediate_input=intermediate_cache2,
             intermediate_cache=intermediate_cache3,
@@ -339,6 +352,9 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             apply_router_weight_on_input=apply_router_weight_on_input,
             lora_info=lora_info,
         )
+
+        # we still need to combine the output
+
 
         # ============================================================
         # Stage 4: Final reduction (sum across top_k)
@@ -394,6 +410,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         hidden_states: torch.Tensor,  # [M, hidden_dim]
         intermediate_cache: torch.Tensor,  # [M, top_k, gate_up_dim]
         topk_ids: torch.Tensor,  # [M, top_k]
+        topk_weights: torch.Tensor,  # [M, top_k]
         lora_info: LoRAInfo,
     ) -> None:
         """
@@ -403,44 +420,56 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             delta = scaling * B @ (A @ hidden_states[token])
         and adds it to intermediate_cache[token, k] where k is the top_k index.
         """
-        from sglang.srt.lora.triton_ops.per_expert_lora_moe import (
-            per_expert_lora_forward,
-        )
+        from sglang.srt.lora.triton_ops import fused_moe_lora
 
         M, top_k, gate_up_dim = intermediate_cache.shape
         num_dispatched = lora_info.token_ids.shape[0]
 
-        # Compute LoRA delta for each (token, expert) pair
-        # Output shape: [num_dispatched, gate_up_dim]
-        lora_delta = torch.zeros(
-            (num_dispatched, gate_up_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        # Compute LoRA delta where intermediate_cache needs to be [M, top_k, gate_up_dim] in original token order.
+        # Output shape: [M, top_k, gate_up_dim]
+        # Hidden_states shape: [M, hidden_dim] (handles token duplication internally)
 
-        _, lora_delta = per_expert_lora_forward(
-            hidden_states=hidden_states,
-            lora_a_weights=lora_info.gate_up_lora_a_weights,
-            lora_b_weights=lora_info.gate_up_lora_b_weights,
-            token_ids=lora_info.token_ids,
-            expert_ids=lora_info.expert_ids,
+        num_tokens_post_padded_formatted = torch.tensor([num_dispatched], dtype=torch.int32, device=hidden_states.device)
+        actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
+
+        # Handle multi-LoRA: stack weights for all loaded LoRAs
+        # lora_info.gate_up_lora_a_weights shape: [num_loras, num_experts, max_rank, hidden_dim]
+        # Note: LoRA scaling factors (lora_info.lora_scalings) are already applied to weights during loading
+        max_loras = len(lora_info.lora_ranks)
+
+        lora_a_stacked = [lora_info.gate_up_lora_a_weights[i] for i in range(max_loras)]
+        lora_b_stacked = [lora_info.gate_up_lora_b_weights[i] for i in range(max_loras)]
+
+        fused_moe_lora(
+            output=intermediate_cache,
+            qcurr_hidden_states=hidden_states,
+            lora_a_stacked=lora_a_stacked,
+            lora_b_stacked=lora_b_stacked,
+            topk_weights=topk_weights,  # Use actual routing weights
+            sorted_token_ids=lora_info.token_ids.unsqueeze(0),
+            expert_ids=lora_info.expert_ids.unsqueeze(0),
+            num_tokens_post_padded=num_tokens_post_padded_formatted,
+            max_lora_rank=actual_max_lora_rank,
+            top_k_num=top_k,
             lora_ids=lora_info.lora_ids,
-            lora_ranks=lora_info.lora_ranks,
-            lora_scalings=lora_info.lora_scalings,
-            num_experts=lora_info.num_experts,
-            base_output=lora_delta,
-            is_down_proj=False,
+            adapter_enabled=lora_info.adapter_enabled,
+            shrink_block_size_m=64,
+            shrink_block_size_n=64,
+            shrink_block_size_k=64,
+            shrink_group_size_m=8,
+            shrink_num_warps=4,
+            shrink_num_stages=2,
+            shrink_split_k=1,
+            expand_block_size_m=64,
+            expand_block_size_n=64,
+            expand_block_size_k=64,
+            expand_group_size_m=8,
+            expand_num_warps=4,
+            expand_num_stages=2,
+            expand_split_k=1,
         )
 
-        # Add delta to intermediate_cache at the right positions
-        # We need to map from dispatched indices back to (token, top_k_idx) pairs
-        self._scatter_add_to_topk_cache(
-            lora_delta=lora_delta,
-            intermediate_cache=intermediate_cache,
-            token_ids=lora_info.token_ids,
-            expert_ids=lora_info.expert_ids,
-            topk_ids=topk_ids,
-        )
+
 
     def _add_lora_down_delta(
         self,
@@ -458,163 +487,56 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             delta = scaling * B @ (A @ intermediate_input[dispatched_idx])
         and adds it to intermediate_cache[token, k].
         """
-        from sglang.srt.lora.triton_ops.per_expert_lora_moe import (
-            per_expert_lora_forward,
-        )
+        from sglang.srt.lora.triton_ops import fused_moe_lora
 
         M, top_k, hidden_dim = intermediate_cache.shape
 
-        # Build indices to gather from intermediate_input
-        # For each dispatched (token, expert) pair, find which top_k slot it corresponds to
-        lora_intermediate_input = self._gather_dispatched_inputs(
-            intermediate_input=intermediate_input,
-            token_ids=lora_info.token_ids,
-            expert_ids=lora_info.expert_ids,
-            topk_ids=topk_ids,
-            M=M,
-            top_k=top_k,
-        )
+        # intermediate_input is the input from the previous stage and is in original token order.
 
-        # Compute LoRA delta for down projection
-        num_dispatched = lora_info.token_ids.shape[0]
-        lora_delta = torch.zeros(
-            (num_dispatched, hidden_dim),
-            dtype=intermediate_input.dtype,
-            device=intermediate_input.device,
-        )
+        # Data format adaptation for vLLM kernel
+        num_dispatched_down = lora_info.token_ids.shape[0]
+        num_tokens_post_padded_formatted = torch.tensor([num_dispatched_down], dtype=torch.int32, device=intermediate_input.device)
+        actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
 
-        # IMPORTANT: For down_proj, the input (lora_intermediate_input) is already
-        # gathered and indexed by dispatched position (0, 1, ..., num_dispatched-1),
-        # not by original token position. So we pass identity indices for token_ids
-        # to make the kernel read from the correct positions.
-        dispatched_indices = torch.arange(
-            num_dispatched,
-            device=lora_info.token_ids.device,
-            dtype=lora_info.token_ids.dtype,
-        )
+        # Handle multi-LoRA: stack weights for all loaded LoRAs
+        # lora_info.down_lora_a_weights shape: [num_loras, num_experts, max_rank, intermediate_dim]
+        # Note: LoRA scaling factors (lora_info.lora_scalings) are already applied to weights during loading
+        max_loras = len(lora_info.lora_ranks)
 
-        _, lora_delta = per_expert_lora_forward(
-            hidden_states=lora_intermediate_input,
-            lora_a_weights=lora_info.down_lora_a_weights,
-            lora_b_weights=lora_info.down_lora_b_weights,
-            token_ids=dispatched_indices,  # Use identity indices, not original token_ids
-            expert_ids=lora_info.expert_ids,
+        # Validate weight dimensions match expectations
+        assert lora_info.down_lora_a_weights.shape[0] == max_loras, f"Expected {max_loras} LoRAs, got {lora_info.down_lora_a_weights.shape[0]}"
+        assert lora_info.adapter_enabled.shape[0] >= max_loras, f"adapter_enabled too small: {lora_info.adapter_enabled.shape[0]} < {max_loras}"
+
+        lora_a_stacked = [lora_info.down_lora_a_weights[i] for i in range(max_loras)]
+        lora_b_stacked = [lora_info.down_lora_b_weights[i] for i in range(max_loras)]
+
+        fused_moe_lora(
+            output=intermediate_cache,
+            qcurr_hidden_states=intermediate_input,
+            lora_a_stacked=lora_a_stacked,
+            lora_b_stacked=lora_b_stacked,
+            topk_weights=topk_weights,  # Use the routing weights passed to this function
+            sorted_token_ids=lora_info.token_ids.unsqueeze(0),
+            expert_ids=lora_info.expert_ids.unsqueeze(0),
+            num_tokens_post_padded=num_tokens_post_padded_formatted,
+            max_lora_rank=actual_max_lora_rank,
+            top_k_num=top_k,
             lora_ids=lora_info.lora_ids,
-            lora_ranks=lora_info.lora_ranks,
-            lora_scalings=lora_info.lora_scalings,
-            num_experts=lora_info.num_experts,
-            base_output=lora_delta,
-            is_down_proj=True,
+            adapter_enabled=lora_info.adapter_enabled,
+            shrink_block_size_m=64,
+            shrink_block_size_n=64,
+            shrink_block_size_k=64,
+            shrink_group_size_m=8,
+            shrink_num_warps=4,
+            shrink_num_stages=2,
+            shrink_split_k=1,
+            expand_block_size_m=64,
+            expand_block_size_n=64,
+            expand_block_size_k=64,
+            expand_group_size_m=8,
+            expand_num_warps=4,
+            expand_num_stages=2,
+            expand_split_k=1,
         )
+    
 
-        # Apply router weights if not already applied to input
-        # This matches the base MoE behavior
-        if not apply_router_weight_on_input:
-            # Get router weights for each dispatched pair
-            router_weights = self._gather_router_weights(
-                topk_weights=topk_weights,
-                token_ids=lora_info.token_ids,
-                expert_ids=lora_info.expert_ids,
-                topk_ids=topk_ids,
-            )
-            lora_delta = lora_delta * router_weights.unsqueeze(-1)
-
-        # Add delta to intermediate_cache
-        self._scatter_add_to_topk_cache(
-            lora_delta=lora_delta,
-            intermediate_cache=intermediate_cache,
-            token_ids=lora_info.token_ids,
-            expert_ids=lora_info.expert_ids,
-            topk_ids=topk_ids,
-        )
-
-    def _scatter_add_to_topk_cache(
-        self,
-        lora_delta: torch.Tensor,  # [num_dispatched, dim]
-        intermediate_cache: torch.Tensor,  # [M, top_k, dim]
-        token_ids: torch.Tensor,  # [num_dispatched]
-        expert_ids: torch.Tensor,  # [num_dispatched]
-        topk_ids: torch.Tensor,  # [M, top_k]
-    ) -> None:
-        """
-        Scatter-add lora_delta to intermediate_cache based on dispatch info.
-
-        For each dispatched index d:
-            - token_id = token_ids[d]
-            - expert_id = expert_ids[d]
-            - Find k such that topk_ids[token_id, k] == expert_id
-            - intermediate_cache[token_id, k] += lora_delta[d]
-        """
-        M, top_k, dim = intermediate_cache.shape
-
-        # Find the top_k index for each dispatched pair
-        # topk_ids[token_ids] gives [num_dispatched, top_k]
-        # We need to find which column matches expert_ids
-        expanded_topk = topk_ids[token_ids]  # [num_dispatched, top_k]
-        expert_mask = expanded_topk == expert_ids.unsqueeze(
-            1
-        )  # [num_dispatched, top_k]
-
-        # Get the k index for each dispatched pair
-        k_indices = expert_mask.int().argmax(dim=1)  # [num_dispatched]
-
-        # Compute flat indices into intermediate_cache viewed as [M * top_k, dim]
-        flat_indices = token_ids * top_k + k_indices  # [num_dispatched]
-
-        # Reshape cache for scatter_add
-        cache_flat = intermediate_cache.view(M * top_k, dim)
-
-        # Scatter add
-        cache_flat.scatter_add_(
-            0,
-            flat_indices.unsqueeze(-1).expand(-1, dim),
-            lora_delta.to(cache_flat.dtype),
-        )
-
-    def _gather_dispatched_inputs(
-        self,
-        intermediate_input: torch.Tensor,  # [M * top_k, dim]
-        token_ids: torch.Tensor,  # [num_dispatched]
-        expert_ids: torch.Tensor,  # [num_dispatched]
-        topk_ids: torch.Tensor,  # [M, top_k]
-        M: int,
-        top_k: int,
-    ) -> torch.Tensor:
-        """
-        Gather intermediate inputs for dispatched (token, expert) pairs.
-
-        Returns tensor of shape [num_dispatched, dim].
-        """
-        # Find which top_k slot each dispatched pair corresponds to
-        expanded_topk = topk_ids[token_ids]  # [num_dispatched, top_k]
-        expert_mask = expanded_topk == expert_ids.unsqueeze(1)
-        k_indices = expert_mask.int().argmax(dim=1)  # [num_dispatched]
-
-        # Compute flat indices
-        flat_indices = token_ids * top_k + k_indices
-
-        # Gather
-        return intermediate_input[flat_indices]
-
-    def _gather_router_weights(
-        self,
-        topk_weights: torch.Tensor,  # [M, top_k]
-        token_ids: torch.Tensor,  # [num_dispatched]
-        expert_ids: torch.Tensor,  # [num_dispatched]
-        topk_ids: torch.Tensor,  # [M, top_k]
-    ) -> torch.Tensor:
-        """
-        Gather router weights for dispatched (token, expert) pairs.
-
-        Returns tensor of shape [num_dispatched].
-        """
-        # Find which top_k slot each dispatched pair corresponds to
-        expanded_topk = topk_ids[token_ids]  # [num_dispatched, top_k]
-        expert_mask = expanded_topk == expert_ids.unsqueeze(1)
-        k_indices = expert_mask.int().argmax(dim=1)  # [num_dispatched]
-
-        # Gather weights
-        expanded_weights = topk_weights[token_ids]  # [num_dispatched, top_k]
-        return expanded_weights[
-            torch.arange(len(token_ids), device=topk_weights.device), k_indices
-        ]

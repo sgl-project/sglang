@@ -594,8 +594,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self,
         base_layer: nn.Module,
         lora_backend: BaseLoRABackend,
+        adapter_enabled: torch.Tensor = None,
     ):
         super().__init__(base_layer, lora_backend)
+        self.adapter_enabled = adapter_enabled
         # LoRA tensors will be set by LoRAManager
         self.gate_up_lora_a_weights = None
         self.gate_up_lora_b_weights = None
@@ -641,6 +643,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_ranks = batch_info.lora_ranks  # [num_loras]
         scalings = batch_info.scalings  # [num_loras]
 
+        # Get adapter_enabled from layer instance, slice to match current batch
+        adapter_enabled = self.adapter_enabled[:len(lora_ranks)] if self.adapter_enabled is not None else torch.zeros(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
+
         # Use precomputed per-token LoRA indices from forward batch
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
@@ -661,6 +666,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_ids=lora_ids,
             lora_ranks=lora_ranks,
             lora_scalings=scalings,
+            adapter_enabled=adapter_enabled,
             num_experts=self.base_layer.num_experts,
         )
 
@@ -763,7 +769,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
 
 def get_lora_layer(
-    layer: nn.Module, lora_backend: BaseLoRABackend
+    layer: nn.Module, lora_backend: BaseLoRABackend, adapter_enabled: torch.Tensor = None
 ) -> BaseLayerWithLoRA:
     # FusedMoE is now imported at the top of the file
     # FusedMoEWithLoRA is now defined in this file
@@ -780,6 +786,9 @@ def get_lora_layer(
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-            ret = lora_layer_type(layer, lora_backend)
+            if src_layer_type == FusedMoE:
+                ret = lora_layer_type(layer, lora_backend, adapter_enabled)
+            else:
+                ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")

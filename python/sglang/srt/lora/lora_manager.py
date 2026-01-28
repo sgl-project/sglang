@@ -75,6 +75,9 @@ class LoRAManager:
         self.tp_rank: int = tp_rank
         self.lora_added_tokens_size: Optional[int] = None
 
+        # Track which LoRA adapters are enabled (loaded/available)
+        self.adapter_enabled = torch.zeros(max_loras_per_batch + 1, dtype=torch.int32, device=self.device)
+
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
 
@@ -141,6 +144,9 @@ class LoRAManager:
             # keep metadata for displayed messages
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
+
+            # Mark this adapter as enabled
+            self.adapter_enabled[lora_ref.lora_id] = 1
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -202,6 +208,9 @@ class LoRAManager:
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
             self.num_pinned_loras -= int(lora_ref.pinned)
+
+            # Mark this adapter as disabled
+            self.adapter_enabled[lora_ref.lora_id] = 0
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -530,7 +539,7 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        lora_module = get_lora_layer(module, self.lora_backend, self.adapter_enabled)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 
