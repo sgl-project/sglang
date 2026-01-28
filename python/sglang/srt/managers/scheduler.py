@@ -2255,16 +2255,6 @@ class Scheduler(
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        # For adaptive speculation, spec_info might be out of sync if SD was toggled
-        # Check and clear it if needed before filtering
-        # if (
-        #     self.adaptive_spec_threshold is not None
-        #     and batch.spec_info is not None
-        #     and hasattr(batch.spec_info, "topk_p")
-        #     and len(batch.spec_info.topk_p) != initial_bs
-        # ):
-        #     batch.spec_info = None
-
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
             batch.batch_is_full = False

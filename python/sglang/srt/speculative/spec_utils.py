@@ -463,7 +463,7 @@ def create_accept_length_filter(
     return accept_length_filter
 
 
-#@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=_is_npu)
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -506,12 +506,6 @@ def select_top_k_tokens(
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
 
-        # parent_local_index = topk_cs_index // topk
-        # batch_offset = (
-        #     torch.arange(topk_cs_index.shape[0], device=topk_index.device).unsqueeze(1)
-        #     * topk
-        # )
-        # real_parents = (parent_local_index + batch_offset).flatten()
         real_parents = topk_cs_index // topk
 
         tree_info = (

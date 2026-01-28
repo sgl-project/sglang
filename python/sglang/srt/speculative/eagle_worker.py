@@ -655,11 +655,6 @@ class EAGLEWorker(TpModelWorker):
 
         enable_sd = self.should_enable_sd(batch)
         
-        # If SD is not enabled but spec_info exists from a previous iteration,
-        # clear it to avoid stale data causing issues
-        # if not enable_sd and batch.spec_info is not None:
-        #     batch.spec_info = None
-        
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch

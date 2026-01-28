@@ -662,11 +662,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         # Prefill only generate 1 token.
         assert len(self.verified_id) == len(batch.seq_lens)
 
-        # # Handle both V1 (ScheduleBatch) and V2 (ModelWorkerBatch) APIs
-        # extend_lens = getattr(batch, 'extend_seq_lens', None) or getattr(batch, 'extend_lens', None)
-        # if extend_lens is None:
-        #     raise AttributeError(f"Batch has neither 'extend_seq_lens' nor 'extend_lens' attribute")
-
         pt = 0
         for i, extend_len in enumerate(batch.extend_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
