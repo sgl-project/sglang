@@ -301,12 +301,27 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            if (
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                )
+                and get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH")
+            ):
+                backend = MoeRunnerBackend.DEEP_GEMM
+            else:
+                if self.use_triton_kernels:
+                    backend = MoeRunnerBackend.TRITON_KERNELS
+                else:
+                    backend = MoeRunnerBackend.TRITON
+
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
@@ -332,7 +347,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -349,7 +363,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
+        elif self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
+            topk_output = dispatch_output.topk_output
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
@@ -368,7 +394,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         else:
             if _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
-                topk_weights, topk_ids, _ = topk_output
+                topk_weights, topk_ids, _ = dispatch_output.topk_output
                 if moe_runner_config.apply_router_weight_on_input:
                     assert (
                         topk_weights.dim() == 2

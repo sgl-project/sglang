@@ -113,14 +113,25 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> DeepGemmRunnerOutput:
+        weight_dtype = quant_info.w13_weight.dtype
         if not runner_input.use_masked_gemm:
-            hidden_states = self._run_contiguous_gemm(
-                runner_input, quant_info, running_state
-            )
+            if weight_dtype == torch.bfloat16:
+                hidden_states = self._run_bf16_contiguous_gemm(
+                    runner_input, quant_info, running_state
+                )
+            else:
+                hidden_states = self._run_contiguous_gemm(
+                    runner_input, quant_info, running_state
+                )
         else:
-            hidden_states = self._run_masked_gemm(
-                runner_input, quant_info, running_state
-            )
+            if weight_dtype == torch.bfloat16:
+                hidden_states = self._run_masked_bf16_gemm(
+                    runner_input, quant_info, running_state
+                )
+            else:
+                hidden_states = self._run_masked_gemm(
+                    runner_input, quant_info, running_state
+                )
         return DeepGemmRunnerOutput(hidden_states=hidden_states)
 
     def _run_contiguous_gemm(
@@ -200,6 +211,68 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
+            down_output,
+            m_indices,
+        )
+
+        return down_output
+
+    def _run_bf16_contiguous_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+
+        hidden_states = runner_input.hidden_states
+        all_tokens = running_state["all_tokens"]
+        hidden_states_device = running_state["hidden_states_device"]
+        hidden_states_shape = running_state["hidden_states_shape"]
+        m_indices = runner_input.m_indices
+
+        N = quant_info.w13_weight.size(1)
+        K = hidden_states_shape[1]
+
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
+
+        # GroupGemm-1: (M, K) (E, N, K) -> (M, N)
+        gateup_output = torch.empty(
+            (all_tokens, N),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+
+        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
+            hidden_states,
+            w13_weight,
+            gateup_output,
+            m_indices,
+        )
+
+        dispose_tensor(hidden_states)
+
+        # Act: (M, N) -> (M, N/2)
+        down_input = torch.empty(
+            (
+                all_tokens,
+                N // 2,
+            ),
+            device=gateup_output.device,
+            dtype=torch.bfloat16,
+        )
+        silu_and_mul(gateup_output.view(-1, N), down_input)
+        del gateup_output
+
+        # GroupGemm-2: (M, N/2) (E, K, N/2) -> (M, K)
+        down_output = torch.empty(
+            (all_tokens, K),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
+            down_input,
+            w2_weight,
             down_output,
             m_indices,
         )
@@ -337,6 +410,74 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
             **gemm_overlap_args_dict,
+        )
+        meta_overlap_args = running_state.get("meta_overlap_args", None)
+        if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
+            meta_overlap_args["block_m"] = block_m
+            meta_overlap_args["threshold"] = threshold
+
+        return down_output
+
+    def _run_masked_bf16_gemm(
+        self,
+        runner_input: DeepGemmRunnerInput,
+        quant_info: DeepGemmMoeQuantInfo,
+        running_state: dict,
+    ) -> torch.Tensor:
+        from sglang.srt.layers import deep_gemm_wrapper
+        from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_fwd
+
+        hidden_states = runner_input.hidden_states
+        masked_m = runner_input.masked_m
+        expected_m = runner_input.expected_m
+
+        w13_weight = quant_info.w13_weight
+        w2_weight = quant_info.w2_weight
+
+        hidden_states_device = running_state["hidden_states_device"]
+
+        # GroupGemm-0
+        num_groups, m, k = hidden_states.shape
+        n = w13_weight.size(1)
+        gateup_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        )
+        deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
+            hidden_states,
+            w13_weight,
+            gateup_output,
+            masked_m,
+            expected_m,
+        )
+        dispose_tensor(hidden_states)
+
+        down_input = torch.empty(
+            (
+                gateup_output.shape[0],
+                gateup_output.shape[1],
+                gateup_output.shape[2] // 2,
+            ),
+            device=hidden_states_device,
+            dtype=torch.bfloat16,
+        )
+
+        # Act
+        silu_and_mul_masked_fwd(gateup_output, down_input, masked_m)
+        del gateup_output
+
+        # GroupGemm-1
+        n = w2_weight.shape[1]
+
+        down_output = torch.empty(
+            (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
+        )
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_bf16_masked(
+            down_input,
+            w2_weight,
+            down_output,
+            masked_m,
+            expected_m,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         if meta_overlap_args is not None:
@@ -565,7 +706,8 @@ def pre_permute_deepep_normal_to_deep_gemm(
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
     dispose_tensor(hidden_states)
-    dispose_tensor(hidden_states_scale)
+    if hidden_states_scale is not None:
+        dispose_tensor(hidden_states_scale)
 
     running_state["output_index"] = output_index
 

@@ -430,6 +430,114 @@ def silu_and_mul_masked_post_quant_fwd(
 
 
 @triton.jit
+def _silu_and_mul_kernel(
+    input_ptr,
+    stride_input_0,
+    stride_input_1,
+    stride_input_2,
+    output_ptr,
+    stride_output_0,
+    stride_output_1,
+    stride_output_2,
+    masked_m_ptr,
+    size_n,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    token_id = tl.program_id(1)
+    hidden_dim_block_index = tl.program_id(0)
+
+    block_num_per_expert = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
+    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
+    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
+    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
+
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
+    input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
+    output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
+
+    for token_index in tl.range(
+        token_id, token_num_cur_expert, block_num_per_expert, num_stages=NUM_STAGE
+    ):
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+        tl.store(
+            output_ptr_offs + token_index * stride_output_1,
+            gate_up,
+            mask=offs_in_d < size_n,
+        )
+
+
+def silu_and_mul_masked_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+):
+    """
+    input shape [expert_num, token_num_padded, hidden_dim], dtype bf16
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype bf16
+    masked_m shape [expert_num]
+    """
+
+    assert input.is_contiguous()
+    assert output.dtype == torch.bfloat16
+    assert input.dtype == torch.bfloat16
+    assert output.is_contiguous()
+    assert len(input.shape) == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+
+    size_n = input.shape[-1] // 2
+    expert_num = len(masked_m)
+
+    if expert_num < 4:
+        BLOCK_NUM_PER_EXPERT = 64
+    else:
+        BLOCK_NUM_PER_EXPERT = 32
+
+    BLOCK_N = 128
+    num_warps = 4
+    NUM_STAGES = 4
+
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+
+    grid = (
+        hidden_dim_split_block_num,
+        BLOCK_NUM_PER_EXPERT,
+        expert_num,
+    )
+
+    _silu_and_mul_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        masked_m,
+        size_n,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=num_warps,
+    )
+    return output
+
+
+@triton.jit
 def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
     input_ptr,
     output_ptr,
@@ -665,6 +773,7 @@ def _fwd_kernel_ep_scatter_2(
     HIDDEN_SIZE_PAD: tl.constexpr,
     SCALE_HIDDEN_SIZE: tl.constexpr,
     SCALE_HIDDEN_SIZE_PAD: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     start_token_id = tl.program_id(0)
     grid_num = tl.num_programs(0)
@@ -678,12 +787,13 @@ def _fwd_kernel_ep_scatter_2(
     for token_id_int32 in range(start_token_id, total_token_num, grid_num):
         token_id = token_id_int32.to(tl.int64)
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
-        to_copy_s = tl.load(
-            recv_x_scale
-            + token_id * recv_x_scale_stride0
-            + index_in_s * recv_x_scale_stride1,
-            mask=mask_s,
-        )
+        if IS_FP8:
+            to_copy_s = tl.load(
+                recv_x_scale
+                + token_id * recv_x_scale_stride0
+                + index_in_s * recv_x_scale_stride1,
+                mask=mask_s,
+            )
 
         for topk_idx_int32 in tl.range(0, topk_num, 1, num_stages=4):
             topk_index = topk_idx_int32.to(tl.int64)
@@ -699,15 +809,18 @@ def _fwd_kernel_ep_scatter_2(
                 output_tensor_ptr = (
                     output_tensor + dest_token_index * output_tensor_stride0
                 )
-                output_tensor_scale_ptr = (
-                    output_tensor_scale + dest_token_index * output_tensor_scale_stride0
-                )
                 tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
-                tl.store(
-                    output_tensor_scale_ptr + index_in_s * output_tensor_scale_stride1,
-                    to_copy_s,
-                    mask=mask_s,
-                )
+                if IS_FP8:
+                    output_tensor_scale_ptr = (
+                        output_tensor_scale
+                        + dest_token_index * output_tensor_scale_stride0
+                    )
+                    tl.store(
+                        output_tensor_scale_ptr
+                        + index_in_s * output_tensor_scale_stride1,
+                        to_copy_s,
+                        mask=mask_s,
+                    )
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py
@@ -739,10 +852,15 @@ def ep_scatter(
         scale_hidden_size = ceil_div(scale_hidden_size, 4)
 
     assert m_indices.shape[0] % BLOCK_E == 0
-    assert (
-        recv_x_scale.dtype == output_tensor_scale.dtype
-    ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
-    assert recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
+
+    is_fp8 = recv_x_scale is not None and recv_x.dtype != torch.bfloat16
+    if is_fp8:
+        assert (
+            recv_x_scale.dtype == output_tensor_scale.dtype
+        ), f"recv_x_scale.dtype: {recv_x_scale.dtype}, output_tensor_scale.dtype: {output_tensor_scale.dtype}"
+        assert (
+            recv_x_scale.shape[1] == output_tensor_scale.shape[1] == scale_hidden_size
+        )
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
@@ -763,8 +881,8 @@ def ep_scatter(
         recv_x.stride(0),
         recv_x.stride(1),
         recv_x_scale,
-        recv_x_scale.stride(0),
-        recv_x_scale.stride(1),
+        recv_x_scale.stride(0) if is_fp8 else 0,
+        recv_x_scale.stride(1) if is_fp8 else 0,
         recv_topk,
         recv_topk.stride(0),
         recv_topk.stride(1),
@@ -772,8 +890,8 @@ def ep_scatter(
         output_tensor.stride(0),
         output_tensor.stride(1),
         output_tensor_scale,
-        output_tensor_scale.stride(0),
-        output_tensor_scale.stride(1),
+        output_tensor_scale.stride(0) if is_fp8 else 0,
+        output_tensor_scale.stride(1) if is_fp8 else 0,
         output_index,
         output_index.stride(0),
         output_index.stride(1),
@@ -783,6 +901,7 @@ def ep_scatter(
         HIDDEN_SIZE_PAD=triton.next_power_of_2(hidden_size),
         SCALE_HIDDEN_SIZE=scale_hidden_size,
         SCALE_HIDDEN_SIZE_PAD=triton.next_power_of_2(scale_hidden_size),
+        IS_FP8=is_fp8,
     )
     return
 
