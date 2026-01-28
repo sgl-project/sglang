@@ -465,11 +465,8 @@ class WanTransformerBlock(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
-        )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, None, None
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
@@ -648,9 +645,8 @@ class WanTransformerBlock_VSA(nn.Module):
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
 
-        null_shift = null_scale = torch.zeros((1,), device=hidden_states.device)
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
-            hidden_states, attn_output, gate_msa, null_shift, null_scale
+            hidden_states, attn_output, gate_msa, None, None
         )
         norm_hidden_states, hidden_states = norm_hidden_states.to(
             orig_dtype
