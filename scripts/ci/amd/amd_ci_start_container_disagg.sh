@@ -154,13 +154,28 @@ else
     CACHE_VOLUME=""
 fi
 
+# Detect libionic library for RDMA support
+LIBIONIC_MOUNT=""
+LIBIONIC_LIB=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 -name "libionic.so.*" -type f 2>/dev/null | head -1)
+if [[ -n "$LIBIONIC_LIB" ]]; then
+    echo "Found libionic library: $LIBIONIC_LIB"
+    LIBIONIC_MOUNT="-v ${LIBIONIC_LIB}:${LIBIONIC_LIB}:ro"
+else
+    echo "Warning: libionic library not found on host, RDMA may not work"
+fi
+
 echo "Launching container: ci_sglang"
-docker run -dt --user root --device=/dev/kfd --device=/dev/rdma --device=/dev/dri ${DEVICE_FLAG} \
+docker run -dt --user root \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
+  -v /sys/class/infiniband_verbs:/sys/class/infiniband_verbs:ro \
   -v /sys/class/net:/sys/class/net:ro \
-  -v /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro \
   -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
+  -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro \
+  $LIBIONIC_MOUNT \
   $CACHE_VOLUME \
   --privileged \
   --network=host \
@@ -169,19 +184,15 @@ docker run -dt --user root --device=/dev/kfd --device=/dev/rdma --device=/dev/dr
   --cap-add=IPC_LOCK \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
-  --device=/dev/kfd \
-  ${DEVICE_FLAG} \
   --group-add video \
   --group-add rdma \
   --shm-size 32g \
-  --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e HF_HOME=/sgl-data/hf-cache \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
-  --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
