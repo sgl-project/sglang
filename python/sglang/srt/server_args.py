@@ -340,6 +340,7 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
+    stream_output_token_by_token: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -3106,6 +3107,15 @@ class ServerArgs:
             "--stream-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
+        )
+        parser.add_argument(
+            "--stream-output-token-by-token",
+            action="store_true",
+            default=ServerArgs.stream_output_token_by_token,
+            help=(
+                "Force streaming to emit exactly one token per chunk. "
+                "Useful for smoother output and masking speculative decoding behavior."
+            ),
         )
         parser.add_argument(
             "--random-seed",
