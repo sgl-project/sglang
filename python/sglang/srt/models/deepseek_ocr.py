@@ -1784,6 +1784,7 @@ class DeepseekOCRForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            is_qwen2_weight = "qwen2_model." in name
             if name == "lm_head.weight":
                 name = "model.lm_head.weight"
             elif name.startswith("model."):
@@ -1804,6 +1805,26 @@ class DeepseekOCRForCausalLM(nn.Module):
                     or "image_newline" in name
                 ):
                     name = name.replace("model.", "model.model.")
+
+            if is_qwen2_weight:
+                target_name = name
+                if target_name not in params_dict:
+                    if ".model.model." in target_name:
+                        alt_name = target_name.replace(".model.model.", ".model.")
+                    else:
+                        alt_name = target_name.replace(".model.", ".model.model.", 1)
+                    if alt_name in params_dict:
+                        target_name = alt_name
+                if target_name.endswith(".bias") and target_name not in params_dict:
+                    continue
+                if target_name in params_dict:
+                    param = params_dict[target_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(target_name)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
