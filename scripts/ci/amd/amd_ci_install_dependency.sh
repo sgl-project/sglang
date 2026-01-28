@@ -162,8 +162,8 @@ if [[ "${GPU_ARCH}" == "mi35x" ]]; then
                         | head -n1 \
                         | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
 else
-    echo "[CI-AITER-CHECK] Using gfx942-rocm700 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700' docker/rocm.Dockerfile \
+    echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
+    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
                         | grep 'AITER_COMMIT=' \
                         | head -n1 \
                         | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
