@@ -8,12 +8,17 @@ from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import is_hip
 
 after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
 
 nccl_allocator_source = """
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
+#include <hip/hip_runtime.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 extern "C" {
 
@@ -106,11 +111,12 @@ def get_nccl_mem_pool():
 
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
+        ldflags = ["-lrccl"] if is_hip() else ["-lnccl"]
         torch.utils.cpp_extension.load_inline(
             name=nccl_allocator_libname,
             cpp_sources=nccl_allocator_source,
             with_cuda=True,
-            extra_ldflags=["-lnccl"],
+            extra_ldflags=ldflags,
             verbose=True,
             is_python_module=False,
             build_directory=out_dir,
