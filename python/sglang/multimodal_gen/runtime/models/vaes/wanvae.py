@@ -1613,7 +1613,6 @@ class WanDecoder3d(nn.Module):
         if self.use_parallel_decode and world_size > 1:
             rank = get_sp_parallel_rank()
             expected_height = x.shape[-2] * (2 ** self.upsample_count)
-            print(f"Rank{rank} {expected_height=}")
             x = sp_chunk(x, dim=-2, world_size=world_size, rank=rank)
 
         ## conv1
