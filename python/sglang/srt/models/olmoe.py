@@ -42,7 +42,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, make_layers, print_warning_once
+from sglang.srt.utils import add_prefix, is_npu, make_layers, print_warning_once
+
+_is_npu = is_npu()
 
 
 class OlmoeMoE(nn.Module):
@@ -90,7 +92,9 @@ class OlmoeMoE(nn.Module):
             reduce_results=True,
             quant_config=quant_config,
             layer_id=layer_id,
-            top_k=top_k,
+            top_k=(
+                None if not _is_npu else top_k
+            ),  # The top_k parameter is used in NPU scenarios
             prefix=add_prefix("experts", prefix),
         )
 
