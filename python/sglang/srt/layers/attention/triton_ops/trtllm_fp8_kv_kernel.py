@@ -257,10 +257,10 @@ def _fused_fp8_set_qkv_buffer_kernel(
     # Q tensor (input and output)
     q_ptr,  # [num_tokens, num_q_heads, head_dim] input
     q_out_ptr,  # [num_tokens, num_q_heads, head_dim] output FP8
-    # K and V tensors
+    # K and V tensors (same stride assumed)
     k_ptr,  # [num_tokens, num_kv_heads, head_dim]
     v_ptr,  # [num_tokens, num_kv_heads, head_dim]
-    # Output KV cache buffers (FP8 paged layout)
+    # Output KV cache buffers (FP8 paged layout, same stride assumed)
     k_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
     v_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
     # Cache location indices
@@ -274,35 +274,19 @@ def _fused_fp8_set_qkv_buffer_kernel(
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     page_size: tl.constexpr,
-    # Number of head blocks for mapping
-    num_kv_head_blocks: tl.constexpr,  # Bkv = ceil(num_kv_heads / BLOCK_HEAD)
-    num_q_head_blocks: tl.constexpr,  # Bq = ceil(num_q_heads / BLOCK_HEAD)
-    # Strides for Q input [num_tokens, num_q_heads, head_dim]
+    # Strides for Q (input and output share the same stride)
     q_stride_token: tl.constexpr,
     q_stride_head: tl.constexpr,
     q_stride_dim: tl.constexpr,
-    # Strides for Q output [num_tokens, num_q_heads, head_dim]
-    q_out_stride_token: tl.constexpr,
-    q_out_stride_head: tl.constexpr,
-    q_out_stride_dim: tl.constexpr,
-    # Strides for K input [num_tokens, num_kv_heads, head_dim]
-    k_stride_token: tl.constexpr,
-    k_stride_head: tl.constexpr,
-    k_stride_dim: tl.constexpr,
-    # Strides for K cache [total_slots, num_kv_heads, head_dim] (logically paged)
-    k_cache_stride_page: tl.constexpr,
-    k_cache_stride_offset: tl.constexpr,
-    k_cache_stride_head: tl.constexpr,
-    k_cache_stride_dim: tl.constexpr,
-    # Strides for V input [num_tokens, num_kv_heads, head_dim]
-    v_stride_token: tl.constexpr,
-    v_stride_head: tl.constexpr,
-    v_stride_dim: tl.constexpr,
-    # Strides for V cache [total_slots, num_kv_heads, head_dim] (logically paged)
-    v_cache_stride_page: tl.constexpr,
-    v_cache_stride_offset: tl.constexpr,
-    v_cache_stride_head: tl.constexpr,
-    v_cache_stride_dim: tl.constexpr,
+    # Strides for K/V input (K and V share the same stride)
+    kv_stride_token: tl.constexpr,
+    kv_stride_head: tl.constexpr,
+    kv_stride_dim: tl.constexpr,
+    # Strides for KV cache (K cache and V cache share the same stride)
+    cache_stride_page: tl.constexpr,
+    cache_stride_offset: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
     # Block sizes
     BLOCK_HEAD: tl.constexpr,  # Number of heads per block
     BLOCK_DIM: tl.constexpr,  # Head dimension block size
@@ -313,7 +297,7 @@ def _fused_fp8_set_qkv_buffer_kernel(
     - Q: cast to FP8 and write to q_out (no cache)
     - K, V: cast to FP8 with optional scale and write to paged KV cache
 
-    Grid: (num_tokens, 2 * num_kv_head_blocks + num_q_head_blocks)
+    Grid: (num_tokens, 2 * Bkv + Bq) where Bkv = cdiv(num_kv_heads, BLOCK_HEAD)
     Block mapping:
       [0, Bkv)                -> K, head_block = block_id
       [Bkv, 2*Bkv)            -> V, head_block = block_id - Bkv
@@ -322,6 +306,9 @@ def _fused_fp8_set_qkv_buffer_kernel(
     # Get program IDs
     token_id = tl.program_id(0)
     block_id = tl.program_id(1)
+
+    # Compute number of head blocks
+    num_kv_head_blocks = tl.cdiv(num_kv_heads, BLOCK_HEAD)
 
     # Determine which tensor to process based on block_id
     if block_id < num_kv_head_blocks:
@@ -349,13 +336,13 @@ def _fused_fp8_set_qkv_buffer_kernel(
             use_provided_scale,
             num_kv_heads,
             head_dim,
-            k_stride_token,
-            k_stride_head,
-            k_stride_dim,
-            k_cache_stride_page,
-            k_cache_stride_offset,
-            k_cache_stride_head,
-            k_cache_stride_dim,
+            kv_stride_token,
+            kv_stride_head,
+            kv_stride_dim,
+            cache_stride_page,
+            cache_stride_offset,
+            cache_stride_head,
+            cache_stride_dim,
             BLOCK_HEAD,
             BLOCK_DIM,
         )
@@ -384,13 +371,13 @@ def _fused_fp8_set_qkv_buffer_kernel(
             use_provided_scale,
             num_kv_heads,
             head_dim,
-            v_stride_token,
-            v_stride_head,
-            v_stride_dim,
-            v_cache_stride_page,
-            v_cache_stride_offset,
-            v_cache_stride_head,
-            v_cache_stride_dim,
+            kv_stride_token,
+            kv_stride_head,
+            kv_stride_dim,
+            cache_stride_page,
+            cache_stride_offset,
+            cache_stride_head,
+            cache_stride_dim,
             BLOCK_HEAD,
             BLOCK_DIM,
         )
@@ -408,9 +395,9 @@ def _fused_fp8_set_qkv_buffer_kernel(
             q_stride_token,
             q_stride_head,
             q_stride_dim,
-            q_out_stride_token,
-            q_out_stride_head,
-            q_out_stride_dim,
+            q_stride_token,
+            q_stride_head,
+            q_stride_dim,
             BLOCK_HEAD,
             BLOCK_DIM,
         )
@@ -745,16 +732,22 @@ def fused_fp8_set_qkv_buffer(
     k_3d = k if k.ndim == 3 else k.view(num_tokens, num_kv_heads, head_dim)
     v_3d = v if v.ndim == 3 else v.view(num_tokens, num_kv_heads, head_dim)
 
-    # Compute cache strides (3D layout)
-    k_cache_stride_page = k_cache.stride(0) * page_size
-    k_cache_stride_offset = k_cache.stride(0)
-    k_cache_stride_head = k_cache.stride(1)
-    k_cache_stride_dim = k_cache.stride(2)
+    # Assert K and V share the same stride (they come from same QKV projection)
+    assert k_3d.stride() == v_3d.stride(), "K and V must have the same stride"
+    # Assert K cache and V cache share the same stride
+    assert (
+        k_cache.stride() == v_cache.stride()
+    ), "K and V cache must have the same stride"
+    # Assert Q input and output share the same stride
+    assert (
+        q_3d.stride() == q_out.stride()
+    ), "Q input and output must have the same stride"
 
-    v_cache_stride_page = v_cache.stride(0) * page_size
-    v_cache_stride_offset = v_cache.stride(0)
-    v_cache_stride_head = v_cache.stride(1)
-    v_cache_stride_dim = v_cache.stride(2)
+    # Compute cache strides (3D layout)
+    cache_stride_page = k_cache.stride(0) * page_size
+    cache_stride_offset = k_cache.stride(0)
+    cache_stride_head = k_cache.stride(1)
+    cache_stride_dim = k_cache.stride(2)
 
     # Block sizes and grid
     BLOCK_HEAD = 8
@@ -782,28 +775,96 @@ def fused_fp8_set_qkv_buffer(
         num_kv_heads,
         head_dim,
         page_size,
-        num_kv_head_blocks,
-        num_q_head_blocks,
         q_3d.stride(0),
         q_3d.stride(1),
         q_3d.stride(2),
-        q_out.stride(0),
-        q_out.stride(1),
-        q_out.stride(2),
         k_3d.stride(0),
         k_3d.stride(1),
         k_3d.stride(2),
-        k_cache_stride_page,
-        k_cache_stride_offset,
-        k_cache_stride_head,
-        k_cache_stride_dim,
-        v_3d.stride(0),
-        v_3d.stride(1),
-        v_3d.stride(2),
-        v_cache_stride_page,
-        v_cache_stride_offset,
-        v_cache_stride_head,
-        v_cache_stride_dim,
+        cache_stride_page,
+        cache_stride_offset,
+        cache_stride_head,
+        cache_stride_dim,
         BLOCK_HEAD=BLOCK_HEAD,
         BLOCK_DIM=BLOCK_DIM,
     )
+
+
+if __name__ == "__main__":
+    # Simple test for fused_fp8_set_qkv_buffer kernel
+    print("Testing fused_fp8_set_qkv_buffer kernel...")
+
+    # Test parameters
+    num_tokens = 32
+    num_q_heads = 32
+    num_kv_heads = 8
+    head_dim = 128
+    total_slots = 1024
+    page_size = 16
+
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    # Create input tensors
+    q = torch.randn(num_tokens, num_q_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+
+    # Create cache tensors (FP8)
+    k_cache = torch.zeros(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+    v_cache = torch.zeros(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+
+    # Create output tensor for Q
+    q_out = torch.zeros(
+        num_tokens, num_q_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+    )
+
+    # Create cache locations (sequential for simplicity)
+    cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
+
+    # Create inverse scales
+    inv_k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+    inv_v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+    # Run the kernel
+    fused_fp8_set_qkv_buffer(
+        q, k, v, k_cache, v_cache, cache_loc, q_out, inv_k_scale, inv_v_scale, page_size
+    )
+
+    # Verify results
+    # Check Q output
+    q_expected = q.to(torch.float8_e4m3fn)
+    q_match = torch.allclose(
+        q_out.to(torch.float32), q_expected.to(torch.float32), rtol=1e-2, atol=1e-2
+    )
+    print(f"Q output matches expected: {q_match}")
+
+    # Check K cache
+    k_expected = k.to(torch.float8_e4m3fn)
+    k_match = torch.allclose(
+        k_cache[cache_loc].to(torch.float32),
+        k_expected.to(torch.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print(f"K cache matches expected: {k_match}")
+
+    # Check V cache
+    v_expected = v.to(torch.float8_e4m3fn)
+    v_match = torch.allclose(
+        v_cache[cache_loc].to(torch.float32),
+        v_expected.to(torch.float32),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print(f"V cache matches expected: {v_match}")
+
+    if q_match and k_match and v_match:
+        print("All tests passed!")
+    else:
+        print("Some tests failed!")
+        exit(1)
