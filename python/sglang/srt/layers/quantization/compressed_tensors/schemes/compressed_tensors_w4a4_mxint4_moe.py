@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
-        StandardCombineInput,
     )
     from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
         CompressedTensorsConfig,
@@ -89,8 +88,10 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        assert (params_dtype == torch.bfloat16, 
-                f"Params dtype should be torch.bfloat16, but got: {params_dtype}")
+        assert (
+            params_dtype == torch.bfloat16,
+            f"Params dtype should be torch.bfloat16, but got: {params_dtype}",
+        )
 
         extra_weight_attrs.update({"quant_method": self.strategy})
         w13_weight = torch.nn.Parameter(
@@ -292,6 +293,7 @@ class CompressedTensorsMxInt4MoE(CompressedTensorsScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
             self.moe_runner_config.is_gated
