@@ -18,11 +18,11 @@ from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    import mori
 
 from enum import Enum, auto
 from functools import lru_cache
 
-import mori
 import torch
 
 from sglang.srt.distributed import (
@@ -85,20 +85,23 @@ class EpDispatchConfig:
     rdma_block_num: int
 
 
-EP_DISPATCH_CONFIGS = {
-    EpMode.INTRA_NODE: EpDispatchConfig(
-        kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
-        warp_num_per_block=16,
-        block_num=80,
-        rdma_block_num=0,
-    ),
-    EpMode.INTER_NODE: EpDispatchConfig(
-        kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
-        warp_num_per_block=8,
-        block_num=64,
-        rdma_block_num=32,
-    ),
-}
+def get_ep_dispatch_configs():
+    import mori
+
+    return {
+        EpMode.INTRA_NODE: EpDispatchConfig(
+            kernel_type=mori.ops.EpDispatchCombineKernelType.IntraNode,
+            warp_num_per_block=16,
+            block_num=80,
+            rdma_block_num=0,
+        ),
+        EpMode.INTER_NODE: EpDispatchConfig(
+            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+            warp_num_per_block=8,
+            block_num=64,
+            rdma_block_num=32,
+        ),
+    }
 
 
 # init_mori_op only needs do once in model initial stage
@@ -114,6 +117,8 @@ def init_mori_op(
     num_max_dispatch_tokens_per_rank,
 ):
 
+    import mori
+
     world_size = get_moe_expert_parallel_world_size()
     rank = get_moe_expert_parallel_rank()
 
@@ -125,7 +130,7 @@ def init_mori_op(
     )
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
-    cfg = EP_DISPATCH_CONFIGS[mode]
+    cfg = get_ep_dispatch_configs()[mode]
 
     kernel_type = cfg.kernel_type
     warp_num_per_block = cfg.warp_num_per_block
