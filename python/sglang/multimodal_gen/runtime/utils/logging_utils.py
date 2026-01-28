@@ -142,6 +142,7 @@ def get_is_local_main_process():
 
 
 def _log_process_aware(
+    server_log_level: int,
     level: int,
     logger_self: Logger,
     msg: object,
@@ -153,12 +154,12 @@ def _log_process_aware(
     """Helper function to log a message if the process rank matches the criteria."""
     is_main_process = get_is_main_process()
     is_local_main_process = get_is_local_main_process()
-
     should_log = (
         not main_process_only
         and not local_main_process_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
+        or server_log_level <= logging.DEBUG
     )
 
     if should_log:
@@ -234,6 +235,8 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
+    server_log_level = logger.getEffectiveLevel()
+
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -252,6 +255,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
+                server_log_level,
                 level,
                 self,
                 msg,
@@ -281,7 +285,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, False), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)

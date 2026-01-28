@@ -297,7 +297,10 @@ def matmul_persistent(
         return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
 
     if _ENABLE_MM_FALLBACK_VARIANT:
-        return torch.einsum("ik,kj->ij", a, b)
+        out = torch.einsum("ik,kj->ij", a, b)
+        if bias is not None:
+            out += bias
+        return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
