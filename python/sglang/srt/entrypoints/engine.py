@@ -92,6 +92,63 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
+@dataclasses.dataclass
+class SchedulerLaunchResult:
+    """Unified result from launching schedulers (mp or Ray mode).
+
+    This abstraction hides the mode-specific details, providing a common interface
+    for both multiprocessing and Ray-based scheduler launching.
+    """
+
+    scheduler_infos: List[Dict]
+
+    # Ray mode fields
+    _actors: Optional[List] = None
+    _event_loop_refs: Optional[List] = None
+
+    # mp mode fields
+    _procs: Optional[List] = None
+    _pipe_readers: Optional[List] = None
+
+    @property
+    def actors(self) -> Optional[List]:
+        """Ray actors (None for mp mode). Exposed for Engine to store."""
+        return self._actors
+
+    @property
+    def event_loop_refs(self) -> Optional[List]:
+        """Ray event loop ObjectRefs (None for mp mode). Exposed for Engine to store."""
+        return self._event_loop_refs
+
+    def wait_for_ready(self) -> None:
+        """Wait for schedulers to be ready (mp mode only, no-op for Ray).
+
+        In Ray mode, schedulers are already ready when this object is created
+        (ray.get() was called during launch). In mp mode, we need to wait for
+        pipe messages from the subprocesses.
+        """
+        if self._procs is not None and self._pipe_readers is not None:
+            # mp mode: wait for pipe messages
+            infos = _wait_for_scheduler_ready(self._pipe_readers, self._procs)
+            self.scheduler_infos.extend(infos)
+
+    def wait_for_completion(self) -> None:
+        """Block until all schedulers terminate (used for non-zero rank nodes)."""
+        if self._actors is not None:
+            import ray
+
+            try:
+                ray.get(self._event_loop_refs)
+            except Exception as e:
+                logger.error(f"Ray scheduler actor terminated with error: {e}")
+        elif self._procs is not None:
+            for proc in self._procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                )
+
+
 def init_tokenizer_manager(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -879,63 +936,6 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
-
-
-@dataclasses.dataclass
-class SchedulerLaunchResult:
-    """Unified result from launching schedulers (mp or Ray mode).
-
-    This abstraction hides the mode-specific details, providing a common interface
-    for both multiprocessing and Ray-based scheduler launching.
-    """
-
-    scheduler_infos: List[Dict]
-
-    # Ray mode fields
-    _actors: Optional[List] = None
-    _event_loop_refs: Optional[List] = None
-
-    # mp mode fields
-    _procs: Optional[List] = None
-    _pipe_readers: Optional[List] = None
-
-    @property
-    def actors(self) -> Optional[List]:
-        """Ray actors (None for mp mode). Exposed for Engine to store."""
-        return self._actors
-
-    @property
-    def event_loop_refs(self) -> Optional[List]:
-        """Ray event loop ObjectRefs (None for mp mode). Exposed for Engine to store."""
-        return self._event_loop_refs
-
-    def wait_for_ready(self) -> None:
-        """Wait for schedulers to be ready (mp mode only, no-op for Ray).
-
-        In Ray mode, schedulers are already ready when this object is created
-        (ray.get() was called during launch). In mp mode, we need to wait for
-        pipe messages from the subprocesses.
-        """
-        if self._procs is not None and self._pipe_readers is not None:
-            # mp mode: wait for pipe messages
-            infos = _wait_for_scheduler_ready(self._pipe_readers, self._procs)
-            self.scheduler_infos.extend(infos)
-
-    def wait_for_completion(self) -> None:
-        """Block until all schedulers terminate (used for non-zero rank nodes)."""
-        if self._actors is not None:
-            import ray
-
-            try:
-                ray.get(self._event_loop_refs)
-            except Exception as e:
-                logger.error(f"Ray scheduler actor terminated with error: {e}")
-        elif self._procs is not None:
-            for proc in self._procs:
-                proc.join()
-                logger.error(
-                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-                )
 
 
 def _wait_for_scheduler_ready(
