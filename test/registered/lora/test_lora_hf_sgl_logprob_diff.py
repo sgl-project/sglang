@@ -554,9 +554,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
 
         model_path = "Qwen/Qwen1.5-MoE-A2.7B"
-        # model_path = "Qwen/Qwen3-30B-A3B"
         lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
-        # lora_paths = ["debaterhub/sentence-selection-orpo-lora"]
         prompts = DEFAULT_TEST_PROMPTS
 
         self._run_comparison_test(
