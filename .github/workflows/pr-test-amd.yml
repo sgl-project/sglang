@@ -842,7 +842,7 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-      
+
       - name: Debug RDMA Driver Dependencies
         run: |
           echo "=== Debugging Ionic Driver Dependencies ==="
