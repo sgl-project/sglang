@@ -233,6 +233,12 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
+    # Which decode worker to route to
+    decode_dp_rank: Optional[int] = None
+
+    # Which prefill DP rank holds KV cache
+    prefill_dp_rank: Optional[int] = None
+
     # For background responses (OpenAI responses API)
     background: bool = False
 
@@ -740,6 +746,12 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # Which decode worker to route to
+    decode_dp_rank: Optional[int] = None
+
+    # Which prefill DP rank holds KV cache
+    prefill_dp_rank: Optional[int] = None
 
     # Priority for the request
     priority: Optional[int] = None
