@@ -251,6 +251,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             lora_info=lora_info,
+            num_tokens_post_padded=num_tokens_post_padded,
         )
 
         # ============================================================
@@ -350,6 +351,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             topk_weights=topk_weights,
             apply_router_weight_on_input=apply_router_weight_on_input,
             lora_info=lora_info,
+            num_tokens_post_padded=num_tokens_post_padded,
         )
 
         # we still need to combine the output
@@ -410,6 +412,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         topk_ids: torch.Tensor,  # [M, top_k]
         topk_weights: torch.Tensor,  # [M, top_k]
         lora_info: LoRAInfo,
+        num_tokens_post_padded: torch.Tensor,
     ) -> None:
         """
         Add LoRA gate_up delta to intermediate_cache in-place.
@@ -427,9 +430,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # Output shape: [M, top_k, gate_up_dim]
         # Hidden_states shape: [M, hidden_dim] (handles token duplication internally)
 
-        num_tokens_post_padded_formatted = torch.tensor(
-            [num_dispatched], dtype=torch.int32, device=hidden_states.device
-        )
+        # Create num_tokens_post_padded tensor for vLLM kernel
+        # It expects shape (max_loras,) with the same value for each LoRA
+        num_loras = len(lora_info.lora_ranks)
+        num_tokens_post_padded_formatted = num_tokens_post_padded.expand(num_loras)
         actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
 
         # Skip LoRA computation if no LoRA adapters have non-zero rank
@@ -476,6 +480,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         topk_weights: torch.Tensor,  # [M, top_k]
         apply_router_weight_on_input: bool,
         lora_info: LoRAInfo,
+        num_tokens_post_padded: torch.Tensor,
     ) -> None:
         """
         Add LoRA down delta to intermediate_cache in-place.
@@ -492,9 +497,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         # Data format adaptation for vLLM kernel
         num_dispatched_down = lora_info.token_ids.shape[0]
-        num_tokens_post_padded_formatted = torch.tensor(
-            [num_dispatched_down], dtype=torch.int32, device=intermediate_input.device
-        )
+        # Create num_tokens_post_padded tensor for vLLM kernel
+        # It expects shape (max_loras,) with the same value for each LoRA
+        num_loras = len(lora_info.lora_ranks)
+        num_tokens_post_padded_formatted = num_tokens_post_padded.expand(num_loras)
         actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
 
         # Skip LoRA computation if no LoRA adapters have non-zero rank
