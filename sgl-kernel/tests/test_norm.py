@@ -138,5 +138,20 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("token_num", [1, 19, 99, 989])
+@pytest.mark.parametrize("head_num", [8, 16, 32, 48])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_turbomind_rms_norm(token_num, head_num, head_dim, dtype):
+    x = torch.randn(token_num, head_num * head_dim).to(0).to(dtype)
+    w = torch.randn(head_dim).to(0).to(dtype)
+    x = x.reshape(-1, head_dim)
+    y_ref = llama_rms_norm(x, w)
+    y = x.clone()
+    sgl_kernel.turbomind_rms_norm(y, w)
+
+    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
