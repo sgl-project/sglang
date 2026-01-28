@@ -102,7 +102,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
     def prepare_for_verify(self, batch: ScheduleBatch, page_size: int):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -220,6 +219,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        vocab_mapper=None,  # For heterogeneous vocab speculative decoding
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -252,7 +252,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         bs = self.retrive_index.shape[0]
+        # Note: draft_token is already mapped to target vocab in EAGLEWorker.verify()
+        # before prepare_for_verify() is called, so no mapping needed here
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
+
         sampling_info = batch.sampling_info
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
@@ -412,9 +415,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         try:
                             req.grammar.accept_token(id)
                         except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                            )
+                            logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                             raise e
             # Update KV cache tracking for the accepted tokens
             req.kv_committed_len += num_accepted
@@ -520,9 +521,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(accept_length + 1)
             batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
+            # Map verified_id from target vocab to draft vocab for   vocab
+            draft_verified_id = verified_id
+            if vocab_mapper is not None:
+                draft_verified_id = vocab_mapper.map_target_to_draft(verified_id)
+
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
-                verified_id=verified_id,
+                verified_id=draft_verified_id,
                 accept_length=accept_length,
                 accept_length_cpu=accept_length_list,
                 seq_lens_for_draft_extend=batch.seq_lens,
@@ -581,11 +587,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(self.draft_token_num),
                     )
 
+                # Map verified_id from target vocab to draft vocab for heterogeneous vocab
+                unfinished_verified_id = predict[unfinished_accept_index]
+                if vocab_mapper is not None:
+                    unfinished_verified_id = vocab_mapper.map_target_to_draft(
+                        unfinished_verified_id
+                    )
+
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
-                    verified_id=predict[unfinished_accept_index],
+                    verified_id=unfinished_verified_id,
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
@@ -655,7 +668,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
 
     def prepare_for_extend(self, batch: ScheduleBatch):
-
         if batch.forward_mode.is_idle():
             return
 
@@ -695,7 +707,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch: ScheduleBatch,
         speculative_num_steps: int,
     ):
-
         if batch.forward_mode.is_idle():
             return
 
