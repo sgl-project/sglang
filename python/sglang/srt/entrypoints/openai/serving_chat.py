@@ -1203,13 +1203,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.chat_template_kwargs.get("thinking") is True
             )
         if self.reasoning_parser in ["kimi_k2"]:
-            # Models that th by default, and can be disabled by setting thinking=False
+            # Models that thinking by default, and can be disabled by setting thinking=False
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("thinking") is not False
             )
         if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
-            # Models that reasoning by default, and can be disabled by setting enable_thinking=False
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
