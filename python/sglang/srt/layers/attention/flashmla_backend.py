@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
-from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
@@ -117,7 +117,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 num_splits,
                 block_kv_indices,
             )
-        elif forward_batch.forward_mode.is_target_verify():
+        elif forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_simple_verify() or forward_batch.forward_mode.is_simple_draft():
+            if (
+                forward_batch.forward_mode.is_simple_verify()
+                and forward_batch.simple_eagle_skip_attn_backend_init
+            ):
+                return
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
 
@@ -159,6 +164,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         max_num_tokens: int,
         block_kv_indices: Optional[torch.Tensor] = None,
     ):
+        # super().init_cuda_graph_state(max_bs,max_num_tokens, None)
         if block_kv_indices is None:
             cuda_graph_kv_indices = torch.full(
                 (max_bs, (self.max_context_len + PAGE_SIZE) // PAGE_SIZE),
@@ -225,7 +231,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_simple_verify() or forward_mode.is_simple_draft():
             seq_lens = seq_lens + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
@@ -302,7 +308,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
-        elif forward_mode.is_target_verify():
+        elif forward_mode.is_target_verify() or forward_mode.is_simple_verify() or forward_mode.is_simple_draft():
             seq_lens = seq_lens[:bs] + self.num_draft_tokens
             seq_lens_cpu = seq_lens_cpu[:bs] + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
@@ -352,6 +358,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        if forward_batch.forward_mode.is_simple_verify():
+            return self.forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
@@ -432,6 +440,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if (
             forward_batch.forward_mode == ForwardMode.EXTEND
             or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
+            # or forward_batch.forward_mode == ForwardMode.SIMPLE_DRAFT_EXTEND
         ):
             return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
         else:

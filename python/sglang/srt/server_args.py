@@ -456,9 +456,11 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    requests_all_greedy: Optional[bool] = True
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
     speculative_moe_runner_backend: Optional[str] = None
+    requests_all_greedy: Optional[bool] = True
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
 
@@ -2196,14 +2198,17 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
+        if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "SIMPLE_EAGLE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
                 raise ValueError(
                     "Currently standalone speculative decoding does not support dp attention."
                 )
 
-            if self.max_running_requests is None:
+            if (
+                self.max_running_requests is None
+                and self.speculative_algorithm != "SIMPLE_EAGLE"
+            ):
                 self.max_running_requests = 48
                 logger.warning(
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
@@ -2339,6 +2344,17 @@ class ServerArgs:
                 # TODO: support dp attention for ngram speculative decoding
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
+                )
+
+            # Set parameters for SIMPLE_EAGLE
+            if self.speculative_algorithm == "SIMPLE_EAGLE":
+                self.speculative_num_steps = 1
+                self.speculative_eagle_topk = 1
+                self.speculative_num_draft_tokens = 2
+                self.attention_backend = "flashinfer"
+                logger.warning(
+                    "SIMPLE_EAGLE only supports using flashinfer attention backend currently. "
+                    "Attention backend is automatically set to flashinfer."
                 )
 
     def _handle_load_format(self):
@@ -3613,6 +3629,12 @@ class ServerArgs:
             help="Choose the backend for grammar-guided decoding.",
         )
         parser.add_argument(
+            "--requests-all-greedy",
+            type=bool,
+            default=ServerArgs.requests_all_greedy,
+            help="Determine which type of cuda graph builds, all-greedy or all-sampling.",
+        )
+        parser.add_argument(
             "--mm-attention-backend",
             type=str,
             choices=["sdpa", "fa3", "fa4", "triton_attn", "ascend_attn", "aiter_attn"],
@@ -3674,7 +3696,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SIMPLE_EAGLE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

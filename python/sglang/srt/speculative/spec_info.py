@@ -40,6 +40,12 @@ class SpeculativeAlgorithm(Enum):
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
 
+    def is_simple_eagle(self) -> bool:
+        return self._has_flag("SIMPLE_EAGLE")
+
+    def is_simple_eagle(self) -> bool:
+        return self._has_flag("SIMPLE_EAGLE")
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -75,7 +81,6 @@ class SpeculativeAlgorithm(Enum):
         elif self.is_eagle():
             if enable_overlap:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
-
                 return EAGLEWorkerV2
 
             from sglang.srt.speculative.eagle_worker import EAGLEWorker
@@ -101,8 +106,6 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
-
-        raise ValueError("Unreachable code path in create_worker.")
 
 
 class SpecInputType(IntEnum):
