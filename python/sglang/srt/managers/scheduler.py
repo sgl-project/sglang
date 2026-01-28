@@ -70,6 +70,9 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    ActiveRanksOutput,
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
     BaseBatchReq,
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
@@ -80,6 +83,8 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
     ExpertDistributionReqType,
@@ -122,7 +127,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -550,6 +555,7 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.forward_stream,
             _,
             _,
             _,
@@ -605,6 +611,7 @@ class Scheduler(
             or self.tp_worker.model_runner.mamba2_config is not None
         )
 
+        self.sliding_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
@@ -634,6 +641,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
+            sliding_window_size=self.sliding_window_size,
         )
 
         if (
@@ -646,9 +654,6 @@ class Scheduler(
                 self.tree_cache = ChunkCache(params)
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
-
-                params.sliding_window_size = self.model_config.sliding_window_size
-                params.attention_chunk_size = self.model_config.attention_chunk_size
 
                 self.tree_cache = SWAChunkCache(params)
         else:
@@ -669,9 +674,7 @@ class Scheduler(
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
-                self.tree_cache = SWARadixCache(
-                    params=params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWARadixCache(params=params)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
@@ -704,18 +707,6 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
-
-        self.decode_mem_cache_buf_multiplier = (
-            1
-            if self.spec_algorithm.is_none()
-            else (
-                server_args.speculative_num_draft_tokens
-                + (
-                    (server_args.speculative_eagle_topk or 1)
-                    * (server_args.speculative_num_steps or 1)
-                )
-            )
-        )
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
@@ -778,7 +769,7 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -961,9 +952,10 @@ class Scheduler(
             self.mm_receiver = MMReceiver(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
-                tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
+                scheduler=self,
             )
 
     def init_overlap(self):
@@ -972,7 +964,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
 
-        self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1021,6 +1012,8 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
+                (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -1196,6 +1189,7 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = unwrap_shm_features(recv_req)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1262,7 +1256,16 @@ class Scheduler(
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
             for req in recv_reqs:
@@ -1408,6 +1411,14 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+                continue
+            for item in mm_inputs.mm_items:
+                item.feature = None
+            req.multimodal_inputs = None
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1465,7 +1476,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
@@ -2146,29 +2157,15 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (
-            kv_full_retract_flag := not batch.check_decode_mem(
-                self.decode_mem_cache_buf_multiplier
-            )
-        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            if self.is_hybrid_swa:
-                old_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        ):
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args, self.decode_mem_cache_buf_multiplier
+                self.server_args
             )
-            if self.is_hybrid_swa:
-                new_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
@@ -2364,6 +2361,19 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
 
+        if (
+            self.server_args.enable_dp_attention
+            and self.server_args.elastic_ep_backend == "mooncake"
+        ):
+            # Get the tensors indicating rank activeness
+            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+            tp_active_ranks &= tp_active_ranks_cpu
+            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
+            self.send_to_tokenizer.send_output(
+                ActiveRanksOutput(status=dp_active_ranks.tolist())
+            )
+
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2400,6 +2410,7 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+        self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
@@ -2423,6 +2434,118 @@ class Scheduler(
             logging.warning("Hierarchical cache is not enabled.")
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
+
+    def _is_idle_for_hicache_storage_op(self) -> bool:
+        """Stricter idle check for storage attach/detach.
+
+        We require:
+        - no running batches (including overlap/pp/disagg paths) via `_is_no_request()`
+        - no queued requests in scheduler queues (waiting/grammar/disagg queues)
+        """
+        if not self._is_no_request():
+            return False
+        if len(self.waiting_queue) != 0:
+            return False
+        if len(self.grammar_manager.grammar_queue) != 0:
+            return False
+        return True
+
+    def attach_hicache_storage_wrapped(
+        self, recv_req: AttachHiCacheStorageReqInput
+    ) -> AttachHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return AttachHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject attach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "attach_storage_backend"):
+            return AttachHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support dynamic attach.",
+            )
+
+        try:
+            ok, msg = self.tree_cache.attach_storage_backend(
+                storage_backend=recv_req.hicache_storage_backend,
+                storage_backend_extra_config_json=recv_req.hicache_storage_backend_extra_config_json,
+                served_model_name=self.server_args.served_model_name,
+                hicache_storage_prefetch_policy=recv_req.hicache_storage_prefetch_policy,
+                hicache_write_policy=recv_req.hicache_write_policy,
+            )
+        except Exception as e:
+            logger.exception("Attach HiCache storage backend failed with exception.")
+            return AttachHiCacheStorageReqOutput(success=False, message=str(e))
+        if ok:
+            self.enable_hicache_storage = True
+            self.server_args.hicache_storage_backend = recv_req.hicache_storage_backend
+            if recv_req.hicache_storage_backend_extra_config_json is not None:
+                self.server_args.hicache_storage_backend_extra_config = (
+                    recv_req.hicache_storage_backend_extra_config_json
+                )
+            if recv_req.hicache_storage_prefetch_policy is not None:
+                self.server_args.hicache_storage_prefetch_policy = (
+                    recv_req.hicache_storage_prefetch_policy
+                )
+            if recv_req.hicache_write_policy is not None:
+                self.server_args.hicache_write_policy = recv_req.hicache_write_policy
+            logger.info(
+                f"Attached HiCache storage backend: {recv_req.hicache_storage_backend}"
+            )
+        return AttachHiCacheStorageReqOutput(success=ok, message=msg)
+
+    def detach_hicache_storage_wrapped(
+        self, recv_req: DetachHiCacheStorageReqInput
+    ) -> DetachHiCacheStorageReqOutput:
+        if not self.enable_hierarchical_cache:
+            return DetachHiCacheStorageReqOutput(
+                success=False, message="Hierarchical cache is not enabled."
+            )
+
+        if not self._is_idle_for_hicache_storage_op():
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message=(
+                    "Reject detach: scheduler is not idle. "
+                    f"#queue-req={len(self.waiting_queue)} "
+                    f"#running-req={len(self.running_batch.reqs)}"
+                ),
+            )
+
+        if not hasattr(self.tree_cache, "detach_storage_backend"):
+            return DetachHiCacheStorageReqOutput(
+                success=False,
+                message="Current tree_cache implementation does not support dynamic detach.",
+            )
+
+        # Idempotent detach: even if scheduler thinks storage is disabled, we still
+        # attempt best-effort cleanup in tree_cache (it may have leftover state).
+        try:
+            ok, msg = self.tree_cache.detach_storage_backend()
+        except Exception as e:
+            logger.exception("Detach HiCache storage backend failed with exception.")
+            return DetachHiCacheStorageReqOutput(success=False, message=str(e))
+
+        if ok or (not self.enable_hicache_storage):
+            # Treat "already disabled / nothing to do" as success for idempotence.
+            self.enable_hicache_storage = False
+            self.server_args.hicache_storage_backend = None
+            self.server_args.hicache_storage_backend_extra_config = None
+            logger.info("Detached HiCache storage backend.")
+            return DetachHiCacheStorageReqOutput(
+                success=True, message=msg or "HiCache storage backend is detached."
+            )
+
+        return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def _is_no_request(self):
         no_request = (
