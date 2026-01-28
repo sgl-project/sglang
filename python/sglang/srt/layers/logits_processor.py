@@ -274,108 +274,6 @@ class LogitsProcessor(nn.Module):
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
 
-    def compute_logprobs_for_multi_item_scoring(
-        self,
-        input_ids,
-        hidden_states,
-        lm_head: VocabParallelEmbedding,
-        logits_metadata: Union[LogitsMetadata, ForwardBatch],
-        delimiter_token: int,
-    ):
-        """
-        Compute logprobs for multi-item scoring using delimiter-based token extraction.
-
-        This method is designed for scenarios where you want to score multiple items/candidates
-        against a single query by combining them into one sequence separated by delimiters.
-
-        Sequence format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
-        Scoring positions: Extracts logprobs at positions before each <delimiter>
-
-        Args:
-            input_ids (torch.Tensor): Input token IDs containing query and items separated by delimiters.
-                Shape: [total_sequence_length] for single request or [batch_total_length] for batch.
-            hidden_states (torch.Tensor): Hidden states from the model.
-                Shape: [sequence_length, hidden_dim].
-            lm_head (VocabParallelEmbedding): Language model head for computing logits.
-            logits_metadata (Union[LogitsMetadata, ForwardBatch]): Metadata containing batch info
-                and token ID specifications for logprob extraction.
-            delimiter_token (int): Token ID used as delimiter between query and items.
-
-        Returns:
-            LogitsProcessorOutput: Contains:
-                - next_token_logits: None (not needed for scoring-only requests)
-                - input_token_logprobs: Logprobs of delimiter tokens at scoring positions
-                - input_top_logprobs_val: Top-k logprobs at delimiter positions (if requested)
-                - input_top_logprobs_idx: Top-k token indices at delimiter positions (if requested)
-                - input_token_ids_logprobs_val: Logprobs for user-requested token IDs (if any)
-                - input_token_ids_logprobs_idx: Indices for user-requested token IDs (if any)
-        """
-        multi_item_indices = (input_ids == delimiter_token).nonzero(as_tuple=True)[
-            0
-        ] - 1
-        # Extract hidden states at delimiter positions for multi-item scoring
-        sliced_hidden = hidden_states[multi_item_indices]
-
-        sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
-        sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
-
-        # Initialize return values
-        input_token_ids_logprobs_val = []
-        input_token_ids_logprobs_idx = []
-        input_top_logprobs_val = None
-        input_top_logprobs_idx = None
-
-        # Recalculate extend_logprob_pruned_lens_cpu to match delimiter counts per request
-        # Original contains sequence lengths, but we need delimiter counts for sliced_logprobs
-        if (
-            logits_metadata.token_ids_logprobs
-            or logits_metadata.extend_return_top_logprob
-        ):
-            logits_metadata.extend_logprob_pruned_lens_cpu = []
-
-            if logits_metadata.extend_seq_lens_cpu is not None:
-                # Multi-request batch: count delimiters per request
-                input_pt = 0
-                for req_seq_len in logits_metadata.extend_seq_lens_cpu:
-                    req_input_ids = input_ids[input_pt : input_pt + req_seq_len]
-                    delimiter_count = (req_input_ids == delimiter_token).sum().item()
-                    logits_metadata.extend_logprob_pruned_lens_cpu.append(
-                        delimiter_count
-                    )
-                    input_pt += req_seq_len
-            else:
-                # Single request case: one request gets all delimiters
-                total_delimiters = (input_ids == delimiter_token).sum().item()
-                logits_metadata.extend_logprob_pruned_lens_cpu = [total_delimiters]
-
-        # Get the logprobs of specified token ids
-        if logits_metadata.extend_token_ids_logprob:
-            (
-                input_token_ids_logprobs_val,
-                input_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs_prefill(
-                sliced_logprobs, logits_metadata, delay_cpu_copy=True
-            )
-
-        # Get the logprob of top-k tokens
-        if logits_metadata.extend_return_top_logprob:
-            (
-                input_top_logprobs_val,
-                input_top_logprobs_idx,
-            ) = get_top_logprobs_prefill(sliced_logprobs, logits_metadata)
-
-        # For input_token_logprobs, use delimiter token logprobs
-        input_token_logprobs = sliced_logprobs[:, delimiter_token]
-
-        return LogitsProcessorOutput(
-            next_token_logits=None,  # Multi-item scoring doesn't need next token logits
-            input_token_logprobs=input_token_logprobs,
-            input_top_logprobs_val=input_top_logprobs_val,
-            input_top_logprobs_idx=input_top_logprobs_idx,
-            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-        )
-
     def forward(
         self,
         input_ids,
@@ -967,6 +865,108 @@ class LogitsProcessor(nn.Module):
                 )
 
         return logits
+
+    def compute_logprobs_for_multi_item_scoring(
+        self,
+        input_ids,
+        hidden_states,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        delimiter_token: int,
+    ):
+        """
+        Compute logprobs for multi-item scoring using delimiter-based token extraction.
+
+        This method is designed for scenarios where you want to score multiple items/candidates
+        against a single query by combining them into one sequence separated by delimiters.
+
+        Sequence format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
+        Scoring positions: Extracts logprobs at positions before each <delimiter>
+
+        Args:
+            input_ids (torch.Tensor): Input token IDs containing query and items separated by delimiters.
+                Shape: [total_sequence_length] for single request or [batch_total_length] for batch.
+            hidden_states (torch.Tensor): Hidden states from the model.
+                Shape: [sequence_length, hidden_dim].
+            lm_head (VocabParallelEmbedding): Language model head for computing logits.
+            logits_metadata (Union[LogitsMetadata, ForwardBatch]): Metadata containing batch info
+                and token ID specifications for logprob extraction.
+            delimiter_token (int): Token ID used as delimiter between query and items.
+
+        Returns:
+            LogitsProcessorOutput: Contains:
+                - next_token_logits: None (not needed for scoring-only requests)
+                - input_token_logprobs: Logprobs of delimiter tokens at scoring positions
+                - input_top_logprobs_val: Top-k logprobs at delimiter positions (if requested)
+                - input_top_logprobs_idx: Top-k token indices at delimiter positions (if requested)
+                - input_token_ids_logprobs_val: Logprobs for user-requested token IDs (if any)
+                - input_token_ids_logprobs_idx: Indices for user-requested token IDs (if any)
+        """
+        multi_item_indices = (input_ids == delimiter_token).nonzero(as_tuple=True)[
+            0
+        ] - 1
+        # Extract hidden states at delimiter positions for multi-item scoring
+        sliced_hidden = hidden_states[multi_item_indices]
+
+        sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
+        sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
+
+        # Initialize return values
+        input_token_ids_logprobs_val = []
+        input_token_ids_logprobs_idx = []
+        input_top_logprobs_val = None
+        input_top_logprobs_idx = None
+
+        # Recalculate extend_logprob_pruned_lens_cpu to match delimiter counts per request
+        # Original contains sequence lengths, but we need delimiter counts for sliced_logprobs
+        if (
+            logits_metadata.token_ids_logprobs
+            or logits_metadata.extend_return_top_logprob
+        ):
+            logits_metadata.extend_logprob_pruned_lens_cpu = []
+
+            if logits_metadata.extend_seq_lens_cpu is not None:
+                # Multi-request batch: count delimiters per request
+                input_pt = 0
+                for req_seq_len in logits_metadata.extend_seq_lens_cpu:
+                    req_input_ids = input_ids[input_pt : input_pt + req_seq_len]
+                    delimiter_count = (req_input_ids == delimiter_token).sum().item()
+                    logits_metadata.extend_logprob_pruned_lens_cpu.append(
+                        delimiter_count
+                    )
+                    input_pt += req_seq_len
+            else:
+                # Single request case: one request gets all delimiters
+                total_delimiters = (input_ids == delimiter_token).sum().item()
+                logits_metadata.extend_logprob_pruned_lens_cpu = [total_delimiters]
+
+        # Get the logprobs of specified token ids
+        if logits_metadata.extend_token_ids_logprob:
+            (
+                input_token_ids_logprobs_val,
+                input_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs_prefill(
+                sliced_logprobs, logits_metadata, delay_cpu_copy=True
+            )
+
+        # Get the logprob of top-k tokens
+        if logits_metadata.extend_return_top_logprob:
+            (
+                input_top_logprobs_val,
+                input_top_logprobs_idx,
+            ) = get_top_logprobs_prefill(sliced_logprobs, logits_metadata)
+
+        # For input_token_logprobs, use delimiter token logprobs
+        input_token_logprobs = sliced_logprobs[:, delimiter_token]
+
+        return LogitsProcessorOutput(
+            next_token_logits=None,  # Multi-item scoring doesn't need next token logits
+            input_token_logprobs=input_token_logprobs,
+            input_top_logprobs_val=input_top_logprobs_val,
+            input_top_logprobs_idx=input_top_logprobs_idx,
+            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+        )
 
 
 @triton.jit
