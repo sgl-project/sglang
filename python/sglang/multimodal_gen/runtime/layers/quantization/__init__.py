@@ -5,13 +5,18 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+)
 
-QuantizationMethods = Literal[None]
+QuantizationMethods = Literal["modelopt_fp4"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
 # The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {}
+_CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
+    "modelopt_fp4": ModelOptFp4Config,
+}
 
 
 def register_quantization_config(quantization: str):
@@ -61,6 +66,14 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
     return method_to_config[quantization]
+
+
+def get_quantization_dtype(quantization: str) -> str:
+    """Extract ModelOpt quantization type from unified quantization flag."""
+    if quantization == "modelopt_fp4":
+        return "NVFP4"
+    else:
+        return quantization
 
 
 all = [
