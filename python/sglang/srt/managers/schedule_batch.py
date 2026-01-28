@@ -1999,7 +1999,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
-    def prepare_for_decode(self):
+    def prepare_for_decode(self, skip_prepare: bool = False):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
@@ -2008,7 +2008,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
+        if skip_prepare:# if not self.spec_algorithm.is_none():
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return

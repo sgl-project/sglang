@@ -1327,6 +1327,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether the model is a draft model, default is base model
+    is_draft_model: bool = False
 
 
 @dataclass
@@ -1436,6 +1438,7 @@ class UpdateWeightVersionReqInput(BaseReq):
 class GetWeightsByNameReqInput(BaseReq):
     name: str
     truncate_size: int = 100
+    is_draft_model: bool = False
 
 
 @dataclass

@@ -17,6 +17,7 @@ async def update_weights(
     device_mesh_key: str,
     device_mesh: DeviceMesh,
     load_format: Optional[str] = None,
+    is_draft_model: bool = False,
 ):
     """
     Update weights for the inference engine.
@@ -96,6 +97,7 @@ async def update_weights(
                 for _ in range(infer_tp_size)
             ],
             load_format=load_format,
+            is_draft_model=is_draft_model,
         )
 
         return await engine.update_weights_from_tensor(update_weights_request)

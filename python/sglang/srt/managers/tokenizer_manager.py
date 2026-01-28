@@ -1840,27 +1840,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         i: int,
     ) -> None:
         """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        if (
-            hasattr(recv_obj, "spec_verify_ct")
-            and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_tokens")
-            and len(recv_obj.spec_accepted_tokens) > i
-        ):
-            # The draft tokens per speculative step (excluding the target-sampled token).
-            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
-            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
-            accepted_tokens = recv_obj.spec_accepted_tokens[i]
+        if hasattr(recv_obj, "spec_verify_ct"):
+            # Always set spec_verify_ct if it exists in recv_obj
+            meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
-            # Calculate per-request acceptance rate and average acceptance length.
-            if total_draft_tokens > 0:
-                # Calculate acceptance rate: accepted / (steps * lookahead)
-                meta_info["spec_accept_rate"] = accepted_tokens / total_draft_tokens
-                meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
-                )
-                meta_info["spec_accept_token_num"] = accepted_tokens
-                meta_info["spec_draft_token_num"] = total_draft_tokens
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
+            if (
+                recv_obj.spec_verify_ct[i] > 0
+                and hasattr(recv_obj, "spec_accepted_tokens")
+                and len(recv_obj.spec_accepted_tokens) > i
+            ):
+                # The draft tokens per speculative step (excluding the target-sampled token).
+                num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+                total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
+                accepted_tokens = recv_obj.spec_accepted_tokens[i]
+
+                # Calculate per-request acceptance rate and average acceptance length.
+                if total_draft_tokens > 0:
+                    # Calculate acceptance rate: accepted / (steps * lookahead)
+                    meta_info["spec_accept_rate"] = accepted_tokens / total_draft_tokens
+                    meta_info["spec_accept_length"] = (
+                        recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                    )
+                    meta_info["spec_accept_token_num"] = accepted_tokens
+                    meta_info["spec_draft_token_num"] = total_draft_tokens
 
     def _calculate_timing_metrics(
         self,

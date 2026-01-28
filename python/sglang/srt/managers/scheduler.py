@@ -313,6 +313,11 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
+        # Init adaptive speculative decoding
+        self.adaptive_spec_threshold = server_args.adaptive_speculative_batch_size_threshold
+        self.in_spec_transition = False
+        self.spec_transition_remaining_reqs = 0
+
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -1067,6 +1072,40 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            # Check for pending transition before getting batch
+            if self.draft_worker and hasattr(self.draft_worker, "check_and_trigger_transition"):
+                if self.draft_worker.check_and_trigger_transition():
+                    # Reset cache and allocator to ensure clean state before transition
+                    self.tree_cache.reset()
+                    self.token_to_kv_pool_allocator.clear()
+                    self.req_to_token_pool.free_slots = list(range(self.req_to_token_pool.size))
+
+                    # Collect all requests from running batch
+                    reqs_to_requeue = []
+                    if self.running_batch and not self.running_batch.is_empty():
+                        reqs_to_requeue.extend(self.running_batch.reqs)
+
+                    # Reset all requests in all queues
+                    all_reqs = reqs_to_requeue + self.waiting_queue
+                    for req in all_reqs:
+                        req.fill_ids = []
+                        req.extend_input_len = 0
+                        req.prefix_indices = []
+                        req.req_pool_idx = None
+                        req.last_node = None
+
+                    # Rebuild waiting queue with running batch requests first
+                    self.waiting_queue = reqs_to_requeue + self.waiting_queue
+
+                    # Clear running batch by creating new empty one
+                    self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+                    self.cur_batch = None
+                    self.last_batch = None
+
+                    self.in_spec_transition = True
+                    self.spec_transition_remaining_reqs = len(reqs_to_requeue)
+
+                    continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1103,6 +1142,40 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+            # Check for pending transition before getting batch
+            if self.draft_worker and hasattr(self.draft_worker, "check_and_trigger_transition"):
+                if self.draft_worker.check_and_trigger_transition():
+                    # Reset cache and allocator to ensure clean state before transition
+                    self.tree_cache.reset()
+                    self.token_to_kv_pool_allocator.clear()
+                    self.req_to_token_pool.free_slots = list(range(self.req_to_token_pool.size))
+
+                    # Collect all requests from running batch
+                    reqs_to_requeue = []
+                    if self.running_batch and not self.running_batch.is_empty():
+                        reqs_to_requeue.extend(self.running_batch.reqs)
+
+                    # Reset all requests in all queues
+                    all_reqs = reqs_to_requeue + self.waiting_queue
+                    for req in all_reqs:
+                        req.fill_ids = []
+                        req.extend_input_len = 0
+                        req.prefix_indices = []
+                        req.req_pool_idx = None
+                        req.last_node = None
+
+                    # Rebuild waiting queue with running batch requests first
+                    self.waiting_queue = reqs_to_requeue + self.waiting_queue
+
+                    # Clear running batch by creating new empty one
+                    self.running_batch = ScheduleBatch(reqs=[], batch_is_full=False)
+                    self.cur_batch = None
+                    self.last_batch = None
+
+                    self.in_spec_transition = True
+                    self.spec_transition_remaining_reqs = len(reqs_to_requeue)
+
+                    continue
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -1974,6 +2047,18 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        
+        # Limit batch size during speculative decoding transition to avoid OOM
+        max_prefill_tokens_for_batch = self.max_prefill_tokens
+        if self.in_spec_transition and self.spec_transition_remaining_reqs > 0:
+            max_prefill_tokens_for_batch = self.max_prefill_tokens // 4  # FIXME: make it configurable
+            
+            logger.debug(
+                f"[AdaptiveSpec] In transition, limiting max_prefill_tokens to "
+                f"{max_prefill_tokens_for_batch} (remaining: "
+                f"{self.spec_transition_remaining_reqs})"
+            )
+
 
         # Prefill policy
         adder = PrefillAdder(
@@ -1982,7 +2067,7 @@ class Scheduler(
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            max_prefill_tokens_for_batch,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
@@ -2155,7 +2240,7 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
+                self.running_batch.prepare_for_decode(skip_prepare=not self.running_batch.spec_algorithm.is_none())
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -2169,6 +2254,16 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+
+        # For adaptive speculation, spec_info might be out of sync if SD was toggled
+        # Check and clear it if needed before filtering
+        # if (
+        #     self.adaptive_spec_threshold is not None
+        #     and batch.spec_info is not None
+        #     and hasattr(batch.spec_info, "topk_p")
+        #     and len(batch.spec_info.topk_p) != initial_bs
+        # ):
+        #     batch.spec_info = None
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
@@ -2227,9 +2322,18 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
+        
+        # Disable spec algorithm if batch size exceeds adaptive spec threshold
+        if (
+            self.adaptive_spec_threshold is not None
+            and self.adaptive_spec_threshold > 0
+            and batch.batch_size() > self.adaptive_spec_threshold
+        ):
+            self.running_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            batch.spec_algorithm = SpeculativeAlgorithm.NONE
 
         # Update batch tensors
-        batch.prepare_for_decode()
+        batch.prepare_for_decode(skip_prepare=not self.running_batch.spec_algorithm.is_none())
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
@@ -2423,6 +2527,15 @@ class Scheduler(
                 self.process_batch_result_dllm(batch, result)
             else:
                 self.process_batch_result_prefill(batch, result)
+            # Track transition progress for adaptive speculative decoding
+            if self.in_spec_transition and self.spec_transition_remaining_reqs > 0:
+                batch_size = batch.batch_size()
+                self.spec_transition_remaining_reqs = max(
+                    0, self.spec_transition_remaining_reqs - batch_size
+                )
+                if self.spec_transition_remaining_reqs == 0:
+                    self.in_spec_transition = False
+                    logger.debug("[AdaptiveSpec] Transition complete, all requests re-processed")
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2599,6 +2712,11 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
+                # Reset adaptive spec parameters if enabled
+                if hasattr(self.draft_worker, "draft_worker"):
+                    draft_worker = self.draft_worker.draft_worker
+                    if hasattr(draft_worker, "adaptive_spec_threshold") and draft_worker.adaptive_spec_threshold is not None:
+                        draft_worker.reset_adaptive_spec_params()
 
             # TODO: allow optional empty cache
             torch.cuda.empty_cache()

@@ -32,6 +32,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.speculative.eagle_mab import MABConfig, MABGroupManager
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
@@ -473,6 +474,15 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+
+    # Speculative decoding (adaptive)
+    adaptive_speculative_batch_size_threshold: Optional[int] = None
+
+    # Speculative decoding (multi-armed bandit)
+    speculative_eagle_mab_algorithm: Optional[str] = "EG"
+    speculative_eagle_mab_configs: Optional[List[str]] = None
+    speculative_mab_window_size: int = 300
+    speculative_mab_bs_threshold: Optional[List[int]] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2415,6 +2425,22 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+        # Parse MAB configuration strings
+        # if self.speculative_eagle_mab_configs is not None:
+        #     if isinstance(self.speculative_eagle_mab_configs, str):
+        #         self.speculative_eagle_mab_configs = [
+        #             config.strip()
+        #             for config in self.speculative_eagle_mab_configs.split(",")
+        #             if config.strip()
+        #         ]
+
+        # if self.speculative_mab_bs_threshold is not None:
+        #     if isinstance(self.speculative_mab_bs_threshold, str):
+        #         self.speculative_mab_bs_threshold = [
+        #             int(x.strip())
+        #             for x in self.speculative_mab_bs_threshold.split(",")
+        #             if x.strip()
+        #         ]
 
     def _handle_load_format(self):
         if (
@@ -3902,6 +3928,45 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+
+        # Speculative decoding (adaptive)
+        parser.add_argument(
+            "--adaptive-speculative-batch-size-threshold",
+            type=int,
+            default=ServerArgs.adaptive_speculative_batch_size_threshold,
+            help="Batch size threshold to disable speculative decoding when exceeded.",
+        )
+
+        # Speculative decoding (multi-armed bandit)
+        parser.add_argument(
+            "--speculative-eagle-mab-algorithm",
+            type=str,
+            default="EG",
+            choices=list(MABGroupManager.ALGORITHM_FACTORIES.keys()),
+            help="The algorithm for multi-armed bandit in EAGLE speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-mab-configs",
+            type=lambda s: MABConfig.validate_configs(s) if s else None,
+            default=None,
+            help=(
+                "Comma-separated list of MAB configurations in format '<speculative_num_steps>_<topk>_<draft_tokens>'. "
+                "Example: '1_1_1,2_2_4,3_4_8' means three configurations with different "
+                "combinations of steps, topk, and draft tokens."
+            ),
+        )
+        parser.add_argument(
+            "--speculative-mab-window-size",
+            type=int,
+            default=300,
+            help="Window size for multi-armed bandit algorithm",
+        )
+        parser.add_argument(
+            "--speculative-mab-bs-threshold",
+            type=lambda s: [int(x) for x in s.split(',')] if s else None,
+            default=None,
+            help="Comma-separated list of batch size thresholds for multi-armed bandit algorithm",
         )
 
         # Speculative decoding (ngram)
