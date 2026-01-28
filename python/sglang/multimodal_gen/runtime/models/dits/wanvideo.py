@@ -5,7 +5,6 @@
 import math
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -21,11 +20,11 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
-    ScaleResidual,
     ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
@@ -55,6 +54,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -308,13 +308,16 @@ class WanTransformerBlock(nn.Module):
         self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
 
         self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
-        if attention_type == "sla":
+        if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
                 head_size=dim // num_heads,
                 attention_type=attention_type,
                 topk=sla_topk,
-                supported_attention_backends={AttentionBackendEnum.SLA_ATTN},
+                supported_attention_backends={
+                    AttentionBackendEnum.SLA_ATTN,
+                    AttentionBackendEnum.SAGE_SLA_ATTN,
+                },
             )
         else:
             self.attn1 = USPAttention(
@@ -379,7 +382,7 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -442,7 +445,7 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
+        if _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -485,7 +488,7 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
@@ -579,7 +582,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -624,7 +627,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
+        if _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -666,7 +669,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
@@ -752,15 +755,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # For type checking
-        self.previous_e0_even = None
-        self.previous_e0_odd = None
-        self.previous_residual_even = None
-        self.previous_residual_odd = None
-        self.is_even = True
-        self.should_calc_even = True
-        self.should_calc_odd = True
-        self.accumulated_rel_l1_distance_even = 0
-        self.accumulated_rel_l1_distance_odd = 0
+
         self.cnt = 0
         self.__post_init__()
 
@@ -793,7 +788,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
-        enable_teacache = forward_batch is not None and forward_batch.enable_teacache
+        self.enable_teacache = (
+            forward_batch is not None and forward_batch.enable_teacache
+        )
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -878,7 +875,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
             # if teacache is enabled, we need to cache the original hidden states
-            if enable_teacache:
+            if self.enable_teacache:
                 original_hidden_states = hidden_states.clone()
 
             for block in self.blocks:
@@ -886,8 +883,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
                 )
             # if teacache is enabled, we need to cache the original hidden states
-            if enable_teacache:
+            if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+        self.cnt += 1
         # 5. Output norm, projection & unpatchify
         if temb.dim() == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
@@ -921,114 +919,62 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     def maybe_cache_states(
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
     ) -> None:
-        if self.is_even:
-            self.previous_residual_even = (
-                hidden_states.squeeze(0) - original_hidden_states
-            )
+        """Cache residual with CFG positive/negative separation."""
+        residual = hidden_states.squeeze(0) - original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = residual
         else:
-            self.previous_residual_odd = (
-                hidden_states.squeeze(0) - original_hidden_states
-            )
+            self.previous_residual_negative = residual
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-
-        forward_context = get_forward_context()
-        forward_batch = forward_context.forward_batch
-        if forward_batch is None or not forward_batch.enable_teacache:
+        if not self.enable_teacache:
             return False
-        teacache_params = forward_batch.teacache_params
-        assert teacache_params is not None, "teacache_params is not initialized"
+        ctx = self._get_teacache_context()
+        if ctx is None:
+            return False
+
+        # Wan uses WanTeaCacheParams with additional fields
+        teacache_params = ctx.teacache_params
         assert isinstance(
             teacache_params, WanTeaCacheParams
         ), "teacache_params is not a WanTeaCacheParams"
-        current_timestep = forward_context.current_timestep
-        num_inference_steps = forward_batch.num_inference_steps
 
-        # initialize the coefficients, cutoff_steps, and ret_steps
-        coefficients = teacache_params.coefficients
+        # Initialize Wan-specific parameters
         use_ret_steps = teacache_params.use_ret_steps
-        cutoff_steps = teacache_params.get_cutoff_steps(num_inference_steps)
+        cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
         ret_steps = teacache_params.ret_steps
-        teacache_thresh = teacache_params.teacache_thresh
 
-        if current_timestep == 0:
-            self.cnt = 0
+        # Adjust ret_steps and cutoff_steps for non-CFG mode
+        # (WanTeaCacheParams uses *2 factor assuming CFG)
+        if not ctx.do_cfg:
+            ret_steps = ret_steps // 2
+            cutoff_steps = cutoff_steps // 2
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]
         modulated_inp = timestep_proj if use_ret_steps else temb
 
-        if self.cnt % 2 == 0:  # even -> condition
-            self.is_even = True
-            if self.cnt < ret_steps or self.cnt >= cutoff_steps:
-                self.should_calc_even = True
-                self.accumulated_rel_l1_distance_even = 0
-            else:
-                assert (
-                    self.previous_e0_even is not None
-                ), "previous_e0_even is not initialized"
-                assert (
-                    self.accumulated_rel_l1_distance_even is not None
-                ), "accumulated_rel_l1_distance_even is not initialized"
-                rescale_func = np.poly1d(coefficients)
-                self.accumulated_rel_l1_distance_even += rescale_func(
-                    (
-                        (modulated_inp - self.previous_e0_even).abs().mean()
-                        / self.previous_e0_even.abs().mean()
-                    )
-                    .cpu()
-                    .item()
-                )
-                if self.accumulated_rel_l1_distance_even < teacache_thresh:
-                    self.should_calc_even = False
-                else:
-                    self.should_calc_even = True
-                    self.accumulated_rel_l1_distance_even = 0
-            self.previous_e0_even = modulated_inp.clone()
+        self.is_cfg_negative = ctx.is_cfg_negative
 
-        else:  # odd -> unconditon
-            self.is_even = False
-            if self.cnt < ret_steps or self.cnt >= cutoff_steps:
-                self.should_calc_odd = True
-                self.accumulated_rel_l1_distance_odd = 0
-            else:
-                assert (
-                    self.previous_e0_odd is not None
-                ), "previous_e0_odd is not initialized"
-                assert (
-                    self.accumulated_rel_l1_distance_odd is not None
-                ), "accumulated_rel_l1_distance_odd is not initialized"
-                rescale_func = np.poly1d(coefficients)
-                self.accumulated_rel_l1_distance_odd += rescale_func(
-                    (
-                        (modulated_inp - self.previous_e0_odd).abs().mean()
-                        / self.previous_e0_odd.abs().mean()
-                    )
-                    .cpu()
-                    .item()
-                )
-                if self.accumulated_rel_l1_distance_odd < teacache_thresh:
-                    self.should_calc_odd = False
-                else:
-                    self.should_calc_odd = True
-                    self.accumulated_rel_l1_distance_odd = 0
-            self.previous_e0_odd = modulated_inp.clone()
-        self.cnt += 1
-        should_skip_forward = False
-        if self.is_even:
-            if not self.should_calc_even:
-                should_skip_forward = True
-        else:
-            if not self.should_calc_odd:
-                should_skip_forward = True
+        # Wan uses ret_steps/cutoff_steps for boundary detection
+        is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
 
-        return should_skip_forward
+        # Use shared helper to compute cache decision
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=modulated_inp,
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+
+        return not should_calc
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.is_even:
-            return hidden_states + self.previous_residual_even
+        """Retrieve cached residual with CFG positive/negative separation."""
+        if not self.is_cfg_negative:
+            return hidden_states + self.previous_residual
         else:
-            return hidden_states + self.previous_residual_odd
+            return hidden_states + self.previous_residual_negative
 
 
 EntryClass = WanTransformer3DModel
