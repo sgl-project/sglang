@@ -60,6 +60,7 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.model_executor.model_runner import unwrap_ipc_tensors
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -848,15 +849,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]
         )
+        # Unwrap LocalSerializedTensor to detach from IPC memory
+        # This is done only once here, before passing to both workers
+        unwrapped_tensors = unwrap_ipc_tensors(named_tensors, self.tp_rank, torch.device(self.device))
+
         success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
+            named_tensors=unwrapped_tensors,
             load_format=recv_req.load_format,
         )
         if not success:
             return success, message
 
         success, message = self.target_worker.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
+            named_tensors=unwrapped_tensors,
             load_format=recv_req.load_format,
         )
         return success, message
