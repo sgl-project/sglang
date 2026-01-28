@@ -758,18 +758,46 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        if self.do_tensor_parallel_all_gather_dp_attn:
-            logits_metadata.compute_dp_attention_metadata()
-            hidden_states, local_hidden_states = (
-                logits_metadata.gathered_buffer,
-                hidden_states,
-            )
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+        hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
+            hidden_states, logits_metadata
+        )
 
+        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+
+        if self.do_tensor_parallel_all_gather:
+            if self.use_attn_tp_group:
+                logits = self._gather_attn_tp_logits(logits)
+            else:
+                logits = tensor_model_parallel_all_gather(logits)
+
+        logits = self._scatter_dp_attn_logits(logits, local_hidden_states, logits_metadata)
+
+        logits = self._copy_logits_to_buffer(logits, logits_metadata)
+
+        if self.final_logit_softcapping:
+            if not _is_npu:
+                fused_softcap(logits, self.final_logit_softcapping)
+            else:
+                logits = self.final_logit_softcapping * torch.tanh(
+                    logits / self.final_logit_softcapping
+                )
+
+        return logits
+
+    def _compute_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
+            # Normal linear layer
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
@@ -802,52 +830,66 @@ class LogitsProcessor(nn.Module):
                 logits = lm_head.quant_method.apply(
                     lm_head, hidden_states, embedding_bias
                 )
+        return logits
 
-        if self.logit_scale is not None:
-            logits.mul_(self.logit_scale)
-
-        if self.do_tensor_parallel_all_gather:
-            if self.use_attn_tp_group:
-                if self.config.vocab_size % self.attn_tp_size == 0:
-                    global_logits = torch.empty(
-                        (
-                            self.attn_tp_size,
-                            logits.shape[0],
-                            self.config.vocab_size // self.attn_tp_size,
-                        ),
-                        device=logits.device,
-                        dtype=logits.dtype,
-                    )
-                    attn_tp_all_gather_into_tensor(global_logits, logits)
-                    global_logits = global_logits.permute(1, 0, 2).reshape(
-                        logits.shape[0], self.config.vocab_size
-                    )
-                else:
-                    global_logits = torch.empty(
-                        (self.config.vocab_size, logits.shape[0]),
-                        device=logits.device,
-                        dtype=logits.dtype,
-                    )
-                    global_logits = global_logits.T
-                    attn_tp_all_gather(
-                        list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
-                        logits,
-                    )
-                logits = global_logits
-            else:
-                logits = tensor_model_parallel_all_gather(logits)
-
+    def _gather_dp_attn_hidden_states(
+        self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.do_tensor_parallel_all_gather_dp_attn:
-            logits, global_logits = (
-                torch.empty(
-                    (local_hidden_states.shape[0], logits.shape[1]),
-                    device=logits.device,
-                    dtype=logits.dtype,
+            logits_metadata.compute_dp_attention_metadata()
+            local_hidden_states = hidden_states
+            hidden_states = logits_metadata.gathered_buffer
+            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            return hidden_states, local_hidden_states
+        return hidden_states, hidden_states
+
+    def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.config.vocab_size % self.attn_tp_size == 0:
+            global_logits = torch.empty(
+                (
+                    self.attn_tp_size,
+                    logits.shape[0],
+                    self.config.vocab_size // self.attn_tp_size,
                 ),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            attn_tp_all_gather_into_tensor(global_logits, logits)
+            global_logits = global_logits.permute(1, 0, 2).reshape(
+                logits.shape[0], self.config.vocab_size
+            )
+        else:
+            global_logits = torch.empty(
+                (self.config.vocab_size, logits.shape[0]),
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            global_logits = global_logits.T
+            attn_tp_all_gather(
+                list(global_logits.tensor_split(self.attn_tp_size, dim=-1)),
                 logits,
             )
-            dp_scatter(logits, global_logits, logits_metadata)
+        return global_logits
 
+    def _scatter_dp_attn_logits(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            global_logits = logits
+            logits = torch.empty(
+                (local_hidden_states.shape[0], global_logits.shape[1]),
+                device=global_logits.device,
+                dtype=global_logits.dtype,
+            )
+            dp_scatter(logits, global_logits, logits_metadata)
+        return logits
+
+    def _copy_logits_to_buffer(
+        self, logits: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> torch.Tensor:
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
@@ -855,15 +897,6 @@ class LogitsProcessor(nn.Module):
             logits = logits_buffer
         else:
             logits = logits[:, : self.config.vocab_size].float()
-
-        if self.final_logit_softcapping:
-            if not _is_npu:
-                fused_softcap(logits, self.final_logit_softcapping)
-            else:
-                logits = self.final_logit_softcapping * torch.tanh(
-                    logits / self.final_logit_softcapping
-                )
-
         return logits
 
     def compute_logprobs_for_multi_item_scoring(
