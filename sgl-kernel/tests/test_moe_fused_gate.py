@@ -191,8 +191,6 @@ def test_moe_fused_gate_combined(
                 (shared_ref_indices >= valid_min) & (shared_ref_indices < valid_max)
             ), f"Shared expert reference indices out of range: found values outside [{valid_min}, {valid_max})"
 
-    print(ref_indices.sort()[0].to(torch.int32))
-    print(indices.sort()[0].to(torch.int32))
     idx_check = torch.allclose(
         ref_indices.sort()[0].to(torch.int32),
         indices.sort()[0].to(torch.int32),
