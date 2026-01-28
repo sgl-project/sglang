@@ -182,6 +182,7 @@ class DiffusionServerArgs:
     enable_warmup: bool = False
 
     dit_layerwise_offload: bool = False
+    dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
 
@@ -387,6 +388,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
             dit_layerwise_offload=True,
+            dit_offload_prefetch_size=2,
         ),
         T2I_sampling_params,
     ),
