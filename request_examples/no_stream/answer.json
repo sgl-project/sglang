@@ -1,0 +1,56 @@
+{
+  "id": "92c229ba63e442d3973712762aa18f0f",
+  "choices": [
+    {
+      "finish_reason": "tool_calls",
+      "index": 0,
+      "logprobs": null,
+      "message": {
+        "content": null,
+        "refusal": null,
+        "role": "assistant",
+        "annotations": null,
+        "audio": null,
+        "function_call": null,
+        "tool_calls": [
+          {
+            "id": "call_144459ab238e4f0aba978047",
+            "function": {
+              "arguments": "{\"city\": \"Nashville\", \"state\": \"TN\", \"unit\": \"fahrenheit\"}",
+              "name": "get_current_weather"
+            },
+            "type": "function",
+            "index": -1
+          },
+          {
+            "id": "call_83b94adca9d940359cd645b7",
+            "function": {
+              "arguments": "{\"city\": \"New York\", \"state\": \"NY\", \"unit\": \"fahrenheit\"}",
+              "name": "get_current_weather"
+            },
+            "type": "function",
+            "index": -1
+          }
+        ],
+        "reasoning_content": "Okay, the user is asking about the weather in both Nashville and New York. Let me check the tools provided. The available function is get_current_weather, which requires city, state, and unit. The user didn't specify the state for either city, so I need to assume the correct two-letter abbreviations. Nashville is in Tennessee, so TN, and New York is NY. They also didn't mention the unit, so I should probably default to either celsius or fahrenheit. Since the user might be in the US, maybe fahrenheit is more common there. I'll call the function for each city with those parameters. Wait, but the function can only handle one city at a time, right? So I need to make two separate tool calls. Let me structure each with the respective city and state, and the unit as fahrenheit. That should cover both locations the user mentioned.\n"
+      },
+      "matched_stop": null
+    }
+  ],
+  "created": 1769618374,
+  "model": "qwen3-235b-a22b-fp8",
+  "object": "chat.completion",
+  "service_tier": null,
+  "system_fingerprint": null,
+  "usage": {
+    "completion_tokens": 255,
+    "prompt_tokens": 258,
+    "total_tokens": 513,
+    "completion_tokens_details": null,
+    "prompt_tokens_details": null,
+    "reasoning_tokens": 0
+  },
+  "metadata": {
+    "weight_version": "default"
+  }
+}

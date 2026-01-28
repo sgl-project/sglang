@@ -14,6 +14,7 @@ from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
+from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -1611,6 +1612,114 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
+
+
+class TestQwen25Detector(unittest.TestCase):
+    """Test suite for Qwen25Detector."""
+
+    def setUp(self):
+        """Initialize test fixtures before each test method."""
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_current_weather",
+                    description="Get the current weather in a given location",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "state": {"type": "string"},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city", "state", "unit"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Qwen25Detector()
+
+    def test_detect_and_parse_multiple_tool_calls(self):
+        """Test non-stream parsing of consecutive Qwen tool call blocks."""
+        text = (
+            "<tool_call>\n"
+            '{"name":"get_current_weather","arguments":{"city":"Nashville","state":"TN","unit":"fahrenheit"}}'
+            "\n</tool_call>\n"
+            "<tool_call>\n"
+            '{"name":"get_current_weather","arguments":{"city":"New York","state":"NY","unit":"fahrenheit"}}'
+            "\n</tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(result.calls[1].name, "get_current_weather")
+
+        params0 = json.loads(result.calls[0].parameters)
+        params1 = json.loads(result.calls[1].parameters)
+        self.assertEqual(
+            params0,
+            {"city": "Nashville", "state": "TN", "unit": "fahrenheit"},
+        )
+        self.assertEqual(
+            params1,
+            {"city": "New York", "state": "NY", "unit": "fahrenheit"},
+        )
+
+    def test_streaming_multiple_tool_calls(self):
+        """Test streaming parsing across consecutive Qwen tool call blocks."""
+        chunks = [
+            "<tool_call>\n",
+            '{"name":"get_current_weather","arguments":{"city":"Nashville","state":"TN","unit":"fahrenheit"}}',
+            "\n</tool_call>\n<tool_call>\n",
+            '{"name":"get_current_weather","arguments":{"city":"New York","state":"NY","unit":"fahrenheit"}}',
+            "\n</tool_call>",
+        ]
+
+        detector = Qwen25Detector()
+        tool_calls_by_index = {}
+        normal_text = ""
+
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            if result.normal_text:
+                normal_text += result.normal_text
+
+            for call in result.calls:
+                if call.tool_index is None:
+                    continue
+                if call.tool_index not in tool_calls_by_index:
+                    tool_calls_by_index[call.tool_index] = {
+                        "name": "",
+                        "parameters": "",
+                    }
+                if call.name:
+                    tool_calls_by_index[call.tool_index]["name"] = call.name
+                if call.parameters:
+                    tool_calls_by_index[call.tool_index]["parameters"] += (
+                        call.parameters
+                    )
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(sorted(tool_calls_by_index.keys()), [0, 1])
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_current_weather")
+        self.assertEqual(tool_calls_by_index[1]["name"], "get_current_weather")
+
+        params0 = json.loads(tool_calls_by_index[0]["parameters"])
+        params1 = json.loads(tool_calls_by_index[1]["parameters"])
+        self.assertEqual(
+            params0,
+            {"city": "Nashville", "state": "TN", "unit": "fahrenheit"},
+        )
+        self.assertEqual(
+            params1,
+            {"city": "New York", "state": "NY", "unit": "fahrenheit"},
+        )
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
