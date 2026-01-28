@@ -734,11 +734,32 @@ jobs:
           ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
 
           echo ""
-          echo "=== 0. Deep search for libionic-rdmav34.so ==="
+          echo "=== 0a. Resolve symlink and check actual library file ==="
+          IONIC_SYMLINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+          if [[ -L "$IONIC_SYMLINK" ]]; then
+            IONIC_REAL=$(readlink -f "$IONIC_SYMLINK" 2>/dev/null)
+            echo "Symlink: $IONIC_SYMLINK"
+            echo "Points to: $IONIC_REAL"
+            if [[ -f "$IONIC_REAL" ]]; then
+              echo "Actual library EXISTS:"
+              ls -la "$IONIC_REAL"
+            else
+              echo "ERROR: Actual library file does NOT exist (broken symlink)!"
+            fi
+          else
+            echo "Symlink $IONIC_SYMLINK does not exist"
+          fi
+
+          echo ""
+          echo "=== 0b. Check libionic.so.* directly ==="
+          ls -la /usr/lib/x86_64-linux-gnu/libionic* 2>/dev/null || echo "No libionic.so.* files in /usr/lib/x86_64-linux-gnu/"
+
+          echo ""
+          echo "=== 0c. Deep search for libionic-rdmav34.so ==="
           find /usr /lib /opt -name "libionic-rdmav34.so" 2>/dev/null || echo "libionic-rdmav34.so not found anywhere"
 
           echo ""
-          echo "=== 0. Search for any ionic related libraries ==="
+          echo "=== 0d. Search for any ionic related libraries ==="
           find /usr /lib /opt -name "*libionic*" 2>/dev/null || echo "No ionic related files found"
 
           echo ""

@@ -156,12 +156,29 @@ fi
 
 # Detect libionic library for RDMA support
 LIBIONIC_MOUNT=""
-LIBIONIC_LIB=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 -name "libionic.so.*" -type f 2>/dev/null | head -1)
-if [[ -n "$LIBIONIC_LIB" ]]; then
-    echo "Found libionic library: $LIBIONIC_LIB"
-    LIBIONIC_MOUNT="-v ${LIBIONIC_LIB}:${LIBIONIC_LIB}:ro"
+IONIC_SYMLINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+if [[ -L "$IONIC_SYMLINK" ]]; then
+    LIBIONIC_LIB=$(readlink -f "$IONIC_SYMLINK" 2>/dev/null)
+    if [[ -f "$LIBIONIC_LIB" ]]; then
+        echo "Found libionic library: $LIBIONIC_LIB (resolved from symlink)"
+        LIBIONIC_MOUNT="-v ${LIBIONIC_LIB}:${LIBIONIC_LIB}:ro"
+    else
+        echo "Warning: libionic symlink exists but target does not: $LIBIONIC_LIB"
+    fi
 else
-    echo "Warning: libionic library not found on host, RDMA may not work"
+    # Fallback: try to find directly
+    LIBIONIC_FOUND=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 -name "libionic.so.*" 2>/dev/null | head -1)
+    if [[ -n "$LIBIONIC_FOUND" ]]; then
+        LIBIONIC_LIB=$(readlink -f "$LIBIONIC_FOUND" 2>/dev/null)
+        if [[ -f "$LIBIONIC_LIB" ]]; then
+            echo "Found libionic library: $LIBIONIC_LIB"
+            LIBIONIC_MOUNT="-v ${LIBIONIC_LIB}:${LIBIONIC_LIB}:ro"
+        else
+            echo "Warning: libionic found but cannot resolve real path: $LIBIONIC_FOUND"
+        fi
+    else
+        echo "Warning: libionic library not found on host, RDMA may not work"
+    fi
 fi
 
 echo "Launching container: ci_sglang"
