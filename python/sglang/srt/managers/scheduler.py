@@ -1118,6 +1118,7 @@ class Scheduler(
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+
             else:
                 batch_result = None
 
@@ -1802,6 +1803,15 @@ class Scheduler(
         if self.dllm_config is not None:
             self.dllm_staging_reqs.filter_finished_reqs()
 
+        skip_prefill_scheduler = False
+        if self.schedule_enhancer and not self.schedule_enhancer.get_schedule_decision(
+            self.running_batch
+        ):
+            # Decrease prefill idle as much as possible during high dp load.
+            skip_prefill_scheduler = True
+            chunked_back = self.chunked_req
+            self.chunked_req = None
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
 
@@ -1847,7 +1857,10 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        if skip_prefill_scheduler:
+            new_batch = None
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1878,7 +1891,8 @@ class Scheduler(
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
-
+        if skip_prefill_scheduler:
+            self.chunked_req = chunked_back
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
