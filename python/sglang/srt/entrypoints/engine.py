@@ -1152,7 +1152,9 @@ def _launch_scheduler_ray_actors(
     # Unlike mp mode, Ray actors are ready once __init__ completes.
     # If initialization fails, ray.get() raises RayActorError.
     try:
-        scheduler_infos = ray.get([actor.get_info.remote() for actor in scheduler_actors])
+        scheduler_infos = ray.get(
+            [actor.get_info.remote() for actor in scheduler_actors]
+        )
     except ray.exceptions.RayActorError as e:
         raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
 
