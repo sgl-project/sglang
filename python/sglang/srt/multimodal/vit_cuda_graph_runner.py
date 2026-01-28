@@ -92,20 +92,20 @@ class ViTCudaGraphRunner:
             max_shape = self.max_context_len or seq_len
             max_shape = max(max_shape, seq_len)
             cos_ws = torch.empty(
-                max_shape, head_dim, dtype= sin_cos_dtype, device=self.device
+                max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
             )
             sin_ws = torch.empty(
-                max_shape, head_dim, dtype= sin_cos_dtype, device=self.device
+                max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
             )
             self.sin_cos_ws = (cos_ws, sin_ws)
         else:
             if self.sin_cos_ws[0].size(0) < seq_len:
                 max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
                 cos_ws = torch.empty(
-                    max_shape, head_dim, dtype= sin_cos_dtype, device=self.device
+                    max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
                 )
                 sin_ws = torch.empty(
-                    max_shape, head_dim, dtype= sin_cos_dtype, device=self.device
+                    max_shape, head_dim, dtype=sin_cos_dtype, device=self.device
                 )
                 self.sin_cos_ws = (cos_ws, sin_ws)
 
