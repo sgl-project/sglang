@@ -1600,7 +1600,7 @@ class NativeSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
-        indices = page_table_1.view(batch_size,-1,self.nsa_index_topk)
+        indices = page_table_1.view(batch_size, -1, self.nsa_index_topk)
         assert (
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
