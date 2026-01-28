@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
-from sglang.srt.platforms.interface import Platform, PlatformEnum
+from sglang.srt.platforms.interface import OpSpec, Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from sglang.srt.ops.base import OpProxy
@@ -53,24 +53,37 @@ class XpuPlatform(Platform):
     _ops: dict[str, Callable] | None = None
 
     @classmethod
-    def _init_ops(cls) -> dict[str, Callable]:
-        """Initialize the op registry with XPU kernels.
+    def _init_ops(cls) -> dict[str, OpSpec | Callable]:
+        """Initialize the op registry with XPU kernel specs.
 
         sgl_kernel provides XPU-compiled versions of the same kernels
         used on CUDA. The API is identical.
-        """
-        from sgl_kernel import gelu_and_mul as xpu_gelu_and_mul
-        from sgl_kernel import gelu_tanh_and_mul as xpu_gelu_tanh_and_mul
-        from sgl_kernel import silu_and_mul as xpu_silu_and_mul
 
+        Uses OpSpec for lazy imports - kernels are only imported when
+        an op is first called.
+        """
         return {
-            "silu_and_mul": xpu_silu_and_mul,
-            "gelu_and_mul": xpu_gelu_and_mul,
-            "gelu_tanh_and_mul": xpu_gelu_tanh_and_mul,
+            "silu_and_mul": OpSpec("sgl_kernel", "silu_and_mul"),
+            "gelu_and_mul": OpSpec("sgl_kernel", "gelu_and_mul"),
+            "gelu_tanh_and_mul": OpSpec("sgl_kernel", "gelu_tanh_and_mul"),
         }
 
     def get_op(self, op: "OpProxy") -> Callable | None:
         """Get the XPU implementation of an operation."""
         if XpuPlatform._ops is None:
             XpuPlatform._ops = self._init_ops()
-        return XpuPlatform._ops.get(op.name)
+
+        impl = XpuPlatform._ops.get(op.name)
+        if impl is None:
+            return None
+
+        # Resolve OpSpec to actual callable if needed
+        if isinstance(impl, OpSpec):
+            try:
+                resolved = impl.resolve()
+                XpuPlatform._ops[op.name] = resolved
+                return resolved
+            except (ImportError, AttributeError):
+                return None
+
+        return impl

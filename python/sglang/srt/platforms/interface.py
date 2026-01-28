@@ -29,63 +29,208 @@ KEY CONCEPTS:
    - Provides: device info, op registry, server arg post-processing, modules
 
 2. **Op Registry** (Maps op names to platform-specific kernels)
-   - Each platform registers its kernels in _init_ops()
+   - Supports lazy imports via OpSpec (module path + attribute name)
+   - Supports out-of-class registration via register_op()
    - Ops are looked up via get_op_by_name()
-   - This enables the ops module (sglang.srt.ops) to dispatch transparently
 
 3. **PlatformModules** (Lazy access to vendor-specific modules)
    - Allows accessing vendor modules (torch_npu, sgl_kernel) without if-else
-   - Example: current_platform.modules.npu_swiglu(x) instead of
-     if is_npu(): import torch_npu; torch_npu.npu_swiglu(x)
+   - Example: current_platform.modules.npu_swiglu(x)
 
 4. **Server Arg Post-processing** (Platform-specific defaults)
    - Each platform can override postprocess_server_args() to set defaults
-   - Called during ServerArgs initialization
 
-ARCHITECTURE:
--------------
+LAZY IMPORT SUPPORT:
+--------------------
+Ops can be registered with lazy imports to reduce startup time:
 
-    current_platform (singleton, from platforms/__init__.py)
-         │
-         ▼
-    Platform (base class, this file)
-         │
-         ├── device_name, device_type  (device info)
-         │
-         ├── get_op_by_name(name)      (op registry lookup)
-         │   └── _ops = {"silu_and_mul": kernel_fn, ...}
-         │
-         ├── modules                    (vendor module access)
-         │   └── PlatformModules → _get_module_attr()
-         │
-         └── postprocess_server_args()  (server defaults)
+    # Instead of importing at registration time:
+    from sgl_kernel import silu_and_mul
+    register_op(PlatformEnum.CUDA, "silu_and_mul", silu_and_mul)
 
-EXAMPLE - Adding a New Platform:
---------------------------------
+    # Use OpSpec for lazy import (imported only when op is first called):
+    register_op(PlatformEnum.CUDA, "silu_and_mul",
+                OpSpec("sgl_kernel", "silu_and_mul"))
 
-    class MyPlatform(Platform):
-        _enum = PlatformEnum.MYPLATFORM
-        device_name = "mydevice"
-        device_type = "mydevice"
+OUT-OF-CLASS REGISTRATION:
+--------------------------
+Ops can be registered from anywhere, not just in Platform subclasses:
 
-        @classmethod
-        def _init_ops(cls) -> dict[str, Callable]:
-            from my_kernel_lib import silu_and_mul
-            return {"silu_and_mul": silu_and_mul}
+    # In a separate file (e.g., my_custom_ops.py):
+    from sglang.srt.platforms.interface import register_op, OpSpec, PlatformEnum
 
-        def get_op(self, op: "OpProxy") -> Callable | None:
-            if MyPlatform._ops is None:
-                MyPlatform._ops = self._init_ops()
-            return MyPlatform._ops.get(op.name)
+    # Register a custom op for CUDA
+    register_op(PlatformEnum.CUDA, "my_custom_op",
+                OpSpec("my_kernel_lib", "my_custom_op"))
+
+    # Or register with a callable directly
+    register_op(PlatformEnum.CUDA, "my_custom_op", my_custom_op_fn)
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum, auto
+from importlib import import_module
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from sglang.srt.ops.base import OpProxy
     from sglang.srt.server_args import ServerArgs
+
+
+# =============================================================================
+# Op Specification for Lazy Imports
+# =============================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class OpSpec:
+    """Specification for a lazily-imported operation.
+
+    Instead of importing a kernel at registration time, OpSpec stores the
+    import path and resolves it only when the op is first accessed.
+
+    This provides:
+    - Faster startup (no kernel imports until needed)
+    - No import errors if the kernel library isn't installed
+    - Ability to register ops before their dependencies are available
+
+    Example:
+        # Lazy import: sgl_kernel.silu_and_mul will be imported on first use
+        spec = OpSpec("sgl_kernel", "silu_and_mul")
+
+        # Nested attribute access (e.g., torch_npu.npu_swiglu)
+        spec = OpSpec("torch_npu", "npu_swiglu")
+
+    Attributes:
+        module: The module path to import (e.g., "sgl_kernel", "torch_npu")
+        attr: The attribute name to get from the module (e.g., "silu_and_mul")
+    """
+
+    module: str
+    attr: str
+
+    def resolve(self) -> Callable:
+        """Import the module and return the callable.
+
+        Returns:
+            The resolved callable from the module.
+
+        Raises:
+            ImportError: If the module cannot be imported.
+            AttributeError: If the attribute doesn't exist in the module.
+        """
+        mod = import_module(self.module)
+        return getattr(mod, self.attr)
+
+
+# =============================================================================
+# Global Op Registry
+# =============================================================================
+# Maps (PlatformEnum, op_name) -> OpSpec | Callable
+# This allows registering ops from anywhere, not just in Platform subclasses.
+
+_global_op_registry: dict[tuple["PlatformEnum", str], OpSpec | Callable] = {}
+
+# Cache for resolved ops (OpSpec -> Callable)
+_resolved_ops_cache: dict[tuple["PlatformEnum", str], Callable] = {}
+
+
+def register_op(
+    platform: "PlatformEnum",
+    op_name: str,
+    impl: OpSpec | Callable,
+) -> None:
+    """Register an operation for a specific platform.
+
+    This function allows registering ops from anywhere in the codebase,
+    not just inside Platform subclass files. This is similar to PyTorch's
+    dispatch mechanism where ops can be registered externally.
+
+    Args:
+        platform: The platform to register the op for (e.g., PlatformEnum.CUDA)
+        op_name: The canonical name of the operation (e.g., "silu_and_mul")
+        impl: Either an OpSpec for lazy import, or a callable directly
+
+    Example:
+        # Register with lazy import (recommended for startup performance)
+        register_op(PlatformEnum.CUDA, "silu_and_mul",
+                    OpSpec("sgl_kernel", "silu_and_mul"))
+
+        # Register with a callable directly
+        register_op(PlatformEnum.CUDA, "my_op", my_op_function)
+
+        # Register from a separate file (out-of-class registration)
+        # In my_custom_kernels.py:
+        from sglang.srt.platforms.interface import register_op, OpSpec, PlatformEnum
+        register_op(PlatformEnum.CUDA, "custom_attention",
+                    OpSpec("my_attention_lib", "flash_attention"))
+    """
+    key = (platform, op_name)
+    _global_op_registry[key] = impl
+    # Clear cache if re-registering
+    if key in _resolved_ops_cache:
+        del _resolved_ops_cache[key]
+
+
+def get_registered_op(platform: "PlatformEnum", op_name: str) -> Callable | None:
+    """Get a registered operation, resolving lazy imports if needed.
+
+    This function handles the lazy import resolution: if an op was registered
+    with an OpSpec, it will be imported on first access and cached.
+
+    Args:
+        platform: The platform to look up the op for
+        op_name: The canonical name of the operation
+
+    Returns:
+        The callable implementation, or None if not registered.
+    """
+    key = (platform, op_name)
+
+    # Check resolved cache first
+    if key in _resolved_ops_cache:
+        return _resolved_ops_cache[key]
+
+    # Check global registry
+    if key not in _global_op_registry:
+        return None
+
+    impl = _global_op_registry[key]
+
+    # Resolve OpSpec if needed
+    if isinstance(impl, OpSpec):
+        try:
+            resolved = impl.resolve()
+            _resolved_ops_cache[key] = resolved
+            return resolved
+        except (ImportError, AttributeError):
+            # Import failed - return None (will fall back to native impl)
+            return None
+    else:
+        # Already a callable
+        _resolved_ops_cache[key] = impl
+        return impl
+
+
+def list_registered_ops(platform: "PlatformEnum" | None = None) -> list[str]:
+    """List all registered ops, optionally filtered by platform.
+
+    Args:
+        platform: If provided, only list ops for this platform.
+                  If None, list all ops across all platforms.
+
+    Returns:
+        List of op names.
+    """
+    if platform is None:
+        return list(set(op_name for _, op_name in _global_op_registry.keys()))
+    return [op_name for (p, op_name) in _global_op_registry.keys() if p == platform]
+
+
+# =============================================================================
+# Platform Enum
+# =============================================================================
 
 
 class PlatformEnum(Enum):
@@ -316,6 +461,13 @@ class Platform(ABC):
         return False
 
     # === Op Registry ===
+    #
+    # The op registry supports two sources:
+    # 1. Class-level _ops dict (populated by _init_ops() in subclasses)
+    # 2. Global registry (populated by register_op() from anywhere)
+    #
+    # The global registry is checked first, allowing external registration
+    # to override class-level ops if needed.
 
     @abstractmethod
     def get_op(self, op: "OpProxy") -> Callable | None:
@@ -332,8 +484,12 @@ class Platform(ABC):
     def get_op_by_name(self, name: str) -> Callable | None:
         """Get the platform-specific implementation of an operation by name.
 
-        This is a convenience method for looking up ops without an OpProxy.
-        Used by the new function-based ops in sglang.srt.ops.
+        This method checks two sources in order:
+        1. Global registry (register_op() - supports lazy imports)
+        2. Class-level _ops dict (from _init_ops())
+
+        The global registry takes precedence, allowing external registration
+        to override class-level ops.
 
         Args:
             name: The canonical name of the operation.
@@ -341,19 +497,37 @@ class Platform(ABC):
         Returns:
             The callable implementation, or None if not available.
         """
-        if self._ops is None:
-            return None
-        return self._ops.get(name)
+        # First, check global registry (supports lazy imports and external registration)
+        global_impl = get_registered_op(self._enum, name)
+        if global_impl is not None:
+            return global_impl
+
+        # Fall back to class-level _ops dict
+        if self._ops is not None:
+            return self._ops.get(name)
+
+        return None
 
     def has_op(self, op: "OpProxy") -> bool:
         """Check if an operation is available on this platform."""
         return self.get_op(op) is not None
 
+    def has_op_by_name(self, name: str) -> bool:
+        """Check if an operation is available by name."""
+        return self.get_op_by_name(name) is not None
+
     def list_available_ops(self) -> list[str]:
-        """List all available ops on this platform."""
-        if self._ops is None:
-            return []
-        return list(self._ops.keys())
+        """List all available ops on this platform.
+
+        Combines ops from both the global registry and class-level _ops.
+        """
+        ops = set()
+        # Add ops from global registry
+        ops.update(list_registered_ops(self._enum))
+        # Add ops from class-level _ops
+        if self._ops is not None:
+            ops.update(self._ops.keys())
+        return list(ops)
 
     # === Server Argument Post-processing ===
 

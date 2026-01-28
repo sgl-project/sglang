@@ -122,6 +122,23 @@ class NpuPlatform(Platform):
         - NPU: npu_swiglu(x) returns a new tensor
 
         We wrap NPU functions to match the standard signature.
+
+        NOTE: Why NPU doesn't use OpSpec for lazy imports
+        -------------------------------------------------
+        Unlike CUDA/ROCm/MUSA/XPU which can use OpSpec("sgl_kernel", "silu_and_mul")
+        for direct lazy imports, NPU requires wrapper functions because:
+
+        1. Different API signature - NPU functions return tensors instead of
+           modifying output tensors in-place
+        2. Different function names - torch_npu.npu_swiglu vs sgl_kernel.silu_and_mul
+        3. Different parameters - npu_geglu needs dim, approximate, activate_left args
+
+        The wrapper functions bridge this gap by:
+        - Calling the NPU function with correct parameters
+        - Copying the result to the output tensor (in-place semantics)
+
+        If NPU ever provides in-place APIs matching the standard signature,
+        we could switch to OpSpec for lazy imports.
         """
         import torch_npu
 

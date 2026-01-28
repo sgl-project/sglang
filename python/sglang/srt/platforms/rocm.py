@@ -41,7 +41,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable
 
-from sglang.srt.platforms.interface import Platform, PlatformEnum
+from sglang.srt.platforms.interface import OpSpec, Platform, PlatformEnum
 
 if TYPE_CHECKING:
     from sglang.srt.ops.base import OpProxy
@@ -99,24 +99,37 @@ class RocmPlatform(Platform):
         return self._get_sgl_kernel_attr(name)
 
     @classmethod
-    def _init_ops(cls) -> dict[str, Callable]:
-        """Initialize the op registry with HIP kernels.
+    def _init_ops(cls) -> dict[str, OpSpec | Callable]:
+        """Initialize the op registry with HIP kernel specs.
 
         sgl_kernel provides HIP-compiled versions of the same kernels
         used on CUDA. The API is identical.
-        """
-        from sgl_kernel import gelu_and_mul as hip_gelu_and_mul
-        from sgl_kernel import gelu_tanh_and_mul as hip_gelu_tanh_and_mul
-        from sgl_kernel import silu_and_mul as hip_silu_and_mul
 
+        Uses OpSpec for lazy imports - kernels are only imported when
+        an op is first called.
+        """
         return {
-            "silu_and_mul": hip_silu_and_mul,
-            "gelu_and_mul": hip_gelu_and_mul,
-            "gelu_tanh_and_mul": hip_gelu_tanh_and_mul,
+            "silu_and_mul": OpSpec("sgl_kernel", "silu_and_mul"),
+            "gelu_and_mul": OpSpec("sgl_kernel", "gelu_and_mul"),
+            "gelu_tanh_and_mul": OpSpec("sgl_kernel", "gelu_tanh_and_mul"),
         }
 
     def get_op(self, op: "OpProxy") -> Callable | None:
         """Get the ROCm/HIP implementation of an operation."""
         if RocmPlatform._ops is None:
             RocmPlatform._ops = self._init_ops()
-        return RocmPlatform._ops.get(op.name)
+
+        impl = RocmPlatform._ops.get(op.name)
+        if impl is None:
+            return None
+
+        # Resolve OpSpec to actual callable if needed
+        if isinstance(impl, OpSpec):
+            try:
+                resolved = impl.resolve()
+                RocmPlatform._ops[op.name] = resolved
+                return resolved
+            except (ImportError, AttributeError):
+                return None
+
+        return impl
