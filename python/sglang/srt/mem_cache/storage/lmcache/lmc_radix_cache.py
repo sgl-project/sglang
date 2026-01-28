@@ -269,30 +269,30 @@ class LMCRadixCache(RadixCache):
         return super().evict(params)
 
     def take_events(self):
-        """Retrieve KV events from LMCache.
+        """Retrieve KV events from LMCache and RadixCache.
 
         Returns:
-            A list of KV cache events.
+            A list of KV events.
         """
+        lmcache_blocks = []
         if hasattr(self.lmcache_connector, "get_kv_events"):
             events = self.lmcache_connector.get_kv_events()
-            if not events:
-                return []
+            if events:
+                lmcache_blocks = [
+                    BlockStored(
+                        block_hashes=e.block_hashes,
+                        parent_block_hash=e.parent_block_hash,
+                        token_ids=e.token_ids,
+                        lora_id=e.lora_id,
+                        block_size=e.block_size,
+                    )
+                    for e in events
+                ]
         else:
             warn_kv_events_once()
-            return []
 
-        blocks: list[BlockStored] = [
-            BlockStored(
-                block_hashes=e.block_hashes,
-                parent_block_hash=e.parent_block_hash,
-                token_ids=e.token_ids,
-                lora_id=e.lora_id,
-                block_size=e.block_size,
-            )
-            for e in events
-        ]
-        return blocks
+        radix_events = super().take_events()
+        return radix_events + lmcache_blocks
 
     def pretty_print(self):  # type: ignore[override]
         super().pretty_print()

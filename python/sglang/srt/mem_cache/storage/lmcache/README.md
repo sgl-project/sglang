@@ -52,7 +52,7 @@ Secondly, the events need to be published. This requires configuring SGLang to p
 Finally, setup SGLang serving engine with LMCache as follows:
 
 ```bash
-export LMCACHE_CONFIG_FILE=example_config.yaml # Don't forget to enable `enable_kv_events`
+export LMCACHE_CONFIG_FILE=example_config.yaml # Don't forget to set `enable_kv_events` to `true`
 
 python -m sglang.launch_server \
   --model-path MODEL \

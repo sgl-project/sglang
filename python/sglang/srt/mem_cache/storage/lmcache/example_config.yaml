@@ -1,6 +1,5 @@
 # Basic configurations
 chunk_size: 256
-# enable_kv_events: true # Enable KV events
 
 # CPU offloading configurations
 local_cpu: true
