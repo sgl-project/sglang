@@ -1131,13 +1131,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if os.environ.get("HPC_OPS") == "1":
             import hpc
 
-            from sglang.srt.distributed import get_moe_expert_parallel_rank
+            from sglang.srt.distributed import (
+                get_moe_expert_parallel_rank,
+                get_moe_expert_parallel_world_size,
+            )
             from sglang.srt.layers.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
 
             x_q, x_scale = sglang_per_token_group_quant_fp8(x, 128)
             rank_ep = get_moe_expert_parallel_rank()
+            size_ep = get_moe_expert_parallel_world_size()
 
             w13_weight_scale_inv = layer.w13_weight_scale_inv
             w2_weight_scale_inv = layer.w2_weight_scale_inv
@@ -1181,6 +1185,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 w2_weight_scale_inv = w2_weight_scale_inv_padded
 
+            # Convert local expert IDs to global expert IDs if needed
+            topk_ids = dispatch_output.topk_output.topk_ids
+            if size_ep > 1:
+
+                topk_ids = torch.where(
+                    topk_ids >= 0,
+                    topk_ids + rank_ep * layer.num_local_experts,
+                    topk_ids,
+                )
+
             my = hpc.fuse_moe_blockwise_fp8(
                 x_q,
                 x_scale,
@@ -1188,11 +1202,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_inv,
                 layer.w2_weight,
                 w2_weight_scale_inv,
-                dispatch_output.topk_output.topk_ids,
+                topk_ids,
                 dispatch_output.topk_output.topk_weights,
                 rank_ep,
                 layer.num_local_experts,
             )
+            # logger.info(f"topk_ids: {topk_ids} topk_ids shape: {topk_ids.shape}")
+
             # logger.info(f"my shape: {my.shape} num_local_experts: {layer.num_local_experts}")
             return StandardCombineInput(hidden_states=my)
 
