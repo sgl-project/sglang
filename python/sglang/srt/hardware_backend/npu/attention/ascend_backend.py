@@ -221,6 +221,11 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
+            if (
+                "Glm4MoeLiteForCausalLM"
+                in model_runner.model_config.hf_config.architectures
+            ):
+                self.prefill_use_mha = True
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
         self.native_attn = TorchNativeAttnBackend(model_runner)
@@ -749,8 +754,8 @@ class AscendAttnBackend(AttentionBackend):
                 q_rope=q_rope,
                 k_rope=k_rope,
             )
-
-        if not self.use_mla:
+        forward_mha = not self.use_mla or getattr(self, "prefill_use_mha", False)
+        if forward_mha:
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
