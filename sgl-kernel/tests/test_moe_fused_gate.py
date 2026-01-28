@@ -1,7 +1,9 @@
+from typing import Optional
+
 import pytest
 import torch
-from typing import Optional
 from sgl_kernel import moe_fused_gate
+
 
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
@@ -86,7 +88,7 @@ def biased_grouped_topk(
     routed_scaling_factor: Optional[float] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):  
+):
     return biased_grouped_topk_impl(
         hidden_states,
         gating_output,
