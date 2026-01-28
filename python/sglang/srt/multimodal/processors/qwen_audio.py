@@ -31,7 +31,7 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         self.ATTR_NAME_TO_MODALITY.update({"feature_attention_mask": Modality.AUDIO})
 
-    def get_mm_data(self, prompt, embeddings, **kwargs):
+    def get_mm_data(self, prompt, embeddings, embedding_offsets, **kwargs):
         audio_feature_lens = kwargs.get("audio_feature_lens", None)
 
         # Convert audio_feature_lens to token counts for build_input_ids
@@ -49,12 +49,14 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
         )
 
         mm_items = []
-        embedding_index = 0
+        embedding_index_by_modality = {}
+
         for modality, offset in zip(modality_list, offsets):
-            start_idx, end_idx = offset
-            num_tokens = end_idx - start_idx + 1
-            embedding_slice = embeddings[embedding_index : embedding_index + num_tokens]
-            embedding_index += num_tokens
+            num_tokens = offset[1] - offset[0] + 1
+            start_idx, end_idx = self.update_embedding_index(
+                embedding_offsets, modality, embedding_index_by_modality, num_tokens
+            )
+            embedding_slice = embeddings[start_idx:end_idx]
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
