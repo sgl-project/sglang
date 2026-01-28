@@ -159,7 +159,7 @@ docker run -dt --user root --device=/dev/kfd --device=/dev/rdma --device=/dev/dr
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   -v /sys/class/infiniband:/sys/class/infiniband:ro \
   -v /sys/class/net:/sys/class/net:ro \
-  -v /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro
+  -v /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro \
   -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
   $CACHE_VOLUME \
   --privileged \
