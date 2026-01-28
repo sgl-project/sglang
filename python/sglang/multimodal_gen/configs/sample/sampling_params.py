@@ -149,6 +149,8 @@ class SamplingParams:
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
+    # if True, suppress verbose logging for this request
+    suppress_logs: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -417,14 +419,17 @@ class SamplingParams:
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
         from sglang.multimodal_gen.registry import get_model_info
 
-        model_info = get_model_info(model_path)
+        backend = kwargs.pop("backend", None)
+        model_info = get_model_info(model_path, backend=backend)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
-            sampling_params = SamplingParams.from_pretrained(model_path)
+            sampling_params = SamplingParams.from_pretrained(
+                model_path, backend=server_args.backend
+            )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
@@ -463,7 +468,9 @@ class SamplingParams:
                 # Re-raise if it's not a safetensors file issue
                 raise
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        user_kwargs = dict(kwargs)
+        user_kwargs.pop("diffusers_kwargs", None)
+        user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
