@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^python/sglang/multimodal_gen/csrc
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/jit_kernel/flash_attention/cute)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
