@@ -253,19 +253,16 @@ def handle_rerun_stage(
     # Valid AMD stage names that support target_stage
     amd_stages = [
         "sgl-kernel-unit-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
         "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
-        "stage-b-test-small-1-gpu-performance-amd",
-        "stage-b-test-large-1-gpu-performance-amd",
-        "stage-b-test-large-2-gpu-performance-amd",
+        "multimodal-gen-test-1-gpu-amd",
+        "multimodal-gen-test-2-gpu-amd",
+        "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
-        "unit-test-backend-1-gpu-amd",
-        "unit-test-backend-2-gpu-amd",
-        "unit-test-backend-8-gpu-amd",
-        "accuracy-test-1-gpu-amd",
-        "accuracy-test-2-gpu-amd",
     ]
 
     valid_stages = nvidia_stages + amd_stages
