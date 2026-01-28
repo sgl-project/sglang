@@ -996,7 +996,7 @@ class EAGLEWorker(TpModelWorker):
             named_tensors, self.tp_rank, torch.device(self.device)
         )
 
-        success, message = self.draft_worker.draft_runner.update_weights_from_tensor(
+        success, message = self.model_runner.update_weights_from_tensor(
             named_tensors=unwrapped_tensors,
             load_format=recv_req.load_format,
         )
