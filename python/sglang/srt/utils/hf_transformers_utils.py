@@ -344,7 +344,9 @@ def get_config(
             if not hasattr(config, key) and val is not None:
                 setattr(config, key, val)
 
-    if config.model_type in _CONFIG_REGISTRY:
+    if _is_deepseek_ocr2_model(config):
+        _override_v_head_dim_if_zero(config)
+    elif config.model_type in _CONFIG_REGISTRY:
         model_type = config.model_type
         if model_type == "deepseek_vl_v2":
             if _is_deepseek_ocr_model(config):
