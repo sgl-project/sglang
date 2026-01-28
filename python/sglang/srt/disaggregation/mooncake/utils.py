@@ -18,8 +18,6 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-import os
-
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -58,7 +56,6 @@ def init_mooncake_custom_mem_pool(
 
                 allocator = BarexAllocator.get_allocator(device)
             elif custom_mem_pool_type == "INTRA_NVLINK":
-                logger.info("custom pool intra-nvlink")
                 return False, None, None
             else:
                 # This should not happen due to the enable_custom_mem_pool check above
@@ -101,7 +98,6 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
         Tuple of (enable_custom_mem_pool, custom_mem_pool_type)
     """
     custom_mem_pool_type = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
-
     if custom_mem_pool_type is not None:
         # Handle boolean True as NVLINK
         if custom_mem_pool_type.lower() == "true":

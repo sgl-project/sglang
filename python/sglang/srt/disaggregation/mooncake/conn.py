@@ -345,6 +345,7 @@ class MooncakeKVManager(CommonKVManager):
             for src_ptr, dst_ptr, item_len in layers_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
+
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
@@ -550,7 +551,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_aux_ptrs: list[int],
     ):
         # TODO(shangming): Fix me when nvlink_transport of Mooncake is bug-free
-        if (self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK"):
+        if self.enable_custom_mem_pool and self.custom_mem_pool_type == "NVLINK":
             return self.send_aux_tcp(req, prefill_aux_index, dst_aux_ptrs)
 
         transfer_blocks = []
