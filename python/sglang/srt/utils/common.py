@@ -2905,6 +2905,7 @@ def is_fa3_default_architecture(hf_config):
         "Glm4MoeForCausalLM",
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
+        "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
