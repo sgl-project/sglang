@@ -37,7 +37,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_flashinfer_available, rank0_log
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -801,6 +801,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if use_cutedsl
             else fused_sigmoid_gating_delta_rule_update
         )
+        self._flashinfer_gdn_prefill = None
+        self._use_flashinfer_gdn_prefill = False
+        if (
+            is_flashinfer_available()
+            and torch.cuda.get_device_capability()[0] == 9
+        ):
+            try:
+                from flashinfer.gdn_prefill import (
+                    chunk_gated_delta_rule as flashinfer_chunk_gated_delta_rule,
+                )
+
+                self._flashinfer_gdn_prefill = flashinfer_chunk_gated_delta_rule
+                self._use_flashinfer_gdn_prefill = True
+                rank0_log("FlashInfer GDN prefill kernel enabled.")
+            except Exception as exc:
+                rank0_log(
+                    f"FlashInfer GDN prefill kernel unavailable, "
+                    f"falling back to Triton FLA. Reason: {exc}"
+                )
 
     def forward_decode(
         self,
@@ -980,33 +999,62 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            # Only cuda env uses fuse ssm_states update
-            recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
-            core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
+            use_flashinfer = (
+                self._use_flashinfer_gdn_prefill
+                and (
+                    forward_batch.mamba_track_mask is None
+                    or not forward_batch.mamba_track_mask.any()
+                )
             )
-            if is_npu():
-                last_recurrent_state = last_recurrent_state.to(
+            if use_flashinfer:
+                q_for_kernel = query.squeeze(0).contiguous()
+                k_for_kernel = key.squeeze(0).contiguous()
+                v_for_kernel = value.squeeze(0).contiguous()
+                g_for_kernel = g.squeeze(0).to(torch.float32, copy=False)
+                beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
+                output, output_state = self._flashinfer_gdn_prefill(
+                    q=q_for_kernel,
+                    k=k_for_kernel,
+                    v=v_for_kernel,
+                    g=g_for_kernel,
+                    beta=beta_for_kernel,
+                    initial_state=ssm_states[cache_indices],
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc.to(torch.int64),
+                    use_qk_l2norm_in_kernel=True,
+                )
+                ssm_states[cache_indices] = output_state.to(
                     ssm_states.dtype, copy=False
                 )
-                ssm_states[cache_indices] = last_recurrent_state
+                core_attn_out = output.unsqueeze(0)
+            else:
+                # Only cuda env uses fuse ssm_states update
+                recurrent_state = ssm_states
+                recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+                if is_npu():
+                    recurrent_state = ssm_states[cache_indices]
+                    recurrent_state_indices_args = {}
+                core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    **recurrent_state_indices_args,
+                )
+                if is_npu():
+                    last_recurrent_state = last_recurrent_state.to(
+                        ssm_states.dtype, copy=False
+                    )
+                    ssm_states[cache_indices] = last_recurrent_state
 
-            self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
-            )
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
 
         return core_attn_out
 
