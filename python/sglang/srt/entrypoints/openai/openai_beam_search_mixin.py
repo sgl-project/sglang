@@ -34,8 +34,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     DeltaMessage,
+    SglExt,
 )
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
+from sglang.srt.entrypoints.openai.utils import process_routed_experts_from_ret
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 
@@ -192,7 +194,7 @@ class OpenAIBeamSearchMixin:
                             index=choice.index,
                             delta=DeltaMessage(content=choice.message.content),
                             finish_reason=None,
-                            sequence_score=choice.sequence_score,
+                            sgl_ext=choice.sgl_ext,
                         )
                     ],
                     model=request.model,
@@ -303,6 +305,7 @@ class OpenAIBeamSearchMixin:
             beam_meta_info = beam_result.get("meta_info", {})
             finish_reason = beam_meta_info.get("finish_reason")
             sequence_score = beam_meta_info.get("sequence_score")
+            routed_experts = process_routed_experts_from_ret(beam_result, request)
 
             # Handle tool calls
             tool_calls = None
@@ -322,6 +325,14 @@ class OpenAIBeamSearchMixin:
                 if tool_calls:
                     history_tool_calls_cnt += len(tool_calls)
 
+            # Build sgl_ext if any extension field is present
+            sgl_ext = None
+            if sequence_score is not None or routed_experts is not None:
+                sgl_ext = SglExt(
+                    sequence_score=sequence_score,
+                    routed_experts=routed_experts,
+                )
+
             choice_data = ChatCompletionResponseChoice(
                 index=start_index + beam_idx,
                 message=ChatMessage(
@@ -334,7 +345,7 @@ class OpenAIBeamSearchMixin:
                 finish_reason=(finish_reason["type"] if finish_reason else "stop"),
                 matched_stop=(finish_reason.get("matched") if finish_reason else None),
                 hidden_states=None,
-                sequence_score=sequence_score,
+                sgl_ext=sgl_ext,
             )
             choices.append(choice_data)
 
@@ -425,7 +436,7 @@ class OpenAIBeamSearchMixin:
                 logprobs=choice.logprobs,
                 finish_reason=choice.finish_reason,
                 matched_stop=choice.matched_stop,
-                sequence_score=choice.sequence_score,
+                sgl_ext=choice.sgl_ext,
             )
             chunk = CompletionStreamResponse(
                 id=request_id,
@@ -512,6 +523,15 @@ class OpenAIBeamSearchMixin:
             beam_meta_info = beam_result.get("meta_info", {})
             finish_reason = beam_meta_info.get("finish_reason")
             sequence_score = beam_meta_info.get("sequence_score")
+            routed_experts = process_routed_experts_from_ret(beam_result, request)
+
+            # Build sgl_ext if any extension field is present
+            sgl_ext = None
+            if sequence_score is not None or routed_experts is not None:
+                sgl_ext = SglExt(
+                    sequence_score=sequence_score,
+                    routed_experts=routed_experts,
+                )
 
             choice_data = CompletionResponseChoice(
                 index=start_index + beam_idx,
@@ -520,7 +540,7 @@ class OpenAIBeamSearchMixin:
                 finish_reason=(finish_reason["type"] if finish_reason else "stop"),
                 matched_stop=(finish_reason.get("matched") if finish_reason else None),
                 hidden_states=None,
-                sequence_score=sequence_score,
+                sgl_ext=sgl_ext,
             )
             choices.append(choice_data)
 
