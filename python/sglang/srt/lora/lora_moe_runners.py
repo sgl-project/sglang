@@ -305,7 +305,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
-
         # output shape: [M, hidden_dim] and in original token order since we do not pass in c_sorted=True. If we
         # want to get the output in sorted order by expert, we can pass in c_sorted=True. We use  no_combine=False because the next
         # LoRA computation requires input to be [M, hidden_dim]
@@ -340,7 +339,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             block_shape=block_shape,
         )
 
-         # ============================================================
+        # ============================================================
         # Stage 3.5: Add LoRA down delta BEFORE final reduction
         # ============================================================
         # intermediate_cache2 is in the original token order and token-major order.
@@ -354,7 +353,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         )
 
         # we still need to combine the output
-
 
         # ============================================================
         # Stage 4: Final reduction (sum across top_k)
@@ -429,16 +427,13 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # Output shape: [M, top_k, gate_up_dim]
         # Hidden_states shape: [M, hidden_dim] (handles token duplication internally)
 
-        num_tokens_post_padded_formatted = torch.tensor([num_dispatched], dtype=torch.int32, device=hidden_states.device)
+        num_tokens_post_padded_formatted = torch.tensor(
+            [num_dispatched], dtype=torch.int32, device=hidden_states.device
+        )
         actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
 
-        # Handle multi-LoRA: stack weights for all loaded LoRAs
-        # lora_info.gate_up_lora_a_weights shape: [num_loras, num_experts, max_rank, hidden_dim]
-        # Note: LoRA scaling factors (lora_info.lora_scalings) are already applied to weights during loading
-        max_loras = len(lora_info.lora_ranks)
-
-        lora_a_stacked = [lora_info.gate_up_lora_a_weights[i] for i in range(max_loras)]
-        lora_b_stacked = [lora_info.gate_up_lora_b_weights[i] for i in range(max_loras)]
+        lora_a_stacked = [lora_info.gate_up_lora_a_weights]
+        lora_b_stacked = [lora_info.gate_up_lora_b_weights]
 
         fused_moe_lora(
             output=intermediate_cache,
@@ -469,8 +464,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             expand_split_k=1,
         )
 
-
-
     def _add_lora_down_delta(
         self,
         intermediate_input: torch.Tensor,  # [M * top_k, intermediate_dim]
@@ -495,7 +488,9 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         # Data format adaptation for vLLM kernel
         num_dispatched_down = lora_info.token_ids.shape[0]
-        num_tokens_post_padded_formatted = torch.tensor([num_dispatched_down], dtype=torch.int32, device=intermediate_input.device)
+        num_tokens_post_padded_formatted = torch.tensor(
+            [num_dispatched_down], dtype=torch.int32, device=intermediate_input.device
+        )
         actual_max_lora_rank = int(lora_info.lora_ranks.max().item())
 
         # Handle multi-LoRA: stack weights for all loaded LoRAs
@@ -504,11 +499,15 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         max_loras = len(lora_info.lora_ranks)
 
         # Validate weight dimensions match expectations
-        assert lora_info.down_lora_a_weights.shape[0] == max_loras, f"Expected {max_loras} LoRAs, got {lora_info.down_lora_a_weights.shape[0]}"
-        assert lora_info.adapter_enabled.shape[0] >= max_loras, f"adapter_enabled too small: {lora_info.adapter_enabled.shape[0]} < {max_loras}"
+        assert (
+            lora_info.down_lora_a_weights.shape[0] == max_loras
+        ), f"Expected {max_loras} LoRAs, got {lora_info.down_lora_a_weights.shape[0]}"
+        assert (
+            lora_info.adapter_enabled.shape[0] >= max_loras
+        ), f"adapter_enabled too small: {lora_info.adapter_enabled.shape[0]} < {max_loras}"
 
-        lora_a_stacked = [lora_info.down_lora_a_weights[i] for i in range(max_loras)]
-        lora_b_stacked = [lora_info.down_lora_b_weights[i] for i in range(max_loras)]
+        lora_a_stacked = [lora_info.down_lora_a_weights]
+        lora_b_stacked = [lora_info.down_lora_b_weights]
 
         fused_moe_lora(
             output=intermediate_cache,
@@ -538,5 +537,3 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             expand_num_stages=2,
             expand_split_k=1,
         )
-    
-
