@@ -758,8 +758,6 @@ class Glm4vForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if "model.visual." in name:
                 name = name.replace("model.visual.", "visual.")
-            if name.startswith("lm_head.") and not self.pp_group.is_last_rank:
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

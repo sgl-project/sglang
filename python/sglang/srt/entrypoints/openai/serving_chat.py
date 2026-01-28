@@ -917,6 +917,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model_type=reasoning_parser,
                         stream_reasoning=False,
                         force_reasoning=is_force_reasoning,
+                        request=request,
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1166,6 +1167,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
+                request,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
