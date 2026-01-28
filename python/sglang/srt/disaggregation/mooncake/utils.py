@@ -18,12 +18,14 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+import os
+
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
-SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX"]
+SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NVLINK"]
 
 
 def init_mooncake_custom_mem_pool(
@@ -46,53 +48,48 @@ def init_mooncake_custom_mem_pool(
 
     if enable_custom_mem_pool:
         try:
+            # TODO(shangming): abstract custom allocator class for more backends
             if custom_mem_pool_type == "NVLINK":
-                from mooncake.allocator import NVLinkAllocator, MemoryBackend
-                mem_backend = NVLinkAllocator.detect_mem_backend()
-                if mem_backend == MemoryBackend.USE_CUMEMCREATE:
-                    logger.info("I support fabric mem, using NVLink memory pool")
-                    allocator = NVLinkAllocator.get_allocator(device)
-                    custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-                    logger.debug(
-                        f"Initialized NVLink memory pool on device {device}"
-                    )
-                    return True, custom_mem_pool, custom_mem_pool_type
-                elif mem_backend == MemoryBackend.USE_CUDAMALLOC:
-                    logger.info("Fabric memory not supported, falling back to default cudaMalloc")
-                    return False, None, None
-                else:
-                    logger.info("Memory Backend Unknown or UnSupported")
-                    return False, None, None
+                from mooncake.allocator import NVLinkAllocator
 
+                allocator = NVLinkAllocator.get_allocator(device)
             elif custom_mem_pool_type == "BAREX":
                 from mooncake.allocator import BarexAllocator
-                allocator = BarexAllocator.get_allocator(device)
-                custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
-                logger.debug(
-                    f"Initialized BAREX memory pool on device {device}"
-                )
-                return True, custom_mem_pool, custom_mem_pool_type
 
+                allocator = BarexAllocator.get_allocator(device)
+            elif custom_mem_pool_type == "INTRA_NVLINK":
+                logger.info("custom_mem_pool_type = INTRA_NVLINK")
+                return False, None, None
             else:
+                # This should not happen due to the enable_custom_mem_pool check above
                 raise ValueError(
                     f"Unsupported custom mem pool type: {custom_mem_pool_type}"
                 )
 
+            custom_mem_pool = torch.cuda.MemPool(allocator.allocator())
+            logger.debug(
+                f"Initialized custom memory pool: {custom_mem_pool_type} on device {device}"
+            )
         except ImportError as e:
             logger.warning(
                 f"Failed to import mooncake allocator for {custom_mem_pool_type}: {e}. "
                 f"Falling back to default memory pool."
             )
-            return False, None, None
-
+            enable_custom_mem_pool = False
+            custom_mem_pool = None
+            custom_mem_pool_type = None
         except Exception as e:
             logger.error(
                 f"Failed to initialize custom memory pool {custom_mem_pool_type}: {e}. "
                 f"Falling back to default memory pool."
             )
-            return False, None, None
+            enable_custom_mem_pool = False
+            custom_mem_pool = None
+            custom_mem_pool_type = None
     else:
         return False, None, None
+
+    return enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type
 
 
 
@@ -107,8 +104,10 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
 
     if custom_mem_pool_type is not None:
         # Handle boolean True as NVLINK
-        if custom_mem_pool_type.lower() == "true":
+        if custom_mem_pool_type.lower() == "true" and not os.getenv("MC_INTRANODE_NVLINK"):
             custom_mem_pool_type = "NVLINK"
+        if custom_mem_pool_type.lower() == "true" and os.getenv("MC_INTRANODE_NVLINK"):
+            custom_mem_pool_type = "INTRA_NVLINK"
         enable_custom_mem_pool = (
             custom_mem_pool_type in SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES
         )
