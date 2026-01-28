@@ -4,6 +4,7 @@ import enum
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import ceil_align
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1794,46 +1795,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False
 
-    def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
+    def new_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ):
         page_size = self.token_to_kv_pool_allocator.page_size
         requests = (
             self.reqs
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        if page_size == 1:
-            return len(requests)
 
-        if not self.spec_algorithm.is_none():
-            # A loose bound that err towards safety
-            server_args = get_global_server_args()
-            thresh = server_args.speculative_num_draft_tokens + (
-                (server_args.speculative_eagle_topk or 1)
-                * (server_args.speculative_num_steps or 1)
-            )
-            return sum(
-                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
-            )
+        if self.spec_algorithm.is_none():
+            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            return new_pages * page_size
 
-        # In the decoding phase, the length of a request's KV cache should be
-        # the total length of the request minus 1
-        return (
-            sum(1 for req in requests if req.seqlen % page_size == 0)
-            if self.enable_overlap
-            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
-        )
+        server_args = get_global_server_args()
+        len_per_topk = server_args.speculative_num_steps or 1
+        spec_topk = server_args.speculative_eagle_topk or 1
+        spec_tokens = server_args.speculative_num_draft_tokens
 
-    def check_decode_mem(
-        self, buf_multiplier=1, selected_indices: Optional[List[int]] = None
-    ):
-        num_tokens = (
-            self.new_page_count_next_decode(selected_indices)
-            * buf_multiplier
-            * self.token_to_kv_pool_allocator.page_size
-        )
+        if page_size > 1 and spec_topk > 1:
+            # last partial page and ceil alignment
+            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
+        elif page_size > 1:
+            # only page alignment
+            len_per_topk = ceil_align(len_per_topk, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
 
+        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+
+        # v2 eagle has over-allocation
+        return num_tokens * (1 + self.is_spec_v2)
+
+    def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self._is_available_size_sufficient(num_tokens)
+        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -1844,9 +1842,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs
 
     def retract_decode(
-        self,
-        server_args: ServerArgs,
-        buf_multiplier: int = 1,
+        self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1868,9 +1864,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(
-                selected_indices=sorted_indices, buf_multiplier=buf_multiplier
-            )
+            not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
@@ -1884,7 +1878,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.release_req(idx, len(sorted_indices), server_args)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+            selected_indices=sorted_indices
         ):
             # Retracting loops ends and still not enough memory
             raise ValueError(
@@ -2319,15 +2313,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
-
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid_swa:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def __str__(self):
         return (
