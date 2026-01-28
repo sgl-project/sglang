@@ -76,7 +76,7 @@ class LoRAManager:
         self.lora_added_tokens_size: Optional[int] = None
 
         # Track which LoRA adapters are enabled (loaded/available)
-        self.adapter_enabled = torch.zeros(max_loras_per_batch + 1, dtype=torch.int32, device=self.device)
+git         self.adapter_enabled = torch.zeros(int(self.max_loras_per_batch) + 1, dtype=torch.int32, device=self.device)
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -146,7 +146,7 @@ class LoRAManager:
             self.num_pinned_loras += int(lora_ref.pinned)
 
             # Mark this adapter as enabled
-            self.adapter_enabled[lora_ref.lora_id] = 1
+            self.adapter_enabled[int(lora_ref.lora_id)] = 1
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
@@ -210,7 +210,7 @@ class LoRAManager:
             self.num_pinned_loras -= int(lora_ref.pinned)
 
             # Mark this adapter as disabled
-            self.adapter_enabled[lora_ref.lora_id] = 0
+            self.adapter_enabled[int(lora_ref.lora_id)] = 0
         except Exception as e:
             return self.create_lora_update_result(
                 success=False,
