@@ -13,7 +13,7 @@ from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -23,13 +23,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
 __all__ = ["NPUCompressedTensorsW8A8Int8DynamicMoE"]
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _use_aiter:
-    pass
-
 
 logger = logging.getLogger(__name__)
 
