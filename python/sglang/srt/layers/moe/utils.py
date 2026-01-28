@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
     ASCEND_FUSEEP = "ascend_fuseep"
+    FLASHINFER = "flashinfer"
 
     @classmethod
     def _missing_(cls, value):
@@ -42,6 +43,9 @@ class MoeA2ABackend(Enum):
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
+
+    def is_flashinfer(self):
+        return self == MoeA2ABackend.FLASHINFER
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
@@ -266,6 +270,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     return (
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+        and get_moe_a2a_backend().is_none()
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
