@@ -58,7 +58,7 @@ def init_mooncake_custom_mem_pool(
 
                 allocator = BarexAllocator.get_allocator(device)
             elif custom_mem_pool_type == "INTRA_NVLINK":
-                logger.info("custom_mem_pool_type = INTRA_NVLINK")
+                logger.info("custom pool intra-nvlink")
                 return False, None, None
             else:
                 # This should not happen due to the enable_custom_mem_pool check above
@@ -104,10 +104,8 @@ def check_mooncake_custom_mem_pool_enabled() -> Tuple[bool, Optional[str]]:
 
     if custom_mem_pool_type is not None:
         # Handle boolean True as NVLINK
-        if custom_mem_pool_type.lower() == "true" and not os.getenv("MC_INTRANODE_NVLINK"):
+        if custom_mem_pool_type.lower() == "true":
             custom_mem_pool_type = "NVLINK"
-        if custom_mem_pool_type.lower() == "true" and os.getenv("MC_INTRANODE_NVLINK"):
-            custom_mem_pool_type = "INTRA_NVLINK"
         enable_custom_mem_pool = (
             custom_mem_pool_type in SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES
         )
