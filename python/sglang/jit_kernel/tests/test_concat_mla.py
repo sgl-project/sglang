@@ -45,7 +45,8 @@ def sgl_kernel_concat_mla_absorb_q(
     """AOT compiled sgl_kernel implementation."""
     from sgl_kernel import concat_mla_absorb_q
 
-    concat_mla_absorb_q(a, b, out)
+    result = concat_mla_absorb_q(a, b)  # AOT returns output
+    out.copy_(result)  # Copy to provided tensor for comparison
 
 
 def jit_concat_mla_k(
@@ -60,10 +61,11 @@ def jit_concat_mla_k(
 def jit_concat_mla_absorb_q(
     a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
 ) -> None:
-    """JIT compiled implementation."""
+    """JIT compiled implementation - wrapper for test compatibility."""
     from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
 
-    concat_mla_absorb_q(a, b, out)
+    result = concat_mla_absorb_q(a, b)
+    out.copy_(result)
 
 
 # Constants matching the kernel

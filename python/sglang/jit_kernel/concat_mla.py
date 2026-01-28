@@ -67,16 +67,22 @@ def concat_mla_k(k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor) ->
     module.concat_mla_k(k, k_nope, k_rope)
 
 
-def concat_mla_absorb_q(
-    a: torch.Tensor, b: torch.Tensor, out: torch.Tensor
-) -> None:
+def concat_mla_absorb_q(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """
-    Concatenate tensors a and b into out for MLA absorbed Q computation.
+    Concatenate tensors a and b for MLA absorbed Q computation.
 
     Args:
-        a: Input tensor of shape [dim_0, dim_1, 512], dtype=bfloat16
-        b: Input tensor of shape [dim_0, dim_1, 64], dtype=bfloat16
-        out: Output tensor of shape [dim_0, dim_1, 576], dtype=bfloat16
+        a: Input tensor of shape [dim_0, dim_1, a_last_dim], dtype=bfloat16
+        b: Input tensor of shape [dim_0, dim_1, b_last_dim], dtype=bfloat16
+
+    Returns:
+        Output tensor of shape [dim_0, dim_1, a_last_dim + b_last_dim], dtype=bfloat16
     """
+    out = torch.empty(
+        (*a.shape[:-1], a.shape[-1] + b.shape[-1]),
+        dtype=a.dtype,
+        device=a.device,
+    )
     module = _jit_concat_mla_absorb_q_module()
     module.concat_mla_absorb_q(a, b, out)
+    return out
