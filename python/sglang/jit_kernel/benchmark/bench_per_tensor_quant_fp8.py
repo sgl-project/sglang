@@ -1,10 +1,10 @@
-import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.testing
 
+from sglang.jit_kernel.benchmark.utils import is_in_ci
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 
 try:
@@ -22,10 +22,7 @@ try:
 except ImportError:
     _is_hip = False
 
-IS_CI = (
-    os.getenv("CI", "false").lower() == "true"
-    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
-)
+IS_CI = is_in_ci()
 
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 

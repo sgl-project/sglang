@@ -40,6 +40,7 @@ class AccuracyTestResult:
     baseline_accuracy: float
     error: Optional[str]
     latency: Optional[float] = None
+    variant: Optional[str] = None
 
 
 def write_accuracy_github_summary(
@@ -54,16 +55,18 @@ def write_accuracy_github_summary(
         dataset: Dataset name used for evaluation
         results: List of AccuracyTestResult objects
     """
-    summary = f"## {test_name} - Accuracy ({dataset})\n"
-    summary += "| model | status | score | baseline | error |\n"
-    summary += "| ----- | ------ | ----- | -------- | ----- |\n"
+    summary = f"#### {test_name} - Accuracy ({dataset})\n"
+    summary += "| config | status | score | baseline | error |\n"
+    summary += "| ------ | ------ | ----- | -------- | ----- |\n"
 
     for result in results:
         status_emoji = "✅" if result.passed else "❌"
         score_str = f"{result.score:.4f}" if result.score is not None else "N/A"
         baseline_str = f"{result.baseline_accuracy:.4f}"
         error_str = result.error if result.error else "-"
-        summary += f"| {result.model} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
+        # Use variant name if available, otherwise use model path
+        config_name = result.variant if result.variant else result.model
+        summary += f"| {config_name} | {status_emoji} | {score_str} | {baseline_str} | {error_str} |\n"
 
     write_github_step_summary(summary)
 
@@ -239,6 +242,7 @@ def run_accuracy_test(
             score=None,
             baseline_accuracy=params.baseline_accuracy,
             error=error,
+            variant=model.variant,
         )
 
     # Validate against baseline
@@ -265,4 +269,5 @@ def run_accuracy_test(
         baseline_accuracy=params.baseline_accuracy,
         error=error if not passed else None,
         latency=latency,
+        variant=model.variant,
     )

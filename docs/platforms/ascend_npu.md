@@ -7,10 +7,10 @@ You can install SGLang using any of the methods below. Please go through `System
 | Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
 |-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | HDK               | 25.3.RC1                  | [link](https://hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
-| CANN              | 8.3.rc2                 | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
+| CANN              | 8.5.0                     | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
 | Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
-| MemFabric         | 1.0.3                   | `pip install memfabric-hybrid==1.0.3`                                                                                                                                                                 |
-| Triton            | 3.2.0.dev2025112116     | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/triton_ascend-3.2.0.dev2025112116-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl)                                           |
+| MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
+| Triton            | 3.2.0                   | `pip install triton-ascend`|
 | Bisheng           | 20251121                | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/Ascend-BiSheng-toolkit_aarch64_20251121.run)                                                                                               |
 | SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
 
@@ -19,9 +19,9 @@ You can install SGLang using any of the methods below. Please go through `System
 You can obtain the dependency of a specified version of CANN through an image.
 ```shell
 # for Atlas 800I A3 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
 # for Atlas 800I A2 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Preparing the Running Environment
@@ -46,7 +46,7 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 If you want to use PD disaggregation mode, you need to install MemFabric-Hybrid. MemFabric-Hybrid is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-pip install memfabric-hybrid==1.0.3
+pip install memfabric-hybrid==1.0.5
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
@@ -71,7 +71,7 @@ BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton
 wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
 ```
 ```shell
-pip install -i https://test.pypi.org/simple/ "triton-ascend<3.2.0rc" --pre --no-cache-dir
+pip install triton-ascend
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
@@ -100,8 +100,8 @@ pip install ./custom_ops-2.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 # Use the last release branch
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
-mv python/pyproject_other.toml python/pyproject.toml
-pip install -e python[srt_npu]
+mv python/pyproject_npu.toml python/pyproject.toml
+pip install -e python[all_npu]
 ```
 
 ### Method 2: Using Docker Image

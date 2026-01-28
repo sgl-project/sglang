@@ -278,8 +278,8 @@ def _handle_output_by_index(output, i):
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
-            output_routed_experts=_extract_field_by_index(
-                output, "output_routed_experts", i, check_length=False
+            routed_experts=_extract_field_by_index(
+                output, "routed_experts", i, check_length=False
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False

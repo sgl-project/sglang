@@ -31,6 +31,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
             results,
             pydantic_result_filename=bench_args.pydantic_result_filename,
             model_path=server_args.model_path,
+            server_args=bench_args.server_args_for_metrics,
         )
 
     return results, server_info

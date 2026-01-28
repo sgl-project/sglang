@@ -7,6 +7,67 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+class NixlBackendConfig:
+    """Handles NIXL backend configurations"""
+
+    def __init__(self, config: Optional[dict[str, str]] = None):
+        """Initialize backend configuration.
+        Args:
+            config: configurations in a dictionary. This config comes from --hicache-storage-backend-extra-config
+
+            config can be in two forms:
+            1. fully qualified form (for all plugins, some of them are enabled, others not):
+                {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
+            2. flat form (for a specific selected plugin), assuming all params apply to a selected plugin
+                {'param1': 'value1', 'param2': 'value2', ...}
+        """
+        self.config = config or {}
+
+    def get_specified_plugin(self) -> str:
+        """decide which plugin to use: either config or SGLANG_HICACHE_NIXL_BACKEND_PLUGIN specifies the plugin, if not, use "auto" """
+
+        if "plugin" in self.config:
+            # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
+            # choose the FIRST active plugin
+            for key, item in self.config["plugin"].items():
+                if item.get("active", False) in [True, "true", "True"]:
+                    plugin = key.upper()
+                    break
+        else:
+            # config is empty, or in flat form {'param1': 'value1', 'param2': 'value2', ...}
+            plugin = os.getenv("SGLANG_HICACHE_NIXL_BACKEND_PLUGIN", "auto")
+
+        return plugin
+
+    def get_backend_initparams(self, backend_name) -> dict:
+        """Get initialization parameters from config of NIXL backend for backend creation.
+        Args:
+            backend_name: a specific backend's name (already converted "auto" into a specific backend name)
+
+        """
+
+        initparams = {}
+
+        # config can be in two forms:
+        if "plugin" in self.config:
+            # fully qualified form: {'plugin': { 'posix': {...}, 'gds': {...}, ...}}
+            if backend_name.lower() in self.config["plugin"]:
+                config_data = self.config["plugin"][backend_name.lower()]
+            else:
+                logger.debug(
+                    f"No specific config found for plugin {backend_name} in extra_config. Use default init params."
+                )
+                config_data = {}
+        else:
+            # flat form {'param1': 'value1', 'param2': 'value2', ...}
+            config_data = self.config
+
+        for key, value in config_data.items():
+            initparams[key] = value
+
+        return initparams
+
+
 class NixlBackendSelection:
     """Handles NIXL backend selection and creation."""
 
@@ -15,7 +76,9 @@ class NixlBackendSelection:
     # Priority order for File-based plugins in case of auto selection (add more as needed)
     OBJ_PLUGINS = ["OBJ"]  # Based on Amazon S3 SDK
 
-    def __init__(self, plugin: str = "auto"):
+    def __init__(
+        self, plugin: str = "auto", nixlconfig: Optional[NixlBackendConfig] = None
+    ):
         """Initialize backend selection.
         Args:
             plugin: Plugin to use (default "auto" selects best available).
@@ -25,6 +88,7 @@ class NixlBackendSelection:
         self.plugin = plugin
         self.backend_name = None
         self.mem_type = None
+        self.nixlconfig = nixlconfig
 
     def set_bucket(self, bucket_name: str) -> None:
         """Set AWS bucket name in environment variable."""
@@ -60,17 +124,30 @@ class NixlBackendSelection:
                 )
                 return False
 
+            # obtain initparams for the backend from the NIXL config
+            initparams = (
+                self.nixlconfig.get_backend_initparams(self.backend_name)
+                if self.nixlconfig
+                else {}
+            )
+
             # Create backend and set memory type
-            if self.backend_name in self.OBJ_PLUGINS:
+            if self.backend_name in self.OBJ_PLUGINS and "bucket" not in initparams:
                 bucket = os.environ.get("AWS_DEFAULT_BUCKET")
                 if not bucket:
                     logger.error(
                         "AWS_DEFAULT_BUCKET environment variable must be set for object storage"
                     )
                     return False
-                agent.create_backend(self.backend_name, {"bucket": bucket})
-            else:
-                agent.create_backend(self.backend_name)
+
+                initparams["bucket"] = bucket
+
+            # create backend using initialization parameters
+            agent.create_backend(self.backend_name, initparams)
+
+            logger.info(
+                f"NixlBackendSelection.create_backend: backend_name {self.backend_name} initparams {initparams} customParams {agent.get_backend_params(self.backend_name)} supported plugins {plugin_list}"
+            )
 
             self.mem_type = "OBJ" if self.backend_name in self.OBJ_PLUGINS else "FILE"
             logger.debug(
@@ -79,7 +156,9 @@ class NixlBackendSelection:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to create NIXL backend: {e}")
+            logger.error(
+                f"Failed to create NIXL backend: {e}, backend_name {self.backend_name}, supported plugins {plugin_list} initparams {initparams}"
+            )
             return False
 
 

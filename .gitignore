@@ -266,3 +266,17 @@ python/sglang/_version.py
 python/sglang/srt/grpc/*_pb2.py
 python/sglang/srt/grpc/*_pb2_grpc.py
 python/sglang/srt/grpc/*_pb2.pyi
+
+# MUSA section
+# Generated source files by torchada
+sgl-kernel/csrc_musa/
+sgl-kernel/include_musa/
+sgl-kernel/csrc/**/*_musa/
+sgl-kernel/third_party/*/csrc_musa/
+sgl-kernel/third_party/*/include_musa/
+
+# Third-party libraries source code
+sgl-kernel/third_party/
+
+# MUSA core dump files
+core_*

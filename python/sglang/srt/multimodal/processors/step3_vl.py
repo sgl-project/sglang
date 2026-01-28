@@ -11,6 +11,7 @@ from torchvision.transforms import InterpolationMode
 from transformers import BatchFeature, ProcessorMixin, TensorType
 
 from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
+from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -469,16 +470,17 @@ class Step3VLProcessor:
 
 
 class Step3VLImageProcessor(SGLangBaseProcessor):
-    models = [Step3VLForConditionalGeneration]
+    models = [Step3VLForConditionalGeneration, StepVLForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # TODO, check _processor is tokenizer or processor.
         processor = Step3VLProcessor(hf_config, _processor)
         super().__init__(hf_config, server_args, processor, *args, **kwargs)
-        self.IM_TOKEN_ID = 128001
+        self.IM_TOKEN = "<im_patch>"
+        self.IM_TOKEN_ID = self._processor.tokenizer.get_vocab()[self.IM_TOKEN]
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<im_patch>",
-            image_token_id=128001,
+            image_token=self.IM_TOKEN,
+            image_token_id=self.IM_TOKEN_ID,
             image_token_regex=re.compile(r"(?:<im_patch>)"),
         ).build(_processor)
 

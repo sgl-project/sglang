@@ -13,12 +13,16 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_capability,
-    is_blackwell,
+    is_blackwell_supported,
     is_cuda,
     is_hip,
     is_npu,
@@ -400,6 +404,58 @@ class VisionFlash3Attention(nn.Module):
         return output
 
 
+class VisionFlash4Attention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("VisionFlash4Attention is only available for cuda")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            ver=4,
+        )
+
+        return output
+
+
 class VisionAiterAttention(nn.Module):
     def __init__(
         self,
@@ -499,6 +555,7 @@ QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
+    "fa4": VisionFlash4Attention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
 }
@@ -533,6 +590,7 @@ class VisionAttention(nn.Module):
         num_dummy_heads: int = 0,
         qkv_bias: bool = True,
         qk_normalization: bool = False,
+        qk_normalization_by_head_size: bool = False,
         layer_norm_eps: float = 1e-06,
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
@@ -560,30 +618,19 @@ class VisionAttention(nn.Module):
         self.kv_size = self.num_attention_kv_heads_per_partition * self.head_size
 
         self.qk_normalization = qk_normalization
+        self.qk_normalization_by_head_size = qk_normalization_by_head_size
 
         # Additional dummy heads are used to enable TP for common GPU counts.
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
-            norm_kwargs = (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
+            self.q_norm, self.k_norm = self._init_qk_norm(
+                self.dummy_dim, layer_norm_eps, embed_dim
             )
-            self.q_norm = RMSNorm(
-                self.dummy_dim,
-                eps=layer_norm_eps,
-                var_hidden_size=embed_dim,
-                **norm_kwargs,
-            )
-            self.k_norm = RMSNorm(
-                self.dummy_dim,
-                eps=layer_norm_eps,
-                var_hidden_size=embed_dim,
-                **norm_kwargs,
+
+        elif self.qk_normalization_by_head_size:
+            self.q_norm, self.k_norm = self._init_qk_norm(
+                self.head_size, layer_norm_eps
             )
 
         # Select attention backend via a unified method
@@ -639,10 +686,36 @@ class VisionAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
+            reduce_results=False,
             prefix=add_prefix("proj", prefix),
         )
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []
+
+    def _init_qk_norm(
+        self, norm_dim: int, eps: float, var_hidden_size: Optional[int] = None
+    ):
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        q_norm = RMSNorm(
+            norm_dim,
+            eps=eps,
+            var_hidden_size=var_hidden_size,
+            **norm_kwargs,
+        )
+        k_norm = RMSNorm(
+            norm_dim,
+            eps=eps,
+            var_hidden_size=var_hidden_size,
+            **norm_kwargs,
+        )
+        return q_norm, k_norm
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
         """Decide the multimodal attention backend string.
@@ -671,10 +744,20 @@ class VisionAttention(nn.Module):
                 backend = "triton_attn"
         else:
             backend = "sdpa"
-        if backend == "fa3" and is_blackwell():
+        if backend == "fa3" and is_blackwell_supported():
             raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
 
         return backend
+
+    def _apply_qk_norm_head_size(self, q: torch.Tensor, k: torch.Tensor):
+        """apply qk norm for GLM-OCR vit attn"""
+        q_by_head = q.reshape(-1, self.head_size)
+        q_by_head = self.q_norm(q_by_head)
+        k_by_head = k.reshape(-1, self.head_size)
+        k_by_head = self.k_norm(k_by_head)
+        q = q_by_head.view(q.shape)
+        k = k_by_head.view(k.shape)
+        return q, k
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
@@ -758,6 +841,8 @@ class VisionAttention(nn.Module):
             q = q.reshape(bsz * s, head, -1).contiguous()
             k = k.reshape(bsz * s, kv_head, -1).contiguous()
             v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            if self.qk_normalization_by_head_size:
+                q, k = self._apply_qk_norm_head_size(q, k)
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -778,6 +863,9 @@ class VisionAttention(nn.Module):
             q, k, v = [
                 rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
             ]
+
+            if self.qk_normalization_by_head_size:
+                q, k = self._apply_qk_norm_head_size(q, k)
 
         cos = None
         sin = None
@@ -823,7 +911,7 @@ class VisionAttention(nn.Module):
         assert v.dim() == 3, v.dim()
 
         # internvl
-        if self.qk_normalization:
+        if self.qk_normalization and not self.qk_normalization_by_head_size:
             # jit kernel
             if can_use_jit_qk_norm(self.head_size, q.dtype):
 
@@ -861,6 +949,8 @@ class VisionAttention(nn.Module):
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)
+            if self.tp_size > 1:
+                output = get_attention_tp_group().all_reduce(output)
         else:
             # [b * s, h, head_size] --> [s, b, h * head_size]
             context_layer = rearrange(
@@ -869,6 +959,8 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [s, b, h * head_size]
             output, _ = self.proj(context_layer)
+            if self.tp_size > 1:
+                output = get_attention_tp_group().all_reduce(output)
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)

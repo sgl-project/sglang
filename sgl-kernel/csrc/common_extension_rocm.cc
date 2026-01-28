@@ -231,6 +231,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "float scale,"
       "int max_period) -> Tensor");
   m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
+
+  /*
+   * From csrc/memory
+   */
+  m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
+  m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 }
 
 REGISTER_EXTENSION(common_ops)

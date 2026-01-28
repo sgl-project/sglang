@@ -69,7 +69,7 @@ class TestDeepseekV32CPSingleNode(unittest.TestCase):
             ModelLaunchSettings(
                 DEEPSEEK_V32_EXP_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + ["--tp=8"] + MTP_ARGS + CP_ROUND_ROBIN_ARGS,
+                extra_args=BASE_ARGS + MTP_ARGS + CP_ROUND_ROBIN_ARGS,
                 variant="CP-round-robin-split",
             ),
         ]

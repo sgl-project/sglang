@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942', 'gfx942-rocm700', 'gfx950']
+        gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -58,8 +58,6 @@ jobs:
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-            rocm_tag="rocm630-mi30x"
-          elif [ "${{ matrix.gpu_arch }}" = "gfx942-rocm700" ]; then
             rocm_tag="rocm700-mi30x"
           elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
             rocm_tag="rocm700-mi35x"
@@ -83,7 +81,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942', 'gfx942-rocm700']
+        gpu_arch: ['gfx942']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -123,8 +121,6 @@ jobs:
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-            rocm_tag="rocm630-mi30x"
-          elif [ "${{ matrix.gpu_arch }}" = "gfx942-rocm700" ]; then
             rocm_tag="rocm700-mi30x"
           else
             echo "Unsupported gfx arch"
@@ -143,9 +139,7 @@ jobs:
           image="rocm/sgl-dev:${tag}-${{ env.DATE }}${tag_suffix}"
 
           # Determine target cache file name based on ROCm variant
-          if [[ "${rocm_tag}" == rocm630* ]]; then
-            final_path="/home/runner/sgl-data/docker/image.tar"
-          elif [[ "${rocm_tag}" == rocm700* ]]; then
+          if [[ "${rocm_tag}" == rocm700* ]]; then
             final_path="/home/runner/sgl-data/docker/image-700.tar"
           else
             echo "Unexpected ROCm tag: ${rocm_tag}"

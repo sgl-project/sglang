@@ -6,7 +6,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/ci-coverage-overview.yml'
-      - 'scripts/ci/ci_coverage_report.py'
+      - 'scripts/ci/utils/ci_coverage_report.py'
       - 'test/registered/**'
   workflow_dispatch:
     inputs:
@@ -34,7 +34,7 @@ jobs:
 
       - name: Generate Summary Report
         run: |
-          python scripts/ci/ci_coverage_report.py --section summary
+          python scripts/ci/utils/ci_coverage_report.py --section summary
 
   by-folder:
     name: Tests by Folder
@@ -50,7 +50,7 @@ jobs:
 
       - name: Generate Tests by Folder Report
         run: |
-          python scripts/ci/ci_coverage_report.py --section by-folder
+          python scripts/ci/utils/ci_coverage_report.py --section by-folder
 
   by-suite:
     name: Tests by Suite
@@ -66,7 +66,7 @@ jobs:
 
       - name: Generate Tests by Suite Report
         run: |
-          python scripts/ci/ci_coverage_report.py --section by-suite
+          python scripts/ci/utils/ci_coverage_report.py --section by-suite
 
   json-export:
     name: JSON Export
@@ -83,7 +83,7 @@ jobs:
 
       - name: Generate JSON Report
         run: |
-          python scripts/ci/ci_coverage_report.py --output-format json > ci_coverage.json
+          python scripts/ci/utils/ci_coverage_report.py --output-format json > ci_coverage.json
 
       - name: Upload JSON artifact
         uses: actions/upload-artifact@v4

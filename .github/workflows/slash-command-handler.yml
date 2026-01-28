@@ -12,13 +12,14 @@ permissions:
 
 jobs:
   slash_command:
-    # Only run if it is a PR and the comment starts with a recognized command
+    # Only run if it is a PR and the comment contains a recognized command
+    # Use contains() since startsWith() can't handle leading whitespace/newlines
     if: >
       github.event.issue.pull_request &&
-      (startsWith(github.event.comment.body, '/tag-run-ci-label') ||
-       startsWith(github.event.comment.body, '/rerun-failed-ci') ||
-       startsWith(github.event.comment.body, '/tag-and-rerun-ci') ||
-       startsWith(github.event.comment.body, '/rerun-stage'))
+      (contains(github.event.comment.body, '/tag-run-ci-label') ||
+       contains(github.event.comment.body, '/rerun-failed-ci') ||
+       contains(github.event.comment.body, '/tag-and-rerun-ci') ||
+       contains(github.event.comment.body, '/rerun-stage'))
     runs-on: ubuntu-latest
 
     steps:
@@ -74,4 +75,4 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           USER_LOGIN: ${{ github.event.comment.user.login }}
         run: |
-          python scripts/ci/slash_command_handler.py
+          python scripts/ci/utils/slash_command_handler.py

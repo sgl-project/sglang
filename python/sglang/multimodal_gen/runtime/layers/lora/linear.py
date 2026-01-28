@@ -90,6 +90,8 @@ class BaseLayerWithLoRA(nn.Module):
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
             delta = delta * self.strength
+            if delta.dim() > 2:
+                delta = delta.reshape(-1, delta.shape[-1])
             out, output_bias = self.base_layer(x)
             return out + delta, output_bias
         else:
@@ -171,6 +173,8 @@ class BaseLayerWithLoRA(nn.Module):
             if self.lora_alpha is not None and self.lora_rank is not None:
                 if self.lora_alpha != self.lora_rank:
                     lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
+            if lora_delta.dim() > 2:
+                lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
             data += lora_strength * lora_delta
 
     @torch.no_grad()
@@ -468,6 +472,8 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
             delta = delta * self.strength
+            if delta.dim() > 2:
+                delta = delta.reshape(-1, delta.shape[-1])
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             return out + delta
