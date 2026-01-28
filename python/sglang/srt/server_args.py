@@ -2204,7 +2204,7 @@ class ServerArgs:
                 )
 
         if self.speculative_algorithm == "NGRAM":
-            if not self.device.startswith("cuda"):
+            if not self.device.startswith("cuda") and not self.device.startswith("npu"):
                 raise ValueError(
                     "Ngram speculative decoding only supports CUDA device."
                 )
@@ -2230,7 +2230,7 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend != "flashinfer"
+                and self.attention_backend != "flashinfer" and self.attention_backend != "ascend"
             ):
                 raise ValueError(
                     f"speculative_eagle_topk({self.speculative_eagle_topk}) > 1 "

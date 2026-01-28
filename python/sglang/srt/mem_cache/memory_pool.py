@@ -692,8 +692,9 @@ class MHATokenToKVPool(KVCache):
         self.alt_stream = (
             self.device_module.Stream() if _is_cuda and enable_alt_stream else None
         )
+        self.enable_kv_cache_copy = enable_kv_cache_copy
 
-        if enable_kv_cache_copy:
+        if self.enable_kv_cache_copy:
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -941,6 +942,8 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if not self.enable_kv_cache_copy:
+            return
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return

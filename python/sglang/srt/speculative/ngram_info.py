@@ -33,7 +33,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, next_power_of_2, is_npu
 
 if is_cuda():
     from sgl_kernel import (
@@ -44,6 +44,8 @@ if is_cuda():
     )
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
+elif is_npu():
+    from sgl_kernel_npu.sample.verify_tree_greedy import verify_tree_greedy
 
 
 @dataclass

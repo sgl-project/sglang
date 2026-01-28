@@ -1,9 +1,17 @@
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
-from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+from sglang.srt.utils import is_npu
+_is_npu = is_npu()
+if not _is_npu:
+    from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
+else:
+    # todo replace by triton or ascend c
+    from sglang.srt.hardware_backend.npu.npu_native_ops.native_ops_npu import (
+        reconstruct_indices_from_tree_mask,
+    )
 
 from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -19,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
-
 
 class NGRAMWorker:
     def __init__(
