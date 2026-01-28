@@ -66,7 +66,7 @@ def build_pipeline(
         )
     else:
         logger.info("No pipeline_class_name specified, using model_index.json")
-        model_info = get_model_info(model_path)
+        model_info = get_model_info(model_path, backend=server_args.backend)
         pipeline_cls = model_info.pipeline_cls
         logger.info(f"Using pipeline from model_index.json: {pipeline_cls.__name__}")
 
