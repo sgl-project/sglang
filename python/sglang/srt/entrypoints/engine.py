@@ -1076,13 +1076,13 @@ def _launch_scheduler_ray_actors(
             )
             scheduler_actors.append(actor)
 
-    # Wait for all schedulers to initialize (equivalent to pipe handshake)
-    scheduler_infos = ray.get([actor.get_info.remote() for actor in scheduler_actors])
-
-    # Verify initialization
-    for i, info in enumerate(scheduler_infos):
-        if info.get("status") != "ready":
-            raise RuntimeError(f"Scheduler {i} failed to initialize: {info}")
+    # Wait for all schedulers to initialize
+    # Unlike mp mode, Ray actors are ready once __init__ completes.
+    # If initialization fails, ray.get() raises RayActorError.
+    try:
+        scheduler_infos = ray.get([actor.get_info.remote() for actor in scheduler_actors])
+    except ray.exceptions.RayActorError as e:
+        raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
 
     # Start event loops (non-blocking - returns immediately)
     # Keep refs to detect when actors terminate
