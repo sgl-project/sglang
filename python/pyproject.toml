@@ -73,6 +73,12 @@ dependencies = [
 
 [project.optional-dependencies]
 decord = ["decord"]
+
+diffusion = [
+  "accelerate",
+  "ftfy",
+]
+
 test = [
   "accelerate",
   "expecttest",
