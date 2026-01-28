@@ -21,7 +21,12 @@ from typing import Tuple
 import torch
 import triton
 import triton.testing
-from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
+from sgl_kernel.kvcacheio import (
+    transfer_kv_all_layer,
+    transfer_kv_all_layer_lf_pf,
+    transfer_kv_per_layer,
+    transfer_kv_per_layer_pf_lf,
+)
 
 from sglang.jit_kernel.benchmark.utils import (
     DEFAULT_DTYPE,
@@ -31,7 +36,9 @@ from sglang.jit_kernel.benchmark.utils import (
 from sglang.jit_kernel.hicache import (
     can_use_hicache_jit_kernel,
     transfer_hicache_all_layer,
+    transfer_hicache_all_layer_lf_pf,
     transfer_hicache_one_layer,
+    transfer_hicache_one_layer_pf_lf,
 )
 
 
@@ -394,13 +401,317 @@ def benchmark_all_layer_d2h(
     )
 
 
+# =============================================================================
+# Page-First Layout Benchmarks
+# =============================================================================
+
+LINE_VALS_PF = ["aot", "jit", "pytorch"]
+LINE_NAMES_PF = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
+STYLES_PF = [("orange", "-"), ("blue", "--"), ("red", ":")]
+
+
+def sglang_aot_transfer_one_pf_lf(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+) -> None:
+    """SGL AOT Kernel for page_first -> layer_first single layer transfer."""
+    transfer_kv_per_layer_pf_lf(
+        k_cache_src,
+        k_cache_dst,
+        v_cache_src,
+        v_cache_dst,
+        indices_src,
+        indices_dst,
+        layer_id,
+        item_size,
+        src_layout_dim,
+    )
+
+
+def sglang_jit_transfer_one_pf_lf(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    layer_id: int,
+    element_dim: int,
+    src_layout_dim: int,
+) -> None:
+    """SGL JIT Kernel for page_first -> layer_first single layer transfer."""
+    transfer_hicache_one_layer_pf_lf(
+        k_cache_dst,
+        v_cache_dst,
+        indices_dst,
+        k_cache_src,
+        v_cache_src,
+        indices_src,
+        layer_id=layer_id,
+        src_layout_dim=src_layout_dim,
+        element_dim=element_dim,
+    )
+
+
+def sglang_aot_transfer_all_lf_pf(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptrs_src: torch.Tensor,
+    v_ptrs_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    num_layers: int,
+) -> None:
+    """SGL AOT Kernel for layer_first -> page_first all layer transfer."""
+    transfer_kv_all_layer_lf_pf(
+        k_ptrs_src,
+        k_cache_dst,
+        v_ptrs_src,
+        v_cache_dst,
+        indices_src,
+        indices_dst,
+        item_size,
+        dst_layout_dim,
+        num_layers,
+    )
+
+
+def sglang_jit_transfer_all_lf_pf(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptrs_src: torch.Tensor,
+    v_ptrs_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    stride_bytes: int,
+    dst_layout_dim: int,
+    element_size: int,
+) -> None:
+    """SGL JIT Kernel for layer_first -> page_first all layer transfer."""
+    transfer_hicache_all_layer_lf_pf(
+        k_cache_dst,
+        v_cache_dst,
+        indices_dst,
+        k_ptrs_src,
+        v_ptrs_src,
+        indices_src,
+        kv_cache_src_stride_bytes=stride_bytes,
+        dst_layout_dim=dst_layout_dim,
+        element_size=element_size,
+    )
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["element_size", "batch_size"],
+        x_vals=CONFIGS,
+        line_arg="provider",
+        line_vals=LINE_VALS_PF,
+        line_names=LINE_NAMES_PF,
+        styles=STYLES_PF,
+        ylabel="us",
+        plot_name="hicache-one-layer-pf-lf",
+        args={},
+    )
+)
+def benchmark_one_layer_pf_lf(
+    element_size: int, batch_size: int, provider: str
+) -> Tuple[float, float, float]:
+    """One Layer: Host (page_first) -> Device (layer_first)."""
+    k_cache_src = torch.randn(
+        (HOST_CACHE_SIZE, NUM_LAYERS, element_size),
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
+    )
+    v_cache_src = torch.randn(
+        (HOST_CACHE_SIZE, NUM_LAYERS, element_size),
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
+    )
+    k_cache_dst = torch.randn(
+        (GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
+    )
+    v_cache_dst = torch.randn(
+        (GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
+    )
+
+    indices_src_gpu = torch.randperm(HOST_CACHE_SIZE, device="cuda")[:batch_size]
+    indices_dst_gpu = torch.randperm(GPU_CACHE_SIZE, device="cuda")[:batch_size]
+    indices_src_cpu = indices_src_gpu.cpu()
+    torch.cuda.synchronize()
+
+    element_bytes = element_size * k_cache_src.element_size()
+    src_layout_dim = NUM_LAYERS * element_bytes
+    layer_id = 0  # benchmark for layer 0
+
+    FN_MAP = {
+        "aot": lambda: sglang_aot_transfer_one_pf_lf(
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_cache_src,
+            v_cache_src,
+            indices_src_gpu,
+            layer_id,
+            element_bytes,
+            src_layout_dim,
+        ),
+        "jit": lambda: sglang_jit_transfer_one_pf_lf(
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_cache_src,
+            v_cache_src,
+            indices_src_gpu,
+            layer_id,
+            element_size,
+            src_layout_dim,
+        ),
+        "pytorch": lambda: (
+            k_cache_dst.__setitem__(
+                indices_dst_gpu, k_cache_src[indices_src_cpu, layer_id].cuda()
+            ),
+            v_cache_dst.__setitem__(
+                indices_dst_gpu, v_cache_src[indices_src_cpu, layer_id].cuda()
+            ),
+        ),
+    }
+
+    if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
+        return (float("nan"), float("nan"), float("nan"))
+
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        FN_MAP[provider], quantiles=DEFAULT_QUANTILES
+    )
+    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["element_size", "batch_size"],
+        x_vals=CONFIGS,
+        line_arg="provider",
+        line_vals=LINE_VALS_PF,
+        line_names=LINE_NAMES_PF,
+        styles=STYLES_PF,
+        ylabel="us",
+        plot_name="hicache-all-layer-lf-pf",
+        args={},
+    )
+)
+def benchmark_all_layer_lf_pf(
+    element_size: int, batch_size: int, provider: str
+) -> Tuple[float, float, float]:
+    """All Layer: Device (layer_first) -> Host (page_first)."""
+    k_caches_src = torch.randn(
+        (NUM_LAYERS, GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
+    )
+    v_caches_src = torch.randn(
+        (NUM_LAYERS, GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
+    )
+    k_cache_dst = torch.randn(
+        (HOST_CACHE_SIZE, NUM_LAYERS, element_size),
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
+    )
+    v_cache_dst = torch.randn(
+        (HOST_CACHE_SIZE, NUM_LAYERS, element_size),
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
+    )
+
+    indices_src_gpu = torch.randperm(GPU_CACHE_SIZE, device="cuda")[:batch_size]
+    indices_dst_gpu = torch.randperm(HOST_CACHE_SIZE, device="cuda")[:batch_size]
+    indices_dst_cpu = indices_dst_gpu.cpu()
+    torch.cuda.synchronize()
+
+    element_bytes = element_size * k_caches_src.element_size()
+    dst_layout_dim = NUM_LAYERS * element_bytes
+
+    k_ptrs_src = _create_ptr_tensor([k_caches_src[i] for i in range(NUM_LAYERS)])
+    v_ptrs_src = _create_ptr_tensor([v_caches_src[i] for i in range(NUM_LAYERS)])
+
+    FN_MAP = {
+        "aot": lambda: sglang_aot_transfer_all_lf_pf(
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            dst_layout_dim,
+            NUM_LAYERS,
+        ),
+        "jit": lambda: sglang_jit_transfer_all_lf_pf(
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            dst_layout_dim,
+            element_bytes,
+        ),
+        "pytorch": lambda: [
+            (
+                k_cache_dst[indices_dst_cpu, i].__iadd__(
+                    k_caches_src[i, indices_src_gpu].cpu()
+                    - k_cache_dst[indices_dst_cpu, i]
+                ),
+                v_cache_dst[indices_dst_cpu, i].__iadd__(
+                    v_caches_src[i, indices_src_gpu].cpu()
+                    - v_cache_dst[indices_dst_cpu, i]
+                ),
+            )
+            for i in range(NUM_LAYERS)
+        ],
+    }
+
+    if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
+        return (float("nan"), float("nan"), float("nan"))
+
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        FN_MAP[provider], quantiles=DEFAULT_QUANTILES
+    )
+    return (
+        1000 * ms / NUM_LAYERS,
+        1000 * max_ms / NUM_LAYERS,
+        1000 * min_ms / NUM_LAYERS,
+    )
+
+
 if __name__ == "__main__":
     print("=" * 60)
-    print("One Layer: Host -> Device (CPU -> GPU)")
+    print("One Layer: Host -> Device (CPU -> GPU) [layer_first]")
     print("=" * 60)
     benchmark_one_layer_h2d.run(print_data=True)
 
     print("\n" + "=" * 60)
-    print("All Layer: Device -> Host (GPU -> CPU) [per-layer avg]")
+    print("All Layer: Device -> Host (GPU -> CPU) [layer_first] [per-layer avg]")
     print("=" * 60)
     benchmark_all_layer_d2h.run(print_data=True)
+
+    print("\n" + "=" * 60)
+    print("One Layer: Host (page_first) -> Device (layer_first) [per-layer avg]")
+    print("=" * 60)
+    benchmark_one_layer_pf_lf.run(print_data=True)
+
+    print("\n" + "=" * 60)
+    print("All Layer: Device (layer_first) -> Host (page_first) [per-layer avg]")
+    print("=" * 60)
+    benchmark_all_layer_lf_pf.run(print_data=True)
