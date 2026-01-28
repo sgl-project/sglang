@@ -292,6 +292,7 @@ class ServerArgs:
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+    model_offload: bool = False
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -741,6 +742,15 @@ class ServerArgs:
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
             "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
+
+        # Offload
+        parser.add_argument(
+            "--model-offload",
+            action=StoreBoolean,
+            default=ServerArgs.model_offload,
+            help="Enable model offloading to CPU to reduce GPU memory usage in diffusers backend.",
+        )
+
         return parser
 
     def url(self):

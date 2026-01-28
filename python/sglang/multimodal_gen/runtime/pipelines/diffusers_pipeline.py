@@ -548,13 +548,9 @@ class DiffusersPipeline(ComposedPipelineBase):
 
     def _apply_offload(self, pipe: Any, server_args: ServerArgs) -> None:
         """Apply model offloading strategies from pipeline config."""
-        config = server_args.pipeline_config
-        if config is None:
-            return
-
         # Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance.
         # https://huggingface.co/docs/diffusers/optimization/memory#model-offloading
-        if getattr(config, "model_offload", False):
+        if server_args.model_offload:
             if hasattr(pipe, "enable_model_cpu_offload") and hasattr(
                 pipe, "reset_device_map"
             ):
