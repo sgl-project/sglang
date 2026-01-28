@@ -12,7 +12,11 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.communicator import (
+    LayerScatterModes,
+    ScatterMode,
+    get_attn_tp_context,
+)
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.utils import get_bool_env_var
 
@@ -30,6 +34,7 @@ def forward_mha_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes: LayerScatterModes,
 ):
     if m.q_lora_rank is not None:
         q, latent_cache = (
@@ -45,6 +50,13 @@ def forward_mha_prepare_npu(
 
         if m.use_nsa:
             q_lora = m.q_a_layernorm(q)
+            if (
+                _use_ag_after_qlora
+                and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+                and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+            ):
+                q_lora = scattered_to_tp_attn_full(q_lora, forward_batch)
+                latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
             _ = m.indexer(
                 x=hidden_states,
@@ -143,7 +155,7 @@ def forward_mla_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
-    layer_scatter_modes,
+    layer_scatter_modes: LayerScatterModes,
 ):
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
@@ -308,7 +320,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
-    layer_scatter_modes,
+    layer_scatter_modes: LayerScatterModes,
 ):
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
         if not hasattr(m, "mla_preprocess"):

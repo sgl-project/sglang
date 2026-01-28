@@ -1638,7 +1638,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif attn_forward_method == AttnForwardMethod.MHA_NPU:
             inner_state = forward_mha_prepare_npu(
-                self, positions, hidden_states, forward_batch, zero_allocator
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
