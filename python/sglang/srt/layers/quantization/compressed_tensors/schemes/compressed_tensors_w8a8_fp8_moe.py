@@ -22,9 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
-        StandardCombineInput,
     )
-    from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
@@ -83,6 +81,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.float8_e4m3fn
 
@@ -317,6 +316,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsScheme):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
