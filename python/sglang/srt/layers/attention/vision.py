@@ -374,7 +374,7 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
             output = flash_attn_varlen_func(
                 q,

@@ -368,6 +368,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        
+        self.rope_compiled = False
 
     @property
     def dtype(self) -> torch.dtype:
@@ -422,14 +424,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             patch_pos_embeds_permute.append(pos_embed)
         return torch.cat(patch_pos_embeds_permute)
 
-    def forward(
+    def raw_forward(
         self,
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            return self.forward_with_cuda_graph(x, grid_thw)
-
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -475,6 +474,19 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+            if not self.rope_compiled:
+                self.raw_forward(x, grid_thw)
+                self.rope_compiled = True
+            return self.forward_with_cuda_graph(x, grid_thw)
+        else:
+            return self.raw_forward(x, grid_thw)
 
     def forward_with_cuda_graph(
         self,
