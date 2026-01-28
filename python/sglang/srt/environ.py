@@ -174,6 +174,7 @@ class Envs:
     # Constrained Decoding (Grammar)
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
+    SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # CuTe DSL GDN Decode
     SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
@@ -233,6 +234,7 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -408,6 +410,10 @@ class Envs:
     # MM splitting behavior control
     SGLANG_ENABLE_MM_SPLITTING = EnvBool(False)
 
+    # Mamba
+    SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
+    SGLANG_MAMBA_SSM_DTYPE = EnvStr("float32")
+
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
@@ -447,6 +453,9 @@ class Envs:
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+
+    # Symmetric Memory
+    SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)

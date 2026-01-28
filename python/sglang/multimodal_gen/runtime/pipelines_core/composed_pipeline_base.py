@@ -330,7 +330,7 @@ class ComposedPipelineBase(ABC):
         batch.log(server_args=server_args)
 
         # Execute each stage
-        if not batch.is_warmup:
+        if not batch.is_warmup and not batch.suppress_logs:
             logger.info(
                 "Running pipeline stages: %s",
                 list(self._stage_name_mapping.keys()),
