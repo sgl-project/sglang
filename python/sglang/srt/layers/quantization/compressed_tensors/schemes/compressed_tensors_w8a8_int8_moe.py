@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
 __all__ = ["NPUCompressedTensorsW8A8Int8DynamicMoE"]
 
@@ -68,8 +69,6 @@ class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsScheme):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         params_dtype = torch.int8
 
