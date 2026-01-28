@@ -76,7 +76,9 @@ class LoRAManager:
         self.lora_added_tokens_size: Optional[int] = None
 
         # Track which LoRA adapters are enabled (loaded/available)
-git         self.adapter_enabled = torch.zeros(int(self.max_loras_per_batch) + 1, dtype=torch.int32, device=self.device)
+        self.adapter_enabled = torch.zeros(
+            int(self.max_loras_per_batch) + 1, dtype=torch.int32, device=self.device
+        )
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
