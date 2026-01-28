@@ -53,7 +53,11 @@ def _extract_image_url(image_item: Union[str, dict, "ImageData"]) -> str:
         return image_item
     elif isinstance(image_item, dict):
         # Support both {"url": "..."} and {"image_url": "..."} formats
-        return image_item.get("url", image_item.get("image_url", ""))
+        # Support both {"url": "..."} and {"image_url": "..."} formats
+        url = image_item.get("url") or image_item.get("image_url")
+        if url:
+            return url
+        raise ValueError(f"Dictionary image data must contain 'url' or 'image_url' key: {image_item}")
     elif hasattr(image_item, "url"):
         return image_item.url
     else:
