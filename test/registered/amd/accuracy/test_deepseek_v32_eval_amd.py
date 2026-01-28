@@ -1,9 +1,9 @@
-"""AMD GROK GSM8K Completion Evaluation Test (8-GPU)
+"""AMD DeepSeek-V3.2 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests GROK models (Grok-1 FP8, Grok-1 INT4, Grok-2) using
-few-shot completion benchmark on MI300X.
+Tests DeepSeek-V3.2 with basic configuration using few-shot completion
+benchmark on MI325/MI300X.
 
-Registry: nightly-amd-8-gpu-grok suite
+Registry: nightly-amd-accuracy-8-gpu-deepseek-v32 suite
 """
 
 import ast
@@ -27,13 +27,11 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-# DISABLED: Split into individual files for each model variant
-# See: test_grok1_fp8_eval_amd.py, test_grok1_int4_eval_amd.py, test_grok2_eval_amd.py
+# Register for AMD CI - DeepSeek-V3.2 accuracy test (~60 min for basic only)
 register_amd_ci(
-    est_time=2700,
-    suite="nightly-amd-8-gpu-grok",
+    est_time=3600,
+    suite="nightly-amd-accuracy-8-gpu-deepseek-v32",
     nightly=True,
-    disabled="Split into test_grok1_fp8_eval_amd.py, test_grok1_int4_eval_amd.py, test_grok2_eval_amd.py",
 )
 
 INVALID = -9999999
@@ -48,8 +46,8 @@ class ModelConfig:
     accuracy_threshold: float = 0.50
     other_args: Optional[List[str]] = None
     env_vars: Optional[dict] = None
-    tokenizer_path: Optional[str] = None
     timeout: Optional[int] = None
+    variant: Optional[str] = None
 
     def __post_init__(self):
         if self.other_args is None:
@@ -57,74 +55,35 @@ class ModelConfig:
         if self.env_vars is None:
             self.env_vars = {}
 
+    def get_display_name(self) -> str:
+        if self.variant:
+            return f"{self.model_path} ({self.variant})"
+        return self.model_path
 
-# GROK models for MI300X
-GROK_MODELS = [
-    # GROK1-FP8
+
+# DeepSeek-V3.2 models for MI325/MI300X - basic variant
+DEEPSEEK_V32_MODELS = [
+    # DeepSeek-V3.2 basic (TP=8 only)
     ModelConfig(
-        model_path="lmzheng/grok-1",
+        model_path="deepseek-ai/DeepSeek-V3.2",
         tp_size=8,
-        accuracy_threshold=0.80,
+        accuracy_threshold=0.93,
         timeout=3600,
-        tokenizer_path="Xenova/grok-1-tokenizer",
+        variant="basic",
         other_args=[
-            "--quantization",
-            "fp8",
+            "--trust-remote-code",
             "--attention-backend",
             "aiter",
+            "--chunked-prefill-size",
+            "131072",
             "--mem-fraction-static",
             "0.85",
-            "--trust-remote-code",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
+            "--watchdog-timeout",
+            "1200",  # 20 minutes for weight loading
         ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
-        },
-    ),
-    # GROK1-INT4
-    ModelConfig(
-        model_path="amd/grok-1-W4A8KV8",
-        tp_size=8,
-        accuracy_threshold=0.80,
-        timeout=3600,
-        tokenizer_path="Xenova/grok-1-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "1",
-        },
-    ),
-    # GROK2
-    ModelConfig(
-        model_path="xai-org/grok-2",
-        tp_size=8,
-        accuracy_threshold=0.915,
-        timeout=3600,
-        tokenizer_path="alvarobartt/grok-2-tokenizer",
-        other_args=[
-            "--quantization",
-            "fp8",
-            "--attention-backend",
-            "aiter",
-            "--mem-fraction-static",
-            "0.85",
-            "--trust-remote-code",
-        ],
-        env_vars={
-            "RCCL_MSCCL_ENABLE": "0",
-            "SGLANG_USE_AITER": "1",
-            "SGLANG_INT4_WEIGHT": "0",
-        },
+        env_vars={"SGLANG_USE_AITER": "1"},
     ),
 ]
 
@@ -204,26 +163,27 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
-class TestGrokEvalAMD(unittest.TestCase):
-    """GROK GSM8K Completion Evaluation Test for AMD MI300X."""
+class TestDeepSeekV32EvalAMD(unittest.TestCase):
+    """DeepSeek-V3.2 GSM8K Completion Evaluation Test for AMD MI325/MI300X."""
 
     @classmethod
     def setUpClass(cls):
-        cls.models = GROK_MODELS
+        cls.models = DEEPSEEK_V32_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
 
-    def test_grok_accuracy(self):
-        """Test GROK models with GSM8K completion benchmark."""
+    def test_deepseek_v32_accuracy(self):
+        """Test DeepSeek-V3.2 models with GSM8K completion benchmark."""
         all_results = []
-        summary = "### GROK Models (MI300X)\n\n"
-        summary += "| Model | TP | Accuracy | Threshold | Status |\n"
-        summary += "| ----- | -- | -------- | --------- | ------ |\n"
+        summary = "### DeepSeek-V3.2 Models (MI325)\n\n"
+        summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"
+        summary += "| ----- | ------- | -- | -------- | --------- | ------ |\n"
 
         for config in self.models:
-            with self.subTest(model=config.model_path):
+            display_name = config.get_display_name()
+            with self.subTest(model=display_name):
                 print(f"\n{'='*60}")
-                print(f"Testing: {config.model_path}")
+                print(f"Testing: {display_name}")
                 print(f"{'='*60}")
 
                 env = os.environ.copy()
@@ -232,8 +192,6 @@ class TestGrokEvalAMD(unittest.TestCase):
 
                 other_args = list(config.other_args)
                 other_args.extend(["--tp", str(config.tp_size)])
-                if config.tokenizer_path:
-                    other_args.extend(["--tokenizer-path", config.tokenizer_path])
                 timeout = config.timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
                 try:
@@ -257,21 +215,21 @@ class TestGrokEvalAMD(unittest.TestCase):
 
                         all_results.append(
                             {
-                                "model": config.model_path,
+                                "model": display_name,
                                 "accuracy": acc,
                                 "passed": passed,
                             }
                         )
-                        summary += f"| {config.model_path} | {config.tp_size} | {acc:.3f} | {config.accuracy_threshold} | {status} |\n"
+                        summary += f"| {config.model_path} | {config.variant or 'N/A'} | {config.tp_size} | {acc:.3f} | {config.accuracy_threshold} | {status} |\n"
 
                     finally:
                         kill_process_tree(process.pid)
 
                 except Exception as e:
-                    summary += f"| {config.model_path} | {config.tp_size} | N/A | {config.accuracy_threshold} | ❌ ERROR |\n"
+                    summary += f"| {config.model_path} | {config.variant or 'N/A'} | {config.tp_size} | N/A | {config.accuracy_threshold} | ❌ ERROR |\n"
                     all_results.append(
                         {
-                            "model": config.model_path,
+                            "model": display_name,
                             "accuracy": None,
                             "passed": False,
                             "error": str(e),
