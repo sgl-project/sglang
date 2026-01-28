@@ -144,15 +144,16 @@ class Sampler(nn.Module):
                     logprobs = torch.log(probs).clamp(min=torch.finfo(probs.dtype).min)
 
         # Attach logprobs to logits_output (in-place modification)
-        self._attach_logprobs_to_output(
-            logits_output,
-            logprobs,
-            return_logprob,
-            top_logprobs_nums,
-            token_ids_logprobs,
-            sampling_info,
-            batch_next_token_ids,
-        )
+        if return_logprob:
+            self._attach_logprobs_to_output(
+                logits_output,
+                logprobs,
+                return_logprob,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                sampling_info,
+                batch_next_token_ids,
+            )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
@@ -179,30 +180,28 @@ class Sampler(nn.Module):
         self,
         logits_output: LogitsProcessorOutput,
         logprobs: torch.Tensor,
-        return_logprob: bool,
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         sampling_info: SamplingBatchInfo,
         batch_next_token_ids: torch.Tensor,
     ):
         # Attach logprobs to logits_output (in-place modification)
-        if return_logprob:
-            if any(x > 0 for x in top_logprobs_nums):
-                (
-                    logits_output.next_token_top_logprobs_val,
-                    logits_output.next_token_top_logprobs_idx,
-                ) = get_top_logprobs(logprobs, top_logprobs_nums)
+        if any(x > 0 for x in top_logprobs_nums):
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = get_top_logprobs(logprobs, top_logprobs_nums)
 
-            if any(x is not None for x in token_ids_logprobs):
-                (
-                    logits_output.next_token_token_ids_logprobs_val,
-                    logits_output.next_token_token_ids_logprobs_idx,
-                ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+        if any(x is not None for x in token_ids_logprobs):
+            (
+                logits_output.next_token_token_ids_logprobs_val,
+                logits_output.next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
 
-            logits_output.next_token_logprobs = logprobs[
-                torch.arange(len(batch_next_token_ids), device=sampling_info.device),
-                batch_next_token_ids,
-            ]
+        logits_output.next_token_logprobs = logprobs[
+            torch.arange(len(batch_next_token_ids), device=sampling_info.device),
+            batch_next_token_ids,
+        ]
 
     def _sample_from_probs(
         self,
