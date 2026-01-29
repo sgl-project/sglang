@@ -190,7 +190,6 @@ async def create_video(
         # Save first input image
         image = image_list[0]
         uploads_dir = os.path.join("outputs", "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
         filename = image.filename if hasattr(image, "filename") else f"url_image"
         input_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
         try:
@@ -271,7 +270,11 @@ async def create_video(
 
     logger.debug(f"Server received from create_video endpoint: req={req}")
 
-    sampling_params = _build_sampling_params_from_request(request_id, req)
+    try:
+        sampling_params = _build_sampling_params_from_request(request_id, req)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     job = _video_job_from_sampling(request_id, req, sampling_params)
     await VIDEO_STORE.upsert(request_id, job)
 
