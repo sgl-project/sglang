@@ -19,10 +19,8 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
-import errno
 import logging
 import os
-import socket
 import tempfile
 import threading
 import time
@@ -152,8 +150,7 @@ from sglang.srt.utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
-from sglang.srt.utils.common import is_valid_ipv6_address
-from sglang.utils import get_exception_traceback
+from sglang.utils import _prebind_listening_socket, get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -1819,71 +1816,6 @@ def _wait_weights_ready():
     )
 
 
-def _create_server_socket(host: str, port: int) -> socket.socket:
-    """
-    Create and bind a server socket to reserve the port before model loading.
-
-    This prevents port conflicts that could occur if another process (e.g., a
-    subprocess spawned during model loading) binds to the same port before the
-    HTTP server starts. By binding early, we ensure the port is available and
-    reserved for the HTTP server.
-
-    Args:
-        host: The host address to bind to.
-        port: The port number to bind to.
-
-    Returns:
-        A bound socket object.
-
-    Raises:
-        RuntimeError: If the port is already in use or permission is denied.
-    """
-    # Determine socket family based on address type
-    if host and is_valid_ipv6_address(host):
-        family = socket.AF_INET6
-    else:
-        family = socket.AF_INET
-
-    sock = socket.socket(family=family, type=socket.SOCK_STREAM)
-
-    # Set socket options to allow port reuse
-    # SO_REUSEADDR: Allows binding to a port in TIME_WAIT state
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # SO_REUSEPORT: Allows multiple processes to bind to the same port
-    # This is useful for multi-worker mode
-    if hasattr(socket, "SO_REUSEPORT"):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
-    try:
-        sock.bind((host or "", port))
-        sock.listen(128)  # Put socket in listening state for uvicorn
-        sock.set_inheritable(True)
-        logger.info(
-            f"Successfully reserved port {port} on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'"
-        )
-    except OSError as e:
-        sock.close()
-        if e.errno == errno.EADDRINUSE:
-            raise RuntimeError(
-                f"Port {port} is already in use on host '{host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}'. "
-                f"Please choose a different port with --port or stop the process using this port. "
-                f"You can find the process using: lsof -i :{port} or netstat -tlnp | grep {port}"
-            ) from e
-        elif e.errno == errno.EACCES:
-            raise RuntimeError(
-                f"Permission denied when trying to bind to port {port}. "
-                f"Ports below 1024 require root/sudo privileges. "
-                f"Consider using a port >= 1024 (e.g., --port 8000) or run with sudo."
-            ) from e
-        else:
-            raise RuntimeError(
-                f"Failed to bind to {host or ('::' if family == socket.AF_INET6 else '0.0.0.0')}:{port}: {e}"
-            ) from e
-
-    return sock
-
-
 def launch_server(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
@@ -1909,7 +1841,7 @@ def launch_server(
     """
     # Reserve the HTTP port before launching subprocesses to fail fast if port is unavailable.
     # This prevents wasting time loading models only to discover port conflicts later.
-    reserved_socket = _create_server_socket(server_args.host, server_args.port)
+    reserved_socket = _prebind_listening_socket(server_args.host, server_args.port)
 
     try:
         # Launch subprocesses
