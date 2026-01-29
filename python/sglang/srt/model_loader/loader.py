@@ -2718,6 +2718,16 @@ class ModelOptModelLoader(DefaultModelLoader):
 class RunaiModelStreamerLoader(BaseModelLoader):
     """
     Model loader that uses Runai Model Streamer to load a model.
+
+    Supports object storage (S3, GCS) with lazy weight streaming.
+
+    Configuration (via load_config.model_loader_extra_config):
+        - distributed (bool): Enable distributed streaming
+        - concurrency (int): Number of concurrent downloads
+        - memory_limit (int): Memory limit for streaming buffer
+
+    Note: Metadata files must be pre-downloaded via
+    ObjectStorageModel.download_and_get_path() before instantiation.
     """
 
     @dataclasses.dataclass
@@ -2765,6 +2775,8 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 f"{unexpected_keys}"
             )
 
+        set_runai_streamer_env(load_config)
+
         self._is_distributed = None
         if load_config.model_loader_extra_config:
             extra_config = load_config.model_loader_extra_config
@@ -2773,25 +2785,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
                 extra_config.get("distributed"), bool
             ):
                 self._is_distributed = extra_config.get("distributed")
-
-            if "concurrency" in extra_config and isinstance(
-                extra_config.get("concurrency"), int
-            ):
-                os.environ["RUNAI_STREAMER_CONCURRENCY"] = str(
-                    extra_config.get("concurrency")
-                )
-
-            if "memory_limit" in extra_config and isinstance(
-                extra_config.get("memory_limit"), int
-            ):
-                os.environ["RUNAI_STREAMER_MEMORY_LIMIT"] = str(
-                    extra_config.get("memory_limit")
-                )
-
-            runai_streamer_s3_endpoint = os.getenv("RUNAI_STREAMER_S3_ENDPOINT")
-            aws_endpoint_url = os.getenv("AWS_ENDPOINT_URL")
-            if runai_streamer_s3_endpoint is None and aws_endpoint_url is not None:
-                os.environ["RUNAI_STREAMER_S3_ENDPOINT"] = aws_endpoint_url
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
