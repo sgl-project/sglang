@@ -4,6 +4,7 @@ import torch
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    norm_infer,
     rms_norm_fn,
     triton_one_pass_rms_norm,
 )
@@ -44,7 +45,7 @@ def layer_norm(
     shape = x.shape
     x = x.view(-1, self.hidden_size)
     return (
-        self.norm_infer(
+        norm_infer(
             x.view(-1, self.hidden_size),
             self.weight,
             self.bias,
