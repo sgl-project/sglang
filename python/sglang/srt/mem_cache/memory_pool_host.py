@@ -2,9 +2,8 @@ import abc
 import logging
 import threading
 from collections import defaultdict
-from functools import wraps
+from functools import partial, wraps
 from typing import Optional
-from functools import partial
 
 import psutil
 import torch
@@ -40,6 +39,27 @@ if not (_is_npu or _is_xpu):
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    def _transfer_kv_dim_exchange(device_indices, host_indices, kv_pool_host, device_pool, direction):
+        transfer_kv_dim_exchange(
+            device_indices=device_indices,
+            host_indices=host_indices,
+            device_k=device_pool.k_buffer,
+            host_k=kv_pool_host.k_buffer,
+            device_v=device_pool.v_buffer,
+            host_v=kv_pool_host.v_buffer,
+            device_index_k=(
+                device_pool.index_k_buffer
+                if device_pool.index_head_dim is not None
+                else None
+            ),
+            host_index_k=(
+                kv_pool_host.index_k_buffer
+                if device_pool.index_head_dim is not None
+                else None
+            ),
+            page_size=kv_pool_host.page_size,
+            direction=direction,
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -451,10 +471,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
-                    transfer_kv_dim_exchange(
+                    _transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        **build_transfer_kv_dim_exchange_args(self, device_pool),
+                        kv_pool_host=self,
+                        device_pool=device_pool,
                         direction=TransferDirection.H2D,
                     )
             else:
@@ -539,10 +560,11 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                transfer_kv_dim_exchange(
+                _transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    **build_transfer_kv_dim_exchange_args(self, device_pool),
+                    kv_pool_host=self,
+                    device_pool=device_pool,
                     direction=TransferDirection.D2H,
                 )
             else:
@@ -828,10 +850,11 @@ class MLATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_kv_split":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
-                    transfer_kv_dim_exchange(
+                    _transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        **build_transfer_kv_dim_exchange_args(self, device_pool),
+                        kv_pool_host=self,
+                        device_pool=device_pool,
                         direction=TransferDirection.H2D,
                     )
             else:
@@ -885,10 +908,11 @@ class MLATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_kv_split":
-                transfer_kv_dim_exchange(
+                _transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    **build_transfer_kv_dim_exchange_args(self, device_pool),
+                    kv_pool_host=self,
+                    device_pool=device_pool,
                     direction=TransferDirection.D2H,
                 )
             else:
@@ -998,22 +1022,3 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
-
-def build_transfer_kv_dim_exchange_args(kv_pool_host, device_pool):
-    return dict(
-        device_k=device_pool.k_buffer,
-        host_k=kv_pool_host.k_buffer,
-        device_v=device_pool.v_buffer,
-        host_v=kv_pool_host.v_buffer,
-        device_index_k=(
-            device_pool.index_k_buffer
-            if device_pool.index_head_dim is not None
-            else None
-        ),
-        host_index_k=(
-            kv_pool_host.index_k_buffer
-            if device_pool.index_head_dim is not None
-            else None
-        ),
-        page_size=kv_pool_host.page_size,
-    )
