@@ -25,6 +25,7 @@ def _fused_scale_shift_4d_kernel(
     normalized_ptr,
     scale_ptr,
     shift_ptr,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
     rows,
     inner_dim,
     seq_len,
@@ -56,8 +57,8 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    one = tl.full([BLOCK_N], 1.0, dtype=scale.dtype)
-    output = normalized * (one + scale) + shift
+    scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
+    output = normalized * (scale_const_tensor + scale) + shift
 
     tl.store(out_ptrs, output, mask=mask)
 
@@ -67,6 +68,7 @@ def fuse_scale_shift_kernel_blc_opt(
     x_ptr,
     shift_ptr,
     scale_ptr,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.,
     y_ptr,
     B,
     L,
@@ -125,7 +127,7 @@ def fuse_scale_shift_kernel_blc_opt(
         )
         scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
 
-    y = x * (1 + scale) + shift
+    y = x * (scale_constant + scale) + shift
     tl.store(y_ptr + x_off, y, mask=mask)
 
 
@@ -221,6 +223,7 @@ def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    scale_constant: float = 1.0,
     block_l: int = 128,
     block_c: int = 128,
 ):
@@ -251,6 +254,7 @@ def fuse_scale_shift_kernel(
             x_2d,
             scale_reshaped,
             shift_reshaped,
+            scale_constant,
             rows,
             C,
             L,
@@ -306,6 +310,7 @@ def fuse_scale_shift_kernel(
             x,
             shift_blc if need_shift_scalar else shift_exp,
             scale_blc if need_scale_scalar else scale_exp,
+            scale_constant,
             output,
             B,
             L,
