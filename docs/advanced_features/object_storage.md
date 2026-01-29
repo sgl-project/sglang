@@ -11,9 +11,9 @@ When loading models from object storage, SGLang uses a two-phase approach:
 
 ## Supported Storage Backends
 
-- **Amazon S3**: `s3://bucket-name/path/to/model/`
-- **Amazon S3**: `s3://bucket-name/path/to/model/`
-- **S3 compatible**: `s3://bucket-name/path/to/model/`
+1. **Amazon S3**: `s3://bucket-name/path/to/model/`
+2. **Amazon S3**: `s3://bucket-name/path/to/model/`
+3. **S3 compatible**: `s3://bucket-name/path/to/model/`
 
 ## Quick Start
 
@@ -83,56 +83,6 @@ python -m sglang.launch_server \
 | `concurrency` | int | Number of concurrent download streams. Higher values can improve throughput for large models. | 4 |
 | `memory_limit` | int | Memory limit (in bytes) for the streaming buffer. | System-dependent |
 
-
-## Environment Variables
-
-### Required Credentials
-
-#### S3 Configuration
-
-Use standard AWS credential methods:
-
-```bash
-# Option 1: AWS CLI configuration
-aws configure
-
-# Option 2: Environment variables
-export AWS_ACCESS_KEY_ID=your_access_key
-export AWS_SECRET_ACCESS_KEY=your_secret_key
-export AWS_DEFAULT_REGION=us-west-2
-
-# Option 3: Custom S3 endpoint (for S3-compatible storage)
-export AWS_ENDPOINT_URL=https://s3.custom-endpoint.com
-export RUNAI_STREAMER_S3_ENDPOINT=https://s3.custom-endpoint.com
-```
-
-**Note**: `RUNAI_STREAMER_S3_ENDPOINT` will automatically fall back to `AWS_ENDPOINT_URL` if not set.
-
-#### Google Cloud Storage Configuration
-
-Use Google Cloud SDK authentication:
-
-```bash
-# Option 1: Application Default Credentials
-gcloud auth application-default login
-
-# Option 2: Service account key
-export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
-
-# Option 3: For public/anonymous access (testing only)
-export RUNAI_STREAMER_GCS_USE_ANONYMOUS_CREDENTIALS=true
-```
-
-### Optional Configuration
-
-```bash
-# Cache directory for metadata files
-export SGLANG_CACHE_DIR=~/.cache/sglang/
-
-# Control streaming behavior
-export RUNAI_STREAMER_CONCURRENCY=8
-export RUNAI_STREAMER_MEMORY_LIMIT=2147483648
-```
 
 ## Performance Considerations
 
