@@ -427,14 +427,22 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
+        use_grouped_topk = True
+        n_group = config.n_group
+        topk_group = config.topk_group
+        if (n_group, topk_group) == (1, 1):
+            n_group = None
+            topk_group = None
+            use_grouped_topk = False
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            topk_group=config.topk_group,
+            topk_group=topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
