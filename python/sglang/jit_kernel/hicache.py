@@ -33,12 +33,19 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
     )
 
 
+@cache_once
 def can_use_hicache_jit_kernel(
     *,
     element_size: int,
     unroll: int | None = None,  # can be tuned for performance
     block_quota: int | None = None,  # can be tuned for less interference
 ) -> bool:
+    logger = logging.getLogger(__name__)
+    if element_size not in [128, 256, 512, 1024, 2048]:
+        logger.warning(
+            f"Unsupported element_size for HiCache JIT kernel: {element_size}"
+        )
+        return False
     try:
         unroll = unroll or _default_unroll(element_size)
         block_quota = block_quota or DEFAULT_BLOCK_QUOTA
@@ -49,7 +56,6 @@ def can_use_hicache_jit_kernel(
         )
         return True
     except Exception as e:
-        logger = logging.getLogger(__name__)
         logger.warning(f"Failed to load JIT HiCache kernel: {e}")
         return False
 
