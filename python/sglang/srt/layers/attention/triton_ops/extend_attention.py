@@ -63,9 +63,21 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     if _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
+    elif _is_cuda and CUDA_CAPABILITY[0] == 12:
+        # SM120 Blackwell RTX (RTX 5090, RTX PRO 6000, etc.)
+        # Consumer/workstation Blackwell has only ~100KB shared memory
+        # (vs 228KB on SM100 datacenter Blackwell like B100/B200)
+        # Use smaller block sizes similar to sm86/sm89 Ampere which also has ~100KB
+        if Lq <= 128:
+            BLOCK_M, BLOCK_N = (64, 64)
+        elif Lq <= 256:
+            BLOCK_M, BLOCK_N = (32, 64)
+        else:
+            BLOCK_M, BLOCK_N = (32, 32)
+        num_warps = 4 if Lq <= 64 else 8
     else:
         if _is_cuda and CUDA_CAPABILITY[0] >= 9:
-            # Hopper architecture (H100, etc.)
+            # Hopper (SM90) and SM100 datacenter Blackwell (B100/B200)
             if Lq <= 256:
                 BLOCK_M, BLOCK_N = (128, 64)
             else:
