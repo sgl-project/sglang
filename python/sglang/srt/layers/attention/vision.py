@@ -38,6 +38,7 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 if _is_cuda:
+    from hpc import attention_prefill_bf16 as hpc_attention_prefill_bf16
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
 if _is_npu:
@@ -345,6 +346,52 @@ class VisionTritonAttention(nn.Module):
         return output
 
 
+class VisionHpcOpsAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cuda:
+            raise Exception("HpcOpsAttention is only available for cuda")
+        super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | SingletonCache | None,
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+        seqlens_q = torch.full((bsz,), seq_len, dtype=torch.int32, device="cuda")
+        output = hpc_attention_prefill_bf16(
+            q,
+            k,
+            v,
+            seqlens_q,
+            cu_seqlens,
+            max_seqlen,
+        )
+
+        return output
+
+
 class VisionFlash3Attention(nn.Module):
     def __init__(
         self,
@@ -558,6 +605,7 @@ QKV_BACKEND_IMPL = {
     "fa4": VisionFlash4Attention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
+    "hpc_ops": VisionHpcOpsAttention,
 }
 
 

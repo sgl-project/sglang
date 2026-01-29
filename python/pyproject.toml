@@ -32,6 +32,7 @@ dependencies = [
   "flashinfer_cubin==0.6.2",
   "gguf",
   "hf_transfer",
+  "hpc-ops==0.0.1.dev0+g8e3ea9e",
   "huggingface_hub",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",

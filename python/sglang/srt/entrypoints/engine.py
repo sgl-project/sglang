@@ -795,7 +795,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set ulimit
     set_ulimit()
 
-    # Check flashinfer version
+    # Check sgl-kernel version
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
@@ -804,6 +804,14 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
+            )
+        if server_args.mm_attention_backend == "hpc_ops":
+            assert_pkg_version(
+                "hpc_ops",
+                "0.0.1.dev0+g8e3ea9e",
+                "Please uninstall the current version and "
+                "reinstall the required version by following the instructions "
+                "at https://github.com/Tencent/hpc-ops/blob/main/README.md.",
             )
         if _is_cuda:
             assert_pkg_version(

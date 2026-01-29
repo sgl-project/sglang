@@ -309,6 +309,17 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+@lru_cache(maxsize=1)
+def is_hpc_ops_available():
+    """
+    Check whether flashinfer is available.
+    As of Jan. 27, 2026, it is only available on NVIDIA SM90 GPUs.
+    """
+    if not get_bool_env_var("SGLANG_IS_HPC_OPS_AVAILABLE", default="true"):
+        return False
+    return importlib.util.find_spec("hpc_ops") is not None and is_sm90_supported
+
+
 def is_nvidia_cublas_cu12_version_ge_12_9():
     """
     temporary fix for issue #11272
