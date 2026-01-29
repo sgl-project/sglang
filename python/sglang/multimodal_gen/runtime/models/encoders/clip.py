@@ -244,7 +244,6 @@ class CLIPAttention(nn.Module):
                 )
             else:
                 if attention_mask is not None:
-                    is_causal = False
                     # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
                     if attention_mask.dim() == 2:
                         attn_mask = attention_mask[:, None, None, :].to(
@@ -256,7 +255,6 @@ class CLIPAttention(nn.Module):
                     else:
                         attn_mask = attention_mask
                 else:
-                    is_causal = True
                     attn_mask = None
 
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -264,7 +262,7 @@ class CLIPAttention(nn.Module):
                     key_states,
                     value_states,
                     attn_mask=attn_mask,
-                    is_causal=is_causal,
+                    is_causal=attention_mask is None,
                     scale=self.scale,
                 )
             attn_output = attn_output.transpose(1, 2)
