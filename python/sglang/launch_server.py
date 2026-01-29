@@ -10,7 +10,12 @@ from sglang.srt.utils import kill_process_tree
 
 def run_server(server_args):
     """Run the server based on server_args.grpc_mode and server_args.encoder_only."""
-    if server_args.grpc_mode:
+    if server_args.grpc_mode and server_args.encoder_only:
+        # gRPC encoder server for EPD mode
+        from sglang.srt.disaggregation.encode_grpc_server import serve_grpc_encoder
+
+        asyncio.run(serve_grpc_encoder(server_args))
+    elif server_args.grpc_mode:
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
         asyncio.run(serve_grpc(server_args))

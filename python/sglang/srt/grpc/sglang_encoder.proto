@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package sglang.grpc.encoder;
+
+// Service definition for SGLang encoder server communication
+// This protocol enables gRPC-based encoding for EPD (Encode-Prefill-Decode) mode
+service SglangEncoder {
+  // Encode multimodal items (images/videos/audio)
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+
+  // Send encoded embeddings to prefill server (for mooncake backend)
+  rpc Send(SendRequest) returns (SendResponse);
+
+  // Register scheduler receive URL (for zmq_to_scheduler backend)
+  rpc SchedulerReceiveUrl(SchedulerReceiveUrlRequest) returns (SchedulerReceiveUrlResponse);
+}
+
+// =====================
+// Encode Request/Response
+// =====================
+
+message EncodeRequest {
+  // List of multimodal item URLs (images, videos, audio)
+  repeated string mm_items = 1;
+
+  // Unique request identifier
+  string req_id = 2;
+
+  // Number of parts for distributed encoding
+  int32 num_parts = 3;
+
+  // Current part index
+  int32 part_idx = 4;
+
+  // Prefill server host for ZMQ transfer
+  string prefill_host = 5;
+
+  // Embedding ports for ZMQ transfer (multiple for distributed)
+  repeated int32 embedding_port = 6;
+}
+
+message EncodeResponse {
+  // Size of embedding in bytes (for mooncake backend)
+  int64 embedding_size = 1;
+
+  // Number of embedding vectors (sequence length)
+  int64 embedding_len = 2;
+
+  // Dimension of each embedding vector
+  int64 embedding_dim = 3;
+}
+
+// =====================
+// Send Request/Response (mooncake backend)
+// =====================
+
+message SendRequest {
+  // Request identifier
+  string req_id = 1;
+
+  // Prefill server host
+  string prefill_host = 2;
+
+  // Embedding port for ZMQ transfer
+  int32 embedding_port = 3;
+
+  // Mooncake session ID
+  string session_id = 4;
+
+  // Mooncake buffer address for RDMA transfer
+  int64 buffer_address = 5;
+}
+
+message SendResponse {}
+
+// =====================
+// Scheduler Receive URL (zmq_to_scheduler backend)
+// =====================
+
+message SchedulerReceiveUrlRequest {
+  // Request identifier
+  string req_id = 1;
+
+  // URL where scheduler expects to receive embeddings
+  string receive_url = 2;
+
+  // Expected number of receive endpoints
+  int32 receive_count = 3;
+}
+
+message SchedulerReceiveUrlResponse {}
