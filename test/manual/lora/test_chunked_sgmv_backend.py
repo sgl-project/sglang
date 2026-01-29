@@ -14,6 +14,7 @@ from sglang.srt.lora.triton_ops import (
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     reference_embedding_lora_a_shrink,
     reference_sgmv_expand,
@@ -21,6 +22,8 @@ from sglang.test.lora_utils import (
 )
 
 CHUNK_SIZE = 16
+
+register_cuda_ci(est_time=60, suite="nightly-1-gpu", nightly=True)
 
 
 def reset_kernel_cache():
