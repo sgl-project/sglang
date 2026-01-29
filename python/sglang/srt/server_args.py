@@ -1431,11 +1431,10 @@ class ServerArgs:
                 )
                 self.disable_hybrid_swa_memory = True
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
-                assert self.attention_backend in {
-                    "fa3",
-                    "triton",
-                    "trtllm_mha",
-                }, f"fa3, triton, or trtllm_mla is required for {model_arch}"
+                accepted_backends = ["fa3", "triton", "trtllm_mha"]
+                assert (
+                    self.attention_backend in accepted_backends
+                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
