@@ -501,14 +501,15 @@ def calculate_time(show=False, min_cost_ms=0.0):
     return wrapper
 
 
-@deprecated
+@deprecated(
+    "This function has been deprecated. Please use 'get_available_device_memory' instead."
+)
 def get_available_gpu_memory(
     device, gpu_id, distributed=False, empty_cache=True, cpu_group=None
 ):
     """
     Get available memory for cuda:gpu_id device.
     When distributed is True, the available memory is the minimum available memory of all GPUs.
-    This function has been deprecated. Please use 'get_available_device_memory' instead.
     """
     return get_available_device_memory(
         device,
@@ -526,71 +527,56 @@ def get_available_device_memory(
     Get available memory for platform:device_id device.
     When distributed is True, the available memory is the minimum available memory of all devices.
     """
-
-    def warn_not_device_id(current_id):
-        if current_id != device_id:
-            print(
-                f"WARNING: current device is not {device_id}, but {current_id}, ",
-                f"which may cause useless memory allocation for torch {device.upper()} context.",
-            )
-
-    if device == "cuda":
-        assert device_id < torch.cuda.device_count()
-        warn_not_device_id(torch.cuda.current_device())
-
-        if empty_cache:
-            torch.cuda.empty_cache()
-        props = torch.cuda.get_device_properties(gpu_id)
-        if props.is_integrated:
-            # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
-            # only reports "free" memory, which can be lower than what is actually
-            # available due to not including cache memory. So we use the system available
-            # memory metric instead.
-            free_device_memory = psutil.virtual_memory().available
-        else:
-            free_device_memory, _ = torch.cuda.mem_get_info(device_id)
-
-    elif device == "xpu":
-        assert device_id < torch.xpu.device_count()
-        warn_not_device_id(torch.xpu.current_device())
-
-        if empty_cache:
-            torch.xpu.empty_cache()
-        used_memory = torch.xpu.memory_allocated()
-        total_device_memory = torch.xpu.get_device_properties(device_id).total_memory
-        free_device_memory = total_device_memory - used_memory
-
-    elif device == "hpu":
-        assert device_id < torch.hpu.device_count()
-        warn_not_device_id(torch.hpu.current_device())
-
-        free_device_memory, total_device_memory = torch.hpu.mem_get_info()
-
-    elif device == "cpu":
+    if device == "cpu":
         total_free_memory = psutil.virtual_memory().available
         n_numa_node: int = len(get_cpu_ids_by_node())
         free_device_memory = round(total_free_memory / n_numa_node, 3)
-    elif device == "npu":
-        assert device_id < torch.npu.device_count()
-        warn_not_device_id(torch.npu.current_device())
+    else:
+        device_module = torch.get_device_module(device)
+        assert device_id < device_module.device_count()
+        current_device_id = device_module.current_device()
 
-        if empty_cache:
-            torch.npu.empty_cache()
-        free_device_memory, total_device_memory = torch.npu.mem_get_info()
-    elif device == "musa":
-        assert device_id < torch.musa.device_count()
-        warn_not_device_id(torch.musa.current_device())
+        if current_device_id != device_id:
+            print(
+                f"WARNING: current device is not {device_id}, but {current_device_id}, ",
+                f"which may cause useless memory allocation for torch {device.upper()} context.",
+            )
 
-        if empty_cache:
-            torch.musa.empty_cache()
-        props = torch.musa.get_device_properties(device_id)
-        if props.is_integrated:
-            # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
-            # only reports "free" memory, which can be lower than what is actually
-            # available due to not including cache memory. So we use the system available
-            # memory metric instead.
-            free_device_memory = psutil.virtual_memory().available
-        free_device_memory, total_device_memory = torch.musa.mem_get_info()
+        if device == "cuda":
+            if empty_cache:
+                torch.cuda.empty_cache()
+            props = torch.cuda.get_device_properties(device_id)
+            if props.is_integrated:
+                # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
+                # only reports "free" memory, which can be lower than what is actually
+                # available due to not including cache memory. So we use the system available
+                # memory metric instead.
+                free_device_memory = psutil.virtual_memory().available
+            else:
+                free_device_memory, _ = torch.cuda.mem_get_info(device_id)
+        elif device == "xpu":
+            if empty_cache:
+                torch.xpu.empty_cache()
+            used_memory = torch.xpu.memory_allocated()
+            total_device_memory = torch.xpu.get_device_properties(device_id).total_memory
+            free_device_memory = total_device_memory - used_memory
+        elif device == "hpu":
+            free_device_memory, total_device_memory = torch.hpu.mem_get_info()
+        elif device == "npu":
+            if empty_cache:
+                torch.npu.empty_cache()
+            free_device_memory, total_device_memory = torch.npu.mem_get_info()
+        elif device == "musa":
+            if empty_cache:
+                torch.musa.empty_cache()
+            props = torch.musa.get_device_properties(device_id)
+            if props.is_integrated:
+                # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
+                # only reports "free" memory, which can be lower than what is actually
+                # available due to not including cache memory. So we use the system available
+                # memory metric instead.
+                free_device_memory = psutil.virtual_memory().available
+            free_device_memory, total_device_memory = torch.musa.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_device_memory, dtype=torch.float32)
