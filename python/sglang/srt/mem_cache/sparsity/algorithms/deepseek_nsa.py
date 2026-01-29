@@ -1,5 +1,5 @@
 from typing import Any, Optional
-
+import nvtx
 import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
@@ -18,6 +18,7 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
 
+    @nvtx.annotate(message="DeepSeekNSAAlgorithm.retrieve_topk", color="yellow")
     def retrieve_topk(
         self,
         queries: torch.Tensor,

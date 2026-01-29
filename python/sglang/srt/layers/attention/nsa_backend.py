@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
-
+import nvtx
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
@@ -1553,6 +1553,7 @@ class NativeSparseAttnBackend(
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
 
+    @nvtx.annotate(message="NSABackend._forward_fa3", color="yellow")
     def _forward_fa3(
         self,
         q_rope: torch.Tensor,

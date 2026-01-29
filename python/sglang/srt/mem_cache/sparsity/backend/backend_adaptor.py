@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
+import nvtx
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -59,6 +60,7 @@ class NSABackendAdaptor(BackendAdaptor):
         self.req_to_token_pool = req_to_token_pool
         self.sparse_kv_cache_manager = sparse_kv_cache_manager
 
+    @nvtx.annotate(message="NSABackendAdaptor.adapt_for_attn_metadata", color="yellow")
     def adapt_for_attn_metadata(
         self,
         selected_indices: torch.Tensor,
