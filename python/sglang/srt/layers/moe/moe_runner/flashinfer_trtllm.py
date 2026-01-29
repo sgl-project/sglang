@@ -32,11 +32,10 @@ if TYPE_CHECKING:
         StandardCombineInput,
         StandardDispatchOutput,
     )
-if is_flashinfer_available():
-    if is_sm120_supported():
-        from flashinfer import fp4_quantize
-    else:
-        from sgl_kernel import scaled_fp4_quant as fp4_quantize
+if is_flashinfer_available() and is_sm120_supported():
+    from flashinfer import fp4_quantize
+else:
+    from sgl_kernel import scaled_fp4_quant as fp4_quantize
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
