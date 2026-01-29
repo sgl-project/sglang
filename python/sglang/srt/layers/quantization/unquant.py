@@ -47,13 +47,13 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
