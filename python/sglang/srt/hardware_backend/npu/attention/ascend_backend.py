@@ -223,6 +223,11 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
+            if (
+                "Gemma2ForSequenceClassification"
+                in model_runner.model_config.hf_config.architectures
+            ):
+                self.use_native_sdpa = True
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -812,7 +817,11 @@ class AscendAttnBackend(AttentionBackend):
                 ):
                     causal = False
 
-                if layer.qk_head_dim <= 128 and causal:
+                if (
+                    layer.qk_head_dim <= 128
+                    and causal
+                    and not getattr(self, "use_native_sdpa", False)
+                ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                         attn_output = torch.empty(
