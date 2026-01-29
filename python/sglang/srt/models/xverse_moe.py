@@ -170,32 +170,36 @@ class XverseMoE(nn.Module):
         for expert in self.experts:
             w1.append(expert.gate_up_proj.weight)
             w2.append(expert.down_proj.weight)
-        if _is_npu:
-            self.w13_weight = torch._utils._flatten_dense_tensors(w1)
-            w1s = torch._utils._unflatten_dense_tensors(self.w13_weight, w1)
-            for data, param in zip(w1s, w1):
-                param.data = data
-            self.w13_weight = self.w13_weight.view(len(w1), *w1s[0].shape)
 
-            self.w2_weight = torch._utils._flatten_dense_tensors(w2)
-            w2s = torch._utils._unflatten_dense_tensors(self.w2_weight, w2)
-            for data, param in zip(w2s, w2):
+        w1_name, w2_name = ("w13_weight", "w2_weight") if _is_npu else ("w1", "w2")
+        for weights_list, attr_name in [(w1, w1_name), (w2, w2_name)]:
+            flat_tensor = torch._utils._flatten_dense_tensors(weights_list)
+            unflattened = torch._utils._unflatten_dense_tensors(
+                flat_tensor, weights_list
+            )
+            for data, param in zip(unflattened, weights_list):
                 param.data = data
+            setattr(
+                self,
+                attr_name,
+                flat_tensor.view(len(weights_list), *unflattened[0].shape),
+            )
 
-            self.w2_weight = self.w2_weight.view(len(w2), *w2s[0].shape)
-        else:
-            self.w1 = torch._utils._flatten_dense_tensors(w1)
-            w1s = torch._utils._unflatten_dense_tensors(self.w1, w1)
-            for data, param in zip(w1s, w1):
-                param.data = data
-            self.w1 = self.w1.view(len(w1), *w1s[0].shape)
+    def fused_moe_npu(self, topk_output, hidden_states: torch.Tensor) -> torch.Tensor:
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=topk_output,
+        )
+        final_hidden_states = self.quant_method.apply(
+            layer=self, dispatch_output=dispatch_output
+        )
 
-            self.w2 = torch._utils._flatten_dense_tensors(w2)
-            w2s = torch._utils._unflatten_dense_tensors(self.w2, w2)
-            for data, param in zip(w2s, w2):
-                param.data = data
-
-            self.w2 = self.w2.view(len(w2), *w2s[0].shape)
+        if isinstance(
+            final_hidden_states, CombineInput
+        ):  # quant_method use `UnquantizedFusedMoEMethod`
+            final_hidden_states = final_hidden_states.hidden_states
+        return final_hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -206,19 +210,7 @@ class XverseMoE(nn.Module):
         router_logits, _ = self.router(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if _is_npu:
-            dispatch_output = StandardDispatchOutput(
-                hidden_states=hidden_states,
-                hidden_states_scale=None,
-                topk_output=topk_output,
-            )
-            final_hidden_states = self.quant_method.apply(
-                layer=self, dispatch_output=dispatch_output
-            )
-
-            if isinstance(
-                final_hidden_states, CombineInput
-            ):  # quant_method use `UnquantizedFusedMoEMethod`
-                final_hidden_states = final_hidden_states.hidden_states
+            final_hidden_states = self.fused_moe_npu(topk_output, hidden_states)
         else:
             final_hidden_states = fused_moe(
                 hidden_states,
