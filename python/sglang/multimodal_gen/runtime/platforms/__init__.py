@@ -119,10 +119,31 @@ def musa_platform_plugin() -> str | None:
         "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None
     )
 
+def xpu_platform_plugin() -> str | None:
+    """Detect if Intel XPU platform is available."""
+    is_xpu = False
+
+    try:
+        import torch
+
+        # Check if Intel Extension for PyTorch is available and XPU devices exist
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            device_count = torch.xpu.device_count()
+            if device_count > 0:
+                is_xpu = True
+                logger.info(
+                    "Intel XPU platform is available with %d device(s)", device_count
+                )
+    except Exception as e:
+        logger.info("Intel XPU platform is unavailable: %s", e)
+
+    return "sglang.multimodal_gen.runtime.platforms.xpu.XpuPlatform" if is_xpu else None
+
 
 builtin_platform_plugins = {
     "cuda": cuda_platform_plugin,
     "rocm": rocm_platform_plugin,
+    "xpu": xpu_platform_plugin,
     "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
     "musa": musa_platform_plugin,
@@ -135,6 +156,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Try MPS first on macOS
     platform_cls_qualname = mps_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Try Intel XPU
+    platform_cls_qualname = xpu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

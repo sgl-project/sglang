@@ -43,6 +43,9 @@ class SGLDiffusionProfiler:
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
+        if torch.xpu.is_available():
+            activities.append(torch.profiler.ProfilerActivity.XPU)
+
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
