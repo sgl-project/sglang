@@ -96,7 +96,7 @@ diffusion_hip = [
   "torchcodec==0.5.0",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer",
+  "runai_model_streamer>=0.15.5",
 ]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -124,7 +124,7 @@ diffusion_musa = [
   "remote-pdb",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer",
+  "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8"
 ]
 
