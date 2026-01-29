@@ -55,9 +55,6 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-if _is_npu:
-    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
