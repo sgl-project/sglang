@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 from diffusers import AutoModel
+from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 from sglang.multimodal_gen.configs.models import ModelConfig
@@ -125,7 +126,8 @@ class ComponentLoader(ABC):
             logger.error("Load %s failed", module_name)
             consumed = 0.0
         else:
-            component = component.eval()
+            if isinstance(component, nn.Module):
+                component = component.eval()
             current_gpu_mem = current_platform.get_available_gpu_memory()
             consumed = get_memory_usage_of_component(component)
             if consumed is None or consumed == 0.0:
