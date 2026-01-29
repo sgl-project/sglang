@@ -130,7 +130,7 @@ impl Router {
     }
 
     /// Select worker for a specific model considering circuit breaker state
-    fn select_worker_for_model(
+    async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
@@ -167,15 +167,17 @@ impl Router {
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                headers,
-                hash_ring,
-            },
-        )?;
+        let idx = policy
+            .select_worker(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                },
+            )
+            .await?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -276,7 +278,10 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+        let worker = match self
+            .select_worker_for_model(model_id, Some(text), headers)
+            .await
+        {
             Some(w) => w,
             None => {
                 return error::service_unavailable(

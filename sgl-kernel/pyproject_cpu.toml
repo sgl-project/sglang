@@ -1,13 +1,13 @@
 [build-system]
 requires = [
   "scikit-build-core>=0.10",
-  "torch>=2.7.1",
+  "torch==2.9.0",
   "wheel",
 ]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "sgl-kernel"
+name = "sgl-kernel-cpu"
 version = "0.3.21"
 description = "Kernel Library for SGLang"
 readme = "README.md"
@@ -33,3 +33,4 @@ exclude = [
 cmake.source-dir = "csrc/cpu"
 cmake.build-type = "Release"
 minimum-version = "build-system.requires"
+wheel.packages = ["python/sgl_kernel"]
