@@ -27,7 +27,7 @@ import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
-from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
@@ -143,7 +143,7 @@ ATTENTION_BACKEND_CHOICES = [
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
@@ -1358,6 +1358,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
+                elif (
+                    is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+                ) and is_mxfp4_quant_format:
+                    self.moe_runner_backend = "auto"
+                    logger.warning(
+                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
+                    )
                 elif self.ep_size == 1 and is_triton_kernels_available():
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
@@ -2485,12 +2492,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        # Set the highest strict level for Kimi K2 tool calls
-        if (
-            self.tool_call_parser == "kimi_k2"
-            and not envs.SGLANG_TOOL_STRICT_LEVEL.is_set()
-        ):
-            envs.SGLANG_TOOL_STRICT_LEVEL.set(ToolStrictLevel.PARAMETER)
 
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
