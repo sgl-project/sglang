@@ -3,12 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/layernorm.py
 """Custom normalization layers."""
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -17,12 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
 )
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    fuse_scale_shift_kernel,
-    norm_infer,
-    rms_norm_fn,
-    triton_one_pass_rms_norm,
-)
+from sglang.multimodal_gen.runtime.layers.triton_ops import fuse_scale_shift_kernel
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
@@ -45,6 +39,7 @@ class RMSNorm(CustomOp):
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
     ) -> None:
+        self.function_name = "rms_norm"
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
@@ -55,93 +50,12 @@ class RMSNorm(CustomOp):
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
 
-    def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-        return rms_norm_fn(
-            x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
-        )
+    def use_forward_cpu(self):
+        return self.use_forward_native()
 
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        shape = x.shape
-        x = x.reshape(-1, shape[-1])
-        if residual is not None:
-            residual_shape = residual.shape
-            residual = residual.view(-1, shape[-1])
-
-        if x.dtype == torch.float:
-            # fp32
-            out = self.forward_triton(x, residual)
-        elif self.variance_size_override is not None:
-            return self.forward_native(x, residual)
-        elif residual is not None:
-            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
-            return x.view(shape), residual.view(residual_shape)
-        else:
-            if x.shape[-1] <= 128:
-                out = triton_one_pass_rms_norm(
-                    x, self.weight.data, self.variance_epsilon
-                )
-            else:
-                out = rmsnorm(x, self.weight.data, self.variance_epsilon)
-        out = out.view(shape)
-        return out
-
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        orig_dtype = x.dtype
-        x = x.to(torch.float32)
-        if residual is not None:
-            x = x + residual.to(torch.float32)
-            residual = x.to(orig_dtype)
-
-        hidden_size = x.shape[-1]
-        if hidden_size != self.hidden_size:
-            raise ValueError(
-                "Expected hidden_size to be "
-                f"{self.hidden_size}, but found: {hidden_size}"
-            )
-
-        if self.variance_size_override is None:
-            x_var = x
-        else:
-            if hidden_size < self.variance_size_override:
-                raise ValueError(
-                    "Expected hidden_size to be at least "
-                    f"{self.variance_size_override}, but found: {hidden_size}"
-                )
-
-            x_var = x[..., : self.variance_size_override]
-
-        variance = x_var.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = (x * self.weight).to(orig_dtype)
-        if residual is None:
-            return x
-        else:
-            return x, residual
-
-    def forward_cpu(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self.forward_native(x, residual)
-
-    def forward_hip(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def use_forward_hip(self):
         # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
-        return self.forward_native(x, residual)
+        return self.use_forward_native()
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
@@ -161,6 +75,7 @@ class LayerNorm(CustomOp):
         device=None,
         dtype=None,
     ) -> None:
+        self.function_name = "layer_norm"
         super().__init__()
         self.eps = eps
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -190,47 +105,8 @@ class LayerNorm(CustomOp):
             self._weight_fallback_cache = wf
         return wf
 
-    def forward_triton(self, x: torch.Tensor):
-        # Fast inference kernel without residual/dropout branches
-        return norm_infer(
-            x.view(-1, self.hidden_size),
-            self.weight,
-            self.bias,
-            eps=self.eps,
-            is_rms_norm=False,
-        ).view(x.shape)
-
-    def forward_cuda(
-        self,
-        x: torch.Tensor,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        shape = x.shape
-        x = x.view(-1, self.hidden_size)
-        return self.forward_triton(x).view(shape)
-
-    @torch.compile(backend="inductor")
-    def forward_native(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        input_dtype = x.dtype
-        mean = x.mean(-1, keepdim=True)
-        variance = (x - mean).pow(2).mean(-1, keepdim=True)
-        x = (x - mean) * torch.rsqrt(variance + self.eps)
-        if self.weight is not None:
-            x = self.weight * x
-        # if no affine, this is a no-op
-        if self.bias is not None:
-            x = x + self.bias
-        return x.to(input_dtype)
-
-    def forward_cpu(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self.forward_native(x, residual)
+    def use_forward_cpu(self):
+        return self.use_forward_native()
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"

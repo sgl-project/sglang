@@ -6,6 +6,9 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.hardware_backend.native.rotary_embedding import (
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
@@ -16,7 +19,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT

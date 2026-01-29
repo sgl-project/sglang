@@ -15,6 +15,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.hardware_backend.native.rotary_embedding import (
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
@@ -35,7 +38,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (

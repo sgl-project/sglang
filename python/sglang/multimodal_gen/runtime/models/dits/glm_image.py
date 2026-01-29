@@ -20,13 +20,15 @@ import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
 
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
+from sglang.multimodal_gen.runtime.hardware_backend.native.rotary_embedding import (
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import Timesteps

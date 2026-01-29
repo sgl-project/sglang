@@ -25,6 +25,9 @@ import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
+from sglang.multimodal_gen.runtime.hardware_backend.native.rotary_embedding import (
+    _apply_rotary_emb,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -35,10 +38,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
-    get_rotary_pos_embed,
-)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import get_rotary_pos_embed
 from sglang.multimodal_gen.runtime.layers.visual_embedding import PatchEmbed
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import (
