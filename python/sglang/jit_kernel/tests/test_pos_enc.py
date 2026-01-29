@@ -144,7 +144,7 @@ def test_correctness(
     ), "JIT rotary embedding kernel is not available."
 
     # Create inputs and caches
-    query, key, value, pos_ids = create_test_inputs(
+    query, key, _, pos_ids = create_test_inputs(
         head_size, batch_size, seq_len, device, dtype, num_q_heads, num_kv_heads
     )
     cos_sin_cache = create_cos_sin_cache(
@@ -216,7 +216,7 @@ def test_performance(
     ), "JIT rotary embedding kernel is not available."
 
     # Create inputs and caches
-    query, key, value, pos_ids = create_test_inputs(
+    query, key, _, pos_ids = create_test_inputs(
         head_size, batch_size, seq_len, device, dtype, num_q_heads, num_kv_heads
     )
     cos_sin_cache = create_cos_sin_cache(

@@ -37,14 +37,14 @@ def rotary_embedding(
     # [num_tokens, num_heads * head_size] or
     # [batch_size, seq_len, num_heads, head_size] or
     # [num_tokens, num_heads, head_size]
-    key: torch.Tensor,  # // [batch_size, seq_len, num_kv_heads * head_size] or
+    key: torch.Tensor,  # [batch_size, seq_len, num_kv_heads * head_size] or
     # [num_tokens, num_kv_heads * head_size] or
     # [batch_size, seq_len, num_heads, head_size] or
     # [num_tokens, num_heads, head_size]
     head_size: int,
     cos_sin_cache: torch.Tensor,  # [max_position, rot_dim]
     is_neox: bool = True,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embedding to query and key tensors.
 
