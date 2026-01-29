@@ -26,7 +26,6 @@ from enum import Enum, auto
 from functools import lru_cache
 
 import torch
-import torch.distributed as dist
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
@@ -174,15 +173,16 @@ def init_mori_op(
     cpu_group = group.cpu_group
     torch._C._distributed_c10d._register_process_group("mori", cpu_group)
     mori.shmem.shmem_torch_process_group_init("mori")
-    logger.info(
-        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=}"
-    )
-
+    
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
     async_mode = get_bool_env_var("SGLANG_MORI_ASYNC_MODE", "false")
-    # logger.info(f"bill-dbg: {async_mode=}")
     if async_mode:
         mode = EpMode.LOW_LATENCY
+
+    logger.info(
+        f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=} {mode=}"
+    )
+
     cfg = get_ep_dispatch_configs()[mode]
 
     kernel_type = cfg.kernel_type
@@ -493,9 +493,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
-        # logger.info(f"bill-dbg: before comb combine_b: {hidden_states.shape=}")
-        # logger.info(f"bill-dbg: before comb combine_b: {topk_ids.shape=}")
-        # logger.info(f"bill-dbg: before comb combine_b: {topk_weights.shape=}")
 
         hidden_states, done_event = self._combine_core(
             hidden_states, topk_ids, topk_weights, previous_event
@@ -504,7 +501,6 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         if self._comm_stream and self.async_finish and done_event is not None:
             torch.cuda.current_stream().wait_event(done_event)
 
-        # logger.info(f"bill-dbg: after comb combine_b: {hidden_states.shape=}")
         return hidden_states
 
     def _combine_core(
@@ -628,10 +624,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         import mori 
         assert self.mori_op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL, "mori asyncll mismatch"
 
-        # logger.info(f"bill-dbg: mori_op.dispatch_recv start")
-
         self.mori_op.dispatch_recv()
-        # logger.info(f"bill-dbg: mori_op.dispatch_recv end")
 
         return MoriEPLLDispatchOutput(
             hidden_states=hidden_states,
@@ -652,7 +645,6 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
     ):
         ##TODO(billishyahao): add assertion here to check async 
         
-        # logger.info(f"bill-dbg: mori_op.dispatch_send start")
         (
             packed_recv_hidden,
             recv_topk_weights,
@@ -660,7 +652,6 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             recv_topk_ids,
             packed_recv_count
         ) = self.mori_op.dispatch_send(hidden_states, topk_weights, scale, topk_ids)
-        # logger.info(f"bill-dbg: mori_op.dispatch_send end")
 
         return  (
             packed_recv_hidden,
@@ -686,17 +677,9 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         return hidden_states, topk_ids, topk_weights, overlap_args
 
     def combine_b(self, hidden_states, topk_ids, topk_weights, previous_event):
-        # logger.info(f"bill-dbg: before comb combine_b: {hidden_states.shape=}")
-        # logger.info(f"bill-dbg: before comb combine_b: {topk_ids.shape=}")
-        # logger.info(f"bill-dbg: before comb combine_b: {topk_weights.shape=}")
-
-        # logger.info(f"bill-dbg: mori_op.combine_recv start")
 
         self.mori_op.combine_recv()
 
-        # logger.info(f"bill-dbg: mori_op.combine_recv end")
-
-        # logger.info(f"bill-dbg: after comb combine_b: {hidden_states.shape=}")
         return hidden_states[0]
 
     def _combine_core(
@@ -705,16 +688,10 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional[CombineOverlapArgs] = None,
-    ):
-        
-        # logger.info(f"bill-dbg: mori_op.combine_send start")
-
+    ):        
         combined_hidden_states = self.mori_op.combine_send(
             hidden_states, None, topk_ids
         )
-
-        # logger.info(f"bill-dbg: mori_op.combine_send end")
-
 
         return combined_hidden_states
     
@@ -760,21 +737,16 @@ class MoriEPDispatcher(BaseDispatcher):
             deepep_mode=deepep_mode,
         )
 
-        # logger.info(f"bill-dbg: {self.deepep_mode.enable_low_latency()=}")
-
         if self.deepep_mode.enable_low_latency():
-            # logger.info(f"bill-dbg: low latency ")
             self._low_latency_dispatcher = _MoriEPDispatcherImplLowLatency(
                 **common_kwargs,
             )
 
         if self.deepep_mode.enable_normal():
-            # logger.info(f"bill-dbg: normal ")
             self._normal_dispatcher = _MoriEPDispatcherImplNormal(
                 async_finish=async_finish,
                 **common_kwargs,
             )
-        
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = MoriEPPDispatchHooks()
