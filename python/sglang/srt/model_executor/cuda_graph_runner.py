@@ -40,6 +40,8 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -378,6 +380,55 @@ class CudaGraphRunner:
     def _cache_loc_dtype(self):
         return torch.int64
 
+    @staticmethod
+    def _has_lora_requests(forward_batch: ForwardBatch) -> bool:
+        """Check if the batch has any LoRA requests."""
+        if forward_batch.lora_ids is None:
+            return False
+        return any(lora_id is not None for lora_id in forward_batch.lora_ids)
+
+    def _supports_separate_lora_graphs(self) -> bool:
+        """Check if the attention backend supports separate LoRA and non-LoRA graphs.
+
+        Only FlashAttentionBackend and FlashInferAttnBackend support this because they
+        key metadata by (bs, is_lora) to prevent overwrites when both graph types are
+        captured for the same batch size. Other backends would have stale pointers if
+        both LoRA and non-LoRA graphs are captured for the same batch size.
+
+        For non-supported backends, we only capture the LoRA graph and use it
+        for all batches (LoRA kernels no-op when adapters are zeroed).
+        """
+        return isinstance(
+            self.model_runner.attn_backend,
+            (FlashAttentionBackend, FlashInferAttnBackend),
+        )
+
+    @staticmethod
+    def _get_graph_key(
+        bs: int,
+        enable_pdmux: bool,
+        has_lora: bool,
+        stream_idx: Optional[int] = None,
+        enable_lora: bool = False,
+    ) -> Union[int, str]:
+        """Generate graph key including LoRA status.
+
+        When LoRA is enabled, we create separate graphs for batches with/without LoRA requests.
+        When LoRA is disabled, we use the original key format for backward compatibility.
+        """
+        base_key = bs
+        if enable_pdmux:
+            stream_part = (
+                stream_idx if stream_idx is not None else get_current_stream_idx()
+            )
+            base_key = f"{stream_part}_{bs}"
+
+        # Only add LoRA suffix if LoRA is enabled at the server level
+        # This allows separate graphs for non-LoRA batches when LoRA is enabled
+        if enable_lora and has_lora:
+            return f"{base_key}_lora"
+        return base_key
+
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
@@ -389,9 +440,14 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        graph_key = cuda_graph_bs
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        # Check if batch has LoRA requests
+        has_lora = self._has_lora_requests(forward_batch)
+        graph_key = self._get_graph_key(
+            cuda_graph_bs,
+            self.enable_pdmux,
+            has_lora,
+            enable_lora=self.model_runner.server_args.enable_lora,
+        )
 
         is_bs_supported = (
             graph_key in self.graphs
@@ -503,14 +559,52 @@ class CudaGraphRunner:
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
+                    # Capture graph with LoRA logic (if LoRA is enabled)
+                    # Note: LoRA graph is captured first to enable memory sharing.
+                    # The LoRA graph uses more memory (includes LoRA kernels), so capturing it
+                    # first allows the non-LoRA graph to reuse the base model memory.
+                    if self.model_runner.server_args.enable_lora:
+                        (
+                            graph_lora,
+                            output_buffers_lora,
+                        ) = self.capture_one_batch_size(
+                            bs, forward, stream_idx, has_lora=True
+                        )
+                        key_lora = self._get_graph_key(
+                            bs, self.enable_pdmux, True, stream_idx, enable_lora=True
+                        )
+                        self.graphs[key_lora] = graph_lora
+                        self.output_buffers[key_lora] = output_buffers_lora
+
+                    # For non-supported backends with LoRA enabled, only capture the LoRA graph.
+                    # These backends don't support separate LoRA/non-LoRA metadata (they key by bs only,
+                    # not (bs, is_lora)), so capturing both would cause metadata overwrites and crashes.
+                    # The LoRA graph is used for all batches; LoRA kernels no-op when adapters are zeroed.
+                    if (
+                        self.model_runner.server_args.enable_lora
+                        and not self._supports_separate_lora_graphs()
+                    ):
+                        # Skip non-LoRA graph capture for non-supported backends
+                        continue
+
+                    # Capture graph without LoRA logic for non-LoRA batches
+                    # This graph can reuse memory from the LoRA graph since they share the same
+                    # memory pool and have the same batch size.
                     (
-                        graph,
-                        output_buffers,
-                    ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                    # For pd_multiplexing, we need to save the graph and output buffers
-                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    self.graphs[key] = graph
-                    self.output_buffers[key] = output_buffers
+                        graph_no_lora,
+                        output_buffers_no_lora,
+                    ) = self.capture_one_batch_size(
+                        bs, forward, stream_idx, has_lora=False
+                    )
+                    key_no_lora = self._get_graph_key(
+                        bs,
+                        self.enable_pdmux,
+                        False,
+                        stream_idx,
+                        enable_lora=self.model_runner.server_args.enable_lora,
+                    )
+                    self.graphs[key_no_lora] = graph_no_lora
+                    self.output_buffers[key_no_lora] = output_buffers_no_lora
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -550,7 +644,11 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        has_lora: bool = False,
     ):
         buffers: GraphInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -619,11 +717,13 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
-        if self.model_runner.server_args.enable_lora:
+        if self.model_runner.server_args.enable_lora and has_lora:
+            # For LoRA graph: capture with empty LoRA IDs (will be updated during replay)
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
             lora_ids = [None] * bs
         else:
+            # For non-LoRA graph: set lora_ids to None to skip LoRA logic entirely
             lora_ids = None
 
         # mamba state tracking
@@ -680,8 +780,16 @@ class CudaGraphRunner:
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+        else:
+            # Clear batch_info for non-LoRA graph capture to ensure _should_apply_lora() returns False
+            # This prevents stale batch_info from previous LoRA graph capture from causing
+            # LoRA kernels to be launched during non-LoRA graph capture.
+            if self.model_runner.server_args.enable_lora and hasattr(
+                self.model_runner.lora_manager.lora_backend, "batch_info"
+            ):
+                self.model_runner.lora_manager.lora_backend.batch_info = None
 
-        # Attention backend
+        # Attention backend - pass is_lora to key metadata by (bs, is_lora)
         attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
@@ -690,6 +798,7 @@ class CudaGraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            is_lora=has_lora,
         )
 
         # Run and capture
@@ -817,7 +926,8 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
-        # Attention backend
+        # Attention backend - pass is_lora to retrieve correct metadata
+        has_lora = self._has_lora_requests(forward_batch)
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
@@ -832,6 +942,7 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            is_lora=has_lora,
         )
 
         # Store fields
@@ -854,11 +965,24 @@ class CudaGraphRunner:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
-        # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
-        else:
-            graph_key = self.bs
+        # Replay - select graph based on LoRA status
+        has_lora = self._has_lora_requests(forward_batch)
+
+        # For non-supported backends with LoRA enabled, always use the LoRA graph
+        # since we only captured the LoRA graph (non-LoRA graph was skipped to avoid
+        # metadata overwrites). LoRA kernels will no-op when adapters are zeroed.
+        if (
+            self.model_runner.server_args.enable_lora
+            and not self._supports_separate_lora_graphs()
+        ):
+            has_lora = True  # Force LoRA graph selection
+
+        graph_key = self._get_graph_key(
+            self.bs,
+            self.enable_pdmux,
+            has_lora,
+            enable_lora=self.model_runner.server_args.enable_lora,
+        )
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 

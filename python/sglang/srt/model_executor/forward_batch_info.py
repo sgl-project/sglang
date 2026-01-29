@@ -42,6 +42,8 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -518,12 +520,43 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init lora information
         if model_runner.server_args.enable_lora:
-            # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
-            # as a batch, right before running the batch
-            if not model_runner.server_args.enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+            # Check if batch has LoRA requests (same logic as _has_lora_requests in cuda_graph_runner)
+            has_lora_requests = ret.lora_ids is not None and any(
+                lora_id is not None for lora_id in ret.lora_ids
+            )
 
-            model_runner.lora_manager.prepare_lora_batch(ret)
+            # For piecewise CUDA graph, always call prepare_lora_batch() when LoRA is enabled
+            # Note: piecewise CUDA graph is only used for EXTEND mode (prefill), not DECODE mode
+            will_use_piecewise_cuda_graph = (
+                model_runner.piecewise_cuda_graph_runner is not None
+                and ret.forward_mode.is_extend()
+                and model_runner.piecewise_cuda_graph_runner.can_run(ret)
+            )
+
+            # For non-supported backends (not FlashAttention or FlashInfer) with LoRA enabled,
+            # we only capture the LoRA graph (to avoid metadata overwrites). Therefore,
+            # we must always call prepare_lora_batch() to ensure adapters are properly
+            # set up (zeroed for non-LoRA requests, so LoRA kernels no-op).
+            supports_separate_lora_graphs = isinstance(
+                model_runner.attn_backend,
+                (FlashAttentionBackend, FlashInferAttnBackend),
+            )
+
+            if (
+                has_lora_requests
+                or will_use_piecewise_cuda_graph
+                or not supports_separate_lora_graphs
+            ):
+                # In the non-LoRA overlap loading case, we fetch LoRA adapters into the
+                # memory pool as a batch, right before running the batch
+                if not model_runner.server_args.enable_lora_overlap_loading:
+                    model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                model_runner.lora_manager.prepare_lora_batch(ret)
+            else:
+                # This prevents LoRA kernels from being launched when using non-LoRA graphs
+                # or during normal forward passes without LoRA requests
+                if hasattr(model_runner.lora_manager.lora_backend, "batch_info"):
+                    model_runner.lora_manager.lora_backend.batch_info = None
 
         return ret
 

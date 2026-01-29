@@ -1629,8 +1629,14 @@ class FlashAttentionBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        is_lora: bool = False,
     ):
-        """Initialize forward metadata for capturing CUDA graph."""
+        """Initialize forward metadata for capturing CUDA graph.
+
+        Args:
+            is_lora: Whether this is a LoRA graph. Used to key metadata by (bs, is_lora)
+                to support both LoRA and non-LoRA graphs for the same batch size.
+        """
         metadata = FlashAttentionMetadata()
 
         # metadata_expand is needed for Spec Decoding when top k > 1
@@ -1660,7 +1666,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.page_table = self.decode_cuda_graph_metadata[
                         "page_table_draft_decode"
                     ][:bs, :]
-                    self.decode_cuda_graph_metadata[bs] = metadata
+                    self.decode_cuda_graph_metadata[(bs, is_lora)] = metadata
                 else:
                     # When top k > 1, we need two specific draft decode metadata, and then merge states
                     # 1. The first half of metadata for prefix tokens
@@ -1724,7 +1730,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
-                self.decode_cuda_graph_metadata[bs] = metadata
+                self.decode_cuda_graph_metadata[(bs, is_lora)] = metadata
 
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
@@ -1869,8 +1875,14 @@ class FlashAttentionBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
+        is_lora: bool = False,
     ):
-        """Initialize forward metadata for replaying CUDA graph."""
+        """Initialize forward metadata for replaying CUDA graph.
+
+        Args:
+            is_lora: Whether this is a LoRA graph. Must match the value used during
+                capture to retrieve the correct metadata tensors.
+        """
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
@@ -1884,7 +1896,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Draft Decode
                 if self.topk <= 1:
                     # When topk = 1, we use the normal decode metadata
-                    metadata = self.decode_cuda_graph_metadata[bs]
+                    metadata = self.decode_cuda_graph_metadata[(bs, is_lora)]
                     max_len = seq_lens_cpu.max().item()
                     metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
                     max_seq_pages = (
@@ -1954,7 +1966,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # TODO: Handle local attention metadata for draft decode when llama4 eagle is supported
             else:
                 # Normal Decode
-                metadata = self.decode_cuda_graph_metadata[bs]
+                metadata = self.decode_cuda_graph_metadata[(bs, is_lora)]
                 max_len = seq_lens_cpu.max().item()
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len

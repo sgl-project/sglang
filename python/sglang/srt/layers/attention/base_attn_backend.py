@@ -35,8 +35,14 @@ class AttentionBackend(ABC):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        is_lora: bool = False,
     ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
+        """Init the metadata for a forward pass for capturing a cuda graph.
+
+        Args:
+            is_lora: Whether this is a LoRA graph. Used to key metadata by (bs, is_lora)
+                to support both LoRA and non-LoRA graphs for the same batch size.
+        """
         raise NotImplementedError()
 
     def init_forward_metadata_replay_cuda_graph(
@@ -49,8 +55,14 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        is_lora: bool = False,
     ):
-        """Init the metadata for a forward pass for replaying a cuda graph."""
+        """Init the metadata for a forward pass for replaying a cuda graph.
+
+        Args:
+            is_lora: Whether this is a LoRA graph. Must match the value used during
+                capture to retrieve the correct metadata tensors.
+        """
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):

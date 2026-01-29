@@ -547,7 +547,14 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        is_lora: bool = False,
     ):
+        """Initialize forward metadata for capturing CUDA graph.
+
+        Args:
+            is_lora: Whether this is a LoRA graph. Used to key metadata by (bs, is_lora)
+                to support both LoRA and non-LoRA graphs for the same batch size.
+        """
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
@@ -576,7 +583,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.decode_cuda_graph_metadata[(bs, is_lora)] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
             for i in range(self.num_wrappers):
                 decode_wrappers[i].begin_forward = partial(
@@ -684,14 +691,21 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        is_lora: bool = False,
     ):
+        """Initialize forward metadata for replaying CUDA graph.
+
+        Args:
+            is_lora: Whether this is a LoRA graph. Must match the value used during
+                capture to retrieve the correct metadata tensors.
+        """
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
+                decode_wrappers=self.decode_cuda_graph_metadata[(bs, is_lora)],
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
                 fixed_split_size=None,
