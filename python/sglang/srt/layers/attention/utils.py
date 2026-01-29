@@ -255,8 +255,8 @@ def pad_sequence_with_mask(
         dtype=torch.bool,
     )
 
-    BLOCK_M = 32
     BLOCK_D = triton.next_power_of_2(hidden_dim)
+    BLOCK_M = triton.next_power_of_2(max_len)
 
     grid = (
         B,

@@ -64,6 +64,7 @@ suites = {
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
+        TestFile("ep/test_moriep_small.py"),
     ],
 }
 
