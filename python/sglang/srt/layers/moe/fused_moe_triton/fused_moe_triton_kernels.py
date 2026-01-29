@@ -618,19 +618,21 @@ def fused_moe_kernel(
     if FUSE_SUM_ALL_REDUCE:
         offs_token_out = offs_token // ROUTER_TOPK
         c_ptrs = (
-            c_ptr
-            + stride_cm * offs_token_out[:, None]
-            + stride_cn * offs_cn[None, :]
+            c_ptr + stride_cm * offs_token_out[:, None] + stride_cn * offs_cn[None, :]
         )
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
     else:
         if c_sorted:
             c_ptrs = (
-                c_ptr + stride_cm * offs_token_id[:, None] + stride_cn * offs_cn[None, :]
+                c_ptr
+                + stride_cm * offs_token_id[:, None]
+                + stride_cn * offs_cn[None, :]
             )
         else:
-            c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            c_ptrs = (
+                c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+            )
         c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
         tl.store(c_ptrs, accumulator, mask=c_mask)
 
@@ -740,7 +742,9 @@ def invoke_fused_moe_kernel(
         and block_shape is not None
         and block_shape[1] > 0
     ):
-        assert not fuse_sum_all_reduce, "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
+        assert (
+            not fuse_sum_all_reduce
+        ), "fuse_sum_all_reduce is not supported for GPTQ/AWQ kernels"
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
