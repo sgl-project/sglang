@@ -9,6 +9,22 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_SCHEMES = ["s3://", "gs://"]
 
+# Design Pattern: Single Metadata Download Before Process Launch
+
+#   1. Engine entrypoint (engine.py) or server arguments post init  (server_args.py):
+#     - Downloads config/tokenizer metadata ONCE before launching subprocesses
+#     - This happens in the main process, avoiding multi-process coordination
+#
+#   2. ModelConfig/HF Utils (model_config.py, hf_transformers_utils.py):
+#     - Use ObjectStorageModel.get_path() to retrieve the cached local path
+#     - NO re-download - just path resolution
+#
+#   3. RunaiModelStreamerLoader (loader.py):
+#     - Calls list_safetensors() which operates directly on the object storage URI
+#     - Streams weights lazily during model loading
+
+#   This avoids file locks, race conditions, and duplicate downloads
+
 
 def get_cache_dir() -> str:
     # Expand user path (~) to ensure absolute paths for locking
@@ -37,14 +53,20 @@ def is_runai_obj_uri(model_or_path: str) -> bool:
 
 class ObjectStorageModel:
     """
-    A class representing an ObjectStorage model mirrored into a
-    temporary directory.
+    Model loader that uses Runai Model Streamer to load a model.
+
+      Supports object storage (S3, GCS) with lazy weight streaming.
+
+      Configuration (via load_config.model_loader_extra_config):
+          - distributed (bool): Enable distributed streaming
+          - concurrency (int): Number of concurrent downloads
+          - memory_limit (int): Memory limit for streaming buffer
+
+      Note: Metadata files must be pre-downloaded via
+      ObjectStorageModel.download_and_get_path() before instantiation.
 
     Attributes:
         dir: The temporary created directory.
-
-    Methods:
-        pull_files(): Pull model from object storage to the temporary directory.
     """
 
     def __init__(self, url: str) -> None:
