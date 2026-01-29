@@ -38,6 +38,30 @@ def _get_cutedsl_gdn_verify():
         except ImportError:
             _cutedsl_gdn_verify_available = False
     return _cutedsl_gdn_verify_available, _cutedsl_gdn_verify_k_last
+
+
+# Lazy import for FlashInfer GDN prefill kernel
+_flashinfer_gdn_prefill_available = None
+_flashinfer_chunk_gated_delta_rule = None
+
+
+def _get_flashinfer_gdn_prefill():
+    """Lazy import for FlashInfer GDN prefill kernel."""
+    global _flashinfer_gdn_prefill_available, _flashinfer_chunk_gated_delta_rule
+    if _flashinfer_gdn_prefill_available is None:
+        try:
+            os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+            from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+            _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
+            # Check if SM90+ (required for FlashInfer prefill)
+            _flashinfer_gdn_prefill_available = (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] >= 9
+            )
+        except (ImportError, RuntimeError):
+            _flashinfer_gdn_prefill_available = False
+    return _flashinfer_gdn_prefill_available, _flashinfer_chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -1358,9 +1382,124 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Prefill/Extend path
             g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
             
-            # Only cuda env uses fuse ssm_states update
-            # For K-last layout, we need to handle V-last kernel with K-last pool
+            # Check if we should use FlashInfer prefill (K-last optimized)
+            use_flashinfer_prefill = False
             if self.ssm_k_last:
+                disable_flashinfer_prefill = (
+                    os.getenv("SGLANG_DISABLE_FLASHINFER_PREFILL", "0") == "1"
+                )
+                # FlashInfer requires square state matrix (K == V)
+                kv_same = head_k_dim == head_v_dim
+                # FlashInfer expects num_sab_heads = max(num_q_heads, num_v_heads)
+                # ssm_states has shape [pool_size, HV, V, K] where HV = num_value_heads
+                # In GVA: num_sab_heads = num_v_heads = HV, format matches
+                # In GQA: num_sab_heads = num_q_heads > HV, format doesn't match (fallback to Triton)
+                # For safety, only use FlashInfer when num_sab_heads == num_value_heads (GVA or equal heads)
+                num_sab_heads = max(num_heads, num_value_heads)
+                heads_match = num_sab_heads == num_value_heads
+                if not disable_flashinfer_prefill and kv_same and heads_match:
+                    flashinfer_available, flashinfer_chunk_gdr = _get_flashinfer_gdn_prefill()
+                    use_flashinfer_prefill = flashinfer_available and flashinfer_chunk_gdr is not None
+            
+            if use_flashinfer_prefill:
+                # Use FlashInfer prefill kernel (K-last format, no transpose needed)
+                batch_size = cache_indices.shape[0]
+                total_seq_len = query.shape[1]  # query is [1, total_seq_len, H, K]
+                
+                # Check if cache_indices is contiguous to avoid unnecessary copies
+                cache_indices_contiguous = (
+                    batch_size > 0
+                    and torch.equal(
+                        cache_indices,
+                        torch.arange(
+                            batch_size,
+                            device=cache_indices.device,
+                            dtype=cache_indices.dtype,
+                        ),
+                    )
+                )
+                
+                # Format conversion: SGLang -> FlashInfer
+                # q/k/v: [1, total_seq_len, H, K] -> [total_seq_len, H, K]
+                q_fi = query[0].contiguous()  # [total_seq_len, num_heads, head_k_dim]
+                k_fi = key[0].contiguous()  # [total_seq_len, num_heads, head_k_dim]
+                v_fi = value[0].contiguous()  # [total_seq_len, num_value_heads, head_v_dim]
+                
+                # g (alpha): g_log is in log space, convert to alpha = exp(g_log)
+                # g_log: [1, total_seq_len, num_value_heads] -> alpha: [total_seq_len, num_sab_heads]
+                # FlashInfer expects [total_seq_len, num_sab_heads] where num_sab_heads = max(num_q_heads, num_v_heads)
+                # At this point, num_sab_heads == num_value_heads (checked above), so format matches
+                num_sab_heads = max(num_heads, num_value_heads)  # Should equal num_value_heads at this point
+                head_size = head_k_dim  # K == V at this point
+                alpha_fi = torch.exp(g[0]).contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
+                beta_fi = beta[0].contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
+                
+                # cu_seqlens: query_start_loc [batch+1] int32 -> int64
+                cu_seqlens_fi = query_start_loc.to(torch.int64)
+                
+                # initial_state and output_state: optimize based on cache_indices contiguity
+                # FlashInfer expects [num_seqs, num_sab_heads, head_size, head_size] where head_size == K == V
+                # At this point, we know: kv_same (K == V) and heads_match (num_sab_heads == num_value_heads)
+                
+                if cache_indices_contiguous:
+                    # Use view to avoid copy: ssm_states[:batch_size] is a view
+                    # ssm_states: [pool_size, HV, V, K] -> FlashInfer expects [batch, num_sab_heads, head_size, head_size]
+                    # Since V == K == head_size and num_sab_heads == HV, we can use ssm_states directly
+                    initial_state_fi = ssm_states[:batch_size].to(torch.float32)  # [batch, HV, V, K] -> [batch, num_sab_heads, head_size, head_size]
+                    output_state_fi = ssm_states[:batch_size].to(torch.float32)  # Direct write to ssm_states
+                else:
+                    # Need to copy: ssm_states[cache_indices] creates a new tensor
+                    initial_state_fi = ssm_states[cache_indices].to(torch.float32)  # [batch, HV, V, K]
+                    output_state_fi = torch.empty(
+                        (batch_size, num_sab_heads, head_size, head_size),
+                        dtype=torch.float32,
+                        device=ssm_states.device,
+                    )
+                
+                # Call FlashInfer prefill kernel
+                output_fi, output_state_fi_result = flashinfer_chunk_gdr(
+                    q=q_fi,
+                    k=k_fi,
+                    v=v_fi,
+                    g=alpha_fi,
+                    beta=beta_fi,
+                    scale=None,  # Will use default 1/sqrt(head_size)
+                    initial_state=initial_state_fi,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens_fi,
+                    use_qk_l2norm_in_kernel=True,
+                    output=None,  # Let FlashInfer allocate
+                    output_state=output_state_fi,
+                )
+                
+                # Process output
+                # output_fi: [total_seq_len, num_o_heads, head_size] -> [1, total_seq_len, num_o_heads, head_size]
+                core_attn_out = output_fi.view(1, total_seq_len, num_value_heads, head_v_dim)
+                
+                # output_state: already written to ssm_states if contiguous, otherwise copy back
+                if not cache_indices_contiguous:
+                    ssm_states[cache_indices] = output_state_fi_result.to(
+                        ssm_states.dtype, copy=False
+                    )
+                else:
+                    # output_state_fi is a view of ssm_states, kernel wrote directly
+                    # Just ensure dtype matches (if needed)
+                    if ssm_states.dtype != torch.float32:
+                        ssm_states[:batch_size] = output_state_fi_result.to(
+                            ssm_states.dtype, copy=False
+                        )
+                
+                # Track mamba state (h is not returned by FlashInfer, use None or compute if needed)
+                # Note: FlashInfer doesn't return intermediate h states, so we pass None
+                # The tracking function should handle this gracefully
+                self._track_mamba_state_extend(
+                    forward_batch, None, ssm_states, forward_metadata
+                )
+                
+                # Return early: FlashInfer prefill path is complete
+                return core_attn_out
+            
+            elif self.ssm_k_last:
                 disable_k_last_inplace_transpose = (
                     os.getenv("SGLANG_DISABLE_KLAST_INPLACE_TRANSPOSE", "0") == "1"
                 )
