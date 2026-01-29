@@ -71,10 +71,7 @@ class LoRAConfig:
         """
         weights_dir = self._get_weights_dir()
         if weights_dir is None:
-            logger.debug(
-                f"Path '{self.path}' is not a local directory, "
-                "falling back to declared target_modules"
-            )
+            # _get_weights_dir already logged the warning
             return None
 
         safetensors_path = self._find_safetensors_file(weights_dir)
@@ -105,9 +102,18 @@ class LoRAConfig:
         """Get the directory containing adapter weights."""
         if os.path.isdir(self.path):
             return self.path
-        # For HF repo IDs, fall back to declared target_modules
-        # (safetensors would need to be downloaded separately)
-        return None
+        # For HF repo IDs, download the safetensors file to inspect it.
+        # This is cached by huggingface_hub, so it won't be re-downloaded later.
+        try:
+            return snapshot_download(
+                self.path, allow_patterns=["adapter_model.safetensors"]
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not download adapter_model.safetensors for '{self.path}'. "
+                f"Falling back to declared target_modules. Error: {e}"
+            )
+            return None
 
     def _find_safetensors_file(self, weights_dir: str) -> Optional[str]:
         """Find the safetensors file in the weights directory."""
