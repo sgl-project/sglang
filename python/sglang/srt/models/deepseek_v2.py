@@ -822,9 +822,7 @@ class DeepseekV2MoE(nn.Module):
             ):
                 dispatcher.clear_overlap_args()
                 self.experts.clear_overlap_args()
-                post_combine_hook_handle.remove()
-
-                
+                post_combine_hook_handle.remove()            
 
             assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
             deepep_dispatch_hook_handle = (
@@ -1058,22 +1056,9 @@ class DeepseekV2MoE(nn.Module):
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
-        ##TODO(billishyahao): fix this bug 
-
         if get_moe_a2a_backend().is_mori():
-            # logger.info(f"bill-dbg: op_output {state._data=}")
             num_tokens = state.pop("num_tokens")
-            # logger.info(f"bill-dbg: {num_tokens=}")
             final_hidden_states = final_hidden_states[:num_tokens]
-            # if (shared_output := state.get("shared_output")) is not None:
-            #     num_tokens = shared_output.shape[0]
-            #     logger.info(f"bill-dbg: {num_tokens=}")
-            #     final_hidden_states = final_hidden_states[:num_tokens]
-            # else:
-            #     # logger.info(f"bill-dbg: shared_output is None...")
-            #     # logger.info(f"bill-dbg: {final_hidden_states.shape=}")
-            #     num_tokens = 0
-            #     final_hidden_states = []
 
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
