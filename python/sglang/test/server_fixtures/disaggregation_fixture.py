@@ -112,13 +112,18 @@ def _get_available_ib_devices():
     """
     ib_sysfs_path = "/sys/class/infiniband"
     if not os.path.isdir(ib_sysfs_path):
+        logger.info("IB sysfs path %s does not exist", ib_sysfs_path)
         return None
 
+    all_devices = sorted(os.listdir(ib_sysfs_path))
+    logger.info("All IB devices in sysfs: %s", all_devices)
+
     devices = []
-    for dev in sorted(os.listdir(ib_sysfs_path)):
+    for dev in all_devices:
         # Check port 1 state and rate (most devices have single port)
         port_path = os.path.join(ib_sysfs_path, dev, "ports", "1")
         if not os.path.isdir(port_path):
+            logger.info("Device %s: SKIPPED (no port 1)", dev)
             continue
 
         # Check if port is active
@@ -128,8 +133,10 @@ def _get_available_ib_devices():
                 state = f.read().strip()
                 # State format is like "4: ACTIVE" or just "ACTIVE"
                 if "ACTIVE" not in state.upper():
+                    logger.info("Device %s: SKIPPED (state=%s)", dev, state)
                     continue
-        except (OSError, IOError):
+        except (OSError, IOError) as e:
+            logger.info("Device %s: SKIPPED (cannot read state: %s)", dev, e)
             continue
 
         # Check rate (filter out low-speed NICs like 10/25 Gbps Ethernet)
@@ -140,13 +147,16 @@ def _get_available_ib_devices():
                 # Rate format is like "400 Gb/sec" or just a number
                 rate = int(rate_str.split()[0])
                 if rate < 100:  # Skip devices slower than 100 Gbps
+                    logger.info("Device %s: SKIPPED (rate=%d Gbps)", dev, rate)
                     continue
-        except (OSError, IOError, ValueError, IndexError):
+        except (OSError, IOError, ValueError, IndexError) as e:
             # If we can't read rate, include the device anyway
-            pass
+            logger.info("Device %s: cannot read rate (%s), including anyway", dev, e)
 
         devices.append(dev)
+        logger.info("Device %s: INCLUDED", dev)
 
+    logger.info("Filtered IB devices: %s (count=%d)", devices, len(devices))
     return devices if devices else None
 
 
@@ -198,6 +208,14 @@ def get_rdma_devices_args():
             )
 
     # 3. Generate RDMA device names
+    # Protect against division by zero when n_rdma > 8
+    if n_rdma > 8:
+        logger.warning(
+            "More than 8 RDMA devices detected (%d), using first and middle device",
+            n_rdma,
+        )
+        return ",".join(_pick_default_pair(rdma_all_devices))
+
     rdma_devices = []
     for gpu_idx in gpu_indices:
         nic_index = gpu_idx // (8 // n_rdma)
