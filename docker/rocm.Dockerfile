@@ -183,7 +183,7 @@ RUN git clone ${SGL_REPO} \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip,diffusion_hip]"; \
+         python -m pip --no-cache-dir install -e "python[all_hip]"; \
        fi
 
 RUN python -m pip cache purge
