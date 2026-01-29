@@ -53,8 +53,7 @@ elif _is_hip:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
-    else:
-        from vllm import _custom_ops as vllm_ops
+    # No vllm import needed - using triton/torch.compile fallback for moe_sum
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -492,9 +491,10 @@ def fused_experts_impl(
                         activation,
                     )
             else:
-                vllm_ops.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
+                # Native PyTorch fallback for non-CUDA/HIP environments
+                x = intermediate_cache1.view(-1, N)
+                d = x.shape[-1] // 2
+                intermediate_cache2.copy_(F.silu(x[..., :d]) * x[..., d:])
         elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
@@ -512,9 +512,10 @@ def fused_experts_impl(
                         activation,
                     )
             else:
-                vllm_ops.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1.view(-1, N)
-                )
+                # Native PyTorch fallback for non-CUDA/HIP environments
+                x = intermediate_cache1.view(-1, N)
+                d = x.shape[-1] // 2
+                intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
         # Activation function without multiplication
         elif activation == "silu" and not is_gated:
             intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
@@ -607,9 +608,9 @@ def fused_experts_impl(
                         routed_scaling_factor,
                     )
         else:
-            vllm_ops.moe_sum(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            # Native PyTorch fallback for non-CUDA/HIP environments
+            out_hidden_states[begin_chunk_idx:end_chunk_idx].copy_(
+                intermediate_cache3.view(*intermediate_cache3.shape).sum(dim=1)
             )
 
     return out_hidden_states
