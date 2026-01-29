@@ -74,7 +74,10 @@ class NGRAMWorkerV2(NGRAMWorker):
 
         self.ngram_cache.synchronize()
         batch_tokens = []
+        assert len(batch.reqs) == len(self.prev_token_ids)
         for i, req in enumerate(batch.reqs):
+            # TODO grammar doesn't overlap, output_ids will be normal, deal with it!
+            # prev_token_id and prev_accept_lens are filtered and merged, so here should not encounter index out of bound
             prev_tokens = self.prev_token_ids[
                 i * stride : i * stride + self.prev_accept_lens[i]
             ]
@@ -102,6 +105,7 @@ class NGRAMWorkerV2(NGRAMWorker):
             # if batch.forward_mode.is_extend():
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
+            # TODO deal with grammar, where output_id is complete
             prev_tokens = self.prev_token_ids[
                 i * stride : i * stride + self.prev_accept_lens[i]
             ]
@@ -206,30 +210,32 @@ class NGRAMWorkerV2(NGRAMWorker):
                     verify_input.retrive_next_token.shape
                 ).cpu()
 
-            if self.count == 0:
-                prompt_len = len(model_worker_batch.reqs[0].origin_input_ids)
-                cache_loc = self.req_to_token_pool.req_to_token[
-                    model_worker_batch.req_pool_indices[0]
-                ][: (prompt_len + self.draft_token_num)]
-                k, v = self.token_to_kv_pool.get_kv_buffer(layer_id=0)
-                k, v = k[cache_loc], v[cache_loc]
-                torch.save(
-                    {"k": k, "v": v, "prompt_len": prompt_len},
-                    "ngram-v2-before-verify-kv.pt",
-                )
+            # if self.count == 0:
+            #     prompt_len = len(model_worker_batch.reqs[0].origin_input_ids)
+            #     cache_loc = self.req_to_token_pool.req_to_token[
+            #         model_worker_batch.req_pool_indices[0]
+            #     ][: (prompt_len + self.draft_token_num)]
+            #     k, v = self.token_to_kv_pool.get_kv_buffer(layer_id=0)
+            #     k, v = k[cache_loc], v[cache_loc]
+            #     torch.save(
+            #         {"k": k, "v": v, "prompt_len": prompt_len},
+            #         "ngram-v2-before-verify-kv.pt",
+            #     )
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
-            if self.count == 0:
-                prompt_len = len(model_worker_batch.reqs[0].origin_input_ids)
-                cache_loc = self.req_to_token_pool.req_to_token[
-                    model_worker_batch.req_pool_indices[0]
-                ][: (prompt_len + self.draft_token_num)]
-                k, v = self.token_to_kv_pool.get_kv_buffer(layer_id=0)
-                k, v = k[cache_loc], v[cache_loc]
-                torch.save({"k": k, "v": v, "prompt_len": prompt_len}, "ngram-v2-kv.pt")
-                self.count += 1
+
+            # if self.count == 0:
+            #     prompt_len = len(model_worker_batch.reqs[0].origin_input_ids)
+            #     cache_loc = self.req_to_token_pool.req_to_token[
+            #         model_worker_batch.req_pool_indices[0]
+            #     ][: (prompt_len + self.draft_token_num)]
+            #     k, v = self.token_to_kv_pool.get_kv_buffer(layer_id=0)
+            #     k, v = k[cache_loc], v[cache_loc]
+            #     torch.save({"k": k, "v": v, "prompt_len": prompt_len}, "ngram-v2-kv.pt")
+            #     self.count += 1
+
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
@@ -276,6 +282,7 @@ class NGRAMWorkerV2(NGRAMWorker):
 
             self._update_ngram_cache_v2(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
+            verify_next_token_ids = predict
 
         else:
             batch_result = self.target_worker.forward_batch_generation(
@@ -287,17 +294,21 @@ class NGRAMWorkerV2(NGRAMWorker):
                 batch_result.can_run_cuda_graph,
             )
             new_seq_lens = model_worker_batch.seq_lens
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
             accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
                 device=self.device, non_blocking=True
             )
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
+            verify_next_token_ids = predict.to_padded_tensor(
+                0, (bs, self.draft_token_num)
+            )
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
-            next_token_ids=predict,
+            next_token_ids=verify_next_token_ids,
             accept_lens=accept_length,
         )
         return GenerationBatchResult(
