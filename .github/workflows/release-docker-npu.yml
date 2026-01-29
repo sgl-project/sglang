@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ["8.3.rc2"]
+        cann_version: ["8.5.0"]
         device_type: ["910b", "a3"]
     steps:
       - name: Checkout repository
@@ -81,7 +81,7 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2025.12.31
+            SGLANG_KERNEL_NPU_TAG=2026.01.21
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
             SGLANG_TAG=${{ steps.version.outputs.version }}
