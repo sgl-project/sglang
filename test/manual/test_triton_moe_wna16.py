@@ -7,6 +7,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.utils import get_device
 
 NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
@@ -159,10 +160,10 @@ def test_fused_moe_wn16(
     weight_bits: int,
 ):
     print(m, n, k, e, topk, dtype, group_size, has_zp, weight_bits)
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
-    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
-    score = torch.randn((m, e), device="cuda", dtype=dtype)
+    a = torch.randn((m, k), device=get_device(), dtype=dtype) / 10
+    w1 = torch.randn((e, 2 * n, k), device=get_device(), dtype=dtype) / 10
+    w2 = torch.randn((e, k, n), device=get_device(), dtype=dtype) / 10
+    score = torch.randn((m, e), device=get_device(), dtype=dtype)
 
     if weight_bits == 4:
         pack_factor = 2
@@ -174,16 +175,22 @@ def test_fused_moe_wn16(
     w1_ref = w1.clone()
     w2_ref = w2.clone()
     w1_qweight = torch.empty(
-        (e, 2 * n, k // pack_factor), device="cuda", dtype=torch.uint8
+        (e, 2 * n, k // pack_factor), device=get_device(), dtype=torch.uint8
     )
-    w2_qweight = torch.empty((e, k, n // pack_factor), device="cuda", dtype=torch.uint8)
-    w1_scales = torch.empty((e, 2 * n, k // group_size), device="cuda", dtype=dtype)
-    w2_scales = torch.empty((e, k, n // group_size), device="cuda", dtype=dtype)
+    w2_qweight = torch.empty(
+        (e, k, n // pack_factor), device=get_device(), dtype=torch.uint8
+    )
+    w1_scales = torch.empty(
+        (e, 2 * n, k // group_size), device=get_device(), dtype=dtype
+    )
+    w2_scales = torch.empty((e, k, n // group_size), device=get_device(), dtype=dtype)
     w1_qzeros = torch.empty(
-        (e, 2 * n // pack_factor, k // group_size), device="cuda", dtype=torch.uint8
+        (e, 2 * n // pack_factor, k // group_size),
+        device=get_device(),
+        dtype=torch.uint8,
     )
     w2_qzeros = torch.empty(
-        (e, k // pack_factor, n // group_size), device="cuda", dtype=torch.uint8
+        (e, k // pack_factor, n // group_size), device=get_device(), dtype=torch.uint8
     )
 
     for i in range(e * 2):
