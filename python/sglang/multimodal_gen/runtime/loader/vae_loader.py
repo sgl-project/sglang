@@ -21,8 +21,9 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
+
 class VAELoader(ComponentLoader):
-    """Loader for VAE."""
+    """Shared loader for (video/audio) VAE modules."""
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
@@ -42,17 +43,20 @@ class VAELoader(ComponentLoader):
         server_args.model_paths[module_name] = component_model_path
 
         logger.debug("HF model config: %s", config)
-        if module_name == "audio_vae":
-            vae_config = server_args.pipeline_config.audio_vae_config
-            vae_precision = server_args.pipeline_config.audio_vae_precision
+        if module_name in ("vae", "video_vae"):
+            pipeline_vae_config_attr = "vae_config"
+            pipeline_vae_precision = "vae_precision"
+        elif module_name in ("audio_vae",):
+            pipeline_vae_config_attr = "audio_vae_config"
+            pipeline_vae_precision = "audio_vae_precision"
         else:
-            vae_config = server_args.pipeline_config.vae_config
-            vae_precision = server_args.pipeline_config.vae_precision
-
+            raise ValueError(f"Unsupported module name for VAE loader: {module_name}")
+        vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
+        vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
         vae_config.update_model_arch(config)
-
-        # NOTE: some post init logics are only available after updated with config
-        vae_config.post_init()
+        if hasattr(vae_config, "post_init"):
+            # NOTE: some post init logics are only available after updated with config
+            vae_config.post_init()
 
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)
@@ -91,4 +95,14 @@ class VAELoader(ComponentLoader):
         ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
+
+        state_keys = set(vae.state_dict().keys())
+        loaded_keys = set(loaded.keys())
+        missing_keys = sorted(state_keys - loaded_keys)
+        unexpected_keys = sorted(loaded_keys - state_keys)
+        if missing_keys:
+            logger.warning("VAE missing keys: %s", missing_keys)
+        if unexpected_keys:
+            logger.warning("VAE unexpected keys: %s", unexpected_keys)
+
         return vae.eval()
