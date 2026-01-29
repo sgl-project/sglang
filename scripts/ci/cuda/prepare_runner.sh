@@ -16,4 +16,9 @@ echo ""
 python3 "${SCRIPT_DIR}/../utils/prevalidate_cached_models.py"
 echo ""
 
+# Validate weight checksums for critical models to detect bit-flip corruption
+# This catches corruption that safetensors header validation might miss
+python3 "${SCRIPT_DIR}/../utils/validate_weight_checksums.py"
+echo ""
+
 echo "CI runner preparation complete!"
