@@ -2207,6 +2207,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             encoder_lens_cpu=self.encoder_lens_cpu,
             encoder_out_cache_loc=self.encoder_out_cache_loc,
             lora_ids=[req.lora_id for req in self.reqs],
+            req_ids=[req.rid for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
             token_type_ids=self.token_type_ids,
@@ -2368,6 +2369,9 @@ class ModelWorkerBatch:
 
     # For LoRA
     lora_ids: Optional[List[str]]
+
+    # For per-chain (per request) loggings
+    req_ids: Optional[List[str]]
 
     # Sampling info
     sampling_info: SamplingBatchInfo
