@@ -233,7 +233,8 @@ class ComponentLoader(ABC):
             "video_dit",
         ]:
             transformers_or_diffusers = "diffusers"
-if (
+
+        if (
             module_type == "scheduler"
             and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
         ):
