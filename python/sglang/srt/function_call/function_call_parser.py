@@ -206,6 +206,5 @@ class FunctionCallParser:
         ):
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
-            return ("json_schema", json_schema)
+        # Disable JSON schema constraint for tool calls to avoid repetition issues
+        # The parser-based approach is sufficient and doesn't cause out-of-distribution looping

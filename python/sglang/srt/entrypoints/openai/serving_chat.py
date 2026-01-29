@@ -401,14 +401,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice
                 )
-            # Handle JSON schema constraint directly for required or named tool choice
-            if request.tool_choice == "required" or isinstance(
-                request.tool_choice, ToolChoice
-            ):
-                json_schema = get_json_schema_constraint(
-                    request.tools, request.tool_choice
-                )
-                tool_call_constraint = ("json_schema", json_schema)
+            # Disable JSON schema constraint for tool calls to avoid repetition issues
+            # The parser-based approach is sufficient and doesn't cause out-of-distribution looping
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
