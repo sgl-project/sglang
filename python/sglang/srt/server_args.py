@@ -1358,6 +1358,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
+                elif (
+                    is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+                ) and is_mxfp4_quant_format:
+                    self.moe_runner_backend = "auto"
+                    logger.warning(
+                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
+                    )
                 elif self.ep_size == 1 and is_triton_kernels_available():
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
