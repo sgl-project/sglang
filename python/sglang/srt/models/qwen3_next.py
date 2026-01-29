@@ -306,11 +306,12 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         self.linear_attn = RadixLinearAttention(
             layer_id=layer_id,
-            num_qk_heads=self.num_k_heads // self.attn_tp_size,
+            num_q_heads=self.num_k_heads // self.attn_tp_size,
+            num_k_heads=self.num_k_heads // self.attn_tp_size,
             num_v_heads=self.num_v_heads // self.attn_tp_size,
-            head_qk_dim=self.head_k_dim,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            attention_tp_size=self.attn_tp_size,
             conv_weights=self.conv1d.weight.squeeze(1),
             bias=self.conv1d.bias,
             activation=self.activation,

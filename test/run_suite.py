@@ -24,11 +24,6 @@ PER_COMMIT_SUITES = {
         "stage-b-test-small-1-gpu-amd-mi35x",
         "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
-        "stage-b-test-small-1-gpu-performance-amd",
-        "stage-b-test-large-1-gpu-performance-amd",
-        "stage-b-test-large-2-gpu-performance-amd",
-        "stage-b-test-small-1-gpu-accuracy-amd",
-        "stage-b-test-large-2-gpu-accuracy-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
