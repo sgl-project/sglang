@@ -1,0 +1,80 @@
+[
+  {
+    "timestamp": "2026-01-29T20:49:46.034076",
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "metrics": {
+      "en": 0.884,
+      "en:std": 0.32022492095400695,
+      "group_latin": 0.884,
+      "group_latin:std": 0.32022492095400695,
+      "score:std": 0.32022492095400695,
+      "score": 0.884
+    },
+    "score": 0.884
+  },
+  {
+    "timestamp": "2026-01-29T20:52:24.361795",
+    "model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "metrics": {
+      "en": 0.596,
+      "en:std": 0.49069746280167376,
+      "group_latin": 0.596,
+      "group_latin:std": 0.49069746280167376,
+      "score:std": 0.49069746280167376,
+      "score": 0.596
+    },
+    "score": 0.596
+  },
+  {
+    "timestamp": "2026-01-29T20:55:32.759503",
+    "model": "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct",
+    "metrics": {
+      "en": 0.872,
+      "en:std": 0.33408980828513757,
+      "group_latin": 0.872,
+      "group_latin:std": 0.33408980828513757,
+      "score:std": 0.33408980828513757,
+      "score": 0.872
+    },
+    "score": 0.872
+  },
+  {
+    "timestamp": "2026-01-29T21:00:03.773841",
+    "model": "google/gemma-2-27b-it",
+    "metrics": {
+      "en": 0.92,
+      "en:std": 0.2712931993250107,
+      "group_latin": 0.92,
+      "group_latin:std": 0.2712931993250107,
+      "score:std": 0.2712931993250107,
+      "score": 0.92
+    },
+    "score": 0.92
+  },
+  {
+    "timestamp": "2026-01-29T21:01:45.987882",
+    "model": "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8",
+    "metrics": {
+      "en": 0.868,
+      "en:std": 0.3384907679686405,
+      "group_latin": 0.868,
+      "group_latin:std": 0.3384907679686405,
+      "score:std": 0.3384907679686405,
+      "score": 0.868
+    },
+    "score": 0.868
+  },
+  {
+    "timestamp": "2026-01-29T21:03:12.639314",
+    "model": "neuralmagic/Mistral-7B-Instruct-v0.3-FP8",
+    "metrics": {
+      "en": 0.564,
+      "en:std": 0.4958870839213298,
+      "group_latin": 0.564,
+      "group_latin:std": 0.4958870839213298,
+      "score:std": 0.4958870839213298,
+      "score": 0.564
+    },
+    "score": 0.564
+  }
+]
