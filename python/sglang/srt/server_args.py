@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_memory_capacity,
     get_device_name,
     get_device_sm,
+    get_int_env_var,
     get_quantization_config,
     is_blackwell_supported,
     is_cuda,
@@ -182,7 +183,14 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
-MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"]
+MOE_A2A_BACKEND_CHOICES = [
+    "none",
+    "deepep",
+    "mooncake",
+    "mori",
+    "ascend_fuseep",
+    "flashinfer",
+]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -475,7 +483,7 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "ascend_fuseep", "flashinfer"
+        "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -2075,6 +2083,18 @@ class ServerArgs:
             assert self.moe_runner_backend in [
                 "flashinfer_cutlass"
             ], "Flashinfer MoE A2A is only supported with flashinfer_cutlass moe runner backend"
+
+        if self.moe_a2a_backend == "mori":
+            self.ep_size = self.tp_size
+            self.deepep_mode = "normal"
+            logger.warning("auto set deepep_mode=`normal` for MORI EP")
+            logger.warning(
+                f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
+            assert (self.chunked_prefill_size) <= get_int_env_var(
+                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+            ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
