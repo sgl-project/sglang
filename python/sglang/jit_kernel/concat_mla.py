@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,28 +26,6 @@ def _jit_concat_mla_absorb_q_module() -> Module:
         cuda_files=["elementwise/concat_mla.cuh"],
         cuda_wrappers=[("concat_mla_absorb_q", "ConcatMlaAbsorbQKernel::run")],
     )
-
-
-@cache_once
-def can_use_jit_concat_mla_k() -> bool:
-    logger = logging.getLogger(__name__)
-    try:
-        _jit_concat_mla_k_module()
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT concat_mla_k kernel: {e}")
-        return False
-
-
-@cache_once
-def can_use_jit_concat_mla_absorb_q() -> bool:
-    logger = logging.getLogger(__name__)
-    try:
-        _jit_concat_mla_absorb_q_module()
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT concat_mla_absorb_q kernel: {e}")
-        return False
 
 
 def concat_mla_k(k: torch.Tensor, k_nope: torch.Tensor, k_rope: torch.Tensor) -> None:
