@@ -89,9 +89,9 @@ class XpuPlatform(Platform):
         current = torch.xpu.current_device()
         if current != device_id:
             logger.warning(
-            "current device is not %s, but %s; this may cause useless memory allocation for torch XPU context.",
-            device_id,
-            current,
+                "current device is not %s, but %s; this may cause useless memory allocation for torch XPU context.",
+                device_id,
+                current,
             )
 
         if empty_cache:
@@ -126,12 +126,40 @@ class XpuPlatform(Platform):
     ) -> str:
         """Get the attention backend class string for Intel XPU.
 
-        Intel XPU supports PyTorch's native SDPA which is the most portable option.
+        Defaults to XPU backend (requires fp16/bf16 and a supported head size),
+        falling back to Torch SDPA if constraints are not met.
         """
-        if (
-            selected_backend == AttentionBackendEnum.TORCH_SDPA
-            or selected_backend is None
-        ):
+        if selected_backend in (AttentionBackendEnum.XPU_FA, None):
+            if dtype not in (torch.float16, torch.bfloat16):
+                logger.info(
+                    "XPU attention backend requires fp16/bf16 but got dtype=%s; falling back to Torch SDPA.",
+                    dtype,
+                )
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+            try:
+                from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (  # noqa: F401
+                    XPUAttentionBackend,
+                )
+
+                supported_sizes = XPUAttentionBackend.get_supported_head_sizes()
+                if head_size not in supported_sizes:
+                    logger.info(
+                        "XPU attention backend does not support head_size=%d; falling back to Torch SDPA.",
+                        head_size,
+                    )
+                    return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+                logger.info("Using XPU attention backend on Intel XPU.")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend.XPUAttentionBackend"
+            except Exception as e:
+                logger.warning(
+                    "Failed to import/use XPU attention backend (%s); falling back to Torch SDPA.",
+                    e,
+                )
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
+
+        if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend for Intel XPU.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 

@@ -25,6 +25,7 @@ class DiTArchConfig(ArchConfig):
     reverse_param_names_mapping: dict = field(default_factory=dict)
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
+            AttentionBackendEnum.XPU_FA,
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
             AttentionBackendEnum.FA,
