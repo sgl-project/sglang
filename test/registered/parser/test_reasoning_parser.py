@@ -3,18 +3,20 @@ import unittest
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    GptOssDetector,
     KimiDetector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+
+# from sglang.test.test_utils import CustomTestCase  # noqa
 
 register_cpu_ci(est_time=5, suite="stage-a-cpu-only")
 
 
-class TestStreamingParseResult(CustomTestCase):
+class TestStreamingParseResult(unittest.TestCase):
     def test_init_default(self):
         """Test default initialization of StreamingParseResult."""
         result = StreamingParseResult()
@@ -28,7 +30,7 @@ class TestStreamingParseResult(CustomTestCase):
         self.assertEqual(result.reasoning_text, "reasoning")
 
 
-class TestBaseReasoningFormatDetector(CustomTestCase):
+class TestBaseReasoningFormatDetector(unittest.TestCase):
     def setUp(self):
         self.detector = BaseReasoningFormatDetector(
             think_start_token="<think>",
@@ -150,7 +152,7 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "normal")
 
 
-class TestDeepSeekR1Detector(CustomTestCase):
+class TestDeepSeekR1Detector(unittest.TestCase):
     def setUp(self):
         self.detector = DeepSeekR1Detector()
 
@@ -192,7 +194,7 @@ class TestDeepSeekR1Detector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
-class TestQwen3Detector(CustomTestCase):
+class TestQwen3Detector(unittest.TestCase):
     def setUp(self):
         self.detector = Qwen3Detector()
 
@@ -218,7 +220,7 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
 
 
-class TestQwen3ForcedReasoningDetector(CustomTestCase):
+class TestQwen3ForcedReasoningDetector(unittest.TestCase):
     def setUp(self):
         self.detector = Qwen3Detector(force_reasoning=True)
 
@@ -264,7 +266,7 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "The answer is 42.")
 
 
-class TestKimiDetector(CustomTestCase):
+class TestKimiDetector(unittest.TestCase):
     def setUp(self):
         self.detector = KimiDetector()
 
@@ -313,7 +315,7 @@ class TestKimiDetector(CustomTestCase):
         self.assertEqual(result.normal_text, "answer")
 
 
-class TestReasoningParser(CustomTestCase):
+class TestReasoningParser(unittest.TestCase):
     def test_init_valid_model(self):
         """Test initialization with valid model types."""
         parser = ReasoningParser("deepseek-r1")
@@ -384,7 +386,7 @@ class TestReasoningParser(CustomTestCase):
         self.assertTrue(parser.detector.stream_reasoning)
 
 
-class TestIntegrationScenarios(CustomTestCase):
+class TestIntegrationScenarios(unittest.TestCase):
     """Integration tests for realistic usage scenarios."""
 
     def test_deepseek_r1_complete_response(self):
@@ -490,7 +492,7 @@ class TestIntegrationScenarios(CustomTestCase):
         self.assertIn("final answer", all_normal)
 
 
-class TestBufferLossBugFix(CustomTestCase):
+class TestBufferLossBugFix(unittest.TestCase):
     """Test cases for the buffer loss bug fix in parse_streaming_increment."""
 
     def test_partial_end_tag_buffer_loss_bug(self):
@@ -587,7 +589,7 @@ class TestBufferLossBugFix(CustomTestCase):
         """
         detector = BaseReasoningFormatDetector("<think>", "</think>")
 
-        # Build up the exact start token character by character
+        # Build up exact start token character by character
         detector.parse_streaming_increment("<")
         detector.parse_streaming_increment("t")
         detector.parse_streaming_increment("h")
@@ -600,6 +602,110 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
+
+
+class TestGptOssDetector(unittest.TestCase):
+    """Test cases for GptOssDetector, including fix for tool_choice='required' bug."""
+
+    def setUp(self):
+        self.detector = GptOssDetector()
+
+    def test_init(self):
+        """Test GptOssDetector initialization."""
+        self.assertEqual(
+            self.detector.think_start_token, "<|channel|>analysis<|message|>"
+        )
+        self.assertEqual(self.detector.think_end_token, "<|end|>")
+        self.assertTrue(self.detector._in_reasoning)  # force_reasoning=True
+        self.assertTrue(self.detector.stream_reasoning)
+        self.assertIsNot(self.detector.parser, None)
+
+    def test_detect_and_parse_full_harmony_format(self):
+        """Test parsing full Harmony format with <|channel|> marker."""
+        text = "<|channel|>analysis<|message|>Let me think...<|end|>The answer is 42."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Let me think...")
+        self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_only_end_marker(self):
+        """Test parsing when only <|end|> marker is present (bug fix scenario)."""
+        text = 'Some reasoning content<|end|>[{"name":"test","parameters":{}}]'
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Some reasoning content")
+        self.assertEqual(result.normal_text, '[{"name":"test","parameters":{}}]')
+
+    def test_detect_and_parse_end_marker_with_json_array(self):
+        """Test parsing <|end|> marker followed by JSON array (user's bug scenario)."""
+        reasoning_part = "The user wants to extract concepts. Let me think about what tools to call.\n\nI should call the TermConcept function with the extracted parameters."
+        tool_call_part = '[{"name":"TermConcept","parameters":{"fsn_zh":"中部槽","concept_type":"DOMAIN_ENTITY"}}]'
+        text = f"{reasoning_part}<|end|>{tool_call_part}"
+
+        result = self.detector.detect_and_parse(text)
+        self.assertIn("extract concepts", result.reasoning_text)
+        self.assertEqual(result.normal_text, tool_call_part)
+        self.assertNotIn("<|end|>", result.reasoning_text)
+        self.assertNotIn("<|end|>", result.normal_text)
+
+    def test_detect_and_parse_multiple_end_markers(self):
+        """Test parsing when multiple <|end|> markers are present."""
+        text = "Reasoning part 1<|end|>Normal part 1<|end|>Normal part 2"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "Reasoning part 1")
+        self.assertEqual(result.normal_text, "Normal part 1<|end|>Normal part 2")
+
+    def test_detect_and_parse_no_harmony_markers(self):
+        """Test parsing when no Harmony markers are present."""
+        text = "Just some plain text without any special markers"
+        result = self.detector.detect_and_parse(text)
+        # Without markers, HarmonyParser returns empty events
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_pure_json(self):
+        """Test parsing pure JSON without any Harmony markers."""
+        text = '[{"name":"get_weather","parameters":{"city":"Beijing"}}]'
+        result = self.detector.detect_and_parse(text)
+        # Pure JSON without markers returns empty (HarmonyParser doesn't recognize it)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+    def test_parse_streaming_increment(self):
+        """Test streaming incremental parsing."""
+        # Test with full Harmony format
+        result = self.detector.parse_streaming_increment(
+            "<|channel|>analysis<|message|>"
+        )
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "")
+
+        result = self.detector.parse_streaming_increment("Let me think")
+        self.assertEqual(result.reasoning_text, "Let me think")
+        self.assertEqual(result.normal_text, "")
+
+        result = self.detector.parse_streaming_increment("<|end|>")
+        # End token flushes the reasoning content, but if it was already emitted, this should be empty
+        # Content "Let me think" was emitted in previous chunk
+        self.assertEqual(result.reasoning_text, "")
+
+        result = self.detector.parse_streaming_increment("Answer: 42")
+        self.assertEqual(result.normal_text, "Answer: 42")
+
+    def test_parse_streaming_increment_only_end_marker(self):
+        """Test streaming parsing when only <|end|> marker is present (bug fix scenario)."""
+        # Chunk 1: Reasoning content
+        result = self.detector.parse_streaming_increment("Reasoning content")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+
+        # Chunk 2: End marker
+        result = self.detector.parse_streaming_increment("<|end|>")
+        self.assertEqual(result.reasoning_text, "Reasoning content")
+        self.assertEqual(result.normal_text, "")
+
+        # Chunk 3: Normal content (tool call)
+        result = self.detector.parse_streaming_increment(' {"tool": "test"}')
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, ' {"tool": "test"}')
 
 
 if __name__ == "__main__":
