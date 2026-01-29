@@ -58,6 +58,12 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
+from sglang.srt.layers.quantization.mxfp8_utils import (
+    _copy_or_rebind,
+    _quantize_and_swizzle_with_cutlass_es_kernel,
+    _quantize_and_swizzle_with_triton_kernel,
+)
+from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -80,8 +86,6 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.layers.quantization.mxfp8_utils import _quantize_and_swizzle_with_cutlass_es_kernel, _quantize_and_swizzle_with_triton_kernel, _copy_or_rebind
-from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -106,7 +110,6 @@ if _use_aiter or _use_hip_int4:
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 logger = logging.getLogger(__name__)
-
 
 
 class Fp8Config(QuantizationConfig):
@@ -461,9 +464,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     # MXFP8 quantization
                     qweight, weight_scale = mxfp8_group_quantize(full_loaded_weight)
                     # Register weight_scale_inv if not already registered
-                    if not hasattr(layer, "weight_scale_inv") or layer.weight_scale_inv is None:
+                    if (
+                        not hasattr(layer, "weight_scale_inv")
+                        or layer.weight_scale_inv is None
+                    ):
                         layer.register_parameter(
-                            "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
+                            "weight_scale_inv",
+                            Parameter(weight_scale, requires_grad=False),
                         )
                     else:
                         layer.weight_scale_inv.data = weight_scale
@@ -1177,9 +1184,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if quantize:
             if get_moe_runner_backend().is_cutlass():
-                w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(layer.w13_weight.data)
+                w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
+                    layer.w13_weight.data
+                )
             else:
-                w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(layer.w13_weight.data)
+                w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
+                    layer.w13_weight.data
+                )
         else:
             w13_q = layer.w13_weight.data
             w13_s = self._swizzle_with_triton_kernel(
