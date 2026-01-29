@@ -141,6 +141,7 @@ test = [
   "tabulate",
 ]
 
+checkpoint-engine = ["checkpoint-engine==0.2.1"]
 all_hip = ["sglang[srt_hip]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
