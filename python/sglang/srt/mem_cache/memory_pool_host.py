@@ -39,7 +39,10 @@ if not (_is_npu or _is_xpu):
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
-    def _transfer_kv_dim_exchange(device_indices, host_indices, kv_pool_host, device_pool, direction):
+
+    def _transfer_kv_dim_exchange(
+        device_indices, host_indices, kv_pool_host, device_pool, direction
+    ):
         transfer_kv_dim_exchange(
             device_indices=device_indices,
             host_indices=host_indices,
@@ -60,6 +63,7 @@ if _is_npu:
             page_size=kv_pool_host.page_size,
             direction=direction,
         )
+
 
 logger = logging.getLogger(__name__)
 
