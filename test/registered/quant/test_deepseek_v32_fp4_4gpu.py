@@ -5,6 +5,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -14,6 +15,13 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+<<<<<<<< HEAD:test/srt/models/test_kimi_k2_models.py
+========
+register_cuda_ci(est_time=600, suite="stage-c-test-4-gpu-b200")
+
+FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
+SERVER_LAUNCH_TIMEOUT = 1200
+>>>>>>>> 7abd9e5b0 (Move test_deepseek_v32_fp4_4gpu.py to test/registered/quant/ with CI registry):test/registered/quant/test_deepseek_v32_fp4_4gpu.py
 
 class TestKimiK2Thinking(CustomTestCase):
     @classmethod
