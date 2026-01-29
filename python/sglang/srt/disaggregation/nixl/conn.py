@@ -164,6 +164,12 @@ class NixlKVManager(CommonKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._start_bootstrap_thread()
+            # If a timeout happens on the prefill side, it means prefill instances
+            # fail to receive the KV indices from the decode instance of this request.
+            # These timeout requests should be aborted to release the tree cache.
+            self.bootstrap_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT", 300
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -731,6 +737,7 @@ class NixlKVSender(CommonKVSender):
         self.xfer_handles = []
         self.has_sent = False
         self.chunk_id = 0
+        self.init_time = time.time()
 
     def send(
         self,
@@ -757,7 +764,25 @@ class NixlKVSender(CommonKVSender):
 
     def poll(self) -> KVPoll:
         if not self.has_sent:
-            return self.kv_mgr.check_status(self.bootstrap_room)
+            status = self.kv_mgr.check_status(self.bootstrap_room)
+            if status == KVPoll.Bootstrapping:
+                if self.init_time is not None:
+                    now = time.time()
+                    elapsed = now - self.init_time
+                    if elapsed >= self.kv_mgr.bootstrap_timeout:
+                        logger.warning_once(
+                            "Some requests timed out when bootstrapping, "
+                            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+                            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+                        )
+                        self.kv_mgr.record_failure(
+                            self.bootstrap_room,
+                            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.Bootstrapping",
+                        )
+                        self.conclude_state = KVPoll.Failed
+                        return KVPoll.Failed
+
+            return status
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
             return KVPoll.Success  # type: ignore
