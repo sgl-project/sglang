@@ -209,6 +209,8 @@ class BaseMultimodalProcessor(ABC):
             "aspect_ratio_mask": Modality.IMAGE,
             "num_patches": Modality.IMAGE,
             "patch_pixel_values": Modality.IMAGE,
+            "pixel_attention_mask": Modality.IMAGE,
+            "spatial_shapes": Modality.IMAGE,
             "block_sizes": Modality.IMAGE,
             "grid_thws": Modality.IMAGE,  # for kimi k2.5
             # Audio-related attributes
