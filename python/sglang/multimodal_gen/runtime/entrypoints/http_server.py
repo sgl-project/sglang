@@ -118,12 +118,28 @@ async def forward_to_scheduler(req_obj, sp):
             raise RuntimeError("Model generation returned no output.")
 
         output_file_path = sp.output_file_path()
+        sample = response.output[0]
+        try:
+            audio = response.audio
+        except AttributeError:
+            audio = None
+        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+            audio = audio[0]
+        if audio is not None and not (
+            isinstance(sample, (tuple, list)) and len(sample) == 2
+        ):
+            sample = (sample, audio)
         post_process_sample(
-            sample=response.output[0],
+            sample=sample,
             data_type=sp.data_type,
             fps=sp.fps or 24,
             save_output=True,
             save_file_path=output_file_path,
+            audio_sample_rate=(
+                response.audio_sample_rate
+                if hasattr(response, "audio_sample_rate")
+                else None
+            ),
         )
 
         if hasattr(response, "model_dump"):
@@ -167,19 +183,28 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
         image_input = inst.get("image") or inst.get("image_url")
         seed_val = params.get("seed", DEFAULT_SEED)
 
+        # Create a dictionary of provided parameters
+        # This filters out None values so the dataclass defaults kick in
+        user_params = {
+            "num_frames": params.get("num_frames"),
+            "fps": params.get("fps"),
+            "width": params.get("width"),
+            "height": params.get("height"),
+            "guidance_scale": params.get("guidance_scale"),
+            "save_output": params.get("save_output"),
+        }
+
+        # Remove None values to allow SamplingParams defaults to take over
+        valid_params = {k: v for k, v in user_params.items() if v is not None}
+
         sp = SamplingParams.from_user_sampling_params_args(
             model_path=server_args.model_path,
             request_id=rid,
             prompt=prompt,
             image_path=image_input,
-            num_frames=params.get("num_frames"),
-            fps=params.get("fps"),
-            width=params.get("width"),
-            height=params.get("height"),
-            guidance_scale=params.get("guidance_scale"),
             seed=seed_val,
             server_args=server_args,
-            save_output=params.get("save_output"),
+            **valid_params,  # Unpack the filtered dictionary
         )
 
         backend_req = prepare_request(server_args, sampling_params=sp)

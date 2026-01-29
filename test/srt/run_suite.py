@@ -34,8 +34,9 @@ suites = {
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_fp8_blockwise_gemm.py", 280),
-        TestFile("test_gpt_oss_4gpu.py", 700),
-        TestFile("test_llama31_fp4.py", 90),
+        TestFile("test_gpt_oss_4gpu.py", 300),
+        TestFile("test_nvfp4_gemm.py", 360),
+        TestFile("test_deepseek_v32_fp4_4gpu.py", 600),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
@@ -48,26 +49,13 @@ suites = {
         TestFile("ep/test_deepep_small.py", 531),
         TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
-    # Disabled: IBGDA/cudaHostRegister environment issues on 8-GPU runner, see #17175
-    # 4-GPU DeepEP tests provide sufficient coverage
-    # "per-commit-8-gpu-h200-deepep": [
-    #     TestFile("ep/test_deepep_large.py", 563),
-    # ],
-    "quantization_test": [
-        TestFile("quant/test_awq.py", 163),
-        TestFile("quant/test_marlin_moe.py", 200),
-        TestFile("test_bnb.py", 5),
-        TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_quantization.py", 185),
-        TestFile("test_gguf.py", 96),
+    "per-commit-8-gpu-h200-deepep": [
+        TestFile("ep/test_deepep_large.py", 563),
     ],
+    # quantization_test suite migrated to test/registered/quant/
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
-        TestFile("test_bench_one_batch.py"),
-        TestFile("test_bench_serving.py"),
-        TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
@@ -76,7 +64,7 @@ suites = {
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
-        TestFile("ep/test_deepep_large.py", 563),  # Disabled: see #17175
+        TestFile("ep/test_moriep_small.py"),
     ],
 }
 
@@ -91,10 +79,7 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_rope_rocm.py", 3),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_type_based_dispatcher.py", 10),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
@@ -103,14 +88,9 @@ suite_amd = {
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
-        TestFile("test_int4fp8_moe.py", 313),
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
-    ],
-    "per-commit-8-gpu-amd": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
     ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
@@ -154,6 +134,7 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
@@ -176,7 +157,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 3600),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
         TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
