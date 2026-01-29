@@ -138,7 +138,6 @@ async def generations(
     )
     save_file_path = save_file_path_list[0]
 
-    resp_format = (request.response_format or "b64_json").lower()
     b64_data = None
 
     # 1. Get b64 data if needed
@@ -300,14 +299,15 @@ async def edits(
 
     # 4. Return Response
     if (response_format or "b64_json").lower() == "b64_json":
-        response_kwargs = {"data": []}
-        response_kwargs["data"] = [
-            ImageResponseData(
-                b64_json=frames_list[0],
-                revised_prompt=prompt,
-            )
-            for frames_list in b64_data
-        ]
+        response_kwargs = {
+            "data": [
+                ImageResponseData(
+                    b64_json=frames_list[0],
+                    revised_prompt=prompt,
+                )
+                for frames_list in b64_data
+            ]
+        }
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb
     else:

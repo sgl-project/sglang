@@ -1,12 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
 import dataclasses
+import io
 import os
 import re
 import time
 from typing import Any, List, Optional, Union
 
 import httpx
+import imageio
 import numpy as np
 import torch
 from fastapi import UploadFile
@@ -207,10 +209,6 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
 async def frames_to_base64_list(
     frames: List[np.ndarray], format: str = "jpg", quality: int = 75
 ) -> List[str]:
-    import io
-
-    import imageio
-
     if not frames:
         return None
     b64_list = []
@@ -246,6 +244,7 @@ async def process_generation_batch(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )
         save_file_path_list = []
+        base64_data_list = []
         audio_sample_rate = result.audio_sample_rate
         if batch.data_type == DataType.VIDEO:
             for idx, output in enumerate(result.output):
@@ -260,7 +259,7 @@ async def process_generation_batch(
                     isinstance(sample, (tuple, list)) and len(sample) == 2
                 ):
                     sample = (sample, audio)
-                post_process_sample(
+                frames_np_array = post_process_sample(
                     sample,
                     batch.data_type,
                     batch.fps,
@@ -268,9 +267,11 @@ async def process_generation_batch(
                     save_file_path,
                     audio_sample_rate=audio_sample_rate,
                 )
+                if not save_output:
+                    frames_base64_list = await frames_to_base64_list(frames_np_array)
+                    base64_data_list.append(frames_base64_list)
                 save_file_path_list.append(save_file_path)
         else:
-            base64_data_list = []
             for idx, output in enumerate(result.output):
                 save_file_path = str(
                     os.path.join(
@@ -295,9 +296,7 @@ async def process_generation_batch(
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
-    if len(base64_data_list) > 0:
-        return save_file_path_list, base64_data_list, result
-    return save_file_path_list, result
+    return save_file_path_list, base64_data_list, result
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
