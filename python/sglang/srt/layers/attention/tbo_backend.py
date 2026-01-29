@@ -47,6 +47,7 @@ class TboAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
         spec_info: Optional[SpecInput],
+        is_lora: bool = False,
     ):
         self.primary.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -56,6 +57,7 @@ class TboAttnBackend(AttentionBackend):
             encoder_lens=encoder_lens,
             forward_mode=forward_mode,
             spec_info=spec_info,
+            is_lora=is_lora,
         )
 
         self._init_forward_metadata_cuda_graph_children(
@@ -67,6 +69,7 @@ class TboAttnBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=spec_info,
             capture_num_tokens=num_tokens,
+            is_lora=is_lora,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -79,6 +82,7 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: "ForwardMode",
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        is_lora: bool = False,
     ):
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -89,11 +93,13 @@ class TboAttnBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=spec_info,
             seq_lens_cpu=seq_lens_cpu,
+            is_lora=is_lora,
         )
 
         self._init_forward_metadata_cuda_graph_children(
             fn_name="init_forward_metadata_replay_cuda_graph",
             bs=bs,
+            is_lora=is_lora,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             encoder_lens=encoder_lens,

@@ -152,6 +152,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        is_lora: bool = False,
     ):
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -192,6 +193,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        is_lora: bool = False,
     ):
 
         if forward_mode.is_decode_or_idle():

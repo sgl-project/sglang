@@ -216,6 +216,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        is_lora: bool = False,
     ):
         """Initialize metadata for CUDA graph capture."""
         metadata = TRTLLMMHAMetadata()
@@ -330,6 +331,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        is_lora: bool = False,
     ):
         """Replay CUDA graph with new inputs."""
         seq_lens = seq_lens[:bs]
