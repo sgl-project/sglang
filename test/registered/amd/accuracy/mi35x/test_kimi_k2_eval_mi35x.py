@@ -51,6 +51,8 @@ class TestKimiK2EvalMI35x(CustomTestCase):
             "--trust-remote-code",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
+            "--watchdog-timeout",
+            "1200",
         ]
         env = os.environ.copy()
         env["SGLANG_USE_AITER"] = "1"
