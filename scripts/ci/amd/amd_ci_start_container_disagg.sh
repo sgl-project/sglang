@@ -181,12 +181,34 @@ else
     fi
 fi
 
-IONIC_REAL_PATH=$(readlink -f /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so)
+MOUNT_ARGS=""
 
-echo "Found Real Ionic Driver at: $IONIC_REAL_PATH"
+add_mount_if_exists() {
+    local name=$1
+    local search_pattern=$2
+    local path=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 -name "$search_pattern" -print -quit 2>/dev/null)
 
-LIBNL_REAL_PATH=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libnl-3.so.200*" -print -quit)
-LIBMNL_REAL_PATH=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libmnl.so.0*" -print -quit)
+    if [ -n "$path" ]; then
+        echo "Found $name at: $path"
+        MOUNT_ARGS="$MOUNT_ARGS -v $path:$path:ro"
+    else
+        echo "WARNING: Could not find $name on host! (Pattern: $search_pattern)"
+    fi
+}
+
+IONIC_LINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+if [ -L "$IONIC_LINK" ]; then
+    IONIC_REAL=$(readlink -f "$IONIC_LINK")
+    if [ -f "$IONIC_REAL" ]; then
+        echo "Ionic Driver: $IONIC_REAL"
+        MOUNT_ARGS="$MOUNT_ARGS -v $IONIC_REAL:$IONIC_REAL:ro"
+    fi
+fi
+
+add_mount_if_exists "libnl-3" "libnl-3.so*"
+add_mount_if_exists "libmnl" "libmnl.so*"
+
+echo "Mount args: $MOUNT_ARGS"
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root \
@@ -199,9 +221,7 @@ docker run -dt --user root \
   -v /sys/class/net:/sys/class/net:ro \
   -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
   -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro \
-  -v "${IONIC_REAL_PATH}:${IONIC_REAL_PATH}:ro" \
-  -v "${LIBNL_REAL_PATH}:${LIBNL_REAL_PATH}:ro" \
-  -v "${LIBMNL_REAL_PATH}:${LIBMNL_REAL_PATH}:ro" \
+  $MOUNT_ARGS \
   $CACHE_VOLUME \
   --privileged \
   --network=host \
