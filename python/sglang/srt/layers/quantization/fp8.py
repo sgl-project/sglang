@@ -1013,7 +1013,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif is_w2:
                 param = layer.w2_weight
 
-            # Track how many elements were loaded
+            # In case TP>1, the weight loader logic uses narrow so we can not directly rely on `param.shape` or `loaded_weight.shape`.
             copy_numel_counter = CopyNumelCounter()
             with copy_numel_counter:
                 original_weight_loader(
@@ -1035,7 +1035,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 current_loaded <= target_loaded_numel
             ), f"target_loaded_numel={target_loaded_numel}, current_loaded={current_loaded}"
 
-            # Quantize when all weights are loaded
+            # Delay online quantization until all tensor shards (e.g. w1 and w3) are loaded, to avoid having to re-quantize later on.
             if is_w13 and layer._w13_loaded_numel == target_loaded_numel:
                 if self.use_mxfp8:
                     self._process_mxfp8_w13_weights(layer, quantize=True)

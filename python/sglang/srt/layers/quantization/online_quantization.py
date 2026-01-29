@@ -1,5 +1,6 @@
-from torch.utils._python_dispatch import TorchDispatchMode
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
+
 
 class CopyNumelCounter(TorchDispatchMode):
     """
