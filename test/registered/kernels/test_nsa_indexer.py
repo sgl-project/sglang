@@ -1,5 +1,5 @@
 import unittest
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -131,6 +131,12 @@ class MockIndexerMetadata(BaseIndexerMetadata):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         """Return: seq lens for each batch."""
         return torch.tensor(self.seq_lens, dtype=torch.int32, device="cpu")
+
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        """
+        Return: extend seq lens for each batch.
+        """
+        return list(self.seq_lens)
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
         """Return: batch idx for each token."""

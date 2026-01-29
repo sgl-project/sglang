@@ -189,6 +189,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     def get_indexer_seq_len_cpu(self) -> torch.Tensor:
         return self.attn_metadata.indexer_seq_lens_cpu
 
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        return self.attn_metadata.nsa_extend_seq_lens_list
+
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
 
