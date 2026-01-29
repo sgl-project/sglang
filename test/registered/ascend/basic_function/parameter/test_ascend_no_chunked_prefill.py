@@ -16,45 +16,25 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestNoChunkedPrefill(CustomTestCase):
-    """Testcase: Verify Llama-3.1-8B-Instruct accuracy ≥ 0.65 with chunked prefill disabled.
+    """Testcase: Verify Llama-3.1-8B-Instruct accuracy ≥ 0.65 and and serving normal with chunked prefill disabled.
 
     [Test Category] Parameter
     [Test Target] --chunked-prefill-size
     """
-    
-    @classmethod
-    def setUpClass(cls):
-        # disable chunked prefill (set to -1)
-        cls.model = Llama_3_1_8B_Instruct_WEIGHTS_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--disable-radix-cache",
-                "--chunked-prefill-size",
-                "-1",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-            ],
+    def test_no_chunked_prefill(self):
+        run_mmlu_test(
+            disable_radix_cache=False, enable_mixed_chunk=False, chunked_prefill_size=-1
         )
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_mmlu(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="mmlu",
-            num_examples=64,
-            num_threads=32,
+    def test_no_chunked_prefill_without_radix_cache(self):
+        res = run_bench_serving(
+            model=Llama_3_1_8B_Instruct_WEIGHTS_PATH,
+            num_prompts=10,
+            request_rate=float("inf"),
+            other_server_args=["--disable-radix-cache", "--chunked-prefill-size", "-1"],
         )
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.65)
+
+        assert res["completed"] == 10
 
 
 
