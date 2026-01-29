@@ -730,8 +730,8 @@ def maybe_download_model(
 
                     local_path = ms_snapshot_download(
                         model_id=model_name_or_path,
-                        ignore_patterns=["*.onnx", "*.msgpack"],
-                        allow_patterns=allow_patterns,
+                        ignore_file_pattern=["*.onnx", "*.msgpack"],
+                        allow_file_pattern=allow_patterns,
                         local_dir=local_dir,
                         max_workers=8,
                     )
