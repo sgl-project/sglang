@@ -154,6 +154,7 @@ class Req:
 
     # results
     output: torch.Tensor | None = None
+    # quality control (1-100) for generated images or videos
     output_compression: int | None = None
 
     def __init__(self, **kwargs):
