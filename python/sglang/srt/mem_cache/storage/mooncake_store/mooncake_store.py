@@ -396,7 +396,26 @@ class MooncakeStore(HiCacheStorage):
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
-        assert self.store.put(warmup_key, warmup_value) == 0
+
+        # Retry logic to handle Transfer Engine startup race condition
+        max_retries = 10
+        retry_delay = 2.0  # seconds
+
+        for attempt in range(max_retries):
+            ret = self.store.put(warmup_key, warmup_value)
+            if ret == 0:
+                break
+            logger.warning(
+                f"Warmup put failed (attempt {attempt + 1}/{max_retries}), "
+                f"ret={ret}, retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+        else:
+            raise RuntimeError(
+                f"Warmup put failed after {max_retries} attempts, "
+                "Transfer Engine might not be ready"
+            )
+
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 
