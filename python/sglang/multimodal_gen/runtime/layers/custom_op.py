@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
-hardware_path = "sglang.multimodal_gen.runtime.hardware_backend"
+hardware_path = "sglang.multimodal_gen.runtime.backend"
 
 
 class CustomOp(nn.Module):

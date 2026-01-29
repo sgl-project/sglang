@@ -24,10 +24,10 @@ flex_attention = torch.compile(
 import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
-from sglang.multimodal_gen.runtime.hardware_backend.native.rotary_embedding import (
+from sglang.multimodal_gen.runtime.backend.native.rotary_embedding import (
     _apply_rotary_emb,
 )
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
