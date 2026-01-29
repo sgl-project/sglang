@@ -93,7 +93,6 @@ class ObjectStorageModel:
     ) -> None:
         """
         Pull files from object storage into the temporary directory.
-        Safe for concurrent execution using FileLock.
         """
         from runai_model_streamer import pull_files as runai_pull_files
 
