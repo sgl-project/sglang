@@ -181,6 +181,13 @@ else
     fi
 fi
 
+IONIC_REAL_PATH=$(readlink -f /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so)
+
+echo "Found Real Ionic Driver at: $IONIC_REAL_PATH"
+
+LIBNL_REAL_PATH=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libnl-3.so.200*" -print -quit)
+LIBMNL_REAL_PATH=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu -name "libmnl.so.0*" -print -quit)
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root \
   --device=/dev/kfd \
@@ -192,7 +199,9 @@ docker run -dt --user root \
   -v /sys/class/net:/sys/class/net:ro \
   -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
   -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro \
-  -v /usr/lib/x86_64-linux-gnu:/host_sys_libs:ro \
+  -v "${IONIC_REAL_PATH}:${IONIC_REAL_PATH}:ro" \
+  -v "${LIBNL_REAL_PATH}:${LIBNL_REAL_PATH}:ro" \
+  -v "${LIBMNL_REAL_PATH}:${LIBMNL_REAL_PATH}:ro" \
   $CACHE_VOLUME \
   --privileged \
   --network=host \
