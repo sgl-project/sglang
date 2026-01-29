@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -27,12 +28,20 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     # import gradio in function to avoid CI crash
 
     import gradio as gr
-    from huggingface_hub import model_info
+
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope.hub.api import HubApi
+
+        api = HubApi()
+        model_info_obj = api.model_info(server_args.model_path)
+        task_name = model_info_obj.tasks[0]["Name"].replace("-synthesis", "")
+    else:
+        from huggingface_hub import model_info
+
+        task_name = model_info(server_args.model_path).pipeline_tag
 
     # init client
     sync_scheduler_client.initialize(server_args)
-
-    task_name = model_info(server_args.model_path).pipeline_tag
 
     if task_name in ("text-to-video", "image-to-video", "video-to-video"):
         task_type = "video"

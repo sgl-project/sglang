@@ -10,6 +10,8 @@ from typing import Optional
 import filelock
 from huggingface_hub import hf_hub_download
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 temp_dir = tempfile.gettempdir()
@@ -52,16 +54,27 @@ def _maybe_download_model(
 
     with _get_lock(model_name_or_path):
         # Try `model_index.json` first (diffusers models)
+        source_hub = "MS Hub" if envs.SGLANG_USE_MODELSCOPE.get() else "HF Hub"
         try:
             logger.info(
-                "Downloading model_index.json from HF Hub for %s...",
+                "Downloading model_index.json from %s for %s...",
+                source_hub,
                 model_name_or_path,
             )
-            file_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="model_index.json",
-                local_dir=local_dir,
-            )
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope import model_file_download
+
+                file_path = model_file_download(
+                    model_id=model_name_or_path,
+                    file_path="model_index.json",
+                    cache_dir=local_dir,
+                )
+            else:
+                file_path = hf_hub_download(
+                    repo_id=model_name_or_path,
+                    filename="model_index.json",
+                    local_dir=local_dir,
+                )
             logger.info("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_index:
@@ -70,22 +83,33 @@ def _maybe_download_model(
         # Fallback to `config.json`
         try:
             logger.info(
-                "Downloading config.json from HF Hub for %s...", model_name_or_path
+                "Downloading config.json from %s for %s...",
+                source_hub,
+                model_name_or_path,
             )
-            file_path = hf_hub_download(
-                repo_id=model_name_or_path,
-                filename="config.json",
-                local_dir=local_dir,
-            )
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope import model_file_download
+
+                file_path = model_file_download(
+                    model_id=model_name_or_path,
+                    file_path="config.json",
+                    cache_dir=local_dir,
+                )
+            else:
+                file_path = hf_hub_download(
+                    repo_id=model_name_or_path,
+                    filename="config.json",
+                    local_dir=local_dir,
+                )
             logger.info("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_config:
             raise ValueError(
                 (
                     "Could not find model locally at %s and failed to download "
-                    "model_index.json/config.json from HF Hub: %s"
+                    "model_index.json/config.json from %s: %s"
                 )
-                % (model_name_or_path, e_config)
+                % (model_name_or_path, source_hub, e_config)
             ) from e_config
 
 
