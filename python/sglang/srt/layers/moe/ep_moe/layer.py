@@ -24,14 +24,11 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPNormalCombineInput
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPLLCombineInput,
     MoriEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
-
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
     NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
@@ -46,8 +43,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
-        MoriEPNormalDispatchOutput,
-        MoriEPLLDispatchOutput,
         DispatchOutput,
     )
 
@@ -163,7 +158,6 @@ class DeepEPMoE(FusedMoE):
             # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
 
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -256,12 +250,12 @@ class DeepEPMoE(FusedMoE):
             if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
             else DeepEPLLCombineInput
         )
-        
+
         return combine_input_wrapper(
-                hidden_states=output,
-                topk_ids=dispatch_output.topk_ids,
-                topk_weights=dispatch_output.topk_weights,
-            )
+            hidden_states=output,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
 
     def combine(
         self,
@@ -606,7 +600,7 @@ class MoriEPMoE(DeepEPMoE):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        num_token = hidden_states.shape[0] 
+        num_token = hidden_states.shape[0]
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
@@ -617,13 +611,12 @@ class MoriEPMoE(DeepEPMoE):
 
         return hidden_states[:num_token]
 
-
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
     ):
-        #TODO(billishyahao): check aiter path
-        #billishyahao: for now, fused_moe only support torch.bfloat16
+        # TODO(billishyahao): check aiter path
+        # billishyahao: for now, fused_moe only support torch.bfloat16
         output_dtype = torch.bfloat16
         scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
@@ -636,7 +629,7 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_weights,
             dispatch_recv_token_num,
             origin_topk_ids,
-            origin_topk_weights
+            origin_topk_weights,
         ) = (
             dispatch_output.hidden_states,
             dispatch_output.hidden_states_scale,
@@ -644,7 +637,7 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_output.topk_weights,
             dispatch_output.num_recv_tokens_per_expert,
             dispatch_output.origin_topk_ids,
-            dispatch_output.origin_topk_weights
+            dispatch_output.origin_topk_weights,
         )
 
         w13_weight = self.w13_weight
@@ -715,8 +708,6 @@ class MoriEPMoE(DeepEPMoE):
             topk_ids=dispatch_output.origin_topk_ids,
             topk_weights=dispatch_output.origin_topk_weights,
         )
-
-
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):

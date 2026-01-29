@@ -822,7 +822,7 @@ class DeepseekV2MoE(nn.Module):
             ):
                 dispatcher.clear_overlap_args()
                 self.experts.clear_overlap_args()
-                post_combine_hook_handle.remove()            
+                post_combine_hook_handle.remove()
 
             assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
             deepep_dispatch_hook_handle = (
@@ -939,7 +939,6 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
-
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,

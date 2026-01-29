@@ -9,7 +9,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
     CombineInputFormat,
-    DispatcherBaseHooks,
     DispatchOutput,
     DispatchOutputFormat,
 )
@@ -40,6 +39,7 @@ if _use_aiter:
     from aiter import QuantType, get_hip_quant
 
 logger = logging.getLogger(__name__)
+
 
 class MoriEPPDispatchHooks(DeepEPPDispatchHooks):
 
@@ -79,9 +79,9 @@ class MoriEPLLDispatchOutput(NamedTuple):
     def format(self) -> DispatchOutputFormat:
         return DispatchOutputFormat.DEEPEP_LL
 
+
 assert isinstance(MoriEPNormalDispatchOutput, DispatchOutput)
 assert isinstance(MoriEPLLDispatchOutput, DispatchOutput)
-
 
 
 class MoriEPNormalCombineInput(NamedTuple):
@@ -154,9 +154,9 @@ def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
             block_num=64,
             rdma_block_num=32,
         ),
-         # TODO(billishyahao): may need to set different configs for intra node async
+        # TODO(billishyahao): may need to set different configs for intra node async
         EpMode.LOW_LATENCY: EpDispatchConfig(
-            kernel_type = mori.ops.EpDispatchCombineKernelType.AsyncLL,
+            kernel_type=mori.ops.EpDispatchCombineKernelType.AsyncLL,
             warp_num_per_block=8,
             block_num=64,
             rdma_block_num=32,
@@ -185,7 +185,7 @@ def init_mori_op(
     cpu_group = group.cpu_group
     torch._C._distributed_c10d._register_process_group("mori", cpu_group)
     mori.shmem.shmem_torch_process_group_init("mori")
-    
+
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
     async_mode = get_bool_env_var("SGLANG_MORI_ASYNC_MODE", "false")
     if async_mode:
@@ -307,7 +307,7 @@ class _MoriEPDispatcherImplBase:
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor
+        topk_weights: torch.Tensor,
     ):
         raise NotImplementedError
 
@@ -358,12 +358,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
 
         previous_event = self._capture_event_if_async() if self._comm_stream else None
 
-        return (
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            previous_event
-        )
+        return (hidden_states, topk_weights, topk_ids, previous_event)
 
     def dispatch_b(
         self,
@@ -406,7 +401,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             topk_weights,
             topk_ids,
             scale=scale,
-            previous_event=previous_event
+            previous_event=previous_event,
         )
 
         if self._comm_stream and self.async_finish and done_event is not None:
@@ -419,7 +414,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             topk_weights=recv_topk_weights,
             num_recv_tokens_per_expert=packed_recv_count,
             origin_topk_ids=topk_ids,
-            origin_topk_weights=topk_weights
+            origin_topk_weights=topk_weights,
         )
 
     def _dispatch_core(
@@ -434,7 +429,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
 
         if self._comm_stream:
             compute_stream = torch.cuda.current_stream()
-            comm_stream = self._comm_stream # comm stream
+            comm_stream = self._comm_stream  # comm stream
 
             for t in (hidden_states, topk_weights, topk_ids):
                 t.record_stream(comm_stream)
@@ -455,7 +450,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     recv_topk_weights,
                     recv_scales,
                     recv_topk_ids,
-                    packed_recv_count
+                    packed_recv_count,
                 ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
 
                 if self.async_finish:
@@ -479,14 +474,13 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 recv_topk_weights,
                 recv_scales,
                 recv_topk_ids,
-                packed_recv_count
+                packed_recv_count,
             ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
 
-
-        #TODO(billishyahao): EPLB
+        # TODO(billishyahao): EPLB
         # get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
 
-        return  (
+        return (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
@@ -523,7 +517,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         previous_event: Optional[torch.cuda.Event],
     ):
         done_event: Optional[torch.cuda.Event] = None
-        
+
         if self._comm_stream:
             compute_stream = torch.cuda.current_stream()
             comm_stream = self._comm_stream
@@ -546,7 +540,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     done_event.record(comm_stream)
                 else:
                     compute_stream.wait_stream(comm_stream)
-            
+
             combined_hidden_states.record_stream(comm_stream)
 
         else:
@@ -555,7 +549,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
             )[0]
 
         return combined_hidden_states, done_event
-    
+
     def set_quant_config(self, quant_config: dict):
         self.quant_config = quant_config
 
@@ -572,7 +566,11 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         topk_output: TopKOutput,
     ):
         import mori
-        assert self.mori_op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL, "mori asyncll mismatch"
+
+        assert (
+            self.mori_op.config.kernel_type
+            is mori.ops.EpDispatchCombineKernelType.AsyncLL
+        ), "mori asyncll mismatch"
 
         num_tokens = hidden_states.shape[0]
         scale = None
@@ -603,13 +601,8 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
-            packed_recv_count
-        ) = self._dispatch_core(
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            scale=scale
-        )
+            packed_recv_count,
+        ) = self._dispatch_core(hidden_states, topk_weights, topk_ids, scale=scale)
 
         return (
             packed_recv_hidden,
@@ -629,12 +622,16 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         recv_scales,
         packed_recv_count,
         topk_weights,
-        topk_ids
+        topk_ids,
     ):
 
         ##TODO(billishyahao): add assertion here to check async
-        import mori 
-        assert self.mori_op.config.kernel_type is mori.ops.EpDispatchCombineKernelType.AsyncLL, "mori asyncll mismatch"
+        import mori
+
+        assert (
+            self.mori_op.config.kernel_type
+            is mori.ops.EpDispatchCombineKernelType.AsyncLL
+        ), "mori asyncll mismatch"
 
         self.mori_op.dispatch_recv()
 
@@ -645,7 +642,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
             topk_weights=recv_topk_weights,
             num_recv_tokens_per_expert=packed_recv_count,
             origin_topk_ids=topk_ids,
-            origin_topk_weights=topk_weights
+            origin_topk_weights=topk_weights,
         )
 
     def _dispatch_core(
@@ -653,19 +650,19 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
-        scale: Optional[torch.Tensor] = None
+        scale: Optional[torch.Tensor] = None,
     ):
-        ##TODO(billishyahao): add assertion here to check async 
-        
+        ##TODO(billishyahao): add assertion here to check async
+
         (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
             recv_topk_ids,
-            packed_recv_count
+            packed_recv_count,
         ) = self.mori_op.dispatch_send(hidden_states, topk_weights, scale, topk_ids)
 
-        return  (
+        return (
             packed_recv_hidden,
             recv_topk_weights,
             recv_scales,
@@ -700,16 +697,15 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         overlap_args: Optional[CombineOverlapArgs] = None,
-    ):        
+    ):
         combined_hidden_states = self.mori_op.combine_send(
             hidden_states, None, topk_ids
         )
 
         return combined_hidden_states
-    
+
     def set_quant_config(self, quant_config: dict):
         self.quant_config = quant_config
-
 
 
 @dataclass
