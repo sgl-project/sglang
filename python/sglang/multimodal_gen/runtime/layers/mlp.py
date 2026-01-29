@@ -45,7 +45,7 @@ class MLP(nn.Module):
             output_dim,
             bias=True,
             input_is_parallel=True,
-            quant_config: QuantizationConfig = None,
+            quant_config=quant_config,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
