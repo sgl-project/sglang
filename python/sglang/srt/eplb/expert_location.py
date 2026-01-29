@@ -57,9 +57,9 @@ class ExpertLocationMetadata:
 
     @property
     def num_local_physical_experts(self) -> int:
-        ans, remainder = divmod(self.num_physical_experts, self.ep_size)
+        answer, remainder = divmod(self.num_physical_experts, self.ep_size)
         assert remainder == 0
-        return ans
+        return answer
 
     @property
     def num_logical_experts(self) -> int:
@@ -509,9 +509,9 @@ def _find_nearest_expert(
 
 def _fair_choices(arr: List, k: int, r: random.Random) -> List:
     quotient, remainder = divmod(k, len(arr))
-    ans = arr * quotient + r.sample(arr, k=remainder)
-    r.shuffle(ans)
-    return ans
+    answer = arr * quotient + r.sample(arr, k=remainder)
+    r.shuffle(answer)
+    return answer
 
 
 @dataclass
