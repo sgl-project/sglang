@@ -432,8 +432,6 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_loader=online_fp8_weight_loader,
                 )
 
-                param = layer.weight
-
             # Move to device for faster quantization. At this point, loaded weights are already materialized on CPU RAM.
             loaded_weight = loaded_weight.to(layer._load_device)
 
