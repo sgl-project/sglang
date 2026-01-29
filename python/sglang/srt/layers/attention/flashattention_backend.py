@@ -10,7 +10,7 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
+from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor, get_attention_cp_rank
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -883,15 +883,36 @@ class FlashAttentionBackend(AttentionBackend):
                     2,
                     dim=0,
                 )
+
+                cp_rank = get_attention_cp_rank()
+                print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q: {cu_seqlens_q}")
+                
                 # TODO: should fix with multi-batch
-                cu_seqlens_q_split = cu_seqlens_q // 2
+                cu_seqlens_q_split = cu_seqlens_q // 4
+                torch.cuda.synchronize()
+
+                # Debug: print inputs for result_prev
+                print(f"[Rank {cp_rank}] [CP Attention - result_prev] Inputs:")
+                print(f"[Rank {cp_rank}]   q_prev.shape: {q_prev.shape}")
+                print(f"[Rank {cp_rank}]   prev_key_cache.shape: {key_cache.shape}")
+                print(f"[Rank {cp_rank}]   prev_value_cache.shape: {value_cache.shape}")
+                print(f"[Rank {cp_rank}]   prev_page_table.shape: {page_table.shape}")
+                print(f"[Rank {cp_rank}]   prev_cache_seqlens: {forward_batch.attn_cp_metadata.kv_len_prev_tensor}")
+                print(f"[Rank {cp_rank}]   prev_cu_seqlens_q: {cu_seqlens_q_split}")
+                print(f"[Rank {cp_rank}]   prev_cu_seqlens_k_new: {cu_seqlens_k if not use_local_attn else None}")
+                print(f"[Rank {cp_rank}]   prev_max_seqlen_q: {forward_batch.attn_cp_metadata.actual_seq_q_prev}")
+                print(f"[Rank {cp_rank}]   prev_causal: {False if use_cascade_attn else causal}")
+                print(f"[Rank {cp_rank}]   prev_window_size: {window_size}")
+
+                cu_seqlens_q_prev = torch.tensor([0, forward_batch.attn_cp_metadata.actual_seq_q_prev-1], device=self.device, dtype=torch.int32)
+                print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q_prev: {cu_seqlens_q_prev}")
                 result_prev = flash_attn_with_kvcache(
                     q=q_prev,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
                     cache_seqlens=forward_batch.attn_cp_metadata.kv_len_prev_tensor,
-                    cu_seqlens_q=cu_seqlens_q_split,
+                    cu_seqlens_q=cu_seqlens_q_prev,
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_prev,  # int, not tensor
                     softmax_scale=layer.scaling,
@@ -904,14 +925,31 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+
+                torch.cuda.synchronize()
+                # Debug: print inputs for result_next
+                print(f"[Rank {cp_rank}] [CP Attention - result_next] Inputs:")
+                print(f"[Rank {cp_rank}]   q_next.shape: {q_next.shape}")
+                print(f"[Rank {cp_rank}]   next_key_cache.shape: {key_cache.shape}")
+                print(f"[Rank {cp_rank}]   next_value_cache.shape: {value_cache.shape}")
+                print(f"[Rank {cp_rank}]   next_page_table.shape: {page_table.shape}")
+                print(f"[Rank {cp_rank}]   next_cache_seqlens: {forward_batch.attn_cp_metadata.kv_len_next_tensor}")
+                print(f"[Rank {cp_rank}]   next_cu_seqlens_q: {cu_seqlens_q_split}")
+                print(f"[Rank {cp_rank}]   next_cu_seqlens_k_new: {cu_seqlens_k if not use_local_attn else None}")
+                print(f"[Rank {cp_rank}]   next_max_seqlen_q: {forward_batch.attn_cp_metadata.actual_seq_q_next}")
+                print(f"[Rank {cp_rank}]   next_causal: {False if use_cascade_attn else causal}")
+                print(f"[Rank {cp_rank}]   next_window_size: {window_size}")
+
+                cu_seqlens_q_next = torch.tensor([0, forward_batch.attn_cp_metadata.actual_seq_q_next-1], device=self.device, dtype=torch.int32)
+                print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q_next: {cu_seqlens_q_next}")
                 result_next = flash_attn_with_kvcache(
                     q=q_next,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table,
                     cache_seqlens=forward_batch.attn_cp_metadata.kv_len_next_tensor,
-                    cu_seqlens_q=cu_seqlens_q_split,
-                    cu_seqlens_k_new=cu_seqlens_k_prev if not use_local_attn else None,
+                    cu_seqlens_q=cu_seqlens_q_next,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_next,  # int, not tensor
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
@@ -924,11 +962,12 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
 
+                # torch.cuda.synchronize()
                 result = torch.concat([result_prev, result_next], dim=0)
                 result = result.contiguous()
-                print("DEBUG: result", result.shape, flush=True)
-                print("DEBUG: result_prev", result_prev.shape, flush=True)
-                print("DEBUG: result_next", result_next.shape, flush=True)
+                print(f"[Rank {cp_rank}] DEBUG: result", result.shape, flush=True)
+                print(f"[Rank {cp_rank}] DEBUG: result_prev", result_prev.shape, flush=True)
+                print(f"[Rank {cp_rank}] DEBUG: result_next", result_next.shape, flush=True)
                 torch.cuda.synchronize()
 
             else:
