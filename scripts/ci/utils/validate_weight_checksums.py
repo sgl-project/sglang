@@ -7,18 +7,16 @@ by comparing local file checksums against HuggingFace Hub metadata.
 If corruption is detected, the corrupted files are removed to trigger
 a fresh re-download.
 
-This catches bit-flip corruption that the basic safetensors header validation
-might miss, preventing silent 0.0 accuracy test failures.
+This reuses the existing model_file_verifier.py logic for checksum validation.
 
 NOTE: This script ONLY runs in CI environments (SGLANG_IS_IN_CI=true).
 """
 
-import hashlib
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 
 def is_in_ci() -> bool:
@@ -38,6 +36,11 @@ if not is_in_ci():
 REPO_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "python"))
 
+from sglang.srt.utils.model_file_verifier import (
+    IntegrityError,
+    _compute_manifest_from_folder,
+    _load_file_infos_from_hf,
+)
 
 # Models commonly used in CI tests that should be validated with checksums
 # These are models where 0.0 accuracy failures have been observed
@@ -70,54 +73,7 @@ def get_hf_cache_path() -> Path:
 
 def model_id_to_cache_dir(model_id: str) -> str:
     """Convert model ID to HF cache directory name."""
-    # meta-llama/Llama-3.1-8B -> models--meta-llama--Llama-3.1-8B
     return "models--" + model_id.replace("/", "--")
-
-
-def compute_sha256(file_path: Path) -> str:
-    """Compute SHA256 hash of a file."""
-    sha256 = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        while chunk := f.read(64 * 1024):
-            sha256.update(chunk)
-    return sha256.hexdigest()
-
-
-def get_expected_checksums_from_hub(model_id: str) -> Optional[Dict[str, str]]:
-    """
-    Fetch expected SHA256 checksums from HuggingFace Hub.
-
-    Returns dict mapping filename -> sha256, or None if fetch fails.
-    """
-    try:
-        from huggingface_hub import HfFileSystem
-
-        fs = HfFileSystem()
-        files = fs.ls(model_id, detail=True)
-
-        checksums = {}
-        for file_info in files:
-            if file_info.get("type") != "file":
-                continue
-
-            filename = Path(file_info.get("name", "")).name
-
-            # Only validate weight files
-            if not filename.endswith((".safetensors", ".bin", ".pt")):
-                continue
-
-            # Get SHA256 from LFS info (large files) or compute from content
-            lfs_info = file_info.get("lfs")
-            if lfs_info and "sha256" in lfs_info:
-                checksums[filename] = lfs_info["sha256"]
-            elif "sha256" in file_info:
-                checksums[filename] = file_info["sha256"]
-
-        return checksums
-
-    except Exception as e:
-        print(f"  Warning: Could not fetch checksums from Hub: {e}")
-        return None
 
 
 def find_snapshot_dir(model_id: str) -> Optional[Path]:
@@ -140,53 +96,6 @@ def find_snapshot_dir(model_id: str) -> Optional[Path]:
     # Sort by modification time, newest first
     snapshots.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return snapshots[0]
-
-
-def validate_model_checksums(
-    model_id: str, expected_checksums: Dict[str, str], snapshot_dir: Path
-) -> Tuple[bool, List[str]]:
-    """
-    Validate local files against expected checksums.
-
-    Returns:
-        Tuple of (all_valid, list_of_corrupted_files)
-    """
-    corrupted_files = []
-    validated_count = 0
-
-    for filename, expected_sha256 in expected_checksums.items():
-        if validated_count >= MAX_FILES_PER_MODEL:
-            print(f"  (reached max files limit, skipping remaining)")
-            break
-
-        file_path = snapshot_dir / filename
-        if not file_path.exists():
-            # File doesn't exist locally - not corruption, just incomplete download
-            continue
-
-        # Resolve symlink to actual blob
-        if file_path.is_symlink():
-            real_path = file_path.resolve()
-            if not real_path.exists():
-                print(f"  {filename}: BROKEN SYMLINK")
-                corrupted_files.append(str(file_path))
-                continue
-        else:
-            real_path = file_path
-
-        print(f"  Validating {filename}...", end=" ", flush=True)
-        actual_sha256 = compute_sha256(real_path)
-        validated_count += 1
-
-        if actual_sha256 != expected_sha256:
-            print(f"CORRUPTED!")
-            print(f"    Expected: {expected_sha256[:16]}...")
-            print(f"    Actual:   {actual_sha256[:16]}...")
-            corrupted_files.append(str(file_path))
-        else:
-            print("OK")
-
-    return len(corrupted_files) == 0, corrupted_files
 
 
 def cleanup_corrupted_files(corrupted_files: List[str]) -> int:
@@ -228,6 +137,74 @@ def cleanup_corrupted_files(corrupted_files: List[str]) -> int:
     return cleaned
 
 
+def validate_model(model_id: str, snapshot_dir: Path) -> List[str]:
+    """
+    Validate a model's checksums using model_file_verifier logic.
+
+    Returns list of corrupted file paths.
+    """
+    corrupted_files = []
+
+    # Fetch expected checksums from HuggingFace Hub
+    try:
+        expected_files = _load_file_infos_from_hf(repo_id=model_id)
+    except IntegrityError as e:
+        print(f"  Warning: {e}")
+        return []
+    except Exception as e:
+        print(f"  Warning: Could not fetch checksums from Hub: {e}")
+        return []
+
+    if not expected_files:
+        print("  No files found to validate")
+        return []
+
+    # Filter to only weight files and limit count
+    weight_extensions = (".safetensors", ".bin", ".pt")
+    weight_files = {
+        k: v for k, v in expected_files.items() if k.endswith(weight_extensions)
+    }
+
+    if not weight_files:
+        print("  No weight files found to validate")
+        return []
+
+    # Limit number of files to validate
+    filenames = list(weight_files.keys())[:MAX_FILES_PER_MODEL]
+    if len(weight_files) > MAX_FILES_PER_MODEL:
+        print(f"  Limiting validation to {MAX_FILES_PER_MODEL} files")
+
+    print(f"  Validating {len(filenames)} weight files...")
+
+    # Compute actual checksums
+    try:
+        actual_manifest = _compute_manifest_from_folder(
+            model_path=snapshot_dir,
+            filenames=filenames,
+            max_workers=4,
+        )
+    except Exception as e:
+        print(f"  Warning: Failed to compute checksums: {e}")
+        return []
+
+    # Compare and find corrupted files
+    for filename in filenames:
+        expected_info = weight_files[filename]
+        actual_info = actual_manifest.files.get(filename)
+
+        if actual_info is None:
+            # File doesn't exist locally - not corruption, just incomplete download
+            continue
+
+        if actual_info.sha256 != expected_info.sha256:
+            print(f"  CORRUPTED: {filename}")
+            print(f"    Expected: {expected_info.sha256[:16]}...")
+            print(f"    Actual:   {actual_info.sha256[:16]}...")
+            corrupted_files.append(str(snapshot_dir / filename))
+
+    return corrupted_files
+
+
 def main():
     print("=" * 70)
     print("CI Weight Checksum Validation")
@@ -267,27 +244,11 @@ def main():
 
         print(f"  Snapshot: {snapshot_dir.name[:12]}...")
 
-        # Fetch expected checksums from Hub
-        expected_checksums = get_expected_checksums_from_hub(model_id)
-        if expected_checksums is None:
-            print("  Could not fetch checksums from Hub, skipping")
-            print()
-            continue
-
-        if not expected_checksums:
-            print("  No weight files found to validate, skipping")
-            print()
-            continue
-
-        print(f"  Found {len(expected_checksums)} weight files to validate")
-
-        # Validate checksums
-        is_valid, corrupted_files = validate_model_checksums(
-            model_id, expected_checksums, snapshot_dir
-        )
+        # Validate using model_file_verifier logic
+        corrupted_files = validate_model(model_id, snapshot_dir)
         total_validated += 1
 
-        if is_valid:
+        if not corrupted_files:
             print("  Result: PASS - all checksums match")
         else:
             print(f"  Result: FAIL - {len(corrupted_files)} corrupted file(s)")
