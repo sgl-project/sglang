@@ -38,6 +38,7 @@ pub enum WorkerType {
     Regular,
     Prefill,
     Decode,
+    Encode,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +86,7 @@ impl MockWorker {
             .route("/get_server_info", get(server_info_handler))
             .route("/get_model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
+            .route("/encode", post(encode_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
@@ -1263,6 +1265,58 @@ async fn rerank_handler(
     });
 
     (StatusCode::OK, Json(mock_results)).into_response()
+}
+
+/// Mock encode endpoint for EPD (Encode-Prefill-Decode) mode testing
+///
+/// Simulates the encode worker's /encode endpoint that processes multimodal
+/// inputs and sends embeddings to prefill via ZMQ (in real implementation).
+async fn encode_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let config = config.read().await;
+
+    // Simulate response delay
+    if config.response_delay_ms > 0 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(config.response_delay_ms)).await;
+    }
+
+    // Simulate failure rate
+    if rand::random::<f32>() < config.fail_rate {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "Simulated encode failure"
+            })),
+        )
+            .into_response();
+    }
+
+    // Extract request fields for validation
+    let mm_items = payload
+        .get("mm_items")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+    let req_id = payload
+        .get("req_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let prefill_host = payload
+        .get("prefill_host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    // Log the encode request (useful for test verification)
+    eprintln!(
+        "[MockEncode] req_id={}, mm_items={}, prefill_host={}",
+        req_id, mm_items, prefill_host
+    );
+
+    // Return success - in real implementation, embeddings go via ZMQ
+    // For zmq_to_scheduler backend, response is typically null/empty
+    (StatusCode::OK, Json(json!(null))).into_response()
 }
 
 impl Default for MockWorkerConfig {

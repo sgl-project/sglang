@@ -38,8 +38,10 @@ pub struct ServiceDiscoveryConfig {
     pub namespace: Option<String>,
     // PD mode specific configuration
     pub pd_mode: bool,
+    pub epd_mode: bool,
     pub prefill_selector: HashMap<String, String>,
     pub decode_selector: HashMap<String, String>,
+    pub encode_selector: HashMap<String, String>,
     // Bootstrap port annotation specific to mooncake implementation
     pub bootstrap_port_annotation: String,
     // Router node discovery for mesh
@@ -56,6 +58,8 @@ impl Default for ServiceDiscoveryConfig {
             port: 8000,
             namespace: None,
             pd_mode: false,
+            epd_mode: false,
+            encode_selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -67,6 +71,7 @@ impl Default for ServiceDiscoveryConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PodType {
+    Encode,
     Prefill,
     Decode,
     Regular,
@@ -104,6 +109,17 @@ impl PodInfo {
             }
             Self::matches_selector(pod, &config.prefill_selector)
                 || Self::matches_selector(pod, &config.decode_selector)
+        } else if config.epd_mode {
+            if config.encode_selector.is_empty()
+                && config.prefill_selector.is_empty()
+                && config.decode_selector.is_empty()
+            {
+                warn!("EPD mode enabled but all selectors (encode, prefill, decode) are empty");
+                return false;
+            }
+            Self::matches_selector(pod, &config.encode_selector)
+                || Self::matches_selector(pod, &config.prefill_selector)
+                || Self::matches_selector(pod, &config.decode_selector)
         } else {
             if config.selector.is_empty() {
                 warn!("Regular mode enabled but selector is empty");
@@ -130,7 +146,9 @@ impl PodInfo {
 
         let pod_type = if let Some(config) = config {
             if config.pd_mode {
-                if Self::matches_selector(pod, &config.prefill_selector) {
+                if Self::matches_selector(pod, &config.encode_selector) {
+                    Some(PodType::Encode)
+                } else if Self::matches_selector(pod, &config.prefill_selector) {
                     Some(PodType::Prefill)
                 } else if Self::matches_selector(pod, &config.decode_selector) {
                     Some(PodType::Decode)
@@ -144,7 +162,7 @@ impl PodInfo {
             None
         };
 
-        let bootstrap_port = if matches!(pod_type, Some(PodType::Prefill)) {
+        let bootstrap_port = if matches!(pod_type, Some(PodType::Encode) | Some(PodType::Prefill)) {
             if let Some(config) = config {
                 pod.metadata
                     .annotations
@@ -434,6 +452,7 @@ async fn handle_pod_event(
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => Some("prefill".to_string()),
                     Some(PodType::Decode) => Some("decode".to_string()),
+                    Some(PodType::Encode) => Some("encode".to_string()),
                     Some(PodType::Regular) | None => None,
                 }
             } else {
@@ -442,7 +461,7 @@ async fn handle_pod_event(
 
             let bootstrap_port = if pd_mode {
                 match &pod_info.pod_type {
-                    Some(PodType::Prefill) => pod_info.bootstrap_port,
+                    Some(PodType::Prefill) | Some(PodType::Encode) => pod_info.bootstrap_port,
                     _ => None,
                 }
             } else {
@@ -879,8 +898,10 @@ mod tests {
             port: 8080,
             namespace: None,
             pd_mode: true,
+            epd_mode: false,
             prefill_selector,
             decode_selector,
+            encode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),

@@ -14,6 +14,7 @@ class WorkerType(str, Enum):
     """Worker specialization type."""
 
     REGULAR = "regular"
+    ENCODE = "encode"
     PREFILL = "prefill"
     DECODE = "decode"
 
