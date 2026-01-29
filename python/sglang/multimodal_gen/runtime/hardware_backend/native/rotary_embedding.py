@@ -23,11 +23,7 @@ def _apply_rotary_emb(
     if is_neox_style:
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
-        if is_neox_style:
-            x1, x2 = torch.chunk(x, 2, dim=-1)
-        else:
-            x1 = x[..., ::2]
-            x2 = x[..., 1::2]
+        x1, x2 = torch.chunk(x, 2, dim=-1)
         o1 = (x1.float() * cos - x2.float() * sin).type_as(x)
         o2 = (x2.float() * cos + x1.float() * sin).type_as(x)
         return torch.cat((o1, o2), dim=-1)
