@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
     get_diffusers_component_config,
     get_hf_config,
+    get_quant_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -872,6 +873,10 @@ class TransformerLoader(ComponentLoader):
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
+
+        config["model_path"] = component_model_path
+        quant_config = get_quant_config(config)
+
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
         if cls_name is None:
@@ -892,7 +897,7 @@ class TransformerLoader(ComponentLoader):
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
-
+            dit_config.quant_config = quant_config
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)
 
         # Find all safetensors files
@@ -934,7 +939,10 @@ class TransformerLoader(ComponentLoader):
         assert server_args.hsdp_shard_dim is not None
         model = maybe_load_fsdp_model(
             model_cls=model_cls,
-            init_params={"config": dit_config, "hf_config": hf_config},
+            init_params={
+                "config": dit_config, 
+                "hf_config": hf_config
+            },
             weight_dir_list=safetensors_list,
             device=get_local_torch_device(),
             hsdp_replicate_dim=server_args.hsdp_replicate_dim,
