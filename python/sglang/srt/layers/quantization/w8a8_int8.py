@@ -354,11 +354,16 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
                 False,  # inplace See [Note] inplace should be False in fused_experts.
                 True,  # use_int8_w8a8
                 False,  # use_fp8_w8a16
+                False,  # use_mxfp4
                 layer.w13_weight_scale,  # w1_scale
                 layer.w2_weight_scale,  # w2_scale
                 None,  # block_size
                 layer.w13_input_scale,  # a1_scale
                 layer.w2_input_scale,  # a2_scale
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
