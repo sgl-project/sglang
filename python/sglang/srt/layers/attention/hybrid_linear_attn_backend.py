@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.srt.layers.attention.fla.kda import chunk_kda
+from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
@@ -37,7 +38,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import is_flashinfer_available, rank0_log
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -801,6 +802,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if use_cutedsl
             else fused_sigmoid_gating_delta_rule_update
         )
+        self._flashinfer_gdn_prefill = None
+        self._use_flashinfer_gdn_prefill = False
+        self._flashinfer_gdn_decode = None
+        self._use_flashinfer_gdn_decode = False
+        self._flashinfer_gdn_mtp = None
+        self._use_flashinfer_gdn_mtp = False
+        if is_flashinfer_available() and torch.cuda.get_device_capability()[0] == 9:
+            try:
+                from flashinfer.gdn_prefill import (
+                    chunk_gated_delta_rule as flashinfer_chunk_gated_delta_rule,
+                )
+
+                self._flashinfer_gdn_prefill = flashinfer_chunk_gated_delta_rule
+                self._use_flashinfer_gdn_prefill = True
+                rank0_log("FlashInfer GDN prefill kernel enabled.")
+                from flashinfer.gdn_decode import (
+                    gated_delta_rule_decode as flashinfer_gdn_decode,
+                )
+                from flashinfer.gdn_decode import (
+                    gated_delta_rule_mtp as flashinfer_gdn_mtp,
+                )
+
+                self._flashinfer_gdn_decode = flashinfer_gdn_decode
+                self._use_flashinfer_gdn_decode = True
+                self._flashinfer_gdn_mtp = flashinfer_gdn_mtp
+                self._use_flashinfer_gdn_mtp = True
+                rank0_log("FlashInfer GDN decode kernel enabled.")
+            except Exception as exc:
+                rank0_log(
+                    f"FlashInfer GDN prefill kernel unavailable, "
+                    f"falling back to Triton FLA. Reason: {exc}"
+                )
 
     def forward_decode(
         self,
@@ -838,25 +871,55 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        core_attn_out = self._kernel_func(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
+        use_flashinfer = self._use_flashinfer_gdn_decode and (
+            ssm_states.dtype == torch.float32
         )
+        if use_flashinfer:
+            q_for_kernel = query.permute(1, 0, 2, 3).contiguous()
+            k_for_kernel = key.permute(1, 0, 2, 3).contiguous()
+            v_for_kernel = value.permute(1, 0, 2, 3).contiguous()
+            a_for_kernel = a.view(bs, 1, -1).contiguous()
+            b_for_kernel = b.view(bs, 1, -1).contiguous()
+            # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
+            state_for_kernel = (
+                ssm_states[cache_indices].transpose(-1, -2).contiguous()
+            )
+            output, output_state = self._flashinfer_gdn_decode(
+                q=q_for_kernel,
+                k=k_for_kernel,
+                v=v_for_kernel,
+                state=state_for_kernel,
+                A_log=layer.A_log,
+                a=a_for_kernel,
+                dt_bias=layer.dt_bias,
+                b=b_for_kernel,
+                use_qk_l2norm=True,
+            )
+            output_state = output_state.transpose(-1, -2).contiguous()
+            ssm_states[cache_indices] = output_state.to(
+                ssm_states.dtype, copy=False
+            )
+            core_attn_out = output.permute(1, 0, 2, 3).contiguous()
+        else:
+            core_attn_out = self._kernel_func(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
 
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
 
         return core_attn_out
 
@@ -963,50 +1026,131 @@ class GDNAttnBackend(MambaAttnBackendBase):
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
         if is_target_verify:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                disable_state_update=True,
-                intermediate_states_buffer=intermediate_state_cache,
-                intermediate_state_indices=intermediate_state_indices,
-                cache_steps=forward_batch.spec_info.draft_token_num,
-                retrieve_parent_token=retrieve_parent_token,
+            use_flashinfer = (
+                self._use_flashinfer_gdn_mtp
+                and retrieve_parent_token is None
+                and ssm_states.dtype == torch.float32
             )
+            if use_flashinfer:
+                draft_token_num = forward_batch.spec_info.draft_token_num
+                batch_size = seq_len // draft_token_num
+                q_for_kernel = query.view(
+                    batch_size, draft_token_num, layer.num_q_heads, layer.head_q_dim
+                ).contiguous()
+                k_for_kernel = key.view(
+                    batch_size, draft_token_num, layer.num_k_heads, layer.head_k_dim
+                ).contiguous()
+                v_for_kernel = value.view(
+                    batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim
+                ).contiguous()
+                a_for_kernel = a.view(batch_size, draft_token_num, -1).contiguous()
+                b_for_kernel = b.view(batch_size, draft_token_num, -1).contiguous()
+                # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
+                initial_state = ssm_states.transpose(-1, -2).contiguous()
+                intermediate_state_buffer = (
+                    intermediate_state_cache.transpose(-1, -2).contiguous()
+                )
+                output, _ = self._flashinfer_gdn_mtp(
+                    q=q_for_kernel,
+                    k=k_for_kernel,
+                    v=v_for_kernel,
+                    initial_state=initial_state,
+                    initial_state_indices=cache_indices[:batch_size],
+                    A_log=layer.A_log,
+                    a=a_for_kernel,
+                    dt_bias=layer.dt_bias,
+                    b=b_for_kernel,
+                    intermediate_states_buffer=intermediate_state_buffer,
+                    disable_state_update=True,
+                    use_qk_l2norm=True,
+                )
+                core_attn_out = output.view(
+                    1, seq_len, layer.num_v_heads, layer.head_v_dim
+                ).contiguous()
+            else:
+                core_attn_out = fused_recurrent_gated_delta_rule_update(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state_source=ssm_states,
+                    initial_state_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    use_qk_l2norm_in_kernel=True,
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_state_cache,
+                    intermediate_state_indices=intermediate_state_indices,
+                    cache_steps=forward_batch.spec_info.draft_token_num,
+                    retrieve_parent_token=retrieve_parent_token,
+                )
         else:
-            # Only cuda env uses fuse ssm_states update
-            recurrent_state = ssm_states
-            recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu():
-                recurrent_state = ssm_states[cache_indices]
-                recurrent_state_indices_args = {}
-            core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-                **recurrent_state_indices_args,
+            use_flashinfer = self._use_flashinfer_gdn_prefill and (
+                forward_batch.mamba_track_mask is None
+                or not forward_batch.mamba_track_mask.any()
             )
-            if is_npu():
-                last_recurrent_state = last_recurrent_state.to(
+            if use_flashinfer:
+                q_for_kernel = query.squeeze(0).contiguous()
+                k_for_kernel = key.squeeze(0).contiguous()
+                v_for_kernel = value.squeeze(0).contiguous()
+                # Should? FlashInfer GDN prefill does not apply QK L2 norm internally.
+                # Keep behavior aligned with the non-FlashInfer path.
+                q_for_kernel = l2norm_fwd(q_for_kernel)
+                k_for_kernel = l2norm_fwd(k_for_kernel)
+                # FlashInfer expects alpha in probability space, not log space.
+                g_for_kernel = (
+                    g.squeeze(0).to(torch.float32, copy=False).exp().contiguous()
+                )
+                beta_for_kernel = (
+                    beta.squeeze(0).to(torch.float32, copy=False).contiguous()
+                )
+                # FlashInfer expects state in [N, H, K, V] (k-major) layout.
+                # SGLang stores state as [N, H, V, K], so transpose before/after.
+                initial_state = ssm_states[cache_indices].transpose(-1, -2).contiguous()
+                output, output_state = self._flashinfer_gdn_prefill(
+                    q=q_for_kernel,
+                    k=k_for_kernel,
+                    v=v_for_kernel,
+                    g=g_for_kernel,
+                    beta=beta_for_kernel,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc.to(torch.int64),
+                    use_qk_l2norm_in_kernel=True,
+                )
+                output_state = output_state.transpose(-1, -2).contiguous()
+                ssm_states[cache_indices] = output_state.to(
                     ssm_states.dtype, copy=False
                 )
-                ssm_states[cache_indices] = last_recurrent_state
+                core_attn_out = output.unsqueeze(0)
+            else:
+                # Only cuda env uses fuse ssm_states update
+                recurrent_state = ssm_states
+                recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+                if is_npu():
+                    recurrent_state = ssm_states[cache_indices]
+                    recurrent_state_indices_args = {}
+                core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                    **recurrent_state_indices_args,
+                )
+                if is_npu():
+                    last_recurrent_state = last_recurrent_state.to(
+                        ssm_states.dtype, copy=False
+                    )
+                    ssm_states[cache_indices] = last_recurrent_state
 
-            self._track_mamba_state_extend(
-                forward_batch, h, ssm_states, forward_metadata
-            )
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
 
         return core_attn_out
 
