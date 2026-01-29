@@ -7,12 +7,11 @@ import glob
 import importlib.util
 import json
 import os
-import sys
 import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
-from typing import Any, Dict, cast
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -51,20 +50,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
-
-_HY3D_SHAPE_CACHE: Dict[str, Dict[str, Any]] = {}
-
-
-def _ensure_hunyuan3d_shape_path(repo_path: str) -> str:
-    repo_root = os.path.abspath(repo_path)
-    shape_root = os.path.join(repo_root, "hy3dshape")
-    if not os.path.isdir(shape_root):
-        raise FileNotFoundError(
-            "Hunyuan3D repo path must contain 'hy3dshape': " f"{repo_root}"
-        )
-    if shape_root not in sys.path:
-        sys.path.insert(0, shape_root)
-    return shape_root
 
 
 class skip_init_modules:
@@ -272,6 +257,8 @@ class ComponentLoader(ABC):
         """
         # Map of module types to their loader classes and expected library
         module_type = _normalize_module_type(module_type)
+
+        # Standard loaders defined in this module
         module_loaders = {
             "scheduler": (SchedulerLoader, "diffusers"),
             "transformer": (TransformerLoader, "diffusers"),
@@ -281,11 +268,6 @@ class ComponentLoader(ABC):
             "image_processor": (ImageProcessorLoader, "transformers"),
             "image_encoder": (ImageEncoderLoader, "transformers"),
             "processor": (AutoProcessorLoader, "transformers"),
-            "hy3dshape_model": (Hunyuan3DShapeLoader, "diffusers"),
-            "hy3dshape_vae": (Hunyuan3DShapeLoader, "diffusers"),
-            "hy3dshape_scheduler": (Hunyuan3DShapeLoader, "diffusers"),
-            "hy3dshape_conditioner": (Hunyuan3DShapeLoader, "diffusers"),
-            "hy3dshape_image_processor": (Hunyuan3DShapeLoader, "diffusers"),
             "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
 
@@ -299,6 +281,27 @@ class ComponentLoader(ABC):
         # NOTE(FlamingoPg): special for LTX-2 models
         if module_type == "vocoder" or module_type == "connectors":
             transformers_or_diffusers = "diffusers"
+        
+
+        # Hunyuan3D shape components - use lazy import to keep this module clean
+        hy3d_shape_modules = {
+            "hy3dshape_model",
+            "hy3dshape_vae",
+            "hy3dshape_scheduler",
+            "hy3dshape_conditioner",
+            "hy3dshape_image_processor",
+        }
+
+        if module_type in hy3d_shape_modules:
+            # Lazy import to avoid circular imports and keep this module clean
+            from sglang.multimodal_gen.runtime.loader.hunyuan3d_loader import (
+                Hunyuan3DShapeLoader,
+            )
+
+            assert (
+                transformers_or_diffusers == "diffusers"
+            ), f"{module_type} must be loaded from diffusers, got {transformers_or_diffusers}"
+            return Hunyuan3DShapeLoader()
 
         if module_type in module_loaders:
             loader_cls, expected_library = module_loaders[module_type]
