@@ -17,6 +17,7 @@ import faulthandler
 import logging
 import multiprocessing as mp
 import signal
+import tempfile
 import threading
 import time
 from enum import Enum, auto
@@ -437,6 +438,20 @@ class DataParallelController:
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+
+                # Compute mappings needed so PP stages may sleep on idle
+                if server_args.enable_pp_sleep_on_idle and tp_rank == tp_rank_range[0]:
+                    # Add notifier-listener pair if this rank precedes another on the same node
+                    if (pp_rank // pp_size_per_node) == (
+                        (pp_rank + 1) // pp_size_per_node
+                    ):
+                        notifier_listener_ipc_name = port_args.pp_idle_wakeup_listeners_ipc_names.setdefault(
+                            (dp_rank, pp_rank + 1),
+                            f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                        )
+                        port_args.pp_idle_wakeup_notifiers_ipc_names[
+                            dp_rank, pp_rank
+                        ] = notifier_listener_ipc_name
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
