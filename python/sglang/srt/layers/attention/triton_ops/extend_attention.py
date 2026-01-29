@@ -470,7 +470,7 @@ def _fwd_kernel(
                 K_Extend + offs_k, mask=(mask_n[None, :]) & (mask_d[:, None]), other=0.0
             )
 
-            qk = tl.dot(q, k, out_dtype=tl.float32)
+            qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32)
             if BLOCK_DPE > 0:
                 offs_kpe = (
                     (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
@@ -482,7 +482,7 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe, kpe)
+                qk += tl.dot(qpe.to(kpe.dtype), kpe)
 
             qk *= sm_scale
 
