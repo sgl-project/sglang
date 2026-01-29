@@ -1,7 +1,9 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
 
-
+from sglang.multimodal_gen.runtime.models.model_stages.zimage_omni import (
+    ZImageOmniBeforeDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline, Req
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -113,4 +115,67 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = ZImagePipeline
+class ZImageOmniPipeline(ZImagePipeline):
+    pipeline_name = "ZImageOmniPipeline"
+
+    # TODO: review how to add extra component?
+    _extra_config_module_map = {
+        "siglip": "image_encoder",
+        "siglip_processor": "processor",
+    }
+    _required_config_modules = [
+        "text_encoder",
+        "tokenizer",
+        "vae",
+        "transformer",
+        "scheduler",
+        "siglip",
+        "siglip_processor",
+    ]
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        """Set up pipeline stages with proper dependency injection."""
+        self.add_stage(
+            stage_name="zimage_omni_before_denoising",
+            stage=ZImageOmniBeforeDenoisingStage(
+                vae=self.get_module("vae"),
+                vae_scale_factor=server_args.pipeline_config.vae_config.vae_scale_factor,
+                siglip=self.get_module("siglip"),
+                siglip_processor=self.get_module("siglip_processor"),
+                text_encoder=self.get_module("text_encoder"),
+                tokenizer=self.get_module("tokenizer"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="timestep_preparation_stage",
+            stage=TimestepPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                prepare_extra_set_timesteps_kwargs=[prepare_mu],
+            ),
+        )
+
+        self.add_stage(
+            stage_name="latent_preparation_stage",
+            stage=LatentPreparationStage(
+                scheduler=self.get_module("scheduler"),
+                transformer=self.get_module("transformer"),
+            ),
+        )
+        self.add_stage(
+            stage_name="denoising_stage",
+            stage=DenoisingStage(
+                transformer=self.get_module("transformer"),
+                scheduler=self.get_module("scheduler"),
+            ),
+        )
+
+        self.add_stage(
+            stage_name="decoding_stage", stage=DecodingStage(vae=self.get_module("vae"))
+        )
+
+
+EntryClass = [
+    ZImagePipeline,
+    ZImageOmniPipeline,
+]

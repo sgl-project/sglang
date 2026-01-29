@@ -160,6 +160,17 @@ class Req:
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
 
+    #
+    ## TODO: debug member
+    #
+
+    # for prepare_siglip_embeds
+    resized_images = None
+    condition_latents = None
+    negative_condition_latents = None
+    condition_siglip_embeds = None
+    negative_condition_siglip_embeds = None
+
     def __init__(self, **kwargs):
         # Initialize dataclass fields
         for name, field in self.__class__.__dataclass_fields__.items():
