@@ -16,9 +16,9 @@
 import unittest
 
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=10, suite="stage-a-test-2")
+register_cpu_ci(est_time=10, suite="stage-a-cpu-only")
 
 
 class TestLoRAConfigFilterAddedTokens(unittest.TestCase):
