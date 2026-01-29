@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import math
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, List, Tuple
 
 import torch
 
@@ -456,17 +456,156 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
 
         return inputs
 
+    def get_freqs_cis(
+        self,
+        prompt_embeds: List[torch.Tensor],
+        images: List[torch.Tensor],
+        siglips: List[torch.Tensor],
+        device,
+        rotary_emb,
+    ):
+        def create_coordinate_grid(size, start=None, device=None):
+            if start is None:
+                start = (0 for _ in size)
+
+            axes = [
+                torch.arange(x0, x0 + span, dtype=torch.int32, device=device)
+                for x0, span in zip(start, size)
+            ]
+            grids = torch.meshgrid(axes, indexing="ij")
+            return torch.stack(grids, dim=-1)
+
+        def _get_pos_ids(
+            ori_len: int,
+            pos_grid_size: Tuple,
+            pos_start: Tuple,
+            device: torch.device,
+        ):
+            pad_len = (-ori_len) % SEQ_MULTI_OF
+            total_len = ori_len + pad_len
+
+            # Pos IDs
+            ori_pos_ids = create_coordinate_grid(
+                size=pos_grid_size, start=pos_start, device=device
+            ).flatten(0, 2)
+            if pad_len > 0:
+                pad_pos_ids = (
+                    create_coordinate_grid(
+                        size=(1, 1, 1), start=(0, 0, 0), device=device
+                    )
+                    .flatten(0, 2)
+                    .repeat(pad_len, 1)
+                )
+                pos_ids = torch.cat([ori_pos_ids, pad_pos_ids], dim=0)
+            else:
+                pos_ids = ori_pos_ids
+
+            return pos_ids
+
+        # TODO: assert batch size == 1
+
+        # TODO: hard code....
+        PATCH_SIZE = 2
+        F_PATCH_SIZE = 1
+        SEQ_MULTI_OF = 32
+
+        # cap_start_pos for cap pos ids
+        cap_cu_len = 1
+        # cap_end_pos + 0 for image pos ids
+        # cap_end_pos + 1 for image siglip ids
+        cap_end_pos = []
+
+        image_size = []
+
+        cap_pos_ids_list = []
+        image_pos_ids_list = []
+        siglip_pos_ids_list = []
+
+        for cap_item in prompt_embeds:
+            cap_padded_pos_ids = _get_pos_ids(
+                len(cap_item),
+                (len(cap_item) + (-len(cap_item)) % SEQ_MULTI_OF, 1, 1),
+                (cap_cu_len, 0, 0),
+                device,
+            )
+            cap_cu_len += len(cap_item)
+            cap_end_pos.append(cap_cu_len)
+            cap_cu_len += 2  # for image vae and siglip tokens
+            cap_pos_ids_list.append(cap_padded_pos_ids)
+
+        for j, image in enumerate(images):
+            if image is not None:
+                pH, pW, pF = PATCH_SIZE, PATCH_SIZE, F_PATCH_SIZE
+                C, F, H, W = image.size()
+                F_t, H_t, W_t = F // pF, H // pH, W // pW
+                image = image.view(C, F_t, pF, H_t, pH, W_t, pW)
+                image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(
+                    F_t * H_t * W_t, pF * pH * pW * C
+                )
+                image_pos = _get_pos_ids(
+                    F_t * H_t * W_t, (F_t, H_t, W_t), (cap_end_pos[j], 0, 0), device
+                )
+                image_size.append((F, H, W))
+            else:
+                image_len = SEQ_MULTI_OF
+                image_pos = (
+                    create_coordinate_grid((1, 1, 1), (0, 0, 0), device)
+                    .flatten(0, 2)
+                    .repeat(image_len, 1)
+                )
+                image_size.append(None)
+
+            image_pos_ids_list.append(image_pos)
+
+        for j, sig_item in enumerate(siglips if siglips is not None else []):
+            if sig_item is not None:
+                sig_H, sig_W, sig_C = sig_item.size()
+                sig_flat = sig_item.permute(2, 0, 1).reshape(sig_H * sig_W, sig_C)
+                sig_pos = _get_pos_ids(
+                    len(sig_flat),
+                    (1, sig_H, sig_W),
+                    (cap_end_pos[j] + 1, 0, 0),
+                    device,
+                )
+                # Scale position IDs to match x resolution
+                if image_size[j] is not None:
+                    sig_pos = sig_pos.float()
+                    sig_pos[..., 1] = (
+                        sig_pos[..., 1] / max(sig_H - 1, 1) * (image_size[j][1] - 1)
+                    )
+                    sig_pos[..., 2] = (
+                        sig_pos[..., 2] / max(sig_W - 1, 1) * (image_size[j][2] - 1)
+                    )
+                    sig_pos = sig_pos.to(torch.int32)
+            else:
+                sig_len = SEQ_MULTI_OF
+                sig_pos = (
+                    create_coordinate_grid((1, 1, 1), (0, 0, 0), device)
+                    .flatten(0, 2)
+                    .repeat(sig_len, 1)
+                )
+            siglip_pos_ids_list.append(sig_pos)
+
+        cap_freqs_cis = rotary_emb(torch.cat(cap_pos_ids_list, dim=0))
+        x_freqs_cis = rotary_emb(torch.cat(image_pos_ids_list, dim=0))
+        siglip_freqs_cis = (
+            rotary_emb(torch.cat(siglip_pos_ids_list, dim=0))
+            if len(siglip_pos_ids_list) != 0
+            else None
+        )
+        return (cap_freqs_cis, x_freqs_cis, siglip_freqs_cis)
+
     # TODO: hack
     # pos and freq is online compute
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # TODO: hard code bsz1
+        current_batch_size = 1
         if (
             batch.condition_siglip_embeds is not None
             and batch.condition_latents is not None
         ):
             assert len(batch.condition_siglip_embeds) == 1, "Single batch only for now."
             assert len(batch.condition_latents) == 1, "Single batch only for now."
-
-            current_batch_size = len(batch.condition_latents)
 
             condition_latents_model_input = batch.condition_latents
             # Create noise mask: 0 for condition images (clean), 1 for target image (noisy)
@@ -482,20 +621,46 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
                 "image_noise_mask": image_noise_mask,
             }
         else:
-            # TODO: hard code bsz1
-            current_batch_size = 1
             image_noise_mask = [[1] for i in range(current_batch_size)]
             pos_cond_kwargs = {
                 # NOTE: always omni mode in omni pipeline
+                # which condition_latents is not None, [[]] instead
                 "condition_latents": [[] for i in range(current_batch_size)],
                 "token_lens": self.token_lens[0],
                 "siglip_feats": None,
                 "image_noise_mask": image_noise_mask,
             }
 
+        encoder_hidden_states = [
+            list(
+                batch.prompt_embeds[0].split_with_sizes(
+                    pos_cond_kwargs["token_lens"], dim=0
+                )
+            )
+        ]
+        hidden_states = [
+            pos_cond_kwargs["condition_latents"][i] + [batch.latents[i]]
+            for i in range(current_batch_size)
+        ]
+        freqs_cis = self.get_freqs_cis(
+            prompt_embeds=encoder_hidden_states[0],
+            images=hidden_states[0],
+            siglips=(
+                pos_cond_kwargs["siglip_feats"][0]
+                if pos_cond_kwargs["siglip_feats"] is not None
+                else None
+            ),
+            device=device,
+            rotary_emb=rotary_emb,
+        )
+
+        pos_cond_kwargs["freqs_cis"] = freqs_cis
+
         return pos_cond_kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # TODO: hard code bsz1
+        current_batch_size = 1
         if (
             batch.negative_condition_siglip_embeds is not None
             and batch.negative_condition_latents is not None
@@ -506,8 +671,6 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
             assert (
                 len(batch.negative_condition_latents) == 1
             ), "Single batch only for now."
-
-            current_batch_size = len(batch.negative_condition_latents)
 
             condition_latents_model_input = batch.negative_condition_latents
             # Create noise mask: 0 for condition images (clean), 1 for target image (noisy)
@@ -523,15 +686,39 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
                 "image_noise_mask": image_noise_mask,
             }
         else:
-            # TODO: hard code bsz1
-            current_batch_size = 1
             image_noise_mask = [[1] for i in range(current_batch_size)]
             # NOTE: always omni mode in omni pipeline
+            # which condition_latents is not None, [[]] instead
             neg_cond_kwargs = {
                 "condition_latents": [[] for i in range(current_batch_size)],
                 "token_lens": self.token_lens[1],
                 "siglip_feats": None,
                 "image_noise_mask": image_noise_mask,
             }
+
+        encoder_hidden_states = [
+            list(
+                batch.negative_prompt_embeds[0].split_with_sizes(
+                    neg_cond_kwargs["token_lens"], dim=0
+                )
+            )
+        ]
+        hidden_states = [
+            neg_cond_kwargs["condition_latents"][i] + [batch.latents[i]]
+            for i in range(current_batch_size)
+        ]
+        freqs_cis = self.get_freqs_cis(
+            prompt_embeds=encoder_hidden_states[0],
+            images=hidden_states[0],
+            siglips=(
+                neg_cond_kwargs["siglip_feats"][0]
+                if neg_cond_kwargs["siglip_feats"] is not None
+                else None
+            ),
+            device=device,
+            rotary_emb=rotary_emb,
+        )
+
+        neg_cond_kwargs["freqs_cis"] = freqs_cis
 
         return neg_cond_kwargs

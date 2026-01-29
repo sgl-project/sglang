@@ -25,6 +25,7 @@ class ZImageOmniBeforeDenoisingStage(PipelineStage):
         tokenizer,
         text_encoder,
     ):
+        super().__init__()
         self.vae = vae
 
         # Copied from diffusers.pipeline_z_image_omni

@@ -1280,29 +1280,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             adaln_input = self.t_embedder(t).type_as(x[0])
             t_noisy = t_clean = None
 
-        # TODO: overwrite freqs_cis for debug
-        # TODO: single batch only
-        # compute freqs before patchify
-        # TODO: ugly
-        if freqs_cis is None:
-            # omni-mode online compute
-            # TODO: try pre-compute
-            freqs_cis = self.get_freqs_cis(
-                prompt_embeds=(
-                    encoder_hidden_states[0]
-                    if isinstance(encoder_hidden_states[0], list)
-                    else encoder_hidden_states
-                ),
-                images=(
-                    hidden_states[0]
-                    if isinstance(hidden_states[0], list)
-                    else hidden_states
-                ),
-                siglips=siglip_feats[0] if siglip_feats is not None else None,
-                device=device,
-                rotary_emb=getattr(self, "rotary_emb", None),
-            )
-
         # Patchify
         if omni_mode:
             (
@@ -1343,7 +1320,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         x_freqs_cis = freqs_cis[1]
 
         x = x.unsqueeze(0)
-        x_freqs_cis = x_freqs_cis
         x_noise_tensor = None
         if x_noise_mask is not None:
             x_noise_tensor = torch.tensor(x_noise_mask, dtype=torch.long, device=device)
