@@ -4,6 +4,7 @@ import threading
 from collections import defaultdict
 from functools import wraps
 from typing import Optional
+from functools import partial
 
 import psutil
 import torch
@@ -453,11 +454,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
-                        host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
-                        host_v=self.v_buffer,
-                        page_size=self.page_size,
+                        **build_transfer_kv_dim_exchange_args(self, device_pool),
                         direction=TransferDirection.H2D,
                     )
             else:
@@ -545,11 +542,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
-                    host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
-                    host_v=self.v_buffer,
-                    page_size=self.page_size,
+                    **build_transfer_kv_dim_exchange_args(self, device_pool),
                     direction=TransferDirection.D2H,
                 )
             else:
@@ -754,28 +747,18 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.page_size,
                 1,
             )
-            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-            self.k_buffer = alloc_func(
-                (*base_dims, self.kv_lora_rank),
+            alloc_func = partial(
+                ALLOC_MEMORY_FUNCS[self.device_pool.device],
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.v_buffer = alloc_func(
-                (*base_dims, self.qk_rope_head_dim),
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                allocator=self.allocator,
-            )
+            self.k_buffer = alloc_func((*base_dims, self.kv_lora_rank))
+            self.v_buffer = alloc_func((*base_dims, self.qk_rope_head_dim))
             if self.device_pool.index_head_dim is not None:
                 self.index_k_buffer = alloc_func(
-                    (*base_dims, self.device_pool.index_head_dim),
-                    dtype=self.dtype,
-                    device=self.device,
-                    pin_memory=self.pin_memory,
-                    allocator=self.allocator,
+                    (*base_dims, self.device_pool.index_head_dim)
                 )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
@@ -848,21 +831,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
                         host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
-                        host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
-                        host_v=self.v_buffer,
-                        device_index_k=(
-                            device_pool.index_k_buffer
-                            if device_pool.index_head_dim is not None
-                            else None
-                        ),
-                        host_index_k=(
-                            self.index_k_buffer
-                            if device_pool.index_head_dim is not None
-                            else None
-                        ),
-                        page_size=self.page_size,
+                        **build_transfer_kv_dim_exchange_args(self, device_pool),
                         direction=TransferDirection.H2D,
                     )
             else:
@@ -919,21 +888,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
                     host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
-                    host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
-                    host_v=self.v_buffer,
-                    device_index_k=(
-                        device_pool.index_k_buffer
-                        if device_pool.index_head_dim is not None
-                        else None
-                    ),
-                    host_index_k=(
-                        self.index_k_buffer
-                        if device_pool.index_head_dim is not None
-                        else None
-                    ),
-                    page_size=self.page_size,
+                    **build_transfer_kv_dim_exchange_args(self, device_pool),
                     direction=TransferDirection.D2H,
                 )
             else:
@@ -1043,3 +998,22 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+def build_transfer_kv_dim_exchange_args(kv_pool_host, device_pool):
+    return dict(
+        device_k=device_pool.k_buffer,
+        host_k=kv_pool_host.k_buffer,
+        device_v=device_pool.v_buffer,
+        host_v=kv_pool_host.v_buffer,
+        device_index_k=(
+            device_pool.index_k_buffer
+            if device_pool.index_head_dim is not None
+            else None
+        ),
+        host_index_k=(
+            kv_pool_host.index_k_buffer
+            if device_pool.index_head_dim is not None
+            else None
+        ),
+        page_size=kv_pool_host.page_size,
+    )
