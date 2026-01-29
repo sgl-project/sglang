@@ -1653,7 +1653,8 @@ def create_mm_data_row(
     text_prompt, images: list, images_base64, output_len, processor, backend
 ):
     # for chat backends that go through /v1/chat/completions endpoints
-    if backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
+    # consider extending to vllm-chat and lmdeploy-chat after test
+    if backend in ["sglang-oai-chat"]:
         return DatasetRow(
             prompt=text_prompt,
             prompt_len=len(text_prompt.split()),  # Rough estimate
@@ -1719,8 +1720,10 @@ def create_mm_data_row(
         "sglang",
         "sglang-oai",
         "vllm",
+        "vllm-chat",
         "lmdeploy",
-        # Removed: sglang-oai-chat, vllm-chat, lmdeploy-chat (handled by early return)
+        "lmdeploy-chat",
+        # Removed: sglang-oai-chat (handled by early return)
     ]
 
     return DatasetRow(
