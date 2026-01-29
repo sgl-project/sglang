@@ -2291,6 +2291,10 @@ class ServerArgs:
                     self.speculative_eagle_topk,
                     self.speculative_num_draft_tokens,
                 ) = auto_choose_speculative_params(self)
+            else:
+                # Set default values when speculative_num_steps is provided but other params are None
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 1
 
             if (
                 self.attention_backend == "trtllm_mha"
