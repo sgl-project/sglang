@@ -11,7 +11,6 @@ You can install SGLang using any of the methods below. Please go through `System
 | Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
 | MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
 | Triton            | 3.2.0                   | `pip install triton-ascend`|
-| Bisheng           | 20251121                | [link](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/Ascend-BiSheng-toolkit_aarch64_20251121.run)                                                                                               |
 | SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
 
 <a id="obtain-cann-image"></a>
@@ -66,11 +65,6 @@ If you are using other versions of `torch` and install `torch_npu`, check [insta
 We provide our own implementation of Triton for Ascend.
 
 ```shell
-BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
-BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
-wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
-```
-```shell
 pip install triton-ascend
 ```
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
@@ -112,8 +106,8 @@ You can download the SGLang image or build an image based on Dockerfile to obtai
 dockerhub: docker.io/lmsysorg/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
-Atlas 800I A3 : {main}-cann8.3.rc2-a3
-Atlas 800I A2: {main}-cann8.3.rc2-910b
+Atlas 800I A3 : {main}-cann8.5.0-a3
+Atlas 800I A2: {main}-cann8.5.0-910b
 ```
 2. Build an image based on Dockerfile
 ```shell

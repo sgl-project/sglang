@@ -519,8 +519,8 @@ def get_available_gpu_memory(
 
         if empty_cache:
             torch.cuda.empty_cache()
-        SHARED_SYSMEM_DEVICE_MEM_SMS = (87, 110, 121)  # Orin, Thor, Spark
-        if get_device_sm() in SHARED_SYSMEM_DEVICE_MEM_SMS:
+        props = torch.cuda.get_device_properties(gpu_id)
+        if props.is_integrated:
             # On these devices, which use sysmem as device mem, torch.cuda.mem_get_info()
             # only reports "free" memory, which can be lower than what is actually
             # available due to not including cache memory. So we use the system available
@@ -574,6 +574,25 @@ def get_available_gpu_memory(
         if empty_cache:
             torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "musa":
+        num_gpus = torch.musa.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.musa.current_device() != gpu_id:
+            print(
+                f"WARNING: current device is not {gpu_id}, but {torch.musa.current_device()}, ",
+                "which may cause useless memory allocation for torch MUSA context.",
+            )
+        if empty_cache:
+            torch.musa.empty_cache()
+        props = torch.musa.get_device_properties(gpu_id)
+        if props.is_integrated:
+            # On these devices, which use sysmem as device mem, torch.musa.mem_get_info()
+            # only reports "free" memory, which can be lower than what is actually
+            # available due to not including cache memory. So we use the system available
+            # memory metric instead.
+            free_gpu_memory = psutil.virtual_memory().available
+        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -1227,7 +1246,9 @@ def broadcast_pyobj(
     of dist_group argument).
     """
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and not force_cpu_device else "cpu"
+        "cuda"
+        if torch.cuda.is_available() and not force_cpu_device
+        else "musa" if is_musa() and not force_cpu_device else "cpu"
     )
 
     if rank == src:
@@ -1788,6 +1809,47 @@ def get_xpu_memory_capacity():
         raise RuntimeError("torch.xpu is not available.")
 
 
+def get_mtgpu_memory_capacity():
+    try:
+        # Run mthreads-gmi and capture the output
+        result = subprocess.run(
+            [
+                "mthreads-gmi --query | grep 'FB Memory Usage' -A 2 | grep 'Total' | awk -F':' '{print $2}' | awk '{print $1}' | sed 's/MiB//'"
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"mthreads-gmi error: {result.stderr.strip()}")
+
+        # Parse the output to extract memory values
+        memory_values = [
+            float(mem)
+            for mem in result.stdout.strip().split("\n")
+            if re.match(r"^\d+(\.\d+)?$", mem.strip())
+        ]
+
+        if not memory_values:
+            # Fallback to torch.musa.mem_get_info() when failed to get memory capacity from mthreads-gmi.
+            if hasattr(torch, "musa") and torch.musa.is_available():
+                logger.warning(
+                    "Failed to get GPU memory capacity from mthreads-gmi, falling back to torch.musa.mem_get_info()."
+                )
+                return torch.musa.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            raise ValueError("No GPU memory values found.")
+
+        # Return the minimum memory value
+        return min(memory_values)
+
+    except FileNotFoundError:
+        raise RuntimeError(
+            "mthreads-gmi not found. Ensure Moore Threads drivers are installed and accessible."
+        )
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1801,6 +1863,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_cpu_memory_capacity()
     elif device == "xpu":
         gpu_mem = get_xpu_memory_capacity()
+    elif device == "musa":
+        gpu_mem = get_mtgpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1899,7 +1963,7 @@ def print_info_once(msg: str) -> None:
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
@@ -1956,12 +2020,17 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
+    if is_musa():
+        if device_id == None:
+            return "musa"
+        return "musa:{}".format(device_id)
+
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
 
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
         except RuntimeError:
@@ -1986,7 +2055,7 @@ def get_device_count() -> int:
 
 
 def get_device_core_count(device_id: int = 0) -> int:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
 
     return 0
@@ -1994,7 +2063,7 @@ def get_device_core_count(device_id: int = 0) -> int:
 
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         major, minor = torch.cuda.get_device_capability(device_id)
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
