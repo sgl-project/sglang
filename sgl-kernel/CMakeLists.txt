@@ -98,11 +98,22 @@ FetchContent_Declare(
 FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
+if("${CUDA_VERSION}" VERSION_LESS 12.1)
+    set(SED_PTN
+        [[s|\\(^\\s*set(CMAKE_CUDA_ARCHITECTURES \${CMAKE_CUDA_ARCHITECTURES} 90)\\)|#\\1|]]
+    )
+    set(MSCCLPP_PATCH_COMMAND
+        COMMAND sed -i ${SED_PTN} CMakeLists.txt
+    )
+else()
+    set(MSCCLPP_PATCH_COMMAND "")
+endif()
 FetchContent_Declare(
     repo-mscclpp
     GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
     GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
     GIT_SHALLOW    OFF
+    PATCH_COMMAND  ${MSCCLPP_PATCH_COMMAND}
 )
 FetchContent_Populate(repo-mscclpp)
 
