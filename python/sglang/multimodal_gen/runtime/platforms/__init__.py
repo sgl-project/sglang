@@ -101,6 +101,24 @@ def rocm_platform_plugin() -> str | None:
     )
 
 
+def npu_platform_plugin() -> str | None:
+    is_npu = False
+
+    try:
+        import torch
+
+        if torch.npu.is_available():
+            is_npu = True
+            logger.info("NPU is available")
+    except Exception as e:
+        logger.info("NPU detection failed: %s", e)
+    return (
+        "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase"
+        if is_npu
+        else None
+    )
+
+
 def musa_platform_plugin() -> str | None:
     is_musa = False
 
@@ -125,6 +143,7 @@ builtin_platform_plugins = {
     "rocm": rocm_platform_plugin,
     "mps": mps_platform_plugin,
     "cpu": cpu_platform_plugin,
+    "npu": npu_platform_plugin,
     "musa": musa_platform_plugin,
 }
 
@@ -145,6 +164,11 @@ def resolve_current_platform_cls_qualname() -> str:
 
     # Fall back to CUDA
     platform_cls_qualname = cuda_platform_plugin()
+    if platform_cls_qualname is not None:
+        return platform_cls_qualname
+
+    # Fall back to NPU
+    platform_cls_qualname = npu_platform_plugin()
     if platform_cls_qualname is not None:
         return platform_cls_qualname
 

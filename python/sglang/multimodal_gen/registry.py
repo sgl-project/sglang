@@ -46,6 +46,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import (
+    MOVA360PConfig,
+    MOVA720PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -72,6 +76,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.mova import (
+    MOVA_360P_SamplingParams,
+    MOVA_720P_SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -541,6 +549,21 @@ def _register_configs():
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
+        ],
+    )
+    # MOVA
+    register_configs(
+        sampling_param_cls=MOVA_360P_SamplingParams,
+        pipeline_config_cls=MOVA360PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MOVA_720P_SamplingParams,
+        pipeline_config_cls=MOVA720PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
         ],
     )
     # FLUX

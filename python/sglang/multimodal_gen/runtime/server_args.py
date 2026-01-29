@@ -342,6 +342,11 @@ class ServerArgs:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "video_vae": True,
+            "audio_vae": True,
+            "video_dit": True,
+            "audio_dit": True,
+            "dual_tower_bridge": True,
         }
     )
 

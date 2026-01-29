@@ -255,8 +255,8 @@ def pad_sequence_with_mask(
         dtype=torch.bool,
     )
 
-    BLOCK_M = 32
     BLOCK_D = triton.next_power_of_2(hidden_dim)
+    BLOCK_M = triton.next_power_of_2(max_len)
 
     grid = (
         B,
@@ -277,3 +277,38 @@ def pad_sequence_with_mask(
     )
 
     return B, output, attn_mask
+
+
+# When num_kv_heads=1, we have tensors with degenerate strides,
+# For example, as below, where we have stride[-3] == stride[-2]:
+# - shape: [num_pages, 1, 64, 128]
+# - stride: [8192, 128, 128, 1]
+# This will cause TMA desc validation fail in flashinfer (trtllm-mha backend).
+#
+# See: https://github.com/flashinfer-ai/flashinfer/issues/2232
+def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Adjust degenerate strides for a tensor, make it canonical.
+    """
+    sizes = tensor.size()
+    strides = tensor.stride()
+    ndim = tensor.dim()
+
+    need_fix = any(
+        sizes[i] == 1 and strides[i] == strides[i + 1] for i in range(ndim - 1)
+    )
+
+    if not need_fix:
+        return tensor
+
+    # canonicalize the stride
+    # Example:
+    # - shape: [num_pages, 1, 64, 128]
+    # - stride: [8192, 128, 128, 1] (wrong!)
+    # Gives new stride: [8192, 8192, 128 ,1] (correct!)
+    new_strides = [0] * ndim
+    new_strides[-1] = 1
+    for i in range(ndim - 2, -1, -1):
+        new_strides[i] = new_strides[i + 1] * sizes[i + 1]
+
+    return tensor.as_strided(sizes, new_strides)

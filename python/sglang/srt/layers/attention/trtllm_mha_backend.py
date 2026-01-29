@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
     fused_fp8_set_kv_buffer,
 )
+from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -608,6 +609,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v_cache = v_cache.view(
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
+
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+
         kv_cache = (k_cache, v_cache)
 
         # TODO: add support for quantization
@@ -684,6 +691,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v_cache = v_cache.view(
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
+
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+
         kv_cache = (k_cache, v_cache)
 
         # sink: additional value per head in the denominator of the softmax.

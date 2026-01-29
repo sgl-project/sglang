@@ -70,7 +70,7 @@ class GPUWorker:
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
-        torch.cuda.set_device(self.local_rank)
+        torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -85,6 +85,7 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
         )
 
         self.pipeline = build_pipeline(self.server_args)
@@ -98,6 +99,9 @@ class GPUWorker:
                 [
                     self.pipeline.get_module("transformer"),
                     self.pipeline.get_module("transformer_2"),
+                    self.pipeline.get_module("video_dit"),
+                    self.pipeline.get_module("video_dit_2"),
+                    self.pipeline.get_module("audio_dit"),
                 ],
             ):
                 if isinstance(dit, OffloadableDiTMixin):
@@ -155,7 +159,7 @@ class GPUWorker:
         output_batch = None
         try:
             if self.rank == 0:
-                torch.cuda.reset_peak_memory_stats()
+                torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
@@ -164,6 +168,8 @@ class GPUWorker:
             if isinstance(result, Req):
                 output_batch = OutputBatch(
                     output=result.output,
+                    audio=getattr(result, "audio", None),
+                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
@@ -323,7 +329,8 @@ def run_scheduler_process(
     """
     configure_logger(server_args)
     globally_suppress_loggers()
-    set_cuda_arch()
+    if current_platform.is_cuda():
+        set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 
