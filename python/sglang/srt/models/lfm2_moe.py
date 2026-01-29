@@ -602,14 +602,12 @@ class Lfm2MoeForCausalLM(nn.Module):
             if "embed_tokens.weight" in name:
                 embed_tokens_weight = loaded_weight
 
-            # Handle conv.weight -> conv_weight conversion
-            if ".conv.weight" in name:
-                name = name.replace(".conv.weight", ".conv_weight")
-                loaded_weight = loaded_weight.squeeze(1)
-
-            # Handle conv.bias -> conv_bias
-            if ".conv.bias" in name:
-                name = name.replace(".conv.bias", ".conv_bias")
+            # Handle conv weight/bias naming: HF uses conv.conv, we use conv_weight/conv_bias
+            if ".conv.conv.weight" in name:
+                name = name.replace(".conv.conv.weight", ".conv.conv_weight")
+                loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
+            if ".conv.conv.bias" in name:
+                name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
             # Handle dense MLP w2 -> down_proj
             if "feed_forward.w2" in name and "experts" not in name:

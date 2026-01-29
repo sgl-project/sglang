@@ -533,16 +533,12 @@ class Lfm2ForCausalLM(nn.Module):
             if "embed_tokens.weight" in name:
                 embed_tokens_weight = loaded_weight
 
-            # Handle conv.weight -> conv_weight conversion for ShortConv layers
-            # HF shape: (hidden_size, 1, kernel_size) -> squeeze to (hidden_size, kernel_size)
-            if ".conv.weight" in name:
-                name = name.replace(".conv.weight", ".conv_weight")
-                # Squeeze out the middle dimension: (D, 1, K) -> (D, K)
-                loaded_weight = loaded_weight.squeeze(1)
-
-            # Handle conv.bias -> conv_bias conversion
-            if ".conv.bias" in name:
-                name = name.replace(".conv.bias", ".conv_bias")
+            # Handle conv weight/bias naming: HF uses conv.conv, we use conv_weight/conv_bias
+            if ".conv.conv.weight" in name:
+                name = name.replace(".conv.conv.weight", ".conv.conv_weight")
+                loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
+            if ".conv.conv.bias" in name:
+                name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
             # Handle QKV stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:
