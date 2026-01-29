@@ -154,6 +154,7 @@ class Req:
 
     # results
     output: torch.Tensor | None = None
+    output_compression: float | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields

@@ -173,6 +173,7 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    output_compression: Optional[float] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -280,6 +281,7 @@ async def create_video(
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
+    batch.output_compression = output_compression
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs

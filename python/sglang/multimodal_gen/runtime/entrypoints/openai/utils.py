@@ -238,6 +238,7 @@ async def process_generation_batch(
                     batch.save_output,
                     save_file_path,
                     audio_sample_rate=audio_sample_rate,
+                    output_compression=batch.output_compression,
                 )
                 save_file_path_list.append(save_file_path)
         else:
@@ -254,6 +255,7 @@ async def process_generation_batch(
                     batch.save_output,
                     save_file_path,
                     audio_sample_rate=audio_sample_rate,
+                    output_compression=batch.output_compression,
                 )
                 save_file_path_list.append(save_file_path)
 

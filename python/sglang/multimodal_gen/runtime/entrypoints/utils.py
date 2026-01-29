@@ -238,6 +238,7 @@ def post_process_sample(
     save_output: bool = True,
     save_file_path: Optional[str] = None,
     audio_sample_rate: Optional[int] = None,
+    output_compression=None,
 ):
     """
     Process sample output and save video if necessary
@@ -284,7 +285,9 @@ def post_process_sample(
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
                 # TODO: make this configurable
-                quality = 5
+                quality = (
+                    output_compression / 10 if output_compression is not None else 5
+                )
                 imageio.mimsave(
                     save_file_path,
                     frames,
@@ -303,7 +306,7 @@ def post_process_sample(
                 )
 
             else:
-                quality = 75
+                quality = output_compression if output_compression is not None else 75
                 if len(frames) > 1:
                     for i, image in enumerate(frames):
                         parts = save_file_path.rsplit(".", 1)

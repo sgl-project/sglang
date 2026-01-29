@@ -266,6 +266,7 @@ class DiffGenerator:
                             ),
                             data_type=req.data_type,
                             audio_sample_rate=audio_sample_rate,
+                            output_compression=req.output_compression,
                         )
 
                         result_item: dict[str, Any] = {
