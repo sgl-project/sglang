@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     to_openai_style_logprobs,
@@ -840,7 +841,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -900,6 +900,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
             routed_experts = process_routed_experts_from_ret(ret_item, request)
+            cached_tokens_details = process_cached_tokens_details_from_ret(
+                ret_item, request
+            )
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
@@ -944,6 +947,14 @@ class OpenAIServingChat(OpenAIServingBase):
                     history_tool_calls_cnt,
                 )
 
+            # Build sgl_ext if any extension fields are present
+            sgl_ext = None
+            if routed_experts or cached_tokens_details:
+                sgl_ext = SglExt(
+                    routed_experts=routed_experts,
+                    cached_tokens_details=cached_tokens_details,
+                )
+
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
                 message=ChatMessage(
@@ -960,9 +971,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
-                sgl_ext=(
-                    SglExt(routed_experts=routed_experts) if routed_experts else None
-                ),
+                sgl_ext=sgl_ext,
             )
             choices.append(choice_data)
 
@@ -970,7 +979,6 @@ class OpenAIServingChat(OpenAIServingBase):
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
-            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
         return ChatCompletionResponse(

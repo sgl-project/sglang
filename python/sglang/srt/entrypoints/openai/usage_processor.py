@@ -2,11 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import (
-    CachedTokensDetails,
-    PromptTokensDetails,
-    UsageInfo,
-)
+from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
 
 
 @final
@@ -22,7 +18,6 @@ class UsageProcessor:
     def calculate_response_usage(
         responses: List[Dict[str, Any]],
         n_choices: int = 1,
-        enable_cache_report: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
 
@@ -31,66 +26,11 @@ class UsageProcessor:
             for i in range(0, len(responses), n_choices)
         )
 
-        cached_details = None
-        if enable_cache_report:
-            cached_total = sum(
-                responses[i]["meta_info"].get("cached_tokens", 0)
-                for i in range(0, len(responses), n_choices)
-            )
-
-            # Check if detailed breakdown is available
-            has_details = any(
-                responses[i]["meta_info"].get("cached_tokens_details")
-                for i in range(0, len(responses), n_choices)
-            )
-
-            if has_details:
-                # Aggregate detailed breakdown across requests
-                details_list = [
-                    responses[i]["meta_info"].get("cached_tokens_details")
-                    for i in range(0, len(responses), n_choices)
-                ]
-                details_list = [d for d in details_list if d]
-
-                if details_list:
-                    device_total = sum(d.get("device", 0) for d in details_list)
-                    host_total = sum(d.get("host", 0) for d in details_list)
-
-                    # Check if L3 storage fields are present (only when storage backend is enabled)
-                    has_storage_fields = any("storage" in d for d in details_list)
-
-                    if has_storage_fields:
-                        storage_total = sum(d.get("storage", 0) for d in details_list)
-                        # Get storage backend from first request with details
-                        storage_backend = next(
-                            (
-                                d.get("storage_backend")
-                                for d in details_list
-                                if d.get("storage_backend")
-                            ),
-                            None,
-                        )
-                        cached_tokens_details_obj = CachedTokensDetails(
-                            device=device_total,
-                            host=host_total,
-                            storage=storage_total,
-                            storage_backend=storage_backend,
-                        )
-                    else:
-                        # L3 storage not enabled - only device and host
-                        cached_tokens_details_obj = CachedTokensDetails(
-                            device=device_total,
-                            host=host_total,
-                        )
-
-                    cached_details = PromptTokensDetails(
-                        cached_tokens=cached_total,
-                        cached_tokens_details=cached_tokens_details_obj,
-                    )
-                else:
-                    cached_details = UsageProcessor._details_if_cached(cached_total)
-            else:
-                cached_details = UsageProcessor._details_if_cached(cached_total)
+        cached_total = sum(
+            responses[i]["meta_info"].get("cached_tokens", 0)
+            for i in range(0, len(responses), n_choices)
+        )
+        cached_details = UsageProcessor._details_if_cached(cached_total)
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -104,7 +44,6 @@ class UsageProcessor:
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
         n_choices: int,
-        enable_cache_report: bool = False,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -112,12 +51,8 @@ class UsageProcessor:
         )
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
-            )
-            if enable_cache_report
-            else None
+        cached_details = UsageProcessor._details_if_cached(
+            sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
         )
 
         return UsageProcessor.calculate_token_usage(

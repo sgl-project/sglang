@@ -126,7 +126,6 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens including cache breakdown."""
 
     cached_tokens: int = 0
-    cached_tokens_details: Optional[CachedTokensDetails] = None
 
 
 class UsageInfo(BaseModel):
@@ -260,6 +259,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -316,6 +316,7 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
+    cached_tokens_details: Optional[CachedTokensDetails] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -553,6 +554,7 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
