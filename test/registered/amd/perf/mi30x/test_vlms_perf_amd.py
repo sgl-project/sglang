@@ -123,6 +123,7 @@ class TestNightlyVLMsPerfAMD(unittest.TestCase):
                         output_lens=self.output_lens,
                         other_args=other_args,
                         extra_bench_args=extra_bench_args,
+                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]

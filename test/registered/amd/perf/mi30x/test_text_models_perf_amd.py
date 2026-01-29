@@ -110,6 +110,7 @@ class TestNightlyTextModelsPerfAMD(unittest.TestCase):
                         input_lens=self.input_lens,
                         output_lens=self.output_lens,
                         other_args=other_args,
+                        enable_profile=False,  # Disable profiling for AMD tests
                     )
                     results = result_tuple[0]
                     success = result_tuple[1]
