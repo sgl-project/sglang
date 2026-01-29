@@ -493,7 +493,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         w2 = layer.w2_weight
 
         hidden_states, expanded_row_idx, expert_tokens, _ = (
-            torch_npu.npu_moe_init_routing_v2(
+            torch.ops.npu.npu_moe_init_routing_v2(
                 x,
                 topk_ids,
                 active_num=num_tokens * top_k,
@@ -509,7 +509,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         w2_bias = [layer.w2_weight_bias] if self.with_bias else None
 
         # gmm1: gate_up_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w13_weight],
             bias=w13_bias,
@@ -526,14 +526,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
             hidden_states = swiglu_oai(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
-            hidden_states = torch_npu.npu_swiglu(hidden_states)
+            hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
         else:
             from sglang.srt.layers.activation import GeluAndMul
 
             hidden_states = GeluAndMul()(hidden_states)
 
         # gmm2: down_proj
-        hidden_states = torch_npu.npu_grouped_matmul(
+        hidden_states = torch.ops.npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[layer.w2_weight],
             bias=w2_bias,
@@ -544,7 +544,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             output_dtype=original_dtype,
         )[0]
 
-        final_hidden_states = torch_npu.npu_moe_finalize_routing(
+        final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
             hidden_states,
             skip1=None,
             skip2=None,
