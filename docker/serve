@@ -6,6 +6,7 @@ ARG_PREFIX="--"
 
 ARGS=()
 
+# Parse environment variables with the specific prefix to convert to arguments
 while IFS='=' read -r key value; do
     arg_name=$(echo "${key#"${PREFIX}"}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
 
@@ -30,5 +31,11 @@ if ! [[ " ${ARGS[@]} " =~ " --model-path " ]]; then
     ARGS+=(--model-path "${SM_SGLANG_MODEL_PATH:-/opt/ml/model}")
 fi
 
-echo "Running command: exec python3 -m sglang.launch_server ${ARGS[@]}"
-exec python3 -m sglang.launch_server "${ARGS[@]}"
+# Add conditional logic for multimodal generation runtime
+if [[ "${SM_SGLANG_USE_MULTIMODAL}" == "true" ]]; then
+    echo "Running command: python3 -m sglang.multimodal_gen.runtime.launch_server ${ARGS[@]}"
+    exec python3 -m sglang.multimodal_gen.runtime.launch_server "${ARGS[@]}"
+else
+    echo "Running command: python3 -m sglang.launch_server ${ARGS[@]}"
+    exec python3 -m sglang.launch_server "${ARGS[@]}"
+fi
