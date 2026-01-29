@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import UsageInfo
+from sglang.srt.entrypoints.openai.protocol import (
+    CachedTokensDetails,
+    PromptTokensDetails,
+    UsageInfo,
+)
 
 
 @final
@@ -10,9 +14,9 @@ class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[Dict[str, int]]:
-        """Return {"cached_tokens": N} only when N > 0 (keeps JSON slim)."""
-        return {"cached_tokens": count} if count > 0 else None
+    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
+        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
+        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
 
     @staticmethod
     def calculate_response_usage(
@@ -33,7 +37,60 @@ class UsageProcessor:
                 responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
             )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+
+            # Check if detailed breakdown is available
+            has_details = any(
+                responses[i]["meta_info"].get("cached_tokens_details")
+                for i in range(0, len(responses), n_choices)
+            )
+
+            if has_details:
+                # Aggregate detailed breakdown across requests
+                details_list = [
+                    responses[i]["meta_info"].get("cached_tokens_details")
+                    for i in range(0, len(responses), n_choices)
+                ]
+                details_list = [d for d in details_list if d]
+
+                if details_list:
+                    device_total = sum(d.get("device", 0) for d in details_list)
+                    host_total = sum(d.get("host", 0) for d in details_list)
+
+                    # Check if L3 storage fields are present (only when storage backend is enabled)
+                    has_storage_fields = any("storage" in d for d in details_list)
+
+                    if has_storage_fields:
+                        storage_total = sum(d.get("storage", 0) for d in details_list)
+                        # Get storage backend from first request with details
+                        storage_backend = next(
+                            (
+                                d.get("storage_backend")
+                                for d in details_list
+                                if d.get("storage_backend")
+                            ),
+                            None,
+                        )
+                        cached_tokens_details_obj = CachedTokensDetails(
+                            device=device_total,
+                            host=host_total,
+                            storage=storage_total,
+                            storage_backend=storage_backend,
+                        )
+                    else:
+                        # L3 storage not enabled - only device and host
+                        cached_tokens_details_obj = CachedTokensDetails(
+                            device=device_total,
+                            host=host_total,
+                        )
+
+                    cached_details = PromptTokensDetails(
+                        cached_tokens=cached_total,
+                        cached_tokens_details=cached_tokens_details_obj,
+                    )
+                else:
+                    cached_details = UsageProcessor._details_if_cached(cached_total)
+            else:
+                cached_details = UsageProcessor._details_if_cached(cached_total)
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -73,7 +130,7 @@ class UsageProcessor:
     def calculate_token_usage(
         prompt_tokens: int,
         completion_tokens: int,
-        cached_tokens: Optional[Dict[str, int]] = None,
+        cached_tokens: Optional[PromptTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
