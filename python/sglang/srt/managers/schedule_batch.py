@@ -1248,6 +1248,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
+    ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
     seq_lens: torch.Tensor = None  # shape: [b], int64
@@ -2209,6 +2210,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             lora_ids=[req.lora_id for req in self.reqs],
             sampling_info=self.sampling_info,
             input_embeds=self.input_embeds,
+            ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
@@ -2377,6 +2379,9 @@ class ModelWorkerBatch:
 
     # The input Embeds
     input_embeds: Optional[torch.Tensor] = None
+
+    # token table for ngram embedding
+    ne_token_table: Optional[torch.Tensor] = None
 
     # For corss-encoder model
     token_type_ids: Optional[torch.Tensor] = None
