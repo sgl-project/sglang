@@ -312,7 +312,7 @@ Now, when we call `python run.py`, we will get the outputs of our newly created 
 
 ## Documentation
 
-Add to table of supported models in [generative_models.md](https://github.com/sgl-project/sglang/blob/main/docs/supported_models/text_generation/generative_models.md) or [multimodal_language_models.md](https://github.com/sgl-project/sglang/blob/main/docs/supported_models/text_generation/multimodal_language_models.md)
+Add to table of supported models in [generative_models.md](../text_generation/generative_models.md) or [multimodal_language_models.md](../text_generation/multimodal_language_models.md)
 
 ---
 
