@@ -332,23 +332,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 skip_block_quant_check,
             )
 
-        # Create the weight
-        weight_dtype = (
-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
-        )
-
         # Wrap weight loader for online quantization if checkpoint is not fp8 serialized
         if not self.is_checkpoint_fp8_serialized:
             layer.weight_scale = None
             layer._loaded_numel = 0
+            device = torch.device("meta")
+            weight_dtype = params_dtype
 
             weight_loader = self.get_online_weight_loader(layer, original_weight_loader)
         else:
             weight_loader = original_weight_loader
+            weight_dtype = torch.float8_e4m3fn
+            device = torch.get_default_device()
 
+        layer._load_device = torch.get_default_device()
+        
         weight = ModelWeightParameter(
             data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+                output_size_per_partition, input_size_per_partition, dtype=weight_dtype, device=device
             ),
             input_dim=1,
             output_dim=0,
@@ -418,8 +419,22 @@ class Fp8LinearMethod(LinearMethodBase):
             loaded_weight: torch.Tensor,
             shard_id: int | None = None,
         ):
+            assert param.device.type == "meta"
+
+            if layer._loaded_numel == 0:
+                layer.weight = ModelWeightParameter(
+                    data=torch.empty_like(param.data, device=layer._load_device),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=online_fp8_weight_loader,
+                )
+
+                param = layer.weight
+
             # Move to device for faster quantization. At this point, loaded weights are already materialized on CPU RAM.
-            loaded_weight = loaded_weight.to(param.device)
+            loaded_weight = loaded_weight.to(layer._load_device)
+
+            param = layer.weight
 
             kwargs = {}
             if shard_id is not None:
