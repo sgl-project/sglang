@@ -65,9 +65,7 @@ class Lfm2Config(HFLfm2Config):
             return None
 
         hidden_size = self.hidden_size
-        # conv_L_cache in config is kernel_size (e.g., 3)
         conv_kernel = int(self.conv_L_cache)
-        L_cache = conv_kernel - 1  # actual cache size (e.g., 2 for kernel=3)
 
         # get_attention_tp_size() requires initialization, default to 1 if not available
         try:
@@ -77,11 +75,13 @@ class Lfm2Config(HFLfm2Config):
 
         # For ShortConv layers, we use a simplified Mamba2StateShape
         # LFM2 doesn't use SSM state (state_size=0), only conv state
+        # We pass num_heads=tp_size so divide(tp_size, tp_size)=1 always works.
+        # Since state_size=0, the temporal state shape has zero elements anyway.
         shape = Mamba2StateShape.create(
             tp_world_size=tp_size,
             intermediate_size=hidden_size,
             n_groups=1,  # ShortConv doesn't use grouping
-            num_heads=1,  # ShortConv is not multi-head
+            num_heads=tp_size,  # Ensures divide works; temporal state is empty anyway
             head_dim=hidden_size,  # Conv operates on full hidden dim
             state_size=0,  # No SSM temporal state for ShortConv
             conv_kernel=conv_kernel,
