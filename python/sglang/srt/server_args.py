@@ -62,6 +62,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    torch_release,
     wait_port_available,
     xpu_has_xmx_support,
 )
@@ -4978,10 +4979,7 @@ class ServerArgs:
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch
 
-            parts = torch.__version__.split("+", 1)[0].split(".")
-            major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            if (major, minor) > (2, 6):
+            if torch_release >= (2, 7):
                 logger.warning(
                     "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
                     f"  Current torch version is {torch.__version__}.\n"
@@ -5049,8 +5047,7 @@ class ServerArgs:
         if self.get_model_config().is_multimodal:
             import torch
 
-            torch_version = torch.__version__.split("+", 1)[0]
-            if torch_version == "2.9.1":
+            if torch_release[:3] == (2, 9, 1):
                 cudnn_version = None
                 try:
                     cudnn_version = torch.backends.cudnn.version()
