@@ -127,6 +127,7 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+    batch.output_compression = request.output_compression
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
@@ -217,6 +218,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
+    output_compression: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
@@ -269,7 +271,7 @@ async def edits(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-
+    batch.output_compression = output_compression
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )
