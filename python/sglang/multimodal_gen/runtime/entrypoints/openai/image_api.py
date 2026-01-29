@@ -1,6 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import base64
 import os
 import time
 from typing import List, Optional
@@ -130,13 +129,12 @@ async def generations(
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
-     
+
     resp_format = (request.response_format or "b64_json").lower()
 
     # Run synchronously for images
     save_file_path_list, base64_data_list, result = await process_generation_batch(
-        async_scheduler_client, batch , 
-        save_output= resp_format != "b64_json"
+        async_scheduler_client, batch, save_output=resp_format != "b64_json"
     )
     save_file_path = save_file_path_list[0]
 
@@ -168,7 +166,8 @@ async def generations(
                 ImageResponseData(
                     b64_json=frames_list[0],
                     revised_prompt=request.prompt,
-                ) for frames_list in b64_data
+                )
+                for frames_list in b64_data
             ]
         }
     elif resp_format == "url":
@@ -273,13 +272,12 @@ async def edits(
     )
     resp_format = (response_format or "b64_json").lower()
     save_file_path_list, base64_data_list, result = await process_generation_batch(
-        async_scheduler_client, batch,
-        save_output= resp_format != "b64_json"
+        async_scheduler_client, batch, save_output=resp_format != "b64_json"
     )
     save_file_path = save_file_path_list[0]
 
     b64_data = None
-    
+
     # 1. Get b64 data if needed
     if resp_format == "b64_json":
         b64_data = base64_data_list
@@ -307,7 +305,8 @@ async def edits(
             ImageResponseData(
                 b64_json=frames_list[0],
                 revised_prompt=prompt,
-            ) for frames_list in b64_data
+            )
+            for frames_list in b64_data
         ]
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb

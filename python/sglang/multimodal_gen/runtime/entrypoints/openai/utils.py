@@ -7,9 +7,9 @@ import time
 from typing import Any, List, Optional, Union
 
 import httpx
+import numpy as np
 import torch
 from fastapi import UploadFile
-import numpy as np
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
@@ -202,12 +202,15 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
         return target_path
     except Exception as e:
         raise Exception(f"Failed to decode base64 image: {str(e)}")
-    
+
+
 async def frames_to_base64_list(
     frames: List[np.ndarray], format: str = "jpg", quality: int = 75
 ) -> List[str]:
     import io
+
     import imageio
+
     if not frames:
         return None
     b64_list = []
@@ -216,7 +219,9 @@ async def frames_to_base64_list(
         if isinstance(frame, torch.Tensor):
             frame = frame.cpu().numpy()
         if not isinstance(frame, np.ndarray):
-            raise TypeError(f"Frame must be numpy array or torch.Tensor, got {type(frame)}")
+            raise TypeError(
+                f"Frame must be numpy array or torch.Tensor, got {type(frame)}"
+            )
         # Encode image to bytes in memory
         buffer = io.BytesIO()
         imageio.imwrite(buffer, frame, format=format, quality=quality)
@@ -229,9 +234,7 @@ async def frames_to_base64_list(
 
 
 async def process_generation_batch(
-    scheduler_client: AsyncSchedulerClient,
-    batch,
-    save_output: bool = False
+    scheduler_client: AsyncSchedulerClient, batch, save_output: bool = False
 ) -> tuple[str, OutputBatch]:
     total_start_time = time.perf_counter()
     with log_generation_timer(logger, batch.prompt):
