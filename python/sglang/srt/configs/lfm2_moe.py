@@ -19,13 +19,11 @@ For now, we define a standalone config to support the model immediately.
 
 from typing import List, Optional
 
-import torch
 from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
-    Mamba2StateDType,
     Mamba2StateShape,
 )
 
@@ -180,17 +178,11 @@ class Lfm2MoeConfig(PretrainedConfig):
             conv_kernel=conv_kernel,
         )
 
-        default_dtype = torch.get_default_dtype()
-        conv_dtype = (
-            default_dtype
-            if default_dtype in (torch.float16, torch.bfloat16)
-            else torch.bfloat16
-        )
-
+        # Uses default mamba2_state_dtype() which reads SGLANG_MAMBA_CONV_DTYPE env var
+        # (defaults to bfloat16). Set SGLANG_MAMBA_CONV_DTYPE=float16 for fp16 inference.
         return Mamba2CacheParams(
             shape=shape,
             layers=conv_layer_ids,
-            dtype=Mamba2StateDType(conv=conv_dtype, temporal=torch.float32),
         )
 
 
