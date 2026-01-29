@@ -27,6 +27,7 @@ import torch
 from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
@@ -36,6 +37,14 @@ LORA_PATH = "yushengsu/sglang_lora_logprob_diff_without_tuning"
 LORA_BACKEND = "triton"
 SIMILARITY_THRESHOLD = 0.9999
 
+register_cuda_ci(
+    est_time=150,
+    suite="stage-b-test-small-1-gpu",
+)
+register_amd_ci(
+    est_time=250,
+    suite="stage-b-test-small-1-gpu-amd",
+)
 
 class TestEmbeddingLoraSupport(unittest.TestCase):
     """Test LoRA support in embedding request structures."""
