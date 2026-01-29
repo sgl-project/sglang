@@ -10,10 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
-from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-    fused_norm_scale_shift,
-    fused_scale_residual_norm_scale_shift,
-)
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -313,6 +309,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(residual, x, gate, shift, scale)
+
+        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+            fused_scale_residual_norm_scale_shift,
+        )
+
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
             x.contiguous(),
@@ -404,6 +405,10 @@ class _NormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(x, shift, scale)
+
+        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+            fused_norm_scale_shift,
+        )
 
         return fused_norm_scale_shift(
             x.contiguous(),

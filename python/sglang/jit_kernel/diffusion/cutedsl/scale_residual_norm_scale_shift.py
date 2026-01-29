@@ -10,7 +10,7 @@ from sglang.jit_kernel.diffusion.cutedsl.common.norm_fusion import (
     broadcast_tensor_for_bsfd,
     tensor_slice_for_bsfd,
 )
-from sglang.jit_kernel.diffusion.cutedsl.utils import TORCH_TO_CUTE_DTYPE
+from sglang.jit_kernel.diffusion.cutedsl.utils import TORCH_TO_CUTE_DTYPE, WARP_SIZE
 
 _COMPILE_CACHE = {}
 
@@ -80,7 +80,9 @@ class ScaleResidualNormScaleShift:
 
     def __init__(self, D: int, norm_type: str):
         self.D = D
-        self.norm_type = norm_type  # layernorm or rmsnorm
+        self.norm_type = norm_type  # "layer" or "rms"
+        self.num_warps = self.D // 256  # num of warps per cta
+        self.num_threads = self.num_warps * WARP_SIZE  # num of threads per cta
 
     @cute.jit
     def __call__(
@@ -107,7 +109,6 @@ class ScaleResidualNormScaleShift:
             num_bits_per_copy=128,
         )
         # Thread/value layouts for tiled copy
-        self.num_threads = self.D // 256 * 32  # num of threads per cta
         t_layout = cute.make_layout(self.num_threads)  # thread layout within a CTA
         v_layout = cute.make_layout(num_vectorized)  # per-thread vector layout
         tiled_copy = cute.make_tiled_copy_tv(atom_copy, t_layout, v_layout)
@@ -168,7 +169,7 @@ class ScaleResidualNormScaleShift:
         @cute.jit
         def norm(x, weight, bias):
             return apply_norm_cta(
-                self.norm_type, self.num_threads, tidx, x, weight, bias, self.D, eps
+                self.norm_type, self.num_warps, tidx, x, weight, bias, self.D, eps
             )
 
         # Slice: retrieve the per-thread data slices for both global memory (gmem)

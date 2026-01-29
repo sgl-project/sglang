@@ -10,13 +10,11 @@ from sglang.jit_kernel.diffusion.cutedsl.common.reduce import (
     warp_reduce_sum,
 )
 
-WARP_SIZE = 32
-
 
 @cute.jit
 def apply_norm_cta(
     norm_type: cutlass.Constexpr,
-    num_threads: Union[cutlass.Int32, cutlass.Constexpr],
+    num_warps: cutlass.Constexpr,
     tidx: cutlass.Int32,
     tXrX: cute.Tensor,
     tWrW: Optional[cute.Tensor],
@@ -25,14 +23,14 @@ def apply_norm_cta(
     eps: Union[cutlass.Float32, cutlass.Constexpr],
 ) -> cute.Tensor:
     if cutlass.const_expr(norm_type == "rms"):
-        return apply_rmsnorm_cta(num_threads, tidx, tXrX, tWrW, D, eps)
+        return apply_rmsnorm_cta(num_warps, tidx, tXrX, tWrW, D, eps)
     else:
-        return apply_layernorm_cta(num_threads, tidx, tXrX, tWrW, tBrB, D, eps)
+        return apply_layernorm_cta(num_warps, tidx, tXrX, tWrW, tBrB, D, eps)
 
 
 @cute.jit
 def apply_rmsnorm_cta(
-    num_threads: Union[cutlass.Int32, cutlass.Constexpr],
+    num_warps: Union[cutlass.Int32, cutlass.Constexpr],
     tidx: cutlass.Int32,
     tXrX: cute.Tensor,
     tWrW: Optional[cute.Tensor],
@@ -49,7 +47,7 @@ def apply_rmsnorm_cta(
         x_fp32 = tXrX[idx].to(cutlass.Float32)
         val += x_fp32 * x_fp32
     val = warp_reduce_sum(val)
-    acc_sq = cta_reduce_sum(val, num_threads // WARP_SIZE, tidx)
+    acc_sq = cta_reduce_sum(val, num_warps, tidx)
     factor = cute.rsqrt(acc_sq / D + eps)
     tNrN = cute.make_fragment_like(tXrX)
     if cutlass.const_expr(isinstance(tWrW, cute.Tensor)):
@@ -61,7 +59,7 @@ def apply_rmsnorm_cta(
 
 @cute.jit
 def apply_layernorm_cta(
-    num_threads: Union[cutlass.Int32, cutlass.Constexpr],
+    num_warps: Union[cutlass.Int32, cutlass.Constexpr],
     tidx: cutlass.Int32,
     tXrX: cute.Tensor,
     tWrW: Optional[cute.Tensor],
@@ -81,7 +79,7 @@ def apply_layernorm_cta(
         # Accumulate in FP32 to improve numerical precision.
         val += tXrX[idx].to(cutlass.Float32)
     val = warp_reduce_sum(val)
-    val = cta_reduce_sum(val, num_threads // WARP_SIZE, tidx)
+    val = cta_reduce_sum(val, num_warps, tidx)
     mean = val / D
     # Reduce variance
     val = cute.Float32(0.0)
@@ -90,7 +88,7 @@ def apply_layernorm_cta(
         x_fp32 = tXrX[idx].to(cutlass.Float32)
         val += (x_fp32 - mean) * (x_fp32 - mean)
     val = warp_reduce_sum(val)
-    val = cta_reduce_sum(val, num_threads // WARP_SIZE, tidx)
+    val = cta_reduce_sum(val, num_warps, tidx)
     factor = cute.rsqrt(val / D + eps)
     # Normalize
     tNrN = cute.make_fragment_like(tXrX)
