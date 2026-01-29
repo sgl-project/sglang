@@ -63,7 +63,7 @@ from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
-    get_available_gpu_memory,
+    get_available_device_memory,
     get_bool_env_var,
     is_hip,
     log_info_on_rank0,
@@ -475,7 +475,7 @@ class CudaGraphRunner:
             profile_context = self._init_profile_context_and_memory_record()
 
         def _capture_one_stream(stream_idx: Optional[int] = None):
-            avail_mem = get_available_gpu_memory(
+            avail_mem = get_available_device_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
                 empty_cache=False,
@@ -488,7 +488,7 @@ class CudaGraphRunner:
             )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
+                    avail_mem = get_available_device_memory(
                         self.model_runner.device,
                         self.model_runner.gpu_id,
                         empty_cache=False,
