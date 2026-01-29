@@ -135,6 +135,7 @@ class RequestTrackers:
             self.last_top_k_result[req_pool_idx] = torch.arange(
                 num_pages, device=self.device
             )
+            self.lru_slots[req_pool_idx] = torch.arange(num_pages, device=self.device)
         else:
             indices_len = self.device_buffer_cnt
             self.last_device_indices[req_pool_idx] = req_to_token_pool.req_to_token[
@@ -143,6 +144,7 @@ class RequestTrackers:
             self.last_top_k_result[req_pool_idx] = torch.arange(
                 indices_len, device=self.device
             )
+            self.lru_slots[req_pool_idx] = torch.arange(indices_len, device=self.device)
         self.hierarchical_sparse_enabled[req_pool_idx] = True
 
 

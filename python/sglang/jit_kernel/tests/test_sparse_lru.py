@@ -1,6 +1,8 @@
 import torch
 
-from sglang.jit_kernel.sparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.sparse import load_cache_to_device_buffer
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 
 
 def _expected_lru(
@@ -9,8 +11,11 @@ def _expected_lru(
     top_k_tokens: torch.Tensor,
     num_top_k: int,
     hot_buffer_size: int,
+    newest_token: int,
 ) -> torch.Tensor:
+    lru_size = hot_buffer_size - 1
     top_k_set = set(top_k_tokens.tolist())
+
     hit_slots: list[int] = []
     evictable_slots: list[int] = []
     for slot in lru_slots.tolist():
@@ -21,25 +26,27 @@ def _expected_lru(
             evictable_slots.append(int(slot))
 
     total_hits = len(hit_slots)
-    assert total_hits <= num_top_k
-    num_misses = num_top_k - total_hits
+    newest_hit = 1 if newest_token in top_k_set else 0
+    num_misses = num_top_k - total_hits - newest_hit
+    assert num_misses >= 0
 
-    lru_out = [None] * hot_buffer_size
+    total_evictable = lru_size - total_hits
+    assert num_misses <= total_evictable
 
-    # Front region: older evictable slots that are not used for current misses.
-    front_size = hot_buffer_size - num_top_k
+    lru_out = [None] * lru_size
+    front_size = total_evictable - num_misses
     front_slots = evictable_slots[num_misses:]
     assert len(front_slots) == front_size
+
     for i, slot in enumerate(front_slots):
         lru_out[i] = slot
 
-    # Middle region: slots used for current misses.
-    middle_base = hot_buffer_size - num_top_k
-    for i, slot in enumerate(evictable_slots[:num_misses]):
+    middle_base = front_size
+    miss_slots = list(reversed(evictable_slots[:num_misses]))
+    for i, slot in enumerate(miss_slots):
         lru_out[middle_base + i] = slot
 
-    # End region: hits (most recent).
-    end_base = hot_buffer_size - total_hits
+    end_base = lru_size - total_hits
     for i, slot in enumerate(hit_slots):
         lru_out[end_base + i] = slot
 
@@ -47,31 +54,8 @@ def _expected_lru(
     return torch.tensor(lru_out, dtype=torch.int16, device=lru_slots.device)
 
 
-def _round_trip_lru_test() -> None:
-    device = "cuda"
-    torch.set_default_dtype(torch.bfloat16)
-
-    # Small, deterministic sizes for LRU validation.
-    num_top_k = 8
-    hot_buffer_size = 16
-    item_size = 64
-    token_stride_size = item_size * torch.bfloat16.itemsize
-    total_items_in_pool = 64
-
-    # Single-batch, single-layer inputs.
-    batch = 1
-    layer_id = 0
-
-    host_cache_k = torch.randn(total_items_in_pool * 2, item_size).pin_memory()
-    device_buffer_k = torch.randn(total_items_in_pool, item_size, device=device)
-
-    sparse_mask = torch.tensor([True], device=device)
-    page_table = torch.zeros(batch, 64, dtype=torch.int32, device=device)
-    diff_map = torch.full((batch, 128), -1, dtype=torch.int16, device=device)
-    seq_lens = torch.tensor([64], dtype=torch.int64, device=device)
-    req_pool_indices = torch.tensor([0], dtype=torch.int64, device=device)
-
-    tasks_per_block = num_top_k * 1
+def _build_transfer_tasks(batch: int, num_top_k: int, page_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    tasks_per_block = num_top_k * page_size
     stride_per_block = tasks_per_block + 1
     max_transfer_tasks = batch * stride_per_block
     transfer_tasks_src = torch.full(
@@ -80,48 +64,144 @@ def _round_trip_lru_test() -> None:
     transfer_tasks_dst = torch.full(
         (max_transfer_tasks,), -1, dtype=torch.int64, device="cuda"
     )
-    # LRU slots in LRU order (0 is oldest).
-    lru_slots = torch.arange(hot_buffer_size, dtype=torch.int16, device=device).reshape(1, 1, -1)
+    return transfer_tasks_src, transfer_tasks_dst
 
-    # Buffer tokens: mostly 0..15, but replace 7 with 16 so token 7 will miss.
-    buffer_tokens = torch.tensor(
-        [0, 1, 2, 3, 4, 5, 6, 16, 8, 9, 10, 11, 12, 13, 14, 15],
+
+def test_sparse_lru_end_to_end() -> None:
+    device = "cuda"
+    torch.manual_seed(0)
+
+    num_top_k = 6
+    hot_buffer_size = 8
+    page_size = 1
+    head_num = 8
+    head_dim = 16
+    layer_id = 0
+    batch = 1
+    pool_size = 1
+
+    item_size_bytes = head_num * head_dim * torch.float16.itemsize
+
+    # Allocate real pools (matches SparseKVCacheManager usage).
+    device_pool_size = pool_size * hot_buffer_size * page_size
+    mem_pool_device = MHATokenToKVPool(
+        size=device_pool_size,
+        page_size=page_size,
+        dtype=torch.float16,
+        head_num=head_num,
+        head_dim=head_dim,
+        layer_num=1,
+        device=device,
+        enable_memory_saver=False,
+    )
+    mem_pool_host = MHATokenToKVPoolHost(
+        device_pool=mem_pool_device,
+        host_to_device_ratio=4.0,
+        host_size=0,
+        page_size=page_size,
+        layout="layer_first",
+        pin_memory=True,
+        device="cpu",
+    )
+
+    # Host mapping and buffer mappings.
+    host_token_count = mem_pool_host.size
+    host_pages = host_token_count // page_size
+    assert host_pages > 24, "Host pool too small for test top-k values"
+    host_cache_locs = torch.arange(
+        host_token_count, dtype=torch.int64, device=device
+    ).reshape(pool_size, -1)
+    device_buffer_locs = torch.arange(
+        hot_buffer_size, dtype=torch.int32, device=device
+    ).reshape(pool_size, 1, -1)
+    lru_slots = torch.arange(
+        hot_buffer_size - 1, dtype=torch.int16, device=device
+    ).reshape(pool_size, 1, -1)
+
+    # Seed host pool with deterministic data.
+    token_ids = torch.arange(host_token_count, dtype=torch.float16, device="cpu")
+    token_ids = token_ids.view(-1, 1, 1).repeat(1, head_num, head_dim)
+    mem_pool_host.k_buffer[layer_id][:host_token_count].copy_(token_ids)
+    mem_pool_host.v_buffer[layer_id][:host_token_count].copy_(token_ids + 1.0)
+
+    # Initialize device buffer tokens and preload corresponding K/V.
+    device_buffer_tokens = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6, 0],
         dtype=torch.int32,
         device=device,
-    ).reshape(1, 1, -1)
-    buffer_locs = torch.arange(
-        hot_buffer_size, dtype=torch.int32, device=device
-    ).reshape(1, 1, -1)
+    ).reshape(pool_size, 1, -1)
+    for slot in range(hot_buffer_size):
+        token_id = int(device_buffer_tokens[0, 0, slot].item())
+        for page_offset in range(page_size):
+            host_loc = int(host_cache_locs[0, token_id * page_size + page_offset].item())
+            device_loc = int(device_buffer_locs[0, 0, slot].item()) * page_size + page_offset
+            mem_pool_device.k_buffer[layer_id][device_loc].copy_(
+                mem_pool_host.k_buffer[layer_id][host_loc]
+            )
+            mem_pool_device.v_buffer[layer_id][device_loc].copy_(
+                mem_pool_host.v_buffer[layer_id][host_loc]
+            )
 
-    # host_cache_locs needs to cover miss tokens (page_size = 1).
-    host_cache_locs = torch.arange(128, dtype=torch.int64, device=device).reshape(1, -1)
+    top_k_device_locs = torch.full(
+        (batch, num_top_k), -1, dtype=torch.int32, device=device
+    )
+    page_table = torch.zeros(batch, host_token_count, dtype=torch.int32, device=device)
+    diff_map = torch.full((batch, host_token_count), -1, dtype=torch.int16, device=device)
+    sparse_mask = torch.tensor([True], dtype=torch.bool, device=device)
+    req_pool_indices = torch.tensor([0], dtype=torch.int64, device=device)
+    transfer_tasks_src, transfer_tasks_dst = _build_transfer_tasks(batch, num_top_k, page_size)
 
-    top_k_device_locs = torch.zeros(batch, num_top_k, dtype=torch.int32, device=device)
-
-    # Two rounds with different top_k selections.
+    # Multi-round LRU test with changing seq_len/newest token.
     rounds = [
-        torch.tensor([0, 1, 2, 3, 4, 5, 7, 16], dtype=torch.int32, device=device),
-        torch.tensor([8, 9, 10, 11, 12, 13, 6, 16], dtype=torch.int32, device=device),
-        torch.tensor([1, 3, 5, 7, 9, 11, 13, 16], dtype=torch.int32, device=device),
+        {"seq_len": 15, "top_k": [1, 3, 6, 9, 10, 11]},
+        {"seq_len": 17, "top_k": [2, 3, 6, 10, 11, 12]},
+        {"seq_len": 19, "top_k": [0, 4, 5, 9, 11, 13]},
+        # max topk equals seq_len - 1
+        {"seq_len": 21, "top_k": [1, 2, 4, 7, 8, 20]},
+        # max topk smaller than previous round's max
+        {"seq_len": 23, "top_k": [0, 1, 2, 3, 4, 5]},
+        # mix of hits/misses with smaller max
+        {"seq_len": 25, "top_k": [6, 7, 8, 9, 10, 24]},
     ]
 
-    for round_idx, top_k in enumerate(rounds):
-        top_k_tokens = top_k.reshape(1, -1)
+    for round_idx, round_cfg in enumerate(rounds):
+        seq_lens = torch.tensor([round_cfg["seq_len"]], dtype=torch.int64, device=device)
+        newest_token = int((seq_lens[0].item() - 1) // page_size)
+        newest_slot = hot_buffer_size - 1
+        top_k_list = list(round_cfg["top_k"])
+        if newest_token not in top_k_list:
+            top_k_list[-1] = newest_token
+        top_k_tokens = torch.tensor(
+            top_k_list, dtype=torch.int32, device=device
+        ).reshape(batch, -1)
 
-        # Snapshot pre-call state for reference.
-        pre_lru = lru_slots[0, 0].detach()
-        pre_tokens = buffer_tokens[0, 0].detach()
+        # Simulate the latest token written to newest_slot on device.
+        device_buffer_tokens[0, 0, newest_slot] = newest_token
+        for page_offset in range(page_size):
+            host_loc = int(host_cache_locs[0, newest_token * page_size + page_offset].item())
+            device_loc = int(device_buffer_locs[0, 0, newest_slot].item()) * page_size + page_offset
+            mem_pool_device.k_buffer[layer_id][device_loc].copy_(
+                mem_pool_host.k_buffer[layer_id][host_loc]
+            )
+            mem_pool_device.v_buffer[layer_id][device_loc].copy_(
+                mem_pool_host.v_buffer[layer_id][host_loc]
+            )
+
+        pre_lru = lru_slots[0, 0].detach().clone()
+        pre_tokens = device_buffer_tokens[0, 0].detach().clone()
         expected_lru = _expected_lru(
-            pre_lru, pre_tokens, top_k, num_top_k, hot_buffer_size
+            pre_lru, pre_tokens, top_k_tokens[0], num_top_k, hot_buffer_size, newest_token
         )
 
-        load_cache_to_device_buffer_mla(
+        load_cache_to_device_buffer(
             top_k_tokens,
-            buffer_tokens,
+            device_buffer_tokens,
             host_cache_locs,
-            buffer_locs,
-            host_cache_k,
-            device_buffer_k,
+            device_buffer_locs,
+            mem_pool_host.k_buffer[layer_id],
+            mem_pool_host.v_buffer[layer_id],
+            mem_pool_device.k_buffer[layer_id],
+            mem_pool_device.v_buffer[layer_id],
             top_k_device_locs,
             page_table,
             diff_map,
@@ -131,22 +211,57 @@ def _round_trip_lru_test() -> None:
             lru_slots,
             transfer_tasks_src,
             transfer_tasks_dst,
-            1,  # page_size
+            page_size,
             layer_id,
-            token_stride_size,
+            item_size_bytes,
             num_top_k=num_top_k,
             hot_buffer_size=hot_buffer_size,
         )
         torch.cuda.synchronize()
 
+        # 1) LRU eviction logic
         got_lru = lru_slots[0, 0]
-        assert sorted(got_lru.tolist()) == sorted(
-            pre_lru.tolist()
-        ), f"LRU permutation broken at round {round_idx}"
+        if not torch.equal(got_lru, expected_lru):
+            print(
+                "[lru mismatch] round",
+                round_idx,
+                "seq_len",
+                int(seq_lens[0].item()),
+                "newest_token",
+                newest_token,
+                "top_k",
+                top_k_list,
+            )
+            print("[lru mismatch] pre_lru", pre_lru.tolist())
+            print("[lru mismatch] pre_tokens", pre_tokens.tolist())
+            print("[lru mismatch] expected", expected_lru.tolist())
+            print("[lru mismatch] got", got_lru.tolist())
         assert torch.equal(
             got_lru, expected_lru
-        ), f"LRU mismatch at round {round_idx}: got={got_lru.tolist()} expected={expected_lru.tolist()}"
+        ), f"LRU mismatch round {round_idx}"
+
+        # 2) max topk logic (newest token binds to newest_slot)
+        newest_idx = int((top_k_tokens[0] == newest_token).nonzero(as_tuple=False)[0].item())
+        expected_newest_loc = int(device_buffer_locs[0, 0, newest_slot].item())
+        assert int(top_k_device_locs[0, newest_idx].item()) == expected_newest_loc
+
+        # 3) data transfer correctness: verify device cache matches host for top-k
+        assert int(top_k_device_locs.min().item()) >= 0, "top_k_device_locs contains -1"
+        for i in range(num_top_k):
+            token_id = int(top_k_tokens[0, i].item())
+            device_page = int(top_k_device_locs[0, i].item())
+            for page_offset in range(page_size):
+                host_loc = int(host_cache_locs[0, token_id * page_size + page_offset].item())
+                device_loc = device_page * page_size + page_offset
+                assert torch.equal(
+                    mem_pool_device.k_buffer[layer_id][device_loc].cpu(),
+                    mem_pool_host.k_buffer[layer_id][host_loc],
+                )
+                assert torch.equal(
+                    mem_pool_device.v_buffer[layer_id][device_loc].cpu(),
+                    mem_pool_host.v_buffer[layer_id][host_loc],
+                )
 
 
 if __name__ == "__main__":
-    _round_trip_lru_test()
+    test_sparse_lru_end_to_end()

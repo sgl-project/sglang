@@ -9,6 +9,7 @@ from sglang.jit_kernel.sparse import (
     load_cache_to_device_buffer,
     load_cache_to_device_buffer_mla,
 )
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_module
 
@@ -115,7 +116,6 @@ class SparseKVCacheManager:
             Device indices of the selected pages/tokens
         """
         bs = sparse_mask.shape[0]
-
         block_size = 512 if top_k_result.size(1) == 2048 else 32
         if self.is_mla_pool:
             load_cache_to_device_buffer_mla(
@@ -164,9 +164,10 @@ class SparseKVCacheManager:
                 block_size=block_size,
             )
 
-        return self.req_states.curr_device_indices[
+        result = self.req_states.curr_device_indices[
             :bs, : self.req_states.topk_tokens_cnt // page_size
         ]
+        return result
 
     def offload_decode_token_kvcache(
         self, req_pool_indices, device_cache_locs, seq_lens
