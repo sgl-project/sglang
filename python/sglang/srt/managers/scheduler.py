@@ -62,6 +62,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
     compute_dp_attention_world_info,
+    get_attention_cp_group,
     get_attention_tp_group,
 )
 from sglang.srt.layers.moe import initialize_moe_config
@@ -265,6 +266,8 @@ class Scheduler(
         tp_rank: int,
         moe_ep_rank: int,
         pp_rank: int,
+        attn_cp_rank: int,
+        moe_cp_rank: int,
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
@@ -275,6 +278,10 @@ class Scheduler(
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_cp_rank = moe_cp_rank
+        self.moe_cp_size = server_args.moe_cp_size
         self.dp_rank = dp_rank
         self.tp_size = server_args.tp_size
         self.moe_ep_size = server_args.ep_size
@@ -320,6 +327,7 @@ class Scheduler(
                 self.tp_rank,
                 self.tp_size,
                 self.dp_size,
+                self.attn_cp_size,
             )
         )
 
@@ -408,7 +416,7 @@ class Scheduler(
         context = zmq.Context(2)
         self.idle_sleeper = None
 
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
+        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -504,6 +512,8 @@ class Scheduler(
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,
             pp_rank=self.pp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_cp_rank=self.moe_cp_rank,
             dp_rank=self.dp_rank,
             nccl_port=self.nccl_port,
         )
@@ -522,6 +532,8 @@ class Scheduler(
             nccl_port=self.nccl_port,
             target_worker=self.tp_worker,
             dp_rank=self.dp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_cp_rank=self.moe_cp_rank,
         )
 
         if self.server_args.speculative_draft_load_format is not None:
@@ -569,6 +581,8 @@ class Scheduler(
         self.tp_cpu_group = self.tp_group.cpu_group
         self.attn_tp_group = get_attention_tp_group()
         self.attn_tp_cpu_group = self.attn_tp_group.cpu_group
+        self.attn_cp_group = get_attention_cp_group()
+        self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
@@ -1181,7 +1195,7 @@ class Scheduler(
                 return []
 
         if self.pp_rank == 0:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 recv_reqs = []
 
                 while True:
@@ -1205,7 +1219,7 @@ class Scheduler(
             else:
                 recv_reqs = None
         else:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
@@ -1221,7 +1235,7 @@ class Scheduler(
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
         if self.server_args.enable_dp_attention:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
                 work_reqs, control_reqs = self._split_work_and_control_reqs(recv_reqs)
             else:
                 work_reqs = None
@@ -1234,6 +1248,15 @@ class Scheduler(
                     self.attn_tp_cpu_group,
                     src=self.attn_tp_group.ranks[0],
                 )
+
+            if self.attn_cp_size != 1:
+                work_reqs = broadcast_pyobj(
+                    work_reqs,
+                    self.attn_cp_group.rank,
+                    self.attn_cp_cpu_group,
+                    src=self.attn_cp_group.ranks[0],
+                )
+
             if self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
@@ -2976,6 +2999,8 @@ def run_scheduler_process(
     port_args: PortArgs,
     gpu_id: int,
     tp_rank: int,
+    attn_cp_rank: int,
+    moe_cp_rank: int,
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
@@ -2990,6 +3015,10 @@ def run_scheduler_process(
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
+    if server_args.attn_cp_size > 1:
+        prefix += f" ATTN_CP{attn_cp_rank}"
+    if server_args.moe_cp_size > 1:
+        prefix += f" MOE_CP{moe_cp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
     if server_args.ep_size > 1:
@@ -3034,6 +3063,8 @@ def run_scheduler_process(
             tp_rank,
             moe_ep_rank,
             pp_rank,
+            attn_cp_rank,
+            moe_cp_rank,
             dp_rank,
         )
         result_dict = {
