@@ -1,0 +1,70 @@
+import io
+import re
+
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
+from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import is_cuda_alike
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+
+class TestOnlineQuantizationMemoryLoad(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.stdout = io.StringIO()
+        cls.stderr = io.StringIO()
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--quantization",
+                "fp8",
+                "--tensor-parallel-size",
+                "1",
+                "--log-level",
+                "debug",
+            ],
+            return_stdout_stderr=(cls.stdout, cls.stderr),
+        )
+
+        # Extract and display peak GPU memory from logs
+        combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
+        peak_memory = cls._extract_peak_memory(combined_output)
+
+        if is_cuda_alike() and not peak_memory:
+            raise ValueError("Should have found peak memory")
+
+        cls.peak_memory = float(peak_memory)
+
+    @classmethod
+    def _extract_peak_memory(cls, log_output):
+        """Extract peak GPU memory value from log output."""
+        # Search for the log message pattern
+        pattern = r"Peak GPU memory after loading weights:\s+([\d.]+)\s+GiB"
+        match = re.search(pattern, log_output)
+        if match:
+            return match.group(1)
+        return None
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        cls.stdout.close()
+        cls.stderr.close()
+
+    def test_peak_memory(self):
+        if not is_cuda_alike():
+            self.skipTest("not is_cuda_alike")
+
+        assert self.peak_memory < 2

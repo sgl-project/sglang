@@ -1,4 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/layers/quantization/fp8.py
+# Online quantization adapted from https://github.com/vllm-project/vllm/pull/29196 and https://github.com/vllm-project/vllm/pull/31914
 
 from __future__ import annotations
 
@@ -346,10 +347,13 @@ class Fp8LinearMethod(LinearMethodBase):
             device = torch.get_default_device()
 
         layer._load_device = torch.get_default_device()
-        
+
         weight = ModelWeightParameter(
             data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype, device=device
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=weight_dtype,
+                device=device,
             ),
             input_dim=1,
             output_dim=0,
@@ -452,7 +456,6 @@ class Fp8LinearMethod(LinearMethodBase):
             assert (
                 layer._loaded_numel <= target_loaded_numel
             ), f"target_loaded_numel={target_loaded_numel}, layer._loaded_numel={layer._loaded_numel}"
-            
 
             # Delay online quantization until all tensor shards (e.g. q_proj, k_proj, v_proj) are loaded, to avoid having to re-quantize later on.
             if layer._loaded_numel == target_loaded_numel:
