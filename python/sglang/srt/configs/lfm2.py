@@ -81,7 +81,7 @@ class Lfm2Config(HFLfm2Config):
             tp_world_size=tp_size,
             intermediate_size=hidden_size,
             n_groups=1,  # ShortConv doesn't use grouping
-            num_heads=1,  # ShortConv is not multi-head
+            num_heads=tp_size,  # Ensures divide works; temporal state is empty anyway
             head_dim=hidden_size,  # Conv operates on full hidden dim
             state_size=0,  # No SSM temporal state for ShortConv
             conv_kernel=conv_kernel,

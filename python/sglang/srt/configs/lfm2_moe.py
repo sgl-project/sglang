@@ -172,7 +172,7 @@ class Lfm2MoeConfig(PretrainedConfig):
             tp_world_size=tp_size,
             intermediate_size=hidden_size,
             n_groups=1,
-            num_heads=1,
+            num_heads=tp_size,  # Ensures divide works; temporal state is empty anyway
             head_dim=hidden_size,
             state_size=0,
             conv_kernel=conv_kernel,
