@@ -179,26 +179,6 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
-class KimiK2Detector(BaseReasoningFormatDetector):
-    """
-    Detector for Kimi K2 model.
-
-    It uses the DeepSeek-R1 reasoning format: (<think>)*(.*)</think>.
-    Defaults to thinking mode (force_reasoning=True), but allows disabling it
-    if the model is configured to not think.
-    """
-
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
-        super().__init__(
-            "<think>",
-            "</think>",
-            # Allow force_reasoning to be controlled by arguments, defaulting to True
-            # to match vLLM's default `thinking=True` behavior.
-            force_reasoning=force_reasoning,
-            stream_reasoning=stream_reasoning,
-        )
-
-
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
     Detector for Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
@@ -398,7 +378,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": KimiK2Detector,
+        "kimi_k2": Qwen3Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
