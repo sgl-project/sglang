@@ -56,15 +56,12 @@ def fused_topk_npu(
             ),
             eps=float(1e-20),
         )
-        get_global_experts_capturer().capture(
-            layer_id=layer_id,
-            topk_ids=topk_ids,
-        )
 
     else:
         topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=layer_id,
             router_logits=router_logits,
             topk_config=topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -74,5 +71,9 @@ def fused_topk_npu(
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    get_global_experts_capturer().capture(
+        layer_id=layer_id,
+        topk_ids=topk_ids,
+    )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
