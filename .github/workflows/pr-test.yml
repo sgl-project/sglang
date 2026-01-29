@@ -1131,6 +1131,8 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
       - name: Run diffusion server tests
         timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
@@ -1183,6 +1185,8 @@ jobs:
 
       - name: Run diffusion server tests
         timeout-minutes: 240
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd python
           CONTINUE_ON_ERROR_FLAG=""
