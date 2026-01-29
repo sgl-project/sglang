@@ -1189,7 +1189,7 @@ at::Tensor fused_experts_cpu(
   //   5. Aq_tmp : [M, K] or [M * topk, N]
   //   6. As_tmp : [M * topk]
   //
-  // for fp8 w8a16:
+  // for fp8 w8a16 and mxfp4:
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
@@ -1432,9 +1432,9 @@ at::Tensor shared_expert_cpu(
   //   3. Aq_tmp : [M, K] or [M, N]
   //   4. As_tmp : [M]
   //
-  // for fp8 w8a16 and mxfp4:
+  // for fp8 w8a16:
   //   5. intermediate_cache0 : [M, 2N]
-  //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, std::max(K, N)]
+  //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, max(K, N)]
   //
   int num_threads = at::get_num_threads();
   int64_t buffer_size_nbytes = M * N * 2 + num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);

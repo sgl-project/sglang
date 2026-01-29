@@ -8,7 +8,6 @@ kernel = torch.ops.sgl_kernel
 
 torch.manual_seed(1234)
 
-from sglang.test.test_utils import CustomTestCase
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -24,6 +23,8 @@ from utils import (
     torch_naive_fused_moe_gptoss,
     torch_w8a8_per_column_fused_moe,
 )
+
+from sglang.test.test_utils import CustomTestCase
 
 
 def fused_moe(a, w1, w2, score, topk, renormalize, prepack):

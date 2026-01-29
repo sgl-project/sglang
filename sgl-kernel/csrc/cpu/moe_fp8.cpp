@@ -243,7 +243,6 @@ void fused_experts_fp_kernel_impl(
     // get local pointers
     int tid = get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
-    float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
 
     loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
@@ -503,7 +502,6 @@ void shared_expert_fp8_kernel_impl(
   const int64_t MB2 = MB;
   const int64_t NB2 = div_up(K, BLOCK_N);
   scale_size_K = div_up(N, block_size_K);
-  int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
   // parallel on [MB2, NB2]
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -522,7 +520,7 @@ void shared_expert_fp8_kernel_impl(
           /*   A            */ ic1 + mb * BLOCK_M * N,
           /*   B            */ packed_w2 + nb * BLOCK_N * N,
           /*   C            */ C,
-          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + B_tmp_offset_per_thread + nb_offset * BLOCK_N * IC,
+          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
           /*   Bbias        */ nullptr,
           /*   scale        */ w2s + (nb / blocks_n_per_group) * scale_size_K,
