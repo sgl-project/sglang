@@ -178,6 +178,12 @@ def _yarn_linear_ramp_mask(
 
 
 def get_rope_scaling(config):
+    params = getattr(config, "rope_parameters", None)
+    if isinstance(params, dict) and set(params.keys()).issubset(
+        {"rope_theta", "rope_type"}
+    ):
+        return None
+
     rope_type = getattr(config, "rope_type", None)
     if rope_type:
         original_max_position_embeddings = getattr(
