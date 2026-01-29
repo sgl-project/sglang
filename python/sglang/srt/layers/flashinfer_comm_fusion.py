@@ -4,7 +4,10 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_attn_tensor_model_parallel_world_size,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -171,7 +174,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         )
         return None, None
 
-    world_size = get_tensor_model_parallel_world_size()
+    # world_size = get_tensor_model_parallel_world_size()
+    world_size = get_attn_tensor_model_parallel_world_size()
     if world_size <= 1:
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None

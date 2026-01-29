@@ -4,6 +4,7 @@ from itertools import accumulate
 from typing import TYPE_CHECKING, List
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.layers.dp_attention import get_attention_cp_group
 from sglang.srt.server_args import get_global_server_args
@@ -84,15 +85,25 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
 
 
 def cp_all_gather_reorganazied_into_tensor(
-    input_tensor, cp_size, forward_batch, stream
+    input_tensor, total_len, cp_size, forward_batch, stream
 ):
     """
     Allgather communication for context_parallel hidden_states.
     """
     # The input tensor should already be padded to the same length for allgather communication.
     # No need to pad again.
-    input_tensor_full = input_tensor.new_empty(
-        (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+    # step1
+    max_len = (total_len + cp_size - 1) // cp_size
+    pad_size = max_len - input_tensor.shape[0]
+    if pad_size > 0:
+        input_tensor = F.pad(
+            input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
+        )
+    input_tensor_full = torch.empty(
+        max_len * cp_size,
+        input_tensor.shape[1],
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
     )
 
     get_attention_cp_group().cp_all_gather_into_tensor_async(
@@ -136,8 +147,15 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
     # TODO: Do we need to remove the padding here?
     bs_seq_len, hidden_size = input_tensor.shape
+    print(
+        f"Rank {torch.distributed.get_rank()} DEBUG: cp_all_gather_rerange_output",
+        bs_seq_len,
+        hidden_size,
+        flush=True,
+    )
     output_tensor = cp_all_gather_reorganazied_into_tensor(
         input_tensor,
+        forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
@@ -209,6 +227,11 @@ def prepare_context_parallel_metadata(
     remainder = kv_len % (cp_segment_num)
     if remainder > 0:
         split_list[:remainder] = [x + 1 for x in split_list[:remainder]]
+
+    print(
+        f"Rank {torch.distributed.get_rank()} DEBUG: split_list: {split_list}",
+        flush=True,
+    )
 
     seq_max_rank_len = (kv_len + cp_size - 1) // cp_size
     max_rank_len = seq_max_rank_len.repeat_interleave(cp_size).int().tolist()

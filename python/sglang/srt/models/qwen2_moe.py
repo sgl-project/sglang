@@ -640,6 +640,10 @@ class Qwen2MoeModel(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+            print(
+                f"Rank {torch.distributed.get_rank()} DEBUG: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
 
         aux_hidden_states = []
         if forward_batch.can_run_tbo:

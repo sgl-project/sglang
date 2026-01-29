@@ -30,9 +30,9 @@ from sglang.srt.distributed import (
     get_attn_context_model_parallel_world_size,
     get_moe_context_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -226,7 +226,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        # self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_moe_tensor_parallel_world_size()
         self.layer_id = layer_id
         if self.tp_size > config.num_experts:
             raise ValueError(
