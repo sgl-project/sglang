@@ -103,6 +103,53 @@ class PDDisaggregationServerBase(CustomTestCase):
         time.sleep(5)
 
 
+def _get_available_ib_devices():
+    """Auto-detect available high-speed RDMA devices from sysfs.
+
+    Filters for devices that are:
+    1. Active (port state)
+    2. High-speed (rate >= 100 Gbps to exclude regular Ethernet NICs)
+    """
+    ib_sysfs_path = "/sys/class/infiniband"
+    if not os.path.isdir(ib_sysfs_path):
+        return None
+
+    devices = []
+    for dev in sorted(os.listdir(ib_sysfs_path)):
+        # Check port 1 state and rate (most devices have single port)
+        port_path = os.path.join(ib_sysfs_path, dev, "ports", "1")
+        if not os.path.isdir(port_path):
+            continue
+
+        # Check if port is active
+        state_file = os.path.join(port_path, "state")
+        try:
+            with open(state_file) as f:
+                state = f.read().strip()
+                # State format is like "4: ACTIVE" or just "ACTIVE"
+                if "ACTIVE" not in state.upper():
+                    continue
+        except (OSError, IOError):
+            continue
+
+        # Check rate (filter out low-speed NICs like 10/25 Gbps Ethernet)
+        rate_file = os.path.join(port_path, "rate")
+        try:
+            with open(rate_file) as f:
+                rate_str = f.read().strip()
+                # Rate format is like "400 Gb/sec" or just a number
+                rate = int(rate_str.split()[0])
+                if rate < 100:  # Skip devices slower than 100 Gbps
+                    continue
+        except (OSError, IOError, ValueError, IndexError):
+            # If we can't read rate, include the device anyway
+            pass
+
+        devices.append(dev)
+
+    return devices if devices else None
+
+
 def get_rdma_devices_args():
     def _parse_list_env(var_name: str):
         val = os.getenv(var_name)
@@ -114,9 +161,12 @@ def get_rdma_devices_args():
     def _pick_default_pair(rdma_all_devices):
         return [rdma_all_devices[0], rdma_all_devices[len(rdma_all_devices) // 2]]
 
-    rdma_all_devices = _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES") or [
-        f"mlx5_roce{i}" for i in range(8)
-    ]
+    # Priority: env var > auto-detect > hardcoded fallback
+    rdma_all_devices = (
+        _parse_list_env("SGLANG_CI_RDMA_ALL_DEVICES")
+        or _get_available_ib_devices()
+        or [f"mlx5_roce{i}" for i in range(8)]
+    )
     logger.info("Resolved rdma_all_devices=%s", rdma_all_devices)
 
     n_rdma = len(rdma_all_devices)
