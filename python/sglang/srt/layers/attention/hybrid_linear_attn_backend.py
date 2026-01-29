@@ -23,6 +23,9 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter,
+)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
@@ -1297,15 +1300,18 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
     ):
+        """
+        Update mamba states after MTP verify using fused Triton kernel.
+        
+        This replaces the original advanced indexing operations with a fused
+        gather-scatter kernel to avoid multiple index_elementwise_kernel launches.
+        """
         request_number = accepted_steps.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
                 :request_number
             ]
-        )
-        intermediate_state_indices = torch.arange(
-            request_number, dtype=torch.int32, device=state_indices_tensor.device
         )
 
         mamba_caches = (
@@ -1317,41 +1323,63 @@ class HybridLinearAttnBackend(AttentionBackend):
         intermediate_state_cache = mamba_caches.intermediate_ssm
         intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
-        # Compute common indices once to avoid duplication
-        valid_mask = accepted_steps >= 0
-        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)  # [N]
-        src_state_indices = intermediate_state_indices[valid_mask].to(
+        # Use nonzero instead of bool mask indexing to get valid indices
+        # This avoids the index_elementwise_kernel from tensor[bool_mask]
+        valid_indices = (accepted_steps >= 0).nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            return
+
+        # Gather indices using index_select (more efficient than advanced indexing)
+        dst_state_indices = state_indices_tensor.index_select(0, valid_indices).to(
             torch.int64
-        )  # [N]
-        last_steps = accepted_steps[valid_mask].to(torch.int64)  # [N]
+        )
+        src_state_indices = valid_indices.to(torch.int64)
+        last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int64)
 
-        # scatter into ssm_states at the chosen cache lines
-        ssm_states[:, dst_state_indices, :] = intermediate_state_cache[
-            :, src_state_indices, last_steps
-        ].to(ssm_states.dtype, copy=False)
-
-        # Scatter into conv_states at the chosen cache lines
-        conv_states[:, dst_state_indices, :] = intermediate_conv_window_cache[
-            :, src_state_indices, last_steps
-        ].to(conv_states.dtype, copy=False)
+        # Use fused triton kernel for scatter operations
+        # This replaces: ssm_states[:, dst, :] = intermediate_cache[:, src, step, :]
+        fused_mamba_state_scatter(
+            ssm_states,
+            intermediate_state_cache,
+            dst_state_indices,
+            src_state_indices,
+            last_steps,
+        )
+        fused_mamba_state_scatter(
+            conv_states,
+            intermediate_conv_window_cache,
+            dst_state_indices,
+            src_state_indices,
+            last_steps,
+        )
 
         # Track indices used for tracking mamba states for prefix cache
         if mamba_track_indices is not None:
             assert mamba_steps_to_track is not None
-            track_mask = mamba_steps_to_track >= 0
-            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)  # [N]
-            if track_steps.numel() == 0:
-                # No track indices to update
+            track_valid_indices = (mamba_steps_to_track >= 0).nonzero(as_tuple=True)[0]
+            if track_valid_indices.numel() == 0:
                 return
-            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
-            src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
 
-            # scatter into ssm_states at the chosen track states
-            ssm_states[:, dst_track_indices, :] = intermediate_state_cache[
-                :, src_track_indices, track_steps
-            ].to(ssm_states.dtype, copy=False)
+            dst_track_indices = mamba_track_indices.index_select(
+                0, track_valid_indices
+            ).to(torch.int64)
+            src_track_indices = track_valid_indices.to(torch.int64)
+            track_steps = mamba_steps_to_track.index_select(
+                0, track_valid_indices
+            ).to(torch.int64)
 
-            # scatter into conv_states at the chosen track states
-            conv_states[:, dst_track_indices, :] = intermediate_conv_window_cache[
-                :, src_track_indices, track_steps
-            ].to(conv_states.dtype, copy=False)
+            # Use fused triton kernel for track scatter operations
+            fused_mamba_state_scatter(
+                ssm_states,
+                intermediate_state_cache,
+                dst_track_indices,
+                src_track_indices,
+                track_steps,
+            )
+            fused_mamba_state_scatter(
+                conv_states,
+                intermediate_conv_window_cache,
+                dst_track_indices,
+                src_track_indices,
+                track_steps,
+            )
