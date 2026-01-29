@@ -28,9 +28,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.beam_search_type import BeamSearchSequence
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ImageData
 
 # Handle serialization of Image for pydantic
@@ -63,6 +65,11 @@ class BaseBatchReq(ABC):
         """Generate new request IDs and return them."""
         self.rids = [uuid.uuid4().hex for _ in range(len(self.rids))]
         return self.rids
+
+
+@dataclass
+class BeamSearchOutput(BaseBatchReq):
+    sequences: List[BeamSearchSequence]
 
 
 @dataclass
@@ -343,6 +350,18 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _handle_beam_search_parallel_sampling(self) -> int:
+        """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1."""
+        if not get_global_server_args().enable_beam_search:
+            return self.parallel_sample_num
+
+        if self.parallel_sample_num <= 1:
+            raise ValueError(
+                f"Beam search mode requires n > 1 (beam_width), but got n={self.parallel_sample_num}. "
+                "Please set n to a value greater than 1 in sampling_params."
+            )
+        return 1
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -358,6 +377,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -998,6 +1019,9 @@ class BatchTokenIDOutput(
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # beam search
+    beam_search_output: List[BeamSearchOutput] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1085,6 +1109,9 @@ class BatchStrOutput(
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # beam search
+    beam_search_output: List[BeamSearchOutput] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
