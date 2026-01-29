@@ -1330,11 +1330,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             return
 
         # Gather indices using index_select (more efficient than advanced indexing)
-        dst_state_indices = state_indices_tensor.index_select(0, valid_indices).to(
-            torch.int64
-        )
-        src_state_indices = valid_indices.to(torch.int64)
-        last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int64)
+        dst_state_indices = state_indices_tensor.index_select(0, valid_indices)
+        src_state_indices = valid_indices.to(torch.int32)
+        last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int32)
 
         # Use fused triton kernel for scatter operations
         # This replaces: ssm_states[:, dst, :] = intermediate_cache[:, src, step, :]
@@ -1362,11 +1360,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
             dst_track_indices = mamba_track_indices.index_select(
                 0, track_valid_indices
-            ).to(torch.int64)
-            src_track_indices = track_valid_indices.to(torch.int64)
+            ).to(torch.int32)
+            src_track_indices = track_valid_indices.to(torch.int32)
             track_steps = mamba_steps_to_track.index_select(
                 0, track_valid_indices
-            ).to(torch.int64)
+            ).to(torch.int32)
 
             # Use fused triton kernel for track scatter operations
             fused_mamba_state_scatter(

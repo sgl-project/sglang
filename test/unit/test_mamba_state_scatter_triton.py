@@ -104,9 +104,9 @@ def _new_update_like(
     if valid_indices.numel() == 0:
         return
 
-    dst_state_indices = state_indices_tensor.index_select(0, valid_indices).to(torch.int64)
-    src_state_indices = valid_indices.to(torch.int64)
-    last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int64)
+    dst_state_indices = state_indices_tensor.index_select(0, valid_indices)
+    src_state_indices = valid_indices.to(torch.int32)
+    last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int32)
 
     fused_mamba_state_scatter(
         ssm_states,
@@ -132,8 +132,8 @@ def _new_update_like(
         dst_track_indices = mamba_track_indices.index_select(0, track_valid_indices).to(
             torch.int64
         )
-        src_track_indices = track_valid_indices.to(torch.int64)
-        track_steps = mamba_steps_to_track.index_select(0, track_valid_indices).to(torch.int64)
+        src_track_indices = track_valid_indices.to(torch.int32)
+        track_steps = mamba_steps_to_track.index_select(0, track_valid_indices).to(torch.int32)
 
         fused_mamba_state_scatter(
             ssm_states,
@@ -326,16 +326,16 @@ class TestMambaStateScatterPerf(unittest.TestCase):
             valid_indices = (accepted_steps >= 0).nonzero(as_tuple=True)[0]
             if valid_indices.numel() == 0:
                 return
-            _ = state_indices_tensor.index_select(0, valid_indices).to(torch.int64)
-            _ = valid_indices.to(torch.int64)
-            _ = accepted_steps.index_select(0, valid_indices).to(torch.int64)
+            _ = state_indices_tensor.index_select(0, valid_indices)
+            _ = valid_indices.to(torch.int32)
+            _ = accepted_steps.index_select(0, valid_indices).to(torch.int32)
 
         # (2) kernel only (use precomputed indices)
         valid_indices = (accepted_steps >= 0).nonzero(as_tuple=True)[0]
         if valid_indices.numel() > 0:
-            dst_state_indices = state_indices_tensor.index_select(0, valid_indices).to(torch.int64)
-            src_state_indices = valid_indices.to(torch.int64)
-            last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int64)
+            dst_state_indices = state_indices_tensor.index_select(0, valid_indices)
+            src_state_indices = valid_indices.to(torch.int32)
+            last_steps = accepted_steps.index_select(0, valid_indices).to(torch.int32)
 
             def new_kernel_only():
                 fused_mamba_state_scatter(
