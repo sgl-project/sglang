@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
@@ -39,7 +40,6 @@ from sglang.srt.utils import (
     is_xpu,
     set_weight_attrs,
 )
-from sglang.srt.environ import envs
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()

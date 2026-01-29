@@ -224,8 +224,8 @@ class AscendAttnBackend(AttentionBackend):
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
             if (
-                "Gemma2ForSequenceClassification" in
-                model_runner.model_config.hf_config.architectures
+                "Gemma2ForSequenceClassification"
+                in model_runner.model_config.hf_config.architectures
             ):
                 self.use_native_sdpa = True
         self.native_attn = TorchNativeAttnBackend(model_runner)
@@ -811,8 +811,10 @@ class AscendAttnBackend(AttentionBackend):
                 ):
                     causal = False
 
-                if layer.qk_head_dim <= 128 and causal and not getattr(
-                    self, "use_native_sdpa", False
+                if (
+                    layer.qk_head_dim <= 128
+                    and causal
+                    and not getattr(self, "use_native_sdpa", False)
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)

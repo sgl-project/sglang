@@ -39,7 +39,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers, is_npu
+from sglang.srt.utils import add_prefix, is_npu, make_layers
 
 _is_npu = is_npu()
 
@@ -146,7 +146,7 @@ class Gemma2Attention(nn.Module):
         )
         if (
             not _is_npu
-            or 'Gemma2ForSequenceClassification' not in self.config.architectures
+            or "Gemma2ForSequenceClassification" not in self.config.architectures
         ):
             self.rotary_emb = get_rope(
                 self.head_dim,

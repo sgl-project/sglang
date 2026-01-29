@@ -8,6 +8,8 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
+import logging
+logger = logging.getLogger(__name__)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 MODELS = [
@@ -66,8 +68,8 @@ class TestRewardModels(CustomTestCase):
 
         hf_scores = torch.tensor(hf_outputs.scores)
         srt_scores = torch.tensor(srt_outputs.scores)
-        print(f"{hf_scores=}")
-        print(f"{srt_scores=}")
+        logger.info(f"{hf_scores=}")
+        logger.info(f"{srt_scores=}")
 
         assert torch.all(
             abs(hf_scores - srt_scores) < tolerance
