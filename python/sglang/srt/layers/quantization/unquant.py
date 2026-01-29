@@ -308,9 +308,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 weight.data = npu_format_cast(
                     weight.data,
                 )
-            if layer.w13_weight.shape[-1] == layer.hidden_size:
-               layer.w13_weight.data = layer.w13_weight.transpose(1, 2)
-               layer.w2_weight.data = layer.w2_weight.transpose(1, 2)
 
         return
 
