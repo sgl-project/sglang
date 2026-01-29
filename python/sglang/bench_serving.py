@@ -1652,6 +1652,17 @@ def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
 def create_mm_data_row(
     text_prompt, images: list, images_base64, output_len, processor, backend
 ):
+    # for chat backends that go through /v1/chat/completions endpoints
+    if backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
+        return DatasetRow(
+            prompt=text_prompt,
+            prompt_len=len(text_prompt.split()),  # Rough estimate
+            output_len=output_len,
+            text_prompt_len=len(text_prompt.split()),
+            vision_prompt_len=0,  # Will be calculated by server
+            image_data=images_base64,
+        )
+
     try:
         if type(processor).__name__ == "Phi4MMProcessor":
             # <|endoftext10|> is the image token used in the phi-4-multimodal model.
@@ -1707,12 +1718,11 @@ def create_mm_data_row(
     use_raw_prompt = backend in [
         "sglang",
         "sglang-oai",
-        "sglang-oai-chat",
         "vllm",
-        "vllm-chat",
         "lmdeploy",
-        "lmdeploy-chat",
+        # Removed: sglang-oai-chat, vllm-chat, lmdeploy-chat (handled by early return)
     ]
+
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,
