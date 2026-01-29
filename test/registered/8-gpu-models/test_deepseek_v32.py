@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.tool_call_test_runner import ToolCallTestParams
 
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
@@ -184,6 +185,42 @@ class TestDeepseekV32(unittest.TestCase):
                 repeat=4,
             ),
             performance_params=None,  # Skip performance test for GPQA
+        )
+
+    def test_deepseek_v32_tool_call(self):
+        """Test tool call accuracy for DeepSeek V3.2, non-MTP and MTP."""
+        TOOL_CALL_ARGS = [
+            "--tool-call-parser=deepseekv32",
+            "--reasoning-parser=deepseek-v3",
+        ]
+        MTP_ARGS = [
+            "--speculative-algorithm=EAGLE",
+            "--speculative-num-steps=3",
+            "--speculative-eagle-topk=1",
+            "--speculative-num-draft-tokens=4",
+            "--mem-frac=0.7",
+        ]
+
+        variants = [
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS,
+                variant="DP8",
+            ),
+            ModelLaunchSettings(
+                DEEPSEEK_V32_MODEL_PATH,
+                tp_size=8,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
+                variant="DP8+MTP",
+            ),
+        ]
+
+        run_combined_tests(
+            models=variants,
+            test_name="DeepSeek-V3.2 Tool Call",
+            tool_call_params=ToolCallTestParams(test_thinking=True),
         )
 
 
