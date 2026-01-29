@@ -880,7 +880,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             v_for_kernel = value.permute(1, 0, 2, 3)
             a_for_kernel = a.view(bs, 1, -1)
             b_for_kernel = b.view(bs, 1, -1)
-            # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
+            # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, K, V].
             state_for_kernel = ssm_states[cache_indices]
             output, output_state = self._flashinfer_gdn_decode(
                 q=q_for_kernel,
@@ -1032,20 +1032,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 batch_size = seq_len // draft_token_num
                 q_for_kernel = query.view(
                     batch_size, draft_token_num, layer.num_q_heads, layer.head_q_dim
-                ).contiguous()
+                )
                 k_for_kernel = key.view(
                     batch_size, draft_token_num, layer.num_k_heads, layer.head_k_dim
-                ).contiguous()
+                )
                 v_for_kernel = value.view(
                     batch_size, draft_token_num, layer.num_v_heads, layer.head_v_dim
-                ).contiguous()
-                a_for_kernel = a.view(batch_size, draft_token_num, -1).contiguous()
-                b_for_kernel = b.view(batch_size, draft_token_num, -1).contiguous()
-                # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
-                initial_state = ssm_states.transpose(-1, -2).contiguous()
-                intermediate_state_buffer = intermediate_state_cache.transpose(
-                    -1, -2
-                ).contiguous()
+                )
+                a_for_kernel = a.view(batch_size, draft_token_num, -1)
+                b_for_kernel = b.view(batch_size, draft_token_num, -1)
+                # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, K, V].
+                initial_state = ssm_states
+                intermediate_state_buffer = intermediate_state_cache
                 output, _ = self._flashinfer_gdn_mtp(
                     q=q_for_kernel,
                     k=k_for_kernel,
@@ -1094,14 +1092,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 q_for_kernel = l2norm_fwd(q_for_kernel)
                 k_for_kernel = l2norm_fwd(k_for_kernel)
                 # FlashInfer expects alpha in probability space, not log space.
-                g_for_kernel = (
-                    g.squeeze(0).to(torch.float32, copy=False).exp()
-                )
-                beta_for_kernel = (
-                    beta.squeeze(0).to(torch.float32, copy=False)
-                )
-                # FlashInfer expects state in [N, H, K, V] (k-major) layout.
-                # SGLang stores state as [N, H, V, K], so transpose before/after.
+                g_for_kernel = g.squeeze(0).to(torch.float32, copy=False).exp()
+                beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
+                # FlashInfer expects state in [N, H, V, K]
+                # SGLang stores state as [N, H, K, V], so transpose before/after.
                 initial_state = ssm_states[cache_indices].transpose(-1, -2).contiguous()
                 output, output_state = self._flashinfer_gdn_prefill(
                     q=q_for_kernel,
