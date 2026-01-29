@@ -26,7 +26,6 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -289,10 +288,10 @@ class Lfm2MoeShortConv(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.hidden_size_per_partition = self.hidden_size // self.tp_size
 
-        # TP-aware linear layers
-        self.in_proj = ColumnParallelLinear(
+        # Use MergedColumnParallelLinear so each output (B, C, x) is sharded separately
+        self.in_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            3 * config.hidden_size,
+            [config.hidden_size] * 3,  # B, C, x each get hidden_size
             bias=self.use_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.in_proj",
