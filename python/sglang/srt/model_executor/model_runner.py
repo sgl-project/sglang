@@ -141,6 +141,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -389,6 +390,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
+
+        if self.is_multimodal:
+            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
         # Temporary cached values
         self.support_pp = (
