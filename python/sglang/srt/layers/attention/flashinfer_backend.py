@@ -753,6 +753,10 @@ class FlashInferAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
+    def supports_separate_lora_graphs(self) -> bool:
+        """FlashInfer supports separate LoRA graphs via (bs, is_lora) metadata keying."""
+        return True
+
     def forward_extend(
         self,
         q: torch.Tensor,

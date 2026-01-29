@@ -69,6 +69,18 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def supports_separate_lora_graphs(self) -> bool:
+        """Whether this backend supports separate CUDA graphs for LoRA and non-LoRA batches.
+
+        Backends that key decode metadata by (bs, is_lora) can return True to enable
+        capturing both LoRA and non-LoRA graphs for the same batch size without
+        metadata overwrites.
+
+        Returns False by default - backends without this support will only capture
+        the LoRA graph and use it for all batches.
+        """
+        return False
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers of verify attention kernels that needs to be filled after draft.

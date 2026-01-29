@@ -2203,6 +2203,10 @@ class FlashAttentionBackend(AttentionBackend):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
 
+    def supports_separate_lora_graphs(self) -> bool:
+        """FlashAttention supports separate LoRA graphs via (bs, is_lora) metadata keying."""
+        return True
+
     def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
     ):

@@ -388,26 +388,13 @@ class CudaGraphRunner:
     def _supports_separate_lora_graphs(self) -> bool:
         """Check if the attention backend supports separate LoRA and non-LoRA graphs.
 
-        Only FlashAttentionBackend and FlashInferAttnBackend support this because they
-        key metadata by (bs, is_lora) to prevent overwrites when both graph types are
-        captured for the same batch size. Other backends would have stale pointers if
-        both LoRA and non-LoRA graphs are captured for the same batch size.
+        Backends that support this key metadata by (bs, is_lora) to prevent overwrites
+        when both graph types are captured for the same batch size.
 
         For non-supported backends, we only capture the LoRA graph and use it
         for all batches (LoRA kernels no-op when adapters are zeroed).
         """
-        # Import here to avoid circular import
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
-        from sglang.srt.layers.attention.flashinfer_backend import (
-            FlashInferAttnBackend,
-        )
-
-        return isinstance(
-            self.model_runner.attn_backend,
-            (FlashAttentionBackend, FlashInferAttnBackend),
-        )
+        return self.model_runner.attn_backend.supports_separate_lora_graphs()
 
     @staticmethod
     def _get_graph_key(
