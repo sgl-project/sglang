@@ -1,5 +1,5 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^python/sglang/multimodal_gen/csrc
+exclude: ^(python/sglang/multimodal_gen/csrc|python/sglang/jit_kernel/flash_attention/cute)
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -52,16 +52,6 @@ repos:
     hooks:
       - id: codespell
         args: ['--config', '.codespellrc']
-        exclude: |
-          (?x)^(
-            test/srt/test_reasoning_parser\.py|
-            docs/advanced_features/vlm_query\.ipynb|
-            python/sglang/srt/grpc/.*_pb2\.py|
-            python/sglang/srt/grpc/.*_pb2_grpc\.py|
-            python/sglang/srt/grpc/.*_pb2\.pyi|
-            python/sglang/srt/grpc/.*_pb2_grpc\.pyi|
-            sgl-model-gateway/src/tokenizer/chat_template\.rs
-          )$
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8
     hooks:

@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Tuple, Type
 
+from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
 
 
@@ -24,6 +25,8 @@ class BaseReasoningFormatDetector:
         think_end_token: str,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
@@ -32,6 +35,19 @@ class BaseReasoningFormatDetector:
 
         self._buffer = ""
         self.stripped_think_start = False
+
+        self.continue_final_message = continue_final_message
+        if self.continue_final_message:
+            self.previous_content = previous_content
+            self.previous_count = len(previous_content)
+        else:
+            self.previous_content = ""
+            self.previous_count = 0
+
+        if self.think_start_token in self.previous_content:
+            self._in_reasoning = True
+        if self.think_end_token in self.previous_content:
+            self._in_reasoning = False
 
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
@@ -46,18 +62,25 @@ class BaseReasoningFormatDetector:
         # The text is considered to be in a reasoning block.
         processed_text = text.replace(self.think_start_token, "").strip()
 
-        if self.think_end_token not in processed_text:
+        if (
+            self.think_end_token not in processed_text
+            and self.think_end_token not in self.previous_content
+        ):
             # Assume reasoning was truncated before `</think>` token
             return StreamingParseResult(reasoning_text=processed_text)
 
         # Extract reasoning content
-        splits = processed_text.split(self.think_end_token, maxsplit=1)
-        reasoning_text = splits[0]
-        normal_text = splits[1].strip()
+        if self.think_end_token in processed_text:
+            splits = processed_text.split(self.think_end_token, maxsplit=1)
+            reasoning_text = splits[0]
+            normal_text = splits[1].strip()
 
-        return StreamingParseResult(
-            normal_text=normal_text, reasoning_text=reasoning_text
-        )
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text
+            )
+        else:
+            # think_end_token is in self.previous_content for continue_final_message=True case
+            return StreamingParseResult(normal_text=processed_text)
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -137,15 +160,43 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         # DeepSeek-R1 is assumed to be reasoning until `</think>` token
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
+
+
+class KimiK2Detector(BaseReasoningFormatDetector):
+    """
+    Detector for Kimi K2 model.
+
+    It uses the DeepSeek-R1 reasoning format: (<think>)*(.*)</think>.
+    Defaults to thinking mode (force_reasoning=True), but allows disabling it
+    if the model is configured to not think.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        super().__init__(
+            "<think>",
+            "</think>",
+            # Allow force_reasoning to be controlled by arguments, defaulting to True
+            # to match vLLM's default `thinking=True` behavior.
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
 
 
 class Qwen3Detector(BaseReasoningFormatDetector):
@@ -164,12 +215,20 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             If True, streams reasoning content as it arrives.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
 
 
@@ -182,12 +241,20 @@ class KimiDetector(BaseReasoningFormatDetector):
     and the rest of the text as `normal_text`.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         super().__init__(
             "◁think▷",
             "◁/think▷",
             force_reasoning=False,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
 
 
@@ -196,12 +263,20 @@ class GptOssDetector(BaseReasoningFormatDetector):
     Detector for T4-style reasoning format (GPT-OSS), using the HarmonyParser.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = True,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         super().__init__(
             "<|channel|>analysis<|message|>",
             "<|end|>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         self.parser = HarmonyParser()
 
@@ -254,13 +329,21 @@ class MiniMaxAppendThinkDetector(BaseReasoningFormatDetector):
     Append `<think>` token to the beginning of the text.
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         # scheduler.py need `reasoning_parser.detector.think_end_token`
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
         self.is_first_chunk = False
 
@@ -281,12 +364,20 @@ class NanoV3Detector(BaseReasoningFormatDetector):
 
     """
 
-    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
         super().__init__(
             "<think>",
             "</think>",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
         )
 
 
@@ -307,7 +398,7 @@ class ReasoningParser:
         "glm45": Qwen3Detector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
-        "kimi_k2": DeepSeekR1Detector,
+        "kimi_k2": KimiK2Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
@@ -322,6 +413,7 @@ class ReasoningParser:
         model_type: Optional[str] = None,
         stream_reasoning: bool = True,
         force_reasoning: Optional[bool] = None,
+        request: ChatCompletionRequest = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -338,6 +430,15 @@ class ReasoningParser:
         kwargs = {"stream_reasoning": stream_reasoning}
         if force_reasoning is not None:
             kwargs["force_reasoning"] = force_reasoning
+
+        if (
+            request is not None
+            and isinstance(request, ChatCompletionRequest)
+            and request.continue_final_message
+            and request.messages[-1].role == "assistant"
+        ):
+            kwargs["continue_final_message"] = True
+            kwargs["previous_content"] = request.messages[-1].content
 
         self.detector = detector_class(**kwargs)
 
