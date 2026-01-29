@@ -7,6 +7,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Preparing CI runner..."
 echo ""
 
+# Kill leftover processes from previous CI runs to free up ports
+# This prevents "address already in use" errors in tests
+echo "Cleaning up leftover processes..."
+pkill -9 -f "sglang.launch_server" 2>/dev/null || true
+pkill -9 -f "sglang.srt.server" 2>/dev/null || true
+# Kill processes on commonly used test ports (30000-30005, 19238-19240)
+for port in 30000 30001 30002 30003 30004 30005 19238 19239 19240; do
+    fuser -k ${port}/tcp 2>/dev/null || true
+done
+sleep 2
+echo "Process cleanup complete"
+echo ""
+
 # Clean up stale HuggingFace cache artifacts from previous failed downloads
 python3 "${SCRIPT_DIR}/../utils/cleanup_hf_cache.py"
 echo ""
