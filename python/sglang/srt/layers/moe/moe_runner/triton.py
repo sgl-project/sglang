@@ -548,11 +548,6 @@ def pre_permute_pplx_to_triton(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> TritonRunnerInput:
-    """
-    Extract valid tokens from PPLX format for efficient kernel execution.
-    Store metadata (not the mask) to reconstruct in post_permute, avoiding
-    device context issues.
-    """
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
         get_config_dtype_str,
         moe_align_block_size,
@@ -646,10 +641,6 @@ def post_permute_triton_to_pplx(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> PPLXCombineInput:
-    """
-    Scatter results back to PPLX format by reconstructing the mask from metadata.
-    This avoids storing the mask tensor (which caused device context issues).
-    """
     from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXCombineInput
 
     output_device = runner_output.hidden_states.device
