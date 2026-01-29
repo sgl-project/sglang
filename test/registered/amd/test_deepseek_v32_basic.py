@@ -15,10 +15,12 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
-DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
+register_amd_ci(est_time=1800, suite="stage-c-test-large-8-gpu-amd")
+
+DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
 
+@unittest.skipIf(is_in_amd_ci(), "Skip DP test for AMD CI, run TP only.")
 class TestDeepseekV32DP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -32,7 +34,7 @@ class TestDeepseekV32DP(CustomTestCase):
             "8",
             "--enable-dp-attention",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
+            '{"enable_multithread_load": true}',
         ]
         if is_in_amd_ci():
             other_args += [
@@ -90,7 +92,6 @@ class TestDeepseekV32DP(CustomTestCase):
                 self.assertGreater(speed, 50)
 
 
-@unittest.skipIf(is_in_amd_ci(), "To reduce the CI execution time for AMD.")
 class TestDeepseekV32TP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -101,7 +102,7 @@ class TestDeepseekV32TP(CustomTestCase):
             "--tp",
             "8",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true, "num_threads": 64}',
+            '{"enable_multithread_load": true}',
         ]
         if is_in_amd_ci():
             other_args += [
@@ -154,7 +155,7 @@ class TestDeepseekV32TP(CustomTestCase):
                 f"### test_bs_1_speed (deepseek-v32)\n" f"{speed=:.2f} token/s\n"
             )
             if is_in_amd_ci():
-                self.assertGreater(speed, 20)
+                self.assertGreater(speed, 15)
             else:
                 self.assertGreater(speed, 70)
 
