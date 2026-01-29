@@ -125,7 +125,13 @@ def npu_format_cast(
 
     import torch_npu
 
-    return torch_npu.npu_format_cast(tensor, acl_format.value)
+    if acl_format != NPUACLFormat.ACL_FORMAT_FRACTAL_NZ:
+        return torch_npu.npu_format_cast(tensor, acl_format.value)
+
+    # Use List<NZ> type instead of large NZ tensor to resolve the transfer error in EPLB
+    for i in range(tensor.shape[0]):
+        tensor[i].copy_(torch_npu.npu_format_cast(tensor[i], acl_format.value))
+    return tensor
 
 
 def get_indexer_weight_stream():
