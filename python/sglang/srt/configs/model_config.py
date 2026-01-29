@@ -1147,6 +1147,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
