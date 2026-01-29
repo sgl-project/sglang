@@ -168,31 +168,6 @@ inline void silu_and_mul_stub(
   }
 }
 
-template <typename scalar_t>
-inline void add_bias_stub(float* __restrict__ input, const scalar_t* __restrict__ input2, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0;
-    x1 = x1 + y1;
-    x0.store(input + d);
-    x1.store(input + d + fVec::size());
-  }
-  for (; d < size; ++d) {
-    input[d] = input[d] + float(input2[d]);
-  }
-}
-
 template <typename scalar_t, int BLOCK_N>
 inline void clamp_sigmoid_and_mul(
     scalar_t* __restrict__ output,
@@ -257,8 +232,8 @@ void fused_experts_fp_kernel_impl(
     const scalar_t* __restrict__ input,
     const packed_t* __restrict__ packed_w1,
     const packed_t* __restrict__ packed_w2,
-    const scalar_t* __restrict__ w1_bias,
-    const scalar_t* __restrict__ w2_bias,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
     const param_t* __restrict__ w1s,
     const param_t* __restrict__ w2s,
     int64_t block_size_N,
@@ -319,6 +294,7 @@ void fused_experts_fp_kernel_impl(
       const packed_t* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
       const param_t* __restrict__ Bs =
           w1s + expert_id * scale_size_N * scale_size_K + scale_offset_per_block(nb) * scale_size_K;
+      const float* __restrict__ B_bias = with_bias ? w1_bias + expert_id * 2 * N + nb * BLOCK_N : nullptr;
 
       // do unpacking for the first row or a new expert
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
@@ -339,6 +315,7 @@ void fused_experts_fp_kernel_impl(
           /*   B            */ B,
           /*   C            */ C,
           /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
+          /*   Bbias        */ B_bias,
           /*   scale        */ Bs,
           /*   M            */ m_size,
           /*   N            */ n_size,
@@ -349,12 +326,6 @@ void fused_experts_fp_kernel_impl(
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
           /*   do_unpack    */ do_unpack);
-      if (with_bias) {
-        const scalar_t* __restrict__ B_bias = w1_bias + expert_id * 2 * N + nb * BLOCK_N;
-        for (int64_t m = 0; m < m_size; ++m) {
-          add_bias_stub(C + m * BLOCK_N, B_bias, n_size);
-        }
-      }
       if (act_func == CPUAcTMethod::swiglu) {
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C, m_size, N, alpha, limit, nb * (BLOCK_N / 2));
       } else if (act_func == CPUAcTMethod::silu_and_mul) {
@@ -409,6 +380,7 @@ void fused_experts_fp_kernel_impl(
       const packed_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
       const param_t* __restrict__ Bs =
           w2s + expert_id * scale_size_N * scale_size_K + scale_offset_per_block(nb) * scale_size_K;
+      const float* __restrict__ B_bias = with_bias ? w2_bias + expert_id * OC + nb * BLOCK_N : nullptr;
 
       // do unpacking for the first row or a new expert
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
@@ -419,6 +391,7 @@ void fused_experts_fp_kernel_impl(
           /*   B            */ B,
           /*   C            */ C,
           /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + B_tmp_offset_per_thread + nb_offset * BLOCK_N * IC,
+          /*   Bbias        */ B_bias,
           /*   scale        */ Bs,
           /*   M            */ m_size,
           /*   N            */ n_size,
@@ -430,12 +403,6 @@ void fused_experts_fp_kernel_impl(
           /*   block_size_K */ block_size_K,
           /*   do_unpack    */ do_unpack);
 
-      if (with_bias) {
-        const scalar_t* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
-        for (int64_t m = 0; m < m_size; ++m) {
-          add_bias_stub(C + m * BLOCK_N, B_bias, n_size);
-        }
-      }
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
       for (int64_t m = 0; m < m_size; ++m) {
@@ -470,8 +437,8 @@ void fused_experts_fp_kernel_impl(
       const TYPE1* __restrict__ input,                                       \
       const TYPE2* __restrict__ packed_w1,                                   \
       const TYPE2* __restrict__ packed_w2,                                   \
-      const TYPE1* __restrict__ w1_bias,                                     \
-      const TYPE1* __restrict__ w2_bias,                                     \
+      const float* __restrict__ w1_bias,                                     \
+      const float* __restrict__ w2_bias,                                     \
       const TYPE3* __restrict__ w1s,                                         \
       const TYPE3* __restrict__ w2s,                                         \
       int64_t block_size_N,                                                  \
@@ -544,6 +511,7 @@ void shared_expert_fp8_kernel_impl(
           /*   C            */ ic0 + mb * BLOCK_M * 2 * N + nb * BLOCK_N,
           /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * K,
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
+          /*   Bbias        */ nullptr,
           /*   scale        */ w1s + (nb / blocks_n_per_group) * scale_size_K,
           /*   M            */ m_size,
           /*   N            */ n_size,
@@ -596,6 +564,7 @@ void shared_expert_fp8_kernel_impl(
           /*   C            */ C,
           /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + B_tmp_offset_per_thread + nb_offset * BLOCK_N * IC,
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
+          /*   Bbias        */ nullptr,
           /*   scale        */ w2s + (nb / blocks_n_per_group) * scale_size_K,
           /*   M            */ m_size,
           /*   N            */ n_size,

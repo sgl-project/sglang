@@ -8,6 +8,7 @@ kernel = torch.ops.sgl_kernel
 
 torch.manual_seed(1234)
 
+from sglang.test.test_utils import CustomTestCase
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -23,8 +24,6 @@ from utils import (
     torch_naive_fused_moe_gptoss,
     torch_w8a8_per_column_fused_moe,
 )
-
-from sglang.test.test_utils import CustomTestCase
 
 
 def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
@@ -317,12 +316,12 @@ class TestFusedExperts(CustomTestCase):
         w1q, w1s = MXFP4QuantizeUtil.quantize(w1_bf16)
         w1s = w1s.reshape(e, 2 * n, k // 32)
         w1dq = MXFP4QuantizeUtil.dequantize(w1q, dtype, w1s)
-        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=dtype) / 10
+        w1_b = torch.randn((e, 2 * n), device="cpu", dtype=torch.float32) / 10
         w2_bf16 = torch.randn((e, k, n), device="cpu", dtype=dtype) / 10
         w2q, w2s = MXFP4QuantizeUtil.quantize(w2_bf16)
         w2s = w2s.reshape(e, k, n // 32)
         w2dq = MXFP4QuantizeUtil.dequantize(w2q, dtype, w2s)
-        w2_b = torch.randn((e, k), device="cpu", dtype=dtype) / 10
+        w2_b = torch.randn((e, k), device="cpu", dtype=torch.float32) / 10
         score = torch.randn((m, e), device="cpu", dtype=dtype)
         score = torch.softmax(score, dim=-1, dtype=torch.float32)
         topk_weight, topk_ids = torch.topk(score, topk)
