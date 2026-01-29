@@ -885,7 +885,6 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 # TODO: should fix with multi-batch
                 cu_seqlens_q_split = cu_seqlens_q // 2
-
                 result_prev = flash_attn_with_kvcache(
                     q=q_prev,
                     k_cache=key_cache,
@@ -905,7 +904,6 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
-
                 result_next = flash_attn_with_kvcache(
                     q=q_next,
                     k_cache=key_cache,
@@ -913,7 +911,7 @@ class FlashAttentionBackend(AttentionBackend):
                     page_table=page_table,
                     cache_seqlens=forward_batch.attn_cp_metadata.kv_len_next_tensor,
                     cu_seqlens_q=cu_seqlens_q_split,
-                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    cu_seqlens_k_new=cu_seqlens_k_prev if not use_local_attn else None,
                     max_seqlen_q=forward_batch.attn_cp_metadata.actual_seq_q_next,  # int, not tensor
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
