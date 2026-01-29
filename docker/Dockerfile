@@ -34,7 +34,7 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
-    fi
+fi
 
 # Python setup (combined with apt update to reduce layers)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -129,12 +129,12 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 # Replace pip global cache if specified
 RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
     python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
-    fi
+fi
 
 # GDRCopy installation
 RUN mkdir -p /tmp/gdrcopy && cd /tmp \
     && curl --retry 3 --retry-delay 2 -fsSL -o v${GDRCOPY_VERSION}.tar.gz \
-    https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
+        https://${GITHUB_ARTIFACTORY}/NVIDIA/gdrcopy/archive/refs/tags/v${GDRCOPY_VERSION}.tar.gz \
     && tar -xzf v${GDRCOPY_VERSION}.tar.gz && rm v${GDRCOPY_VERSION}.tar.gz \
     && cd gdrcopy-${GDRCOPY_VERSION}/packages \
     && CUDA=/usr/local/cuda ./build-deb-packages.sh \
@@ -180,13 +180,13 @@ WORKDIR /sgl-workspace
 # Install SGLang
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
-    cp -r /tmp/local_src /sgl-workspace/sglang; \
+        cp -r /tmp/local_src /sgl-workspace/sglang; \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
-    git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     elif [ -z "$SGL_VERSION" ]; then \
-    echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
+        echo "ERROR: SGL_VERSION must be set when USE_LATEST_SGLANG=0 and BRANCH_TYPE!=local" && exit 1; \
     else \
-    git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
 
@@ -194,28 +194,28 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
     && case "$CUDA_VERSION" in \
-    12.6.1) CUINDEX=126 ;; \
-    12.8.1) CUINDEX=128 ;; \
-    12.9.1) CUINDEX=129 ;; \
-    13.0.1) CUINDEX=130 ;; \
-    *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
+        12.6.1) CUINDEX=126 ;; \
+        12.8.1) CUINDEX=128 ;; \
+        12.9.1) CUINDEX=129 ;; \
+        13.0.1) CUINDEX=130 ;; \
+        *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
-    python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-    python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
+        python3 -m pip install sgl-kernel==${SGL_KERNEL_VERSION} \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-    python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sgl_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     else \
-    echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+        echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
     ; \
     fi \
     && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-    python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
@@ -226,46 +226,46 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # CU12 uses 3.3.20 and CU13 uses 3.3.24
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-    git clone https://github.com/fzyzcjy/DeepEP.git && \
-    cd DeepEP && \
-    git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-    sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. ; \
+      git clone https://github.com/fzyzcjy/DeepEP.git && \
+      cd DeepEP && \
+      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
-    git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
-    cd DeepEP && \
-    git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
-    sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. ; \
+      git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
+      cd DeepEP && \
+      git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
     else \
-    curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
-    https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
-    unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
-    sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-    cd .. ; \
+        curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
+            https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
+        unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        cd .. ; \
     fi
 
 # Install DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
-    12.6.1) \
-    CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
-    ;; \
-    12.8.1) \
-    # FIXED: 12.8.1 does NOT support Blackwell 10.3 \
-    CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
-    ;; \
-    12.9.1|13.0.1) \
-    # 12.9.1+ properly supports Blackwell 10.3 \
-    CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
-    ;; \
-    *) \
-    echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
-    ;; \
+        12.6.1) \
+            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
+            ;; \
+        12.8.1) \
+            # FIXED: 12.8.1 does NOT support Blackwell 10.3 \
+            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
+            ;; \
+        12.9.1|13.0.1) \
+            # 12.9.1+ properly supports Blackwell 10.3 \
+            CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
+            ;; \
+        *) \
+            echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
+            ;; \
     esac && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
@@ -285,10 +285,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     nixl \
     py-spy \
     cubloaty \
-    google-cloud-storage \
-    imageio \
-    remote-pdb \
-    diffusers
+    google-cloud-storage
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -310,13 +307,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.1.1 ; \
-    fi
+fi
 
 # Install development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
@@ -374,17 +371,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # diff-so-fancy
 RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/diff-so-fancy \
-    https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
+        https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
     && chmod +x /usr/local/bin/diff-so-fancy
 
 # clang-format
 RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/clang-format \
-    https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
+        https://${GITHUB_ARTIFACTORY}/muttleyxd/clang-tools-static-binaries/releases/download/master-32d3ac78/clang-format-16_linux-amd64 \
     && chmod +x /usr/local/bin/clang-format
 
 # clangd
 RUN curl --retry 3 --retry-delay 2 -fsSL -o clangd.zip \
-    https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
+        https://${GITHUB_ARTIFACTORY}/clangd/clangd/releases/download/18.1.3/clangd-linux-18.1.3.zip \
     && unzip -q clangd.zip \
     && cp -r clangd_18.1.3/bin/* /usr/local/bin/ \
     && cp -r clangd_18.1.3/lib/* /usr/local/lib/ \
@@ -395,7 +392,7 @@ RUN CMAKE_VERSION=3.31.1 \
     && ARCH=$(uname -m) \
     && CMAKE_INSTALLER="cmake-${CMAKE_VERSION}-linux-${ARCH}" \
     && curl --retry 3 --retry-delay 2 -fsSL -o "${CMAKE_INSTALLER}.tar.gz" \
-    "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
+        "https://${GITHUB_ARTIFACTORY}/Kitware/CMake/releases/download/v${CMAKE_VERSION}/${CMAKE_INSTALLER}.tar.gz" \
     && tar -xzf "${CMAKE_INSTALLER}.tar.gz" \
     && cp -r "${CMAKE_INSTALLER}/bin/"* /usr/local/bin/ \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
@@ -424,8 +421,8 @@ COPY docker/configs/.zshrc /root/.zshrc
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-    rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-    ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
 RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
@@ -541,8 +538,8 @@ COPY --from=framework /sgl-workspace /sgl-workspace
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-    rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-    ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
