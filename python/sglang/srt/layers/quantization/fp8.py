@@ -103,6 +103,8 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 from torch.utils._python_dispatch import TorchDispatchMode
+
+
 class CopyNumelCounter(TorchDispatchMode):
     """
     Tracks total number of elements modified with `copy_`. Useful for keeping
@@ -121,6 +123,7 @@ class CopyNumelCounter(TorchDispatchMode):
         if func == torch.ops.aten.copy_.default:
             self.copied_numel += args[0].numel()
         return out
+
 
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
@@ -213,6 +216,7 @@ class Fp8Config(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
 
@@ -254,7 +258,9 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_per_token_if_dynamic = False
 
         if self.block_quant and not self.is_checkpoint_fp8_serialized:
-            raise ValueError(f"block_quant={self.block_quant} is not supported along online quantization (is_checkpoint_fp8_serialized={self.is_checkpoint_fp8_serialized}).")
+            raise ValueError(
+                f"block_quant={self.block_quant} is not supported along online quantization (is_checkpoint_fp8_serialized={self.is_checkpoint_fp8_serialized})."
+            )
 
     def validate_block_quant_shapes(
         self,
@@ -336,7 +342,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale = None
             layer._loaded_numel = 0
 
-            weight_loader = self.get_weight_loader(layer, original_weight_loader)
+            weight_loader = self.get_online_weight_loader(layer, original_weight_loader)
         else:
             weight_loader = original_weight_loader
 
@@ -376,8 +382,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale = PerTensorScaleParameter(
                     data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                     weight_loader=(
-                        weight_loader if self.is_checkpoint_fp8_serialized
-                        else None
+                        weight_loader if self.is_checkpoint_fp8_serialized else None
                     ),
                 )
                 scale[:] = torch.finfo(torch.float32).min
@@ -396,7 +401,9 @@ class Fp8LinearMethod(LinearMethodBase):
                             "Static activation scheme is only supported with fp8 serialized checkpoints."
                         )
                     scale = PerTensorScaleParameter(
-                        data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                        data=torch.empty(
+                            len(output_partition_sizes), dtype=torch.float32
+                        ),
                         weight_loader=weight_loader,
                     )
 
@@ -405,34 +412,34 @@ class Fp8LinearMethod(LinearMethodBase):
                 else:
                     layer.register_parameter("input_scale", None)
 
-    def get_weight_loader(self, layer, original_weight_loader):
+    def get_online_weight_loader(self, layer, original_weight_loader):
         def online_fp8_weight_loader(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
             shard_id: int | None = None,
         ):
-            # Move to device for faster quantization
+            # Move to device for faster quantization. At this point, loaded weights are already materialized on CPU RAM.
             loaded_weight = loaded_weight.to(param.device)
 
             kwargs = {}
             if shard_id is not None:
                 kwargs["loaded_shard_id"] = shard_id
-            
-            # In case TP>1, the weight loader logic uses narrow so we can not directly rely on param.shape or loaded_weight.shape.
+
+            # In case TP>1, the weight loader logic uses narrow so we can not directly rely on `param.shape` or `loaded_weight.shape`.
             copy_numel_counter = CopyNumelCounter()
             with copy_numel_counter:
                 # Loads the quantized weight.
-                original_weight_loader(
-                    param,
-                    loaded_weight,
-                    **kwargs
-                )
-            
+                original_weight_loader(param, loaded_weight, **kwargs)
+
             layer._loaded_numel += copy_numel_counter.copied_numel
             target_loaded_numel = layer.weight.numel()
 
-            assert layer._loaded_numel <= target_loaded_numel, f"target_loaded_numel={target_loaded_numel}, layer._loaded_numel={layer._loaded_numel}"
+            assert (
+                layer._loaded_numel <= target_loaded_numel
+            ), f"target_loaded_numel={target_loaded_numel}, layer._loaded_numel={layer._loaded_numel}"
+            
 
+            # Delay online quantization until all tensor shards (e.g. q_proj, k_proj, v_proj) are loaded, to avoid having to re-quantize later on.
             if layer._loaded_numel == target_loaded_numel:
                 full_loaded_weight = layer.weight
 
