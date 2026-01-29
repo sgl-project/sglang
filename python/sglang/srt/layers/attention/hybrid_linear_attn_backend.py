@@ -1012,18 +1012,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 v_for_kernel = value.squeeze(0).contiguous()
                 g_for_kernel = g.squeeze(0).to(torch.float32, copy=False)
                 beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
+                initial_state = ssm_states[cache_indices].transpose(-1, -2).contiguous()
                 output, output_state = self._flashinfer_gdn_prefill(
                     q=q_for_kernel,
                     k=k_for_kernel,
                     v=v_for_kernel,
                     g=g_for_kernel,
                     beta=beta_for_kernel,
-                    initial_state=ssm_states[cache_indices],
+                    initial_state=initial_state,
                     output_final_state=True,
                     cu_seqlens=query_start_loc.to(torch.int64),
                     use_qk_l2norm_in_kernel=True,
                 )
-                ssm_states[cache_indices] = output_state.to(
+                ssm_states[cache_indices] = output_state.transpose(-1, -2).to(
                     ssm_states.dtype, copy=False
                 )
                 core_attn_out = output.unsqueeze(0)
