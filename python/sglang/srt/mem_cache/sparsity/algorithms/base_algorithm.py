@@ -142,6 +142,15 @@ class BaseSparseAlgorithm(ABC):
         """
         pass
 
+    @abstractmethod
+    def topk_mode(self) -> str:
+        """
+        Return the topk mode of the algorithm.
+        - "page": Page-based topk retrieval
+        - "token": Token-based topk retrieval
+        """
+        pass
+
 
 class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
     """
@@ -164,6 +173,9 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         super().__init__(config, device, **kwargs)
         self.sparsity_ratio = config.sparse_extra_config.get("sparsity_ratio", 0.7)
         self.num_recent_pages = config.sparse_extra_config.get("num_recent_pages", 4)
+        self.fixed_topk_page_cnt = config.sparse_extra_config.get(
+            "fixed_topk_page_cnt", None
+        )
         self.page_size = config.page_size
 
     def initialize_representation_pool(
@@ -194,14 +206,11 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
         k_buffer,
         forward_batch,
     ) -> torch.Tensor:
-
-        if not forward_batch.forward_mode.is_extend():
-            return
-
         num_pages = seq_lens // self.page_size
+        prompt_lens = self.states.prompt_lens[req_pool_indices]
         valid_mask = (
             ~self.states.repr_constructed[req_pool_indices]
-            & (seq_lens >= self.states.prompt_lens[req_pool_indices])
+            & (prompt_lens >= self.states.device_buffer_cnt)
             & (num_pages > 0)
         )
 
@@ -325,7 +334,10 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             scores[:, recent_start:] = float("-inf")
 
             history_pages = max(recent_start, 1)
-            k = max(int(history_pages * self.sparsity_ratio), 1)
+            if self.fixed_topk_page_cnt is not None:
+                k = max(self.fixed_topk_page_cnt - self.num_recent_pages, 1)
+            else:
+                k = max(int(history_pages * self.sparsity_ratio), 1)
             k = min(k, history_pages)
             topk_idx = torch.topk(scores, k=k, dim=1, sorted=False)[1].squeeze(0)
 
@@ -353,6 +365,9 @@ class BaseSparseAlgorithmImpl(BaseSparseAlgorithm):
             out_lengths[i] = length
 
         return out_indices, out_lengths
+
+    def topk_mode(self) -> str:
+        return "page"
 
     def _initialize_representation_pools(
         self, start_layer: int, end_layer: int, total_num_pages: int
