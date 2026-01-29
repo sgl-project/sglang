@@ -621,7 +621,7 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
                 else:
-                    if self.page_size == 1:
+                    if self.page_size == 1 and self.dcp_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -631,8 +631,8 @@ class ModelRunnerKVCacheMixin:
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
+                            self.max_total_num_tokens * self.dcp_size,
+                            page_size=self.page_size * self.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
