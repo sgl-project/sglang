@@ -881,7 +881,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a_for_kernel = a.view(bs, 1, -1)
             b_for_kernel = b.view(bs, 1, -1)
             # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
-            state_for_kernel = ssm_states[cache_indices].transpose(-1, -2)
+            state_for_kernel = ssm_states[cache_indices]
             output, output_state = self._flashinfer_gdn_decode(
                 q=q_for_kernel,
                 k=k_for_kernel,
@@ -893,7 +893,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b=b_for_kernel,
                 use_qk_l2norm=True,
             )
-            output_state = output_state.transpose(-1, -2)
+            output_state = output_state
             ssm_states[cache_indices] = output_state.to(ssm_states.dtype, copy=False)
             core_attn_out = output.permute(1, 0, 2, 3)
         else:
