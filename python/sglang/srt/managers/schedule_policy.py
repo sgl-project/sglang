@@ -34,6 +34,7 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
@@ -421,6 +422,7 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
+        self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
 
@@ -691,6 +693,9 @@ class PrefillAdder:
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if self.nsa_prefill_cp_in_seq_split and len(self.can_run_list) >= 1:
+            return AddReqResult.OTHER
+
+        if self.prefill_context_parallel_enabled and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
