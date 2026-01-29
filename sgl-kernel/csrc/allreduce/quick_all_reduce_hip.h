@@ -138,7 +138,7 @@ struct DeviceComms {
     }
     // Allocate buffer size for worst case: F16 2-stage buffer.
     uint32_t flags_buffer_size = 2 * world_size * kMaxNumBlocks * sizeof(uint32_t);
-    static int64_t data_buffer_size = 2 * this->kMaxProblemSize;
+    int64_t data_buffer_size = 2 * this->kMaxProblemSize;
     int64_t total_buffer_size = flags_buffer_size + data_buffer_size;
     data_offset = flags_buffer_size;
     CUDA_CHECK(hipExtMallocWithFlags((void**)&dbuffer, total_buffer_size, hipDeviceMallocUncached));
