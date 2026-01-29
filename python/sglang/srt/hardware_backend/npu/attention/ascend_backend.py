@@ -814,12 +814,13 @@ class AscendAttnBackend(AttentionBackend):
                 if layer.qk_head_dim <= 128 and causal and not getattr(
                     self, "use_native_sdpa", False
                 ):
-                    query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
-                    attn_output = torch.empty(
-                        (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=query.dtype,
-                        device=query.device,
-                    )
+                    if not self.use_alibi:
+                        query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                        attn_output = torch.empty(
+                            (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                            dtype=query.dtype,
+                            device=query.device,
+                        )
 
                         torch_npu._npu_flash_attention_qlens(
                             query=query,

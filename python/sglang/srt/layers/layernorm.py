@@ -24,6 +24,7 @@ from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -463,7 +464,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if get_bool_env_var("FORWARD_NATIVE_GEMMA_RMS_NORM"):
+        if envs.FORWARD_NATIVE_GEMMA_RMS_NORM.get():
             return self.forward_native(x, residual)
         if residual is not None:
             if post_residual_addition is not None:

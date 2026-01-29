@@ -39,7 +39,7 @@ from sglang.srt.utils import (
     is_xpu,
     set_weight_attrs,
 )
-from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.environ import envs
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
@@ -132,7 +132,7 @@ class GeluAndMul(MultiPlatformOp):
         return self._forward_impl(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        if get_bool_env_var("FORWARD_NATIVE_GELUTANH"):
+        if envs.FORWARD_NATIVE_GELUTANH.get():
             return self.forward_native(x)
         y_npu, gelu_npu = torch_npu.npu_geglu(
             x,
