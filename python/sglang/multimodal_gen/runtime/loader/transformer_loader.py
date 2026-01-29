@@ -117,6 +117,4 @@ class TransformerLoader(ComponentLoader):
             next(model.parameters()).dtype == default_dtype
         ), "Model dtype does not match default dtype"
 
-        model = model.eval()
-
         return model

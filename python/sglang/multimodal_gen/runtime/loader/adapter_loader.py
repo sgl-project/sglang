@@ -67,4 +67,4 @@ class AdapterLoader(ComponentLoader):
         loaded = safetensors_load_file(safetensors_list[0])
         model.load_state_dict(loaded, strict=False)
 
-        return model.eval()
+        return model

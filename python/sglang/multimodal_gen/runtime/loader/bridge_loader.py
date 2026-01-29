@@ -103,4 +103,4 @@ class BridgeLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded bridge model with %.2fM parameters", total_params / 1e6)
 
-        return model.eval()
+        return model

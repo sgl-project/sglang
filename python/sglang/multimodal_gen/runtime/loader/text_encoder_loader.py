@@ -282,4 +282,4 @@ class TextEncoderLoader(ComponentLoader):
                     f"checkpoint: {weights_not_loaded}"
                 )
 
-        return model.eval()
+        return model

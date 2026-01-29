@@ -81,7 +81,7 @@ class VAELoader(ComponentLoader):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
-            return vae.eval()
+            return vae
 
         # Load from ModelRegistry (standard VAE classes)
         with (
@@ -107,4 +107,4 @@ class VAELoader(ComponentLoader):
         if unexpected_keys:
             logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
-        return vae.eval()
+        return vae

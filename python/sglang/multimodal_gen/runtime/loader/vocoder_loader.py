@@ -83,4 +83,4 @@ class VocoderLoader(ComponentLoader):
                 len(missing_keys),
                 len(unexpected_keys),
             )
-        return vocoder.eval()
+        return vocoder
