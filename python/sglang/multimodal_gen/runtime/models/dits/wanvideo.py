@@ -52,6 +52,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
@@ -127,6 +128,7 @@ class WanSelfAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         parallel_attention=False,
+        quant_config: QuantizationConfig = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
         assert dim % num_heads == 0
@@ -141,10 +143,10 @@ class WanSelfAttention(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
         # layers
-        self.to_q = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.to_out = RowParallelLinear(dim, dim, input_is_parallel=True)
+        self.to_q = ColumnParallelLinear(dim, dim, gather_output=False, quant_config=quant_config)
+        self.to_k = ColumnParallelLinear(dim, dim, gather_output=False, quant_config=quant_config)
+        self.to_v = ColumnParallelLinear(dim, dim, gather_output=False, quant_config=quant_config)
+        self.to_out = RowParallelLinear(dim, dim, input_is_parallel=True, quant_config=quant_config)
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.tp_rmsnorm = self.tp_size > 1 and qk_norm
@@ -217,6 +219,7 @@ class WanI2VCrossAttention(WanSelfAttention):
         window_size=(-1, -1),
         qk_norm=True,
         eps=1e-6,
+        quant_config: QuantizationConfig = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
         # VSA should not be in supported_attention_backends
@@ -229,8 +232,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             supported_attention_backends=supported_attention_backends,
         )
 
-        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=False)
-        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=False)
+        self.add_k_proj = ColumnParallelLinear(dim, dim, gather_output=False, quant_config=quant_config)
+        self.add_v_proj = ColumnParallelLinear(dim, dim, gather_output=False, quant_config=quant_config)
         self.norm_added_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
     def forward(self, x, context, context_lens):
@@ -297,17 +300,18 @@ class WanTransformerBlock(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
         prefix: str = "",
         attention_type: str = "original",
+        quant_config: QuantizationConfig = None,
         sla_topk: float = 0.1,
     ):
         super().__init__()
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
-        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, quant_config=quant_config)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, quant_config=quant_config)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False, quant_config=quant_config)
 
-        self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True)
+        self.to_out = RowParallelLinear(dim, dim, bias=True, reduce_results=True, quant_config=quant_config)
         if attention_type in ("sla", "sagesla"):
             self.attn1 = MinimalA2AAttnOp(
                 num_heads=divide(num_heads, get_tensor_model_parallel_world_size()),
@@ -506,20 +510,21 @@ class WanTransformerBlock_VSA(nn.Module):
         eps: float = 1e-6,
         added_kv_proj_dim: int | None = None,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        quant_config=quant_config,
         prefix: str = "",
     ):
         super().__init__()
 
         # 1. Self-attention
         self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
-        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
-        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True, quant_config=quant_config)
+        self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True, quant_config=quant_config)
+        self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True, quant_config=quant_config)
         self.to_gate_compress = ColumnParallelLinear(
-            dim, dim, bias=True, gather_output=True
+            dim, dim, bias=True, gather_output=True, quant_config=quant_config
         )
 
-        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
+        self.to_out = ColumnParallelLinear(dim, dim, bias=True, gather_output=True, quant_config=quant_config)
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
             head_size=dim // num_heads,
