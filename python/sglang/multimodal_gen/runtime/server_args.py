@@ -313,6 +313,17 @@ class ServerArgs:
     # VSA parameters
     VSA_sparsity: float = 0.0  # inference/validation sparsity
 
+    # Sparse Video Gen 2 (SAP) parameters
+    svg2_num_q_centroids: int = 300
+    svg2_num_k_centroids: int = 1000
+    svg2_top_p_kmeans: float = 0.9
+    svg2_min_kc_ratio: float = 0.1
+    svg2_kmeans_iter_init: int = 50
+    svg2_kmeans_iter_step: int = 2
+    svg2_zero_step_kmeans_init: bool = False
+    svg2_first_layers_fp: float = 0.03
+    svg2_first_times_fp: float = 0.2
+
     # V-MoBA parameters
     moba_config_path: str | None = None
     moba_config: dict[str, Any] = field(default_factory=dict)
@@ -668,6 +679,62 @@ class ServerArgs:
             type=float,
             default=ServerArgs.VSA_sparsity,
             help="Validation sparsity for VSA",
+        )
+
+        # Sparse Video Gen 2 (SAP) parameters
+        parser.add_argument(
+            "--svg2-num-q-centroids",
+            type=int,
+            default=ServerArgs.svg2_num_q_centroids,
+            help="Number of query centroids for Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-num-k-centroids",
+            type=int,
+            default=ServerArgs.svg2_num_k_centroids,
+            help="Number of key centroids for Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-top-p-kmeans",
+            type=float,
+            default=ServerArgs.svg2_top_p_kmeans,
+            help="Top-p threshold for block selection in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-min-kc-ratio",
+            type=float,
+            default=ServerArgs.svg2_min_kc_ratio,
+            help="Minimum ratio of key blocks kept per query block in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-kmeans-iter-init",
+            type=int,
+            default=ServerArgs.svg2_kmeans_iter_init,
+            help="KMeans iterations for initialization in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-kmeans-iter-step",
+            type=int,
+            default=ServerArgs.svg2_kmeans_iter_step,
+            help="KMeans iterations for subsequent steps in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-zero-step-kmeans-init",
+            action=StoreBoolean,
+            default=ServerArgs.svg2_zero_step_kmeans_init,
+            help="Run KMeans initialization during full-attention steps in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-first-layers-fp",
+            type=float,
+            default=ServerArgs.svg2_first_layers_fp,
+            help="Fraction (0-1) or absolute count of early layers to keep full attention in Sparse Video Gen 2 (SAP).",
+        )
+        parser.add_argument(
+            "--svg2-first-times-fp",
+            type=float,
+            default=ServerArgs.svg2_first_times_fp,
+            help="Fraction (0-1) or absolute timestep threshold for full attention in Sparse Video Gen 2 (SAP).",
         )
 
         # Master port for distributed inference
