@@ -172,6 +172,40 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        window_size=(-1, -1),
+        qk_norm=True,
+        eps=1e-6,
+        parallel_attention=False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+    ) -> None:
+        # Sparse attention backends should not be used for cross-attention
+        if supported_attention_backends is not None:
+            supported_attention_backends = {
+                b
+                for b in supported_attention_backends
+                if b
+                not in {
+                    AttentionBackendEnum.SLIDING_TILE_ATTN,
+                    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                    AttentionBackendEnum.VMOBA_ATTN,
+                    AttentionBackendEnum.SLA_ATTN,
+                    AttentionBackendEnum.SAGE_SLA_ATTN,
+                }
+            }
+        super().__init__(
+            dim,
+            num_heads,
+            window_size,
+            qk_norm,
+            eps,
+            parallel_attention,
+            supported_attention_backends=supported_attention_backends,
+        )
+
     def forward(self, x, context, context_lens):
         r"""
         Args:
@@ -219,7 +253,20 @@ class WanI2VCrossAttention(WanSelfAttention):
         eps=1e-6,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
-        # VSA should not be in supported_attention_backends
+        # Sparse attention backends should not be used for cross-attention
+        if supported_attention_backends is not None:
+            supported_attention_backends = {
+                b
+                for b in supported_attention_backends
+                if b
+                not in {
+                    AttentionBackendEnum.SLIDING_TILE_ATTN,
+                    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                    AttentionBackendEnum.VMOBA_ATTN,
+                    AttentionBackendEnum.SLA_ATTN,
+                    AttentionBackendEnum.SAGE_SLA_ATTN,
+                }
+            }
         super().__init__(
             dim,
             num_heads,
@@ -550,8 +597,6 @@ class WanTransformerBlock_VSA(nn.Module):
             compute_dtype=torch.float32,
         )
 
-        if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
-            supported_attention_backends.remove(AttentionBackendEnum.VIDEO_SPARSE_ATTN)
         # 2. Cross-attention
         if added_kv_proj_dim is not None:
             # I2V
