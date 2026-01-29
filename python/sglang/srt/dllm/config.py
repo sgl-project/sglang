@@ -48,7 +48,6 @@ class DllmConfig:
             else server_args.max_running_requests
         )
 
-        first_done_first_out_mode = server_args.dllm_algorithm == "LowConfidenceFDFO"
         algorithm_config = {}
         if server_args.dllm_algorithm_config is not None:
             try:
