@@ -706,8 +706,11 @@ class GGUFLinearAscendMethod(LinearMethodBase):
         qweight = layer.qweight
         qweight_type = layer.qweight_type.weight_type
 
-        # Skip if already unquantized (F16/F32/BF16) - just use directly
-        if qweight_type in UNQUANTIZED_TYPES:
+        if qweight_type in UNQUANTIZED_TYPES and qweight.dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
             layer.dequantized_weight = qweight
             return
 
