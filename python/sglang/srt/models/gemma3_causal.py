@@ -177,8 +177,8 @@ class Gemma3Attention(nn.Module):
             self.sliding_window = get_attention_sliding_window_size(config)
         else:
             # Global attention. Use the values in config.json.
-            self.rope_theta = config.rope_theta
-            self.rope_scaling = config.rope_scaling
+            self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
+            self.rope_scaling = config.rope_parameters.get("rope_scaling")
             self.sliding_window = None
 
         self.attn = RadixAttention(
@@ -371,9 +371,10 @@ class Gemma3RotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma3TextConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get(
-                "rope_type", config.rope_scaling.get("type", "default")
+        rope_scaling = config.rope_parameters.get("rope_scaling")
+        if rope_scaling is not None:
+            self.rope_type = rope_scaling.get(
+                "rope_type", rope_scaling.get("type", "default")
             )
 
         else:
@@ -498,8 +499,8 @@ class Gemma3TextModel(PreTrainedModel):
 
         # when we want to create a local RoPE layer. Config defaults should hold values for global RoPE
         config = copy.deepcopy(config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
+        config.rope_parameters["rope_theta"] = config.rope_local_base_freq
+        config.rope_parameters["rope_scaling"] = {"rope_type": "default"}
         self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
 
         self.layers = make_layers(

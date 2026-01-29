@@ -80,7 +80,7 @@ class Starcoder2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.max_position_embeddings = config.max_position_embeddings
         self.use_bias = config.use_bias
 

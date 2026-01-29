@@ -187,8 +187,8 @@ class GraniteDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.residual_multiplier = config.residual_multiplier
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):
