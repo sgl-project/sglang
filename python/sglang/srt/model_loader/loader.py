@@ -2722,7 +2722,7 @@ class RunaiModelStreamerLoader(BaseModelLoader):
     Supports object storage (S3, GCS) with lazy weight streaming.
 
     Configuration (via load_config.model_loader_extra_config):
-        - distributed (bool): Enable distributed streaming
+        - distributed (bool): Enable distributed streaming - True by default for url paths (object storage)
         - concurrency (int): Number of concurrent downloads
         - memory_limit (int): Memory limit for streaming buffer
 
