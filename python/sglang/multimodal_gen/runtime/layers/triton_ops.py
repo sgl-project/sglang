@@ -336,20 +336,6 @@ def fuse_scale_shift_kernel(
     return output
 
 
-if current_platform.is_npu():
-    # TODO: remove this when triton ascend bug is fixed
-    def fuse_scale_shift_native(
-        x: torch.Tensor,
-        scale: torch.Tensor,
-        shift: torch.Tensor,
-        block_l: int = 128,
-        block_c: int = 128,
-    ):
-        return x * (1 + scale) + shift
-
-    fuse_scale_shift_kernel = fuse_scale_shift_native
-
-
 def fuse_scale_shift_gate_select01_kernel(
     x: torch.Tensor,
     scale0: torch.Tensor,
@@ -522,22 +508,6 @@ def apply_rotary_embedding(
     )
 
     return output
-
-
-if current_platform.is_npu():
-    # TODO: remove this when triton ascend bug is fixed
-    def apply_rotary_embedding_native(
-        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
-    ) -> torch.Tensor:
-        cos = cos.unsqueeze(-2).to(x.dtype)
-        sin = sin.unsqueeze(-2).to(x.dtype)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-    apply_rotary_embedding = apply_rotary_embedding_native
 
 
 # RMSNorm-fp32
@@ -1204,3 +1174,31 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
             BLOCK_SIZE_SEQ=BLOCK_SIZE_SEQ,
         )
     return y
+
+
+if current_platform.is_npu():
+    # TODO: remove this when triton ascend bug is fixed
+    def fuse_scale_shift_native(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return x * (1 + scale) + shift
+
+    fuse_scale_shift_kernel = fuse_scale_shift_native
+
+    # TODO: remove this when triton ascend bug is fixed
+    def apply_rotary_embedding_native(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
+    ) -> torch.Tensor:
+        cos = cos.unsqueeze(-2).to(x.dtype)
+        sin = sin.unsqueeze(-2).to(x.dtype)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    apply_rotary_embedding = apply_rotary_embedding_native
