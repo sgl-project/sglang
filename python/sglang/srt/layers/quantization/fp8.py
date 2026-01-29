@@ -705,9 +705,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
-        
+
         if not self.quant_config.is_checkpoint_fp8_serialized and _use_hip_int4:
-            raise NotImplementedError(f"Online MOE FP8 quantization (is_checkpoint_fp8_serialized={self.quant_config.is_checkpoint_fp8_serialized}) along SGLANG_INT4_WEIGHT=1 is not supported at the moment. Please open an issue.")
+            raise NotImplementedError(
+                f"Online MOE FP8 quantization (is_checkpoint_fp8_serialized={self.quant_config.is_checkpoint_fp8_serialized}) along SGLANG_INT4_WEIGHT=1 is not supported at the moment. Please open an issue."
+            )
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
@@ -774,7 +776,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
         # WEIGHTS
-        if (_is_hip and _use_hip_int4):
+        if _is_hip and _use_hip_int4:
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -966,7 +968,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Track how many elements were loaded
             copy_numel_counter = CopyNumelCounter()
             with copy_numel_counter:
-                original_weight_loader(param, loaded_weight, weight_name, shard_id, expert_id)
+                original_weight_loader(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
 
             if is_w13:
                 layer._w13_loaded_numel += copy_numel_counter.copied_numel
@@ -1008,8 +1012,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         for expert in range(layer.num_local_experts):
-            w13_weight[expert, :, :], layer.w13_weight_scale[expert] = (
-                scaled_fp8_quant(layer.w13_weight.data[expert, :, :])
+            w13_weight[expert, :, :], layer.w13_weight_scale[expert] = scaled_fp8_quant(
+                layer.w13_weight.data[expert, :, :]
             )
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
@@ -1020,8 +1024,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_weight = torch.empty_like(layer.w2_weight.data, dtype=fp8_dtype)
 
         for expert in range(layer.num_local_experts):
-            w2_weight[expert, :, :], layer.w2_weight_scale[expert] = (
-                scaled_fp8_quant(layer.w2_weight.data[expert, :, :])
+            w2_weight[expert, :, :], layer.w2_weight_scale[expert] = scaled_fp8_quant(
+                layer.w2_weight.data[expert, :, :]
             )
 
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)

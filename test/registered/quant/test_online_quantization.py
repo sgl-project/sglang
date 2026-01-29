@@ -1,12 +1,16 @@
 import io
-import re
 import os
+import re
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
+from types import SimpleNamespace
+
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike
+from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
@@ -15,15 +19,13 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from types import SimpleNamespace
-from sglang.test.few_shot_gsm8k import run_eval
 
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.SGLANG_USE_AITER = os.environ.get("SGLANG_USE_AITER", None)
-        
+
         # DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE has a shape not compatible with aiter.
         os.environ["SGLANG_USE_AITER"] = "0"
 
@@ -80,7 +82,7 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
     def test_peak_memory(self):
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
-        
+
         # Original BF16 model: 2.887 GiB
         assert self.peak_memory < 2
 
@@ -97,6 +99,7 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
         metrics = run_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["accuracy"], 0.01)
+
 
 class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
