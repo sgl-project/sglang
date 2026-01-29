@@ -18,6 +18,7 @@ class UsageProcessor:
     def calculate_response_usage(
         responses: List[Dict[str, Any]],
         n_choices: int = 1,
+        enable_cache_report: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
 
@@ -26,11 +27,13 @@ class UsageProcessor:
             for i in range(0, len(responses), n_choices)
         )
 
-        cached_total = sum(
-            responses[i]["meta_info"].get("cached_tokens", 0)
-            for i in range(0, len(responses), n_choices)
-        )
-        cached_details = UsageProcessor._details_if_cached(cached_total)
+        cached_details = None
+        if enable_cache_report:
+            cached_total = sum(
+                responses[i]["meta_info"].get("cached_tokens", 0)
+                for i in range(0, len(responses), n_choices)
+            )
+            cached_details = UsageProcessor._details_if_cached(cached_total)
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -44,6 +47,7 @@ class UsageProcessor:
         completion_tokens: Mapping[int, int],
         cached_tokens: Mapping[int, int],
         n_choices: int,
+        enable_cache_report: bool = False,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -51,8 +55,12 @@ class UsageProcessor:
         )
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = UsageProcessor._details_if_cached(
-            sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+        cached_details = (
+            UsageProcessor._details_if_cached(
+                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
+            )
+            if enable_cache_report
+            else None
         )
 
         return UsageProcessor.calculate_token_usage(

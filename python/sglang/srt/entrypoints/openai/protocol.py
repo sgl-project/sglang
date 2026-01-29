@@ -123,7 +123,7 @@ class CachedTokensDetails(BaseModel):
 
 
 class PromptTokensDetails(BaseModel):
-    """Details about prompt tokens including cache breakdown."""
+    """Details about prompt tokens."""
 
     cached_tokens: int = 0
 

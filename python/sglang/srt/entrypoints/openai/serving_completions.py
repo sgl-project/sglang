@@ -360,6 +360,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens,
                     n_choices=request.n,
+                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 final_usage_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -481,7 +482,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
             choices.append(choice_data)
 
         # Calculate usage
-        usage = UsageProcessor.calculate_response_usage(ret, n_choices=request.n)
+        cache_report = self.tokenizer_manager.server_args.enable_cache_report
+        usage = UsageProcessor.calculate_response_usage(
+            ret, n_choices=request.n, enable_cache_report=cache_report
+        )
 
         return CompletionResponse(
             id=ret[0]["meta_info"]["id"],

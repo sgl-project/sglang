@@ -841,6 +841,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens,
                     n_choices=request.n,
+                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -979,6 +980,7 @@ class OpenAIServingChat(OpenAIServingBase):
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
+            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
         return ChatCompletionResponse(
