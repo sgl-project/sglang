@@ -42,6 +42,7 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import (
     get_local_ip_auto,
     get_zmq_socket,
+    is_npu,
     load_audio,
     load_image,
     load_video,
@@ -175,6 +176,7 @@ class MMEncoder:
             rank=rank,
             distributed_init_method=dist_init_method,
             local_rank=rank,
+            backend="hccl" if is_npu() else "nccl",
         )
         initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
