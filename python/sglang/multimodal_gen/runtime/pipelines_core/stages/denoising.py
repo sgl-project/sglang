@@ -742,7 +742,10 @@ class DenoisingStage(PipelineStage):
         # reset offload managers with prefetching first layer for next forward
         for dit in filter(None, [self.transformer, self.transformer_2]):
             if isinstance(dit, OffloadableDiTMixin):
-                dit.prepare_for_next_denoise()
+                # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
+                # TODO: should be make this an option?
+                for manager in dit.layerwise_offload_managers:
+                    manager.release_all()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
@@ -1313,6 +1316,21 @@ class DenoisingStage(PipelineStage):
 
             noise_pred = cfg_model_parallel_all_reduce(partial)
 
+            if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
+                factor = float(batch.cfg_normalization)
+                pred_f = noise_pred.float()
+                new_norm = torch.linalg.vector_norm(pred_f)
+                if cfg_rank == 0:
+                    cond_f = noise_pred_cond.float()
+                    ori_norm = torch.linalg.vector_norm(cond_f)
+                else:
+                    ori_norm = torch.empty_like(new_norm)
+                ori_norm = get_cfg_group().broadcast(ori_norm, src=0)
+                max_norm = ori_norm * factor
+
+                if new_norm > max_norm:
+                    noise_pred = noise_pred * (max_norm / new_norm)
+
             # Guidance rescale: broadcast std(cond) from rank 0, compute std(cfg) locally
             if batch.guidance_rescale > 0.0:
                 std_cfg = noise_pred.std(
@@ -1339,6 +1357,17 @@ class DenoisingStage(PipelineStage):
             noise_pred = noise_pred_uncond + current_guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
             )
+
+            if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
+                factor = float(batch.cfg_normalization)
+                cond_f = noise_pred_cond.float()
+                pred_f = noise_pred.float()
+                ori_norm = torch.linalg.vector_norm(cond_f)
+                new_norm = torch.linalg.vector_norm(pred_f)
+                max_norm = ori_norm * factor
+
+                if new_norm > max_norm:
+                    noise_pred = noise_pred * (max_norm / new_norm)
 
             if batch.guidance_rescale > 0.0:
                 noise_pred = self.rescale_noise_cfg(
