@@ -332,11 +332,25 @@ def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
     return key
 
 
+def find_quant_modelslim_config(model_config):
+    quant_config_file = Path(model_config["model_path"], "quant_model_description.json")
+    quant_cfg = None
+    if quant_config_file.is_file():
+        with open(quant_config_file) as f:
+            quant_cfg = json.load(f)
+        # This field is required for flagless model loading but is not present in
+        # modelslim model description, so we're adding it here manually.
+        model_config["quantization_config"]["quant_method"]
+
+    return model_config
+        
+
 def get_quant_config(
     model_config,
     packed_modules_mapping: Dict[str, List[str]] = {},
     remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
+    model_config = find_quant_modelslim_config(model_config)
     if "quantization_config" not in model_config:
         return None
     quant_cls = get_quantization_config(
