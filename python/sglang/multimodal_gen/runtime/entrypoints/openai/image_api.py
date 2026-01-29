@@ -130,20 +130,22 @@ async def generations(
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
+     
+    resp_format = (request.response_format or "b64_json").lower()
 
-    # Run synchronously for images and save to disk
-    save_file_path_list, result = await process_generation_batch(
-        async_scheduler_client, batch
+    # Run synchronously for images
+    save_file_path_list, base64_data_list, result = await process_generation_batch(
+        async_scheduler_client, batch , 
+        save_output= resp_format != "b64_json"
     )
     save_file_path = save_file_path_list[0]
 
     resp_format = (request.response_format or "b64_json").lower()
     b64_data = None
 
-    # 1. Read content first if needed (while file exists)
+    # 1. Get b64 data if needed
     if resp_format == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64_data = base64.b64encode(f.read()).decode("utf-8")
+        b64_data = base64_data_list
 
     # 2. Upload and Delete local file
     cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
@@ -164,9 +166,9 @@ async def generations(
         response_kwargs = {
             "data": [
                 ImageResponseData(
-                    b64_json=b64_data,
+                    b64_json=frames_list[0],
                     revised_prompt=request.prompt,
-                )
+                ) for frames_list in b64_data
             ]
         }
     elif resp_format == "url":
@@ -269,19 +271,18 @@ async def edits(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-
-    save_file_path_list, result = await process_generation_batch(
-        async_scheduler_client, batch
+    resp_format = (response_format or "b64_json").lower()
+    save_file_path_list, base64_data_list, result = await process_generation_batch(
+        async_scheduler_client, batch,
+        save_output= resp_format != "b64_json"
     )
     save_file_path = save_file_path_list[0]
 
-    resp_format = (response_format or "b64_json").lower()
     b64_data = None
-
-    # 1. Read content first if needed (while file exists)
+    
+    # 1. Get b64 data if needed
     if resp_format == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64_data = base64.b64encode(f.read()).decode("utf-8")
+        b64_data = base64_data_list
 
     # 2. Upload and Delete local file
     cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
@@ -302,19 +303,12 @@ async def edits(
     # 4. Return Response
     if (response_format or "b64_json").lower() == "b64_json":
         response_kwargs = {"data": []}
-        for path in save_file_path_list:
-            if path == save_file_path and b64_data is not None:
-                b64 = b64_data
-            else:
-                with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-            response_kwargs["data"].append(
-                ImageResponseData(
-                    b64_json=b64,
-                    revised_prompt=prompt,
-                    file_path=os.path.abspath(path),
-                )
-            )
+        response_kwargs["data"] = [
+            ImageResponseData(
+                b64_json=frames_list[0],
+                revised_prompt=prompt,
+            ) for frames_list in b64_data
+        ]
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb
     else:

@@ -128,8 +128,9 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 
     try:
-        save_file_path_list, result = await process_generation_batch(
-            async_scheduler_client, batch
+        save_file_path_list, _ , result = await process_generation_batch(
+            async_scheduler_client, batch,
+            save_output=True
         )
         save_file_path = save_file_path_list[0]
 
