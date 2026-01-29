@@ -326,6 +326,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
             self.eps,
         )
 
+    def forward_hip(self, *args, **kwargs):
+        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -419,6 +424,11 @@ class _NormScaleShift(CustomOp):
             self.norm_type,
             self.eps,
         )
+
+    def forward_hip(self, *args, **kwargs):
+        # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
 
     def forward_native(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
