@@ -161,6 +161,12 @@ class TritonRunnerCore(MoeRunnerCore):
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
+
+        # Handle zero-token case (can happen with EP when all tokens routed to other EP)
+        if M == 0:
+            out_hidden_states = torch.empty_like(hidden_states)
+            return TritonRunnerOutput(hidden_states=out_hidden_states)
+
         compute_type = (
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
@@ -365,7 +371,7 @@ def fused_experts_none_to_triton(
     )
 
 
-@register_fused_func("pplx", "triton")
+# @register_fused_func("pplx", "triton")
 def fused_experts_pplx_to_triton(
     dispatch_output: PPLXDispatchOutput,
     quant_info: TritonMoeQuantInfo,
@@ -374,6 +380,8 @@ def fused_experts_pplx_to_triton(
     from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
     from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXCombineInput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    # NOTE: dead code
 
     out_expert_num_tokens = dispatch_output.expert_num_tokens
     expert_offsets = torch.cumsum(out_expert_num_tokens, dim=0)
@@ -530,4 +538,142 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_pre_permute("pplx", "triton")
+def pre_permute_pplx_to_triton(
+    dispatch_output: PPLXDispatchOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> TritonRunnerInput:
+    """
+    Extract valid tokens from PPLX format for efficient kernel execution.
+    Store metadata (not the mask) to reconstruct in post_permute, avoiding
+    device context issues.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+        get_config_dtype_str,
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    device = dispatch_output.hidden_states.device
+    out_expert_num_tokens = dispatch_output.expert_num_tokens
+    num_local_experts = dispatch_output.hidden_states.size(0)
+    capacity = dispatch_output.hidden_states.size(1)
+
+    # Create mask to extract valid tokens
+    range_vector = torch.arange(capacity, device=device)
+    mask = range_vector < out_expert_num_tokens.unsqueeze(1)
+
+    # Extract valid tokens: (E, capacity, H) -> (num_valid_tokens, H)
+    fused_moe_input = dispatch_output.hidden_states[mask]
+
+    # Create fake_topk_ids for contiguous valid tokens
+    fake_topk_ids = torch.repeat_interleave(
+        torch.arange(num_local_experts, device=device, dtype=torch.int32),
+        out_expert_num_tokens.long(),
+        dim=0,
+    ).unsqueeze(1)  # (num_valid_tokens, 1)
+
+    fake_topk_weights = torch.ones_like(fake_topk_ids, dtype=torch.float32)
+    fake_topk_output = StandardTopKOutput(
+        topk_weights=fake_topk_weights, topk_ids=fake_topk_ids, router_logits=None
+    )
+
+    num_tokens = fused_moe_input.shape[0]
+    if (
+        not (quant_info.use_fp8_w8a8 or quant_info.use_int8_w8a8)
+        or quant_info.block_shape is not None
+        or _use_aiter
+    ):
+        padding_size = 0
+    else:
+        padding_size = _MOE_PADDING_SIZE
+
+    config_dtype = get_config_dtype_str(
+        use_fp8_w8a8=quant_info.use_fp8_w8a8,
+        use_int8_w8a8=quant_info.use_int8_w8a8,
+        use_int8_w8a16=quant_info.use_int8_w8a16,
+        use_int4_w4a16=quant_info.use_int4_w4a16,
+        dtype=fused_moe_input.dtype,
+    )
+
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        quant_info.w13_weight.shape,
+        (
+            num_local_experts,
+            quant_info.w2_weight.shape[1],
+            quant_info.w2_weight.shape[2] - padding_size,
+        ),
+        fake_topk_output.topk_ids.shape[1],
+        config_dtype,
+        block_shape=quant_info.block_shape,
+        per_channel_quant=quant_info.per_channel_quant,
+    )
+
+    config = get_config_func(num_tokens)
+
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        fake_topk_output.topk_ids, config["BLOCK_SIZE_M"], num_local_experts
+    )
+
+    running_state["config"] = config
+    running_state["expert_num_tokens"] = out_expert_num_tokens
+    running_state["capacity"] = capacity
+    running_state["output_shape"] = dispatch_output.hidden_states.shape
+    running_state["topk_ids"] = dispatch_output.topk_output.topk_ids
+    running_state["topk_weights"] = dispatch_output.topk_output.topk_weights
+
+    return TritonRunnerInput(
+        hidden_states=fused_moe_input,
+        topk_weights=fake_topk_output.topk_weights,
+        topk_ids=fake_topk_output.topk_ids,
+        sorted_token_ids=sorted_token_ids,
+        expert_ids=expert_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+    )
+
+
+@register_post_permute("triton", "pplx")
+def post_permute_triton_to_pplx(
+    runner_output: TritonRunnerOutput,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> PPLXCombineInput:
+    """
+    Scatter results back to PPLX format by reconstructing the mask from metadata.
+    This avoids storing the mask tensor (which caused device context issues).
+    """
+    from sglang.srt.layers.moe.token_dispatcher.pplx import PPLXCombineInput
+
+    output_device = runner_output.hidden_states.device
+    output_shape = running_state["output_shape"]
+    capacity = running_state["capacity"]
+
+    # Reconstruct mask on the output device
+    expert_num_tokens = running_state["expert_num_tokens"]
+    range_vector = torch.arange(capacity, device=output_device)
+    mask = range_vector < expert_num_tokens.unsqueeze(1)
+
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+
+    # Scatter results back to full shape (E, capacity, H)
+    expert_y = torch.empty(
+        output_shape,
+        device=output_device,
+        dtype=runner_output.hidden_states.dtype,
+    )
+    expert_y[mask] = runner_output.hidden_states
+
+    return PPLXCombineInput(
+        hidden_states=expert_y,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
