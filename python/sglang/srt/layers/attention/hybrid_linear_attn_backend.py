@@ -875,15 +875,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ssm_states.dtype == torch.float32
         )
         if use_flashinfer:
-            q_for_kernel = query.permute(1, 0, 2, 3).contiguous()
-            k_for_kernel = key.permute(1, 0, 2, 3).contiguous()
-            v_for_kernel = value.permute(1, 0, 2, 3).contiguous()
-            a_for_kernel = a.view(bs, 1, -1).contiguous()
-            b_for_kernel = b.view(bs, 1, -1).contiguous()
+            q_for_kernel = query.permute(1, 0, 2, 3)
+            k_for_kernel = key.permute(1, 0, 2, 3)
+            v_for_kernel = value.permute(1, 0, 2, 3)
+            a_for_kernel = a.view(bs, 1, -1)
+            b_for_kernel = b.view(bs, 1, -1)
             # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
-            state_for_kernel = (
-                ssm_states[cache_indices].transpose(-1, -2).contiguous()
-            )
+            state_for_kernel = ssm_states[cache_indices].transpose(-1, -2)
             output, output_state = self._flashinfer_gdn_decode(
                 q=q_for_kernel,
                 k=k_for_kernel,
@@ -895,11 +893,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b=b_for_kernel,
                 use_qk_l2norm=True,
             )
-            output_state = output_state.transpose(-1, -2).contiguous()
-            ssm_states[cache_indices] = output_state.to(
-                ssm_states.dtype, copy=False
-            )
-            core_attn_out = output.permute(1, 0, 2, 3).contiguous()
+            output_state = output_state.transpose(-1, -2)
+            ssm_states[cache_indices] = output_state.to(ssm_states.dtype, copy=False)
+            core_attn_out = output.permute(1, 0, 2, 3)
         else:
             core_attn_out = self._kernel_func(
                 A_log=layer.A_log,
@@ -1047,9 +1043,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b_for_kernel = b.view(batch_size, draft_token_num, -1).contiguous()
                 # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
                 initial_state = ssm_states.transpose(-1, -2).contiguous()
-                intermediate_state_buffer = (
-                    intermediate_state_cache.transpose(-1, -2).contiguous()
-                )
+                intermediate_state_buffer = intermediate_state_cache.transpose(
+                    -1, -2
+                ).contiguous()
                 output, _ = self._flashinfer_gdn_mtp(
                     q=q_for_kernel,
                     k=k_for_kernel,
