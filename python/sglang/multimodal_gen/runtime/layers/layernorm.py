@@ -50,6 +50,11 @@ class RMSNorm(CustomOp):
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
 
+    def use_forward_cuda(self):
+        if self.variance_size_override is not None:
+            return self.use_forward_native()
+        return super().use_forward_cuda()
+
     def use_forward_cpu(self):
         return self.use_forward_native()
 

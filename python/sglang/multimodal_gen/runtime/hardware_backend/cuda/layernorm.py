@@ -25,8 +25,6 @@ def rms_norm(
         out = rms_norm_fn(
             x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
         )
-    elif self.variance_size_override is not None:
-        return self.forward_native(x, residual)
     elif residual is not None:
         fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
         return x.view(shape), residual.view(residual_shape)
