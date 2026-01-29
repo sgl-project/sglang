@@ -566,7 +566,7 @@ class MOVADenoisingStage(PipelineStage):
 
         for dit in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
             if isinstance(dit, OffloadableDiTMixin):
-                dit.prepare_for_next_denoise()
+                dit.prepare_for_next_req()
 
         return batch
 
