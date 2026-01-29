@@ -25,6 +25,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.utils import logger
+from decord import VideoReader
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -150,9 +151,9 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
 ) -> torch.Tensor:
-    if isinstance(vr, tuple) and len(vr) == 2:
+    # preprocessed video
+    if not isinstance(vr, VideoReader):
         return vr
-    assert isinstance(vr, VideoReader), f"The VideoReader is excepted, but got: {type(vr)}"
     entry_time = time.perf_counter()
 
     total_frames, video_fps = len(vr), vr.get_avg_fps()
