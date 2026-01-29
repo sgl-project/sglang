@@ -138,7 +138,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_all_gather_reorganazied_into_tensor(
         input_tensor,
-        forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
