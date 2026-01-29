@@ -238,7 +238,7 @@ def post_process_sample(
     save_output: bool = True,
     save_file_path: Optional[str] = None,
     audio_sample_rate: Optional[int] = None,
-    output_compression=None,
+    output_compression: Optional[int] = None,
 ):
     """
     Process sample output and save video if necessary

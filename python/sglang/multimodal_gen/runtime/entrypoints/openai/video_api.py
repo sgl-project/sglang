@@ -173,7 +173,7 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
-    output_compression: Optional[float] = Form(None),
+    output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()

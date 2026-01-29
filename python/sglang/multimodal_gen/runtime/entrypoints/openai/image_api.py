@@ -218,7 +218,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
-    output_compression: Optional[float] = Form(None),
+    output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
