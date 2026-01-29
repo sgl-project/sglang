@@ -72,6 +72,13 @@ def convert_time_to_realtime_ns(time_value: float) -> int:
     return int((time_value + global_diff_realtime_monotonic) * 1e9)
 
 
+def convert_time_cross_thread(
+    time_value: float, old_diff: float, new_diff: float
+) -> float:
+    # note: precision loss
+    return time_value + old_diff - new_diff
+
+
 @dataclass
 class RequestStageConfig:
     stage_name: str
@@ -201,6 +208,7 @@ class ReqTimeStatsBase:
         default_factory=TraceNullContext
     )
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL
+    diff_realtime_monotonic: float = 0.0
 
     @classmethod
     def new_from_obj(cls, obj: ReqTimeStatsBase, *args, **kwargs) -> "ReqTimeStatsBase":
@@ -275,7 +283,18 @@ class ReqTimeStatsBase:
             "disagg_mode": self.disagg_mode,
             "enable_metrics": False,
             "trace_ctx": self.trace_ctx,
+            "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
+
+    def __setstate__(self, state: object):
+        for key in state.keys():
+            if key.endswith("time"):
+                state[key] = convert_time_cross_thread(
+                    state[key],
+                    state["diff_realtime_monotonic"],
+                    global_diff_realtime_monotonic,
+                )
+        self.__dict__.update(state)
 
 
 @dataclass
@@ -539,6 +558,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             "prefill_run_batch_start_time": self.prefill_run_batch_start_time,
             "prefill_run_batch_end_time": self.prefill_run_batch_end_time,
             "prefill_finished_time": self.prefill_finished_time,
+            "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
         return state
 
