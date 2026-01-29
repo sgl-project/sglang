@@ -66,6 +66,16 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS` | Number of SMs used for DeepEP combine when single batch overlap is enabled | `"32"` |
 | `SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO` | Run shared experts on an alternate stream when single batch overlap is enabled on GB200. When not setting this flag, shared experts and down gemm will be overlapped with DeepEP combine together. | `"false"` |
 
+## MORI Configuration
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_MORI_FP8_DISP` | Use FP8 for dispatch | `"false"` |
+| `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
+| `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
+| `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
+| `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |
+
 ## NSA Backend Configuration (For DeepSeek V3.2)
 
 <!-- # Environment variable to control mtp precomputing of metadata for multi-step speculative decoding -->
