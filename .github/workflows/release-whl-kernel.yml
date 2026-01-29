@@ -197,13 +197,13 @@ jobs:
           git commit -m "update whl index"
           git push
 
-  build-rocm700:
+  build-rocm711:
     if: github.repository == 'sgl-project/sglang'
     runs-on: amd-docker-scale
     strategy:
       matrix:
         python-version: ["3.10"]
-        rocm-version: ["700"]
+        rocm-version: ["711"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -216,7 +216,7 @@ jobs:
 
       - name: Build wheels
         run: |
-          cp 3rdparty/amd/sgl-kernel/* sgl-kernel/
+          cp 3rdparty/amd/wheel/sgl-kernel/* sgl-kernel/
           cd sgl-kernel
           chmod +x ./build_rocm.sh
           ./build_rocm.sh "${{ matrix.rocm-version }}"
@@ -227,8 +227,8 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-rocm${{ matrix.rocm-version }}
           path: sgl-kernel/dist/*
 
-  release-rocm700:
-    needs: build-rocm700
+  release-rocm711:
+    needs: build-rocm711
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -265,7 +265,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --rocm 700
+        run: python3 scripts/update_kernel_whl_index.py --rocm 711
 
       - name: Push wheel index
         run: |

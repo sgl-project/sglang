@@ -1,0 +1,42 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -3,7 +3,7 @@
+ build-backend = "setuptools.build_meta"
+
+ [project]
+-name = "sglang"
++name = "amd-sglang"
+ dynamic = ["version"]
+ description = "SGLang is a fast serving framework for large language models and vision language models."
+ readme = "README.md"
+@@ -76,11 +76,14 @@
+ ]
+
+ # HIP (Heterogeneous-computing Interface for Portability) for AMD
+-# => base docker rocm/vllm-dev:20250114, not from public vllm whl
+ srt_hip = [
+-  "sglang[runtime_common]",
+-  "torch",
++  "amd-aiter @ https://pypi.amd.com/rocm-7.1.1/packages/amd-aiter/amd_aiter-0.1.10-cp310-cp310-linux_x86_64.whl ; python_version == '3.10'",
++  "amd-aiter @ https://pypi.amd.com/rocm-7.1.1/packages/amd-aiter/amd_aiter-0.1.10-cp312-cp312-linux_x86_64.whl ; python_version == '3.12'",
++  "mooncake-transfer-engine-non-cuda==0.3.8.post1",
+   "petit_kernel==0.0.2",
++  "sgl-kernel @ https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+rocm711-cp310-abi3-manylinux2014_x86_64.whl",
++  "amd-sglang[runtime_common]",
++  "torch",
+   "wave-lang==3.8.2",
+ ]
+
+@@ -141,11 +144,11 @@
+   "tabulate",
+ ]
+
+-all_hip = ["sglang[srt_hip]"]
++all_hip = ["amd-sglang[srt_hip]"]
+ all_hpu = ["sglang[srt_hpu]"]
+ all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
+
+-dev_hip = ["sglang[all_hip]", "sglang[test]"]
++dev_hip = ["amd-sglang[all_hip]", "amd-sglang[test]"]
+ dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
+ dev_musa = ["sglang[all_musa]", "sglang[test]"]
