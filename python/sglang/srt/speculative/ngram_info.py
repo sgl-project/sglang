@@ -70,6 +70,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         future_indices: Optional[FutureIndices] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         verify_done: Optional[torch.cuda.Event] = None,
+        next_token_ids: Optional[torch.Tensor] = None,
+        accept_lens: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         if custom_mask is not None:
@@ -85,13 +87,12 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.future_indices = future_indices
         self.new_seq_lens = new_seq_lens
         self.verify_done = verify_done
+        self.next_token_ids = next_token_ids
+        self.accept_lens = accept_lens
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
         )
-        if server_args is not None:
-            self.topk = server_args.speculative_eagle_topk
-            self.spec_steps = server_args.speculative_num_steps
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
