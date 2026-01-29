@@ -38,7 +38,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import HttpMMReceiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -420,7 +420,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Encoder Disaggregation
         if self.server_args.language_only:
-            self.mm_receiver = MMReceiver(
+            self.mm_receiver = HttpMMReceiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
             )
