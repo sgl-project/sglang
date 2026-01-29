@@ -182,12 +182,25 @@ class ComposedPipelineBase(ABC):
             "boundary_ratio" in model_index
             and model_index["boundary_ratio"] is not None
         ):
-            logger.info(
-                "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
+            has_transformer = (
+                "transformer" in model_index
+                or "transformer_2" in model_index
+                or "transformer" in self.required_config_modules
+                or "transformer_2" in self.required_config_modules
             )
-            self.required_config_modules.append("transformer_2")
+            if has_transformer:
+                logger.info(
+                    "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
+                )
+                if "transformer_2" not in self.required_config_modules:
+                    self.required_config_modules.append("transformer_2")
+            else:
+                logger.info(
+                    "Boundary ratio found in model_index.json without transformers; "
+                    "using it for pipeline config only."
+                )
             logger.info(
-                "MoE pipeline detected. Setting boundary ratio to %s",
+                "Setting boundary ratio to %s",
                 model_index["boundary_ratio"],
             )
             server_args.pipeline_config.dit_config.boundary_ratio = model_index[
