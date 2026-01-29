@@ -20,11 +20,11 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     UlyssesAttention_VSA,
     USPAttention,
 )
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
     RMSNorm,
-    ScaleResidual,
     ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 
 class WanImageEmbedding(torch.nn.Module):
@@ -381,7 +382,7 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -444,7 +445,7 @@ class WanTransformerBlock(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
+        if _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -487,7 +488,7 @@ class WanTransformerBlock(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states
@@ -581,7 +582,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 3. Feed-forward
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
-        self.mlp_residual = ScaleResidual()
+        self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
@@ -626,7 +627,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if query.is_cuda and query.shape == key.shape:
+        if _is_cuda and query.shape == key.shape:
             cos_sin_cache = torch.cat(
                 [
                     cos.to(dtype=torch.float32).contiguous(),
@@ -668,7 +669,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = self.mlp_residual(hidden_states, ff_output, c_gate_msa)
+        hidden_states = self.mlp_residual(ff_output, c_gate_msa, hidden_states)
         hidden_states = hidden_states.to(orig_dtype)
 
         return hidden_states

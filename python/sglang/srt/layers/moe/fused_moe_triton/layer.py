@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.kt_ep_wrapper import (
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -52,6 +53,9 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
+)
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
+    CompressedTensorsMxInt4MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
@@ -116,6 +120,27 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             num_local_experts=moe_runner_config.num_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
+        )
+    elif a2a_backend.is_mori():
+        from sglang.srt.layers.moe.token_dispatcher import MoriEPDispatcher
+
+        return MoriEPDispatcher(
+            group=get_tp_group(),
+            router_topk=moe_runner_config.top_k,
+            permute_fusion=True,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            deepep_mode=get_deepep_mode(),
+        )
+    elif a2a_backend.is_flashinfer():
+        return FlashinferDispatcher(
+            group=get_tp_group().device_group,
+            router_topk=moe_runner_config.top_k,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
         )
     else:
         raise NotImplementedError(f"Unsupported a2a backend: {a2a_backend}")
@@ -244,6 +269,7 @@ class FusedMoE(torch.nn.Module):
             gemm1_alpha=gemm1_alpha,
             gemm1_clamp_limit=gemm1_clamp_limit,
             is_gated=is_gated,
+            routing_method_type=routing_method_type,
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -666,6 +692,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16TritonMoEMethod",
                 ]
             )
             else loaded_weight
@@ -679,6 +706,7 @@ class FusedMoE(torch.nn.Module):
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
             or isinstance(self.quant_method, Fp8MoEMethod)
             or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
+            or isinstance(self.quant_method, CompressedTensorsMxInt4MoEMethod)
         ):
             shard_id = {"w1": "w3", "w3": "w1", "w2": "w2"}[shard_id]
 
@@ -878,7 +906,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16TritonMoEMethod",
+                ]
             )
             else loaded_weight
         )
@@ -1131,6 +1162,7 @@ class FlashInferFusedMoE(FusedMoE):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
         correction_bias = topk_config.correction_bias
+        routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
 
         if isinstance(self.quant_method, UnquantizedFusedMoEMethod):
             # lazy import
@@ -1161,6 +1193,7 @@ class FlashInferFusedMoE(FusedMoE):
                     local_expert_offset=self.moe_ep_rank * self.num_local_experts,
                     local_num_experts=self.num_local_experts,
                     routing_method_type=self.routing_method_type,
+                    routed_scaling_factor=routed_scaling_factor,
                     tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
                 )
 
