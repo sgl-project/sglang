@@ -40,8 +40,6 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -398,6 +396,14 @@ class CudaGraphRunner:
         For non-supported backends, we only capture the LoRA graph and use it
         for all batches (LoRA kernels no-op when adapters are zeroed).
         """
+        # Import here to avoid circular import
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
+
         return isinstance(
             self.model_runner.attn_backend,
             (FlashAttentionBackend, FlashInferAttnBackend),

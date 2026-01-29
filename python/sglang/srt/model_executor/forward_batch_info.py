@@ -42,8 +42,6 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -537,6 +535,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # we only capture the LoRA graph (to avoid metadata overwrites). Therefore,
             # we must always call prepare_lora_batch() to ensure adapters are properly
             # set up (zeroed for non-LoRA requests, so LoRA kernels no-op).
+            # Import here to avoid circular import
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+            from sglang.srt.layers.attention.flashinfer_backend import (
+                FlashInferAttnBackend,
+            )
+
             supports_separate_lora_graphs = isinstance(
                 model_runner.attn_backend,
                 (FlashAttentionBackend, FlashInferAttnBackend),
