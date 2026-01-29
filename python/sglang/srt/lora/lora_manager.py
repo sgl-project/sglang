@@ -133,6 +133,8 @@ class LoRAManager:
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
+            # Filter added tokens to only include truly added tokens (ID >= base vocab_size)
+            new_adapter.filter_added_tokens(self.base_hf_config.vocab_size)
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -383,17 +385,25 @@ class LoRAManager:
         )
 
         for lora_id, config in self.configs.items():
-            if not isinstance(config.target_modules, list):
-                raise ValueError(
-                    f"SGLang currently only supports inferring LoRA target modules when a list of "
-                    "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
-                    "specify `--lora-target-modules` during server startup. You can specify `all` to "
-                    "enable all support modules types. "
+            # Use effective_target_modules (computed from actual safetensors weights)
+            # if available and non-empty, otherwise fall back to declared target_modules.
+            # This handles cases where exclude_modules was used during training,
+            # resulting in fewer actual LoRA weights than declared in target_modules.
+            if config.effective_target_modules:
+                adapter_target_modules = get_normalized_target_modules(
+                    config.effective_target_modules
                 )
-
-            adapter_target_modules = get_normalized_target_modules(
-                config.target_modules
-            )
+            else:
+                if not isinstance(config.target_modules, list):
+                    raise ValueError(
+                        f"SGLang currently only supports inferring LoRA target modules when a list of "
+                        "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
+                        "specify `--lora-target-modules` during server startup. You can specify `all` to "
+                        "enable all support modules types. "
+                    )
+                adapter_target_modules = get_normalized_target_modules(
+                    config.target_modules
+                )
 
             if target_modules is not None:
                 # When `--lora-target-modules` is provided, validate adapter target modules is a subset of the specified target modules.
@@ -417,6 +427,12 @@ class LoRAManager:
                 [x.r for x in self.configs.values()],
                 default=0,
             )
+
+        # Filter added tokens to only include truly added tokens (ID >= base vocab_size)
+        # This handles cases where added_tokens.json contains tokens from base model
+        base_vocab_size = self.base_hf_config.vocab_size
+        for config in self.configs.values():
+            config.filter_added_tokens(base_vocab_size)
 
         # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
         # This happens automatically without requiring user input
@@ -490,6 +506,8 @@ class LoRAManager:
 
         try:
             new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            # Filter added tokens to only include truly added tokens (ID >= base vocab_size)
+            new_adapter.filter_added_tokens(self.base_hf_config.vocab_size)
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
