@@ -48,14 +48,16 @@ CI_CRITICAL_MODELS = [
     # GLM models - observed 0.0 accuracy failures
     "THUDM/glm-4-9b-chat",
     "THUDM/glm-4-9b-chat-1m",
+    "zai-org/GLM-4.5-Air-FP8",  # Used in test_glm4_moe_models.py
     # Llama models - commonly tested
     "meta-llama/Llama-3.1-8B-Instruct",
     "meta-llama/Llama-3.2-1B-Instruct",
     # Qwen models
     "Qwen/Qwen2.5-1.5B-Instruct",
     "Qwen/Qwen2.5-7B-Instruct",
-    # Mistral
+    # Mistral/Mixtral
     "mistralai/Mistral-7B-Instruct-v0.3",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",  # Used in benchmark tests
 ]
 
 # Maximum time to spend on validation (seconds)
