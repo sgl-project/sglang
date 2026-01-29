@@ -1,5 +1,7 @@
 # Diffusion Models
 
+> This page covers **image and video generation**. For **text generation** using diffusion LLMs (e.g., LLaDA2.0), see [Diffusion Language Models](../text_generation/diffusion_language_models.md).
+
 SGLang Diffusion is an inference framework for accelerated image and video generation using diffusion models. It provides an end-to-end unified pipeline with optimized kernels from sgl-kernel and an efficient scheduler loop.
 
 ## Key Features
@@ -93,33 +95,33 @@ default parameters when initializing and generating videos.
 ### Video Generation Models
 
 | Model Name                   | Hugging Face Model ID                             | Resolutions         | TeaCache | Sliding Tile Attn | Sage Attn | Video Sparse Attention (VSA) |
-|:-----------------------------|:--------------------------------------------------|:--------------------|:--------:|:-----------------:|:---------:|:----------------------------:|
-| FastWan2.1 T2V 1.3B          | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers`         | 480p                |    ⭕     |         ⭕         |     ⭕     |              ✅               |
-| FastWan2.2 TI2V 5B Full Attn | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | 720p                |    ⭕     |         ⭕         |     ⭕     |              ✅               |
-| Wan2.2 TI2V 5B               | `Wan-AI/Wan2.2-TI2V-5B-Diffusers`                 | 720p                |    ⭕     |         ⭕         |     ✅     |              ⭕               |
-| Wan2.2 T2V A14B              | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`                | 480p<br>720p        |    ❌     |         ❌         |     ✅     |              ⭕               |
-| Wan2.2 I2V A14B              | `Wan-AI/Wan2.2-I2V-A14B-Diffusers`                | 480p<br>720p        |    ❌     |         ❌         |     ✅     |              ⭕               |
-| HunyuanVideo                 | `hunyuanvideo-community/HunyuanVideo`             | 720×1280<br>544×960 |    ❌     |         ✅         |     ✅     |              ⭕               |
-| FastHunyuan                  | `FastVideo/FastHunyuan-diffusers`                 | 720×1280<br>544×960 |    ❌     |         ✅         |     ✅     |              ⭕               |
-| Wan2.1 T2V 1.3B              | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`                | 480p                |    ✅     |         ✅         |     ✅     |              ⭕               |
-| Wan2.1 T2V 14B               | `Wan-AI/Wan2.1-T2V-14B-Diffusers`                 | 480p, 720p          |    ✅     |         ✅         |     ✅     |              ⭕               |
-| Wan2.1 I2V 480P              | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers`            | 480p                |    ✅     |         ✅         |     ✅     |              ⭕               |
-| Wan2.1 I2V 720P              | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers`            | 720p                |    ✅     |         ✅         |     ✅     |              ⭕               |
+| :--------------------------- | :------------------------------------------------ | :------------------ | :------: | :---------------: | :-------: | :--------------------------: |
+| FastWan2.1 T2V 1.3B          | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers`         | 480p                |    ⭕    |        ⭕         |    ⭕     |              ✅              |
+| FastWan2.2 TI2V 5B Full Attn | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | 720p                |    ⭕    |        ⭕         |    ⭕     |              ✅              |
+| Wan2.2 TI2V 5B               | `Wan-AI/Wan2.2-TI2V-5B-Diffusers`                 | 720p                |    ⭕    |        ⭕         |    ✅     |              ⭕              |
+| Wan2.2 T2V A14B              | `Wan-AI/Wan2.2-T2V-A14B-Diffusers`                | 480p<br>720p        |    ❌    |        ❌         |    ✅     |              ⭕              |
+| Wan2.2 I2V A14B              | `Wan-AI/Wan2.2-I2V-A14B-Diffusers`                | 480p<br>720p        |    ❌    |        ❌         |    ✅     |              ⭕              |
+| HunyuanVideo                 | `hunyuanvideo-community/HunyuanVideo`             | 720×1280<br>544×960 |    ❌    |        ✅         |    ✅     |              ⭕              |
+| FastHunyuan                  | `FastVideo/FastHunyuan-diffusers`                 | 720×1280<br>544×960 |    ❌    |        ✅         |    ✅     |              ⭕              |
+| Wan2.1 T2V 1.3B              | `Wan-AI/Wan2.1-T2V-1.3B-Diffusers`                | 480p                |    ✅    |        ✅         |    ✅     |              ⭕              |
+| Wan2.1 T2V 14B               | `Wan-AI/Wan2.1-T2V-14B-Diffusers`                 | 480p, 720p          |    ✅    |        ✅         |    ✅     |              ⭕              |
+| Wan2.1 I2V 480P              | `Wan-AI/Wan2.1-I2V-14B-480P-Diffusers`            | 480p                |    ✅    |        ✅         |    ✅     |              ⭕              |
+| Wan2.1 I2V 720P              | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers`            | 720p                |    ✅    |        ✅         |    ✅     |              ⭕              |
 
 **Note**: Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
 
 ### Image Generation Models
 
-| Model Name       | HuggingFace Model ID                    | Resolutions    |
-|:-----------------|:----------------------------------------|:---------------|
-| FLUX.1-dev       | `black-forest-labs/FLUX.1-dev`          | Any resolution |
-| FLUX.2-dev       | `black-forest-labs/FLUX.2-dev`          | Any resolution |
-| FLUX.2-Klein     | `black-forest-labs/FLUX.2-klein-4B`     | Any resolution |
-| Z-Image-Turbo    | `Tongyi-MAI/Z-Image-Turbo`              | Any resolution |
-| GLM-Image        | `zai-org/GLM-Image`                     | Any resolution |
-| Qwen Image       | `Qwen/Qwen-Image`                       | Any resolution |
-| Qwen Image 2512  | `Qwen/Qwen-Image-2512`                  | Any resolution |
-| Qwen Image Edit  | `Qwen/Qwen-Image-Edit`                  | Any resolution |
+| Model Name      | HuggingFace Model ID                | Resolutions    |
+| :-------------- | :---------------------------------- | :------------- |
+| FLUX.1-dev      | `black-forest-labs/FLUX.1-dev`      | Any resolution |
+| FLUX.2-dev      | `black-forest-labs/FLUX.2-dev`      | Any resolution |
+| FLUX.2-Klein    | `black-forest-labs/FLUX.2-klein-4B` | Any resolution |
+| Z-Image-Turbo   | `Tongyi-MAI/Z-Image-Turbo`          | Any resolution |
+| GLM-Image       | `zai-org/GLM-Image`                 | Any resolution |
+| Qwen Image      | `Qwen/Qwen-Image`                   | Any resolution |
+| Qwen Image 2512 | `Qwen/Qwen-Image-2512`              | Any resolution |
+| Qwen Image Edit | `Qwen/Qwen-Image-Edit`              | Any resolution |
 
 ## Verified LoRA Examples
 
@@ -132,20 +134,19 @@ This section lists example LoRAs that have been explicitly tested and verified w
 
 ### Verified LoRAs by Base Model
 
-| Base Model       | Supported LoRAs |
-|:-----------------|:----------------|
-| Wan2.2           | `lightx2v/Wan2.2-Distill-Loras`<br>`Cseti/wan2.2-14B-Arcane_Jinx-lora-v1` |
-| Wan2.1           | `lightx2v/Wan2.1-Distill-Loras` |
-| Z-Image-Turbo    | `tarn59/pixel_art_style_lora_z_image_turbo`<br>`wcde/Z-Image-Turbo-DeJPEG-Lora` |
-| Qwen-Image       | `lightx2v/Qwen-Image-Lightning`<br>`flymy-ai/qwen-image-realism-lora`<br>`prithivMLmods/Qwen-Image-HeadshotX`<br>`starsfriday/Qwen-Image-EVA-LoRA` |
-| Qwen-Image-Edit  | `ostris/qwen_image_edit_inpainting`<br>`lightx2v/Qwen-Image-Edit-2511-Lightning` |
-| Flux             | `dvyio/flux-lora-simple-illustration`<br>`XLabs-AI/flux-furry-lora`<br>`XLabs-AI/flux-RealismLora` |
+| Base Model      | Supported LoRAs                                                                                                                                    |
+| :-------------- | :------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Wan2.2          | `lightx2v/Wan2.2-Distill-Loras`<br>`Cseti/wan2.2-14B-Arcane_Jinx-lora-v1`                                                                          |
+| Wan2.1          | `lightx2v/Wan2.1-Distill-Loras`                                                                                                                    |
+| Z-Image-Turbo   | `tarn59/pixel_art_style_lora_z_image_turbo`<br>`wcde/Z-Image-Turbo-DeJPEG-Lora`                                                                    |
+| Qwen-Image      | `lightx2v/Qwen-Image-Lightning`<br>`flymy-ai/qwen-image-realism-lora`<br>`prithivMLmods/Qwen-Image-HeadshotX`<br>`starsfriday/Qwen-Image-EVA-LoRA` |
+| Qwen-Image-Edit | `ostris/qwen_image_edit_inpainting`<br>`lightx2v/Qwen-Image-Edit-2511-Lightning`                                                                   |
+| Flux            | `dvyio/flux-lora-simple-illustration`<br>`XLabs-AI/flux-furry-lora`<br>`XLabs-AI/flux-RealismLora`                                                 |
 
 #### Special Requirements
 
 > [!NOTE]
 > Sliding Tile Attention: Currently, only Hopper GPUs (H100s) are supported.
-
 
 ---
 
@@ -157,7 +158,6 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 
 - A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
 - Python 3.11+ if you plan to use the OpenAI Python SDK.
-
 
 ## Supported Arguments
 
@@ -173,7 +173,6 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
 
-
 ### Sampling Parameters
 
 - `--prompt {PROMPT}`: Text description for the video you want to generate
@@ -181,14 +180,12 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--negative-prompt {PROMPT}`: Negative prompt to guide generation away from certain concepts
 - `--seed {SEED}`: Random seed for reproducible generation
 
-
 #### Image/Video Configuration
 
 - `--height {HEIGHT}`: Height of the generated output
 - `--width {WIDTH}`: Width of the generated output
 - `--num-frames {NUM_FRAMES}`: Number of frames to generate
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
-
 
 #### Output Options
 
@@ -210,34 +207,31 @@ Example configuration file (config.json):
 
 ```json
 {
-    "model_path": "FastVideo/FastHunyuan-diffusers",
-    "prompt": "A beautiful woman in a red dress walking down a street",
-    "output_path": "outputs/",
-    "num_gpus": 2,
-    "sp_size": 2,
-    "tp_size": 1,
-    "num_frames": 45,
-    "height": 720,
-    "width": 1280,
-    "num_inference_steps": 6,
-    "seed": 1024,
-    "fps": 24,
-    "precision": "bf16",
-    "vae_precision": "fp16",
-    "vae_tiling": true,
-    "vae_sp": true,
-    "vae_config": {
-        "load_encoder": false,
-        "load_decoder": true,
-        "tile_sample_min_height": 256,
-        "tile_sample_min_width": 256
-    },
-    "text_encoder_precisions": [
-        "fp16",
-        "fp16"
-    ],
-    "mask_strategy_file_path": null,
-    "enable_torch_compile": false
+  "model_path": "FastVideo/FastHunyuan-diffusers",
+  "prompt": "A beautiful woman in a red dress walking down a street",
+  "output_path": "outputs/",
+  "num_gpus": 2,
+  "sp_size": 2,
+  "tp_size": 1,
+  "num_frames": 45,
+  "height": 720,
+  "width": 1280,
+  "num_inference_steps": 6,
+  "seed": 1024,
+  "fps": 24,
+  "precision": "bf16",
+  "vae_precision": "fp16",
+  "vae_tiling": true,
+  "vae_sp": true,
+  "vae_config": {
+    "load_encoder": false,
+    "load_decoder": true,
+    "tile_sample_min_height": 256,
+    "tile_sample_min_width": 256
+  },
+  "text_encoder_precisions": ["fp16", "fp16"],
+  "mask_strategy_file_path": null,
+  "enable_torch_compile": false
 }
 ```
 
@@ -272,7 +266,6 @@ mask_strategy_file_path: null
 enable_torch_compile: false
 ```
 
-
 To see all the options, you can use the `--help` flag:
 
 ```bash
@@ -304,7 +297,6 @@ sglang serve "${SERVER_ARGS[@]}"
 - **--port**: HTTP port to listen on (the default here is `30010`).
 
 For detailed API usage, including Image, Video Generation and LoRA management, please refer to the [OpenAI API Documentation](#sglang-diffusion-openai-api).
-
 
 ## Generate
 
@@ -346,15 +338,15 @@ SGLang diffusion supports a **diffusers backend** that allows you to run any dif
 
 ### Arguments
 
-| Argument | Values | Description |
-|----------|--------|-------------|
-| `--backend` | `auto` (default), `sglang`, `diffusers` | `auto`: prefer native SGLang, fallback to diffusers. `sglang`: force native (fails if unavailable). `diffusers`: force vanilla diffusers pipeline. |
+| Argument                        | Values                                                | Description                                                                                                                                                   |
+| ------------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--backend`                     | `auto` (default), `sglang`, `diffusers`               | `auto`: prefer native SGLang, fallback to diffusers. `sglang`: force native (fails if unavailable). `diffusers`: force vanilla diffusers pipeline.            |
 | `--diffusers-attention-backend` | `flash`, `_flash_3_hub`, `sage`, `xformers`, `native` | Attention backend for diffusers pipelines. See [diffusers attention backends](https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends). |
-| `--trust-remote-code` | flag | Required for models with custom pipeline classes (e.g., Ovis). |
-| `--vae-tiling` | flag | Enable VAE tiling for large image support (decodes tile-by-tile). |
-| `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
-| `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
-| `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+| `--trust-remote-code`           | flag                                                  | Required for models with custom pipeline classes (e.g., Ovis).                                                                                                |
+| `--vae-tiling`                  | flag                                                  | Enable VAE tiling for large image support (decodes tile-by-tile).                                                                                             |
+| `--vae-slicing`                 | flag                                                  | Enable VAE slicing for lower memory usage (decodes slice-by-slice).                                                                                           |
+| `--dit-precision`               | `fp16`, `bf16`, `fp32`                                | Precision for the diffusion transformer.                                                                                                                      |
+| `--vae-precision`               | `fp16`, `bf16`, `fp32`                                | Precision for the VAE.                                                                                                                                        |
 
 ### Example: Running Ovis-Image-7B
 
@@ -381,12 +373,12 @@ For pipeline-specific parameters not exposed via CLI, use `diffusers_kwargs` in 
 
 ```json
 {
-    "model_path": "AIDC-AI/Ovis-Image-7B",
-    "backend": "diffusers",
-    "prompt": "A beautiful landscape",
-    "diffusers_kwargs": {
-        "cross_attention_kwargs": {"scale": 0.5}
-    }
+  "model_path": "AIDC-AI/Ovis-Image-7B",
+  "backend": "diffusers",
+  "prompt": "A beautiful landscape",
+  "diffusers_kwargs": {
+    "cross_attention_kwargs": { "scale": 0.5 }
+  }
 }
 ```
 
@@ -633,7 +625,8 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 **Important Notes:**
-- Mutual Exclusion: Only one LoRA can be *merged* (active) at a time
+
+- Mutual Exclusion: Only one LoRA can be _merged_ (active) at a time
 - Switching: To switch LoRAs, you must first `unmerge` the current one, then `set` the new one
 - Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
 
@@ -644,6 +637,7 @@ Loads one or more LoRA adapters and merges their weights into the model. Support
 **Endpoint:** `POST /v1/set_lora`
 
 **Parameters:**
+
 - `lora_nickname` (string or list of strings, required): A unique identifier for the LoRA adapter(s). Can be a single string or a list of strings for multiple LoRAs
 - `lora_path` (string or list of strings/None, optional): Path to the `.safetensors` file(s) or Hugging Face repo ID(s). Required for the first load; optional if re-activating a cached nickname. If a list, must match the length of `lora_nickname`
 - `target` (string or list of strings, optional): Which transformer(s) to apply the LoRA to. If a list, must match the length of `lora_nickname`. Valid values:
@@ -694,21 +688,22 @@ curl -X POST http://localhost:30010/v1/set_lora \
 
 > [!NOTE]
 > When using multiple LoRAs:
+>
 > - All list parameters (`lora_nickname`, `lora_path`, `target`, `strength`) must have the same length
 > - If `target` or `strength` is a single value, it will be applied to all LoRAs
 > - Multiple LoRAs applied to the same target will be merged in order
-
 
 #### Merge LoRA Weights
 
 Manually merges the currently set LoRA weights into the base model.
 
 > [!NOTE]
-> `set_lora` automatically performs a merge, so this is typically only needed if you have manually unmerged but want to re-apply the same LoRA without calling `set_lora` again.*
+> `set_lora` automatically performs a merge, so this is typically only needed if you have manually unmerged but want to re-apply the same LoRA without calling `set_lora` again.\*
 
 **Endpoint:** `POST /v1/merge_lora_weights`
 
 **Parameters:**
+
 - `target` (string, optional): Which transformer(s) to merge. One of "all" (default), "transformer", "transformer_2", "critic"
 - `strength` (float, optional): LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
 
@@ -719,7 +714,6 @@ curl -X POST http://localhost:30010/v1/merge_lora_weights \
   -H "Content-Type: application/json" \
   -d '{"strength": 0.8}'
 ```
-
 
 #### Unmerge LoRA Weights
 
@@ -768,6 +762,7 @@ curl -sS -X GET "http://localhost:30010/v1/list_loras"
 ```
 
 Notes:
+
 - If LoRA is not enabled for the current pipeline, the server will return an error.
 - `num_lora_layers_with_weights` counts only layers that have LoRA weights applied for the active adapter.
 
@@ -808,16 +803,16 @@ Backend selection is performed by the shared attention layers (e.g. `LocalAttent
 
 The CLI accepts the lowercase names of `AttentionBackendEnum`. The table below lists the backends implemented by the built-in platforms. `fa3`/`fa4` are accepted as aliases for `fa`.
 
-| CLI value | Enum value | Notes |
-|---|---|---|
-| `fa` / `fa3` / `fa4` | `FA` | FlashAttention. `fa3/fa4` are normalized to `fa` during argument parsing (`ServerArgs.__post_init__`). |
-| `torch_sdpa` | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention`. |
-| `sliding_tile_attn` | `SLIDING_TILE_ATTN` | Sliding Tile Attention (STA). Requires `st_attn` and a mask-strategy config file set via the `SGLANG_DIFFUSION_ATTENTION_CONFIG` environment variable. |
-| `sage_attn` | `SAGE_ATTN` | Requires `sageattention`. Upstream SageAttention CUDA extensions target SM80/SM86/SM89/SM90/SM120 (compute capability 8.0/8.6/8.9/9.0/12.0); see upstream `setup.py`: https://github.com/thu-ml/SageAttention/blob/main/setup.py. |
-| `sage_attn_3` | `SAGE_ATTN_3` | Requires SageAttention3 installed per upstream instructions. |
-| `video_sparse_attn` | `VIDEO_SPARSE_ATTN` | Requires `vsa`. |
-| `vmoba_attn` | `VMOBA_ATTN` | Requires `kernel.attn.vmoba_attn.vmoba`. |
-| `aiter` | `AITER` | Requires `aiter`. |
+| CLI value            | Enum value          | Notes                                                                                                                                                                                                                             |
+| -------------------- | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fa` / `fa3` / `fa4` | `FA`                | FlashAttention. `fa3/fa4` are normalized to `fa` during argument parsing (`ServerArgs.__post_init__`).                                                                                                                            |
+| `torch_sdpa`         | `TORCH_SDPA`        | PyTorch `scaled_dot_product_attention`.                                                                                                                                                                                           |
+| `sliding_tile_attn`  | `SLIDING_TILE_ATTN` | Sliding Tile Attention (STA). Requires `st_attn` and a mask-strategy config file set via the `SGLANG_DIFFUSION_ATTENTION_CONFIG` environment variable.                                                                            |
+| `sage_attn`          | `SAGE_ATTN`         | Requires `sageattention`. Upstream SageAttention CUDA extensions target SM80/SM86/SM89/SM90/SM120 (compute capability 8.0/8.6/8.9/9.0/12.0); see upstream `setup.py`: https://github.com/thu-ml/SageAttention/blob/main/setup.py. |
+| `sage_attn_3`        | `SAGE_ATTN_3`       | Requires SageAttention3 installed per upstream instructions.                                                                                                                                                                      |
+| `video_sparse_attn`  | `VIDEO_SPARSE_ATTN` | Requires `vsa`.                                                                                                                                                                                                                   |
+| `vmoba_attn`         | `VMOBA_ATTN`        | Requires `kernel.attn.vmoba_attn.vmoba`.                                                                                                                                                                                          |
+| `aiter`              | `AITER`             | Requires `aiter`.                                                                                                                                                                                                                 |
 
 ## Selection priority
 
@@ -829,16 +824,16 @@ The selection order in `runtime/layers/attention/selector.py` is:
 
 ## Platform support matrix
 
-| Backend | CUDA | ROCm | MPS | Notes |
-|---|---:|---:|---:|---|
-| `fa` | ✅ | ✅ | ❌ | CUDA requires SM80+ and fp16/bf16. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. |
-| `torch_sdpa` | ✅ | ✅ | ✅ | Most compatible option across platforms. |
-| `sliding_tile_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `st_attn` and `SGLANG_DIFFUSION_ATTENTION_CONFIG`. |
-| `sage_attn` | ✅ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `sage_attn_3` | ✅ | ❌ | ❌ | CUDA-only (optional dependency). |
-| `video_sparse_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `vsa`. |
-| `vmoba_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. |
-| `aiter` | ✅ | ❌ | ❌ | Requires `aiter`. |
+| Backend             | CUDA | ROCm | MPS | Notes                                                                                                                                           |
+| ------------------- | ---: | ---: | --: | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `fa`                |   ✅ |   ✅ |  ❌ | CUDA requires SM80+ and fp16/bf16. FlashAttention is only used when the required runtime is installed; otherwise it falls back to `torch_sdpa`. |
+| `torch_sdpa`        |   ✅ |   ✅ |  ✅ | Most compatible option across platforms.                                                                                                        |
+| `sliding_tile_attn` |   ✅ |   ❌ |  ❌ | CUDA-only. Requires `st_attn` and `SGLANG_DIFFUSION_ATTENTION_CONFIG`.                                                                          |
+| `sage_attn`         |   ✅ |   ❌ |  ❌ | CUDA-only (optional dependency).                                                                                                                |
+| `sage_attn_3`       |   ✅ |   ❌ |  ❌ | CUDA-only (optional dependency).                                                                                                                |
+| `video_sparse_attn` |   ✅ |   ❌ |  ❌ | CUDA-only. Requires `vsa`.                                                                                                                      |
+| `vmoba_attn`        |   ✅ |   ❌ |  ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`.                                                                                             |
+| `aiter`             |   ✅ |   ❌ |  ❌ | Requires `aiter`.                                                                                                                               |
 
 ## Usage
 
@@ -906,7 +901,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 DBCache controls block-level caching behavior:
 
 | Parameter | Env Variable              | Default | Description                              |
-|-----------|---------------------------|---------|------------------------------------------|
+| --------- | ------------------------- | ------- | ---------------------------------------- |
 | Fn        | `SGLANG_CACHE_DIT_FN`     | 1       | Number of first blocks to always compute |
 | Bn        | `SGLANG_CACHE_DIT_BN`     | 0       | Number of last blocks to always compute  |
 | W         | `SGLANG_CACHE_DIT_WARMUP` | 4       | Warmup steps before caching starts       |
@@ -918,7 +913,7 @@ DBCache controls block-level caching behavior:
 TaylorSeer improves caching accuracy using Taylor expansion:
 
 | Parameter | Env Variable                  | Default | Description                     |
-|-----------|-------------------------------|---------|---------------------------------|
+| --------- | ----------------------------- | ------- | ------------------------------- |
 | Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | false   | Enable TaylorSeer calibrator    |
 | Order     | `SGLANG_CACHE_DIT_TS_ORDER`   | 1       | Taylor expansion order (1 or 2) |
 
@@ -950,7 +945,7 @@ which to use cached results.
 SCM is configured with presets:
 
 | Preset   | Compute Ratio | Speed    | Quality    |
-|----------|---------------|----------|------------|
+| -------- | ------------- | -------- | ---------- |
 | `none`   | 100%          | Baseline | Best       |
 | `slow`   | ~75%          | ~1.3x    | High       |
 | `medium` | ~50%          | ~2x      | Good       |
@@ -981,7 +976,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 #### SCM Policy
 
 | Policy    | Env Variable                          | Description                                 |
-|-----------|---------------------------------------|---------------------------------------------|
+| --------- | ------------------------------------- | ------------------------------------------- |
 | `dynamic` | `SGLANG_CACHE_DIT_SCM_POLICY=dynamic` | Adaptive caching based on content (default) |
 | `static`  | `SGLANG_CACHE_DIT_SCM_POLICY=static`  | Fixed caching pattern                       |
 
@@ -990,7 +985,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 All Cache-DiT parameters can be set via the following environment variables:
 
 | Environment Variable                | Default | Description                              |
-|-------------------------------------|---------|------------------------------------------|
+| ----------------------------------- | ------- | ---------------------------------------- |
 | `SGLANG_CACHE_DIT_ENABLED`          | false   | Enable Cache-DiT acceleration            |
 | `SGLANG_CACHE_DIT_FN`               | 1       | First N blocks to always compute         |
 | `SGLANG_CACHE_DIT_BN`               | 0       | Last N blocks to always compute          |
@@ -1008,14 +1003,14 @@ All Cache-DiT parameters can be set via the following environment variables:
 
 SGLang Diffusion x Cache-DiT supports almost all models originally supported in SGLang Diffusion:
 
-| Model Family | Example Models                            |
-|--------------|-------------------------------------------|
-| Wan          | Wan2.1, Wan2.2                            |
-| Flux         | FLUX.1-dev, FLUX.2-dev, FLUX.2-Klein      |
-| Z-Image      | Z-Image-Turbo                             |
-| Qwen         | Qwen-Image, Qwen-Image-Edit               |
-| GLM          | GLM-Image                                 |
-| Hunyuan      | HunyuanVideo                              |
+| Model Family | Example Models                       |
+| ------------ | ------------------------------------ |
+| Wan          | Wan2.1, Wan2.2                       |
+| Flux         | FLUX.1-dev, FLUX.2-dev, FLUX.2-Klein |
+| Z-Image      | Z-Image-Turbo                        |
+| Qwen         | Qwen-Image, Qwen-Image-Edit          |
+| GLM          | GLM-Image                            |
+| Hunyuan      | HunyuanVideo                         |
 
 ## Performance Tips
 
@@ -1075,6 +1070,7 @@ sglang generate \
 ```
 
 **Parameters:**
+
 - `--profile`: Enable profiling for the denoising stage
 - `--num-profiled-timesteps N`: Number of timesteps to profile after warmup (default: 5)
   - Smaller values reduce trace file size
@@ -1094,6 +1090,7 @@ sglang generate \
 ```
 
 **Parameters:**
+
 - `--profile-all-stages`: Used with `--profile`, profile all pipeline stages instead of just denoising
 
 ### Output Location
@@ -1109,15 +1106,16 @@ The exact output file path will be shown in the console output, for example:
 ### View Traces
 
 Load and visualize trace files at:
+
 - https://ui.perfetto.dev/ (recommended)
 - chrome://tracing (Chrome only)
 
 For large trace files, reduce `--num-profiled-timesteps` or avoid using `--profile-all-stages`.
 
-
 ### `--perf-dump-path` (Stage/Step Timing Dump)
 
 Besides profiler traces, you can also dump a lightweight JSON report that contains:
+
 - stage-level timing breakdown for the full pipeline
 - step-level timing breakdown for the denoising stage (per diffusion step)
 
@@ -1177,6 +1175,7 @@ nsys profile \
 ```
 
 **Parameters:**
+
 - `--delay N`: Wait N seconds before starting capture (skip initialization overhead)
 - `--duration N`: Capture for N seconds (focus on specific stages)
 - `--force-overwrite`: Overwrite existing output files
@@ -1202,16 +1201,19 @@ This guide outlines the requirements for contributing to the SGLang Diffusion mo
 We follow a structured commit message format to maintain a clean history.
 
 **Format:**
+
 ```text
 [diffusion] <scope>: <subject>
 ```
 
 **Examples:**
+
 - `[diffusion] cli: add --perf-dump-path argument`
 - `[diffusion] scheduler: fix deadlock in batch processing`
 - `[diffusion] model: support Stable Diffusion 3.5`
 
 **Rules:**
+
 - **Prefix**: Always start with `[diffusion]`.
 - **Scope** (Optional): `cli`, `scheduler`, `model`, `pipeline`, `docs`, etc.
 - **Subject**: Imperative mood, short and clear (e.g., "add feature" not "added feature").
@@ -1223,11 +1225,13 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
 ### How to Generate a Report
 
 1.  **Baseline**: run the benchmark (for a single generation task)
+
     ```bash
     $ sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path baseline.json
     ```
 
 2.  **New**: run the same benchmark, without modifying any server_args or sampling_params
+
     ```bash
     $ sglang generate --model-path <model> --prompt "A benchmark prompt" --perf-dump-path new.json
     ```
@@ -1238,7 +1242,7 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
     ### Performance Comparison Report
     ...
     ```
-4. **Paste**: paste the table into the PR description
+4.  **Paste**: paste the table into the PR description
 
 ## 3. CI-Based Change Protection
 
@@ -1260,6 +1264,7 @@ SGLang diffusion uses a modular pipeline architecture built around two key conce
 - **`PipelineStage`**: Modular components (prompt encoding, denoising loop, VAE decoding, etc.)
 
 To add a new model, you'll need to define:
+
 1. **`PipelineConfig`**: Static model configurations (paths, precision settings)
 2. **`SamplingParams`**: Runtime generation parameters (prompt, guidance_scale, steps)
 3. **`ComposedPipeline`**: Chain together pipeline stages

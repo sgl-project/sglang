@@ -34,6 +34,7 @@ Its core features include:
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
+   basic_usage/diffusion.md
    basic_usage/popular_model_usage.rst
 
 .. toctree::
@@ -67,21 +68,14 @@ Its core features include:
    advanced_features/sglang_for_rl.md
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 2
    :caption: Supported Models
 
-   supported_models/generative_models.md
-   supported_models/multimodal_language_models.md
-   supported_models/diffusion_language_models.md
-   supported_models/diffusion_models.md
-   supported_models/embedding_models.md
-   supported_models/reward_models.md
-   supported_models/rerank_models.md
-   supported_models/classify_models.md
-   supported_models/support_new_models.md
-   supported_models/transformers_fallback.md
-   supported_models/modelscope.md
-   supported_models/mindspore_models.md
+   supported_models/text_generation/index
+   supported_models/image_generation/index
+   supported_models/retrieval_ranking/index
+   supported_models/specialized/index
+   supported_models/extending/index
 
 .. toctree::
    :maxdepth: 1
