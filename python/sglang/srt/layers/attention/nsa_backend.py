@@ -9,6 +9,7 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.utils import seqlens_expand_triton
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
@@ -404,24 +405,11 @@ class NativeSparseAttnBackend(
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * batch_size
             forward_batch.extend_seq_lens_cpu = extend_seq_lens_cpu
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in forward_batch.seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
+            seqlens_expanded = seqlens_expand_triton(
+                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
+                cache_seqlens_int32,
+                self.speculative_num_draft_tokens * batch_size,
+                self.speculative_num_draft_tokens
             )
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
@@ -444,21 +432,14 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=device,
             )
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                    for qo_len, kv_len in zip(
-                        forward_batch.extend_seq_lens_cpu,
-                        forward_batch.seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
+
+            seqlens_expanded = seqlens_expand_triton(
+                forward_batch.extend_seq_lens,
+                cache_seqlens_int32,
+                sum(extend_seq_lens_cpu),
+                self.speculative_num_draft_tokens
             )
+
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
                 # tokens upfront. All requests extend by the same fixed
@@ -975,25 +956,13 @@ class NativeSparseAttnBackend(
             metadata.page_table_1[:, :max_seqlen_k].copy_(page_indices)
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
-            seqlens_int32_cpu = [
-                self.speculative_num_draft_tokens + kv_len
-                for kv_len in seq_lens_cpu.tolist()
-            ]
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seqlens_int32_cpu,
-                        strict=True,
-                    )
-                ]
+            seqlens_expanded = seqlens_expand_triton(
+                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=self.device),
+                cache_seqlens,
+                self.speculative_num_draft_tokens * bs,
+                self.speculative_num_draft_tokens
             )
+
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
                 seqlens_expanded, self.nsa_index_topk
@@ -1018,21 +987,13 @@ class NativeSparseAttnBackend(
                 page_indices
             )
 
-            seqlens_expanded = torch.cat(
-                [
-                    torch.arange(
-                        kv_len - qo_len + 1,
-                        kv_len + 1,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
-                    for qo_len, kv_len in zip(
-                        extend_seq_lens_cpu,
-                        seq_lens_cpu.tolist(),
-                        strict=True,
-                    )
-                ]
+            seqlens_expanded = seqlens_expand_triton(
+                extend_seq_lens,
+                cache_seqlens,
+                sum(extend_seq_lens_cpu),
+                self.speculative_num_draft_tokens
             )
+
             metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(
                 seqlens_expanded
             )
