@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
@@ -43,6 +44,7 @@ def _get_cutedsl_gdn_verify():
 # Lazy import for FlashInfer GDN prefill kernel
 _flashinfer_gdn_prefill_available = None
 _flashinfer_chunk_gated_delta_rule = None
+_flashinfer_gdn_prefill_usage_logged = False
 
 
 def _get_flashinfer_gdn_prefill():
@@ -1402,7 +1404,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     use_flashinfer_prefill = flashinfer_available and flashinfer_chunk_gdr is not None
             
             if use_flashinfer_prefill:
-                # Use FlashInfer prefill kernel (K-last format, no transpose needed)
+                # Use FlashInfer prefill kernel.
+                #
+                # NOTE: FlashInfer's GDN prefill kernel consumes/produces the KV state in
+                # K-last layout [V, K] (transpose of the FLA Triton kernel state [K, V]).
+                # This matches our mamba pool layout when `ssm_k_last=True`, so we must
+                # NOT transpose the state for FlashInfer.
                 batch_size = cache_indices.shape[0]
                 total_seq_len = query.shape[1]  # query is [1, total_seq_len, H, K]
                 
@@ -1418,12 +1425,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         ),
                     )
                 )
+
+                # We can avoid state gather/scatter only when:
+                # - the pool state is already float32 (FlashInfer requires float32 state)
+                # - cache_indices are exactly [0, 1, ..., batch_size-1] (so [:batch_size] matches)
+                use_inplace_state = cache_indices_contiguous and ssm_states.dtype == torch.float32
                 
                 # Format conversion: SGLang -> FlashInfer
                 # q/k/v: [1, total_seq_len, H, K] -> [total_seq_len, H, K]
                 q_fi = query[0].contiguous()  # [total_seq_len, num_heads, head_k_dim]
                 k_fi = key[0].contiguous()  # [total_seq_len, num_heads, head_k_dim]
                 v_fi = value[0].contiguous()  # [total_seq_len, num_value_heads, head_v_dim]
+
+                # FlashInfer's `gdn_prefill.chunk_gated_delta_rule` does not currently
+                # honor the `use_qk_l2norm_in_kernel` flag in its Python wrapper.
+                # To match the Triton path (which normalizes q/k when the flag is set),
+                # we explicitly L2-normalize q and k here.
+                from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+
+                q_fi = l2norm_fwd(q_fi)
+                k_fi = l2norm_fwd(k_fi)
                 
                 # g (alpha): g_log is in log space, convert to alpha = exp(g_log)
                 # g_log: [1, total_seq_len, num_value_heads] -> alpha: [total_seq_len, num_sab_heads]
@@ -1436,66 +1457,86 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 
                 # cu_seqlens: query_start_loc [batch+1] int32 -> int64
                 cu_seqlens_fi = query_start_loc.to(torch.int64)
-                
-                # initial_state and output_state: optimize based on cache_indices contiguity
-                # FlashInfer expects [num_seqs, num_sab_heads, head_size, head_size] where head_size == K == V
-                # At this point, we know: kv_same (K == V) and heads_match (num_sab_heads == num_value_heads)
-                
-                if cache_indices_contiguous:
-                    # Use view to avoid copy: ssm_states[:batch_size] is a view
-                    # ssm_states: [pool_size, HV, V, K] -> FlashInfer expects [batch, num_sab_heads, head_size, head_size]
-                    # Since V == K == head_size and num_sab_heads == HV, we can use ssm_states directly
-                    initial_state_fi = ssm_states[:batch_size].to(torch.float32)  # [batch, HV, V, K] -> [batch, num_sab_heads, head_size, head_size]
-                    output_state_fi = ssm_states[:batch_size].to(torch.float32)  # Direct write to ssm_states
+
+                # Prepare initial_state/output_state (FlashInfer requires float32 state).
+                # In K-last mode, ssm_states is already laid out as [V, K] for FlashInfer.
+                if use_inplace_state:
+                    initial_state_fi = ssm_states[:batch_size]
+                    output_state_fi = initial_state_fi  # in-place update is supported
                 else:
-                    # Need to copy: ssm_states[cache_indices] creates a new tensor
-                    initial_state_fi = ssm_states[cache_indices].to(torch.float32)  # [batch, HV, V, K]
-                    output_state_fi = torch.empty(
-                        (batch_size, num_sab_heads, head_size, head_size),
-                        dtype=torch.float32,
-                        device=ssm_states.device,
-                    )
+                    initial_state_fi = ssm_states[cache_indices].to(torch.float32)
+                    output_state_fi = initial_state_fi  # in-place update is supported
                 
                 # Call FlashInfer prefill kernel
-                output_fi, output_state_fi_result = flashinfer_chunk_gdr(
-                    q=q_fi,
-                    k=k_fi,
-                    v=v_fi,
-                    g=alpha_fi,
-                    beta=beta_fi,
-                    scale=None,  # Will use default 1/sqrt(head_size)
-                    initial_state=initial_state_fi,
-                    output_final_state=True,
-                    cu_seqlens=cu_seqlens_fi,
-                    use_qk_l2norm_in_kernel=True,
-                    output=None,  # Let FlashInfer allocate
-                    output_state=output_state_fi,
+                # Optional debug logging + NVTX marker for profiling.
+                # NOTE: Disabled by default to avoid any overhead/log spam.
+                if os.getenv("SGLANG_LOG_FLASHINFER_PREFILL", "0") == "1":
+                    global _flashinfer_gdn_prefill_usage_logged
+                    if not _flashinfer_gdn_prefill_usage_logged:
+                        _flashinfer_gdn_prefill_usage_logged = True
+                        logger.info(
+                            "[flashinfer_gdn_prefill] enabled for GDN prefill: "
+                            f"layer_id={layer_id} "
+                            f"num_q_heads={num_heads} num_v_heads={num_value_heads} "
+                            f"head_k_dim={head_k_dim} head_v_dim={head_v_dim} "
+                            f"ssm_states_shape={tuple(ssm_states.shape)} "
+                            f"cache_indices_contiguous={cache_indices_contiguous}"
+                        )
+
+                torch_profiler_ctx = (
+                    torch.profiler.record_function("flashinfer_gdn_prefill")
+                    if os.getenv("SGLANG_TORCHRF_FLASHINFER_PREFILL", "0") == "1"
+                    else nullcontext()
                 )
-                
+
+                with torch_profiler_ctx:
+                    if os.getenv("SGLANG_NVTX_FLASHINFER_PREFILL", "0") == "1":
+                        torch.cuda.nvtx.range_push("flashinfer_gdn_prefill")
+                        try:
+                            output_fi, output_state_fi_result = flashinfer_chunk_gdr(
+                                q=q_fi,
+                                k=k_fi,
+                                v=v_fi,
+                                g=alpha_fi,
+                                beta=beta_fi,
+                                scale=None,  # Will use default 1/sqrt(head_size)
+                                initial_state=initial_state_fi,
+                                output_final_state=True,
+                                cu_seqlens=cu_seqlens_fi,
+                                use_qk_l2norm_in_kernel=True,
+                                output=None,  # Let FlashInfer allocate
+                                output_state=output_state_fi,
+                            )
+                        finally:
+                            torch.cuda.nvtx.range_pop()
+                    else:
+                        output_fi, output_state_fi_result = flashinfer_chunk_gdr(
+                            q=q_fi,
+                            k=k_fi,
+                            v=v_fi,
+                            g=alpha_fi,
+                            beta=beta_fi,
+                            scale=None,  # Will use default 1/sqrt(head_size)
+                            initial_state=initial_state_fi,
+                            output_final_state=True,
+                            cu_seqlens=cu_seqlens_fi,
+                            use_qk_l2norm_in_kernel=True,
+                            output=None,  # Let FlashInfer allocate
+                            output_state=output_state_fi,
+                        )
+
                 # Process output
                 # output_fi: [total_seq_len, num_o_heads, head_size] -> [1, total_seq_len, num_o_heads, head_size]
-                core_attn_out = output_fi.view(1, total_seq_len, num_value_heads, head_v_dim)
-                
-                # output_state: already written to ssm_states if contiguous, otherwise copy back
-                if not cache_indices_contiguous:
+                core_attn_out = output_fi.view(
+                    1, total_seq_len, num_value_heads, head_v_dim
+                )
+
+                # Write back state in pool layout (K-last) if we used a gathered buffer.
+                if not use_inplace_state:
                     ssm_states[cache_indices] = output_state_fi_result.to(
                         ssm_states.dtype, copy=False
                     )
-                else:
-                    # output_state_fi is a view of ssm_states, kernel wrote directly
-                    # Just ensure dtype matches (if needed)
-                    if ssm_states.dtype != torch.float32:
-                        ssm_states[:batch_size] = output_state_fi_result.to(
-                            ssm_states.dtype, copy=False
-                        )
-                
-                # Track mamba state (h is not returned by FlashInfer, use None or compute if needed)
-                # Note: FlashInfer doesn't return intermediate h states, so we pass None
-                # The tracking function should handle this gracefully
-                self._track_mamba_state_extend(
-                    forward_batch, None, ssm_states, forward_metadata
-                )
-                
+
                 # Return early: FlashInfer prefill path is complete
                 return core_attn_out
             
