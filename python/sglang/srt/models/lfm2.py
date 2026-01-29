@@ -29,6 +29,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -267,13 +268,9 @@ class Lfm2ShortConv(nn.Module):
         self.conv_weight = nn.Parameter(
             torch.empty(self.hidden_size_per_partition, self.conv_kernel)
         )
-        set_weight_attrs(
-            self.conv_weight, {"weight_loader": sharded_weight_loader(0)}
-        )
+        set_weight_attrs(self.conv_weight, {"weight_loader": sharded_weight_loader(0)})
         if self.use_bias:
-            self.conv_bias = nn.Parameter(
-                torch.empty(self.hidden_size_per_partition)
-            )
+            self.conv_bias = nn.Parameter(torch.empty(self.hidden_size_per_partition))
             set_weight_attrs(
                 self.conv_bias, {"weight_loader": sharded_weight_loader(0)}
             )
