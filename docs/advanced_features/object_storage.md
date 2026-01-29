@@ -12,7 +12,7 @@ When loading models from object storage, SGLang uses a two-phase approach:
 ## Supported Storage Backends
 
 1. **Amazon S3**: `s3://bucket-name/path/to/model/`
-2. **Amazon S3**: `s3://bucket-name/path/to/model/`
+2. **Google Cloud Storage**: `gs://bucket-name/path/to/model/`
 3. **S3 compatible**: `s3://bucket-name/path/to/model/`
 
 ## Quick Start
