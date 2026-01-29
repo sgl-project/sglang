@@ -55,6 +55,9 @@ if _use_aiter:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
 except ImportError:
@@ -305,10 +308,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
 
         if _is_npu:
-            layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
-            layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
-            layer.w13_weight.data = npu_format_cast(layer.w13_weight.data)
-            layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
+            for weight_name in ["w13_weight", "w2_weight"]:
+                weight = getattr(layer, weight_name)
+                weight.data = weight.data.transpose(1, 2)
+                weight.data = npu_format_cast(
+                    weight.data,
+                )
 
         return
 
