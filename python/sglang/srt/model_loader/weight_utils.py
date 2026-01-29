@@ -953,21 +953,85 @@ def gguf_quant_weights_iterator(
 
     reader = gguf.GGUFReader(gguf_file)
 
+    # MoE expert weight name patterns
+    MOE_WEIGHT_PATTERNS = {
+        "ffn_gate_exps": "gate_proj",  # gate projection
+        "ffn_up_exps": "up_proj",  # up projection
+        "ffn_down_exps": "down_proj",  # down projection
+    }
+
+    # First pass: yield weight types
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        weight_type = tensor.tensor_type
+        tensor_name = tensor.name
+
+        # Check if this is a MoE expert weight (packed format)
+        is_moe_weight = any(
+            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+        )
+
+        if is_moe_weight:
+            # MoE weights need special handling - extract layer_id and weight type
+            # Format: blk.{layer_id}.ffn_gate_exps.weight
+            import re
+
+            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+            if match:
+                layer_id = int(match.group(1))
+                weight_pattern = match.group(2)
+                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+
+                if hf_weight_name and weight_type.name != "F32":
+                    # Yield weight type for each expert
+                    weight = tensor.data
+                    num_experts = weight.shape[0]
+                    for expert_id in range(num_experts):
+                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
+                        yield hf_name, torch.tensor(weight_type)
+        elif tensor_name in gguf_to_hf_name_map:
+            # Normal weight handling
+            name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
                 weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
+                yield weight_type_name, torch.tensor(weight_type)
 
+    # Second pass: yield actual weights
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        weight = tensor.data
+        weight_type = tensor.tensor_type
+        tensor_name = tensor.name
+
+        # Check if this is a MoE expert weight (packed format)
+        is_moe_weight = any(
+            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+        )
+
+        if is_moe_weight:
+            # MoE weights: split packed format into individual expert weights
+            import re
+
+            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+            if match:
+                layer_id = int(match.group(1))
+                weight_pattern = match.group(2)
+                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+
+                if hf_weight_name:
+                    # Packed format: [num_experts, ...]
+                    num_experts = weight.shape[0]
+                    for expert_id in range(num_experts):
+                        expert_weight = weight[expert_id]
+
+                        if weight_type.name != "F32":
+                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
+                        else:
+                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
+
+                        yield hf_name, torch.tensor(expert_weight)
+        elif tensor_name in gguf_to_hf_name_map:
+            # Normal weight handling
+            name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
