@@ -868,10 +868,10 @@ jobs:
       # MI30x Accuracy Tests
       - nightly-accuracy-2-gpu
       - nightly-accuracy-2-gpu-vlm
-      # MI30x Performance Tests
-      - nightly-perf-2-gpu-text
-      - nightly-perf-2-gpu-vlm
       - nightly-accuracy-8-gpu
+      # MI30x Performance Tests - excluded from check (perf failures don't block CI)
+      # - nightly-perf-2-gpu-text
+      # - nightly-perf-2-gpu-vlm
       # MI30x Combined Accuracy + Performance Tests
       - nightly-8-gpu-grok1-int4
       - nightly-8-gpu-grok2
