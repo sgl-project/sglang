@@ -13,10 +13,16 @@
 # ==============================================================================
 
 import json
+import logging
 import os
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
+
+from sglang.srt.lora.utils import get_target_module_name
+
+logger = logging.getLogger(__name__)
 
 
 class LoRAConfig:
@@ -41,6 +47,103 @@ class LoRAConfig:
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
+
+        # Compute effective target modules from actual weights in safetensors
+        # This is more accurate than using the declared target_modules from config,
+        # especially when exclude_modules was used during training.
+        if path is not None:
+            self.effective_target_modules = self._compute_effective_target_modules()
+        else:
+            # For from_dict case, fall back to declared target_modules
+            self.effective_target_modules = None
+
+    def _compute_effective_target_modules(self) -> Optional[Set[str]]:
+        """
+        Extract actual module names from safetensors weights.
+
+        This scans the safetensors file to determine which modules actually have
+        LoRA weights, rather than relying on the declared target_modules in the
+        config (which may include modules that were excluded during training).
+
+        Returns:
+            Set of module names that actually have LoRA weights, or None if
+            safetensors file not found.
+        """
+        weights_dir = self._get_weights_dir()
+        if weights_dir is None:
+            logger.debug(
+                f"Path '{self.path}' is not a local directory, "
+                "falling back to declared target_modules"
+            )
+            return None
+
+        safetensors_path = self._find_safetensors_file(weights_dir)
+        if safetensors_path is None:
+            logger.warning(
+                f"No safetensors file found in {weights_dir}, "
+                "falling back to declared target_modules"
+            )
+            return None
+
+        modules = set()
+        with safe_open(safetensors_path, framework="pt") as f:
+            for key in f.keys():
+                module_name = get_target_module_name(key, set(self.target_modules))
+                modules.add(module_name)
+
+        if not modules:
+            logger.warning(
+                "No LoRA modules found in safetensors, "
+                "falling back to declared target_modules"
+            )
+            return None
+
+        logger.debug(f"Computed effective target modules from safetensors: {modules}")
+        return modules
+
+    def _get_weights_dir(self) -> Optional[str]:
+        """Get the directory containing adapter weights."""
+        if os.path.isdir(self.path):
+            return self.path
+        # For HF repo IDs, fall back to declared target_modules
+        # (safetensors would need to be downloaded separately)
+        return None
+
+    def _find_safetensors_file(self, weights_dir: str) -> Optional[str]:
+        """Find the safetensors file in the weights directory."""
+        path = os.path.join(weights_dir, "adapter_model.safetensors")
+        if os.path.exists(path):
+            return path
+        return None
+
+    def filter_added_tokens(self, base_vocab_size: int) -> None:
+        """
+        Filter added_tokens_config to only include truly added tokens.
+
+        Tokens with ID < base_vocab_size are already part of the base model's
+        vocabulary and should not be treated as added tokens. This commonly
+        happens when added_tokens.json is copied from the base model's tokenizer.
+
+        Args:
+            base_vocab_size: The vocabulary size of the base model.
+        """
+        if not self.added_tokens_config:
+            return
+
+        original_count = len(self.added_tokens_config)
+        self.added_tokens_config = {
+            token: token_id
+            for token, token_id in self.added_tokens_config.items()
+            if token_id >= base_vocab_size
+        }
+        self.lora_added_tokens_size = len(self.added_tokens_config)
+
+        filtered_count = original_count - self.lora_added_tokens_size
+        if filtered_count > 0:
+            logger.debug(
+                f"Filtered {filtered_count} tokens from added_tokens_config "
+                f"(ID < {base_vocab_size}). Remaining: {self.lora_added_tokens_size}"
+            )
 
     @classmethod
     def from_dict(
