@@ -195,7 +195,7 @@ def init_mori_op(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} {num_max_dispatch_tokens_per_rank=} {num_local_experts=} {router_topk=} {mode=}"
     )
 
-    cfg = get_ep_dispatch_configs()[mode]
+    cfg = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
 
     kernel_type = cfg.kernel_type
     warp_num_per_block = cfg.warp_num_per_block
