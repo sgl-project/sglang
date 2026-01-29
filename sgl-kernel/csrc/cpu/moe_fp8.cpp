@@ -236,8 +236,7 @@ void fused_experts_fp_kernel_impl(
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
   const bool use_brgemm = can_use_brgemm<packed_t>(avg_M);
 
-  int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 2 * N * K;
-  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 3 * N * K;
+  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -350,7 +349,7 @@ void fused_experts_fp_kernel_impl(
           /*   A            */ A,
           /*   B            */ B,
           /*   C            */ C,
-          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + B_tmp_offset_per_thread + nb_offset * BLOCK_N * IC,
+          /*   Btmp         */ B_tmp + tid * B_tmp_size_per_thread + nb_offset * BLOCK_N * IC,
           /*   Ctmp         */ C_tmp + tid * 2 * BLOCK_M * BLOCK_N,
           /*   Bbias        */ B_bias,
           /*   scale        */ Bs,
@@ -454,7 +453,7 @@ void shared_expert_fp8_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(M);
 
-  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 3 * N * K;
+  int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     int tid = get_thread_num();
@@ -504,7 +503,7 @@ void shared_expert_fp8_kernel_impl(
   const int64_t MB2 = MB;
   const int64_t NB2 = div_up(K, BLOCK_N);
   scale_size_K = div_up(N, block_size_K);
-  int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 2 * N * K;
+  int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
   // parallel on [MB2, NB2]
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
