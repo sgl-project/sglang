@@ -21,7 +21,6 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
-
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 

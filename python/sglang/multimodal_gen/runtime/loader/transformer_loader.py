@@ -1,21 +1,16 @@
-import os
 from copy import deepcopy
 
-import torch
-
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
-from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
-from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files, _normalize_module_type
+from sglang.multimodal_gen.runtime.loader.utils import _normalize_module_type
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
 
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""

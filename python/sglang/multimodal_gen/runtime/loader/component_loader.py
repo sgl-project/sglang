@@ -13,6 +13,7 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.adapter_loader import AdapterLoader
+from sglang.multimodal_gen.runtime.loader.bridge_loader import BridgeLoader
 from sglang.multimodal_gen.runtime.loader.image_encoder_loader import ImageEncoderLoader
 from sglang.multimodal_gen.runtime.loader.scheduler_loader import SchedulerLoader
 from sglang.multimodal_gen.runtime.loader.text_encoder_loader import TextEncoderLoader
