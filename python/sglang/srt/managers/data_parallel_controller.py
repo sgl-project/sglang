@@ -476,9 +476,22 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if req.data_parallel_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
-            self.workers[req.data_parallel_rank].send_pyobj(req)
+        target_rank = (
+            req.decode_dp_rank
+            if req.decode_dp_rank is not None
+            else req.data_parallel_rank
+        )
+
+        if target_rank is not None:
+            # Validate rank is in bounds
+            if target_rank < 0 or target_rank >= len(self.workers):
+                logger.error(
+                    f"Invalid decode_dp_rank={target_rank}, must be in [0, {len(self.workers)})"
+                )
+                return False
+
+            logger.debug(f"Direct routing to DP rank {target_rank}")
+            self.workers[target_rank].send_pyobj(req)
             return True
         return False
 
