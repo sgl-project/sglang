@@ -91,7 +91,9 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
 def _compute_moe_deepseek_blog_prefill(layer):
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
-    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+    # deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+    ##TODO(billishyahao): fixme 
+    deep_gemm_num_sms = None
 
     return OperationsStrategy(
         deep_gemm_num_sms=deep_gemm_num_sms,

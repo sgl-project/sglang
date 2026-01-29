@@ -26,6 +26,12 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 )
 from sglang.srt.layers.moe.token_dispatcher.moriep import MoriEPNormalCombineInput
 from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+from sglang.srt.layers.moe.token_dispatcher.moriep import (
+    MoriEPLLCombineInput,
+    MoriEPNormalCombineInput,
+)
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
+
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe import (
     NPUCompressedTensorsW4A16Int4DynamicMoEMethod,
@@ -40,6 +46,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLDispatchOutput,
         DeepEPNormalDispatchOutput,
+        MoriEPNormalDispatchOutput,
+        MoriEPLLDispatchOutput,
         DispatchOutput,
     )
 
@@ -130,6 +138,7 @@ class DeepEPMoE(FusedMoE):
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
+            and not _is_hip
             and not (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config.get_name() == "modelopt_fp4"
@@ -141,18 +150,29 @@ class DeepEPMoE(FusedMoE):
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
         if _use_aiter:
-            # expert_mask is of size (self.num_local_experts + 1),
-            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
-            # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
-            #     self.expert_mask = [1, 1, 1, 1, 0]
-            # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
-            self.expert_mask = torch.zeros(
-                (self.num_local_experts + 1),
-                device=torch.cuda.current_device(),
-                dtype=torch.int,
-            )
-            # the last one is invalid rank_id
-            self.expert_mask[:-1] = 1
+            if get_moe_a2a_backend().is_deepep():
+                # expert_mask is of size (self.num_local_experts + 1),
+                # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
+                # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
+                #     self.expert_mask = [1, 1, 1, 1, 0]
+                # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
+                self.expert_mask = torch.zeros(
+                    (self.num_local_experts + 1),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.int,
+                )
+                # the last one is invalid rank_id
+                self.expert_mask[:-1] = 1
+            elif get_moe_a2a_backend().is_mori():
+                self.expert_mask = torch.zeros(
+                    (self.num_experts),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.int32,
+                )
+                expert_start_idx = self.moe_ep_rank * self.num_local_experts
+                expert_end_idx = expert_start_idx + self.num_local_experts
+                self.expert_mask[expert_start_idx : expert_end_idx] = 1
+
 
     def forward(
         self,
@@ -241,16 +261,26 @@ class DeepEPMoE(FusedMoE):
             else:
                 assert False, "forward_deepgemm_masked is deprecated"
 
-        combine_input_wrapper = (
-            DeepEPNormalCombineInput
-            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
-            else DeepEPLLCombineInput
-        )
+        
+
+        if get_moe_a2a_backend().is_deepep():
+            combine_input_wrapper = (
+                DeepEPNormalCombineInput
+                if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+                else DeepEPLLCombineInput
+            )
+        elif get_moe_a2a_backend().is_mori():
+            combine_input_wrapper = (
+                MoriEPNormalCombineInput
+                if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+                else MoriEPLLCombineInput
+            )
+        
         return combine_input_wrapper(
-            hidden_states=output,
-            topk_ids=dispatch_output.topk_ids,
-            topk_weights=dispatch_output.topk_weights,
-        )
+                hidden_states=output,
+                topk_ids=dispatch_output.origin_topk_ids,
+                topk_weights=dispatch_output.origin_topk_weights,
+            )
 
     def combine(
         self,
@@ -268,29 +298,56 @@ class DeepEPMoE(FusedMoE):
 
     def forward_aiter(
         self,
-        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput],
+        dispatch_output: Union[DeepEPNormalDispatchOutput, DeepEPLLDispatchOutput, MoriEPNormalDispatchOutput, MoriEPLLDispatchOutput],
     ):
-        hidden_states, topk_ids, topk_weights = (
-            dispatch_output.hidden_states,
-            dispatch_output.topk_ids,
-            dispatch_output.topk_weights,
-        )
+        recv_scales = None
+
+        if get_moe_a2a_backend().is_deepep():
+            hidden_states, topk_ids, topk_weights = (
+                dispatch_output.hidden_states,
+                dispatch_output.topk_ids,
+                dispatch_output.topk_weights,
+            )
+        elif get_moe_a2a_backend().is_mori():
+            hidden_states, recv_scales, topk_ids, topk_weights, packed_recv_count = (
+                dispatch_output.hidden_states,
+                dispatch_output.hidden_states_scale,
+                dispatch_output.topk_ids,
+                dispatch_output.topk_weights,
+                dispatch_output.num_recv_tokens_per_expert
+            )
+
+            # logger.info(f"bill-dbg: {hidden_states=}")
+            # logger.info(f"bill-dbg: {recv_scales=}")
+            # logger.info(f"bill-dbg: {topk_ids=}") 
+            # logger.info(f"bill-dbg: {topk_weights=}")
+            # logger.info(f"bill-dbg: {packed_recv_count=}")
+
+        #billishyahao: for now, fused_moe only support torch.bfloat16
+        output_dtype = torch.bfloat16
+
+        # logger.info(f"bill-dbg: {output_dtype=}")
+
         if hidden_states.shape[0] == 0:
             return hidden_states
-        # in original deepep, idx == -1 meaning invalid and will not be processed.
-        # aiter does not accept -1, we use a expert mask to make these idx invalid
-        # (idx == num_local_experts) meaning not used in aiter fused_moe
-        topk_ids_copy = topk_ids.to(torch.int32)
-        topk_ids_copy[topk_ids_copy == -1] = self.num_local_experts
+
+        if get_moe_a2a_backend().is_deepep():
+            # in original deepep, idx == -1 meaning invalid and will not be processed.
+            # aiter does not accept -1, we use a expert mask to make these idx invalid
+            # (idx == num_local_experts) meaning not used in aiter fused_moe
+            topk_ids_copy = topk_ids.to(torch.int32)
+            topk_ids_copy[topk_ids_copy == -1] = self.num_local_experts
+
 
         return fused_moe(
-            hidden_states,
-            self.w13_weight,
-            self.w2_weight,
-            topk_weights,
-            topk_ids_copy,
+            hidden_states=hidden_states,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
             w1_scale=self.w13_weight_scale_inv,
             w2_scale=self.w2_weight_scale_inv,
+            a1_scale=recv_scales,
+            topk_weight=topk_weights,
+            topk_ids=topk_ids_copy if get_moe_a2a_backend().is_deepep() else topk_ids,
             quant_type=QuantType.per_128x128,
             activation=(
                 ActivationType.Silu
@@ -298,6 +355,8 @@ class DeepEPMoE(FusedMoE):
                 else ActivationType.Gelu
             ),
             expert_mask=self.expert_mask,
+            num_local_tokens=packed_recv_count,
+            dtype=output_dtype
         )
 
     def forward_flashinfer_cutedsl(
@@ -592,20 +651,29 @@ class MoriEPMoE(DeepEPMoE):
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
-        forward_shared_experts=None,
-        alt_stream=None,
-        disable_sbo=False,
     ):
-        num_token = hidden_states.shape[0]
-        output_dtype = hidden_states.dtype
+        num_token = hidden_states.shape[0] 
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+        combine_input = self.run_moe_core(dispatch_output)
+        hidden_states = self.dispatcher.combine(
+            combine_input=combine_input,
+        )
+
+        return hidden_states[:num_token]
+
+
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+    ):
+        #TODO(billishyahao): check aiter path
+        #billishyahao: for now, fused_moe only support torch.bfloat16
+        output_dtype = torch.bfloat16
         scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
         is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
-
-        # dispatch
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states, topk_output
-        )  # , scale=scale)
 
         (
             dispatch_a1,
@@ -613,7 +681,17 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_ids,
             dispatch_weights,
             dispatch_recv_token_num,
-        ) = dispatch_output
+            origin_topk_ids,
+            origin_topk_weights
+        ) = (
+            dispatch_output.hidden_states,
+            dispatch_output.hidden_states_scale,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+            dispatch_output.num_recv_tokens_per_expert,
+            dispatch_output.origin_topk_ids,
+            dispatch_output.origin_topk_weights
+        )
 
         w13_weight = self.w13_weight
         w2_weight = self.w2_weight
@@ -670,17 +748,21 @@ class MoriEPMoE(DeepEPMoE):
             dtype=output_dtype,
         )
 
-        combine_input_wrapper = MoriEPNormalCombineInput
-        combine_input = combine_input_wrapper(
-            hidden_states=hidden_states,
-            topk_ids=topk_output.topk_ids,
-            topk_weights=topk_output.topk_weights,
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        combine_input_wrapper = (
+            MoriEPNormalCombineInput
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+            else MoriEPLLCombineInput
         )
 
-        # combine
-        result = self.dispatcher.combine(combine_input)
+        return combine_input_wrapper(
+            hidden_states=hidden_states,
+            topk_ids=dispatch_output.origin_topk_ids,
+            topk_weights=dispatch_output.origin_topk_weights,
+        )
 
-        return result[:num_token]
+
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):

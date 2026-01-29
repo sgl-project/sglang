@@ -30,6 +30,8 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPDispatcher,
     MoriEPNormalCombineInput,
     MoriEPNormalDispatchOutput,
+    MoriEPLLDispatchOutput,
+    MoriEPLLCombineInput,
 )
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardCombineInput,
@@ -53,6 +55,8 @@ __all__ = [
     "MooncakeEPDispatcher",
     "MoriEPNormalDispatchOutput",
     "MoriEPNormalCombineInput",
+    "MoriEPLLDispatchOutput",
+    "MoriEPLLCombineInput",
     "MoriEPDispatcher",
     "StandardDispatcher",
     "StandardDispatchOutput",

@@ -824,6 +824,8 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.clear_overlap_args()
                 post_combine_hook_handle.remove()
 
+                
+
             assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
             deepep_dispatch_hook_handle = (
                 self.experts.dispatcher.register_deepep_dispatch_hook(
@@ -940,6 +942,7 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
+
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
@@ -951,6 +954,7 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
+
         if shared_output is not None:
             x = shared_output
             # aiter moe call will handle routed_scaling_factor in the function
@@ -1054,11 +1058,31 @@ class DeepseekV2MoE(nn.Module):
     def op_output(self, state):
         final_hidden_states = state.pop("hidden_states_after_combine")
 
+        ##TODO(billishyahao): fix this bug 
+
+        if get_moe_a2a_backend().is_mori():
+            # logger.info(f"bill-dbg: op_output {state._data=}")
+            num_tokens = state.pop("num_tokens")
+            # logger.info(f"bill-dbg: {num_tokens=}")
+            final_hidden_states = final_hidden_states[:num_tokens]
+            # if (shared_output := state.get("shared_output")) is not None:
+            #     num_tokens = shared_output.shape[0]
+            #     logger.info(f"bill-dbg: {num_tokens=}")
+            #     final_hidden_states = final_hidden_states[:num_tokens]
+            # else:
+            #     # logger.info(f"bill-dbg: shared_output is None...")
+            #     # logger.info(f"bill-dbg: {final_hidden_states.shape=}")
+            #     num_tokens = 0
+            #     final_hidden_states = []
+
         if (shared_output := state.pop("shared_output")) is not None:
             x = shared_output
-            x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
+            if _use_aiter:
+                x.add_(final_hidden_states)
+            else:
+                x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        else:
+        elif not _use_aiter:
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
@@ -2449,6 +2473,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
+        state.num_tokens = hidden_states.shape[0]
         state.update(
             dict(
                 forward_batch=forward_batch,
