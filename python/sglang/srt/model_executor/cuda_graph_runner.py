@@ -435,6 +435,15 @@ class CudaGraphRunner:
 
         # Check if batch has LoRA requests
         has_lora = self._has_lora_requests(forward_batch)
+
+        # For non-supported backends with LoRA enabled, always use the LoRA graph key
+        # since we only captured the LoRA graph (to match replay behavior)
+        if (
+            self.model_runner.server_args.enable_lora
+            and not self._supports_separate_lora_graphs()
+        ):
+            has_lora = True
+
         graph_key = self._get_graph_key(
             cuda_graph_bs,
             self.enable_pdmux,
