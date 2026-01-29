@@ -564,8 +564,12 @@ class Req:
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
 
-        # Require reasoning for the request (hybrid reasoning model only)
+        # Require reasoning for the request
         self.require_reasoning = require_reasoning
+
+        # State indicating whether the reasoning phase has finished (only meaningful when require_reasoning is True)
+        self._is_reasoning_over = False
+        self.reasoning_tokens = 0
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1153,6 +1157,16 @@ class Req:
         self.to_finish = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def update_reasoning_tokens(self, token_id, think_end_id):
+        if not isinstance(token_id, list):
+            token_id = [token_id]
+
+        if not self._is_reasoning_over:
+            for tok_id in token_id:
+                self.reasoning_tokens += 1
+                if tok_id == think_end_id:
+                    self._is_reasoning_over = True
 
     def __repr__(self):
         return (
