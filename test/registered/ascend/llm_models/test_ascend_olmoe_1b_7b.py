@@ -7,9 +7,9 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
-class TestGLM49BChat(GSM8KAscendMixin, CustomTestCase):
-    model = "/root/.cache/modelscope/hub/models/ZhipuAI/glm-4-9b-chat"
-    accuracy = 0.79
+class TestOlMoe(GSM8KAscendMixin, CustomTestCase):
+    model = "/root/.cache/modelscope/hub/models/allenai/OLMoE-1B-7B-0924"
+    accuracy = 0.13
 
 
 if __name__ == "__main__":
