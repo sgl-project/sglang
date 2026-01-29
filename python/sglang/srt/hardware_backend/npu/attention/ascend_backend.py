@@ -546,7 +546,7 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        attn_out_prev = torch.ops.custom.npu_sparse_flash_attention(
+        attn_out_prev, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_prev,
             key=k_nope,
             value=k_nope,
@@ -565,8 +565,10 @@ class AscendAttnBackend(AttentionBackend):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
         )
-        attn_out_next = torch.ops.custom.npu_sparse_flash_attention(
+        attn_out_next, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope_next,
             key=k_nope,
             value=k_nope,
@@ -585,6 +587,8 @@ class AscendAttnBackend(AttentionBackend):
             layout_query="TND",
             layout_kv="PA_BSND",
             sparse_mode=3,
+            attention_mode=2,
+            return_softmax_lse=False,
         )
         return torch.cat([attn_out_prev, attn_out_next], dim=0)
 
@@ -675,7 +679,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_lengths_kv,
             )
         else:
-            attn_out = torch.ops.custom.npu_sparse_flash_attention(
+            attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
                 query=q_nope,
                 key=k_nope,
                 value=k_nope,
@@ -694,6 +698,8 @@ class AscendAttnBackend(AttentionBackend):
                 layout_query="TND",
                 layout_kv="PA_BSND",
                 sparse_mode=3,
+                attention_mode=2,
+                return_softmax_lse=False,
             )
 
         return attn_out
@@ -713,6 +719,9 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
+        if is_mla_preprocess_enabled():
+            # MLAPO and MLAPROLOG do save kv_cache
+            save_kv_cache = False
         if topk_indices is not None:
             return self.forward_sparse(
                 q,
@@ -730,9 +739,6 @@ class AscendAttnBackend(AttentionBackend):
             or forward_batch.forward_mode.is_draft_extend()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-
-            if is_mla_preprocess_enabled():
-                save_kv_cache = False
             return self.forward_mtp(
                 q,
                 k,

@@ -96,11 +96,8 @@ diffusion_hip = [
   "torchcodec==0.5.0",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer",
+  "runai_model_streamer>=0.15.5",
 ]
-
-# https://docs.sglang.io/platforms/ascend_npu.html
-srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
@@ -111,7 +108,7 @@ srt_musa = [
     "sglang[runtime_common]",
     "torch",
     "torch_musa",
-    "torchada>=0.1.15",
+    "torchada>=0.1.25",
     "mthreads-ml-py",
     "numpy<2.0",
 ]
@@ -127,7 +124,7 @@ diffusion_musa = [
   "remote-pdb",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer",
+  "runai_model_streamer>=0.15.5",
   "cache-dit==1.1.8"
 ]
 
@@ -145,12 +142,10 @@ test = [
 ]
 
 all_hip = ["sglang[srt_hip]"]
-all_npu = ["sglang[srt_npu]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
-dev_npu = ["sglang[all_npu]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 
