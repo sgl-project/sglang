@@ -36,6 +36,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -227,6 +228,8 @@ def get_quant_config(
 
     # If the quantization config is not found, use the default config.
     if not possible_config_filenames:
+        if model_config.quantization == "mxfp8":
+            return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))
@@ -592,6 +595,44 @@ def filter_duplicate_safetensors_files(
     # Filter out any fields that are not found in the index file.
     hf_weights_files = [f for f in hf_weights_files if f in weight_files_in_index]
     return hf_weights_files
+
+
+def maybe_add_mtp_safetensors(
+    hf_weights_files: List[str], hf_folder: str, index_file: str, hf_config
+) -> List[str]:
+    """
+    Auto-detect and add mtp.safetensors for GLM4Moe MTP/NextN models if:
+    1. mtp.safetensors exists in the model directory
+    2. mtp.safetensors is NOT in the index (checkpoint packaging bug)
+    3. Model architecture is Glm4MoeForCausalLM with num_nextn_predict_layers > 0
+
+    This works around incorrectly packaged FP4 checkpoints like
+    baseten-admin/glm-4.7-fp4 where mtp.safetensors exists but
+    isn't referenced in model.safetensors.index.json.
+    """
+    # Only apply for GLM4Moe architecture with nextn layers
+    arch = getattr(hf_config, "architectures", [None])[0]
+    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0)
+    if not (
+        arch in ["Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN"]
+        and num_nextn_layers > 0
+    ):
+        return hf_weights_files
+
+    # Check if mtp.safetensors exists and is not already in the file list
+    mtp_path = os.path.join(hf_folder, "mtp.safetensors")
+    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
+        return hf_weights_files
+
+    # mtp.safetensors exists but not in index - this is a bug
+    logger.warning(
+        f"Found mtp.safetensors but it's not referenced in {index_file}. "
+        f"This is a checkpoint packaging bug. Auto-adding it for loading. "
+        f"Please report this to the checkpoint provider."
+    )
+
+    # Add it to the files list
+    return hf_weights_files + [mtp_path]
 
 
 def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[str]:

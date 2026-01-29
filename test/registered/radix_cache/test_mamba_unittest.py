@@ -1,11 +1,16 @@
-import os
 import unittest
 
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
@@ -80,8 +85,9 @@ class TestMamba(unittest.TestCase):
             state_size=128,
             conv_kernel=4,
         )
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
-        mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
 
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -154,17 +160,17 @@ class TestMamba(unittest.TestCase):
         mamba_layers = [
             i for i in range(num_layers) if i not in full_attention_layer_ids
         ]
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
-        shape = Mamba2StateShape.create(
-            tp_world_size=1,
-            intermediate_size=4096,
-            n_groups=16,
-            num_heads=32,
-            head_dim=128,
-            state_size=128,
-            conv_kernel=4,
-        )
-        mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
 
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -233,9 +239,14 @@ class TestMamba(unittest.TestCase):
         print(
             f"req1: inserting, req1_token_ids: {req1_token_ids}, req1_kv_indices: {req1_kv_indices}"
         )
-        prefix_len = tree.insert(
-            RadixKey(req1_token_ids), req1_kv_indices, req1.mamba_pool_idx.unsqueeze(0)
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(req1_token_ids),
+                value=req1_kv_indices,
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
         )
+        prefix_len = result.prefix_len
         print(
             f"req1: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
         )
@@ -245,9 +256,14 @@ class TestMamba(unittest.TestCase):
         print(
             f"req2: inserting, req2_token_ids: {req2_token_ids}, req2_kv_indices: {req2_kv_indices}"
         )
-        prefix_len = tree.insert(
-            RadixKey(req2_token_ids), req2_kv_indices, req2.mamba_pool_idx.unsqueeze(0)
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(req2_token_ids),
+                value=req2_kv_indices,
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+            )
         )
+        prefix_len = result.prefix_len
         print(
             f"req2: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
         )
@@ -258,9 +274,14 @@ class TestMamba(unittest.TestCase):
         print(
             f"req3: inserting, req3_token_ids: {req3_token_ids}, req3_kv_indices: {req3_kv_indices}"
         )
-        prefix_len = tree.insert(
-            RadixKey(req3_token_ids), req3_kv_indices, req3.mamba_pool_idx.unsqueeze(0)
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(req3_token_ids),
+                value=req3_kv_indices,
+                mamba_value=req3.mamba_pool_idx.unsqueeze(0),
+            )
         )
+        prefix_len = result.prefix_len
         print(
             f"req3: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
         )
@@ -270,9 +291,14 @@ class TestMamba(unittest.TestCase):
         print(
             f"req4: inserting, req4_token_ids: {req4_token_ids}, req4_kv_indices: {req4_kv_indices}"
         )
-        prefix_len = tree.insert(
-            RadixKey(req4_token_ids), req4_kv_indices, req4.mamba_pool_idx.unsqueeze(0)
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(req4_token_ids),
+                value=req4_kv_indices,
+                mamba_value=req4.mamba_pool_idx.unsqueeze(0),
+            )
         )
+        prefix_len = result.prefix_len
         print(
             f"req4: prefix_len: {prefix_len}, allocator mamba available size: {mamba_pool.available_size()}, full available size: {allocator.available_size()}"
         )
@@ -280,16 +306,22 @@ class TestMamba(unittest.TestCase):
         tree.pretty_print()
         full_num_tokens = 1
         print(f"evicting {full_num_tokens} full token")
-        tree.evict(full_num_tokens=full_num_tokens)
+        result = tree.evict(EvictParams(num_tokens=full_num_tokens))
+        assert (
+            result.num_tokens_evicted >= full_num_tokens
+        ), f"evicted {result.num_tokens_evicted} full tokens, expected {full_num_tokens}"
         tree.pretty_print()
 
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
-        tree.evict_mamba(mamba_num=mamba_num)
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+        assert (
+            result.mamba_num_evicted >= mamba_num
+        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
         tree.pretty_print()
 
         req5_token_ids = [1, 2, 3, 4, 5]
-        result = tree.match_prefix(RadixKey(req5_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req5_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req5: token_ids: {req5_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -297,7 +329,7 @@ class TestMamba(unittest.TestCase):
         assert len(kv_indices) == 0
 
         req6_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(RadixKey(req6_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req6_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req6: token_ids: {req6_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -306,7 +338,7 @@ class TestMamba(unittest.TestCase):
         assert len(last_node.key) == 2
 
         req7_token_ids = [1, 2, 3, 4, 5, 6, 7]
-        result = tree.match_prefix(RadixKey(req7_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req7_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req7: token_ids: {req7_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -316,11 +348,14 @@ class TestMamba(unittest.TestCase):
 
         mamba_num = 1
         print(f"evicting {mamba_num} mamba")
-        tree.evict_mamba(mamba_num=mamba_num)
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+        assert (
+            result.mamba_num_evicted >= mamba_num
+        ), f"evicted {result.mamba_num_evicted} mamba states, expected {mamba_num}"
         tree.pretty_print()
 
         req8_token_ids = [1, 2, 3, 4, 5, 60, 70]
-        result = tree.match_prefix(RadixKey(req8_token_ids))
+        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(req8_token_ids)))
         kv_indices, last_node = result.device_indices, result.last_device_node
         print(
             f"req8: token_ids: {req8_token_ids}, matched kv_indices: {kv_indices}, last_node.key: {last_node.key}"
@@ -331,7 +366,7 @@ class TestMamba(unittest.TestCase):
         req9_token_ids = [1, 2, 3, 4, 5, 6, 7]
         req9 = make_dummy_req()
         result = tree.match_prefix(
-            RadixKey(req9_token_ids), **({"req": req9, "cow_mamba": True})
+            MatchPrefixParams(key=RadixKey(req9_token_ids), req=req9, cow_mamba=True)
         )
         kv_indices, last_node = result.device_indices, result.last_device_node
         assert req9.mamba_pool_idx is not None
