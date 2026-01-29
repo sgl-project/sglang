@@ -299,10 +299,6 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
     # TODO: hack
     # pos and freq is online compute
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        pos_cond_kwargs = {
-            "condition_latents": batch.condition_latents,
-            "token_lens": self.token_lens[0],
-        }
         if (
             batch.condition_siglip_embeds is not None
             and batch.condition_latents is not None
@@ -319,16 +315,27 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
                 for i in range(current_batch_size)
             ]
 
-            pos_cond_kwargs["siglip_feats"] = batch.condition_siglip_embeds
-            pos_cond_kwargs["image_noise_mask"] = image_noise_mask
+            pos_cond_kwargs = {
+                "condition_latents": batch.condition_latents,
+                "token_lens": self.token_lens[0],
+                "siglip_feats": batch.condition_siglip_embeds,
+                "image_noise_mask": image_noise_mask,
+            }
+        else:
+            # TODO: hard code bsz1
+            current_batch_size = 1
+            image_noise_mask = [[1] for i in range(current_batch_size)]
+            pos_cond_kwargs = {
+                # NOTE: always omni mode in omni pipeline
+                "condition_latents": [[] for i in range(current_batch_size)],
+                "token_lens": self.token_lens[0],
+                "siglip_feats": None,
+                "image_noise_mask": image_noise_mask,
+            }
 
         return pos_cond_kwargs
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        neg_cond_kwargs = {
-            "condition_latents": batch.negative_condition_latents,
-            "token_lens": self.token_lens[1],
-        }
         if (
             batch.negative_condition_siglip_embeds is not None
             and batch.negative_condition_latents is not None
@@ -349,7 +356,22 @@ class ZImageOmniPipelineConfig(ZImagePipelineConfig):
                 for i in range(current_batch_size)
             ]
 
-            neg_cond_kwargs["siglip_feats"] = batch.negative_condition_siglip_embeds
-            neg_cond_kwargs["image_noise_mask"] = image_noise_mask
+            neg_cond_kwargs = {
+                "condition_latents": batch.negative_condition_latents,
+                "token_lens": self.token_lens[1],
+                "siglip_feats": batch.negative_condition_siglip_embeds,
+                "image_noise_mask": image_noise_mask,
+            }
+        else:
+            # TODO: hard code bsz1
+            current_batch_size = 1
+            image_noise_mask = [[1] for i in range(current_batch_size)]
+            # NOTE: always omni mode in omni pipeline
+            neg_cond_kwargs = {
+                "condition_latents": [[] for i in range(current_batch_size)],
+                "token_lens": self.token_lens[1],
+                "siglip_feats": None,
+                "image_noise_mask": image_noise_mask,
+            }
 
         return neg_cond_kwargs
