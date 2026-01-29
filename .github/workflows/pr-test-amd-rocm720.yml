@@ -261,6 +261,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -303,6 +305,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -345,6 +349,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -700,6 +706,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -743,6 +751,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -785,6 +795,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -827,6 +839,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
@@ -869,6 +883,8 @@ jobs:
           docker exec -w / ci_sglang pip install --force-reinstall /triton-3.5.1+rocm7.2.0.gita272dfa8-cp310-cp310-linux_x86_64.whl
           docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git || true
           docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+          docker exec -w / ci_sglang git clone --depth 1 https://github.com/merrymercy/human-eval.git || true
+          docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
       - name: Run test
         timeout-minutes: 30
