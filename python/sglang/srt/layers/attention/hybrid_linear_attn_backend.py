@@ -874,48 +874,52 @@ class GDNAttnBackend(MambaAttnBackendBase):
         use_flashinfer = self._use_flashinfer_gdn_decode and (
             ssm_states.dtype == torch.float32
         )
-        # if use_flashinfer:
-        #     q_for_kernel = query.permute(1, 0, 2, 3).contiguous()
-        #     k_for_kernel = key.permute(1, 0, 2, 3).contiguous()
-        #     v_for_kernel = value.permute(1, 0, 2, 3).contiguous()
-        #     a_for_kernel = a.view(bs, 1, -1).contiguous()
-        #     b_for_kernel = b.view(bs, 1, -1).contiguous()
-        #     state_for_kernel = ssm_states[cache_indices].contiguous()
-        #     output, output_state = self._flashinfer_gdn_decode(
-        #         q=q_for_kernel,
-        #         k=k_for_kernel,
-        #         v=v_for_kernel,
-        #         state=state_for_kernel,
-        #         A_log=layer.A_log,
-        #         a=a_for_kernel,
-        #         dt_bias=layer.dt_bias,
-        #         b=b_for_kernel,
-        #         use_qk_l2norm=True,
-        #     )
-        #     ssm_states[cache_indices] = output_state.to(
-        #         ssm_states.dtype, copy=False
-        #     )
-        #     core_attn_out = output.permute(1, 0, 2, 3).contiguous()
-        # else:
-        core_attn_out = self._kernel_func(
-            A_log=layer.A_log,
-            dt_bias=layer.dt_bias,
-            q=query,
-            k=key,
-            v=value,
-            a=a,
-            b=b,
-            initial_state_source=ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
+        if use_flashinfer:
+            q_for_kernel = query.permute(1, 0, 2, 3).contiguous()
+            k_for_kernel = key.permute(1, 0, 2, 3).contiguous()
+            v_for_kernel = value.permute(1, 0, 2, 3).contiguous()
+            a_for_kernel = a.view(bs, 1, -1).contiguous()
+            b_for_kernel = b.view(bs, 1, -1).contiguous()
+            # FlashInfer expects state in [N, H, K, V]; SGLang stores [N, H, V, K].
+            state_for_kernel = (
+                ssm_states[cache_indices].transpose(-1, -2).contiguous()
+            )
+            output, output_state = self._flashinfer_gdn_decode(
+                q=q_for_kernel,
+                k=k_for_kernel,
+                v=v_for_kernel,
+                state=state_for_kernel,
+                A_log=layer.A_log,
+                a=a_for_kernel,
+                dt_bias=layer.dt_bias,
+                b=b_for_kernel,
+                use_qk_l2norm=True,
+            )
+            output_state = output_state.transpose(-1, -2).contiguous()
+            ssm_states[cache_indices] = output_state.to(
+                ssm_states.dtype, copy=False
+            )
+            core_attn_out = output.permute(1, 0, 2, 3).contiguous()
+        else:
+            core_attn_out = self._kernel_func(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
 
-        self._track_mamba_state_decode(
-            forward_batch, conv_states, ssm_states, cache_indices
-        )
+            self._track_mamba_state_decode(
+                forward_batch, conv_states, ssm_states, cache_indices
+            )
 
         return core_attn_out
 
