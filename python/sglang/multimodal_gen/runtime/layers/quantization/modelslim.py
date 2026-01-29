@@ -43,7 +43,7 @@ class ModelSlimConfig(QuantizationConfig):
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
     """
 
-def __init__(self, quant_config: Dict[str, Any] = {}):
+    def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
