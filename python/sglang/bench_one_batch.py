@@ -57,7 +57,7 @@ import multiprocessing
 import os
 import time
 from types import SimpleNamespace
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -79,8 +79,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
-    is_cuda_alike,
-    is_xpu,
     kill_process_tree,
     maybe_reindex_device_id,
     require_mlp_sync,
@@ -89,15 +87,6 @@ from sglang.srt.utils import (
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
-    profiler_activity
-    for available, profiler_activity in [
-        (is_cuda_alike(), torch.profiler.ProfilerActivity.CUDA),
-        (is_xpu(), torch.profiler.ProfilerActivity.XPU),
-    ]
-    if available
-]
 
 
 def start_profile(profile_activities, profile_record_shapes=False, rank_print=print):
@@ -118,6 +107,8 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
             activities.append(torch.profiler.ProfilerActivity.CPU)
         if "GPU" in profile_activities:
             activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if "XPU" in profile_activities:
+            activities.append(torch.profiler.ProfilerActivity.XPU)
         if activities:
             profiler = torch.profiler.profile(
                 activities=activities,
@@ -179,6 +170,8 @@ class BenchArgs:
     profile_activities: Tuple[str] = ("CPU", "GPU")
     profile_stage: str = "all"
     profile_filename_prefix: str = "profile"
+    profile_start_step: Optional[int] = None
+    profile_steps: Optional[int] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -217,8 +210,8 @@ class BenchArgs:
             type=str,
             nargs="+",
             default=["CPU", "GPU"],
-            choices=["CPU", "GPU", "CUDA_PROFILER"],
-            help="Profiler activities: CPU, GPU, CUDA_PROFILER. If CPU/GPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
+            choices=["CPU", "GPU", "CUDA_PROFILER", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU, CUDA_PROFILER. If CPU/GPU/XPU, use torch profiler. If CUDA_PROFILER, use CUDA profiler.",
         )
         parser.add_argument(
             "--profile-stage",
@@ -234,14 +227,32 @@ class BenchArgs:
             help="Prefix of the profiling file names. The full profiling result file(s) be "
             '"[profile_filename_prefix]_batch[batch_size]_input[input_len]_output[output_len].trace.json.gz"',
         )
+        parser.add_argument(
+            "--profile-start-step",
+            type=int,
+            default=None,
+            help="Decode step at which to start profiling (0-indexed). If not specified, defaults to output_len // 2.",
+        )
+        parser.add_argument(
+            "--profile-steps",
+            type=int,
+            default=None,
+            help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         # use the default value's type to cast the args into correct types.
         attrs = [(attr.name, type(attr.default)) for attr in dataclasses.fields(cls)]
-        return cls(
-            **{attr: attr_type(getattr(args, attr)) for attr, attr_type in attrs}
-        )
+        result = {}
+        for attr, attr_type in attrs:
+            value = getattr(args, attr)
+            # Handle None values - don't try to cast them
+            if value is None or attr_type == type(None):
+                result[attr] = value
+            else:
+                result[attr] = attr_type(value)
+        return cls(**result)
 
 
 def load_model(server_args, port_args, gpu_id, tp_rank):
@@ -525,6 +536,8 @@ def latency_test_run_once(
     profile_filename_prefix,
     profile_stage,
     tp_rank,
+    profile_start_step=None,
+    profile_steps=None,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
     if batch_size > max_batch_size:
@@ -582,12 +595,17 @@ def latency_test_run_once(
     measurement_results["prefill_throughput"] = throughput
 
     decode_latencies = []
-    profile_step_of_interest = output_len // 2
+    # Determine profiling start step and end step
+    profile_start = (
+        profile_start_step if profile_start_step is not None else (output_len // 2)
+    )
+    profile_end = profile_start + (profile_steps if profile_steps is not None else 1)
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
+    profiler = None
     for i in range(output_len - 1):
         synchronize(device)
-        profiler = None
-        if enable_profile_decode and i == profile_step_of_interest:
+        # Start profiler at the specified step
+        if enable_profile_decode and i == profile_start:
             profiler = start_profile(
                 profile_activities,
                 profile_record_shapes=profile_record_shapes,
@@ -599,7 +617,8 @@ def latency_test_run_once(
         synchronize(device)
         latency = time.perf_counter() - tic
 
-        if enable_profile_decode and i == profile_step_of_interest:
+        # Stop profiler after the specified number of steps
+        if enable_profile_decode and profiler is not None and i >= profile_end - 1:
             trace_filename = _create_torch_profiler_filename(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode"
             )
@@ -611,6 +630,7 @@ def latency_test_run_once(
                 trace_filename=trace_filename,
                 stage="decode",
             )
+            profiler = None
 
         tot_latency += latency
         throughput = batch_size / latency
@@ -686,6 +706,8 @@ def latency_test(
         profile_filename_prefix="",
         profile_stage="all",
         tp_rank=tp_rank,
+        profile_start_step=None,
+        profile_steps=None,
     )
 
     rank_print("Benchmark ...")
@@ -736,6 +758,8 @@ def latency_test(
             bench_args.profile_filename_prefix,
             bench_args.profile_stage,
             tp_rank,
+            bench_args.profile_start_step,
+            bench_args.profile_steps,
         )
         if ret is not None:
             result_list.append(ret)
