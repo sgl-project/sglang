@@ -114,6 +114,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or get_global_server_args().rl_on_policy_target == "fsdp"
+                or get_global_server_args().rl_on_policy_target == "fsdp_tp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(

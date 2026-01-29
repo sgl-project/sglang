@@ -168,7 +168,7 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -2505,6 +2505,17 @@ class ServerArgs:
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
             # TODO remove this environment variable as a whole
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
+
+            if self.rl_on_policy_target == "fsdp_tp":
+                if self.enable_dp_attention:
+                    raise ValueError(
+                        "Currently rl_on_policy_target=fsdp_tp does not support dp attention."
+                    )
+                if self.enable_flashinfer_allreduce_fusion:
+                    self.enable_flashinfer_allreduce_fusion = False
+                    logger.warning(
+                        "Disable flashinfer allreduce fusion because of rl_on_policy_target=fsdp_tp."
+                    )
 
         if self.enable_deterministic_inference:
             # Check sampling backend
