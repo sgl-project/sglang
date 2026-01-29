@@ -1312,7 +1312,7 @@ class Scheduler(
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
-                or self.dllm_staging_reqs.non_empty()
+                or not self.dllm_staging_reqs.empty()
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
@@ -1810,7 +1810,7 @@ class Scheduler(
                 self.chunked_req is None
             ), "chunked_req should be None when dllm_config is set"
 
-            if self.dllm_staging_reqs.non_empty():
+            if not self.dllm_staging_reqs.empty():
                 chunked_req_to_exclude.update(self.dllm_staging_reqs)
                 for req in self.dllm_staging_reqs:
                     self.stash_chunked_request(req)
@@ -1827,7 +1827,7 @@ class Scheduler(
                 # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-            if self.last_batch.dllm_staging_reqs.non_empty():
+            if not self.last_batch.dllm_staging_reqs.empty():
                 chunked_req_to_exclude.update(self.last_batch.dllm_staging_reqs)
 
             # Filter batch
@@ -1918,7 +1918,7 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
-            not self.dllm_staging_reqs.non_empty() and self.chunked_req is None
+            self.dllm_staging_reqs.empty() and self.chunked_req is None
         ):
             return None
 
@@ -1930,7 +1930,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and (self.dllm_staging_reqs.empty() or self.chunked_req is not None)
+            and (not self.dllm_staging_reqs.empty() or self.chunked_req is not None)
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -1977,7 +1977,7 @@ class Scheduler(
                 self.chunked_req is None
             ), "chunked_req should be None when dllm_config is set"
 
-            if self.dllm_staging_reqs.non_empty():
+            if not self.dllm_staging_reqs.empty():
                 self.dllm_staging_reqs.init_next_round()
                 for req in self.dllm_staging_reqs:
                     adder.add_chunked_req(req)
@@ -2033,7 +2033,7 @@ class Scheduler(
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(
-                    self.dllm_staging_reqs.non_empty() or self.chunked_req is not None
+                    not self.dllm_staging_reqs.empty() or self.chunked_req is not None
                 ),
                 truncation_align_size=self.truncation_align_size,
             )
@@ -2074,7 +2074,7 @@ class Scheduler(
                 self.chunked_req is None
             ), "chunked_req should be None when dllm_config is set"
 
-            if adder.dllm_staging_reqs.non_empty():
+            if not adder.dllm_staging_reqs.empty():
                 self.dllm_staging_reqs.add_reqs(adder.dllm_staging_reqs)
 
         if adder.new_chunked_req is not None:
@@ -2085,7 +2085,7 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
 
-        if self.dllm_staging_reqs.non_empty():
+        if not self.dllm_staging_reqs.empty():
             self.dllm_staging_reqs.update_chunked_status()
 
         # Print stats

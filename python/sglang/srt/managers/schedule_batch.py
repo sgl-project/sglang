@@ -1202,9 +1202,6 @@ class DllmStagingReqs:
         for req in self.reqs:
             req.init_next_round_input()
 
-    def non_empty(self) -> bool:
-        return self.dllm_config is not None and len(self.reqs) > 0
-
     def empty(self) -> bool:
         return self.dllm_config is None or len(self.reqs) == 0
 
