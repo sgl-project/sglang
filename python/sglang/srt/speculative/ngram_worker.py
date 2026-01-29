@@ -140,7 +140,7 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch, is_spec_v2=False):
+    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
         if batch.forward_mode.is_extend():
             return
 

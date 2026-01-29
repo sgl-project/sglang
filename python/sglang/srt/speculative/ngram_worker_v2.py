@@ -68,14 +68,16 @@ class NGRAMWorkerV2(NGRAMWorker):
         if not prev_token_ids.is_cpu:
             prev_token_ids = prev_token_ids.cpu()
             prev_accept_lens = prev_accept_lens.cpu()
-        prev_token_ids = prev_token_ids.tolist()
-        prev_accept_lens = prev_accept_lens.tolist()
+        self.prev_token_ids = prev_token_ids.tolist()
+        self.prev_accept_lens = prev_accept_lens.tolist()
         stride = self.draft_token_num
 
         self.ngram_cache.synchronize()
         batch_tokens = []
         for i, req in enumerate(batch.reqs):
-            prev_tokens = prev_token_ids[i * stride : i * stride + prev_accept_lens[i]]
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
             check_token = self._efficient_concat_last_n(
                 req.origin_input_ids,
                 req.output_ids + prev_tokens,
@@ -90,6 +92,24 @@ class NGRAMWorkerV2(NGRAMWorker):
             total_draft_token_num == bs * self.draft_token_num
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
+
+    def _update_ngram_cache_v2(self, batch: ModelWorkerBatch):
+        batch_tokens = []
+        stride = self.draft_token_num
+        for i, req in enumerate(batch.reqs):
+            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
+            # there is not much difference, so we will not insert it for now.
+            # if batch.forward_mode.is_extend():
+            #     put_ids = req.origin_input_ids + req.output_ids
+            # else:
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
+            put_ids = self._efficient_concat_last_n(
+                req.origin_input_ids, req.output_ids + prev_tokens, self.branch_length
+            )
+            batch_tokens.append(put_ids)
+        self.ngram_cache.batch_put(batch_tokens)
 
     def _prepare_for_speculative_decoding_v2(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_extend():
@@ -254,7 +274,7 @@ class NGRAMWorkerV2(NGRAMWorker):
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
-            self._update_ngram_cache(model_worker_batch)
+            self._update_ngram_cache_v2(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
 
         else:
