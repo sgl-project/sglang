@@ -66,14 +66,16 @@ inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ acc,
   }
 }
 
-template <typename scalar_t, typename index_t, int BLOCK_M, int BLOCK_N>
+template <typename scalar_t, typename packed_t, typename index_t, int BLOCK_M, int BLOCK_N>
 void extend_attention_kernel_impl(
     scalar_t* __restrict__ o_extend,
     const scalar_t* __restrict__ q_extend,
     const scalar_t* __restrict__ k_extend,
     const scalar_t* __restrict__ v_extend,
-    const scalar_t* __restrict__ k_buffer,
-    const scalar_t* __restrict__ v_buffer,
+    const packed_t* __restrict__ k_buffer,
+    const packed_t* __restrict__ v_buffer,
+    const float* __restrict__ k_buf_scale,
+    const float* __restrict__ v_buf_scale,
     const index_t* __restrict__ req_to_token,
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
@@ -188,9 +190,10 @@ void extend_attention_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // get key and pack
-        pack_vnni<scalar_t, index_t>(
+        pack_vnni<scalar_t, packed_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_buffer + head_kv_id * k_strideH,
+            /* src_scale*/ k_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n,
             /*     N  */ n_size,
             /*     K  */ head_size,
@@ -257,9 +260,10 @@ void extend_attention_kernel_impl(
         }
 
         // get value and pack
-        pack_vnni2<scalar_t, index_t>(
+        pack_vnni2<scalar_t, packed_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_buffer + head_kv_id * v_strideH,
+            /* src_scale*/ v_buf_scale,
             /*    ind */ req_to_token + req_pool_id * max_context_len + n,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
@@ -289,9 +293,10 @@ void extend_attention_kernel_impl(
         const int padded_n_size = div_up(n_size, TILE_K) * TILE_K;
 
         // get key and pack
-        pack_vnni<scalar_t, index_t>(
+        pack_vnni<scalar_t, scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ k_extend + (seq_extend_start_loc + n) * ke_strideN + head_kv_id * ke_strideH,
+            /* src_scale*/ nullptr,
             /*    ind */ nullptr,
             /*     N  */ n_size,
             /*     K  */ head_size,
@@ -368,9 +373,10 @@ void extend_attention_kernel_impl(
         }
 
         // get value and pack
-        pack_vnni2<scalar_t, index_t>(
+        pack_vnni2<scalar_t, scalar_t, index_t>(
             /*    dst */ Btmp,
             /*    src */ v_extend + (seq_extend_start_loc + n) * ve_strideN + head_kv_id * ve_strideH,
+            /* src_scale*/ nullptr,
             /*    ind */ nullptr,
             /*     K  */ n_size,
             /*     N  */ head_size_v,
@@ -428,6 +434,8 @@ void extend_attention_cpu(
     at::Tensor& o_extend,
     at::Tensor& k_buffer,
     at::Tensor& v_buffer,
+    std::optional<at::Tensor> k_buf_scale,
+    std::optional<at::Tensor> v_buf_scale,
     at::Tensor& req_to_token,
     at::Tensor& req_pool_indices,
     at::Tensor& seq_lens,
@@ -525,44 +533,62 @@ void extend_attention_cpu(
   int num_threads = at::get_num_threads();
   auto buffer = at::empty({num_threads, size_per_thread}, q_extend.options().dtype(at::kChar));
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
-    AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-      extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
-          o_extend.data_ptr<scalar_t>(),
-          q_extend.data_ptr<scalar_t>(),
-          k_extend.data_ptr<scalar_t>(),
-          v_extend.data_ptr<scalar_t>(),
-          k_buffer.data_ptr<scalar_t>(),
-          v_buffer.data_ptr<scalar_t>(),
-          req_to_token.data_ptr<index_t>(),
-          req_pool_indices.data_ptr<int64_t>(),
-          seq_lens.data_ptr<int64_t>(),
-          extend_seq_lens.data_ptr<index_t>(),
-          extend_start_loc.data_ptr<index_t>(),
-          buffer.data_ptr(),
-          num_seqs,
-          num_heads,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          q_strideM,
-          q_strideH,
-          ke_strideN,
-          ke_strideH,
-          ve_strideN,
-          ve_strideH,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          sm_scale,
-          logit_cap,
-          max_num_reqs,
-          max_context_len,
-          max_total_num_tokens,
-          max_len_extend,
-          size_per_thread,
-          is_prefix_skipped);
-    });
-  });
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(
+      q_extend.scalar_type(), k_buffer.scalar_type(), at::kFloat, "extend_attention_kernel", [&] {
+        AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
+          auto kv_dtype = k_buffer.scalar_type();
+          float* __restrict__ k_buf_scale_ptr = nullptr;
+          float* __restrict__ v_buf_scale_ptr = nullptr;
+          if (kv_dtype == at::ScalarType::Float8_e4m3fn) {
+            TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+            TORCH_CHECK(k_buf_scale.has_value() && v_buf_scale.has_value(), "float8 scale tensors are required");
+            at::Tensor k_buf_scale_tensor = k_buf_scale.value();
+            at::Tensor v_buf_scale_tensor = v_buf_scale.value();
+            TORCH_CHECK(k_buf_scale_tensor.scalar_type() == at::kFloat, "k_buf_scale should be float32");
+            TORCH_CHECK(v_buf_scale_tensor.scalar_type() == at::kFloat, "v_buf_scale should be float32");
+            k_buf_scale_ptr = k_buf_scale_tensor.data_ptr<float>();
+            v_buf_scale_ptr = v_buf_scale_tensor.data_ptr<float>();
+          } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
+            TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have same data type");
+          }
+          extend_attention_kernel_impl<scalar_t, packed_t, index_t, BLOCK_M, BLOCK_N>(
+              o_extend.data_ptr<scalar_t>(),
+              q_extend.data_ptr<scalar_t>(),
+              k_extend.data_ptr<scalar_t>(),
+              v_extend.data_ptr<scalar_t>(),
+              k_buffer.data_ptr<packed_t>(),
+              v_buffer.data_ptr<packed_t>(),
+              k_buf_scale_ptr,
+              v_buf_scale_ptr,
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              extend_seq_lens.data_ptr<index_t>(),
+              extend_start_loc.data_ptr<index_t>(),
+              buffer.data_ptr(),
+              num_seqs,
+              num_heads,
+              num_heads_kv,
+              head_size,
+              head_size_v,
+              q_strideM,
+              q_strideH,
+              ke_strideN,
+              ke_strideH,
+              ve_strideN,
+              ve_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens,
+              max_len_extend,
+              size_per_thread,
+              is_prefix_skipped);
+        });
+      });
 }

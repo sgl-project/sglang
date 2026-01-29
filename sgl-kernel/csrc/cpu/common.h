@@ -45,7 +45,7 @@ namespace {
     }                                                                    \
   }()
 
-// dispatch: bfloat16, float16, int8_t, fp8_e4m3
+// dispatch: bfloat16, float16, int8_t, fp8_e4m3, fp8_e5m2
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
     switch (TYPE) {                                              \
@@ -65,48 +65,118 @@ namespace {
         using packed_t = at::Float8_e4m3fn;                      \
         return __VA_ARGS__();                                    \
       }                                                          \
+      case at::ScalarType::Float8_e5m2: {                        \
+        using packed_t = at::Float8_e5m2;                        \
+        return __VA_ARGS__();                                    \
+      }                                                          \
       default:                                                   \
         TORCH_CHECK(false, "Unsupported floating data type.\n"); \
     }                                                            \
   }()
 
-// dispatch with mixed dtypes (TYPE1, TYPE2):
-//   TYPE1: the primary dtype (input, output, weight);
-//   TYPE2: the secondary dtype (bias, etc.).
-#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, ...) \
-  [&] {                                                            \
-    if (TYPE2 == at::kFloat) {                                     \
-      switch (TYPE1) {                                             \
-        case at::ScalarType::BFloat16: {                           \
-          using scalar_t = at::BFloat16;                           \
-          using param_t = float;                                   \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        case at::ScalarType::Half: {                               \
-          using scalar_t = at::Half;                               \
-          using param_t = float;                                   \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        default:                                                   \
-          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-      }                                                            \
-    } else {                                                       \
-      TORCH_CHECK(TYPE1 == TYPE2);                                 \
-      switch (TYPE1) {                                             \
-        case at::ScalarType::BFloat16: {                           \
-          using scalar_t = at::BFloat16;                           \
-          using param_t = at::BFloat16;                            \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        case at::ScalarType::Half: {                               \
-          using scalar_t = at::Half;                               \
-          using param_t = at::Half;                                \
-          return __VA_ARGS__();                                    \
-        }                                                          \
-        default:                                                   \
-          TORCH_CHECK(false, "Unsupported floating data type.\n"); \
-      }                                                            \
-    }                                                              \
+// dispatch with mixed dtypes (TYPE1, TYPE2, TYPE3):
+//   TYPE1: the primary dtype (input, output);
+//   TYPE2: the secondary dtype (weight)
+//   TYPE3: the tertiary dtype (bias, etc)
+#define CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(TYPE1, TYPE2, TYPE3, ...) \
+  [&] {                                                                   \
+    if (TYPE3 == at::kFloat) {                                            \
+      using param_t = float;                                              \
+      switch (TYPE1) {                                                    \
+        case at::ScalarType::BFloat16: {                                  \
+          using scalar_t = at::BFloat16;                                  \
+          switch (TYPE2) {                                                \
+            case at::ScalarType::BFloat16: {                              \
+              using packed_t = at::BFloat16;                              \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e4m3fn: {                         \
+              using packed_t = at::Float8_e4m3fn;                         \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e5m2: {                           \
+              using packed_t = at::Float8_e5m2;                           \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            default:                                                      \
+              TORCH_CHECK(false, "Unsupported packed data type.\n");      \
+          }                                                               \
+        }                                                                 \
+        case at::ScalarType::Half: {                                      \
+          using scalar_t = at::Half;                                      \
+          if (TYPE3 == at::kFloat) {                                      \
+            using param_t = float;                                        \
+          } else {                                                        \
+            TORCH_CHECK(TYPE1 == TYPE3);                                  \
+            using param_t = scalar_t;                                     \
+          }                                                               \
+          switch (TYPE2) {                                                \
+            case at::ScalarType::Half: {                                  \
+              using packed_t = at::Half;                                  \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e4m3fn: {                         \
+              using packed_t = at::Float8_e4m3fn;                         \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e5m2: {                           \
+              using packed_t = at::Float8_e5m2;                           \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            default:                                                      \
+              TORCH_CHECK(false, "Unsupported packed data type.\n");      \
+          }                                                               \
+        }                                                                 \
+        default:                                                          \
+          TORCH_CHECK(false, "Unsupported scalar data type.\n");          \
+      }                                                                   \
+    } else {                                                              \
+      TORCH_CHECK(TYPE1 == TYPE3);                                        \
+      switch (TYPE1) {                                                    \
+        case at::ScalarType::BFloat16: {                                  \
+          using scalar_t = at::BFloat16;                                  \
+          using param_t = at::BFloat16;                                   \
+          switch (TYPE2) {                                                \
+            case at::ScalarType::BFloat16: {                              \
+              using packed_t = at::BFloat16;                              \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e4m3fn: {                         \
+              using packed_t = at::Float8_e4m3fn;                         \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e5m2: {                           \
+              using packed_t = at::Float8_e5m2;                           \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            default:                                                      \
+              TORCH_CHECK(false, "Unsupported packed data type.\n");      \
+          }                                                               \
+        }                                                                 \
+        case at::ScalarType::Half: {                                      \
+          using scalar_t = at::Half;                                      \
+          using param_t = at::Half;                                       \
+          switch (TYPE2) {                                                \
+            case at::ScalarType::Half: {                                  \
+              using packed_t = at::Half;                                  \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e4m3fn: {                         \
+              using packed_t = at::Float8_e4m3fn;                         \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            case at::ScalarType::Float8_e5m2: {                           \
+              using packed_t = at::Float8_e5m2;                           \
+              return __VA_ARGS__();                                       \
+            }                                                             \
+            default:                                                      \
+              TORCH_CHECK(false, "Unsupported packed data type.\n");      \
+          }                                                               \
+        }                                                                 \
+        default:                                                          \
+          TORCH_CHECK(false, "Unsupported scalar data type.\n");          \
+      }                                                                   \
+    }                                                                     \
   }()
 
 #define UNUSED(x) (void)(x)
@@ -154,6 +224,9 @@ static inline void CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const at::I
 
 // grain size for each thread
 constexpr int GRAIN_SIZE = 1024;
+
+constexpr float FP8_MAX = 448.0f;
+constexpr float FP8_MIN = -FP8_MAX;
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
