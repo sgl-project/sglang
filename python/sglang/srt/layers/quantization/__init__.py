@@ -19,6 +19,7 @@ CompressedTensorsConfig = DummyConfig
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -31,11 +32,13 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
+from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
 from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
@@ -57,6 +60,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w8a8_fp8": W8A8Fp8Config,
     "awq": AWQConfig,
     "awq_marlin": AWQMarlinConfig,
+    "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
     "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
@@ -68,6 +72,8 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fbgemm_fp8": FBGEMMFp8Config,
     "quark": QuarkConfig,
     "auto-round": AutoRoundConfig,
+    "modelslim": ModelSlimConfig,
+    "quark_int4fp8_moe": QuarkInt4Fp8Config,
 }
 
 
@@ -75,15 +81,6 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
-        }
-    )
-
-if is_npu():
-    from sglang.srt.hardware_backend.npu.quantization.modelslim import ModelSlimConfig
-
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "modelslim": ModelSlimConfig,
         }
     )
 

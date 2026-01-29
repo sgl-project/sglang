@@ -9,7 +9,8 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 650),
+        TestFile("models/test_qwen3_next_models.py", 350),
+        TestFile("models/test_qwen3_next_models_mtp.py", 500),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
@@ -18,7 +19,7 @@ suites = {
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 400),
         TestFile("models/test_kimi_k2_models.py", 200),
         TestFile("test_deepseek_v32_basic.py", 360),
         TestFile("test_deepseek_v32_mtp.py", 360),
@@ -33,8 +34,9 @@ suites = {
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
         TestFile("test_fp8_blockwise_gemm.py", 280),
-        TestFile("test_gpt_oss_4gpu.py", 700),
-        TestFile("test_llama31_fp4.py", 90),
+        TestFile("test_gpt_oss_4gpu.py", 300),
+        TestFile("test_nvfp4_gemm.py", 360),
+        TestFile("test_deepseek_v32_fp4_4gpu.py", 600),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
@@ -50,26 +52,19 @@ suites = {
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 563),
     ],
-    "quantization_test": [
-        TestFile("quant/test_awq.py", 163),
-        TestFile("quant/test_marlin_moe.py", 200),
-        TestFile("test_bnb.py", 5),
-        TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_quantization.py", 185),
-        TestFile("test_gguf.py", 96),
-    ],
+    # quantization_test suite migrated to test/registered/quant/
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
-        TestFile("test_bench_one_batch.py"),
-        TestFile("test_bench_serving.py"),
-        TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
         TestFile("test_prefill_delayer.py"),
         TestFile("test_fla_layernorm_guard.py"),
+        TestFile(
+            "models/test_qwen3_next_models_pcg.py"
+        ),  # Disabled: intermittent failures, see #17039
+        TestFile("ep/test_moriep_small.py"),
     ],
 }
 
@@ -84,10 +79,7 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_rope_rocm.py", 3),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_type_based_dispatcher.py", 10),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
@@ -95,16 +87,10 @@ suite_amd = {
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
+        # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
-    ],
-    "per-commit-8-gpu-amd": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
-    "per-commit-8-gpu-amd-mi35x": [
-        TestFile("test_deepseek_r1_mxfp4_8gpu.py", 3600),
     ],
     # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
     # have been migrated to test/registered/amd/nightly/ and are now managed
@@ -148,12 +134,14 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
         TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
@@ -168,8 +156,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        TestFile("ascend/test_ascend_deepep.py", 3600),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
 

@@ -34,10 +34,20 @@ ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, n
 
 ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
 ncclResult_t  ncclMemFree(void *ptr);
+const char*  ncclGetErrorString(ncclResult_t result);
+
+#define NCCLCHECK(cmd) do {                                               \
+  ncclResult_t res = cmd;                                                 \
+  if (res != ncclSuccess) {                                               \
+    fprintf(stderr, "ERROR: NCCL symmetric memory allocation failed. Most likely out of device memory. '%s'\\n", \
+           ncclGetErrorString(res));                       \
+    return NULL;                                                        \
+  }                                                                       \
+} while(0)
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
   void* ptr;
-  ncclResult_t err = ncclMemAlloc(&ptr, size);
+  NCCLCHECK(ncclMemAlloc(&ptr, size));
 
   const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
   char *endptr;
@@ -45,7 +55,7 @@ void* nccl_alloc_plug(size_t size, int device, void* stream) {
 
   ncclComm_t comm = (ncclComm_t)(int_val);
   ncclWindow_t win;
-  ncclResult_t err2 = ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC);
+  NCCLCHECK(ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC));
 
   return ptr;
 }

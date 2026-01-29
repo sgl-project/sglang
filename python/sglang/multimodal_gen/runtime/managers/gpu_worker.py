@@ -98,6 +98,9 @@ class GPUWorker:
                 [
                     self.pipeline.get_module("transformer"),
                     self.pipeline.get_module("transformer_2"),
+                    self.pipeline.get_module("video_dit"),
+                    self.pipeline.get_module("video_dit_2"),
+                    self.pipeline.get_module("audio_dit"),
                 ],
             ):
                 if isinstance(dit, OffloadableDiTMixin):
@@ -109,6 +112,41 @@ class GPUWorker:
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."
+        )
+
+    def do_mem_analysis(self, output_batch: OutputBatch):
+        peak_memory_bytes = torch.cuda.max_memory_allocated()
+        output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
+        peak_memory_gb = peak_memory_bytes / (1024**3)
+        remaining_gpu_mem_gb = (
+            current_platform.get_device_total_memory() / (1024**3) - peak_memory_gb
+        )
+        can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
+        suggested_args = set()
+        component_to_arg = {
+            "vae": "--vae-cpu-offload",
+            "text_encoder": "--text-encoder-cpu-offload",
+            "text_encoder_2": "--text-encoder-cpu-offload",
+            "image_encoder": "--image-encoder-cpu-offload",
+        }
+
+        for component in can_stay_resident:
+            if component == "transformer":
+                if self.server_args.dit_layerwise_offload:
+                    suggested_args.add("--dit-layerwise-offload")
+                elif self.server_args.dit_cpu_offload:
+                    suggested_args.add("--dit-cpu-offload")
+            elif component in component_to_arg:
+                suggested_args.add(component_to_arg[component])
+
+        suggested_args_str = (
+            ", ".join(sorted(suggested_args)) if suggested_args else "None"
+        )
+        logger.info(
+            f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
+            f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
+            f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
+            f"Related offload server args to disable: {suggested_args_str}"
         )
 
     def execute_forward(self, batch: List[Req]) -> OutputBatch:
@@ -129,30 +167,19 @@ class GPUWorker:
             if isinstance(result, Req):
                 output_batch = OutputBatch(
                     output=result.output,
+                    audio=getattr(result, "audio", None),
+                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
+                    noise_pred=getattr(result, "noise_pred", None),
                     trajectory_decoded=getattr(result, "trajectory_decoded", None),
                 )
             else:
                 output_batch = result
 
-            if self.rank == 0:
-                peak_memory_bytes = torch.cuda.max_memory_allocated()
-                output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
-                peak_memory_gb = peak_memory_bytes / (1024**3)
-                remaining_gpu_mem_gb = (
-                    current_platform.get_device_total_memory() / (1024**3)
-                    - peak_memory_gb
-                )
-                can_stay_resident = self.get_can_stay_resident_components(
-                    remaining_gpu_mem_gb
-                )
-                logger.info(
-                    f"Peak GPU memory: {peak_memory_gb:.2f} GB, "
-                    f"Remaining GPU memory at peak: {remaining_gpu_mem_gb:.2f} GB. "
-                    f"Components that can stay resident: {can_stay_resident}"
-                )
+            if self.rank == 0 and not req.suppress_logs:
+                self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
@@ -267,6 +294,18 @@ class GPUWorker:
         return OutputBatch(output=status)
 
 
+OOM_MSG = f"""
+OOM detected. Possible solutions:
+  - If the OOM occurs during loading:
+    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+  - If the OOM occurs during runtime:
+    1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
+    2. Enable SP and/or TP
+    3. Enable a sparse-attention backend
+  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
+"""
+
+
 def run_scheduler_process(
     local_rank: int,
     rank: int,
@@ -298,18 +337,23 @@ def run_scheduler_process(
     assert result_pipes_from_slaves is not None
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
-    scheduler = Scheduler(
-        server_args,
-        gpu_id=rank,
-        port_args=port_args,
-        task_pipes_to_slaves=task_pipes_to_slaves,
-        result_pipes_from_slaves=result_pipes_from_slaves,
-    )
-    logger.info(f"Worker {rank}: Scheduler loop started.")
-    pipe_writer.send(
-        {
-            "status": "ready",
-        }
-    )
-    scheduler.event_loop()
-    logger.info(f"Worker {rank}: Shutdown complete.")
+    try:
+        scheduler = Scheduler(
+            server_args,
+            gpu_id=rank,
+            port_args=port_args,
+            task_pipes_to_slaves=task_pipes_to_slaves,
+            result_pipes_from_slaves=result_pipes_from_slaves,
+        )
+        logger.info(f"Worker {rank}: Scheduler loop started.")
+        pipe_writer.send(
+            {
+                "status": "ready",
+            }
+        )
+        scheduler.event_loop()
+    except torch.OutOfMemoryError as _e:
+        print(OOM_MSG)
+        raise
+    finally:
+        logger.info(f"Worker {rank}: Shutdown complete.")

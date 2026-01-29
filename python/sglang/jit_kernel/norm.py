@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -24,6 +24,28 @@ def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
         *args,
         cuda_files=["elementwise/qknorm.cuh"],
         cuda_wrappers=[("qknorm", f"QKNormKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
+    args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
+    return load_jit(
+        "rmsnorm",
+        *args,
+        cuda_files=["elementwise/rmsnorm.cuh"],
+        cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_fused_add_rmsnorm_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype)
+    return load_jit(
+        "fused_add_rmsnorm",
+        *args,
+        cuda_files=["elementwise/fused_add_rmsnorm.cuh"],
+        cuda_wrappers=[("fused_add_rmsnorm", f"FusedAddRMSNormKernel<{args}>::run")],
     )
 
 
@@ -53,3 +75,25 @@ def fused_inplace_qknorm(
     head_dim = head_dim or q.size(-1)
     module = _jit_qknorm_module(head_dim, q.dtype)
     module.qknorm(q, k, q_weight, k_weight, eps)
+
+
+def rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> None:
+    output = output if output is not None else input
+    hidden_size = input.size(-1)
+    module = _jit_rmsnorm_module(hidden_size, input.dtype)
+    module.rmsnorm(input, weight, output, eps)
+
+
+def fused_add_rmsnorm(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    module = _jit_fused_add_rmsnorm_module(input.dtype)
+    module.fused_add_rmsnorm(input, residual, weight, eps)

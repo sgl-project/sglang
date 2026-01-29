@@ -38,7 +38,18 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2KleinPipelineConfig,
+    Flux2PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
+    GlmImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import (
+    MOVA360PConfig,
+    MOVA720PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -55,10 +66,19 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
-from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.sample.flux import (
+    Flux2KleinSamplingParams,
+    FluxSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.mova import (
+    MOVA_360P_SamplingParams,
+    MOVA_720P_SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
@@ -94,6 +114,10 @@ logger = init_logger(__name__)
 
 _PIPELINE_REGISTRY: Dict[str, Type[ComposedPipelineBase]] = {}
 
+# Registry for pipeline configuration classes (for safetensors files without model_index.json)
+# Maps pipeline_class_name -> (PipelineConfig class, SamplingParams class)
+_PIPELINE_CONFIG_REGISTRY: Dict[str, Tuple[Type[PipelineConfig], Type[Any]]] = {}
+
 
 def _discover_and_register_pipelines():
     """
@@ -120,15 +144,43 @@ def _discover_and_register_pipelines():
                 )
 
                 for cls in entry_cls_list:
-                    if hasattr(cls, "pipeline_name"):
-                        if cls.pipeline_name in _PIPELINE_REGISTRY:
-                            logger.warning(
-                                f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
-                            )
-                        _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+                    if not issubclass(cls, ComposedPipelineBase):
+                        continue
+                    if cls.pipeline_name in _PIPELINE_REGISTRY:
+                        logger.warning(
+                            f"Duplicate pipeline name '{cls.pipeline_name}' found. Overwriting."
+                        )
+                    _PIPELINE_REGISTRY[cls.pipeline_name] = cls
+
+                    # Special handling for ComfyUI Pipelines:
+                    # Auto-register config classes if Pipeline class has them defined
+                    # since comfyui get model from a single weight file, so we need to register the config classes here
+                    if hasattr(cls, "pipeline_config_cls") and hasattr(
+                        cls, "sampling_params_cls"
+                    ):
+                        _PIPELINE_CONFIG_REGISTRY[cls.pipeline_name] = (
+                            cls.pipeline_config_cls,
+                            cls.sampling_params_cls,
+                        )
+                        logger.debug(
+                            f"Auto-registered config classes for pipeline '{cls.pipeline_name}': "
+                            f"PipelineConfig={cls.pipeline_config_cls.__name__}, "
+                            f"SamplingParams={cls.sampling_params_cls.__name__}"
+                        )
     logger.debug(
         f"Registering pipelines complete, {len(_PIPELINE_REGISTRY)} pipelines registered"
     )
+
+
+def get_pipeline_config_classes(
+    pipeline_class_name: str,
+) -> Tuple[Type[PipelineConfig], Type[Any]] | None:
+    """
+    Get the configuration classes for a pipeline.
+    """
+    # Ensure pipelines are discovered first
+    _discover_and_register_pipelines()
+    return _PIPELINE_CONFIG_REGISTRY.get(pipeline_class_name)
 
 
 # --- Part 2: Config Registration ---
@@ -289,11 +341,8 @@ def get_model_info(
        manually registered mapping based on the model path.
 
     Args:
-        model_path: Path to the model or HuggingFace model ID
         backend: Backend to use ('auto', 'sglang', 'diffusers'). If None, uses 'auto'.
 
-    Returns:
-        ModelInfo with the resolved pipeline class and config classes, or None if not found.
     """
     # import Backend enum here to avoid circular imports
     from sglang.multimodal_gen.runtime.server_args import Backend
@@ -384,6 +433,16 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # LTX-2
+    register_configs(
+        sampling_param_cls=LTX2SamplingParams,
+        pipeline_config_cls=LTX2PipelineConfig,
+        model_detectors=[
+            lambda path: "ltx" in path.lower() and "video" in path.lower(),
+            lambda path: "ltx-2" in path.lower(),
+        ],
+    )
+
     # Hunyuan
     register_configs(
         sampling_param_cls=HunyuanSamplingParams,
@@ -492,6 +551,21 @@ def _register_configs():
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
+    # MOVA
+    register_configs(
+        sampling_param_cls=MOVA_360P_SamplingParams,
+        pipeline_config_cls=MOVA360PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MOVA_720P_SamplingParams,
+        pipeline_config_cls=MOVA720PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -502,12 +576,26 @@ def _register_configs():
         model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
     )
     register_configs(
+        sampling_param_cls=Flux2KleinSamplingParams,
+        pipeline_config_cls=Flux2KleinPipelineConfig,
+        hf_model_paths=[
+            "black-forest-labs/FLUX.2-klein-4B",
+            "black-forest-labs/FLUX.2-klein-9B",
+        ],
+        model_detectors=[
+            lambda hf_id: "flux.2-klein" in hf_id.lower()
+            or "flux2-klein" in hf_id.lower()
+        ],
+    )
+    register_configs(
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
         ],
-        model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: "flux.2" in hf_id.lower() and "klein" not in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
@@ -550,6 +638,12 @@ def _register_configs():
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
+    )
+
+    register_configs(
+        sampling_param_cls=GlmImageSamplingParams,
+        pipeline_config_cls=GlmImagePipelineConfig,
+        model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
     )
 
 

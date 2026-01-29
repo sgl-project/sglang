@@ -8,11 +8,11 @@ import argparse
 import dataclasses
 import inspect
 import json
+import math
 import os
 import random
 import sys
 import tempfile
-from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
@@ -235,7 +235,9 @@ class ServerArgs:
 
     # Attention
     attention_backend: str = None
-    diffusers_attention_backend: str = None  # for diffusers backend only
+    cache_dit_config: str | dict[str, Any] | None = (
+        None  # cache-dit config for diffusers
+    )
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -265,6 +267,11 @@ class ServerArgs:
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
+    # Pipeline override
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
@@ -279,11 +286,15 @@ class ServerArgs:
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
     dit_layerwise_offload: bool | None = None
+    dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+
+    # ComfyUI integration
+    comfyui_mode: bool = False
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -320,6 +331,8 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
+    output_path: str | None = "outputs/"
+
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
 
@@ -329,6 +342,11 @@ class ServerArgs:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "video_vae": True,
+            "audio_vae": True,
+            "video_dit": True,
+            "audio_dit": True,
+            "dual_tower_bridge": True,
         }
     )
 
@@ -442,15 +460,25 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
-            help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
+            help=(
+                "The attention backend to use. For SGLang-native pipelines, use "
+                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
+                "use diffusers attention backend names such as flash, _flash_3_hub, "
+                "sage, or xformers."
+            ),
         )
         parser.add_argument(
             "--diffusers-attention-backend",
             type=str,
+            dest="attention_backend",
             default=None,
-            help="Attention backend for diffusers pipelines (e.g., flash, _flash_3_hub, sage, xformers). "
-            "See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--cache-dit-config",
+            type=str,
+            default=ServerArgs.cache_dit_config,
+            help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
         )
 
         # HuggingFace specific parameters
@@ -597,6 +625,12 @@ class ServerArgs:
             "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
+            "--dit-offload-prefetch-size",
+            type=float,
+            default=ServerArgs.dit_offload_prefetch_size,
+            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
+        )
+        parser.add_argument(
             "--use-fsdp-inference",
             action=StoreBoolean,
             help="Use FSDP for inference by sharding the model weights. Latency is very low due to prefetch--enable if run out of memory.",
@@ -674,6 +708,12 @@ class ServerArgs:
             default=ServerArgs.webui_port,
             help="Whether to use webui for better display",
         )
+        parser.add_argument(
+            "--output-path",
+            type=str,
+            default=ServerArgs.output_path,
+            help="Directory path to save generated images/videos",
+        )
 
         # LoRA
         parser.add_argument(
@@ -730,17 +770,6 @@ class ServerArgs:
     ) -> int:
         """
         Find an available port with retry logic.
-
-        Args:
-            port: Initial port to check
-            port_inc: Port increment for each attempt
-            max_attempts: Maximum number of attempts to find an available port
-
-        Returns:
-            An available port number
-
-        Raises:
-            RuntimeError: If no available port is found after max_attempts
         """
         attempts = 0
         original_port = port
@@ -933,15 +962,37 @@ class ServerArgs:
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
 
+        if self.dit_offload_prefetch_size > 1 and (
+            isinstance(self.dit_offload_prefetch_size, float)
+            and not self.dit_offload_prefetch_size.is_integer()
+        ):
+            self.dit_offload_prefetch_size = int(
+                math.floor(self.dit_offload_prefetch_size)
+            )
+            logger.info(
+                f"Invalid --dit-offload-prefetch-size value passed, truncated to: {self.dit_offload_prefetch_size}"
+            )
+        if 0.5 <= self.dit_offload_prefetch_size < 1.0:
+            logger.info(
+                f"We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             # TODO: need a better way to tell this
-            if "wan" in self.pipeline_config.__class__.__name__.lower():
+            if (
+                "wan" in self.pipeline_config.__class__.__name__.lower()
+                and self.dit_layerwise_offload is None
+                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            ):
                 logger.info(
                     "Automatically enable dit_layerwise_offload for Wan for best performance"
                 )
                 self.dit_layerwise_offload = True
 
         if self.dit_layerwise_offload:
+            assert (
+                self.dit_offload_prefetch_size >= 0.0
+            ), "dit_offload_prefetch_size must be non-negative"
             if self.use_fsdp_inference:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
@@ -991,7 +1042,7 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
-        if self.attention_backend is None:
+        if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
             self._set_default_attention_backend()
 
         # parallelism
@@ -1069,47 +1120,18 @@ class PortArgs:
         )
 
 
-# TODO: not sure what _current_server_args is for, using a _global_server_args instead
-_current_server_args = None
 _global_server_args = None
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the inference arguments from the command line arguments.
-
-    Args:
-        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The inference arguments.
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
     server_args = ServerArgs.from_cli_args(raw_args)
-    global _current_server_args
-    _current_server_args = server_args
     return server_args
-
-
-@contextmanager
-def set_current_server_args(server_args: ServerArgs):
-    """
-    Temporarily set the current sgl_diffusion config.
-    Used during model initialization.
-    We save the current sgl_diffusion config in a global variable,
-    so that all modules can access it, e.g. custom ops
-    can access the sgl_diffusion config to determine how to dispatch.
-    """
-    global _current_server_args
-    old_server_args = _current_server_args
-    try:
-        _current_server_args = server_args
-        yield
-    finally:
-        _current_server_args = old_server_args
 
 
 def set_global_server_args(server_args: ServerArgs):
@@ -1120,17 +1142,7 @@ def set_global_server_args(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def get_current_server_args() -> ServerArgs | None:
-    if _current_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
-        raise ValueError("Current sgl_diffusion args is not set.")
-    return _current_server_args
-
-
-def get_global_server_args() -> ServerArgs | None:
+def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the sgl_diffusion config. In that case, we set a default

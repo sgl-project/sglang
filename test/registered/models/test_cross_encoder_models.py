@@ -1,17 +1,18 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-# Cross encoder model tests
-register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=150, suite="stage-b-test-small-1-gpu-amd")
-
 import multiprocessing as mp
 import random
 import unittest
 
 import torch
 
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, is_in_ci
+
+# Cross encoder model tests
+
+
+register_cuda_ci(est_time=100, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=150, suite="stage-b-test-small-1-gpu-amd")
 
 MODELS = [
     ("cross-encoder/ms-marco-MiniLM-L6-v2", 1, 1e-2),

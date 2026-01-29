@@ -4,9 +4,10 @@ from types import SimpleNamespace
 import requests
 
 from sglang import Engine
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
@@ -17,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -74,7 +76,10 @@ class TestTorchAO(CustomTestCase):
         print(res["text"])
         throughput = max_tokens / (tok - tic)
         print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 210
+        if is_in_amd_ci():
+            assert throughput >= 150
+        else:
+            assert throughput >= 210
 
 
 class TestTorchAOForVLM(CustomTestCase):
