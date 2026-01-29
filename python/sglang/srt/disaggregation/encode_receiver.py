@@ -242,7 +242,7 @@ def _determine_tensor_transport_mode(server_args):
         return "cuda_ipc"
 
 
-class BaseMMReceiver(ABC):
+class MMReceiverBase(ABC):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -268,7 +268,7 @@ class BaseMMReceiver(ABC):
         pass
 
 
-class HttpMMReceiver(BaseMMReceiver):
+class MMReceiverHTTP(MMReceiverBase):
 
     def __init__(
         self,
@@ -629,7 +629,7 @@ class HttpMMReceiver(BaseMMReceiver):
 
     # For zmq_to_tokenizer and mooncake
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
-        # Bypass HttpMMReceiver
+        # Bypass MMReceiverHTTP
         if req_id is None:
             return None
 
