@@ -53,7 +53,6 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -105,8 +104,6 @@ class ScatterMode(Enum):
         if is_nsa_enable_prefill_cp():
             return ScatterMode.SCATTERED
 
-        if is_prefill_context_parallel_enabled():
-            return ScatterMode.SCATTERED
         return ScatterMode.TP_ATTN_FULL
 
 
@@ -254,6 +251,12 @@ class LayerScatterModes:
     @classmethod
     def init_new(cls, **kwargs):
         context = _LayerModeComputationContext(**kwargs)
+        print("Layer ID: ", context.layer_id)
+        print("Layer Input Mode: ", cls._compute_layer_input_mode(context))
+        print("Attn Mode: ", ScatterMode.TP_ATTN_FULL)
+        print("MLP Mode: ", cls._compute_mlp_mode(context))
+        print("Middle Residual Mode: ", cls._compute_middle_residual_mode(context))
+        print("Layer Output Mode: ", cls._compute_layer_output_mode(context))
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -271,15 +274,20 @@ class LayerScatterModes:
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
         if context.is_layer_sparse:
-            return (
-                ScatterMode.SCATTERED
-                if (
-                    # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
-                    not get_moe_a2a_backend().is_none()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                )
-                else ScatterMode.FULL
-            )
+            # When using specialized MoE backends (a2a or FP4), they handle token dispatch/combine
+            if (
+                not get_moe_a2a_backend().is_none()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                return ScatterMode.SCATTERED
+
+            # # With Context Parallelism, MoE can process each CP group independently
+            # # No need to gather across CP groups - keep in TP_ATTN_FULL mode
+            # if get_attention_cp_size() > 1:
+            #     return ScatterMode.TP_ATTN_FULL
+
+            # Without CP, use FULL mode (gather across all DP groups)
+            return ScatterMode.FULL
         else:
             return (
                 ScatterMode.SCATTERED
@@ -636,7 +644,7 @@ class CommunicateContext:
             ScatterMode.SCATTERED: 1,
             ScatterMode.TP_ATTN_FULL: attn_tp_size,
             # TODO: support --moe-dense-tp-size > 1
-            ScatterMode.FULL: tp_size,
+            ScatterMode.FULL: tp_size // attn_cp_size,
         }
         return cls(
             process_group_sizes=process_group_sizes,
@@ -917,10 +925,9 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._scatter
 
-        return CommunicateSummableTensorPairFn._trivial
-        # raise NotImplementedError(
-        #     f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
-        # )
+        raise NotImplementedError(
+            f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
+        )
 
     @staticmethod
     def _trivial(
@@ -944,6 +951,8 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
+        print("Hidden States Shape: ", hidden_states.shape)
+        print("Global Hidden States Shape: ", global_hidden_states.shape)
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)

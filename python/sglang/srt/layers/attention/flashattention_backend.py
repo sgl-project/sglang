@@ -845,7 +845,11 @@ class FlashAttentionBackend(AttentionBackend):
 
             # If enable context parallelism, the key cache and value cache are split into multiple parts.
             # We need to allgather the key cache and value cache to get the full cache.
-            if self.attn_cp_size > 1:
+            if (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            ):
                 key_cache_full = key_cache.new_empty(
                     key_cache.shape[0] * self.attn_cp_size, *key_cache.shape[1:]
                 )
@@ -869,11 +873,19 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            if forward_batch.forward_mode.is_context_parallel_extend() and self.attn_cp_size > 1:
-                q_prev, q_next = torch.chunk(q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim), 2, dim=0)
+            if (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            ):
+                q_prev, q_next = torch.chunk(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    2,
+                    dim=0,
+                )
                 # TODO: should fix with multi-batch
                 cu_seqlens_q_split = cu_seqlens_q // 2
-                
+
                 result_prev = flash_attn_with_kvcache(
                     q=q_prev,
                     k_cache=key_cache,
@@ -893,7 +905,7 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
-                
+
                 result_next = flash_attn_with_kvcache(
                     q=q_next,
                     k_cache=key_cache,
@@ -915,6 +927,11 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 result = torch.concat([result_prev, result_next], dim=0)
+                result = result.contiguous()
+                print("DEBUG: result", result.shape, flush=True)
+                print("DEBUG: result_prev", result_prev.shape, flush=True)
+                print("DEBUG: result_next", result_next.shape, flush=True)
+                torch.cuda.synchronize()
 
             else:
                 result = flash_attn_with_kvcache(

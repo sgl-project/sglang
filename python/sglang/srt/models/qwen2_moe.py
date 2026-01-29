@@ -69,9 +69,9 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
-    is_prefill_context_parallel_enabled,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    is_prefill_context_parallel_enabled,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -631,8 +631,12 @@ class Qwen2MoeModel(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        
-        if is_prefill_context_parallel_enabled():
+
+        if (
+            is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -682,7 +686,12 @@ class Qwen2MoeModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if self.pp_group.is_last_rank and is_prefill_context_parallel_enabled():
+        if (
+            self.pp_group.is_last_rank
+            and is_prefill_context_parallel_enabled()
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and forward_batch.attn_cp_metadata is not None
+        ):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.moe_cp_size,

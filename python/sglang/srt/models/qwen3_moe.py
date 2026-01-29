@@ -940,6 +940,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # print("DEBUG: forward", len(input_ids), self.attn_cp_size, forward_batch.forward_mode.is_context_parallel_extend(), is_prefill_context_parallel_enabled(), flush=True)
         if is_prefill_context_parallel_enabled():
             if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(

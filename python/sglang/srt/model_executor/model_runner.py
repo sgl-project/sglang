@@ -675,7 +675,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"tp_size {self.tp_size} must be divisible by ep_size {self.moe_ep_size}"
                 )
-            moe_tp_size = self.tp_size // self.moe_ep_size
+            moe_tp_size = self.tp_size // self.moe_ep_size // self.moe_cp_size
 
             moe_intermediate_size = getattr(
                 self.model_config.hf_text_config, "moe_intermediate_size", None
