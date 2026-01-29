@@ -40,18 +40,19 @@ class RMSNorm(CustomOp):
         var_hidden_size: Optional[int] = None,
     ) -> None:
         self.function_name = "rms_norm"
+        self.variance_size_override = (
+            None if var_hidden_size == hidden_size else var_hidden_size
+        )
+        self.dtype = dtype
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
-        self.variance_size_override = (
-            None if var_hidden_size == hidden_size else var_hidden_size
-        )
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
 
     def use_forward_cuda(self):
-        if self.variance_size_override is not None:
+        if self.variance_size_override is not None and self.dtype != torch.float:
             return self.use_forward_native()
         return super().use_forward_cuda()
 
