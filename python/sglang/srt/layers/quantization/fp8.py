@@ -705,6 +705,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
+        
+        if not self.quant_config.is_checkpoint_fp8_serialized and _use_hip_int4:
+            raise NotImplementedError(f"Online MOE FP8 quantization (is_checkpoint_fp8_serialized={self.quant_config.is_checkpoint_fp8_serialized}) along SGLANG_INT4_WEIGHT=1 is not supported at the moment. Please open an issue.")
 
     @staticmethod
     def is_deepgemm_moe_runner_backend_enabled() -> bool:
@@ -771,7 +774,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
         # WEIGHTS
-        if _is_hip and _use_hip_int4:
+        if (_is_hip and _use_hip_int4):
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -1111,7 +1114,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
             return
-    
+
         if not self.quant_config.is_checkpoint_fp8_serialized:
             # Online quantization already happened during weight loading via get_online_weight_loader.
             assert layer.w13_weight.dtype == fp8_dtype
