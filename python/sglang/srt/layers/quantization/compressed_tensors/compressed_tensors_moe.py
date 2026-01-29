@@ -32,6 +32,9 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+    FlashInferTrtllmFp8MoeQuantInfo,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -51,6 +54,7 @@ from sglang.srt.layers.quantization.utils import (
     prepare_static_weights_for_trtllm_fp4_moe,
     reorder_w1w3_to_w3w1,
     replace_parameter,
+    swap_w13_to_w31,
     swizzle_blockscale,
 )
 from sglang.srt.utils import (
@@ -575,6 +579,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
 
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
+        self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
         self.weight_quant = self.quant_config.target_scheme_map["Linear"].get("weights")
         self.input_quant = self.quant_config.target_scheme_map["Linear"].get(
             "input_activations"
@@ -836,11 +841,27 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
                 torch.cuda.empty_cache()
 
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.BLOCK
+            and self.use_flashinfer_trtllm
+        ):
+            layer.w13_weight = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight.data),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale = torch.nn.Parameter(
+                swap_w13_to_w31(layer.w13_weight_scale.data),
+                requires_grad=False,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply(
         self,
@@ -889,16 +910,31 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-                block_shape=self.weight_block_size,
-            )
+            if self.use_flashinfer_trtllm:
+                quant_info = FlashInferTrtllmFp8MoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    global_num_experts=layer.num_experts,
+                    local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                    local_num_experts=layer.num_local_experts,
+                    intermediate_size=layer.w2_weight.shape[2],
+                    routing_method_type=layer.routing_method_type,
+                    block_quant=self.block_quant,
+                    weight_block_k=self.quant_config.weight_block_size[1],
+                    w13_weight_scale_inv=layer.w13_weight_scale,
+                    w2_weight_scale_inv=layer.w2_weight_scale,
+                )
+            else:
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8_w8a8=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    a13_scale=layer.w13_input_scale,
+                    a2_scale=layer.w2_input_scale,
+                    block_shape=self.weight_block_size,
+                )
             return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
@@ -913,6 +949,81 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return self.runner.run(dispatch_output, quant_info)
+
+    # def apply_with_router_logits(
+    #     self,
+    #     layer: torch.nn.Module,
+    #     dispatch_output: StandardDispatchOutput,
+    # ) -> torch.Tensor:
+    #     assert self.use_flashinfer_trtllm
+    #     assert self.weight_quant.strategy == QuantizationStrategy.BLOCK
+
+    #     x = dispatch_output.hidden_states
+    #     topk_output = dispatch_output.topk_output
+
+    #     from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+
+    #     from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    #     router_logits = topk_output.router_logits
+    #     topk_config = topk_output.topk_config
+
+    #     a_q, a_sf = per_token_group_quant_fp8(x, self.quant_config.weight_block_size[1])
+    #     # NOTE: scales of hidden states have to be transposed!
+    #     a_sf_t = a_sf.t().contiguous()
+
+    #     correction_bias = (
+    #         None
+    #         if topk_config.correction_bias is None
+    #         else topk_config.correction_bias.to(x.dtype)
+    #     )
+
+    #     assert layer.routing_method_type is not None
+
+    #     # DeepSeekV3 style routing requires float32 router logits
+    #     if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
+    #         router_logits = router_logits.to(torch.float32)
+
+    #     routed_scaling_factor = self.moe_runner_config.routed_scaling_factor
+    #     routed_scaling_factor = (
+    #         routed_scaling_factor if routed_scaling_factor is not None else 1.0
+    #     )
+
+    #     n_group = topk_config.num_expert_group
+    #     topk_group = topk_config.topk_group
+    #     if n_group == 1 and topk_group == 1:
+    #         n_group = None
+    #         topk_group = None
+
+    #     with use_symmetric_memory(
+    #         get_tp_group(), disabled=not is_allocation_symmetric()
+    #     ):
+
+    #         # FIXME: there is a bug in the trtllm_fp8_block_scale_moe.
+    #         # It ignored the `output`` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
+    #         # so we put the whole function under the ``use_symmetric_memory`` context manager.
+    #         # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+    #         return trtllm_fp8_block_scale_moe(
+    #             routing_logits=router_logits,
+    #             routing_bias=correction_bias,
+    #             hidden_states=a_q,
+    #             hidden_states_scale=a_sf_t,
+    #             gemm1_weights=layer.w13_weight,
+    #             gemm1_weights_scale=layer.w13_weight_scale,
+    #             gemm2_weights=layer.w2_weight,
+    #             gemm2_weights_scale=layer.w2_weight_scale,
+    #             num_experts=layer.num_experts,
+    #             top_k=topk_config.top_k,
+    #             n_group=n_group,
+    #             topk_group=topk_group,
+    #             intermediate_size=layer.intermediate_size_per_partition,
+    #             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+    #             local_num_experts=layer.num_local_experts,
+    #             routed_scaling_factor=routed_scaling_factor,
+    #             tile_tokens_dim=None,
+    #             routing_method_type=layer.routing_method_type,
+    #             tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+    #         )
 
 
 class NPUCompressedTensorsW8A8Int8DynamicMoEMethod(CompressedTensorsMoEMethod):
