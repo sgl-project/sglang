@@ -351,6 +351,7 @@ class TopK(MultiPlatformOp):
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
             expert_location_dispatch_info=expert_location_dispatch_info,
+            layer_id=self.layer_id,
         )
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
