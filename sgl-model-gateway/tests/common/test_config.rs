@@ -66,6 +66,7 @@ impl TestRouterConfig {
                 1.5,  // balance_rel_threshold
                 60,   // eviction_interval_secs
                 1000, // max_tree_size
+                1,    // mesh_sync_interval_secs
             )
             .host(defaults::HOST)
             .port(port)
