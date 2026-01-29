@@ -7,7 +7,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "sgl-kernel-cpu"
+name = "sglang-kernel-cpu"
 version = "0.3.21"
 description = "Kernel Library for SGLang"
 readme = "README.md"
