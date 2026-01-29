@@ -122,6 +122,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "zigzag_attn",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",

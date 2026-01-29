@@ -80,6 +80,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import (
     maybe_executor_submit,
@@ -329,7 +330,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     q_lora_rank=config.q_lora_rank,
                     kv_lora_rank=config.kv_lora_rank,
                     rope_theta=config.rope_theta,
-                    rope_scaling=None,
+                    rope_scaling=getattr(config, "rope_scaling", None),
                     max_position_embeddings=config.max_position_embeddings,
                     quant_config=(
                         None
@@ -507,6 +508,7 @@ class LongcatFlashModel(nn.Module):
         )
 
         self.alt_stream = torch.cuda.Stream()
+        # config.num_hidden_layers = 3; self.start_layer=0; self.end_layer=3
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
@@ -881,6 +883,16 @@ class LongcatFlashForCausalLM(nn.Module):
             weight_names = []
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
+                    continue
                 if "mtp" in name:
                     continue
                 weight_names.append(name)
