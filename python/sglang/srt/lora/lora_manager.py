@@ -71,7 +71,7 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
-        self.lora_added_tokens_size: Optional[int] = None
+        self.lora_added_tokens_size: int = 0
         self.enable_lora_overlap_loading: Optional[bool] = (
             server_args.enable_lora_overlap_loading
         )
@@ -133,14 +133,7 @@ class LoRAManager:
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
-
-            if (
-                new_adapter.lora_added_tokens_size > 0
-                and self.lora_added_tokens_size == 0
-            ):
-                self.lora_added_tokens_size = new_adapter.lora_added_tokens_size
-                self.init_memory_pool()
-
+            self._maybe_update_added_tokens_size(new_adapter)
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -426,23 +419,6 @@ class LoRAManager:
                 default=0,
             )
 
-        # Auto-infer self.lora_added_tokens_size from loaded LoRA configs
-        # This happens automatically without requiring user input
-        if self.lora_added_tokens_size is None:
-            inferred_extra_vocab_size = next(
-                (
-                    x.lora_added_tokens_size
-                    for x in self.configs.values()
-                    if x.lora_added_tokens_size > 0
-                ),
-                0,
-            )
-            if inferred_extra_vocab_size > 0:
-                logger.info(
-                    f"self.lora_added_tokens_size={inferred_extra_vocab_size} from LoRA adapters."
-                )
-            self.lora_added_tokens_size = inferred_extra_vocab_size
-
     def load_lora_weights(self, lora_ref: LoRARef):
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.
@@ -497,6 +473,7 @@ class LoRAManager:
 
         try:
             new_adapter = LoRAConfig.from_dict(config_dict, added_tokens_config)
+            self._maybe_update_added_tokens_size(new_adapter)
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
@@ -529,6 +506,19 @@ class LoRAManager:
 
         # Initializing memory pool with base model
         self.fetch_new_loras({None})
+
+    def _maybe_update_added_tokens_size(self, new_config: LoRAConfig):
+        if new_config.lora_added_tokens_size == 0 or self.lora_added_tokens_size > 0:
+            return
+
+        self.lora_added_tokens_size = new_config.lora_added_tokens_size
+        logger.info(
+            f"self.lora_added_tokens_size={self.lora_added_tokens_size} from LoRA adapters."
+        )
+
+        # Some LoRA adapters are loaded before the memory pool is initialized
+        if getattr(self, "memory_pool"):
+            self.init_memory_pool()
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)
