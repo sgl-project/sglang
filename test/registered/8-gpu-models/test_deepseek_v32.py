@@ -17,6 +17,11 @@ BASE_ARGS = [
     '{"enable_multithread_load": true}',
 ]
 
+TOOL_CALL_ARGS = [
+    "--tool-call-parser=deepseekv32",
+    "--reasoning-parser=deepseek-v3",
+]
+
 DP_ARGS = [
     "--tp=8",
     "--dp=8",
@@ -55,28 +60,28 @@ class TestDeepseekV32(unittest.TestCase):
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS,
                 variant="DP8",
             ),
             # Variant: "dp+mtp" - DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
                 variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + TP_ARGS,
+                extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS,
                 variant="TP8",
             ),
             # Variant: "tp+mtp" - Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + TP_ARGS + MTP_ARGS,
+                extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
                 variant="TP8+MTP",
             ),
         ]
@@ -91,6 +96,7 @@ class TestDeepseekV32(unittest.TestCase):
                 batch_sizes=[1, 8, 16, 64],
                 profile_dir="performance_profiles_deepseek_v32",
             ),
+            tool_call_params=ToolCallTestParams(test_thinking=True),
         )
 
     @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
@@ -185,42 +191,6 @@ class TestDeepseekV32(unittest.TestCase):
                 repeat=4,
             ),
             performance_params=None,  # Skip performance test for GPQA
-        )
-
-    def test_deepseek_v32_tool_call(self):
-        """Test tool call accuracy for DeepSeek V3.2, non-MTP and MTP."""
-        TOOL_CALL_ARGS = [
-            "--tool-call-parser=deepseekv32",
-            "--reasoning-parser=deepseek-v3",
-        ]
-        MTP_ARGS = [
-            "--speculative-algorithm=EAGLE",
-            "--speculative-num-steps=3",
-            "--speculative-eagle-topk=1",
-            "--speculative-num-draft-tokens=4",
-            "--mem-frac=0.7",
-        ]
-
-        variants = [
-            ModelLaunchSettings(
-                DEEPSEEK_V32_MODEL_PATH,
-                tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS,
-                variant="DP8",
-            ),
-            ModelLaunchSettings(
-                DEEPSEEK_V32_MODEL_PATH,
-                tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
-                variant="DP8+MTP",
-            ),
-        ]
-
-        run_combined_tests(
-            models=variants,
-            test_name="DeepSeek-V3.2 Tool Call",
-            tool_call_params=ToolCallTestParams(test_thinking=True),
         )
 
 
