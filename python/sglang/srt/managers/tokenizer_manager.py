@@ -48,6 +48,7 @@ from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
+    AbortReqACK,
     BatchFinishReqACK,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
@@ -2158,6 +2159,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             "meta_info": meta_info,
         }
         state.out_list.append(out)
+        # [Failover] Notify DP controller to cleanup inflight index
+        try:
+            self.send_to_scheduler.send_pyobj(AbortReqACK(rid=recv_obj.rid))
+        except Exception as e:
+            logger.error(f"Failed to send abort ack for {recv_obj.rid}: {e}")
         state.event.set()
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):

@@ -1903,3 +1903,8 @@ _check_all_req_types()
 class BatchFinishReqACK:
     dp_rank: int
     rids: List[str]
+
+
+@dataclass
+class AbortReqACK(BaseReq):
+    rid: str
