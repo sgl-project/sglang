@@ -940,9 +940,11 @@ class ModelConfig:
         needs_tf_v5 = is_glm_46vmoe
 
         tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0dev0")
+        # Accept any version >= 5.0.0 (including dev, rc, and release versions)
+        required_major_minor = (5, 0)
+        tf_major_minor = (tf_version.major, tf_version.minor)
 
-        if tf_version < required_version:
+        if tf_major_minor < required_major_minor:
             if needs_tf_v5:
                 raise ValueError(
                     f"Transformers version {tf_version_str} is not supported for model {self.model_path} "
