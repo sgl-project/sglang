@@ -1095,10 +1095,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 k_for_kernel = l2norm_fwd(k_for_kernel)
                 # FlashInfer expects alpha in probability space, not log space.
                 g_for_kernel = (
-                    g.squeeze(0).to(torch.float32, copy=False).exp().contiguous()
+                    g.squeeze(0).to(torch.float32, copy=False).exp()
                 )
                 beta_for_kernel = (
-                    beta.squeeze(0).to(torch.float32, copy=False).contiguous()
+                    beta.squeeze(0).to(torch.float32, copy=False)
                 )
                 # FlashInfer expects state in [N, H, K, V] (k-major) layout.
                 # SGLang stores state as [N, H, V, K], so transpose before/after.
@@ -1112,7 +1112,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     initial_state=initial_state,
                     output_final_state=True,
                     cu_seqlens=query_start_loc.to(torch.int64),
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=False,
                 )
                 output_state = output_state.transpose(-1, -2).contiguous()
                 ssm_states[cache_indices] = output_state.to(
