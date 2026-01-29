@@ -53,19 +53,22 @@ def _openai_client(port: int) -> OpenAI:
 
 
 def _build_server_extra_args(case: DiffusionTestCase) -> str:
+    server_args = case.server_args
     a = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    a += f" --num-gpus {case.server_args.num_gpus}"
-    if case.server_args.tp_size is not None:
-        a += f" --tp-size {case.server_args.tp_size}"
-    if case.server_args.ulysses_degree is not None:
-        a += f" --ulysses-degree {case.server_args.ulysses_degree}"
-    if case.server_args.dit_layerwise_offload:
+    a += f" --num-gpus {server_args.num_gpus}"
+    if server_args.tp_size is not None:
+        a += f" --tp-size {server_args.tp_size}"
+    if server_args.ulysses_degree is not None:
+        a += f" --ulysses-degree {server_args.ulysses_degree}"
+    if server_args.dit_layerwise_offload:
         a += " --dit-layerwise-offload true"
-    if case.server_args.ring_degree is not None:
-        a += f" --ring-degree {case.server_args.ring_degree}"
-    if case.server_args.lora_path:
-        a += f" --lora-path {case.server_args.lora_path}"
-    if case.server_args.enable_warmup:
+    if server_args.dit_offload_prefetch_size:
+        a += f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+    if server_args.ring_degree is not None:
+        a += f" --ring-degree {server_args.ring_degree}"
+    if server_args.lora_path:
+        a += f" --lora-path {server_args.lora_path}"
+    if server_args.enable_warmup:
         a += " --enable-warmup"
     return a
 

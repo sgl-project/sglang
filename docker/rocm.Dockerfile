@@ -1,29 +1,18 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
+
 # Default base images
-ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
-ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
 
 # ===============================
-# Base image 942 with rocm630 and args
+# Base image 942 with rocm700 and args
 FROM $BASE_IMAGE_942 AS gfx942
-ENV BUILD_VLLM="0"
-ENV BUILD_TRITON="1"
-ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="1"
-ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.4"
-
-# ===============================
-# Base image 942 and args
-FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
@@ -70,6 +59,16 @@ ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
 ARG FHT_COMMIT="46efb7d776d38638fc39f3c803eaee3dd7016bd1"
+
+ARG ENABLE_MORI=0
+ARG NIC_BACKEND=none
+
+ARG MORI_REPO="https://github.com/ROCm/mori.git"
+ARG MORI_COMMIT="b0dce4beebeb1f26c784eee17d5fd9785ee9447f"
+
+# AMD AINIC apt repo settings
+ARG AINIC_VERSION=1.117.5
+ARG UBUNTU_CODENAME=jammy
 USER root
 
 # Install some basic utilities
@@ -109,7 +108,7 @@ RUN cd aiter \
         fi
 
 # -----------------------
-# Triton
+# Triton (TODO: remove this after Triton is no longer needed)
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         pip uninstall -y triton \
      && git clone ${TRITON_REPO} \
@@ -184,7 +183,7 @@ RUN git clone ${SGL_REPO} \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
          python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip,diffusion_hip]"; \
+         python -m pip --no-cache-dir install -e "python[all_hip]"; \
        fi
 
 RUN python -m pip cache purge
@@ -293,6 +292,73 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 RUN python3 -m pip install --no-cache-dir \
     py-spy \
     pre-commit
+
+# -----------------------
+# MORI (optional)
+RUN /bin/bash -lc 'set -euo pipefail; \
+  if [ "${ENABLE_MORI}" != "1" ]; then \
+    echo "[MORI] Skipping (ENABLE_MORI=${ENABLE_MORI})"; \
+    exit 0; \
+  fi; \
+  echo "[MORI] Enabling MORI (NIC_BACKEND=${NIC_BACKEND})"; \
+  \
+  # Base deps for MORI build
+  apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      g++ \
+      jq \
+      libopenmpi-dev \
+      libpci-dev \
+      initramfs-tools \
+  && rm -rf /var/lib/apt/lists/*; \
+  \
+  # NIC backend deps
+  case "${NIC_BACKEND}" in \
+    # default: mlx5
+    none) \
+      export USE_IONIC="OFF"; \
+      export USE_BNXT="OFF"; \
+      ;; \
+    # AMD NIC
+    ainic) \
+      export USE_IONIC="ON"; \
+      export USE_BNXT="OFF"; \
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
+      rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
+      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/amdainic.list; \
+      apt-get update && apt-get install -y --no-install-recommends \
+          libionic-dev \
+          ionic-common \
+      ; \
+      rm -rf /var/lib/apt/lists/*; \
+      ;; \
+    # TODO: Add Broadcom bnxt packages/repos here later.
+    # bnxt) \
+    #   export USE_IONIC="OFF"; \
+    #   export USE_BNXT="ON"; \
+    #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
+    #   ;; \
+    *) \
+      echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
+      exit 2; \
+      ;; \
+  esac; \
+  \
+  # Build/install MORI
+  export MORI_GPU_ARCHS="${GPU_ARCH_LIST}"; \
+  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} USE_IONIC=${USE_IONIC} USE_BNXT=${USE_BNXT}"; \
+  rm -rf /sgl-workspace/mori; \
+  git clone "${MORI_REPO}" /sgl-workspace/mori; \
+  cd /sgl-workspace/mori; \
+  git checkout "${MORI_COMMIT}"; \
+  git submodule update --init --recursive; \
+  python3 setup.py develop; \
+  python3 -c "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))" > /etc/ld.so.conf.d/torch.conf; \
+  ldconfig; \
+  echo "export PYTHONPATH=/sgl-workspace/mori:\${PYTHONPATH}" >> /etc/bash.bashrc; \
+  echo "[MORI] Done."'
 
 # -----------------------
 # Performance environment variable.
