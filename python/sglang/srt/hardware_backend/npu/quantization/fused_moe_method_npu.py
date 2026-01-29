@@ -13,103 +13,11 @@ if TYPE_CHECKING:
     )
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-
-def npu_fused_experts(
-    hidden_states: torch.Tensor,
-    w13: torch.Tensor,
-    w13_scale: torch.Tensor,
-    w2: torch.Tensor,
-    w2_scale: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    top_k: int,
-    **kwargs,
-):
-    w13_offset = kwargs.get("w13_offset", None)
-    w2_offset = kwargs.get("w2_offset", None)
-    use_wna16 = kwargs.get("use_wna16", False)
-
-    original_shape = hidden_states.shape
-    original_dtype = hidden_states.dtype
-    scale_dtype = original_dtype if original_dtype == torch.bfloat16 else torch.float32
-    if len(original_shape) == 3:
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-    num_tokens = hidden_states.shape[0]
-    num_experts = w13.shape[0]
-    row_idx_len = num_tokens * top_k
-    row_idx = (
-        torch.arange(0, row_idx_len, dtype=torch.int32, device=topk_weights.device)
-        .view(top_k, -1)
-        .permute(1, 0)
-        .contiguous()
-    )
-    hidden_states, expanded_row_idx, expanded_expert_idx = (
-        torch.ops.npu.npu_moe_init_routing(
-            hidden_states, row_idx=row_idx, expert_idx=topk_ids, active_num=num_tokens
-        )
-    )
-    expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
-        expanded_expert_idx, num_experts
-    )
-    expert_tokens = expert_tokens.to(torch.int64)
-    # gmm1: gate_up_proj
-    if not use_wna16:
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-        scale_args13 = {
-            "scale": [w13_scale.to(scale_dtype)],
-            "per_token_scale": [pertoken_scale],
-        }
-    else:
-        scale_args13 = {
-            "antiquant_scale": [w13_scale],
-            "antiquant_offset": [w13_offset],
-        }
-
-    hidden_states = torch.ops.npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w13],
-        **scale_args13,
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )[0]
-    # act_fn: swiglu
-    hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-    if not use_wna16:
-        hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-
-        scale_args2 = {
-            "scale": [w2_scale.to(scale_dtype)],
-            "per_token_scale": [pertoken_scale],
-        }
-    else:
-        scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
-    # gmm2: down_proj
-    hidden_states = torch.ops.npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[w2],
-        **scale_args2,
-        split_item=2,
-        group_list_type=0,
-        group_type=0,
-        group_list=expert_tokens,
-        output_dtype=original_dtype,
-    )[0]
-
-    final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
-        hidden_states,
-        skip1=None,
-        skip2=None,
-        bias=None,
-        scales=topk_weights,
-        expanded_src_to_dst_row=expanded_row_idx,
-        export_for_source_row=topk_ids,
-    )
-    if len(original_shape) == 3:
-        final_hidden_states = final_hidden_states.view(original_shape)
-    return final_hidden_states
+from sglang.srt.hardware_backend.npu.moe.torch_npu_kernels import (
+    TorchNpuKernelsQuantInfo,
+)
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
 
 def npu_fused_moe_without_routing_weights_bf16(
@@ -165,36 +73,40 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
                 layer.w13_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
+        else:
+            layer.w13_weight_offset = None
         if hasattr(layer, "w2_weight_offset"):
             layer.w2_weight_offset = torch.nn.Parameter(
                 layer.w2_weight_offset.data.squeeze(-1),
                 requires_grad=False,
             )
+        else:
+            layer.w2_weight_offset = None
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU_KERNELS
+        self.runner = MoeRunner(backend, moe_runner_config)            
 
     def apply(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, _ = topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_weight,
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuKernelsQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale,
-            w2=layer.w2_weight,
             w2_scale=layer.w2_weight_scale,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
+            w13_offset=layer.w13_weight_offset,
+            w2_offset=layer.w2_weight_offset,
         )
-        return StandardCombineInput(hidden_states=output)
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
         self,
@@ -263,15 +175,13 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         n = n * 2
         per_group_scale = per_group_scale.reshape(group_num, -1, n)
         group_num, quantgroup_num, n = per_group_scale.shape
-        bias = None
 
         scale_fp32 = (scale * per_group_scale).to(torch.float16).to(torch.float32)
         scale_fp32_np = scale_fp32.cpu().numpy()
         scale_fp32_np.dtype = np.uint32
+
         sscale_uint64 = np.zeros((group_num, quantgroup_num, n * 2), dtype=np.uint32)
-
         sscale_uint64[..., ::2] = scale_fp32_np
-
         sscale_uint64_buffer = np.frombuffer(
             sscale_uint64.tobytes(), dtype=np.int64
         ).copy()
@@ -279,9 +189,9 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             group_num, quantgroup_num, n
         )
         sscale_uint64_tensor = sscale_uint64_tensor.npu()
-        return sscale_uint64_tensor, bias
+        return sscale_uint64_tensor
 
-    def _update_bias(self, layer, w13_bias, w2_bias):
+    def _update_bias(self, layer):
         layer.w13_scale_bias.data = (
             layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
         )
@@ -330,13 +240,13 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             if hasattr(layer, "w2_weight_scale_second")
             else None
         )
-        layer.w13_weight_scale.data, w13_bias = self._process_scale(
+        layer.w13_weight_scale.data, layer.w13_bias = self._process_scale(
             layer.w13_weight,
             layer.w13_weight_scale.data,
             w13_weight_scale_second,
             is_per_channel_weight,
         )
-        layer.w2_weight_scale.data, w2_bias = self._process_scale(
+        layer.w2_weight_scale.data, layer.w2_bias = self._process_scale(
             layer.w2_weight,
             layer.w2_weight_scale.data,
             w2_weight_scale_second,
@@ -346,10 +256,8 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             # scale_second is no longer used, release this part of the memory
             del layer.w13_weight_scale_second
             del layer.w2_weight_scale_second
-            del layer.w13_weight_offset_second
-            del layer.w2_weight_offset_second
 
-        self._update_bias(layer, w13_bias, w2_bias)
+        self._update_bias(layer)
 
     def _process_weights_with_clip(self, layer: torch.nn.Module) -> None:
         w13_weight_scale = (
@@ -365,89 +273,30 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w13_scale_bias = layer.w13_bias
         layer.w2_scale_bias = layer.w2_bias
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = MoeRunnerBackend.TORCH_NPU_KERNELS
+        self.runner = MoeRunner(backend, moe_runner_config)
+
     def apply(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        hidden_states = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, _ = topk_output
-        top_k = topk_ids.shape[1]
-        group_list_type = 1
-        original_shape = hidden_states.shape
-        topk_weights = topk_weights
-
-        num_tokens = hidden_states.shape[:-1].numel()
-
-        first_expert_idx = 0
-        last_expert_idx = layer.num_experts
-        global_num_experts = layer.num_experts
-
-        sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
-                hidden_states,
-                topk_ids,
-                active_num=num_tokens * top_k,
-                expert_num=global_num_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[first_expert_idx, last_expert_idx],
-                quant_mode=1,
-            )
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuKernelsQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w2_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            w13_scale_bias=layer.w13_scale_bias,
+            w2_scale_bias=layer.w2_scale_bias,
         )
-
-        expert_tokens = expert_tokens.to(torch.int64)
-
-        bias1 = [layer.w13_scale_bias]
-        bias2 = [layer.w2_scale_bias]
-        w1_scale = [layer.w13_weight_scale]
-        w2_scale = [layer.w2_weight_scale]
-        _output_dtype = torch.bfloat16
-
-        hidden_states = torch.ops.npu.npu_grouped_matmul(
-            x=[sorted_hidden_states],
-            weight=[layer.w13_weight],
-            scale=w1_scale,
-            bias=bias1,
-            per_token_scale=[pertoken_scale],
-            group_list=expert_tokens,
-            split_item=2,
-            group_type=0,
-            group_list_type=group_list_type,
-            output_dtype=_output_dtype,
-        )[0]
-
-        # act_fn: swiglu
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
-        hidden_states, swiglu_out_scale = torch.ops.npu.npu_dynamic_quant(hidden_states)
-
-        output = torch.ops.npu.npu_grouped_matmul(
-            x=[hidden_states],
-            weight=[layer.w2_weight],
-            scale=w2_scale,
-            bias=bias2,
-            per_token_scale=[swiglu_out_scale],
-            group_list=expert_tokens,
-            split_item=2,
-            group_type=0,
-            group_list_type=group_list_type,
-            output_dtype=_output_dtype,
-        )[0]
-
-        assert original_shape is not None
-        final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
-            permuted_tokens=output,
-            sorted_indices=torch.abs(expanded_row_idx),
-            probs=topk_weights,
-        )
-        if len(original_shape) == 3:
-            final_hidden_states = final_hidden_states.view(original_shape)
-
-        return StandardCombineInput(hidden_states=final_hidden_states)
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
         self,
@@ -626,28 +475,16 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-
-        topk_weights, topk_ids, _ = topk_output
-        topk_ids = topk_ids.to(torch.int32)
-        topk_weights = topk_weights.to(x.dtype)
-        output = npu_fused_experts(
-            hidden_states=x,
-            w13=layer.w13_weight,
+        backend = self.runner.runner_backend
+        quant_info = TorchNpuKernelsQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             w13_scale=layer.w13_weight_scale,
-            w13_offset=layer.w13_weight_offset,
-            w2=layer.w2_weight,
             w2_scale=layer.w2_weight_scale,
-            w2_offset=layer.w2_weight_offset,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            top_k=topk_ids.shape[1],
-            use_wna16=True,
+            w13_bias=layer.w13_offset,
+            w2_offset=layer.w2_offset,
         )
-        return StandardCombineInput(hidden_states=output)
+        return self.runner.run(dispatch_output, quant_info)
 
     def apply_without_routing_weights(
         self,
