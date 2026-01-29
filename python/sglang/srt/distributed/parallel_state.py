@@ -64,6 +64,21 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+if _is_npu:
+
+    def _get_npu_hccl_pg_options():
+        """Helper to create ProcessGroupHCCL options for NPU."""
+        import torch_npu
+
+        options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+        hccl_buffer_size = int(
+            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+            or os.environ.get("HCCL_BUFFSIZE")
+            or 200
+        )
+        options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+        return options
+
 
 @dataclass
 class GraphCaptureContext:
@@ -268,8 +283,12 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
                 )
             else:
+                if _is_npu and group_name != "attention_tp":
+                    pg_options = _get_npu_hccl_pg_options()
+                else:
+                    pg_options = None
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks, backend=torch_distributed_backend, pg_options=pg_options
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -1505,6 +1524,11 @@ def init_distributed_environment(
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
 
+        if _is_npu:
+            pg_options = _get_npu_hccl_pg_options()
+        else:
+            pg_options = None
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1512,6 +1536,7 @@ def init_distributed_environment(
             world_size=world_size,
             rank=rank,
             timeout=timeout,
+            pg_options=pg_options,
         )
 
     # set the local rank
