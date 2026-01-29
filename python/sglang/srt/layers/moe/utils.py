@@ -63,6 +63,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    SONIC_MOE = "sonic_moe"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -93,6 +94,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_sonic_moe(self):
+        return self == MoeRunnerBackend.SONIC_MOE
 
 
 class DeepEPMode(Enum):
