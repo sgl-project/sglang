@@ -19,9 +19,6 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
-    Ernie4_5_MoeConfig,
-)
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -43,6 +40,9 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.utils import add_prefix, make_layers
+from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
+    Ernie4_5_MoeConfig,
+)
 
 
 class MoEGate(nn.Module):
@@ -155,8 +155,8 @@ class Ernie4DecoderLayer(nn.Module):
         is_mtp: bool = False,
     ):
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         # Self attention.
         self.self_attn = Ernie4Attention(

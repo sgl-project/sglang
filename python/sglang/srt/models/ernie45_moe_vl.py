@@ -20,7 +20,6 @@ from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -44,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -368,8 +368,8 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        rope_theta = getattr(config, "rope_theta", 500000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 500000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         freq_allocation = getattr(config, "freq_allocation", 20)
         max_position_embeddings = getattr(config, "max_position_embeddings", 131072)

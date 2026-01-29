@@ -3,7 +3,6 @@ from typing import Optional
 
 import torch
 from torch import nn
-from transformers import PersimmonConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
@@ -24,6 +23,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import PersimmonConfig
 
 
 class PersimmonMLP(nn.Module):
@@ -65,7 +65,7 @@ class PersimmonAttention(nn.Module):
         self.num_heads = self.total_num_heads // tensor_parallel_world_size
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.partial_rotary_factor = config.partial_rotary_factor
         self.is_causal = True
 
