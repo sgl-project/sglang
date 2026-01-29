@@ -11,8 +11,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.utils import is_npu
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
