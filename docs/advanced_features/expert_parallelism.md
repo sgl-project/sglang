@@ -20,7 +20,7 @@ SGLang's EP integrates diverse, highly efficient backends for different use case
 
 DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
 
-Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
+Currently, `deepep`, `mooncake`, `ascend_fuseep` and `flashinfer` only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
 
 ### Backends for MoE Computation
 
@@ -155,3 +155,28 @@ For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 p
 --speculative-moe-runner-backend triton \
 ...
 ```
+
+
+## Ascend NPU Guidance
+
+Guidance on SGLang configuration in Ascend NPU:
+- `--moe-a2a-backend` only support `deepep` and `ascend_fuseep` backends,
+  - `deepep`: mechanism are consistent with the above description.
+  - `ascend_fuseep`: only used for decode stage in PD Disaggregation Mode. DeepEP Ascend offers a fused operator `fused_deep_moe` which integrates all operations between dispatch and combine to boost MoE computation.
+- `--moe-runner-backend` parameter does not need to be configured.
+- `--deepep-mode`:
+  - In PD mixed mode, please set `--deepep-mode auto`.
+  - In PD Disaggregation Mode, prefill instance sets `--deepep-mode normal`, and decode instance sets `--deepep-mode low_latency`.
+
+Environment variables on DeepEP Ascend configuration in Ascend NPU:
+- `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS`: the maximum number of rounds for token transmission, default 1. Indicates the maximum number of tokens in a prefill batch `--chunked-prefill-size`.
+- `DEEPEP_NORMAL_LONG_SEQ_ROUND`: the number of tokens sent per round, default 8192. Indicates the maximum number of chunks for single request while enabling chunked prefill.
+- `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`: whether ant-moving is enabled in combine stage, default disabled.
+
+DeepEP backends support two modes for token dispatch: `normal` and `low_latency` mode. Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime.
+- `--deepep-mode normal`:
+  - `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=0`: the maximum supported value for `--chunked-prefill-size` is 8192. (In other words, the maximum number of tokens in a prefill batch is 8192)
+  - `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1`: the maximum supported value for `--chunked-prefill-size` is 65536. (In other words, the maximum number of tokens in a prefill batch is 65536)
+- `--deepep-mode low_latency`: the maximum number of requests in a decode batch is 512. (In other words, the maximum number of batch size in a decode batch is 512)
+
+
