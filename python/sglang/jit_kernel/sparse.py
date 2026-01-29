@@ -19,9 +19,7 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
 ) -> Module:
-    args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla
-    )
+    args = make_cpp_args(item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla)
     return load_jit(
         "sparse_cache",
         *args,
@@ -45,6 +43,7 @@ def load_cache_to_device_buffer_mla(
     req_pool_indices: torch.Tensor,
     sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
     transfer_tasks_src: torch.Tensor,
     transfer_tasks_dst: torch.Tensor,
     page_size: int,
@@ -88,6 +87,7 @@ def load_cache_to_device_buffer_mla(
         req_pool_indices,
         sparse_mask,
         seq_lens,
+        lru_slots,
         transfer_tasks_src,
         transfer_tasks_dst,
         page_size,
@@ -111,6 +111,7 @@ def load_cache_to_device_buffer(
     req_pool_indices: torch.Tensor,
     sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
+    lru_slots: torch.Tensor,
     transfer_tasks_src: torch.Tensor,
     transfer_tasks_dst: torch.Tensor,
     page_size: int,
@@ -151,6 +152,7 @@ def load_cache_to_device_buffer(
         req_pool_indices,
         sparse_mask,
         seq_lens,
+        lru_slots,
         transfer_tasks_src,
         transfer_tasks_dst,
         page_size,

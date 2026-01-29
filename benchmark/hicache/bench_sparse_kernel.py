@@ -643,7 +643,7 @@ def setup_jit_kernel(
     )
 
     lru_slots = (
-        torch.arange(top_k, dtype=torch.int16, device="cuda")
+        torch.arange(top_k * 2, dtype=torch.int16, device="cuda")
         .unsqueeze(0)
         .expand(request_pool_size, num_layers, -1)
         .contiguous()
@@ -782,6 +782,7 @@ def execute_jit_kernel(context):
         req_pool_indices=context["req_pool_indices"],
         sparse_mask=context["sparse_mask"],
         seq_lens=context["seq_lens"],
+        lru_slots=context["lru_slots"],
         transfer_tasks_src=context["transfer_tasks_src"],
         transfer_tasks_dst=context["transfer_tasks_dst"],
         page_size=context["page_size"],
@@ -789,7 +790,7 @@ def execute_jit_kernel(context):
         item_size_bytes=context["item_size_bytes"],
         block_size=context["block_size"],
         num_top_k=context["top_k"],
-        hot_buffer_size=context["top_k"],
+        hot_buffer_size=context["top_k"] * 2,
     )
 
 
