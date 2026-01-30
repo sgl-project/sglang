@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import pickle
 import random
 import threading
@@ -19,6 +18,7 @@ from transformers import PretrainedConfig
 
 import grpc
 
+from sglang.srt.environ import envs
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
@@ -75,7 +75,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 
 
 def _grpc_encode_request(target, encode_request):
-    timeout_secs = int(os.getenv("SGLANG_ENCODER_GRPC_TIMEOUT_SECS", "60"))
+    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
@@ -98,7 +98,7 @@ def _grpc_encode_request(target, encode_request):
 
 
 def _grpc_send_request(target, request_json):
-    timeout_secs = int(os.getenv("SGLANG_ENCODER_GRPC_TIMEOUT_SECS", "60"))
+    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
