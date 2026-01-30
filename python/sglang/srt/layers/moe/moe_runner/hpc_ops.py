@@ -71,6 +71,10 @@ class HpcOpsRunnerCore(MoeRunnerCore):
         assert self.config.activation == "silu"
         assert self.config.is_gated
 
+    @property
+    def runner_backend(self) -> MoeRunnerBackend:
+        return MoeRunnerBackend.HPC_OPS
+
     def run(
         self,
         runner_input: HpcOpsRunnerInput,
