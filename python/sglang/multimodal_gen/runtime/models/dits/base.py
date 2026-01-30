@@ -8,6 +8,12 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import DiTConfig
+
+# NOTE: TeaCacheContext and TeaCacheMixin have been moved to
+# sglang.multimodal_gen.runtime.cache.teacache
+# For backwards compatibility, re-export from the new location
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -77,11 +83,11 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(BaseDiT):
+class CachableDiT(TeaCacheMixin, BaseDiT):
     """
     An intermediate base class that adds TeaCache optimization functionality to DiT models.
-    TeaCache accelerates inference by selectively skipping redundant computation when consecutive
-    diffusion steps are similar enough.
+
+    Inherits TeaCacheMixin for cache logic and BaseDiT for core DiT functionality.
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -100,35 +106,4 @@ class CachableDiT(BaseDiT):
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
-
-        self.cnt = 0
-        self.teacache_thresh = 0
-        self.coefficients: list[float] = []
-
-        # NOTE(will): Only wan2.1 needs these, so we are hardcoding it here
-        if self.config.prefix == "wan":
-            self.use_ret_steps = self.config.cache_config.use_ret_steps
-            self.is_even = False
-            self.previous_residual_even: torch.Tensor | None = None
-            self.previous_residual_odd: torch.Tensor | None = None
-            self.accumulated_rel_l1_distance_even = 0
-            self.accumulated_rel_l1_distance_odd = 0
-            self.should_calc_even = True
-            self.should_calc_odd = True
-        else:
-            self.accumulated_rel_l1_distance = 0
-            self.previous_modulated_input = None
-            self.previous_resiual = None
-        self.previous_e0_even: torch.Tensor | None = None
-        self.previous_e0_odd: torch.Tensor | None = None
-
-    def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
-    ) -> None:
-        pass
-
-    def should_skip_forward_for_cached_states(self, **kwargs: dict[str, Any]) -> bool:
-        return False
-
-    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError("maybe_retrieve_cached_states is not implemented")
+        self._init_teacache_state()
