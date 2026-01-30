@@ -683,7 +683,6 @@ class VisionAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
-            reduce_results=False,
             prefix=add_prefix("proj", prefix),
             use_dp_attention_reduce=use_dp_attention_reduce,
         )
