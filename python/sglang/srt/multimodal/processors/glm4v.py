@@ -3,7 +3,14 @@ from typing import List, Union
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
-from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
+
+# GLM-OCR requires custom transformers - make import optional
+try:
+    from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
+
+    _has_glm_ocr = True
+except (ImportError, ModuleNotFoundError):
+    _has_glm_ocr = False
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -14,8 +21,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     models = [
         Glm4vForConditionalGeneration,
         Glm4vMoeForConditionalGeneration,
-        GlmOcrForConditionalGeneration,
-    ]
+    ] + ([GlmOcrForConditionalGeneration] if _has_glm_ocr else [])
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
