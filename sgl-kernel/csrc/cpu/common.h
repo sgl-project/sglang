@@ -45,7 +45,7 @@ namespace {
     }                                                                    \
   }()
 
-// dispatch: bfloat16, float16, int8_t, fp8_e4m3
+// dispatch: bfloat16, float16, int8_t, fp8_e4m3, uint8_t(mxfp4/int4)
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
     switch (TYPE) {                                              \
@@ -63,6 +63,10 @@ namespace {
       }                                                          \
       case at::ScalarType::Float8_e4m3fn: {                      \
         using packed_t = at::Float8_e4m3fn;                      \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Byte: {                               \
+        using packed_t = uint8_t;                                \
         return __VA_ARGS__();                                    \
       }                                                          \
       default:                                                   \
@@ -284,6 +288,13 @@ inline int get_cache_blocks(int chunk_size) {
 template <>
 inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
   // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+template <>
+inline int get_cache_blocks<uint8_t>(int chunk_size) {
+  // mxfp4 uses bf16 as accumulate type
   int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
   return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
 }

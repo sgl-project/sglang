@@ -449,11 +449,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 False,  # inplace # See [Note] inplace should be False in fused_experts.
                 False,  # use_int8_w8a8
                 False,  # use_fp8_w8a16
+                False,  # use_mxfp4
                 None,  # w1_scale
                 None,  # w2_scale
                 None,  # block_size
                 None,  # a1_scale
                 None,  # a2_scale
+                getattr(layer, "w13_weight_bias", None),
+                getattr(layer, "w2_weight_bias", None),
+                layer.moe_runner_config.gemm1_alpha,
+                layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
