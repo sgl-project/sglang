@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed._functional_collectives as ft_c
-from packaging.version import parse
 from torch.distributed.tensor.experimental._attention import _cp_options
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
 )
+from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
 
@@ -226,7 +226,7 @@ def ring_attn(
 
     # Starting from torch 2.6.0, _templated_ring_attention expects an integer
     # segment_id for the attention function.
-    use_segment_id = parse(torch.__version__).release >= parse("2.6.0").release
+    use_segment_id = torch_release >= (2, 6)
 
     attn_kwargs = dict(
         op=attn_callable_adapter,
