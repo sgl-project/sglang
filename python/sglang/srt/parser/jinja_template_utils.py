@@ -201,6 +201,14 @@ def process_content_for_template_format(
                     else:
                         # Keep text content as-is for openai format
                         processed_content_parts.append(chunk)
+                elif chunk_type == "input_text":
+                    # Normalize Responses API "input_text" to Chat API "text"
+                    processed_content_parts.append(
+                        {"type": "text", "text": chunk.get("text", "")}
+                    )
+                else:
+                    # Keep other content as-is (text, etc.)
+                    processed_content_parts.append(chunk)
 
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
@@ -215,7 +223,7 @@ def process_content_for_template_format(
         # String format: flatten to text only (for templates like DeepSeek)
         text_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict) and chunk.get("type") == "text":
+            if isinstance(chunk, dict) and chunk.get("type") in ("text", "input_text"):
                 text_parts.append(chunk["text"])
             # Note: For string format, we ignore images/audio since the template
             # doesn't expect structured content - multimodal placeholders would
