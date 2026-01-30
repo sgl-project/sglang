@@ -106,6 +106,7 @@ suite_xeon = {
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
+        TestFile("cpu/test_flash_attn.py"),
         TestFile("cpu/test_gemm.py"),
         TestFile("cpu/test_intel_amx_attention_backend_a.py"),
         TestFile("cpu/test_intel_amx_attention_backend_b.py"),
