@@ -3,7 +3,7 @@ import time
 import pytest
 import torch
 
-from sglang.jit_kernel.pos_enc import can_use_jit_rotary_embedding, rotary_embedding
+from sglang.jit_kernel.pos_enc import rotary_embedding
 
 
 def create_test_inputs(
@@ -139,10 +139,6 @@ def test_correctness(
     save_kv_cache,
 ):
     """Test correctness of JIT rotary embedding implementation."""
-    assert (
-        can_use_jit_rotary_embedding()
-    ), "JIT rotary embedding kernel is not available."
-
     # Create inputs and caches
     query, key, _, pos_ids = create_test_inputs(
         head_size, batch_size, seq_len, device, dtype, num_q_heads, num_kv_heads
@@ -211,10 +207,6 @@ def test_performance(
     num_kv_heads,
 ):
     """Performance test comparing JIT and SGL implementations with accuracy validation."""
-    assert (
-        can_use_jit_rotary_embedding()
-    ), "JIT rotary embedding kernel is not available."
-
     # Create inputs and caches
     query, key, _, pos_ids = create_test_inputs(
         head_size, batch_size, seq_len, device, dtype, num_q_heads, num_kv_heads

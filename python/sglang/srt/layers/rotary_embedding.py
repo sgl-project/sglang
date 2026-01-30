@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -23,6 +24,8 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -120,10 +123,17 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_xpu)
             and not (_is_npu)
         ):
+            logger.info("use fallback kernel")
+            # rotary_embedding from sglang.jit_kernel.pos_enc and vllm._custom_ops has the same implementation.
+            # TODO: Test on different devices and remove this conditional.
             if _is_cuda or _is_hip:
-                from sgl_kernel import rotary_embedding
+                from sglang.jit_kernel.pos_enc import rotary_embedding
+
+                logger.info("use rotary_embedding from sglang.jit_kernel.pos_enc")
             else:
                 from vllm._custom_ops import rotary_embedding
+
+                logger.info("use rotary_embedding from vllm._custom_ops")
 
             self.use_fallback_kernel = True
             self.fallback_rotary_embedding = rotary_embedding
@@ -396,6 +406,7 @@ class RotaryEmbedding(MultiPlatformOp):
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
+        # TODO: Test sglang.jit_kernel.pos_enc.rotary_embedding on XPU.
         return torch.ops.sgl_kernel.rotary_embedding(
             positions,
             query,

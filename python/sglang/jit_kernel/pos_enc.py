@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,17 +17,6 @@ def _jit_rotary_embedding_module() -> Module:
         cuda_files=["elementwise/pos_enc.cuh"],
         cuda_wrappers=[("rotary_embedding", "RotaryEmbeddingKernel::run")],
     )
-
-
-@cache_once
-def can_use_jit_rotary_embedding() -> bool:
-    logger = logging.getLogger(__name__)
-    try:
-        _jit_rotary_embedding_module()
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to load JIT rotary embedding kernel: {e}")
-        return False
 
 
 def rotary_embedding(

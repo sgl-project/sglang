@@ -1,3 +1,6 @@
+// Adapted from
+// https://github.com/vllm-project/vllm/blob/014ece97c7aa49084a1119dca792af081a18dbc1/csrc/pos_encoding_kernels.cu
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
