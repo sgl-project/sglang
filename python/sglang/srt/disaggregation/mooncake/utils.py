@@ -55,7 +55,7 @@ def init_mooncake_custom_mem_pool(
                 from mooncake.allocator import BarexAllocator
 
                 allocator = BarexAllocator.get_allocator(device)
-            elif custom_mem_pool_type == "INTRA_NVLINK":
+            elif custom_mem_pool_type == "INTRA_NODE_NVLINK":
                 return False, None, None
             else:
                 # This should not happen due to the enable_custom_mem_pool check above
