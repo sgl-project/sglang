@@ -25,11 +25,11 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
-from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils import ImageData, get_local_ip_auto, get_zmq_socket_on_host
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -733,6 +733,14 @@ class MMReceiverHTTP(MMReceiverBase):
         return embeddings.data_ptr()
 
     # For zmq_to_scheduler
+    def build_and_send_encode_request(self, image_urls, rid):
+        encode_req = GenerateReqInput(
+            image_data=[ImageData(url=url) for url in image_urls],
+            rid=rid,
+        )
+        self.send_encode_request(encode_req)
+        return encode_req
+
     def send_encode_request(self, obj):
         if type(obj.image_data) != list:
             image_urls = [obj.image_data.url]
