@@ -311,16 +311,20 @@ class MooncakeStore(HiCacheStorage):
                 )
             else:
                 try:
-                    from sglang.srt.distributed.parallel_state import (
-                        get_mooncake_transfer_engine,
-                    )
+                    # from sglang.srt.distributed.parallel_state import (
+                    #     get_mooncake_transfer_engine,
+                    # )
 
-                    self._shared_mooncake_transfer_engine = (
-                        get_mooncake_transfer_engine().get_engine()
-                    )
-                    logger.info(
-                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
-                    )
+                    # self._shared_mooncake_transfer_engine = (
+                    #     get_mooncake_transfer_engine().get_engine()
+                    # )
+                    # logger.info(
+                    #     f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
+                    # )
+
+                    # TODO(shangming): disable mooncake transfer engine reuse for hicache temporary
+                    # Need to wait for the next mooncake release
+                    self._shared_mooncake_transfer_engine = None
                 except Exception:
                     self._shared_mooncake_transfer_engine = None
                     logger.debug("Failed to reuse initialized mooncake transfer engine")
