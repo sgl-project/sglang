@@ -164,9 +164,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            from sglang.srt.disaggregation.encode_receiver import MMReceiver
+            from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 
-            self.mm_receiver = MMReceiver(self.server_args)
+            self.mm_receiver = create_mm_receiver(self.server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
