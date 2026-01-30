@@ -1,3 +1,4 @@
+import logging
 import multiprocessing as mp
 import os
 import unittest
@@ -8,7 +9,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
-import logging
 logger = logging.getLogger(__name__)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
