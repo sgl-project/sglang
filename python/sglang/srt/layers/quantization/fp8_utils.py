@@ -11,6 +11,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+from sglang.srt.utils.common import torch_release
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -19,6 +20,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     is_fp8_fnuz,
+    mxfp8_block_scaled_matmul_triton,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
@@ -38,6 +40,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_sm90_supported,
+    is_sm100_supported,
     offloader,
 )
 
@@ -78,17 +81,12 @@ TORCH_DEVICE_IDENTITY = None
 
 
 def use_rowwise_torch_scaled_mm():
-    _TORCH_VERSION = torch.__version__.split("+")[0]
-    try:
-        _TORCH_VERSION_TUPLE = tuple(map(int, _TORCH_VERSION.split(".")[:3]))
-    except ValueError:
-        _TORCH_VERSION_TUPLE = (0, 0, 0)
     if _is_hip:
         # The condition to determine if it is on a platform that supports
         # torch._scaled_mm rowwise feature.
         # The condition is determined once as the operations
         # are time consuming.
-        return get_device_capability() >= (9, 4) and _TORCH_VERSION_TUPLE >= (2, 7, 0)
+        return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
     return False
 
 
@@ -534,6 +532,131 @@ def triton_w8a8_block_fp8_linear(
     if bias is not None:
         output += bias
     return output.to(dtype=input_2d.dtype).view(*output_shape)
+
+
+@lru_cache(maxsize=1)
+def _get_triton_mxfp8_downcast():
+    try:
+        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
+    except Exception as err:
+        raise RuntimeError(
+            "MXFP8 quantization requires triton_kernels with MXFP8 support."
+        ) from err
+    return downcast_to_mxfp
+
+
+def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2D contiguous tensor to MXFP8 with UE8M0 scales per group (32)."""
+    assert x.dim() == 2, f"Expected 2D input, got {x.dim()}D"
+    assert x.is_contiguous(), "MXFP8 quantization requires a contiguous 2D tensor."
+    _, k = x.shape
+    assert k % 32 == 0, f"{k=} must be divisible by 32"
+    downcast_to_mxfp = _get_triton_mxfp8_downcast()
+    q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
+    return q_input.contiguous(), scale_u8.contiguous()
+
+
+def _pack_mxfp8_scales(scale_u8: torch.Tensor) -> torch.Tensor:
+    # Pack (M, K//32) UE8M0 scales into the layout expected by tl.dot_scaled.
+    assert scale_u8.dim() == 2, f"Expected 2D scale tensor, got {scale_u8.dim()}D"
+    scale_u8 = scale_u8.contiguous()
+    m, k_groups = scale_u8.shape
+    assert (
+        k_groups % 4 == 0
+    ), f"{k_groups=} must be divisible by 4 (K must be multiple of 128)"
+
+    scale_m = ceil_div(m, 128)
+    if m % 128 != 0:
+        pad_rows = scale_m * 128 - m
+        pad = torch.full(
+            (pad_rows, k_groups),
+            127,
+            dtype=scale_u8.dtype,
+            device=scale_u8.device,
+        )
+        scale_u8 = torch.cat([scale_u8, pad], dim=0)
+
+    scale_k = k_groups // 4
+    scale_u8 = scale_u8.view(scale_m, 128, scale_k, 4)
+    scale_u8 = scale_u8.view(scale_m, 4, 32, scale_k, 4)
+    packed = scale_u8.permute(0, 3, 2, 1, 4).contiguous()
+    return packed.view(1, scale_m, scale_k, 2, 256)
+
+
+def triton_mxfp8_blockscaled_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    if not (_is_cuda and is_sm100_supported()):
+        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
+
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    block_m = 128
+    block_n = 256 if weight.shape[0] % 256 == 0 else 128
+    block_k = 128
+
+    m, k = input_2d.shape
+    n, k_w = weight.shape
+    assert k == k_w, f"{k=} does not match {k_w=}"
+    assert k % 128 == 0, f"{k=} must be divisible by 128 for MXFP8"
+    assert n % block_n == 0, f"{n=} must be divisible by {block_n}"
+    assert weight.dtype == torch.float8_e4m3fn, "MXFP8 weight must be FP8 E4M3."
+    assert weight_scale.dtype == torch.uint8, "MXFP8 weight_scale must be UE8M0 uint8."
+
+    if input_scale is None:
+        q_input, x_scale_u8 = mxfp8_group_quantize(input_2d)
+    else:
+        q_input = input_2d
+        x_scale_u8 = input_scale
+        assert x_scale_u8.dtype == torch.uint8, "MXFP8 input_scale must be UE8M0 uint8."
+        assert x_scale_u8.shape == (m, k // 32)
+
+    if output_dtype is None:
+        if input_2d.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            output_dtype = input_2d.dtype
+        else:
+            output_dtype = torch.bfloat16
+
+    if m % block_m != 0:
+        pad_rows = ceil_div(m, block_m) * block_m - m
+        q_input = torch.cat(
+            [
+                q_input,
+                torch.zeros((pad_rows, k), device=q_input.device, dtype=q_input.dtype),
+            ],
+            dim=0,
+        )
+        pad_scale = torch.full(
+            (pad_rows, k // 32),
+            127,
+            device=x_scale_u8.device,
+            dtype=x_scale_u8.dtype,
+        )
+        x_scale_u8 = torch.cat([x_scale_u8, pad_scale], dim=0)
+
+    a_scale_packed = _pack_mxfp8_scales(x_scale_u8)
+    b_scale_packed = _pack_mxfp8_scales(weight_scale)
+
+    output = mxfp8_block_scaled_matmul_triton(
+        q_input,
+        a_scale_packed,
+        weight.contiguous(),
+        b_scale_packed,
+        output_dtype=output_dtype,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+    )
+    output = output[:m, :]
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def dequant_mxfp4(

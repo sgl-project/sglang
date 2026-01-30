@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     HunyuanConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     SelfForcingWanT2V480PConfig,
     WanI2V480PConfig,
@@ -39,6 +40,7 @@ __all__ = [
     "Flux2FinetunedPipelineConfig",
     "PipelineConfig",
     "SlidingTileAttnConfig",
+    "MOVAPipelineConfig",
     "WanT2V480PConfig",
     "WanI2V480PConfig",
     "WanT2V720PConfig",

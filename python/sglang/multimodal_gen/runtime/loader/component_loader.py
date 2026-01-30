@@ -268,16 +268,34 @@ class ComponentLoader(ABC):
             "processor": (AutoProcessorLoader, "transformers"),
             "vision_language_encoder": (VisionLanguageEncoderLoader, "transformers"),
         }
-
         # Loaders for audio/video specific components that might vary
         av_module_loaders = {
+            "audio_dit": (TransformerLoader, "diffusers"),
             "audio_vae": (VAELoader, "diffusers"),
-            "vocoder": (VocoderLoader, "diffusers"),
             "connectors": (AdapterLoader, "diffusers"),
+            "dual_tower_bridge": (BridgeLoader, "diffusers"),
+            "video_dit": (TransformerLoader, "diffusers"),
+            "video_vae": (VAELoader, "diffusers"),
+            "vocoder": (VocoderLoader, "diffusers"),
         }
 
         # NOTE(FlamingoPg): special for LTX-2 models
         if module_type == "vocoder" or module_type == "connectors":
+            transformers_or_diffusers = "diffusers"
+
+        # NOTE(CloudRipple): special for MOVA models
+        # TODO(CloudRipple): remove most of these special cases after unifying the loading logic
+        if module_type in [
+            "audio_vae",
+            "audio_dit",
+            "dual_tower_bridge",
+            "video_dit",
+        ]:
+            transformers_or_diffusers = "diffusers"
+        if (
+            module_type == "scheduler"
+            and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
+        ):
             transformers_or_diffusers = "diffusers"
 
         if module_type in module_loaders:
@@ -616,7 +634,7 @@ class TokenizerLoader(ComponentLoader):
 
 
 class VAELoader(ComponentLoader):
-    """Loader for VAE."""
+    """Shared loader for (video/audio) VAE modules."""
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None
@@ -636,17 +654,20 @@ class VAELoader(ComponentLoader):
         server_args.model_paths[module_name] = component_model_path
 
         logger.debug("HF model config: %s", config)
-        if module_name == "audio_vae":
-            vae_config = server_args.pipeline_config.audio_vae_config
-            vae_precision = server_args.pipeline_config.audio_vae_precision
+        if module_name in ("vae", "video_vae"):
+            pipeline_vae_config_attr = "vae_config"
+            pipeline_vae_precision = "vae_precision"
+        elif module_name in ("audio_vae",):
+            pipeline_vae_config_attr = "audio_vae_config"
+            pipeline_vae_precision = "audio_vae_precision"
         else:
-            vae_config = server_args.pipeline_config.vae_config
-            vae_precision = server_args.pipeline_config.vae_precision
-
+            raise ValueError(f"Unsupported module name for VAE loader: {module_name}")
+        vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
+        vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
         vae_config.update_model_arch(config)
-
-        # NOTE: some post init logics are only available after updated with config
-        vae_config.post_init()
+        if hasattr(vae_config, "post_init"):
+            # NOTE: some post init logics are only available after updated with config
+            vae_config.post_init()
 
         should_offload = self.should_offload(server_args)
         target_device = self.target_device(should_offload)
@@ -685,6 +706,16 @@ class VAELoader(ComponentLoader):
         ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
         vae.load_state_dict(loaded, strict=False)
+
+        state_keys = set(vae.state_dict().keys())
+        loaded_keys = set(loaded.keys())
+        missing_keys = sorted(state_keys - loaded_keys)
+        unexpected_keys = sorted(loaded_keys - state_keys)
+        if missing_keys:
+            logger.warning("VAE missing keys: %s", missing_keys)
+        if unexpected_keys:
+            logger.warning("VAE unexpected keys: %s", unexpected_keys)
+
         return vae.eval()
 
 
@@ -753,11 +784,96 @@ class VocoderLoader(ComponentLoader):
         return vocoder.eval()
 
 
-class TransformerLoader(ComponentLoader):
-    """Loader for transformer."""
+class BridgeLoader(ComponentLoader):
+    """Loader for MOVA dual tower bridge with FSDP support."""
+
+    pipeline_bridge_config_attr: str = "bridge_config"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        config = get_diffusers_component_config(model_path=component_model_path)
+        hf_config = deepcopy(config)
+        class_name = config.pop("_class_name", None)
+        if class_name is None:
+            raise ValueError(
+                "Model config does not contain a _class_name attribute. "
+                "Only diffusers format is supported."
+            )
+        server_args.model_paths[module_name] = component_model_path
+
+        # Try to get bridge config from pipeline config, fallback to creating one
+        bridge_config = getattr(
+            server_args.pipeline_config, self.pipeline_bridge_config_attr, None
+        )
+        if bridge_config is not None:
+            bridge_config.update_model_arch(config)
+        else:
+            # Create a minimal config from hf_config
+            from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
+                MOVADualTowerConfig,
+            )
+
+            bridge_config = MOVADualTowerConfig()
+            bridge_config.update_model_arch(config)
+
+        model_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+
+        # Find all safetensors files
+        safetensors_list = _list_safetensors_files(component_model_path)
+        if not safetensors_list:
+            raise ValueError(f"No safetensors files found in {component_model_path}")
+
+        default_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+
+        logger.info(
+            "Loading %s from %s safetensors files, default_dtype: %s",
+            class_name,
+            len(safetensors_list),
+            default_dtype,
+        )
+
+        # Check if FSDP loading is available
+        if (
+            server_args.hsdp_shard_dim is not None
+            and hasattr(model_cls, "_fsdp_shard_conditions")
+            and model_cls._fsdp_shard_conditions
+        ):
+            # Load with FSDP support
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params={"config": bridge_config, "hf_config": hf_config},
+                weight_dir_list=safetensors_list,
+                device=get_local_torch_device(),
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
+                cpu_offload=server_args.dit_cpu_offload,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+                fsdp_inference=server_args.use_fsdp_inference,
+                default_dtype=default_dtype,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=False,
+            )
+        else:
+            # Fallback to simple loading (for non-FSDP or legacy models)
+            model = model_cls.from_pretrained(
+                component_model_path, torch_dtype=default_dtype
+            )
+            model = model.to(device=get_local_torch_device(), dtype=default_dtype)
+
+        total_params = sum(p.numel() for p in model.parameters())
+        logger.info("Loaded bridge model with %.2fM parameters", total_params / 1e6)
+
+        return model.eval()
+
+
+class TransformerLoader(ComponentLoader):
+    """Shared loader for (video/audio) DiT transformers."""
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -769,10 +885,17 @@ class TransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        server_args.model_paths["transformer"] = component_model_path
+        module_name = _normalize_module_type(module_name)
+        server_args.model_paths[module_name] = component_model_path
 
+        if module_name in ("transformer", "video_dit"):
+            pipeline_dit_config_attr = "dit_config"
+        elif module_name in ("audio_dit",):
+            pipeline_dit_config_attr = "audio_dit_config"
+        else:
+            raise ValueError(f"Invalid module name: {module_name}")
         # Config from Diffusers supersedes sgl_diffusion's model config
-        dit_config = server_args.pipeline_config.dit_config
+        dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)
 
         model_cls, _ = ModelRegistry.resolve_model_cls(cls_name)

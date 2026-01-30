@@ -20,8 +20,11 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
+from sglang.srt.utils import is_cpu
 
 logger = logging.get_logger(__name__)
+_is_cpu = is_cpu()
 
 
 class HybridLayerType(enum.Enum):
@@ -275,6 +278,10 @@ class Qwen3NextConfig(PretrainedConfig):
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+        if _is_cpu:
+            world_size = get_attention_tp_size()
+            adjust_tp_num_heads_if_necessary(self, world_size, False)
 
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
