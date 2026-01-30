@@ -1748,7 +1748,10 @@ def _get_lock_file_path(model_name_or_path: str, cache_dir: Optional[str]) -> st
     unique_key = f"{model_name_or_path}:{cache_dir or 'default'}"
     key_hash = hashlib.sha256(unique_key.encode()).hexdigest()[:12]
 
-    # Use /tmp for lock files (cleaned up on reboot)
+    # Try /dev/shm first (shared memory, always supports locking)
+    # Fall back to /tmp if /dev/shm doesn't exist
+    if os.path.isdir("/dev/shm"):
+        return f"/dev/shm/sglang_download_lock_{key_hash}"
     return f"/tmp/sglang_download_lock_{key_hash}"
 
 
@@ -1803,20 +1806,27 @@ def ci_download_with_validation_and_retry(
     # This prevents HF hub race conditions with .incomplete files
     lock_file_path = _get_lock_file_path(model_name_or_path, cache_dir)
 
+    # Log lock file path for debugging
+    logger.info(
+        "[CI Download] Process %d using lock file: %s",
+        os.getpid(),
+        lock_file_path,
+    )
+
     # Create lock file if it doesn't exist
     lock_file = open(lock_file_path, "w")
 
     try:
         # Acquire exclusive lock - blocks until lock is available
         # This ensures only one process downloads at a time
-        logger.debug(
-            "Process %d waiting to acquire download lock for %s",
+        logger.info(
+            "[CI Download] Process %d waiting to acquire lock for %s",
             os.getpid(),
             model_name_or_path,
         )
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        logger.debug(
-            "Process %d acquired download lock for %s",
+        logger.info(
+            "[CI Download] Process %d ACQUIRED lock for %s",
             os.getpid(),
             model_name_or_path,
         )
@@ -1864,8 +1874,8 @@ def ci_download_with_validation_and_retry(
         # Always release the lock
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
-        logger.debug(
-            "Process %d released download lock for %s",
+        logger.info(
+            "[CI Download] Process %d RELEASED lock for %s",
             os.getpid(),
             model_name_or_path,
         )
