@@ -517,7 +517,7 @@ class LoRAManager:
         )
 
         # Some LoRA adapters are loaded before the memory pool is initialized
-        if getattr(self, "memory_pool"):
+        if hasattr(self, "memory_pool"):
             self.init_memory_pool()
 
     def set_lora_module(self, module_name, module):
