@@ -1794,7 +1794,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_num_tokens += running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
-        self.is_prefill_only = Falses
+        self.is_prefill_only = False
 
         self.decode_start_or_none = prefill_token_count
         self.decoding_reqs = running_batch.reqs

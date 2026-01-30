@@ -295,7 +295,8 @@ class FlashInferAttnBackend(AttentionBackend):
         # Using two wrappers is unnecessary in the current PR, but are prepared for future PRs
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
-        self.decode_wrappers = []self.pod_wrappers = []
+        self.decode_wrappers = []
+        self.pod_wrappers = []
         for _ in range(self.num_wrappers):
             if self.use_pod and not skip_prefill:
                 self.pod_wrappers.append(
@@ -305,29 +306,29 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
                 )
             if not skip_prefill:
-                    self.prefill_wrappers_paged.append(
-                        BatchPrefillWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            backend="fa2",
-                        )
-                    )
-                    self.prefill_wrappers_verify.append(
-                        BatchPrefillWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                        )
-                    )
-                self.decode_wrappers.append(
-                    BatchDecodeWithPagedKVCacheWrapper(
+                self.prefill_wrappers_paged.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        use_tensor_cores=self.decode_use_tensor_cores,
+                        backend="fa2",
                     )
                 )
+                self.prefill_wrappers_verify.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                    )
+                )
+            self.decode_wrappers.append(
+                BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_tensor_cores=self.decode_use_tensor_cores,
+                )
+            )
 
         # Create indices updater
-         if self.use_pod and not skip_prefill:
+        if self.use_pod and not skip_prefill:
             self.indices_updater_pod = FlashInferIndicesUpdaterPOD(
                 model_runner, self
             )
@@ -1703,8 +1704,8 @@ class FlashInferIndicesUpdaterPOD:
             bs_p = bs - num_decode_reqs
             bs_d = num_decode_reqs
 
-            seq_lens_p = seq_lens.narrow(0, 0, bs_p) if bs_p > 0 else seq_lens.new_zeros(0, device=seq_lens.device, dtype=seq_lens.dtype)
-            seq_lens_d = seq_lens.narrow(0, bs_p, bs_d) if bs_d > 0 else seq_lens.new_zeros(0, device=seq_lens.device, dtype=seq_lens.dtype)
+            seq_lens_p = seq_lens.narrow(0, 0, bs_p) if bs_p > 0 else self._pod_empty_tensor_0
+            seq_lens_d = seq_lens.narrow(0, bs_p, bs_d) if bs_d > 0 else self._pod_empty_tensor_0
 
             paged_kernel_lens_sum_p = seq_lens_p.sum() if bs_p > 0 else 0
             paged_kernel_lens_sum_d = seq_lens_d.sum() if bs_d > 0 else 0
