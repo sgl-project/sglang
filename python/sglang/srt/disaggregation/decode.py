@@ -728,7 +728,7 @@ class DecodeTransferQueue:
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
         Returns:
-            True if request should be removed from queue (success or corruption)
+            True if the request should be removed from the queue (success or corruption)
             False if metadata not ready yet (keep in queue for next poll)
         """
         idx = decode_req.metadata_buffer_index
@@ -742,25 +742,30 @@ class DecodeTransferQueue:
             output_topk_p,
             output_topk_index,
             output_hidden_states,
-            bootstrap_rooms,
+            output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
-        actual_room = bootstrap_rooms[0].item()
+        actual_room = output_bootstrap_room[0].item()
         expected_room = (
             decode_req.req.bootstrap_room
             if decode_req.req.bootstrap_room is not None
             else 0
         )
 
-        # Case 1: Metadata not ready yet (actual_room == 0)
-        # Keep request in queue and wait for next poll
-        if actual_room == 0:
+        if decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+            decode_req.req.bootstrap_host is None
+            and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+        ):  
+            # Warm up or fake transfer mode
+            pass
+        elif actual_room == 0:
+            # Case 1: Metadata not ready yet (actual_room == 0)
+            # Keep request in queue and wait for next poll
             return False
-
-        # Case 2: Real corruption detected (mismatch)
-        # Abort the request and remove from queue
-        if actual_room != expected_room:
+        elif actual_room != expected_room:
+            # Case 2: Real corruption detected (mismatch)
+            # Abort the request and remove from the queue
             error_msg = (
                 f"Context corruption detected: Request {decode_req.req.rid} "
                 f"(bootstrap_room={expected_room}) received metadata from "
