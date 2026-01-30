@@ -13,11 +13,7 @@ from einops import rearrange
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm as can_use_jit_qk_norm
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-)
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -951,8 +947,6 @@ class VisionAttention(nn.Module):
 
             # [b, s, h * head_size] --> [b, s, h * head_size]
             output, _ = self.proj(output)
-            if self.tp_size > 1:
-                output = get_attention_tp_group().all_reduce(output)
         else:
             # [b * s, h, head_size] --> [s, b, h * head_size]
             context_layer = rearrange(
@@ -961,8 +955,6 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [s, b, h * head_size]
             output, _ = self.proj(context_layer)
-            if self.tp_size > 1:
-                output = get_attention_tp_group().all_reduce(output)
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)
