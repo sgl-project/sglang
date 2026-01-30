@@ -23,6 +23,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
 
@@ -49,6 +50,9 @@ class MoeA2ABackend(Enum):
 
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
+
+    def is_mori(self):
+        return self == MoeA2ABackend.MORI
 
 
 class MoeRunnerBackend(Enum):

@@ -33,6 +33,7 @@ Its core features include:
    basic_usage/ollama_api.md
    basic_usage/offline_engine_api.ipynb
    basic_usage/native_api.ipynb
+   basic_usage/deepseek_ocr.md
    basic_usage/sampling_params.md
    basic_usage/popular_model_usage.rst
 
@@ -100,6 +101,7 @@ Its core features include:
 
    developer_guide/contribution_guide.md
    developer_guide/development_guide_using_docker.md
+   developer_guide/development_jit_kernel_guide.md
    developer_guide/benchmark_and_profiling.md
    developer_guide/bench_serving.md
    developer_guide/evaluating_new_models.md
