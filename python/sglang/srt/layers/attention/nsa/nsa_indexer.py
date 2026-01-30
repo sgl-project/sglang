@@ -8,19 +8,22 @@ import torch
 from einops import rearrange
 
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
-
-if is_cuda():
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_fp8_fnuz = is_fp8_fnuz()
+if _is_cuda:
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
 
 if is_npu():
-    import custom_ops  # noqa: F401
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -42,7 +45,8 @@ from sglang.srt.server_args import get_global_server_args
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
-DUAL_STREAM_TOKEN_THRESHOLD = 1024 if is_cuda() else 0
+
+DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 class BaseIndexerMetadata(ABC):
@@ -57,6 +61,13 @@ class BaseIndexerMetadata(ABC):
         """
         Return: (batch_size, num_blocks) int32, page table.
                 The page size of the table is 64.
+        """
+
+    @abstractmethod
+    def get_page_table_1(self) -> torch.Tensor:
+        """
+        Return: (batch_size, num_blocks) int32, page table.
+                The page size of the table is 1.
         """
 
     @abstractmethod
@@ -101,7 +112,11 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert x.dtype == torch.bfloat16
-    from sgl_kernel import hadamard_transform
+    # from sgl_kernel import hadamard_transform
+    if _is_hip:
+        from fast_hadamard_transform import hadamard_transform
+    else:
+        from sgl_kernel import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -145,7 +160,7 @@ class Indexer(MultiPlatformOp):
         else:
             self.cp_size = None
             self.cp_rank = None
-        if is_cuda():
+        if _is_cuda:
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
@@ -168,12 +183,11 @@ class Indexer(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wk", prefix),
         )
-        # NOTE: weights_proj in the checkpoint is stored in bf16, while the parameters here are stored in fp32 for convenience
         self.weights_proj = ReplicatedLinear(
             self.hidden_size,
             self.n_heads,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=torch.bfloat16 if _is_cuda else torch.float32,
             prefix=add_prefix("weights_proj", prefix),
         )
         self.k_norm = LayerNorm(self.head_dim, dtype=torch.float32)
@@ -205,15 +219,21 @@ class Indexer(MultiPlatformOp):
         else:
             yield
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _project_and_scale_head_gates(self, x: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
+        if _is_hip:
+            x = x.to(self.weights_proj.weight.dtype)
+        weights, _ = self.weights_proj(x)
+        weights = weights.float()
         weights = weights * self.n_heads**-0.5
         return weights
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True) if not _is_hip else lambda f: f
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
+        if _is_hip:
+            x = x.to(self.weights_proj.weight.dtype)
+        weights, _ = self.weights_proj(x)
+        weights = weights.float()
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -323,10 +343,13 @@ class Indexer(MultiPlatformOp):
 
         page_size = forward_batch.token_to_kv_pool.page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
-        assert page_size == 64, "only support page size 64"
-
-        # NOTE(dark): this support extend/decode/decode+graph
-        block_tables = metadata.get_page_table_64()
+        if _is_hip:
+            assert page_size == 1, "only support page size 1"
+            block_tables = metadata.get_page_table_1()
+        else:
+            assert page_size == 64, "only support page size 64"
+            # NOTE(dark): this support extend/decode/decode+graph
+            block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
@@ -344,32 +367,64 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        if schedule_metadata is None:
-            schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                seqlens_32, blocksize, self.sm_count
-            )
+        if _is_cuda:
+            if schedule_metadata is None:
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, blocksize, self.sm_count
+                )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
+        block_kv = 1 if _is_hip else 64
         num_heads_kv = 1
         head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
+        if _is_hip:
+            kv_cache_fp8 = kv_cache_fp8.view(
+                -1, block_kv, num_heads_kv, head_dim_with_sf
+            )
+        else:
+            kv_cache_fp8 = kv_cache_fp8.view(
+                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8,
-            kv_cache_fp8,
-            weights,
-            seqlens_32,
-            block_tables,
-            schedule_metadata,
-            max_seq_len,
-            clean_logits=False,
-        )
+
+        if _is_hip:
+            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+
+            batch_size, next_n, heads, _ = q_fp8.shape
+            logits = torch.full(
+                (batch_size * next_n, max_seq_len),
+                float("-inf"),
+                device=q_fp8.device,
+                dtype=torch.float32,
+            )
+            deepgemm_fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                logits,
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+                Preshuffle=False,
+                KVBlockSize=block_kv,
+                ChunkK=128,
+                TotalCuCount=256,
+                WavePerEU=5,
+            )
+        else:
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                seqlens_32,
+                block_tables,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -408,13 +463,20 @@ class Indexer(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        assert page_size == 64, "only support page size 64"
+        if _is_hip:
+            assert page_size == 1, "only support page size 1"
+        else:
+            assert page_size == 64, "only support page size 64"
+
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         k_fp8_list = []
         k_scale_list = []
 
-        block_tables = metadata.get_page_table_64()
+        if _is_hip:
+            block_tables = metadata.get_page_table_1()
+        else:
+            block_tables = metadata.get_page_table_64()
 
         assert (
             forward_batch.seq_lens_cpu is not None
@@ -443,8 +505,10 @@ class Indexer(MultiPlatformOp):
             )
             k_fp8_list.append(k_fp8)
             k_scale_list.append(k_scale)
-
-        k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
+        if _is_fp8_fnuz:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fnuz)
+        else:
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
         k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
         ks, ke = metadata.get_indexer_kvcache_range()
@@ -459,14 +523,22 @@ class Indexer(MultiPlatformOp):
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
-                logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8[:q_offset],
-                    kv_fp8,
-                    weights[:q_offset],
-                    ks,
-                    ke,
-                    clean_logits=False,
-                )
+                if _is_hip:
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+                    kv, scale = kv_fp8
+                    logits = fp8_mqa_logits(
+                        q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
+                    )
+                else:
+                    logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        clean_logits=False,
+                    )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -496,14 +568,27 @@ class Indexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                logits_chunk = deep_gemm.fp8_mqa_logits(
-                    q_fp8[start:end],
-                    kv_fp8,
-                    weights[start:end],
-                    ks[start:end],
-                    ke[start:end],
-                    clean_logits=False,
-                )
+                if _is_hip:
+                    from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+
+                    kv, scale = kv_fp8
+                    logits_chunk = fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv,
+                        scale,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                    )
+                else:
+                    logits_chunk = deep_gemm.fp8_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        clean_logits=False,
+                    )
 
             lengths_chunk = seq_lens_expanded[start:end]
 
@@ -548,6 +633,7 @@ class Indexer(MultiPlatformOp):
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         assert forward_batch.forward_mode.is_extend_without_speculative()
+        x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
@@ -573,7 +659,7 @@ class Indexer(MultiPlatformOp):
             seq_lens_expanded.shape[0],
             self.index_topk,
             dtype=torch.float32,
-            device=x.device,
+            device=x_meta.device,
         )
         return metadata.topk_transform(dummy_logits, self.index_topk)
 
@@ -734,7 +820,7 @@ class Indexer(MultiPlatformOp):
         topk: int,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
-        if not is_npu():
+        if not _is_npu:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index
 
         page_size = forward_batch.token_to_kv_pool.page_size
@@ -818,13 +904,17 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if is_hip():
+        if _is_hip:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
-        elif not is_npu():
+        elif not _is_npu:
             from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
+        # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
+        x_meta = x[0] if isinstance(x, tuple) else x
 
         metadata = forward_batch.attn_backend.get_indexer_metadata(
             layer_id, forward_batch
@@ -866,11 +956,11 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             weights = self._project_and_scale_head_gates(x)
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+            )
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
-                query, key = self._get_q_k_bf16(
-                    q_lora, x, positions, False, forward_batch=forward_batch
-                )
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
             current_stream.wait_stream(self.alt_stream)
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -891,7 +981,39 @@ class Indexer(MultiPlatformOp):
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
 
-            weights = self._get_logits_head_gate(x, q_scale)
+            # `_get_logits_head_gate` expects a Tensor. For tuple activations, dequantize
+            # to a float tensor here (callsite), keeping `_get_logits_head_gate` backend-agnostic.
+            if isinstance(x, tuple):
+                assert len(x) in (
+                    2,
+                    3,
+                ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+                x_q, x_s = x[0], x[1]
+                if (
+                    x_s is not None
+                    and x_q.dim() == 2
+                    and x_s.dim() == 2
+                    and x_q.shape[0] == x_s.shape[0]
+                ):
+                    m, n = x_q.shape
+                    ng = x_s.shape[1]
+                    if ng > 0 and n % ng == 0:
+                        group = n // ng
+                        x_for_gate = (
+                            x_q.to(torch.float32)
+                            .view(m, ng, group)
+                            .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                            .view(m, n)
+                            .to(torch.bfloat16)
+                        )
+                    else:
+                        x_for_gate = x_q.to(torch.bfloat16)
+                else:
+                    x_for_gate = x_q.to(torch.bfloat16)
+            else:
+                x_for_gate = x
+
+            weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
@@ -906,7 +1028,7 @@ class Indexer(MultiPlatformOp):
             index_k_scale=k_scale,
         )
 
-        if is_cuda():
+        if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
@@ -915,7 +1037,10 @@ class Indexer(MultiPlatformOp):
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
                 return torch.full(
-                    (x.shape[0], self.index_topk), -1, dtype=torch.int, device="cuda"
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    dtype=torch.int,
+                    device=x_meta.device,
                 )
 
             if (
@@ -987,6 +1112,7 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
@@ -1010,6 +1136,9 @@ class Indexer(MultiPlatformOp):
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
+                q_lora = (
+                    (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+                )
                 q = self.wq_b(q_lora)[
                     0
                 ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
@@ -1028,6 +1157,7 @@ class Indexer(MultiPlatformOp):
                 q.record_stream(self.alt_stream)
                 q_rope_event = self.alt_stream.record_event()
         else:
+            q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
             q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
             q_pe, q_nope = torch.split(
@@ -1146,6 +1276,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_lengths_kv,
                 block_table,
             )
+            return topk_indices
         else:
             block_table = (
                 block_table[: actual_seq_lengths_q.size()[0]]
@@ -1153,7 +1284,7 @@ class Indexer(MultiPlatformOp):
                 else block_table
             )
 
-            topk_indices = torch.ops.custom.npu_lightning_indexer(
+            topk_indices = torch_npu.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
                 weights=weights,
@@ -1167,8 +1298,7 @@ class Indexer(MultiPlatformOp):
                 sparse_count=self.index_topk,
                 sparse_mode=3,
             )
-
-        return topk_indices
+            return topk_indices[0]
 
     def do_npu_cp_balance_indexer(
         self,
@@ -1191,7 +1321,7 @@ class Indexer(MultiPlatformOp):
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        topk_indices_prev = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_prev = torch_npu.npu_lightning_indexer(
             query=q_prev,
             key=past_key_states,
             weights=weights_prev,
@@ -1207,7 +1337,7 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        topk_indices_next = torch.ops.custom.npu_lightning_indexer(
+        topk_indices_next = torch_npu.npu_lightning_indexer(
             query=q_next,
             key=past_key_states,
             weights=weights_next,
@@ -1223,4 +1353,4 @@ class Indexer(MultiPlatformOp):
             sparse_count=self.index_topk,
             sparse_mode=3,
         )
-        return topk_indices_prev, topk_indices_next
+        return topk_indices_prev[0], topk_indices_next[0]

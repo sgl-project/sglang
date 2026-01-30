@@ -22,6 +22,7 @@ def get_thinking_kwargs(args):
         if thinking_mode == "deepseek-v3":
             thinking_param = "thinking"
         else:
+            # Qwen3
             thinking_param = "enable_thinking"
         return {
             "chat_template_kwargs": {thinking_param: True},
@@ -128,6 +129,15 @@ def run_eval(args):
         from sglang.test.simple_eval_aime25 import AIME25Eval
 
         eval_obj = AIME25Eval(args.num_examples, args.num_threads)
+    elif args.eval_name == "gsm8k":
+        from sglang.test.simple_eval_gsm8k import GSM8KEval
+
+        eval_obj = GSM8KEval(
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            num_shots=getattr(args, "num_shots", 5),
+            data_path=getattr(args, "gsm8k_data_path", None),
+        )
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
@@ -203,7 +213,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-r1", "deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -241,7 +251,7 @@ if __name__ == "__main__":
         default=None,
         type=str,
         choices=THINKING_MODE_CHOICES,
-        help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+        help="Enable thinking mode in Deepseek V3.1/3.2, or Qwen3.--reasoning-parser must be set when launching the server.",
     )
 
     # LongBench-v2 specific arguments
@@ -266,6 +276,18 @@ if __name__ == "__main__":
         "--min-context-length",
         type=int,
         help="Minimum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--num-shots",
+        type=int,
+        default=5,
+        help="Number of few-shot examples for GSM8K (default: 5)",
+    )
+    parser.add_argument(
+        "--gsm8k-data-path",
+        type=str,
+        default=None,
+        help="Path to GSM8K data file (e.g., test.jsonl)",
     )
 
     args = parser.parse_args()

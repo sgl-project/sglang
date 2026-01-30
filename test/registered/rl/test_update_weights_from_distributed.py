@@ -1,8 +1,5 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=103, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=103, suite="stage-b-test-large-2-gpu-amd")
-
 """Test distributed weight updates.
 
 This test suite simulates a distributed training environment to ensure
@@ -44,6 +41,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 from sglang.utils import terminate_process
+
+register_cuda_ci(est_time=103, suite="stage-b-test-large-2-gpu")
+register_amd_ci(est_time=103, suite="stage-b-test-large-2-gpu-amd")
 
 mp.set_start_method("spawn", force=True)
 

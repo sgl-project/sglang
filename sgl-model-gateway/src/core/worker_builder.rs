@@ -397,6 +397,7 @@ mod tests {
             check_interval_secs: 60,
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         let cb_config = CircuitBreakerConfig {
@@ -489,6 +490,7 @@ mod tests {
             check_interval_secs: 45,
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: false,
         };
 
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 3, 16)
