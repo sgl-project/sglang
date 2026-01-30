@@ -9,9 +9,67 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.utils import check_shared_mem, input_guard
+from sglang.srt.layers.attention.fla.utils import check_shared_mem, input_guard, FLA_CUMSUM_SCALAR_VECTORIZATION
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=num_warps)
+#         for num_warps in [1, 2, 4, 8]
+#     ],
+#     key=['B', 'H', 'BT', 'BH', 'IS_VARLEN', 'REVERSE'],
+#     **autotune_cache_kwargs
+# )
+@triton.jit(do_not_specialize=['T'])
+def chunk_local_cumsum_scalar_vectorization_kernel(
+    s,
+    o,
+    scale,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    BT: tl.constexpr,
+    BH: tl.constexpr,
+    REVERSE: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    HEAD_FIRST: tl.constexpr,
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    n_groups = tl.cdiv(H, BH)
+    i_b, i_hg = i_bh // n_groups, i_bh % n_groups
+    if IS_VARLEN:
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        T = eos - bos
+    else:
+        bos, eos = i_b * T, i_b * T + T
+
+    if HEAD_FIRST:
+        p_s = tl.make_block_ptr(s + bos*H, (H,T), (T,1), (i_hg * BH, i_t * BT), (BH,BT), (1,0))
+        p_o = tl.make_block_ptr(o + bos*H, (H,T), (T,1), (i_hg * BH, i_t * BT), (BH,BT), (1,0))
+    else:
+        p_s = tl.make_block_ptr(s + bos*H, (T,H), (H,1), (i_t * BT, i_hg * BH), (BT,BH), (1,0))
+        p_o = tl.make_block_ptr(o + bos*H, (T,H), (H,1), (i_t * BT, i_hg * BH), (BT,BH), (1,0))
+    # [BT, BH]
+    b_s = tl.load(p_s, boundary_check=(0,1)).to(tl.float32)
+    if HEAD_FIRST:
+        b_o = tl.cumsum(b_s, axis=1)
+        if REVERSE:
+            b_z = tl.sum(b_s, axis=1)
+            b_o = -b_o + b_z[:, None] + b_s
+    else:
+        b_o = tl.cumsum(b_s, axis=0)
+        if REVERSE:
+            b_z = tl.sum(b_s, axis=0)
+            b_o = -b_o + b_z[None, :] + b_s
+    if HAS_SCALE:
+        b_o *= scale
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,1))
 
 
 # @triton.autotune(
@@ -178,23 +236,45 @@ def chunk_local_cumsum_scalar(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     grid = (NT, B * H)
-    chunk_local_cumsum_scalar_kernel[grid](
-        s=g_org,
-        o=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
-        B=B,
-        H=H,
-        BT=BT,
-        HEAD_FIRST=head_first,
-        REVERSE=reverse,
-        HAS_SCALE=scale is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=8,
-        num_stages=3,
-    )
+    if not FLA_CUMSUM_SCALAR_VECTORIZATION:
+        chunk_local_cumsum_scalar_kernel[grid](
+            s=g_org,
+            o=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            B=B,
+            H=H,
+            BT=BT,
+            HEAD_FIRST=head_first,
+            REVERSE=reverse,
+            HAS_SCALE=scale is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=8,
+            num_stages=3,
+        )
+    else:
+        BH = min(8, triton.next_power_of_2(H))
+        grid = (NT, B * triton.cdiv(H, BH))
+        chunk_local_cumsum_scalar_vectorization_kernel[grid](
+            s=g_org,
+            o=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            B=B,
+            H=H,
+            BT=BT,
+            BH=BH,
+            HEAD_FIRST=head_first,
+            REVERSE=reverse,
+            HAS_SCALE=scale is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=4,
+            num_stages=3,
+        )
     return g
 
 
