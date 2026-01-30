@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -44,10 +44,29 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestPortArgs(unittest.TestCase):
-    @patch("sglang.srt.server_args.is_port_available")
+    @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
-    def test_init_new_standard_case(self, mock_temp_file, mock_is_port_available):
-        mock_is_port_available.return_value = True
+    def test_init_new_with_nccl_port_none(self, mock_temp_file, mock_get_free_port):
+        """Test that get_free_port() is called when nccl_port is None"""
+        mock_temp_file.return_value.name = "temp_file"
+        mock_get_free_port.return_value = 45678  # Mock ephemeral port
+
+        # Use MagicMock here to verify get_free_port is called
+        server_args = MagicMock()
+        server_args.nccl_port = None
+        server_args.enable_dp_attention = False
+        server_args.tokenizer_worker_num = 1
+
+        port_args = PortArgs.init_new(server_args)
+
+        # Verify get_free_port was called
+        mock_get_free_port.assert_called_once()
+
+        # Verify the returned port is used
+        self.assertEqual(port_args.nccl_port, 45678)
+
+    @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
+    def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
 
         server_args = ServerArgs(model_path="dummy")
@@ -62,9 +81,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("ipc://"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_single_node_dp_attention(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
+    def test_init_new_with_single_node_dp_attention(self):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
@@ -82,10 +99,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_dp_rank(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_dp_rank(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -102,13 +116,9 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_ipv4_address(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
-
         server_args.nccl_port = None
 
         server_args.enable_dp_attention = True
@@ -124,10 +134,7 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_malformed_ipv4_address(self, mock_is_port_available):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -143,12 +150,7 @@ class TestPortArgs(unittest.TestCase):
             "please provide --dist-init-addr as host:port", str(context.exception)
         )
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_malformed_ipv4_address_invalid_port(
-        self, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_malformed_ipv4_address_invalid_port(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -157,16 +159,11 @@ class TestPortArgs(unittest.TestCase):
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:abc"
 
-        with self.assertRaises(ValueError) as context:
+        with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
-    @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
-    def test_init_new_with_ipv6_address(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_ipv6_address(self, mock_is_valid_ipv6):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -186,13 +183,8 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertIsInstance(port_args.nccl_port, int)
 
-    @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=False)
-    def test_init_new_with_invalid_ipv6_address(
-        self, mock_is_valid_ipv6, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_invalid_ipv6_address(self, mock_is_valid_ipv6):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -206,12 +198,7 @@ class TestPortArgs(unittest.TestCase):
 
         self.assertIn("invalid IPv6 address", str(context.exception))
 
-    @patch("sglang.srt.server_args.is_port_available")
-    def test_init_new_with_malformed_ipv6_address_missing_bracket(
-        self, mock_is_port_available
-    ):
-        mock_is_port_available.return_value = True
-
+    def test_init_new_with_malformed_ipv6_address_missing_bracket(self):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -225,13 +212,10 @@ class TestPortArgs(unittest.TestCase):
 
         self.assertIn("invalid IPv6 address format", str(context.exception))
 
-    @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
     def test_init_new_with_malformed_ipv6_address_missing_port(
-        self, mock_is_valid_ipv6, mock_is_port_available
+        self, mock_is_valid_ipv6
     ):
-        mock_is_port_available.return_value = True
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -247,13 +231,10 @@ class TestPortArgs(unittest.TestCase):
             "a port must be specified in IPv6 address", str(context.exception)
         )
 
-    @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
     def test_init_new_with_malformed_ipv6_address_invalid_port(
-        self, mock_is_valid_ipv6, mock_is_port_available
+        self, mock_is_valid_ipv6
     ):
-        mock_is_port_available.return_value = True
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -267,13 +248,10 @@ class TestPortArgs(unittest.TestCase):
 
         self.assertIn("invalid port in IPv6 address", str(context.exception))
 
-    @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.is_valid_ipv6_address", return_value=True)
     def test_init_new_with_malformed_ipv6_address_wrong_separator(
-        self, mock_is_valid_ipv6, mock_is_port_available
+        self, mock_is_valid_ipv6
     ):
-        mock_is_port_available.return_value = True
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
