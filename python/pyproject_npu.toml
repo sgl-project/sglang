@@ -64,6 +64,7 @@ dependencies = [
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "av==16.0.1", # required for qwen3_omni_moe use_audio_with_video
 ]
 
 [project.optional-dependencies]
