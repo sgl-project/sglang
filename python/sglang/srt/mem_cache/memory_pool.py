@@ -39,7 +39,7 @@ import triton.language as tl
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.environ import envs
+from sglang.srt.environ import Envs, envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
@@ -261,6 +261,9 @@ class MambaPool:
                 dtype=ssm_dtype,
                 device=device,
             )
+            # -> K contiguous
+            if envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get():
+                temporal_state = temporal_state.transpose(-2, -1).contiguous().transpose(-2, -1)
             if speculative_num_draft_tokens is not None:
                 # Cache intermediate SSM states per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
@@ -276,6 +279,8 @@ class MambaPool:
                     dtype=ssm_dtype,
                     device="cuda",
                 )
+                if envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get():
+                    intermediate_ssm_state_cache = intermediate_ssm_state_cache.transpose(-2, -1).contiguous().transpose(-2, -1)
                 # Cache intermediate conv windows (last K-1 inputs) per draft token during target verify
                 # Shape: [num_layers, size + 1, speculative_num_draft_tokens, dim, K-1]
                 intermediate_conv_window_cache = [
