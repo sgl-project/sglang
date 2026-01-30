@@ -1446,15 +1446,17 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch in ["Exaone4ForCausalLM"]:
+        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
-                # https://docs.sglang.ai/advanced_features/attention_backend.html
-                assert self.attention_backend in {
-                    "fa3",
-                    "triton",
-                    "trtllm_mha",
-                }, "fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+                logger.warning(
+                    f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
+                )
                 self.disable_hybrid_swa_memory = True
+                # https://docs.sglang.ai/advanced_features/attention_backend.html
+                accepted_backends = ["fa3", "triton", "trtllm_mha"]
+                assert (
+                    self.attention_backend in accepted_backends
+                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
