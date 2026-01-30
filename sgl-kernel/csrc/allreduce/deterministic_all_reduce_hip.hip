@@ -30,6 +30,40 @@ bool _is_weak_contiguous_det(torch::Tensor& t) {
          (t.storage().nbytes() - t.storage_offset() * t.element_size() == t.numel() * t.element_size());
 }
 
+template <typename T>
+static inline void launch_deterministic_all_reduce_kernel(sglang::CustomAllreduce* fa, int size, int threads,
+                                                          hipStream_t stream, sglang::RankData* ptrs,
+                                                          void* out_data_ptr) {
+  using P = typename sglang::packed_t<T>::P;
+  auto d = P::size;
+  if (size % d != 0) {
+    throw std::runtime_error("size must be multiple of " + std::to_string(d));
+  }
+  size /= d;
+  int blocks = std::min(16, (size + threads - 1) / threads);
+  // Always use 1-stage kernel for determinism
+  switch (fa->world_size_) {
+    case 2:
+      hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream, ptrs,
+                          fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out_data_ptr), fa->rank_, size);
+      break;
+    case 4:
+      hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream, ptrs,
+                          fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out_data_ptr), fa->rank_, size);
+      break;
+    case 6:
+      hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream, ptrs,
+                          fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out_data_ptr), fa->rank_, size);
+      break;
+    case 8:
+      hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream, ptrs,
+                          fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out_data_ptr), fa->rank_, size);
+      break;
+    default:
+      throw std::runtime_error("world_size must be in (2,4,6,8)");
+  }
+}
+
 // Deterministic all-reduce for registered buffers (ROCm)
 // Uses the 1-stage kernel which is deterministic (fixed ordering)
 void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out) {
@@ -63,98 +97,16 @@ void deterministic_all_reduce_reg(fptr_t _fa, torch::Tensor& inp, torch::Tensor&
 
   switch (out.scalar_type()) {
     case at::ScalarType::Float: {
-      using T = float;
-      using P = typename sglang::packed_t<T>::P;
-      auto d = P::size;
-      if (size % d != 0) {
-        throw std::runtime_error("size must be multiple of " + std::to_string(d));
-      }
-      size /= d;
-      int blocks = std::min(16, (size + threads - 1) / threads);
-      // Always use 1-stage kernel for determinism
-      switch (fa->world_size_) {
-        case 2:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 4:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 6:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 8:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        default:
-          throw std::runtime_error("world_size must be in (2,4,6,8)");
-      }
+      launch_deterministic_all_reduce_kernel<float>(fa, size, threads, stream, ptrs, out.data_ptr());
       break;
     }
     case at::ScalarType::Half: {
-      using T = half;
-      using P = typename sglang::packed_t<T>::P;
-      auto d = P::size;
-      if (size % d != 0) {
-        throw std::runtime_error("size must be multiple of " + std::to_string(d));
-      }
-      size /= d;
-      int blocks = std::min(16, (size + threads - 1) / threads);
-      switch (fa->world_size_) {
-        case 2:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 4:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 6:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 8:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        default:
-          throw std::runtime_error("world_size must be in (2,4,6,8)");
-      }
+      launch_deterministic_all_reduce_kernel<half>(fa, size, threads, stream, ptrs, out.data_ptr());
       break;
     }
 #if (__HIP_ARCH__ >= 800 || !defined(__HIP_ARCH__))
     case at::ScalarType::BFloat16: {
-      using T = nv_bfloat16;
-      using P = typename sglang::packed_t<T>::P;
-      auto d = P::size;
-      if (size % d != 0) {
-        throw std::runtime_error("size must be multiple of " + std::to_string(d));
-      }
-      size /= d;
-      int blocks = std::min(16, (size + threads - 1) / threads);
-      switch (fa->world_size_) {
-        case 2:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 2>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 4:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 4>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 6:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 6>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        case 8:
-          hipLaunchKernelGGL((sglang::cross_device_reduce_1stage<T, 8>), dim3(blocks), dim3(threads), 0, stream,
-                              ptrs, fa->sg_, fa->self_sg_, reinterpret_cast<T*>(out.data_ptr()), fa->rank_, size);
-          break;
-        default:
-          throw std::runtime_error("world_size must be in (2,4,6,8)");
-      }
+      launch_deterministic_all_reduce_kernel<nv_bfloat16>(fa, size, threads, stream, ptrs, out.data_ptr());
       break;
     }
 #endif
