@@ -207,7 +207,6 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     use_routing_scales_on_input: bool = False
 
 
-@register_fused_func("none", "flashinfer_trtllm")
 def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
@@ -478,3 +477,23 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     )[0]
 
     return StandardCombineInput(hidden_states=result)
+
+
+@register_fused_func("none", "flashinfer_trtllm")
+def fused_experts_none_to_flashinfer_trtllm(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """Dispatch to FP8 or FP4 FlashInfer TRT-LLM MoE based on quant_info type."""
+    if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_fp4(
+            dispatch_output, quant_info, runner_config
+        )
+    if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_fp8(
+            dispatch_output, quant_info, runner_config
+        )
+    raise TypeError(
+        f"Unexpected quant_info type for flashinfer_trtllm: {type(quant_info)}"
+    )
