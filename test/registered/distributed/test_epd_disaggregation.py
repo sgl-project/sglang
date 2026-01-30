@@ -520,6 +520,8 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
             "zmq_to_scheduler",
             "--tp",
             "1",
+            "--base-gpu-id",
+            "0",
             "--enable-prefix-mm-cache",
         ]
         cls.process_encode = subprocess.Popen(encode_command)
@@ -671,7 +673,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
-class TestEPDDisaggregationGrpcEncoder(PDDisaggregationServerBase):
+class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
     """Test gRPC encoder server integration with zmq_to_scheduler transfers."""
 
     @classmethod
@@ -705,6 +707,8 @@ class TestEPDDisaggregationGrpcEncoder(PDDisaggregationServerBase):
             "zmq_to_scheduler",
             "--tp",
             "1",
+            "--base-gpu-id",
+            "0",
             "--enable-prefix-mm-cache",
         ]
         cls.process_encode = subprocess.Popen(encode_command)
