@@ -1,13 +1,50 @@
+import os
+
 import numpy as np
 import pytest
-import tabulate
 import torch
-from diffusers.models.embeddings import get_timestep_embedding
+
+try:
+    import tabulate
+except Exception:
+    tabulate = None
 
 from sglang.jit_kernel.timestep_embedding import (
     timestep_embedding as timestep_embedding_cuda,
 )
-from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+
+
+def get_timestep_embedding_reference(
+    timesteps: torch.Tensor,
+    dim: int,
+    *,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 1,
+    scale: float = 1,
+    max_period: int = 10000,
+):
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+
+    timesteps = timesteps.to(torch.float32)
+    half_dim = dim // 2
+    exponent = -torch.log(
+        torch.tensor(max_period, dtype=torch.float32, device=timesteps.device)
+    ) * torch.arange(
+        start=0, end=half_dim, dtype=torch.float32, device=timesteps.device
+    )
+    exponent = exponent / (half_dim - downscale_freq_shift)
+
+    emb = torch.exp(exponent)
+    emb = timesteps[:, None].float() * emb[None, :]
+
+    emb = scale * emb
+
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
+    if flip_sin_to_cos:
+        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim=-1)
+    if dim % 2 == 1:
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
 
 
 @pytest.mark.parametrize(
@@ -18,8 +55,12 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embed
 def test_timestep_embedding_correctness_with_sgld(batch_size, dim, dtype):
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
-    torch_output = timestep_embedding(t, dim)
-    cuda_output = timestep_embedding_cuda(t, dim, flip_sin_to_cos=True)
+    torch_output = get_timestep_embedding_reference(
+        t, dim, flip_sin_to_cos=True, downscale_freq_shift=0
+    )
+    cuda_output = timestep_embedding_cuda(
+        t, dim, flip_sin_to_cos=True, downscale_freq_shift=0
+    )
     torch.testing.assert_close(torch_output, cuda_output, atol=1e-3, rtol=1e-3)
 
 
@@ -34,7 +75,7 @@ def test_timestep_embedding_correctness_with_diffusers(
 ):
     device = "cuda"
     t = torch.randint(low=0, high=1000, size=(batch_size,), device=device).to(dtype)
-    torch_output = get_timestep_embedding(
+    torch_output = get_timestep_embedding_reference(
         t,
         dim,
         flip_sin_to_cos=flip_sin_to_cos,
@@ -54,6 +95,11 @@ def test_timestep_embedding_correctness_with_diffusers(
 
 
 def test_timestep_embedding_perf():
+    if os.environ.get("SGLANG_RUN_JIT_KERNEL_PERF_TESTS") != "1":
+        pytest.skip("Perf test disabled by default")
+    if tabulate is None:
+        pytest.skip("Optional dependency 'tabulate' is not installed")
+
     NUM_BATCH = [1, 2, 8, 63, 256, 512, 613, 1024, 1536]
     NUM_DIM = [32, 64, 128, 256, 512, 1024, 2048, 4096]
 
@@ -83,7 +129,7 @@ def test_timestep_embedding_perf():
             t = torch.linspace(0, max(100000, B), steps=B, device=device).to(
                 torch.float32
             )
-            time_torch = perf_kernel_fn(timestep_embedding, t, dim)
+            time_torch = perf_kernel_fn(get_timestep_embedding_reference, t, dim)
             time_cuda = perf_kernel_fn(timestep_embedding_cuda, t, dim)
             speedup_cuda = time_torch / time_cuda
 

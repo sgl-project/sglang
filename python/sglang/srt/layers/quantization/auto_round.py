@@ -13,8 +13,6 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 
 ScalarType, scalar_types = get_scalar_types()
 
-
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import is_npu
 
@@ -220,11 +218,13 @@ class AutoRoundConfig(QuantizationConfig):
         return weight_bits < 16
 
     def apply_awq_quant_layer(self, layer, prefix: str, backend: str = "auto"):
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.marlin_utils import (
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
@@ -313,6 +313,7 @@ class AutoRoundConfig(QuantizationConfig):
             check_marlin_supported,
             check_moe_marlin_supports_layer,
         )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         weight_bits, group_size, sym = self.get_layer_config(layer, prefix)
