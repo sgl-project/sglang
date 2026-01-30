@@ -335,6 +335,7 @@ class ServerArgs:
     # Runtime options
     device: Optional[str] = None
     tp_size: int = 1
+    dcp_size: int = 1
     pp_size: int = 1
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
@@ -3078,6 +3079,13 @@ class ServerArgs:
             help="The tensor parallelism size.",
         )
         parser.add_argument(
+            "--decode-context-parallel-size",
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="The decode context parallel size.",
+        )
+        parser.add_argument(
             "--pipeline-parallel-size",
             "--pp-size",
             type=int,
@@ -4815,6 +4823,7 @@ class ServerArgs:
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
         args.tp_size = args.tensor_parallel_size
+        args.dcp_size = args.decode_context_parallel_size
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size

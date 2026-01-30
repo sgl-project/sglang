@@ -77,7 +77,10 @@ class ModelRunnerKVCacheMixin:
                 element_size = torch._utils._element_size(
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                # We do not shard the indexer K cache when DCP is enabled.
+                cell_size += (
+                    indexer_size_per_token * num_layers * element_size * self.dcp_size
+                )
         else:
             cell_size = (
                 self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -452,6 +455,7 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                dcp_size=self.dcp_size,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
@@ -621,7 +625,7 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
                 else:
-                    if self.page_size == 1:
+                    if self.page_size == 1 and self.dcp_size == 1:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
@@ -631,8 +635,8 @@ class ModelRunnerKVCacheMixin:
                         )
                     else:
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens,
-                            page_size=self.page_size,
+                            self.max_total_num_tokens * self.dcp_size,
+                            page_size=self.page_size * self.dcp_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,

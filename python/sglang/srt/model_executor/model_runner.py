@@ -289,6 +289,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dcp_size = server_args.dcp_size
+        self.dcp_rank = self.tp_rank % self.dcp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size
@@ -777,6 +779,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                decode_context_parallel_size=self.dcp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(
@@ -1797,6 +1800,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.model_config.dtype,
             dp_size=self.server_args.dp_size,
             pp_size=self.server_args.pp_size,
+            dcp_size=self.server_args.dcp_size,
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,

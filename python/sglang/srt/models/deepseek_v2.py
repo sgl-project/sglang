@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_dcp_group,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -1103,6 +1104,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.max_position_embeddings = max_position_embeddings
         self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
 
+        self.dcp_size = get_dcp_group().world_size
+        self.dcp_rank = get_dcp_group().rank_in_group
+
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
@@ -1503,6 +1507,33 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
 
+    def _filter_topk_indices_by_dcp(self, topk_indices: torch.Tensor) -> torch.Tensor:
+        """Filter topk_indices to keep only indices where index % dcp_size == dcp_rank.
+
+        This is used for DCP (distributed compute parallel) to ensure each rank
+        only processes its assigned portion of the KV cache.
+
+        Args:
+            topk_indices: Tensor of shape [num_tokens, topk] containing topk indices
+
+        Returns:
+            Filtered tensor with the same shape, where indices not matching
+            the DCP rank are set to -1
+        """
+        if self.dcp_size <= 1:
+            return topk_indices
+
+        # Create mask for indices that belong to this DCP rank
+        mask = (topk_indices % self.dcp_size == self.dcp_rank) & (topk_indices >= 0)
+
+        # Create result tensor initialized with -1
+        result = torch.full_like(topk_indices, -1, dtype=topk_indices.dtype)
+
+        # Copy only the indices that match this DCP rank
+        result[mask] = topk_indices[mask]
+
+        return result
+
     def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
@@ -1608,6 +1639,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
                 )
+                topk_indices = self._filter_topk_indices_by_dcp(topk_indices)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -1620,6 +1652,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                    topk_indices = self._filter_topk_indices_by_dcp(topk_indices)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
