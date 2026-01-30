@@ -160,22 +160,39 @@ For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 p
 
 ## Ascend NPU Guidance
 
-Guidance on SGLang configuration in Ascend NPU:
+
+### Guidance on SGLang configuration in Ascend NPU
 - `--moe-a2a-backend` only supports `deepep` and `ascend_fuseep` backends,
   - `deepep`: The mechanism is consistent with the above description.
-  - `ascend_fuseep`: only used for decode stage in PD Disaggregation Mode. DeepEP Ascend offers a fused operator `fused_deep_moe` which integrates all operations between dispatch and combine to boost MoE computation.
+  - `ascend_fuseep`: Offer a large fused operator which integrates all operations between dispatch and combine to boost MoE computation. Only used for decode stage in PD Disaggregation Mode.
 - `--moe-runner-backend` parameter does not need to be configured.
 - `--deepep-mode`:
   - In PD mixed mode, please set `--deepep-mode auto`.
   - In PD Disaggregation Mode, prefill instance sets `--deepep-mode normal`, and decode instance sets `--deepep-mode low_latency`.
 
-Environment variables on DeepEP Ascend configuration in Ascend NPU:
-- `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS`: The maximum number of rounds for token transmission, default 1. Indicates the maximum number of tokens in a prefill batch `--chunked-prefill-size`.
-- `DEEPEP_NORMAL_LONG_SEQ_ROUND`: The number of tokens sent per round, default 8192. Indicates the maximum number of chunks for single request while enabling chunked prefill.
-- `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`: Whether ant-moving is enabled in combine stage, default disabled.
 
-DeepEP backends support two modes for token dispatch: `normal` and `low_latency` mode. Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime.
-- `--deepep-mode normal`:
-  - `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=0`: the maximum supported value for `--chunked-prefill-size` is 8192. (In other words, the maximum number of tokens in a prefill batch is 8192)
-  - `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1`: the maximum supported value for `--chunked-prefill-size` is 65536. (In other words, the maximum number of tokens in a prefill batch is 65536)
-- `--deepep-mode low_latency`: the maximum number of requests in a decode batch is 512. (In other words, the maximum number of batch size in a decode batch is 512)
+### DeepEP Ascend Introduction
+
+DeepEP Ascend is the adapted version of the DeepEP communication library for Huawei Ascend NPUs, specifically designed for Mixture-of-Experts (MoE) model Expert Parallelism (EP).
+It supports the Ant-moving Function (Split the sequence length into rounds for streaming batch transmission) to optimize the buffer size occupied during collective communication in prefill stage, especially for long sequences.
+
+Ant-moving Function can be enabled for both the dispatch and combine phases via the following environment variables:
+- `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS`: Enable ant-moving function in dispatch stage. Indicates the number of tokens transmitted per round on each rank, default 1.
+- `DEEPEP_NORMAL_LONG_SEQ_ROUND`: Enable ant-moving function in dispatch stage. Indicates the number of rounds transmitted on each rank, default 8192
+- `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`: Enable ant-moving function in combine stage, default disabled.
+
+`DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * DEEPEP_NORMAL_LONG_SEQ_ROUND` means input sequence length. When the input sequence length exceeds 8192, it is recommended to enable the ant-moving function.
+
+The environment variable `HCCL_BUFFSIZE` is used to configure the buffer size (MB). Its calculation formula is as follows:
+```angular2html
+# Enable Ant-moving Function
+HCCL_BUFFSIZE >= 2 * (102MB + 4MB + DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * (hidden_size + hidden_size + hidden_size) * topk) + PADDING_BUFFSIZE
+
+# Disable Ant-moving Function
+HCCL_BUFFSIZE >= 2 * (102MB + 4MB + TOTAL_SEQ_LEN * (hidden_size + hidden_size) * topk) + PADDING_BUFFSIZE
+```
+Wherein the parameters are described as follows:
+- `hidden_size`: hidden size per token.
+- `topk`: The number of selected routing experts.
+- `TOTAL_SEQ_LEN`: input sequence length.
+- `PADDING_BUFFSIZE`: A value of 20 or greater is recommended.
