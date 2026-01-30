@@ -203,10 +203,16 @@ def benchmark_one_layer_h2d(
 ) -> Tuple[float, float, float]:
     """One Layer: Host (CPU) -> Device (GPU)."""
     k_cache_src = torch.randn(
-        (HOST_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cpu", pin_memory=True
+        (HOST_CACHE_SIZE, element_size),
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
     )
     v_cache_src = torch.randn(
-        (HOST_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cpu", pin_memory=True
+        (HOST_CACHE_SIZE, element_size),
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
     )
     k_cache_dst = torch.randn(
         (GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
@@ -224,27 +230,47 @@ def benchmark_one_layer_h2d(
 
     FN_MAP = {
         "aot": lambda: sglang_aot_transfer_one(
-            k_cache_dst, v_cache_dst, indices_dst_gpu,
-            k_cache_src, v_cache_src, indices_src_gpu, element_bytes
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_cache_src,
+            v_cache_src,
+            indices_src_gpu,
+            element_bytes,
         ),
         "jit": lambda: sglang_jit_transfer_one(
-            k_cache_dst, v_cache_dst, indices_dst_gpu,
-            k_cache_src, v_cache_src, indices_src_gpu, element_size
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_cache_src,
+            v_cache_src,
+            indices_src_gpu,
+            element_size,
         ),
         "pytorch": lambda: pytorch_transfer(
-            k_cache_dst, v_cache_dst, indices_dst_gpu,
-            k_cache_src, v_cache_src, indices_src_cpu
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_cache_src,
+            v_cache_src,
+            indices_src_cpu,
         ),
         "torch_streams": lambda: torch_streams_transfer(
-            k_cache_dst, v_cache_dst, indices_dst_gpu,
-            k_cache_src, v_cache_src, indices_src_cpu
+            k_cache_dst,
+            v_cache_dst,
+            indices_dst_gpu,
+            k_cache_src,
+            v_cache_src,
+            indices_src_cpu,
         ),
     }
 
     if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
         return (float("nan"), float("nan"), float("nan"))
 
-    ms, min_ms, max_ms = triton.testing.do_bench(FN_MAP[provider], quantiles=DEFAULT_QUANTILES)
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        FN_MAP[provider], quantiles=DEFAULT_QUANTILES
+    )
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
@@ -280,20 +306,22 @@ def benchmark_all_layer_d2h(
 ) -> Tuple[float, float, float]:
     """All Layer: Device (GPU) -> Host (CPU)."""
     k_caches_src = torch.randn(
-        (NUM_LAYERS, GPU_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE, device="cuda"
+        (NUM_LAYERS, GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
     )
     v_caches_src = torch.randn(
-        (NUM_LAYERS, GPU_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE, device="cuda"
+        (NUM_LAYERS, GPU_CACHE_SIZE, element_size), dtype=DEFAULT_DTYPE, device="cuda"
     )
     k_caches_dst = torch.randn(
         (NUM_LAYERS, HOST_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE, device="cpu", pin_memory=True
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
     )
     v_caches_dst = torch.randn(
         (NUM_LAYERS, HOST_CACHE_SIZE, element_size),
-        dtype=DEFAULT_DTYPE, device="cpu", pin_memory=True
+        dtype=DEFAULT_DTYPE,
+        device="cpu",
+        pin_memory=True,
     )
 
     indices_src_gpu = torch.randperm(GPU_CACHE_SIZE, device="cuda")[:batch_size]
@@ -310,28 +338,60 @@ def benchmark_all_layer_d2h(
 
     FN_MAP = {
         "aot": lambda: sglang_aot_transfer_all(
-            k_ptrs_dst, v_ptrs_dst, indices_dst_gpu,
-            k_ptrs_src, v_ptrs_src, indices_src_gpu, element_bytes, NUM_LAYERS
+            k_ptrs_dst,
+            v_ptrs_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            NUM_LAYERS,
         ),
         "jit": lambda: sglang_jit_transfer_all(
-            k_ptrs_dst, v_ptrs_dst, indices_dst_gpu,
-            k_ptrs_src, v_ptrs_src, indices_src_gpu, element_bytes, element_bytes
+            k_ptrs_dst,
+            v_ptrs_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            element_bytes,
         ),
-        "pytorch": lambda: [pytorch_transfer(
-            k_caches_dst[i], v_caches_dst[i], indices_dst_cpu,
-            k_caches_src[i], v_caches_src[i], indices_src_gpu
-        ) for i in range(NUM_LAYERS)],
-        "torch_streams": lambda: [torch_streams_transfer(
-            k_caches_dst[i], v_caches_dst[i], indices_dst_cpu,
-            k_caches_src[i], v_caches_src[i], indices_src_gpu
-        ) for i in range(NUM_LAYERS)],
+        "pytorch": lambda: [
+            pytorch_transfer(
+                k_caches_dst[i],
+                v_caches_dst[i],
+                indices_dst_cpu,
+                k_caches_src[i],
+                v_caches_src[i],
+                indices_src_gpu,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "torch_streams": lambda: [
+            torch_streams_transfer(
+                k_caches_dst[i],
+                v_caches_dst[i],
+                indices_dst_cpu,
+                k_caches_src[i],
+                v_caches_src[i],
+                indices_src_gpu,
+            )
+            for i in range(NUM_LAYERS)
+        ],
     }
 
     if provider == "jit" and not can_use_hicache_jit_kernel(element_size=element_bytes):
         return (float("nan"), float("nan"), float("nan"))
 
-    ms, min_ms, max_ms = triton.testing.do_bench(FN_MAP[provider], quantiles=DEFAULT_QUANTILES)
-    return 1000 * ms / NUM_LAYERS, 1000 * max_ms / NUM_LAYERS, 1000 * min_ms / NUM_LAYERS
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        FN_MAP[provider], quantiles=DEFAULT_QUANTILES
+    )
+    return (
+        1000 * ms / NUM_LAYERS,
+        1000 * max_ms / NUM_LAYERS,
+        1000 * min_ms / NUM_LAYERS,
+    )
 
 
 if __name__ == "__main__":
