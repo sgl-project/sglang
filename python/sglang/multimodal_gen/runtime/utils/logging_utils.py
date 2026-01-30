@@ -18,8 +18,6 @@ from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
 
-SGLANG_DIFFUSION_CONFIGURE_LOGGING = envs.SGLANG_DIFFUSION_CONFIGURE_LOGGING
-SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
@@ -144,6 +142,7 @@ def get_is_local_main_process():
 
 
 def _log_process_aware(
+    server_log_level: int,
     level: int,
     logger_self: Logger,
     msg: object,
@@ -155,12 +154,12 @@ def _log_process_aware(
     """Helper function to log a message if the process rank matches the criteria."""
     is_main_process = get_is_main_process()
     is_local_main_process = get_is_local_main_process()
-
     should_log = (
         not main_process_only
         and not local_main_process_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
+        or server_log_level <= logging.DEBUG
     )
 
     if should_log:
@@ -236,6 +235,8 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
+    server_log_level = logger.getEffectiveLevel()
+
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -254,6 +255,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
+                server_log_level,
                 level,
                 self,
                 msg,
@@ -283,7 +285,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, False), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)
@@ -468,7 +470,10 @@ def log_generation_timer(
         yield timer
         timer.end_time = time.perf_counter()
         timer.duration = timer.end_time - timer.start_time
-        logger.info("Pixel data generated successfully in %.2f seconds", timer.duration)
+        logger.info(
+            f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
+            timer.duration,
+        )
     except Exception as e:
         if request_idx is not None:
             logger.error(
@@ -489,7 +494,7 @@ def log_batch_completion(
     logger: logging.Logger, num_outputs: int, total_time: float
 ) -> None:
     logger.info(
-        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        f"Completed batch processing. Generated %d outputs in {GREEN}%.2f{RESET} seconds",
         num_outputs,
         total_time,
     )

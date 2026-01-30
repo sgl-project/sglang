@@ -596,11 +596,7 @@ def set_mixed_precision_policy(
 
 
 def get_compute_dtype() -> torch.dtype:
-    """Get the current compute dtype from mixed precision policy.
-
-    Returns:
-        torch.dtype: The compute dtype to use, defaults to get_default_dtype() if no policy set
-    """
+    """Get the current compute dtype from mixed precision policy."""
     if not hasattr(_mixed_precision_state, "state"):
         return torch.get_default_dtype()
     else:

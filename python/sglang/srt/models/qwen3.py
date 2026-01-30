@@ -21,7 +21,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -29,6 +28,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
@@ -138,50 +138,35 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
+        )
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
-    def forward_prepare_npu(self, positions, hidden_states):
+    def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
 
-        if self.attn.layer_id == 0:
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
-            self.q_norm.weight,
-            self.k_norm.weight,
             self.q_size,
             self.kv_size,
             self.head_dim,
-            self.q_norm.variance_epsilon,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
             q_bias=getattr(self.q_norm, "bias", None),
             k_bias=getattr(self.k_norm, "bias", None),
         )
@@ -196,7 +181,7 @@ class Qwen3Attention(nn.Module):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
-        if not _is_npu:
+        if not _is_npu or forward_batch.forward_mode.is_extend():
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -205,6 +190,7 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_npu(
                 positions=positions,
                 hidden_states=hidden_states,
+                forward_batch=forward_batch,
             )
 
         if get_global_server_args().rl_on_policy_target is not None:
@@ -290,10 +276,14 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            post_residual_addition=post_residual_addition,
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -310,6 +300,11 @@ class Qwen3DecoderLayer(nn.Module):
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
                 if _is_npu
+                and not get_global_server_args().enable_piecewise_cuda_graph
+                and (
+                    hasattr(self.mlp.gate_up_proj, "weight")
+                    and hasattr(self.mlp.down_proj, "weight")
+                )
                 else None
             ),
         )
@@ -382,25 +377,12 @@ class Qwen3ForCausalLM(nn.Module):
                     config.vocab_size,
                     config.hidden_size,
                     quant_config=quant_config,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
-
-        # perform weight tying for PP
-        if self.pp_group.world_size > 1 and config.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.world_size - 1
-                )
-            elif self.pp_group.is_last_rank:
-                emb_token_weight = self.pp_group.recv(
-                    size=self.lm_head.weight.shape,
-                    dtype=next(self.model.parameters()).dtype,
-                    src=0,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -510,6 +492,16 @@ class Qwen3ForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
+
+            if name == "model.embed_tokens.weight":
+                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
+                    if "lm_head.weight" in params_dict:
+                        param = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -527,16 +519,6 @@ class Qwen3ForCausalLM(nn.Module):
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
                 continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
-                    # Handle pp weight tying here
-                    # find the embed_tokens.weight in the weights
-                    embed_token_weights = next(
-                        filter(lambda x: x[0] == "model.embed_tokens.weight", weights)
-                    )[1]
-                    loaded_weight = embed_token_weights
-                else:
-                    continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             if "scale" in name:

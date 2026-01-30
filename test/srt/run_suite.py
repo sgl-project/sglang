@@ -2,160 +2,28 @@ import argparse
 import glob
 from pathlib import Path
 
+import tabulate
+
 from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
-    "per-commit-1-gpu": [
-        TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
-        TestFile("hicache/test_hicache_storage.py", 96),
-        TestFile("hicache/test_hicache_variants.py", 368),
-        TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
-        TestFile("layers/attention/mamba/test_mamba_ssm.py", 7),
-        TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 13),
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_cross_encoder_models.py", 100),
-        TestFile("models/test_embedding_models.py", 73),
-        TestFile("models/test_encoder_embedding_models.py", 221),
-        TestFile("models/test_generation_models.py", 103),
-        TestFile("models/test_nvidia_nemotron_nano_v2.py", 132),
-        TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 214),  # GSM8k + MMMU
-        TestFile("models/test_qwen_models.py", 90),
-        TestFile("models/test_reward_models.py", 103),
-        TestFile("models/test_transformers_models.py", 245),
-        TestFile("models/test_vlm_models.py", 270),
-        TestFile("openai_server/basic/test_openai_embedding.py", 70),
-        TestFile("openai_server/basic/test_openai_server.py", 184),
-        TestFile("openai_server/basic/test_protocol.py", 3),
-        TestFile("openai_server/basic/test_serving_chat.py", 10),
-        TestFile("openai_server/basic/test_serving_completions.py", 10),
-        TestFile("openai_server/basic/test_serving_embedding.py", 10),
-        TestFile("openai_server/features/test_enable_thinking.py", 70),
-        TestFile("openai_server/features/test_json_mode.py", 109),
-        TestFile("openai_server/features/test_openai_server_ebnf.py", 7),
-        TestFile("openai_server/features/test_openai_server_hidden_states.py", 186),
-        TestFile("openai_server/features/test_reasoning_content.py", 89),
-        TestFile("openai_server/function_call/test_openai_function_calling.py", 60),
-        TestFile("openai_server/function_call/test_tool_choice.py", 120),
-        TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
-        TestFile("openai_server/validation/test_matched_stop.py", 40),
-        TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 6),
-        TestFile("openai_server/validation/test_request_length_validation.py", 38),
-        TestFile("ops/test_repeat_interleave.py", 60),
-        TestFile("quant/test_block_int8.py", 44),
-        TestFile("quant/test_fp8_kernel.py", 10),
-        TestFile("quant/test_int8_kernel.py", 8),
-        TestFile("quant/test_triton_scaled_mm.py", 8),
-        TestFile("quant/test_w8a8_quantization.py", 160),
-        TestFile("quant/test_autoround.py", 77),
-        TestFile("rl/test_fp32_lm_head.py", 9),
-        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
-        TestFile("rl/test_update_weights_from_tensor.py", 195),
-        TestFile("dllm/test_llada2_mini.py", 520),
-        TestFile("test_abort.py", 131),
-        TestFile("test_chunked_prefill.py", 312),
-        TestFile("test_create_kvindices.py", 7),
-        TestFile("test_deterministic.py", 228),
-        TestFile("test_constrained_decoding.py", 111),
-        TestFile("test_eval_fp8_accuracy.py", 250),
-        TestFile("test_external_models.py", 30),
-        TestFile("test_fa3.py", 420),
-        TestFile("test_flashmla.py", 230),
-        TestFile("test_fp8_utils.py", 9),
-        TestFile("rotary_embedding/test_mrope.py", 10),
-        TestFile("test_fused_moe.py", 80),
-        TestFile("test_gpt_oss_1gpu.py", 402),
-        TestFile("test_harmony_parser.py", 6),
-        TestFile("test_hidden_states.py", 55),
-        TestFile("test_hybrid_attn_backend.py", 379),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_io_struct.py", 8),
-        TestFile("test_jinja_template_utils.py", 7),
-        TestFile("test_mamba_unittest.py", 9),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_metrics_utils.py", 1),
-        TestFile("test_mla.py", 194),
-        TestFile("test_mla_deepseek_v3.py", 442),
-        TestFile("test_mla_flashinfer.py", 302),
-        TestFile("test_mla_fp8.py", 77),
-        TestFile("test_mla_int8_deepseek_v3.py", 300),
-        TestFile("test_model_hooks.py", 6),
-        TestFile("test_modelopt_loader.py", 11),
-        TestFile("test_multi_tokenizer.py", 230),
-        TestFile("test_ngram_speculative_decoding.py", 177),
-        TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_no_overlap_scheduler.py", 217),
-        TestFile("test_original_logprobs.py", 41),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_penalty.py", 82),
-        TestFile("test_priority_scheduling.py", 130),
-        TestFile("test_pytorch_sampling_backend.py", 66),
-        TestFile("test_radix_attention.py", 105),
-        TestFile("test_radix_cache_unit.py", 8),
-        TestFile("test_reasoning_parser.py", 5),
-        TestFile("test_request_queue_validation.py", 47),
-        TestFile("test_retract_decode.py", 259),
-        TestFile("test_score_api.py", 260),
-        TestFile("test_server_args.py", 9),
-        TestFile("test_speculative_registry.py", 8),
-        TestFile("test_skip_tokenizer_init.py", 77),
-        TestFile("test_srt_endpoint.py", 127),
-        TestFile("test_srt_engine.py", 252),
-        TestFile("test_standalone_speculative_decoding.py", 150),
-        TestFile("test_start_profile.py", 41),
-        TestFile("test_profile_merger.py", 8),
-        TestFile("test_profile_merger_http_api.py", 9),
-        TestFile("test_swa_unittest.py", 8),
-        TestFile("test_torch_compile.py", 190),
-        TestFile("test_torch_compile_moe.py", 210),
-        TestFile("test_triton_fused_moe.py", 12),
-        TestFile("test_torch_native_attention_backend.py", 221),
-        TestFile("test_torchao.py", 103),
-        TestFile("test_triton_attention_kernels.py", 4),
-        TestFile("test_triton_attention_backend.py", 203),
-        TestFile("test_triton_attention_kernels.py", 4),
-        TestFile("test_triton_moe_channel_fp8_kernel.py", 16),
-        TestFile("test_triton_sliding_window.py", 84),
-        TestFile("test_utils_update_weights.py", 29),
-        TestFile("test_video_utils.py", 5),
-        TestFile("test_vision_chunked_prefill.py", 150),
-        TestFile("test_vision_openai_server_a.py", 778),
-        TestFile("test_vlm_input_format.py", 166),
-        TestFile("test_modelopt_export.py", 9),
-    ],
-    "per-commit-2-gpu": [
-        TestFile("ep/test_moe_ep.py", 140),
-        TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_file_backend.py", 200),
-        TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
-        TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
-        TestFile("models/test_glm4_moe_models.py", 100),
-        TestFile("models/test_kimi_linear_models.py", 90),
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_constrained_decoding_spec_reasoning.py", 60),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_disaggregation_basic.py", 400),
-        TestFile("test_dp_attention.py", 350),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-        TestFile("test_patch_torch.py", 19),
-        TestFile("test_eagle_dp_attention.py", 200),
-    ],
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 650),
+        TestFile("models/test_qwen3_next_models.py", 350),
+        TestFile("models/test_qwen3_next_models_mtp.py", 500),
         TestFile("test_gpt_oss_4gpu.py", 300),
-        TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 500),
         TestFile("test_epd_disaggregation.py", 150),
-        TestFile("rl/test_return_routed_experts.py", 300),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
         TestFile("test_deepseek_v3_mtp.py", 275),
-        TestFile("test_disaggregation_hybrid_attention.py", 600),
+        TestFile("test_disaggregation_hybrid_attention.py", 400),
         TestFile("models/test_kimi_k2_models.py", 200),
-        TestFile("test_deepseek_v32_basic.py", 275),
-        TestFile("test_deepseek_v32_mtp.py", 275),
+        TestFile("test_deepseek_v32_basic.py", 360),
+        TestFile("test_deepseek_v32_mtp.py", 360),
+        TestFile("models/test_mimo_models.py", 200),
     ],
     "per-commit-8-gpu-h20": [
         TestFile("quant/test_w4a8_deepseek_v3.py", 520),
@@ -165,50 +33,38 @@ suites = {
     ],
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1500),
-        TestFile("test_flash_attention_4.py", 90),
         TestFile("test_fp8_blockwise_gemm.py", 280),
-        TestFile("test_gpt_oss_4gpu.py", 700),
-        TestFile("test_llama31_fp4.py", 90),
-        TestFile("test_eagle_infer_beta_dp_attention.py", 300),
+        TestFile("test_gpt_oss_4gpu.py", 300),
+        TestFile("test_nvfp4_gemm.py", 360),
+        TestFile("test_deepseek_v32_fp4_4gpu.py", 600),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
     # ],
     "per-commit-4-gpu-gb200": [
-        TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 1800),
+        TestFile("test_disaggregation_aarch64.py", 300),
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
-        # TODO: Add it back after mooncake supports torch 2.9
-        # TestFile("ep/test_mooncake_ep_small.py", 450),
+        TestFile("ep/test_mooncake_ep_small.py", 660),
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 563),
     ],
-    "quantization_test": [
-        TestFile("quant/test_awq.py", 163),
-        TestFile("quant/test_marlin_moe.py", 200),
-        TestFile("test_bnb.py", 5),
-        TestFile("test_gptqmodel_dynamic.py", 102),
-        TestFile("test_quantization.py", 185),
-        TestFile("test_gguf.py", 96),
-    ],
+    # quantization_test suite migrated to test/registered/quant/
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
-        TestFile(
-            "rl/test_update_weights_from_disk.py"
-        ),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
-        TestFile("test_bench_one_batch.py"),
-        TestFile("test_bench_serving.py"),
-        TestFile("test_eval_accuracy_large.py"),
-        TestFile("test_gpt_oss_common.py"),
-        TestFile("test_moe_eval_accuracy_large.py"),
-        TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
         TestFile("test_mistral_large3_basic.py"),
+        TestFile("test_prefill_delayer.py"),
+        TestFile("test_fla_layernorm_guard.py"),
+        TestFile(
+            "models/test_qwen3_next_models_pcg.py"
+        ),  # Disabled: intermittent failures, see #17039
+        TestFile("ep/test_moriep_small.py"),
     ],
 }
 
@@ -223,100 +79,22 @@ suite_amd = {
         # TestFile("lora/test_lora_backend.py", 99), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_cuda_graph.py", 250), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
         # TestFile("lora/test_lora_qwen3.py", 97), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("models/test_compressed_tensors_models.py", 42),
-        TestFile("models/test_qwen_models.py", 82),
-        TestFile("models/test_reward_models.py", 132),
-        TestFile("models/test_transformers_models.py", 320),
-        TestFile("models/test_vlm_models.py", 387),
-        TestFile("openai_server/basic/test_openai_embedding.py", 141),
-        TestFile("openai_server/basic/test_openai_server.py", 149),
-        TestFile("openai_server/basic/test_protocol.py", 10),
-        TestFile("openai_server/basic/test_serving_chat.py", 10),
-        TestFile("openai_server/basic/test_serving_completions.py", 10),
-        TestFile("openai_server/basic/test_serving_embedding.py", 10),
-        TestFile("openai_server/features/test_enable_thinking.py", 70),
-        TestFile("openai_server/features/test_json_mode.py", 120),
-        TestFile("openai_server/features/test_openai_server_ebnf.py", 20),
-        TestFile("openai_server/features/test_reasoning_content.py", 89),
-        TestFile("openai_server/function_call/test_openai_function_calling.py", 73),
-        TestFile("openai_server/function_call/test_tool_choice.py", 120),
-        TestFile("openai_server/validation/test_large_max_new_tokens.py", 41),
-        TestFile("openai_server/validation/test_matched_stop.py", 60),
-        TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 85),
-        TestFile("openai_server/validation/test_request_length_validation.py", 31),
-        TestFile("quant/test_awq_dequant.py", 2),
-        TestFile("quant/test_block_int8.py", 22),
-        TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
-        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
-        TestFile("test_abort.py", 51),
-        TestFile("test_bench_typebaseddispatcher.py", 10),
-        TestFile("test_chunked_prefill.py", 312),
-        TestFile("test_create_kvindices.py", 2),
-        TestFile("test_eval_fp8_accuracy.py", 303),
-        TestFile("test_fused_moe.py", 30),
-        TestFile("test_harmony_parser.py", 20),
-        TestFile("test_input_embeddings.py", 38),
-        TestFile("test_io_struct.py", 8),
-        TestFile("test_jinja_template_utils.py", 1),
-        TestFile("test_metrics.py", 32),
-        TestFile("test_metrics_utils.py", 1),
-        # TestFile("test_mla.py", 242), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        # TestFile("test_mla_deepseek_v3.py", 221), # Temporarily disabled, see https://github.com/sgl-project/sglang/issues/12574
-        TestFile("test_no_chunked_prefill.py", 108),
-        TestFile("test_page_size.py", 60),
-        TestFile("test_penalty.py", 180),
-        TestFile("test_pytorch_sampling_backend.py", 66),
-        TestFile("test_radix_attention.py", 105),
-        TestFile("test_reasoning_parser.py", 5),
-        TestFile("test_constrained_decoding.py", 120),
-        TestFile("test_retract_decode.py", 450),
-        TestFile("test_rope_rocm.py", 3),
-        TestFile("test_server_args.py", 1),
-        TestFile("test_skip_tokenizer_init.py", 117),
-        TestFile("test_srt_endpoint.py", 130),
-        TestFile("test_srt_engine.py", 261),
-        TestFile("test_torch_compile.py", 169),
         # TestFile("test_torch_compile_moe.py", 210), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107
-        TestFile("test_torch_native_attention_backend.py", 123),
-        # TestFile("test_triton_attention_kernels.py", 4),
-        TestFile("test_triton_attention_backend.py", 150),
-        TestFile("test_triton_sliding_window.py", 250),
-        TestFile("test_type_based_dispatcher.py", 10),
-        TestFile("test_wave_attention_kernels.py", 2),
         # Disabled temporarily
         # TestFile("test_vlm_input_format.py", 300),
-        # TestFile("models/test_embedding_models.py", 73), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
         # TestFile("openai_server/features/test_openai_server_hidden_states.py", 240),
         # TestFile("rl/test_update_weights_from_tensor.py", 48),
         # TestFile("test_no_overlap_scheduler.py", 234), # Disabled temporarily and track in #7703
         # TestFile("test_vision_chunked_prefill.py", 175), # Disabled temporarily and track in #7701
         # TestFile("test_wave_attention_backend.py", 150), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
-    ],
-    "per-commit-amd-mi35x": [
-        TestFile("test_gpt_oss_1gpu.py", 750),
-        TestFile("test_mla.py", 242),
-    ],
-    "per-commit-2-gpu-amd": [
-        # TestFile("lora/test_lora_tp.py", 116), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/13107. Moved to test/registered/lora/
-        TestFile("rl/test_update_weights_from_distributed.py", 103),
-        TestFile("test_data_parallelism.py", 73),
-        TestFile("test_load_weights_from_remote_instance.py", 72),
-        # TestFile("test_patch_torch.py", 19), # Disabled temporarily, see https://github.com/sgl-project/sglang/issues/11127
+        # The time estimation for `test_int4fp8_moe.py` assumes `mistralai/Mixtral-8x7B-Instruct-v0.1` is already cached (running on 1xMI300X).
     ],
     "per-commit-4-gpu-amd": [
         TestFile("test_pp_single_node.py", 150),
     ],
-    "per-commit-8-gpu-amd": [
-        TestFile("test_deepseek_v3_basic.py", 275),
-        TestFile("test_deepseek_v3_mtp.py", 275),
-    ],
-    "nightly-amd": [
-        TestFile("nightly/test_gsm8k_eval_amd.py"),
-    ],
-    # AMD 8-GPU tests for base models using gsm8k completion benchmark
-    "nightly-amd-8-gpu": [
-        TestFile("nightly/test_gsm8k_completion_eval_amd.py"),
-    ],
+    # NOTE: AMD nightly suites (nightly-amd, nightly-amd-vlm, nightly-amd-8-gpu)
+    # have been migrated to test/registered/amd/nightly/ and are now managed
+    # by test/run_suite.py using the registry system.
 }
 
 # Add Intel Xeon tests
@@ -328,6 +106,7 @@ suite_xeon = {
         TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
+        TestFile("cpu/test_flash_attn.py"),
         TestFile("cpu/test_gemm.py"),
         TestFile("cpu/test_intel_amx_attention_backend_a.py"),
         TestFile("cpu/test_intel_amx_attention_backend_b.py"),
@@ -356,12 +135,15 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
+        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
+        TestFile("test_embed_interpolate_unittest.py", 400),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
@@ -375,8 +157,9 @@ suite_ascend = {
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 400),
-        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        TestFile("ascend/test_ascend_deepep.py", 3600),
+        # TestFile("ascend/test_ascend_deepseek_mtp.py", 2800),
+        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
     ],
 }
 
@@ -508,6 +291,30 @@ def main():
         default=False,
         help="Continue running remaining tests even if one fails (useful for nightly tests)",
     )
+    arg_parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    arg_parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    arg_parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
+    arg_parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -521,9 +328,47 @@ def main():
     if args.auto_partition_size:
         files = auto_partition(files, args.auto_partition_id, args.auto_partition_size)
 
-    print("The running tests are ", [f.name for f in files])
+    # Print test info at beginning (similar to test/run_suite.py pretty_print_tests)
+    if args.auto_partition_size:
+        partition_info = (
+            f"{args.auto_partition_id + 1}/{args.auto_partition_size} "
+            f"(0-based id={args.auto_partition_id})"
+        )
+    else:
+        partition_info = "full"
 
-    exit_code = run_unittest_files(files, args.timeout_per_file, args.continue_on_error)
+    headers = ["Suite", "Partition"]
+    rows = [[args.suite, partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+
+    total_est_time = sum(f.estimated_time for f in files)
+    msg += f"✅ Enabled {len(files)} test(s) (est total {total_est_time:.1f}s):\n"
+    for f in files:
+        msg += f"  - {f.name} (est_time={f.estimated_time})\n"
+
+    print(msg, flush=True)
+
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
+    exit_code = run_unittest_files(
+        files,
+        timeout,
+        args.continue_on_error,
+        args.enable_retry,
+        args.max_attempts,
+        args.retry_wait_seconds,
+    )
+
+    # Print tests again at the end for visibility
+    msg = "\n" + tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+    msg += f"✅ Executed {len(files)} test(s) (est total {total_est_time:.1f}s):\n"
+    for f in files:
+        msg += f"  - {f.name} (est_time={f.estimated_time})\n"
+    print(msg, flush=True)
+
     exit(exit_code)
 
 

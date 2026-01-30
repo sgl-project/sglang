@@ -16,6 +16,9 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use smg_mesh::{
+    rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
+};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 
@@ -23,13 +26,11 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::{
-        steps::{
-            create_external_worker_registration_workflow, create_mcp_registration_workflow,
-            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
-            create_worker_registration_workflow, create_worker_removal_workflow,
-            create_worker_update_workflow,
-        },
-        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+        job_queue::{JobQueue, JobQueueConfig},
+        steps::{TokenizerConfigRequest, WorkflowEngines},
+        worker::WorkerType,
+        worker_manager::WorkerManager,
+        Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -46,13 +47,25 @@ use crate::{
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::{RerankRequest, V1RerankReqInput},
         responses::{ResponsesGetParams, ResponsesRequest},
+        tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, router_manager::RouterManager, RouterTrait},
+    routers::{
+        conversations,
+        mesh::{
+            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
+            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
+            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
+        },
+        parse,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
+    },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    workflow::{LoggingSubscriber, WorkflowEngine},
+    workflow::LoggingSubscriber,
 };
 #[derive(Clone)]
 pub struct AppState {
@@ -60,20 +73,22 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+    pub mesh_handler: Option<Arc<MeshServerHandler>>,
+    pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
 }
 
 async fn parse_function_call(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ParseFunctionCallRequest>,
 ) -> Response {
-    state.router.parse_function_call(&req).await
+    parse::parse_function_call(&state.context, &req).await
 }
 
 async fn parse_reasoning(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SeparateReasoningRequest>,
 ) -> Response {
-    state.router.parse_reasoning(&req).await
+    parse::parse_reasoning(&state.context, &req).await
 }
 
 async fn sink_handler() -> Response {
@@ -461,6 +476,56 @@ async fn update_worker(
     }
 }
 
+// ============================================================================
+// Tokenize / Detokenize Handlers
+// ============================================================================
+
+async fn v1_tokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<TokenizeRequest>,
+) -> Response {
+    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_detokenize(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DetokenizeRequest>,
+) -> Response {
+    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+}
+
+async fn v1_tokenizers_add(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AddTokenizerRequest>,
+) -> Response {
+    tokenize::add_tokenizer(&state.context, request).await
+}
+
+async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
+    tokenize::list_tokenizers(&state.context.tokenizer_registry).await
+}
+
+async fn v1_tokenizers_get(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_status(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
+}
+
+async fn v1_tokenizers_remove(
+    State(state): State<Arc<AppState>>,
+    Path(tokenizer_id): Path<String>,
+) -> Response {
+    tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -473,11 +538,15 @@ pub struct ServerConfig {
     pub request_timeout_secs: u64,
     pub request_id_headers: Option<Vec<String>>,
     pub shutdown_grace_period_secs: u64,
+    /// Control plane authentication configuration
+    pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
+    pub mesh_server_config: Option<MeshServerConfig>,
 }
 
 pub fn build_app(
     app_state: Arc<AppState>,
     auth_config: AuthConfig,
+    control_plane_auth_state: Option<crate::auth::ControlPlaneAuthState>,
     max_payload_size: usize,
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
@@ -516,6 +585,9 @@ pub fn build_app(
             "/v1/conversations/{conversation_id}/items/{item_id}",
             get(v1_conversations_get_item).delete(v1_conversations_delete_item),
         )
+        // Tokenize / Detokenize endpoints
+        .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/detokenize", post(v1_detokenize))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             middleware::concurrency_limit_middleware,
@@ -539,6 +611,7 @@ pub fn build_app(
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
+    // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
@@ -547,17 +620,59 @@ pub fn build_app(
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+        // Tokenizer management endpoints
+        .route(
+            "/v1/tokenizers",
+            post(v1_tokenizers_add).get(v1_tokenizers_list),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}",
+            get(v1_tokenizers_get).delete(v1_tokenizers_remove),
+        )
+        .route(
+            "/v1/tokenizers/{tokenizer_id}/status",
+            get(v1_tokenizers_status),
+        );
 
+    // Build worker routes
     let worker_routes = Router::new()
         .route("/workers", post(create_worker).get(list_workers_rest))
         .route(
             "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),
-        )
+        );
+
+    // Apply authentication middleware to control plane routes
+    let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {
+        if let Some(ref cp_state) = control_plane_auth_state {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                cp_state.clone(),
+                crate::auth::control_plane_auth_middleware,
+            ))
+        } else {
+            routes.route_layer(axum::middleware::from_fn_with_state(
+                auth_config.clone(),
+                middleware::auth_middleware,
+            ))
+        }
+    };
+    let admin_routes = apply_control_plane_auth(admin_routes);
+    let worker_routes = apply_control_plane_auth(worker_routes);
+
+    // HA management routes
+    let mesh_routes = Router::new()
+        .route("/ha/status", get(get_cluster_status))
+        .route("/ha/health", get(get_mesh_health))
+        .route("/ha/workers", get(get_worker_states))
+        .route("/ha/workers/{worker_id}", get(get_worker_state))
+        .route("/ha/policies", get(get_policy_states))
+        .route("/ha/policies/{model_id}", get(get_policy_state))
+        .route("/ha/config/{key}", get(get_app_config))
+        .route("/ha/config", post(update_app_config))
+        .route("/ha/rate-limit", post(set_global_rate_limit))
+        .route("/ha/rate-limit", get(get_global_rate_limit))
+        .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
+        .route("/ha/shutdown", post(trigger_graceful_shutdown))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -568,12 +683,15 @@ pub fn build_app(
         .merge(public_routes)
         .merge(admin_routes)
         .merge(worker_routes)
+        .merge(mesh_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
         ))
         .layer(middleware::create_logging_layer())
-        .layer(middleware::HttpMetricsLayer::new())
+        .layer(middleware::HttpMetricsLayer::new(
+            app_state.context.inflight_tracker.clone(),
+        ))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
         .layer(create_cors_layer(cors_allowed_origins))
         .fallback(sink_handler)
@@ -607,7 +725,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 json_format: false,
                 log_dir: config.log_dir.clone(),
                 colorize: true,
-                log_file_name: "sgl-model-gateway".to_string(),
+                log_file_name: "smg".to_string(),
                 log_targets: None,
             },
             config.router_config.trace_config.clone(),
@@ -619,6 +737,63 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
     }
+
+    let (mesh_handler, mesh_sync_manager) =
+        if let Some(mesh_server_config) = &config.mesh_server_config {
+            // Create HA sync manager with stores first
+            use crate::mesh::{
+                partition::PartitionDetector, stores::StateStores, sync::MeshSyncManager,
+            };
+            let stores = Arc::new(StateStores::with_self_name(
+                mesh_server_config.self_name.clone(),
+            ));
+            let sync_manager = Arc::new(MeshSyncManager::new(
+                stores.clone(),
+                mesh_server_config.self_name.clone(),
+            ));
+
+            // Create partition detector
+            let partition_detector = Arc::new(PartitionDetector::default());
+
+            // Initialize rate-limit hash ring with current membership
+            sync_manager.update_rate_limit_membership();
+
+            // Start rate limit window reset task
+            let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
+            spawn(async move {
+                window_manager.start_reset_task().await;
+            });
+
+            // Create mesh server builder and build with stores
+            use crate::mesh::service::MeshServerBuilder;
+            let builder = MeshServerBuilder::new(
+                mesh_server_config.self_name.clone(),
+                mesh_server_config.self_addr,
+                mesh_server_config.init_peer,
+            );
+            let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
+
+            // Spawn the mesh server with stores and partition detector
+            let stores_for_server = stores.clone();
+            let sync_manager_for_server = sync_manager.clone();
+            let partition_detector_for_server = partition_detector.clone();
+            spawn(async move {
+                if let Err(e) = mesh_server
+                    .start_serve_with_stores(
+                        Some(stores_for_server),
+                        Some(sync_manager_for_server),
+                        Some(partition_detector_for_server),
+                    )
+                    .await
+                {
+                    tracing::error!("Mesh server failed: {}", e);
+                }
+            });
+
+            (Some(Arc::new(handler)), Some(sync_manager))
+        } else {
+            (None, None)
+        };
 
     info!(
         "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
@@ -633,6 +808,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
 
+    if config.prometheus_config.is_some() {
+        app_context.inflight_tracker.start_sampler(20);
+    }
+
     let weak_context = Arc::downgrade(&app_context);
     let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
     app_context
@@ -640,43 +819,56 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize workflow engine and register workflows
-    let engine = Arc::new(WorkflowEngine::new());
+    // Initialize typed workflow engines
+    let engines = WorkflowEngines::new(&config.router_config);
 
-    engine
-        .event_bus()
-        .subscribe(Arc::new(LoggingSubscriber))
-        .await;
+    // Subscribe logging to all workflow engines
+    engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
 
-    engine
-        .register_workflow(create_worker_registration_workflow(&config.router_config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_external_worker_registration_workflow())
-        .expect("external_worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
-    engine
-        .register_workflow(create_worker_update_workflow())
-        .expect("worker_update workflow should be valid");
-    engine
-        .register_workflow(create_mcp_registration_workflow())
-        .expect("mcp_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_registration_workflow())
-        .expect("wasm_module_registration workflow should be valid");
-    engine
-        .register_workflow(create_wasm_module_removal_workflow())
-        .expect("wasm_module_removal workflow should be valid");
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
     debug!(
-        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        "Workflow engines initialized (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
+
+    // Submit startup tokenizer job if tokenizer path is configured
+    // This runs before worker initialization to ensure tokenizer is available
+    if let Some(tokenizer_source) = config
+        .router_config
+        .tokenizer_path
+        .as_ref()
+        .or(config.router_config.model_path.as_ref())
+    {
+        info!("Loading startup tokenizer from: {}", tokenizer_source);
+
+        let job_queue = app_context
+            .worker_job_queue
+            .get()
+            .expect("JobQueue should be initialized");
+
+        let tokenizer_config = TokenizerConfigRequest {
+            id: TokenizerRegistry::generate_id(),
+            name: tokenizer_source.clone(),
+            source: tokenizer_source.clone(),
+            chat_template_path: config.router_config.chat_template.clone(),
+            cache_config: config.router_config.tokenizer_cache.to_option(),
+            fail_on_duplicate: false,
+        };
+
+        let job = Job::AddTokenizer {
+            config: Box::new(tokenizer_config),
+        };
+
+        job_queue
+            .submit(job)
+            .await
+            .map_err(|e| format!("Failed to submit startup tokenizer job: {}", e))?;
+
+        info!("Startup tokenizer job submitted (will complete in background)");
+    }
 
     info!(
         "Initializing workers for routing mode: {:?}",
@@ -728,13 +920,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
 
-    let _health_checker = app_context
-        .worker_registry
-        .start_health_checker(config.router_config.health_check.check_interval_secs);
-    debug!(
-        "Started health checker for workers with {}s interval",
-        config.router_config.health_check.check_interval_secs
-    );
+    if !config.router_config.health_check.disable_health_check {
+        let _health_checker = app_context
+            .worker_registry
+            .start_health_checker(config.router_config.health_check.check_interval_secs);
+        debug!(
+            "Started health checker for workers with {}s interval",
+            config.router_config.health_check.check_interval_secs
+        );
+    } else {
+        info!("Global health checks disabled via CLI/config; skipping health checker");
+    }
 
     if let Some(ref load_monitor) = app_context.load_monitor {
         load_monitor.start().await;
@@ -767,16 +963,49 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
+    // Set mesh sync manager to worker registry and policy registry if mesh is enabled
+    // This allows these components to sync state across mesh nodes when mesh is enabled,
+    // but they work independently without mesh when mesh is disabled.
+    // Using thread-safe set_mesh_sync method that works with Arc-wrapped registries
+    if let Some(ref sync_manager) = mesh_sync_manager {
+        app_context
+            .worker_registry
+            .set_mesh_sync(Some(sync_manager.clone()));
+        info!("Mesh sync manager set on worker registry");
+
+        app_context
+            .policy_registry
+            .set_mesh_sync(Some(sync_manager.clone()));
+        info!("Mesh sync manager set on policy registry");
+    }
+
+    // Get mesh cluster state and port before moving mesh_handler into app_state
+    let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
+    let mesh_port = config
+        .mesh_server_config
+        .as_ref()
+        .map(|c| c.self_addr.port());
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager: Some(router_manager),
+        mesh_handler,
+        mesh_sync_manager,
     });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
             let app_context_arc = Arc::clone(&app_state.context);
-            match start_service_discovery(service_discovery_config, app_context_arc).await {
+
+            match start_service_discovery(
+                service_discovery_config,
+                app_context_arc,
+                mesh_cluster_state,
+                mesh_port,
+            )
+            .await
+            {
                 Ok(handle) => {
                     info!("Service discovery started");
                     spawn(async move {
@@ -811,9 +1040,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         api_key: config.router_config.api_key.clone(),
     };
 
+    // Initialize control plane authentication if configured
+    let control_plane_auth_state =
+        crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+
     let app = build_app(
         app_state,
         auth_config,
+        control_plane_auth_state,
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
@@ -861,6 +1095,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     }
+
+    // HA handler shutdown is handled by the signal in mesh_run! macro
+    // No need to manually shutdown here
 
     Ok(())
 }

@@ -50,11 +50,10 @@ except Exception as e:
 
 def _get_status_message(run_id, current_case_id, thread_messages=None):
     date_str = datetime.now().strftime("%d/%m")
-    base_header = f"""🧵 for nightly test of {date_str}*
+    base_header = f"""🧵 for nightly test of {date_str}
 *Git Revision:* {get_git_commit_hash()}
 *GitHub Run ID:* {run_id}
 *Total Tasks:* {len(ALL_CASES)}
-
 """
 
     if not ALL_CASES:

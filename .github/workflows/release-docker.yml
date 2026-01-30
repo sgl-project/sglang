@@ -12,11 +12,13 @@ name: Release Docker Images
 #
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
+    tags:
+      - 'v[0-9]+.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.5.7)'
+        required: true
 
 jobs:
   publish-x86:
@@ -56,9 +58,31 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push AMD64 Framework
+      - name: Get version from tag
+        id: version
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build AMD64 Framework
+        run: |
+          version=${{ steps.version.outputs.version }}
           tag=v${version}-cu129-amd64
 
           docker buildx build \
@@ -70,13 +94,14 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
 
       - name: Build and Push AMD64 Runtime
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           tag=v${version}-cu129-amd64-runtime
 
           docker buildx build \
@@ -88,13 +113,14 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
 
       - name: Build and Push AMD64 Runtime (CUDA 13)
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           tag=v${version}-cu130-amd64-runtime
 
           docker buildx build \
@@ -106,6 +132,7 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             --build-arg GRACE_BLACKWELL=0 \
+            --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -136,9 +163,31 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push ARM64 Framework
+      - name: Get version from tag
+        id: version
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build ARM64 Framework
+        run: |
+          version=${{ steps.version.outputs.version }}
           tag=v${version}-cu129-arm64
 
           docker buildx build \
@@ -150,13 +199,14 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
 
       - name: Build and Push ARM64 Runtime
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           tag=v${version}-cu129-arm64-runtime
 
           docker buildx build \
@@ -168,13 +218,14 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
 
       - name: Build and Push ARM64 Runtime (CUDA 13)
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           tag=v${version}-cu130-arm64-runtime
 
           docker buildx build \
@@ -185,6 +236,7 @@ jobs:
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
             --build-arg GRACE_BLACKWELL=1 \
+            --build-arg SGL_VERSION=${version} \
             -t lmsysorg/sglang:${tag} \
             --no-cache \
             .
@@ -207,9 +259,31 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Create multi-arch manifests
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
 
           # Create versioned framework manifest (default)
           docker buildx imagetools create \

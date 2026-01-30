@@ -11,15 +11,17 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.srt.custom_op import CustomOp
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -31,6 +33,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
@@ -89,7 +92,7 @@ def _apply_rotary_emb(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
-class RotaryEmbedding(CustomOp):
+class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
 
     def __init__(
@@ -115,9 +118,11 @@ class RotaryEmbedding(CustomOp):
             cache = cache.to(dtype)
 
         if (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
-            and not (_is_cpu and _is_cpu_amx_available)
+            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
+            and not (_is_cpu)
             and not (_is_xpu)
+            and not (_is_npu)
+            and not (_is_musa)
         ):
             if _is_cuda or _is_hip:
                 from sgl_kernel import rotary_embedding
@@ -208,16 +213,37 @@ class RotaryEmbedding(CustomOp):
         )
 
     def get_cos_sin_with_position(self, positions):
-        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
-        last_dim = cos_sin.size()[-1]
-        cos, sin = (
-            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
-        )
-        # BSNH
-        self.position_cos, self.position_sin = (
-            cos.view(-1, 1, 1, last_dim).contiguous(),
-            sin.view(-1, 1, 1, last_dim).contiguous(),
-        )
+        assert positions.ndim == 1 or positions.ndim == 2
+        if positions.ndim == 1:
+            cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+            last_dim = cos_sin.size()[-1]
+            cos, sin = (
+                cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+            )
+            # BSNH
+            self.position_cos, self.position_sin = (
+                cos.view(-1, 1, 1, last_dim).contiguous(),
+                sin.view(-1, 1, 1, last_dim).contiguous(),
+            )
+        else:
+            assert self.mrope_section
+            cos_sin = self.cos_sin_cache[positions]
+            last_dim = cos_sin.size()[-1]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+            self.position_cos = cos.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
+            self.position_sin = sin.repeat(1, 2).view(-1, 1, 1, last_dim).contiguous()
 
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[:seqlen]
@@ -273,8 +299,8 @@ class RotaryEmbedding(CustomOp):
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
-
-        rotary_mode = "half"
+        if query.dtype == torch.bfloat16 and self.cos_sin_cache.dtype == torch.float:
+            return self.forward_native(positions, query, key, offsets)
         if self.is_neox_style:
             rotary_mode = "half"
         else:
@@ -734,8 +760,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        query = query.view(*query.shape[:-1], -1, self.head_size)
-        key = key.view(*key.shape[:-1], -1, self.head_size)
+        query = query.unflatten(1, (-1, self.head_size))
+        key = key.unflatten(1, (-1, self.head_size))
 
         k = self.original_max_position_embeddings
         long_prompt_offset = (
@@ -797,7 +823,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda" if not _is_npu else "npu",
+        device: Optional[str] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -814,7 +840,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self.sin_cached_total = None
         self.cos_cached = None
         self.sin_cached = None
-        self.device = device
+        self.device = device if device is not None else get_device()
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -1438,6 +1464,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
@@ -1447,8 +1476,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def _forward_native(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1505,7 +1533,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
-    def forward(
+    def forward_cuda(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1522,14 +1550,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         """
         assert positions.ndim == 1 or positions.ndim == 2
 
-        if positions.ndim == 2 and self.mrope_section and _is_cuda:
-            return self._forward_triton(positions, query, key)
-        elif _is_npu:
-            return self._forward_npu(positions, query, key)
-        else:
-            return self._forward_native(positions, query, key)
+        # Use Triton kernel for multimodal (2D positions) with mrope
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_triton(positions, query, key)
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
-    def _forward_triton(
+    def forward_triton(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1550,15 +1576,19 @@ class MRotaryEmbedding(RotaryEmbedding):
         )
         return query, key
 
-    def _forward_npu(
+    def forward_npu(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if query.shape[1] > 4096:
-            return self._forward_native(positions, query, key)
+            return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half"
         if self.is_neox_style:
             rotary_mode = "half"
@@ -2259,6 +2289,177 @@ class MRotaryEmbedding(RotaryEmbedding):
 
             return position_ids, mrope_position_deltas
 
+    @staticmethod
+    def get_rope_index_ernie45(
+        input_ids: torch.Tensor,
+        hf_config: Any,
+        image_grid_thw: Union[list[list[int]], torch.Tensor],
+        video_grid_thw: Union[list[list[int]], torch.Tensor],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get mrope input positions and delta value for Ernie VL."""
+
+        image_token_id = hf_config.im_patch_id
+        video_start_token_id = hf_config.video_start_token_id
+        video_end_token_id = hf_config.video_end_token_id
+        spatial_conv_size = hf_config.spatial_conv_size
+        temporal_conv_size = hf_config.temporal_conv_size
+
+        mrope_position_deltas = []
+        if input_ids is not None and (
+            image_grid_thw is not None or video_grid_thw is not None
+        ):
+            total_input_ids = input_ids
+            position_ids = torch.ones(
+                3,
+                input_ids.shape[0],
+                input_ids.shape[1],
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            image_index, video_index = 0, 0
+            for i, input_ids in enumerate(total_input_ids):
+                input_tokens = input_ids.tolist()
+
+                input_token_type = []
+                video_check_flg = False
+                for token in input_tokens:
+                    if token == video_start_token_id:
+                        video_check_flg = True
+                    elif token == video_end_token_id:
+                        video_check_flg = False
+
+                    if token == image_token_id and not video_check_flg:
+                        input_token_type.append("image")
+                    elif token == image_token_id and video_check_flg:
+                        input_token_type.append("video")
+                    else:
+                        input_token_type.append("text")
+
+                input_type_group = []
+                for key, group in itertools.groupby(
+                    enumerate(input_token_type), lambda x: x[1]
+                ):
+                    group = list(group)
+                    start_index = group[0][0]
+                    end_index = group[-1][0] + 1
+                    input_type_group.append((key, start_index, end_index))
+
+                llm_pos_ids_list = []
+                video_frame_num = 1
+                for modality_type, start_idx, end_idx in input_type_group:
+                    st_idx = (
+                        llm_pos_ids_list[-1].max() + 1
+                        if len(llm_pos_ids_list) > 0
+                        else 0
+                    )
+
+                    if modality_type == "image":
+                        t, h, w = (
+                            image_grid_thw[image_index][0],
+                            image_grid_thw[image_index][1],
+                            image_grid_thw[image_index][2],
+                        )
+                        llm_grid_t, llm_grid_h, llm_grid_w = (
+                            t.item(),
+                            h.item() // spatial_conv_size,
+                            w.item() // spatial_conv_size,
+                        )
+
+                        t_index = (
+                            torch.arange(llm_grid_t)
+                            .view(-1, 1)
+                            .expand(-1, llm_grid_h * llm_grid_w)
+                            .flatten()
+                        )
+                        h_index = (
+                            torch.arange(llm_grid_h)
+                            .view(1, -1, 1)
+                            .expand(llm_grid_t, -1, llm_grid_w)
+                            .flatten()
+                        )
+                        w_index = (
+                            torch.arange(llm_grid_w)
+                            .view(1, 1, -1)
+                            .expand(llm_grid_t, llm_grid_h, -1)
+                            .flatten()
+                        )
+                        llm_pos_ids_list.append(
+                            torch.stack([t_index, h_index, w_index]) + st_idx
+                        )
+
+                        image_index += 1
+                        video_frame_num = 1
+
+                    elif modality_type == "video":
+                        t, h, w = (
+                            video_grid_thw[video_index][0],
+                            video_grid_thw[video_index][1],
+                            video_grid_thw[video_index][2],
+                        )
+
+                        llm_grid_t, llm_grid_h, llm_grid_w = (
+                            t.item() // temporal_conv_size,
+                            h.item() // spatial_conv_size,
+                            w.item() // spatial_conv_size,
+                        )
+
+                        for t_idx in range(llm_grid_t):
+                            t_index = (
+                                torch.tensor(t_idx)
+                                .view(-1, 1)
+                                .expand(-1, llm_grid_h * llm_grid_w)
+                                .flatten()
+                            )
+
+                            h_index = (
+                                torch.arange(llm_grid_h)
+                                .view(1, -1, 1)
+                                .expand(1, -1, llm_grid_w)
+                                .flatten()
+                            )
+                            w_index = (
+                                torch.arange(llm_grid_w)
+                                .view(1, 1, -1)
+                                .expand(1, llm_grid_h, -1)
+                                .flatten()
+                            )
+                            llm_pos_ids_list.append(
+                                torch.stack([t_index, h_index, w_index]) + st_idx
+                            )
+
+                        video_index += 1
+                        video_frame_num += 1
+
+                    else:
+                        text_len = end_idx - start_idx
+                        llm_pos_ids_list.append(
+                            torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                        )
+
+                        video_frame_num = 1
+
+                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                position_ids[..., i, :] = llm_positions.to(position_ids.device)
+                mrope_position_deltas.append(
+                    llm_positions.max() + 1 - len(total_input_ids[i])
+                )
+            mrope_position_deltas = torch.tensor(
+                mrope_position_deltas, device=input_ids.device
+            ).unsqueeze(1)
+            return position_ids, mrope_position_deltas
+        else:
+            s = input_ids.shape[1]
+            position_ids = torch.arange(s)
+            position_ids = (
+                position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
+            )
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                -1, keepdim=True
+            )[0]
+            mrope_position_deltas = max_position_ids + 1 - s
+            return position_ids, mrope_position_deltas
+
     # For qwen3-omni
     @staticmethod
     def _get_feat_extract_output_lengths(input_lengths):
@@ -2298,7 +2499,92 @@ class MRotaryEmbedding(RotaryEmbedding):
         return llm_pos_ids
 
 
-class DualChunkRotaryEmbedding(CustomOp):
+class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
+    """3D rotary positional embedding. [h w h w h w h w... t t t...]"""
+
+    def forward_native(  # type: ignore[override]
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert positions.ndim == 1 or positions.ndim == 2
+        assert key is not None
+
+        num_tokens = positions.shape[-1]
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            assert self.mrope_section
+
+            section_h = self.mrope_section[0]  # 22
+            section_w = self.mrope_section[1]  # 22
+            section_t = self.mrope_section[2]  # 20
+            assert section_h == section_w
+            # Split according to [h w h w h w h w... t t t...]
+            section_cos_t = cos[..., -section_t:]
+            section_cos_h = cos[..., : section_h + section_w : 2]
+            section_cos_w = cos[..., 1 : section_h + section_w : 2]
+
+            cos_t, cos_h, cos_w = section_cos_t[0], section_cos_h[1], section_cos_w[2]
+            cos_hw = torch.stack([cos_h, cos_w], dim=-1).reshape(
+                cos_h.shape[:-1] + (cos_h.shape[-1] * 2,)
+            )
+            cos = torch.cat([cos_hw, cos_t], dim=-1)
+
+            section_sin_t = sin[..., -section_t:]
+            section_sin_h = sin[..., : section_h + section_w : 2]
+            section_sin_w = sin[..., 1 : section_h + section_w : 2]
+
+            sin_t, sin_h, sin_w = section_sin_t[0], section_sin_h[1], section_sin_w[2]
+            sin_hw = torch.stack([sin_h, sin_w], dim=-1).reshape(
+                sin_h.shape[:-1] + (sin_h.shape[-1] * 2,)
+            )
+            sin = torch.cat([sin_hw, sin_t], dim=-1)
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+    def forward_cuda(  # type: ignore[override]
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.forward_native(positions, query, key)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+        return self.forward_native(positions, query, key)
+
+
+class DualChunkRotaryEmbedding(MultiPlatformOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
     def __init__(
@@ -2724,6 +3010,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,

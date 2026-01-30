@@ -16,13 +16,18 @@ from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    get_attention_dp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     get_logprob_dict_from_result,
     get_logprob_from_pp_outputs,
 )
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
 
@@ -136,7 +141,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -219,8 +224,7 @@ class SchedulerPPMixin:
 
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
-                if self.require_mlp_sync:
-                    batch = self.prepare_mlp_sync_batch(batch)
+                batch = self.maybe_prepare_mlp_sync_batch_and_log_stats(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -312,7 +316,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -501,10 +505,14 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.check_during_pp_idle()
+                self.self_check_during_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
+        self.require_attn_tp_allgather = (
+            not self.server_args.enable_nsa_prefill_context_parallel
+        )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
         self.running_mbs = [
@@ -533,6 +541,8 @@ class SchedulerPPMixin:
         latencies: List[float] = []
 
         if self.pp_group.is_first_rank:
+            model_runner = self.tp_worker.model_runner
+            model_config = model_runner.model_config
             input_ids_list = []
             for i in range(128):
                 chunk_size = int(
@@ -564,8 +574,8 @@ class SchedulerPPMixin:
                     sampling_params=sampling_params,
                 )
                 req.fill_ids = req.origin_input_ids
-                req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-                req.logprob_start_len = len(req.origin_input_ids) - 1
+                req.logprob_start_len = -1
+                req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
 
                 # Prepare batch
                 batch = ScheduleBatch.init_new(
@@ -579,25 +589,29 @@ class SchedulerPPMixin:
                 )
 
                 current_seq_len = len(req.fill_ids)
+
+                if is_dp_attention_enabled():
+                    # For profiling, we only have one request on PP0
+                    # Set global_num_tokens to indicate this rank has tokens, others have 0
+                    dp_size = get_attention_dp_size()
+                    global_num_tokens = [0] * dp_size
+                    dp_rank = get_attention_dp_rank()
+                    global_num_tokens[dp_rank] = current_seq_len
+                    batch.global_num_tokens = global_num_tokens
+                    batch.global_num_tokens_for_logprob = global_num_tokens
+
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (
-                            current_seq_len,
-                            self.tp_worker.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.tp_worker.model_runner.model_config.dtype,
+                        (current_seq_len, model_config.hidden_size),
+                        dtype=model_config.dtype,
                         device="cuda",
                     ),
                     "residual": torch.zeros(
-                        (
-                            current_seq_len,
-                            self.tp_worker.model_runner.model_config.hidden_size,
-                        ),
-                        dtype=self.tp_worker.model_runner.model_config.dtype,
+                        (current_seq_len, model_config.hidden_size),
+                        dtype=model_config.dtype,
                         device="cuda",
                     ),
                 }
-                from sglang.srt.managers.scheduler_pp_mixin import PPProxyTensors
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
@@ -609,12 +623,9 @@ class SchedulerPPMixin:
                 start = time.perf_counter()
                 batch.prepare_for_extend()
                 model_worker_batch = batch.get_model_worker_batch()
-                from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-                forward_batch = ForwardBatch.init_new(
-                    model_worker_batch, self.tp_worker.model_runner
-                )
-                _ = self.tp_worker.model_runner.forward(
+                forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+                _ = model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
 
@@ -666,7 +677,7 @@ class SchedulerPPMixin:
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
-    def predict_next_chunk_size(self: "Scheduler", history_len: int) -> Optional[int]:
+    def predict_next_chunk_size(self: Scheduler, history_len: int) -> Optional[int]:
         """
         Predict next chunk size dynamically based on current history length.
 
@@ -699,12 +710,6 @@ class SchedulerPPMixin:
             )
 
         return predicted_size
-
-    def check_during_pp_idle(self: Scheduler):
-        self.check_memory()
-        self.check_tree_cache()
-        self.new_token_ratio = self.init_new_token_ratio
-        self.maybe_sleep_on_idle()
 
     def process_bootstrapped_queue(
         self: Scheduler, bootstrapped_rids: Optional[List[str]]
@@ -913,7 +918,9 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=self.attn_tp_group,
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
                 async_send=async_send,
             )
         )
@@ -923,7 +930,11 @@ class SchedulerPPMixin:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(all_gather_group=self.attn_tp_group)
+                self.pp_group.recv_tensor_dict(
+                    all_gather_group=(
+                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                    )
+                )
             )
         return pp_proxy_tensors
 
@@ -931,7 +942,9 @@ class SchedulerPPMixin:
         self: Scheduler,
     ) -> Dict[str, torch.Tensor]:
         res = self.pp_group.recv_tensor_dict(
-            all_gather_group=self.attn_tp_group,
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
         )
         return res
 
@@ -1074,7 +1087,7 @@ class SchedulerPPMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
-            self.tp_worker.get_attention_tp_cpu_group(),
+            self.attn_tp_cpu_group,
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:
@@ -1349,7 +1362,8 @@ class ChunkSizePredictor:
         smoothed_chunk_size = base_chunk_size + smooth_coeff * (
             calculated_chunk_size_float - base_chunk_size
         )
-        calculated_chunk_size = int(smoothed_chunk_size)
+        # Make sure the dynamic chunk size is at least 1/4 of the base chunk size
+        calculated_chunk_size = max(int(smoothed_chunk_size), base_chunk_size // 4)
 
         # Align to page_size (minimum alignment size is 64)
         alignment_size = max(page_size, 64)

@@ -23,7 +23,9 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
+    FLASHINFER = "flashinfer"
 
     @classmethod
     def _missing_(cls, value):
@@ -43,8 +45,14 @@ class MoeA2ABackend(Enum):
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
 
+    def is_flashinfer(self):
+        return self == MoeA2ABackend.FLASHINFER
+
     def is_ascend_fuseep(self):
         return self == MoeA2ABackend.ASCEND_FUSEEP
+
+    def is_mori(self):
+        return self == MoeA2ABackend.MORI
 
 
 class MoeRunnerBackend(Enum):
@@ -249,12 +257,24 @@ def get_tbo_token_distribution_threshold() -> float:
     return TBO_TOKEN_DISTRIBUTION_THRESHOLD
 
 
+def filter_moe_weight_param_global_expert(name, x, num_local_experts):
+    """
+    Filter out for MoE expert parameters that requires global expert.
+    """
+    return (
+        not getattr(x, "_sglang_require_global_experts", False)
+        and x.data.ndim > 0
+        and x.data.shape[0] == num_local_experts
+    )
+
+
 def should_use_flashinfer_cutlass_moe_fp4_allgather():
     """
     Perform FP4 quantize before all-gather for flashinfer cutlass moe to reduce communication cost for high-throughput serving.
     """
     return (
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+        and get_moe_a2a_backend().is_none()
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"

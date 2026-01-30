@@ -55,7 +55,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
         server_args = get_global_server_args()
 
     # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
-    return not server_args.enable_mtp
+    return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit

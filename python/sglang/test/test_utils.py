@@ -3,11 +3,14 @@
 import argparse
 import asyncio
 import copy
+import doctest
+import inspect
 import json
 import logging
 import os
 import random
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -18,7 +21,7 @@ from datetime import datetime
 from functools import partial, wraps
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
@@ -58,6 +61,8 @@ DEFAULT_MLA_FP8_MODEL_NAME_FOR_TEST = "neuralmagic/DeepSeek-Coder-V2-Lite-Instru
 DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
+# Hybrid Mamba models
+DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
@@ -91,18 +96,24 @@ DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
     "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
 )
 
-# EAGLE
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
-DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
-DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
-DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
-DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
-DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
-DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
-    "meta-llama/Llama-3.1-8B-Instruct"
-)
-DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-Instruct"
-DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
+# EAGLE2 algorithm models
+DEFAULT_TARGET_MODEL_EAGLE = "meta-llama/Llama-2-7b-chat-hf"
+DEFAULT_DRAFT_MODEL_EAGLE = "lmsys/sglang-EAGLE-llama2-chat-7B"
+
+# EAGLE3 model
+DEFAULT_TARGET_MODEL_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+
+# EAGLE2 with DP-Attention models
+DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN = "Qwen/Qwen3-30B-A3B"
+DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
+
+# Standalone speculative decoding models
+DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
+
+# N-gram speculative decoding models
+DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
 DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
@@ -115,6 +126,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -168,6 +180,11 @@ def is_blackwell_system():
     return envs.IS_BLACKWELL.get()
 
 
+def is_h200_system():
+    """Return whether it is running on an H200 system."""
+    return envs.IS_H200.get()
+
+
 def _use_cached_default_models(model_repo: str):
     cache_dir = os.getenv("DEFAULT_MODEL_CACHE_DIR")
     if cache_dir and model_repo:
@@ -188,10 +205,13 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_h200_system():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -543,6 +563,255 @@ def popen_with_error_check(command: list[str], allow_exit: bool = False):
     return process
 
 
+def _try_enable_offline_mode_if_cache_complete(
+    model_name_or_path: str, env: dict, other_args: Optional[list[str]] = None
+) -> Optional[str]:
+    """
+    CI helper: Check if model cache is complete and enable offline mode.
+
+    Uses per-run validation markers that are NOT shared across runners.
+    Each runner independently validates its cache using lightweight checks
+    before enabling offline mode.
+
+    IMPORTANT: Even if a per-run marker exists, this function ALWAYS validates
+    the current launch's requirements (e.g., hf_quant_config.json for modelopt).
+    The marker is only a hint that this snapshot was validated earlier in the run.
+
+    Args:
+        model_name_or_path: Model identifier or path
+        env: Environment dict to modify (will add HF_HUB_OFFLINE=1 if validation passes)
+        other_args: Launch command arguments (used to detect quantization requirement)
+
+    Returns:
+        Per-run marker path if offline mode was enabled, None otherwise
+    """
+    from sglang.srt.model_loader.ci_weight_validation import (
+        _get_per_run_marker_path,
+        _read_per_run_marker,
+        _write_per_run_marker,
+        validate_cache_lightweight,
+    )
+    from sglang.srt.utils import find_local_repo_dir
+
+    other_args = other_args or []
+
+    # Skip offline mode for LoRA scenarios (dynamic adapter loading may need online access)
+    is_lora_enabled = "--enable-lora" in other_args or "--lora-paths" in other_args
+    if is_lora_enabled:
+        print(f"CI_OFFLINE: LoRA enabled, skip offline mode - {model_name_or_path}")
+        return None
+
+    # Fast-path: If subprocess env already has HF_HUB_OFFLINE=1, skip
+    if env.get("HF_HUB_OFFLINE") == "1":
+        print(
+            f"CI_OFFLINE: Subprocess env already has HF_HUB_OFFLINE=1, skip - {model_name_or_path}"
+        )
+        return None
+
+    # Skip if already a local path
+    if os.path.isdir(model_name_or_path):
+        return None
+
+    # Try to find local snapshot
+    try:
+        snapshot_dir = find_local_repo_dir(model_name_or_path, revision=None)
+        if not snapshot_dir or not os.path.isdir(snapshot_dir):
+            return None
+    except Exception:
+        return None
+
+    # Detect if quantization requires hf_quant_config.json
+    # Do this BEFORE checking marker to ensure current launch requirements are known
+    requires_hf_quant_config = False
+    for i, arg in enumerate(other_args):
+        if arg == "--quantization" and i + 1 < len(other_args):
+            quant_value = other_args[i + 1].lower()
+            if quant_value in ["modelopt_fp4", "modelopt_fp8", "modelopt"]:
+                requires_hf_quant_config = True
+                break
+
+    # Check per-run marker (fast hint - snapshot validated earlier in this run)
+    per_run_marker = _read_per_run_marker(snapshot_dir)
+    if per_run_marker is not None:
+        # Marker exists, but STILL validate for current launch requirements
+        # This prevents a test without --quantization from enabling offline
+        # for a later test with --quantization that needs hf_quant_config.json
+        is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
+
+        if not is_valid:
+            # Current launch requirements not met, ignore marker
+            print(
+                f"CI_OFFLINE: Per-run marker found but current validation failed "
+                f"(requires_hf_quant_config={requires_hf_quant_config}), "
+                f"will use online mode - {model_name_or_path}"
+            )
+            return None
+
+        # Marker exists and current validation passed
+        env["HF_HUB_OFFLINE"] = "1"
+        marker_path = _get_per_run_marker_path(snapshot_dir)
+        print(
+            f"CI_OFFLINE: Per-run marker found and current validation passed "
+            f"(requires_hf_quant_config={requires_hf_quant_config}), "
+            f"enabling offline mode - {model_name_or_path}"
+        )
+        return marker_path
+
+    # No per-run marker - perform lightweight validation
+    is_valid = validate_cache_lightweight(snapshot_dir, requires_hf_quant_config)
+
+    if not is_valid:
+        # Validation failed - cache is incomplete on this runner
+        print(
+            f"CI_OFFLINE: Cache validation failed "
+            f"(requires_hf_quant_config={requires_hf_quant_config}), "
+            f"will use online mode - {model_name_or_path}"
+        )
+        return None
+
+    # Validation passed - enable offline mode and write per-run marker
+    env["HF_HUB_OFFLINE"] = "1"
+
+    # Write per-run marker for subsequent tests in this run
+    _write_per_run_marker(snapshot_dir, model_name_or_path)
+
+    # Return marker path for potential invalidation if offline launch fails
+    marker_path = _get_per_run_marker_path(snapshot_dir)
+
+    snapshot_basename = os.path.basename(snapshot_dir)
+    print(
+        f"CI_OFFLINE: Enabled HF_HUB_OFFLINE=1 for subprocess - "
+        f"validation passed for {model_name_or_path} "
+        f"(snapshot={snapshot_basename}, requires_hf_quant_config={requires_hf_quant_config})"
+    )
+
+    return marker_path
+
+
+def _create_clean_subprocess_env(env: dict) -> dict:
+    """Create a clean subprocess environment without internal CI keys.
+
+    Removes all keys starting with '_CI_OFFLINE_' or 'CI_OFFLINE' to prevent
+    leaking implementation details to the server subprocess.
+
+    Args:
+        env: Source environment dict
+
+    Returns:
+        Clean copy of environment dict
+    """
+    child_env = env.copy()
+    keys_to_remove = [
+        k for k in child_env if k.startswith(("_CI_OFFLINE_", "CI_OFFLINE_"))
+    ]
+    for k in keys_to_remove:
+        del child_env[k]
+    return child_env
+
+
+def _launch_server_process(
+    command: List[str],
+    env: dict,
+    return_stdout_stderr: Optional[tuple],
+    model: str,
+) -> subprocess.Popen:
+    """Launch server subprocess with clean environment.
+
+    Args:
+        command: Command list for subprocess
+        env: Environment dict (will be cleaned before use)
+        return_stdout_stderr: Optional tuple of (stdout_file, stderr_file) for output capture
+        model: Model name for logging
+
+    Returns:
+        Started subprocess.Popen object
+    """
+    child_env = _create_clean_subprocess_env(env)
+
+    hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
+    print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
+
+    if return_stdout_stderr:
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            text=True,
+            bufsize=1,
+        )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
+    else:
+        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
+
+    return proc
+
+
+def _wait_for_server_health(
+    proc: subprocess.Popen,
+    base_url: str,
+    api_key: Optional[str],
+    timeout_duration: float,
+) -> Tuple[bool, Optional[str]]:
+    """Wait for server health check to pass.
+
+    Args:
+        proc: Server subprocess
+        base_url: Base URL for health check
+        api_key: Optional API key for authorization
+        timeout_duration: Maximum wait time in seconds
+
+    Returns:
+        Tuple of (success, error_message)
+    """
+    start_time = time.perf_counter()
+    with requests.Session() as session:
+        while time.perf_counter() - start_time < timeout_duration:
+            return_code = proc.poll()
+            if return_code is not None:
+                return False, f"Server process exited with code {return_code}"
+
+            try:
+                headers = {
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Authorization": f"Bearer {api_key}",
+                }
+                response = session.get(
+                    f"{base_url}/health_generate",
+                    headers=headers,
+                    timeout=5,
+                )
+                if response.status_code == 200:
+                    return True, None
+            except requests.RequestException:
+                pass
+
+            return_code = proc.poll()
+            if return_code is not None:
+                return False, f"Server unexpectedly exited (return_code={return_code})"
+
+            time.sleep(10)
+
+    return False, "Server failed to start within the timeout period"
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -555,11 +824,22 @@ def popen_launch_server(
     pd_separated: bool = False,
     num_replicas: Optional[int] = None,
 ):
-    """Launch a server process with automatic device detection.
+    """Launch a server process with automatic device detection and offline/online retry.
 
     Args:
-        device: Device type ("auto", "cuda", "rocm" or "cpu").
-                If "auto", will detect available platforms automatically.
+        model: Model path or identifier
+        base_url: Base URL for the server
+        timeout: Timeout for server startup
+        api_key: Optional API key for authentication
+        other_args: Additional command line arguments
+        env: Environment dict for subprocess
+        return_stdout_stderr: Optional tuple for output capture
+        device: Device type ("auto", "cuda", "rocm" or "cpu")
+        pd_separated: Whether to use PD separated mode
+        num_replicas: Number of replicas for mixed PD mode
+
+    Returns:
+        Started subprocess.Popen object
     """
     other_args = other_args or []
 
@@ -569,6 +849,25 @@ def popen_launch_server(
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
+    # CI-specific: Validate cache and enable offline mode if complete
+    if env is None:
+        env = os.environ.copy()
+    else:
+        env = env.copy()
+
+    # Store per-run marker path for potential invalidation
+    per_run_marker_path = None
+    try:
+        from sglang.utils import is_in_ci
+
+        if is_in_ci():
+            per_run_marker_path = _try_enable_offline_mode_if_cache_complete(
+                model, env, other_args
+            )
+    except Exception as e:
+        print(f"CI cache validation failed (non-fatal): {e}")
+
+    # Build server command
     _, host, port = base_url.split(":")
     host = host[2:]
 
@@ -588,103 +887,82 @@ def popen_launch_server(
     ]
 
     if pd_separated or use_mixed_pd_engine:
-        command.extend(
-            [
-                "--lb-host",
-                host,
-                "--lb-port",
-                port,
-            ]
-        )
+        command.extend(["--lb-host", host, "--lb-port", port])
     else:
-        command.extend(
-            [
-                "--host",
-                host,
-                "--port",
-                port,
-            ]
-        )
+        command.extend(["--host", host, "--port", port])
 
     if use_mixed_pd_engine:
-        command.extend(
-            [
-                "--mixed",
-                "--num-replicas",
-                str(num_replicas),
-            ]
-        )
+        command.extend(["--mixed", "--num-replicas", str(num_replicas)])
 
     if api_key:
         command += ["--api-key", api_key]
 
-    print(f"command={' '.join(command)}")
+    print(f"command={shlex.join(command)}")
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            bufsize=1,
+    # Track if offline mode was enabled for potential retry
+    offline_enabled = env.get("HF_HUB_OFFLINE") == "1"
+
+    # First launch attempt
+    process = _launch_server_process(command, env, return_stdout_stderr, model)
+    success, error_msg = _wait_for_server_health(process, base_url, api_key, timeout)
+
+    # If offline launch failed and offline was enabled, retry with online mode
+    if not success and offline_enabled:
+        print(
+            f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
         )
 
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
+        # Kill failed process
+        try:
+            if process.poll() is None:
+                kill_process_tree(process.pid)
+            else:
+                process.wait(timeout=5)
+        except Exception as e:
+            print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
 
-        threading.Thread(
-            target=_dump,
-            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    start_time = time.perf_counter()
-    with requests.Session() as session:
-        while time.perf_counter() - start_time < timeout:
-            return_code = process.poll()
-            if return_code is not None:
-                # Server failed to start (non-zero exit code) or crashed
-                raise Exception(
-                    f"Server process exited with code {return_code}. "
-                    "Check server logs for errors."
-                )
-
+        # Invalidate per-run marker to prevent subsequent tests from using offline
+        if per_run_marker_path and os.path.exists(per_run_marker_path):
             try:
-                headers = {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Authorization": f"Bearer {api_key}",
-                }
-                response = session.get(
-                    f"{base_url}/health_generate",
-                    headers=headers,
-                )
-                if response.status_code == 200:
-                    return process
-            except requests.RequestException:
-                pass
+                os.remove(per_run_marker_path)
+                print("CI_OFFLINE: Invalidated per-run marker due to offline failure")
+            except Exception as e:
+                print(f"CI_OFFLINE: Failed to remove per-run marker: {e}")
 
-            return_code = process.poll()
-            if return_code is not None:
-                raise Exception(
-                    f"Server unexpectedly exits ({return_code=}). Usually there will be error logs describing the cause far above this line."
-                )
+        # Retry with online mode
+        env["HF_HUB_OFFLINE"] = "0"
+        process = _launch_server_process(command, env, return_stdout_stderr, model)
+        success, error_msg = _wait_for_server_health(
+            process, base_url, api_key, timeout
+        )
 
-            time.sleep(10)
+        if success:
+            print("CI_OFFLINE: Online retry succeeded")
+            return process
 
-    kill_process_tree(process.pid)
-    raise TimeoutError("Server failed to start within the timeout period.")
+        # Online retry also failed
+        try:
+            kill_process_tree(process.pid)
+        except Exception as e:
+            print(f"CI_OFFLINE: Error killing process after online retry failure: {e}")
+
+        if "exited" in error_msg:
+            raise Exception(error_msg + ". Check server logs for errors.")
+        raise TimeoutError(error_msg)
+
+    # First attempt succeeded or offline was not enabled
+    if success:
+        return process
+
+    # First attempt failed and offline was not enabled
+    try:
+        kill_process_tree(process.pid)
+    except Exception as e:
+        print(f"CI_OFFLINE: Error killing process after first attempt failure: {e}")
+
+    if "exited" in error_msg:
+        raise Exception(error_msg + ". Check server logs for errors.")
+    raise TimeoutError(error_msg)
 
 
 def popen_launch_pd_server(
@@ -734,6 +1012,7 @@ def get_similarities(vec1, vec2):
 
 def get_benchmark_args(
     base_url="",
+    backend="sglang",
     dataset_name="",
     dataset_path="",
     tokenizer="",
@@ -751,9 +1030,16 @@ def get_benchmark_args(
     lora_name=None,
     lora_request_distribution="uniform",
     lora_zipf_alpha=1.5,
+    gsp_num_groups=4,
+    gsp_prompts_per_group=4,
+    gsp_system_prompt_len=128,
+    gsp_question_len=32,
+    gsp_output_len=32,
+    gsp_num_turns=1,
+    header=None,
 ):
     return SimpleNamespace(
-        backend="sglang",
+        backend=backend,
         base_url=base_url,
         host=None,
         port=None,
@@ -785,6 +1071,13 @@ def get_benchmark_args(
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
+        gsp_num_groups=gsp_num_groups,
+        gsp_prompts_per_group=gsp_prompts_per_group,
+        gsp_system_prompt_len=gsp_system_prompt_len,
+        gsp_question_len=gsp_question_len,
+        gsp_output_len=gsp_output_len,
+        gsp_num_turns=gsp_num_turns,
+        header=header,
     )
 
 
@@ -1203,6 +1496,10 @@ def run_bench_one_batch(model, other_args):
         command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    prefill_latency = None
+    decode_throughput = None
+    decode_latency = None
+
     try:
         stdout, stderr = process.communicate()
         output = stdout.decode(errors="backslashreplace")
@@ -1224,6 +1521,12 @@ def run_bench_one_batch(model, other_args):
             decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
+
+    if prefill_latency is None or decode_throughput is None or decode_latency is None:
+        raise RuntimeError(
+            f"Failed to parse benchmark output. "
+            f"prefill_latency={prefill_latency}, decode_throughput={decode_throughput}, decode_latency={decode_latency}"
+        )
 
     return prefill_latency, decode_throughput, decode_latency
 
@@ -1360,6 +1663,7 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
+    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1387,6 +1691,7 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
     )
 
     # Launch a thread to stream the output
@@ -1697,16 +2002,19 @@ async def send_concurrent_generate_requests_with_custom_params(
 
 class CustomTestCase(unittest.TestCase):
     def _callTestMethod(self, method):
-        max_retry = int(
-            os.environ.get("SGLANG_TEST_MAX_RETRY", "1" if is_in_ci() else "0")
-        )
+        max_retry = envs.SGLANG_TEST_MAX_RETRY.get()
+        if max_retry is None:
+            max_retry = 1 if is_in_ci() else 0
         retry(
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
 
     def setUp(self):
-        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
+        print(
+            f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}",
+            flush=True,
+        )
 
 
 def dump_bench_raw_result(
@@ -1748,11 +2056,13 @@ class ModelLaunchSettings:
         tp_size: int = 1,
         extra_args: Optional[List[str]] = None,
         env: Optional[dict] = None,
+        variant: Optional[str] = None,
     ):
         self.model_path = model_path
         self.tp_size = tp_size
         self.extra_args = list(extra_args) if extra_args else []
         self.env = env
+        self.variant = variant
 
         if self.tp_size > 1 and "--tp" not in self.extra_args:
             self.extra_args.extend(["--tp", str(self.tp_size)])
@@ -1931,3 +2241,177 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def run_doctests(obj: Callable[..., Any] | ModuleType):
+    mod = inspect.getmodule(obj)
+    globals = dict(mod.__dict__)
+    finder = doctest.DocTestFinder()
+    runner = doctest.DocTestRunner(verbose=True)
+    tests = finder.find(obj, obj.__name__, globs=globals)
+    assert len(tests) >= 1, f"No tests found for {obj.__name__}"
+    for test in tests:
+        result = runner.run(test)
+        assert result.failed == 0, f"Test {test.name} failed"
+
+
+def dump_metric(metric_name: str, value: Any, labels: Optional[dict] = None):
+    """
+    Output test metric to JSONL and stdout for CI performance tracking.
+
+    Schema (v1):
+      - Required: filename, test_case, metric_name, value
+      - Optional fields supported: ts, labels
+        - ts is emitted by default for convenience
+        - labels preferred as dict; if not JSON-serializable, stored as string
+
+    Value types (v1 contract):
+      - Supported: int, float, str
+      - Input may be bool (will be coerced to int: True=1, False=0)
+      - Others: best-effort conversion to float, fallback to str
+
+    Output channels:
+      - JSONL: ${SGLANG_TEST_METRICS_OUTPUT}.${pid}.jsonl (if env var set)
+      - stdout: [METRIC] metric_name=value [labels=...]
+
+    This function never fails tests - all errors are silently caught.
+
+    Args:
+        metric_name: Metric name (e.g., "gsm8k_accuracy", "cache_hit_rate")
+        value: Metric value
+        labels: Optional label dict (e.g., {"backend": "fa3"})
+    """
+    try:
+        # 1. Capture test context
+        filename, test_case = _get_test_context()
+
+        # 2. Convert value to int/float/str
+        # First unwrap numpy/torch scalars
+        if hasattr(value, "item"):
+            value = value.item()
+
+        # Now convert, ensuring no bool in final result
+        if isinstance(value, bool):
+            converted_value = int(value)  # True->1, False->0
+        elif isinstance(value, (int, float, str)):
+            converted_value = value
+        else:
+            try:
+                converted_value = float(value)
+            except (ValueError, TypeError):
+                converted_value = str(value)
+
+        # 3. Build record
+        record = {
+            "filename": filename,
+            "test_case": test_case,
+            "metric_name": metric_name,
+            "value": converted_value,
+            "ts": time.time(),
+        }
+
+        # 4. Handle labels (best-effort JSON serialization)
+        labels_for_output = None
+        if labels:
+            try:
+                json.dumps(labels, ensure_ascii=False)  # Test serializability
+                record["labels"] = labels
+                labels_for_output = labels
+            except (TypeError, ValueError):
+                # If not serializable, stringify
+                stringified = str(labels)
+                record["labels"] = stringified
+                labels_for_output = stringified
+
+        # 5. Write JSONL
+        base_path = os.getenv("SGLANG_TEST_METRICS_OUTPUT")
+        if base_path:
+            try:
+                jsonl_path = f"{base_path}.{os.getpid()}.jsonl"
+                with open(jsonl_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as e:
+                logging.warning(
+                    f"sglang.test.dump_metric: failed to write to {jsonl_path}: {e}"
+                )
+
+        # 6. Output to stdout (use same labels as record)
+        if labels_for_output:
+            if isinstance(labels_for_output, str):
+                labels_str = f" labels='{labels_for_output}'"
+            else:
+                labels_str = (
+                    f" labels={json.dumps(labels_for_output, ensure_ascii=False)}"
+                )
+        else:
+            labels_str = ""
+        print(f"[METRIC] {metric_name}={converted_value}{labels_str}")
+
+    except Exception as e:
+        # Silent failure - never break tests
+        logging.warning(
+            f"sglang.test.dump_metric: failed to dump metric '{metric_name}': {e}",
+            exc_info=True,
+        )
+
+
+def _get_test_context() -> tuple[str, str]:
+    """
+    Get current test's filename and test_case.
+
+    Tries PYTEST_CURRENT_TEST first, falls back to inspect.stack().
+    """
+    # 1. Try parsing PYTEST_CURRENT_TEST
+    pytest_current = os.getenv("PYTEST_CURRENT_TEST")
+    if pytest_current:
+        # Format: "path/to/test.py::TestClass::test_method (call)"
+        parts = pytest_current.split(" ")[0].split("::", 1)
+        if len(parts) == 2:
+            filename = _repo_relative_path(parts[0])
+            test_case = parts[1].replace("::", ".")
+            return filename, test_case
+
+    # 2. Fallback to inspect
+    import inspect
+
+    frame = inspect.currentframe()
+    # Assumes direct callsite: frame -> _get_test_context -> dump_metric -> caller
+    # If dump_metric gets wrapped, may need to scan upward
+    if frame and frame.f_back and frame.f_back.f_back:
+        caller = frame.f_back.f_back
+        filename = _repo_relative_path(caller.f_code.co_filename)
+
+        # Try to get class name from self
+        test_self = caller.f_locals.get("self")
+        if test_self and hasattr(test_self, "__class__"):
+            test_case = f"{test_self.__class__.__name__}.{caller.f_code.co_name}"
+        else:
+            test_case = caller.f_code.co_name
+
+        return filename, test_case
+
+    return "unknown.py", "unknown_test"
+
+
+def _repo_relative_path(filepath: str) -> str:
+    """Convert absolute path to repo-relative, preferring GITHUB_WORKSPACE"""
+    # Path is imported at module top (line 20)
+    try:
+        abs_path = Path(filepath).resolve()
+
+        # Try GITHUB_WORKSPACE first
+        workspace = os.getenv("GITHUB_WORKSPACE")
+        if workspace:
+            try:
+                return str(abs_path.relative_to(Path(workspace).resolve()))
+            except ValueError:
+                pass
+
+        # Fallback to cwd
+        try:
+            return str(abs_path.relative_to(Path.cwd()))
+        except ValueError:
+            return abs_path.name
+
+    except Exception:
+        return Path(filepath).name
