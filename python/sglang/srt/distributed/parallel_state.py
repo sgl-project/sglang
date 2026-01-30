@@ -282,9 +282,11 @@ class GroupCoordinator:
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend=torch_distributed_backend,
-                    **({
-                        "timeout": dist_timeout_td
-                    } if dist_timeout_td is not None else {}),
+                    **(
+                        {"timeout": dist_timeout_td}
+                        if dist_timeout_td is not None
+                        else {}
+                    ),
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
