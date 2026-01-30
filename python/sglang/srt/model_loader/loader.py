@@ -2525,6 +2525,7 @@ class IncModelLoader(DefaultModelLoader):
                 scheme=scheme,
                 iters=self.load_config.inc_tuning_iters,
                 disable_opt_rtn=self.load_config.inc_disable_opt_rtn,
+                low_cpu_mem_usage=False,
             )
             model, _ = autoround.quantize_and_save(
                 output_dir=self.load_config.inc_save_path,

@@ -66,7 +66,7 @@ class LoadConfig:
     # Inc-related loading options
     inc_save_path: Optional[str] = None
     inc_tuning_iters: Optional[int] = 0
-    inc_disable_opt_rtn: Optional[bool] = False
+    inc_disable_opt_rtn: Optional[bool] = None
     """
 
     load_format: Union[str, LoadFormat] = LoadFormat.AUTO
@@ -93,7 +93,7 @@ class LoadConfig:
     # Inc-related loading options
     inc_save_path: Optional[str] = None
     inc_tuning_iters: Optional[int] = 0
-    inc_disable_opt_rtn: Optional[bool] = False
+    inc_disable_opt_rtn: Optional[bool] = None
 
     # QuantizedRL-specific options (for FlashRL-style quantization)
     rl_quant_profile: Optional[str] = (
