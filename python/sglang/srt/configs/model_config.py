@@ -479,6 +479,9 @@ class ModelConfig:
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
         )
+        self.first_k_dense_replace = getattr(
+            self.hf_text_config, "first_k_dense_replace", 0
+        )
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
