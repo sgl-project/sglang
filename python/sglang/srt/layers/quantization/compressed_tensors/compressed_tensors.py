@@ -61,7 +61,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda, is_npu, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -639,7 +639,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                         "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
                     )
                     return CompressedTensorsMxInt4MoE(self)
-                elif is_hip:
+                elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(self)
                 else:
