@@ -1127,6 +1127,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             max_seq_len=metadata.max_seq_len_k,
             bmm1_scale=bmm1_scale,
+            enable_pdl=False
         )
 
         # Reshape output directly without slicing
@@ -1321,6 +1322,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens=metadata.seq_lens_k,
                 max_seq_len=max_seq_len,
                 bmm1_scale=bmm1_scale,
+                enable_pdl=False
             )
 
             if needs_unpad:
