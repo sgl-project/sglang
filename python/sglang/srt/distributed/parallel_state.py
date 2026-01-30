@@ -283,7 +283,7 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
                 )
             else:
-                if _is_npu and group_name != "attention_tp":
+                if _is_npu and "moe" in group_name:
                     pg_options = _get_npu_hccl_pg_options()
                 else:
                     pg_options = None
