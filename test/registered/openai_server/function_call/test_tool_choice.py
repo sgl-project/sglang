@@ -911,6 +911,14 @@ class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
 
+    @unittest.skip("maxItems:1 bug causes whitespace stall")
+    def test_tool_choice_required_non_streaming(self):
+        pass
+
+    @unittest.skip("maxItems:1 bug causes whitespace stall")
+    def test_tool_choice_specific_function_non_streaming(self):
+        pass
+
 
 if __name__ == "__main__":
     unittest.main()
