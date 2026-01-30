@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional,  Mapping, cast
 
 import torch
-from torch.nn import Module
-from torch.nn.parameter import Parameter
 
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
@@ -18,22 +13,17 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.models.parameter import (
-    BlockQuantScaleParameter,
-    ModelWeightParameter,
-    PerTensorScaleParameter,
-)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 
 from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimScheme,
     ModelSlimW4A4Int4,
     ModelSlimW8A8Int8,
 )
-
-_is_npu = current_platform.is_npu()
+from types import MappingProxyType
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +72,7 @@ class ModelSlimConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 
         if isinstance(layer, LinearBase):
             if should_ignore_layer(
@@ -111,6 +100,74 @@ class ModelSlimConfig(QuantizationConfig):
             layer.scheme = scheme
             return ModelSlimLinearMethod(self)
         return None
+
+    def _get_scheme_from_parts(
+        self,
+        layer_name: str,
+    ) -> ModelSlimScheme:
+        
+        quant_type = self.quant_description.get(layer_name + ".weight", "")
+        print('+++++++++++++++++++++++')
+        print(layer_name)
+        print('----------------------+')
+        if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
+            return ModelSlimW8A8Int8(
+                quant_config=self.quant_description, prefix=layer_name
+            )
+        elif quant_type == "W4A4_DYNAMIC":
+            return ModelSlimW4A4Int4(
+                quant_config=self.quant_description, prefix=layer_name
+            )
+        raise NotImplementedError("No modelslim compatible scheme was found.")
+
+    def get_scheme(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[ModelSlimScheme]:
+        """
+        get_scheme method adjusted for modelslim, taken from
+        python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+        """
+        scheme = self._get_scheme_from_parts(
+            layer_name=layer_name,
+        )
+
+        # Ascend doesn't support device capability
+        logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
+        return scheme
+
+    def is_layer_skipped(
+        self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
+    ):
+        # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
+        proj_name = prefix.split(".")[-1]
+        if proj_name in fused_mapping:
+            shard_prefixes = [
+                prefix.replace(proj_name, shard_proj_name)
+                for shard_proj_name in fused_mapping[proj_name]
+            ]
+
+            is_skipped = None
+            for shard_prefix in shard_prefixes:
+                is_shard_skipped = (
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
+                )
+
+                if is_skipped is None:
+                    is_skipped = is_shard_skipped
+                elif is_shard_skipped != is_skipped:
+                    raise ValueError(
+                        f"Detected some but not all shards of {prefix} "
+                        "are quantized. All shards of fused layers "
+                        "to have the same precision."
+                    )
+        else:
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
+
+        assert is_skipped is not None
+        return is_skipped
+
+    def get_scaled_act_names(self) -> List[str]:
+        return []
 
 
 class ModelSlimLinearMethod(LinearMethodBase):
