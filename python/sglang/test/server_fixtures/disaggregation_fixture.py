@@ -107,56 +107,75 @@ def _get_available_ib_devices():
     """Auto-detect available high-speed RDMA devices from sysfs.
 
     Filters for devices that are:
-    1. Active (port state)
-    2. High-speed (rate >= 100 Gbps to exclude regular Ethernet NICs)
+    1. Not Ethernet NICs (excludes devices with 'eth' in the name like mlx5_eth0)
+    2. Active (port state)
+    3. High-speed (rate >= 100 Gbps to exclude regular Ethernet NICs)
     """
     ib_sysfs_path = "/sys/class/infiniband"
     if not os.path.isdir(ib_sysfs_path):
-        logger.info("IB sysfs path %s does not exist", ib_sysfs_path)
+        logger.warning("IB sysfs path %s does not exist", ib_sysfs_path)
         return None
 
     all_devices = sorted(os.listdir(ib_sysfs_path))
-    logger.info("All IB devices in sysfs: %s", all_devices)
+    logger.warning("All IB devices in sysfs: %s", all_devices)
 
     devices = []
     for dev in all_devices:
         # Check port 1 state and rate (most devices have single port)
         port_path = os.path.join(ib_sysfs_path, dev, "ports", "1")
         if not os.path.isdir(port_path):
-            logger.info("Device %s: SKIPPED (no port 1)", dev)
+            logger.warning("Device %s: SKIPPED (no port 1)", dev)
             continue
 
-        # Check if port is active
+        # Read state and rate for logging
+        state = "unknown"
+        rate = -1
         state_file = os.path.join(port_path, "state")
+        rate_file = os.path.join(port_path, "rate")
+
         try:
             with open(state_file) as f:
                 state = f.read().strip()
-                # State format is like "4: ACTIVE" or just "ACTIVE"
-                if "ACTIVE" not in state.upper():
-                    logger.info("Device %s: SKIPPED (state=%s)", dev, state)
-                    continue
-        except (OSError, IOError) as e:
-            logger.info("Device %s: SKIPPED (cannot read state: %s)", dev, e)
-            continue
+        except (OSError, IOError):
+            pass
 
-        # Check rate (filter out low-speed NICs like 10/25 Gbps Ethernet)
-        rate_file = os.path.join(port_path, "rate")
         try:
             with open(rate_file) as f:
                 rate_str = f.read().strip()
-                # Rate format is like "400 Gb/sec" or just a number
                 rate = int(rate_str.split()[0])
-                if rate < 100:  # Skip devices slower than 100 Gbps
-                    logger.info("Device %s: SKIPPED (rate=%d Gbps)", dev, rate)
-                    continue
-        except (OSError, IOError, ValueError, IndexError) as e:
-            # If we can't read rate, include the device anyway
-            logger.info("Device %s: cannot read rate (%s), including anyway", dev, e)
+        except (OSError, IOError, ValueError, IndexError):
+            pass
+
+        # Log device properties for debugging
+        logger.warning(
+            "Device %s: state=%s, rate=%d Gbps, has_eth_in_name=%s",
+            dev,
+            state,
+            rate,
+            "eth" in dev.lower(),
+        )
+
+        # Skip devices with "eth" in the name - these are typically Ethernet NICs
+        # that don't work properly with RDMA (e.g., mlx5_eth0)
+        if "eth" in dev.lower():
+            logger.warning("Device %s: SKIPPED (contains 'eth' in name)", dev)
+            continue
+
+        # Check if port is active
+        # State format is like "4: ACTIVE" or just "ACTIVE"
+        if "ACTIVE" not in state.upper():
+            logger.warning("Device %s: SKIPPED (state=%s)", dev, state)
+            continue
+
+        # Check rate (filter out low-speed NICs like 10/25 Gbps Ethernet)
+        if rate >= 0 and rate < 100:  # Skip devices slower than 100 Gbps
+            logger.warning("Device %s: SKIPPED (rate=%d Gbps)", dev, rate)
+            continue
 
         devices.append(dev)
-        logger.info("Device %s: INCLUDED", dev)
+        logger.warning("Device %s: INCLUDED", dev)
 
-    logger.info("Filtered IB devices: %s (count=%d)", devices, len(devices))
+    logger.warning("Filtered IB devices: %s (count=%d)", devices, len(devices))
     return devices if devices else None
 
 
@@ -177,7 +196,7 @@ def get_rdma_devices_args():
         or _get_available_ib_devices()
         or [f"mlx5_roce{i}" for i in range(8)]
     )
-    logger.info("Resolved rdma_all_devices=%s", rdma_all_devices)
+    logger.warning("Resolved rdma_all_devices=%s", rdma_all_devices)
 
     n_rdma = len(rdma_all_devices)
 
