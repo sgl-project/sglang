@@ -817,21 +817,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._flashinfer_gdn_prefill = flashinfer_chunk_gated_delta_rule
                 self._use_flashinfer_gdn_prefill = True
                 rank0_log("FlashInfer GDN prefill kernel enabled.")
+
                 from flashinfer.gdn_decode import (
                     gated_delta_rule_decode as flashinfer_gdn_decode,
                 )
+                self._flashinfer_gdn_decode = flashinfer_gdn_decode
+                self._use_flashinfer_gdn_decode = True
+                rank0_log("FlashInfer GDN decode kernel enabled.")
+
                 from flashinfer.gdn_decode import (
                     gated_delta_rule_mtp as flashinfer_gdn_mtp,
                 )
-
-                self._flashinfer_gdn_decode = flashinfer_gdn_decode
-                self._use_flashinfer_gdn_decode = True
                 self._flashinfer_gdn_mtp = flashinfer_gdn_mtp
                 self._use_flashinfer_gdn_mtp = True
-                rank0_log("FlashInfer GDN decode kernel enabled.")
+                rank0_log("FlashInfer GDN MTP kernel enabled.")
             except Exception as exc:
                 rank0_log(
-                    f"FlashInfer GDN prefill kernel unavailable, "
+                    f"FlashInfer GDN kernels unavailable, "
                     f"falling back to Triton FLA. Reason: {exc}"
                 )
 
