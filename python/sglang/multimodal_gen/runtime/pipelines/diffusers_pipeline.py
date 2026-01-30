@@ -486,22 +486,32 @@ class DiffusersPipeline(ComposedPipelineBase):
         # VAE slicing: decode latents slice-by-slice for lower peak memory
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-slicing
         if getattr(config, "vae_slicing", False):
-            if hasattr(pipe, "enable_vae_slicing"):
-                pipe.enable_vae_slicing()
-                logger.info("Enabled VAE slicing for lower memory usage")
-            elif hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_slicing"):
                 pipe.vae.enable_slicing()
                 logger.info("Enabled VAE slicing for lower memory usage")
+            elif hasattr(pipe, "enable_vae_slicing"):
+                pipe.enable_vae_slicing()
+                logger.info("Enabled VAE slicing for lower memory usage")
+            else:
+                logger.warning(
+                    "VAE slicing is not available: neither "
+                    "`pipe.vae.enable_slicing()` nor `pipe.enable_vae_slicing()` was found."
+                )
 
         # VAE tiling: decode latents tile-by-tile for large images
         # https://huggingface.co/docs/diffusers/optimization/memory#vae-tiling
         if getattr(config, "vae_tiling", False):
-            if hasattr(pipe, "enable_vae_tiling"):
-                pipe.enable_vae_tiling()
-                logger.info("Enabled VAE tiling for large image support")
-            elif hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
+            if hasattr(pipe, "vae") and hasattr(pipe.vae, "enable_tiling"):
                 pipe.vae.enable_tiling()
                 logger.info("Enabled VAE tiling for large image support")
+            elif hasattr(pipe, "enable_vae_tiling"):
+                pipe.enable_vae_tiling()
+                logger.info("Enabled VAE tiling for large image support")
+            else:
+                logger.warning(
+                    "VAE tiling is not available: neither "
+                    "`pipe.vae.enable_tiling()` nor `pipe.enable_vae_tiling()` was found."
+                )
 
     def _apply_attention_backend(self, pipe: Any, server_args: ServerArgs) -> None:
         """Apply attention backend setting from pipeline config or server_args.
