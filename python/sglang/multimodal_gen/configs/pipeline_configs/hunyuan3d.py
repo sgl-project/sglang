@@ -14,7 +14,6 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     """Pipeline configuration for Hunyuan3D image-to-mesh generation."""
 
     shape_subfolder: str = "hunyuan3d-dit-v2-0"
-    vae_subfolder: str = "hunyuan3d-vae-v2-0"
     paint_subfolder: str = "hunyuan3d-paint-v2-0"
     delight_subfolder: str = "hunyuan3d-delight-v2-0"
 
@@ -22,7 +21,6 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
 
     # Shape model configuration
     shape_model_path: Optional[str] = None
-
     shape_use_safetensors: bool = True
     shape_variant: Optional[str] = "fp16"
     shape_num_inference_steps: int = 50
@@ -34,29 +32,12 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     shape_num_chunks: int = 8000
     shape_output_type: str = "trimesh"
 
-    # VAE configuration
-
-    vae_enable_flashvdm: bool = False
-    vae_flashvdm_topk_mode: str = "mean"
-
-    # Conditioner configuration
-    conditioner_type: str = "dino"  # 'dino' or 'dino_mv'
-    conditioner_model: str = "facebook/dinov2-large"
-    conditioner_image_size: int = 518
-
     # Paint model configuration
     paint_enable: bool = False
-    paint_model_path: Optional[str] = None
-
     paint_num_inference_steps: int = 15
     paint_guidance_scale: float = 3.0
-    paint_max_num_view: int = 6
     paint_resolution: int = 512
     paint_texture_size: int = 4096
     paint_use_remesh: bool = True
-    paint_use_super_resolution: bool = True
     paint_save_glb: bool = True
     paint_turbo_mode: bool = False  # Enable turbo mode for faster inference
-
-    # Output configuration
-    output_format: str = "glb"  # 'obj' or 'glb'
