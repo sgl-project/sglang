@@ -178,9 +178,15 @@ class DiffusionServerBase:
 
     @classmethod
     def teardown_class(cls):
+        print(
+            f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
+        )
         for result in cls._perf_results:
             result["class_name"] = cls.__name__
             _GLOBAL_PERF_RESULTS.append(result)
+        print(
+            f"[DEBUG teardown_class] After appending, _GLOBAL_PERF_RESULTS has {len(_GLOBAL_PERF_RESULTS)} entries total"
+        )
 
         if cls._improved_baselines:
             import json
@@ -297,6 +303,9 @@ Consider updating perf_baselines.json with the snippets below:
             )
 
         self.__class__._perf_results.append(result)
+        print(
+            f"[DEBUG _validate_and_record] Appended result for {case.id}, class {self.__class__.__name__} now has {len(self.__class__._perf_results)} results"
+        )
 
     def _check_for_improvement(
         self,
