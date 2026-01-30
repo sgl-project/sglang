@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
-if current_platform.is_cuda() or current_platform.is_hip:
+if current_platform.is_cuda() or current_platform.is_hip():
     from sgl_kernel import silu_and_mul
 
 if current_platform.is_npu():
