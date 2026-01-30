@@ -306,6 +306,7 @@ class EagleVerifyInputV2Mixin:
         if sampling_info.is_all_greedy or _is_npu:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
+            # accept_length has maximum of speculative_draft_token_num - 1
             predict, accept_index, accept_length = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
