@@ -3029,11 +3029,11 @@ def configure_scheduler(
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
-) -> Tuple[str, Optional[int]]:
+) -> Optional[int]:
     """Configure scheduler worker: logging, process title, etc.
 
     Returns:
-        Tuple of (prefix, dp_rank) where dp_rank may be updated from env var.
+        dp_rank
     """
     # Generate the logger prefix
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
@@ -3058,7 +3058,7 @@ def configure_scheduler(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
-    return prefix, dp_rank
+    return dp_rank
 
 
 def run_scheduler_process(
@@ -3071,7 +3071,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    prefix, dp_rank = configure_scheduler(
+    dp_rank = configure_scheduler(
         server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
     )
 

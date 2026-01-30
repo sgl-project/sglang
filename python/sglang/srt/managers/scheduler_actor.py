@@ -25,8 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_scheduler_actor_class():
-    """Factory function to create SchedulerActor class with Ray decorator.
-    """
+    """Factory function to create SchedulerActor class with Ray decorator."""
     import ray
 
     @ray.remote
@@ -53,7 +52,7 @@ def create_scheduler_actor_class():
             )
 
             # Configure worker (logging, process title, etc.)
-            _, dp_rank = configure_scheduler(
+            dp_rank = configure_scheduler(
                 server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
             )
 
@@ -84,7 +83,9 @@ def create_scheduler_actor_class():
             try:
                 self.scheduler.run_event_loop()
             except Exception as e:
-                logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")
+                logger.error(
+                    f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}"
+                )
                 raise
 
     return SchedulerActor
