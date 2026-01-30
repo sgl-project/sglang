@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings, is_blackwell_system
+from sglang.test.tool_call_test_runner import ToolCallTestParams
 
 register_cuda_ci(est_time=5400, suite="nightly-8-gpu-common", nightly=True)
 
@@ -14,6 +15,11 @@ BASE_ARGS = [
     "--trust-remote-code",
     "--model-loader-extra-config",
     '{"enable_multithread_load": true}',
+]
+
+TOOL_CALL_ARGS = [
+    "--tool-call-parser=deepseekv32",
+    "--reasoning-parser=deepseek-v3",
 ]
 
 DP_ARGS = [
@@ -54,28 +60,28 @@ class TestDeepseekV32(unittest.TestCase):
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS,
                 variant="DP8",
             ),
             # Variant: "dp+mtp" - DP + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
+                extra_args=BASE_ARGS + DP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
                 variant="DP8+MTP",
             ),
             # Variant: "tp" - Pure TP=8 only
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + TP_ARGS,
+                extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS,
                 variant="TP8",
             ),
             # Variant: "tp+mtp" - Pure TP=8 + EAGLE speculative decoding
             ModelLaunchSettings(
                 DEEPSEEK_V32_MODEL_PATH,
                 tp_size=8,
-                extra_args=BASE_ARGS + TP_ARGS + MTP_ARGS,
+                extra_args=BASE_ARGS + TP_ARGS + TOOL_CALL_ARGS + MTP_ARGS,
                 variant="TP8+MTP",
             ),
         ]
@@ -90,6 +96,7 @@ class TestDeepseekV32(unittest.TestCase):
                 batch_sizes=[1, 8, 16, 64],
                 profile_dir="performance_profiles_deepseek_v32",
             ),
+            tool_call_params=ToolCallTestParams(test_thinking=True),
         )
 
     @unittest.skipIf(is_blackwell_system(), "Requires H200 system")
