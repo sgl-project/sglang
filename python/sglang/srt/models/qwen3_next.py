@@ -406,7 +406,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         forward_batch: ForwardBatch,
     ):
         if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            output = torch.zeros_like(hidden_states)
+            output = torch.empty_like(hidden_states)
             gdn_with_output(
                 hidden_states,
                 output,
