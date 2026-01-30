@@ -13,6 +13,7 @@
 # ==============================================================================
 """A controller that dispatches requests to multiple data parallel workers."""
 
+import dataclasses
 import faulthandler
 import logging
 import multiprocessing as mp
@@ -159,6 +160,7 @@ class DataParallelController:
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
+        self.worker_ports = []
         self.status: List[bool] = [True] * server_args.dp_size
 
         if server_args.enable_dp_attention:
@@ -190,11 +192,116 @@ class DataParallelController:
         for worker in self.workers[:: self.control_message_step]:
             worker.send_pyobj(obj)
 
+    def handle_recover_ranks_req(self, ranks_to_recover: List[int]):
+        """Handle request to recover specific ranks.
+
+        This method:
+        1. Launches new processes for the specified global ranks
+        2. Sends a message to all workers to call try_recover_ranks
+        """
+        logger.info(f"Recovering ranks: {ranks_to_recover}")
+        assert self.server_args.enable_dp_attention
+
+        # Get worker ports if needed
+        if self.server_args.node_rank == 0:
+            for rank in ranks_to_recover:
+                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
+                self.worker_ports[rank] = port_and_socket[0]
+                self.workers[rank] = port_and_socket[1]
+
+        broadcasted_ports = self._broadcast_worker_ports(
+            self.server_args, self.worker_ports if self.worker_ports else None
+        )
+
+        # Launch processes for each rank that needs to be recovered
+        # We need to determine which ranks belong to this node
+        pp_size_per_node = max(self.server_args.pp_size // self.server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(self.server_args.nnodes // self.server_args.pp_size, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (self.server_args.node_rank // nnodes_per_pp_rank),
+            pp_size_per_node * (self.server_args.node_rank // nnodes_per_pp_rank + 1),
+        )
+
+        nnodes_per_tp_group = nnodes_per_pp_rank
+        tp_size_per_node = self.server_args.tp_size // nnodes_per_tp_group
+        tp_rank_range = range(
+            tp_size_per_node * (self.server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (self.server_args.node_rank % nnodes_per_tp_group + 1),
+        )
+
+        # Launch processes for ranks that belong to this node
+        for global_rank in ranks_to_recover:
+            # Compute tp_rank and pp_rank from global_rank
+            # Assuming pp_size=1 for dp_attention: global_rank = tp_rank
+            tp_rank = global_rank
+            pp_rank = 0  # Assuming pp_size=1
+
+            # Check if this rank belongs to this node
+            if pp_rank in pp_rank_range and tp_rank in tp_rank_range:
+                # Compute dp_rank from tp_rank
+                _, _, dp_rank = compute_dp_attention_world_info(
+                    self.server_args.enable_dp_attention,
+                    tp_rank,
+                    self.server_args.tp_size,
+                    self.server_args.dp_size,
+                )
+
+                # Compute GPU ID
+                gpu_id = (
+                    self.server_args.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                    + (tp_rank % tp_size_per_node) * self.server_args.gpu_id_step
+                )
+
+                moe_ep_rank = tp_rank // (self.server_args.tp_size // self.server_args.ep_size)
+
+                # Create port args for this rank
+                rank_port_args = PortArgs.init_new(
+                    self.server_args, dp_rank, broadcasted_ports
+                )
+                rank_port_args.nccl_port = self.port_args.nccl_port
+
+                # Launch the process
+                reader, writer = mp.Pipe(duplex=False)
+                memory_saver_adapter = TorchMemorySaverAdapter.create(
+                    enable=self.server_args.enable_memory_saver
+                )
+
+                rank_server_args = dataclasses.replace(
+                    self.server_args, mooncake_extend_group=True
+                )
+
+                with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=self.run_scheduler_process_func,
+                        args=(
+                            rank_server_args,
+                            rank_port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            dp_rank,
+                            writer,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        self.server_args, gpu_id
+                    ):
+                        proc.start()
+
+                self.scheduler_procs.append(proc)
+                logger.info(f"Launched process for global_rank={global_rank}, tp_rank={tp_rank}, dp_rank={dp_rank}")
+
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        self.status = ranks.status
+        if self.status != ranks.status:
+            self.status = ranks.status
+            if self.server_args.enable_dp_attention and not all(ranks.status):
+                ranks_to_recover = [i for i in range(len(ranks.status)) if not ranks.status[i]]
+                self.handle_recover_ranks_req(ranks_to_recover)
 
     def dispatching_with_trace(self, req: Req):
         if self.server_args.enable_trace:
@@ -372,16 +479,15 @@ class DataParallelController:
         self, server_args: ServerArgs, port_args: PortArgs
     ):
         # Pre-allocate worker ports on node 0 to avoid conflicts
-        worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
                 port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
-                worker_ports.append(port_and_socket[0])
+                self.worker_ports.append(port_and_socket[0])
                 self.workers[dp_rank] = port_and_socket[1]
                 logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
 
         broadcasted_ports = self._broadcast_worker_ports(
-            server_args, worker_ports if worker_ports else None
+            server_args, self.worker_ports if self.worker_ports else None
         )
         self.launch_tensor_parallel_group(
             server_args, port_args, 0, None, broadcasted_ports

@@ -255,6 +255,7 @@ def compute_dp_attention_local_info(
 def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
+    extend_group: bool = False,
 ):
     global _ATTN_TP_GROUP, _ATTN_TP_RANK, _ATTN_TP_SIZE, _ATTN_DP_RANK, _ATTN_DP_SIZE
     global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
@@ -308,6 +309,7 @@ def initialize_dp_attention(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="attention_tp",
+        extend_group=_ATTN_TP_SIZE > 1 and extend_group,
     )
 
     _DpGatheredBufferWrapper.set_metadata(
