@@ -19,7 +19,7 @@ from openai import OpenAI
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
-from sglang.multimodal_gen.test.server.conftest import _GLOBAL_PERF_RESULTS
+from sglang.multimodal_gen.test.server import conftest
 from sglang.multimodal_gen.test.server.test_server_utils import (
     VALIDATOR_REGISTRY,
     PerformanceValidator,
@@ -182,13 +182,13 @@ class DiffusionServerBase:
             f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
         )
         print(
-            f"[DEBUG teardown_class] _GLOBAL_PERF_RESULTS id={id(_GLOBAL_PERF_RESULTS)} before appending"
+            f"[DEBUG teardown_class] _GLOBAL_PERF_RESULTS id={id(conftest._GLOBAL_PERF_RESULTS)} before appending"
         )
         for result in cls._perf_results:
             result["class_name"] = cls.__name__
-            _GLOBAL_PERF_RESULTS.append(result)
+            conftest._GLOBAL_PERF_RESULTS.append(result)
         print(
-            f"[DEBUG teardown_class] After appending, _GLOBAL_PERF_RESULTS id={id(_GLOBAL_PERF_RESULTS)} has {len(_GLOBAL_PERF_RESULTS)} entries total"
+            f"[DEBUG teardown_class] After appending, _GLOBAL_PERF_RESULTS id={id(conftest._GLOBAL_PERF_RESULTS)} has {len(conftest._GLOBAL_PERF_RESULTS)} entries total"
         )
 
         if cls._improved_baselines:
