@@ -3,6 +3,7 @@ import os
 print("[CONFTEST] Loading conftest.py at import time")
 
 _GLOBAL_PERF_RESULTS = []
+print(f"[CONFTEST] _GLOBAL_PERF_RESULTS created with id={id(_GLOBAL_PERF_RESULTS)}")
 
 
 def _write_github_step_summary(content: str):
@@ -62,7 +63,7 @@ def pytest_sessionfinish(session):
     It prints a consolidated summary of all performance results.
     """
     print(
-        f"\n[DEBUG] pytest_sessionfinish called, _GLOBAL_PERF_RESULTS has {len(_GLOBAL_PERF_RESULTS)} entries"
+        f"\n[DEBUG] pytest_sessionfinish called, _GLOBAL_PERF_RESULTS id={id(_GLOBAL_PERF_RESULTS)}, has {len(_GLOBAL_PERF_RESULTS)} entries"
     )
     if not _GLOBAL_PERF_RESULTS:
         print("[DEBUG] No results collected, skipping summary output")

@@ -181,11 +181,14 @@ class DiffusionServerBase:
         print(
             f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
         )
+        print(
+            f"[DEBUG teardown_class] _GLOBAL_PERF_RESULTS id={id(_GLOBAL_PERF_RESULTS)} before appending"
+        )
         for result in cls._perf_results:
             result["class_name"] = cls.__name__
             _GLOBAL_PERF_RESULTS.append(result)
         print(
-            f"[DEBUG teardown_class] After appending, _GLOBAL_PERF_RESULTS has {len(_GLOBAL_PERF_RESULTS)} entries total"
+            f"[DEBUG teardown_class] After appending, _GLOBAL_PERF_RESULTS id={id(_GLOBAL_PERF_RESULTS)} has {len(_GLOBAL_PERF_RESULTS)} entries total"
         )
 
         if cls._improved_baselines:
