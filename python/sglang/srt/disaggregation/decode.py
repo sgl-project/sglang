@@ -756,7 +756,7 @@ class DecodeTransferQueue:
         if decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
             decode_req.req.bootstrap_host is None
             and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
-        ):  
+        ):
             # Warm up or fake transfer mode
             pass
         elif actual_room == 0:
