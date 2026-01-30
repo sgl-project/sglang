@@ -1,5 +1,7 @@
 import os
 
+print("[CONFTEST] Loading conftest.py at import time")
+
 _GLOBAL_PERF_RESULTS = []
 
 
@@ -59,7 +61,11 @@ def pytest_sessionfinish(session):
     This hook is called by pytest at the end of the entire test session.
     It prints a consolidated summary of all performance results.
     """
+    print(
+        f"\n[DEBUG] pytest_sessionfinish called, _GLOBAL_PERF_RESULTS has {len(_GLOBAL_PERF_RESULTS)} entries"
+    )
     if not _GLOBAL_PERF_RESULTS:
+        print("[DEBUG] No results collected, skipping summary output")
         return
 
     # Print to stdout (existing behavior)
