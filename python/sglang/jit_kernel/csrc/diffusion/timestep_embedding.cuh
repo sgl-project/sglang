@@ -1,6 +1,8 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/math.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -9,23 +11,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
 namespace {
-
-template <typename T>
-__device__ __forceinline__ float cast_to_float(T v) {
-  if constexpr (std::is_same_v<T, nv_bfloat16>) {
-    return __bfloat162float(v);
-  } else if constexpr (std::is_same_v<T, half>) {
-    return __half2float(v);
-  } else {
-    return static_cast<float>(v);
-  }
-}
 
 template <bool kFlipSinToCos, typename TIn>
 __global__ void timestep_embedding_kernel(
@@ -40,7 +29,7 @@ __global__ void timestep_embedding_kernel(
     return;
   }
 
-  float t_val = cast_to_float(t_ptr[row_idx]);
+  float t_val = device::cast<float>(t_ptr[row_idx]);
   float* output_batch_base_ptr = output_ptr + row_idx * dim;
 
   int half_dim = dim / 2;
@@ -57,24 +46,24 @@ __global__ void timestep_embedding_kernel(
     }
 
     float4 vals;
-    vals.x = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0));
-    vals.y = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1));
-    vals.z = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
-    vals.w = scale * t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
-
-    float4 sin_vals;
-    sin_vals.x = cosf(vals.x);
-    sin_vals.y = cosf(vals.y);
-    sin_vals.z = cosf(vals.z);
-    sin_vals.w = cosf(vals.w);
-    *top_half = sin_vals;
+    vals.x = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0));
+    vals.y = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1));
+    vals.z = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
+    vals.w = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
 
     float4 cos_vals;
-    cos_vals.x = sinf(vals.x);
-    cos_vals.y = sinf(vals.y);
-    cos_vals.z = sinf(vals.z);
-    cos_vals.w = sinf(vals.w);
-    *bottom_half = cos_vals;
+    cos_vals.x = device::math::cos(vals.x);
+    cos_vals.y = device::math::cos(vals.y);
+    cos_vals.z = device::math::cos(vals.z);
+    cos_vals.w = device::math::cos(vals.w);
+    *top_half = cos_vals;
+
+    float4 sin_vals;
+    sin_vals.x = device::math::sin(vals.x);
+    sin_vals.y = device::math::sin(vals.y);
+    sin_vals.z = device::math::sin(vals.z);
+    sin_vals.w = device::math::sin(vals.w);
+    *bottom_half = sin_vals;
 
     thread_offset += static_cast<int>(blockDim.x);
   }
@@ -129,6 +118,7 @@ inline void launch_timestep_embedding(
   }
 }
 
+template <typename TIn>
 void timestep_embedding(
     tvm::ffi::TensorView input,
     tvm::ffi::TensorView output,
@@ -143,31 +133,18 @@ void timestep_embedding(
   auto D = SymbolicSize{"dim"};
   auto device = SymbolicDevice{};
 
-  TensorMatcher({B}).with_strides({1}).template with_device<kDLCUDA>(device).verify(input);
+  TensorMatcher({B})  // input
+      .with_strides({1})
+      .with_dtype<TIn>()
+      .template with_device<kDLCUDA>(device)
+      .verify(input);
 
   TensorMatcher({B, D}).with_strides({D, 1}).with_dtype<float>().template with_device<kDLCUDA>(device).verify(output);
 
   RuntimeCheck(D.unwrap() == dim, "Output dim mismatch: ", D.unwrap(), " vs ", dim);
   RuntimeCheck(dim % 8 == 0, "dim must align to 8, got ", dim);
 
-  const DLDataType in_dtype = input.dtype();
-
-  const bool input_dtype_supported = (in_dtype.code == kDLFloat && in_dtype.bits == 16) ||
-                                     (in_dtype.code == kDLBfloat && in_dtype.bits == 16) ||
-                                     (in_dtype.code == kDLFloat && in_dtype.bits == 32);
-  RuntimeCheck(input_dtype_supported, "input dtype must be fp16/bf16/fp32, but got ", in_dtype);
-
-  auto launch = [&]<typename TIn>() {
-    launch_timestep_embedding<TIn>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
-  };
-
-  if (in_dtype.code == kDLFloat && in_dtype.bits == 32) {
-    launch.template operator()<float>();
-  } else if (in_dtype.code == kDLBfloat && in_dtype.bits == 16) {
-    launch.template operator()<nv_bfloat16>();
-  } else if (in_dtype.code == kDLFloat && in_dtype.bits == 16) {
-    launch.template operator()<half>();
-  }
+  launch_timestep_embedding<TIn>(input, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period);
 }
 
 }  // namespace
