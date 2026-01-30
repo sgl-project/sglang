@@ -130,6 +130,9 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -F "response_format=url"
 ```
 
+> **Security note**
+> - Uploaded filenames are sanitized and constrained to the uploads directory.
+
 #### Download image content
 
 When `response_format=url` is used with `POST /v1/images/edits`, the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
