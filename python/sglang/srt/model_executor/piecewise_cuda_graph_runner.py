@@ -301,7 +301,6 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
-                real_num_tokens=num_tokens,
             )
 
         # Attention backend
@@ -430,7 +429,6 @@ class PiecewiseCudaGraphRunner:
                 num_token_non_padded=None,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
-                real_num_tokens=num_tokens,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -553,7 +551,6 @@ class PiecewiseCudaGraphRunner:
             temperature=forward_batch.temperature,
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
-            real_num_tokens=num_tokens,
         )
 
         return static_forward_batch

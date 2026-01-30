@@ -1059,7 +1059,8 @@ def gdn_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
-    real_num_tokens = forward_batch.real_num_tokens
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
     hidden_states = hidden_states[:real_num_tokens, :]
 
     ret = attention_layer._forward(hidden_states, forward_batch)
