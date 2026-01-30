@@ -61,20 +61,11 @@ class NGRAMWorkerV2(NGRAMWorker):
         self, batch: ModelWorkerBatch
     ) -> tuple[np.ndarray, np.ndarray]:
         bs = len(batch.reqs)
-        prev_token_ids, prev_accept_lens = (
-            batch.spec_info.next_token_ids,
-            batch.spec_info.accept_lens,
-        )
-        if not prev_token_ids.is_cpu:
-            prev_token_ids = prev_token_ids.cpu()
-            prev_accept_lens = prev_accept_lens.cpu()
-        self.prev_token_ids = prev_token_ids.tolist()
-        self.prev_accept_lens = prev_accept_lens.tolist()
         stride = self.draft_token_num
 
         self.ngram_cache.synchronize()
         batch_tokens = []
-        assert len(batch.reqs) == len(self.prev_token_ids)
+        assert len(batch.reqs) == len(self.prev_accept_lens)
         for i, req in enumerate(batch.reqs):
             # TODO grammar doesn't overlap, output_ids will be normal, deal with it!
             # prev_token_id and prev_accept_lens are filtered and merged, so here should not encounter index out of bound
@@ -98,6 +89,15 @@ class NGRAMWorkerV2(NGRAMWorker):
 
     def _update_ngram_cache_v2(self, batch: ModelWorkerBatch):
         batch_tokens = []
+        prev_token_ids, prev_accept_lens = (
+            batch.spec_info.next_token_ids,
+            batch.spec_info.accept_lens,
+        )
+        if not prev_token_ids.is_cpu:
+            prev_token_ids = prev_token_ids.cpu()
+            prev_accept_lens = prev_accept_lens.cpu()
+        self.prev_token_ids = prev_token_ids.tolist()
+        self.prev_accept_lens = prev_accept_lens.tolist()
         stride = self.draft_token_num
         for i, req in enumerate(batch.reqs):
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -187,6 +187,7 @@ class NGRAMWorkerV2(NGRAMWorker):
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             draft_token_num=self.draft_token_num,
+            is_spec_v2=True,
         )
 
     def forward_batch_generation(
@@ -195,6 +196,8 @@ class NGRAMWorkerV2(NGRAMWorker):
         model_worker_batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+        # update cache using req.output_ids (round 1 to N-2) and prev_token_ids (round N-1) before draft
+        self._update_ngram_cache_v2(model_worker_batch)
         bs = len(model_worker_batch.seq_lens)
         self._prepare_for_speculative_decoding_v2(model_worker_batch)
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
@@ -280,7 +283,6 @@ class NGRAMWorkerV2(NGRAMWorker):
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
-            self._update_ngram_cache_v2(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
             verify_next_token_ids = predict
 
@@ -300,16 +302,21 @@ class NGRAMWorkerV2(NGRAMWorker):
             accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
                 device=self.device, non_blocking=True
             )
-            verify_next_token_ids = predict.to_padded_tensor(
-                0, (bs, self.draft_token_num)
-            )
+            verify_next_token_ids = torch.zeros(
+                bs, self.draft_token_num, dtype=torch.int32
+            ).to(device=self.device, non_blocking=True)
+            verify_next_token_ids[:, 0] = predict
+            verify_next_token_ids = verify_next_token_ids.flatten()
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
+            server_args=self.server_args,
+            draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
             next_token_ids=verify_next_token_ids,
             accept_lens=accept_length,
+            is_spec_v2=True,
         )
         return GenerationBatchResult(
             logits_output=logits_output,

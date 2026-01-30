@@ -66,7 +66,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         retrive_index: torch.Tensor = None,
         retrive_next_token: torch.Tensor = None,
         retrive_next_sibling: torch.Tensor = None,
-        draft_token_num: int = 0,
+        draft_token_num: int = -1,
         future_indices: Optional[FutureIndices] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         verify_done: Optional[torch.cuda.Event] = None,
@@ -82,7 +82,12 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             self.retrive_index = retrive_index
             self.retrive_next_token = retrive_next_token
             self.retrive_next_sibling = retrive_next_sibling
-            self.draft_token_num = draft_token_num
+
+        self.draft_token_num = (
+            draft_token_num
+            if draft_token_num != -1
+            else server_args.speculative_num_draft_tokens
+        )
 
         # Inputs for V2 overlap worker
         self.future_indices = future_indices
@@ -472,7 +477,10 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.is_spec_v2:
-            self.next_token_ids = self.next_token_ids[new_indices]
+            self.next_token_ids = self.next_token_ids.reshape(-1, self.draft_token_num)[
+                new_indices, :
+            ]
+            self.next_token_ids = self.next_token_ids.flatten()
             self.accept_lens = self.accept_lens[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
