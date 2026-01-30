@@ -13,7 +13,6 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 
@@ -349,6 +348,9 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.disable_chunked_prefix_cache = (
+            model_runner.server_args.disable_chunked_prefix_cache
+        )
         self.skip_prefill = skip_prefill
 
         self.use_sliding_window_kv_pool = (
@@ -940,7 +942,7 @@ class FlashAttentionBackend(AttentionBackend):
             ):
                 # Do multi-head attention with chunked prefix cache
                 if forward_batch.attn_attend_prefix_cache:
-                    assert not get_global_server_args().disable_chunked_prefix_cache
+                    assert not self.disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
                     assert forward_batch.prefix_chunk_idx is not None
                     assert forward_batch.prefix_chunk_cu_seq_lens is not None
