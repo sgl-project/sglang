@@ -66,6 +66,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _normalize_responses_input(
+    input_items: list,
+) -> list[ChatCompletionMessageParam]:
+    """Normalize Responses API input messages to Chat Completions format.
+
+    The OpenAI Responses API uses ``type: "input_text"`` for text content
+    parts, while the Chat Completions API uses ``type: "text"``.  This
+    function converts between the two so the downstream chat pipeline
+    receives the format it expects.
+    """
+    messages: list[ChatCompletionMessageParam] = []
+    for item in input_items:
+        if isinstance(item, dict):
+            item = dict(item)  # shallow copy
+            content = item.get("content")
+            if isinstance(content, list):
+                item["content"] = [_normalize_content_part(part) for part in content]
+            messages.append(item)  # type: ignore[arg-type]
+        else:
+            messages.append(item)  # type: ignore[arg-type]
+    return messages
+
+
+def _normalize_content_part(part: dict) -> dict:
+    """Convert a Responses API content part to Chat Completions format."""
+    if isinstance(part, dict) and part.get("type") == "input_text":
+        return {"type": "text", "text": part.get("text", "")}
+    return part
+
+
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
@@ -622,7 +652,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            messages.extend(_normalize_responses_input(request.input))  # type: ignore
         return messages
 
     def _construct_input_messages_with_harmony(
