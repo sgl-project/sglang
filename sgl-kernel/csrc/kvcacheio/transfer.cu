@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
@@ -20,7 +20,7 @@ transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_
 
 #pragma unroll
   for (int j = lane_id; j < total_chunks; j += WARP_SIZE) {
-#ifndef USE_ROCM
+#if !defined(USE_ROCM) && !defined(USE_MUSA)
     uint64_t tmp;
     asm volatile("ld.global.nc.b64 %0,[%1];" : "=l"(tmp) : "l"(src + j) : "memory");
     asm volatile("st.global.cg.b64 [%0],%1;" ::"l"(dst + j), "l"(tmp) : "memory");

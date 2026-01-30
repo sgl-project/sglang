@@ -7,11 +7,18 @@
 
 #include <cstdint>
 
+#if !defined(USE_MUSA)
 __forceinline__ __device__ int get_lane_id() {
   int lane_id;
   asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
   return lane_id;
 }
+#else
+constexpr int WarpSize = 32;
+__forceinline__ __device__ int get_lane_id() {
+  return threadIdx.x % WarpSize;
+}
+#endif
 
 int ceil_div(int a, int b) {
   return (a + b - 1) / b;
