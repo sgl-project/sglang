@@ -243,11 +243,6 @@ class GroupCoordinator:
             timedelta(seconds=dist_timeout) if dist_timeout is not None else None
         )
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks,
-                backend=torch_distributed_backend,
-                **({"timeout": dist_timeout_td} if dist_timeout_td is not None else {}),
         if is_cuda_alike():
             device_id = (
                 0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
@@ -285,7 +280,11 @@ class GroupCoordinator:
                     else timedelta(seconds=120 * 60)
                 )
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks,
+                    backend=torch_distributed_backend,
+                    **({
+                        "timeout": dist_timeout_td
+                    } if dist_timeout_td is not None else {}),
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
