@@ -191,6 +191,7 @@ class MetadataBuffers:
         )
 
     def set_buf(self, req: Req):
+
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         self.cached_tokens[req.metadata_buffer_index][0] = req.cached_tokens
         if req.return_logprob:
