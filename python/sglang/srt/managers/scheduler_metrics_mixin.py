@@ -150,6 +150,7 @@ class SchedulerMetricsMixin:
         can_run_list: List[Req],
         running_bs: int,
         running_bs_offline_batch: int,
+        can_run_cuda_graph: bool,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
@@ -204,7 +205,7 @@ class SchedulerMetricsMixin:
         self.stats.new_token_ratio = adder.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
-        f = (
+        msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {len(can_run_list)}, "
             f"#new-token: {adder.log_input_tokens}, "
@@ -215,13 +216,23 @@ class SchedulerMetricsMixin:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
-            f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
-            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
         else:
-            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+            msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
-        logger.info(f)
+        graph_backend = defaultdict(
+            lambda: "cuda graph",
+            {
+                "cpu": "cpu graph",
+                "npu": "npu graph",
+            },
+        )
+
+        msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}"
+
+        logger.info(msg)
 
         if self.enable_metrics:
             # Basics
@@ -395,7 +406,7 @@ class SchedulerMetricsMixin:
         msg += (
             f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
+            f"#queue-req: {len(self.waiting_queue)}"
         )
 
         logger.info(msg)
