@@ -19,7 +19,7 @@ logger = init_logger(__name__)
 
 
 class VocoderLoader(ComponentLoader):
-    module_names = ["vocoder"]
+    component_names = ["vocoder"]
     library = "diffusers"
 
     def should_offload(
@@ -28,7 +28,7 @@ class VocoderLoader(ComponentLoader):
         return server_args.vae_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         config = get_diffusers_component_config(model_path=component_model_path)
         class_name = config.pop("_class_name", None)
@@ -36,7 +36,7 @@ class VocoderLoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        server_args.model_paths[module_name] = component_model_path
+        server_args.model_paths[component_name] = component_model_path
 
         from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import (
             LTXVocoderConfig,

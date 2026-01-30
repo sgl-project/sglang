@@ -17,7 +17,7 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
-    _normalize_module_type,
+    _normalize_component_type,
     component_name_to_loader_cls,
     get_memory_usage_of_component,
     loader_cls_to_expected_library,
@@ -34,10 +34,10 @@ class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
     # the list of possible name of the component in model_index.json, e.g., scheduler
-    module_names: list[str] = []
+    component_names: list[str] = []
 
     # diffusers or transformers
-    library: str = ""
+    expected_library: str = ""
 
     _loaders_registered = False
 
@@ -46,11 +46,11 @@ class ComponentLoader(ABC):
         register loaders, called when subclass is imported
         """
         super().__init_subclass__(**kwargs)
-        if cls.library:
-            loader_cls_to_expected_library[cls] = cls.library
+        if cls.expected_library:
+            loader_cls_to_expected_library[cls] = cls.expected_library
 
-        for module_name in cls.module_names:
-            component_name_to_loader_cls[module_name] = cls
+        for component_name in cls.component_names:
+            component_name_to_loader_cls[component_name] = cls
 
     def __init__(self, device=None) -> None:
         self.device = device
@@ -75,38 +75,38 @@ class ComponentLoader(ABC):
         self,
         component_model_path: str,
         server_args: ServerArgs,
-        module_name: str,
+        component_name: str,
         transformers_or_diffusers: str,
     ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
         The priority of loading method is:
-            1. load customized module
-            2. load native diffusers/transformers module
+            1. load customized component
+            2. load native diffusers/transformers component
         If all of the above methods failed, an error will be thrown
 
         """
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
             "Loading %s from %s. avail mem: %.2f GB",
-            module_name,
+            component_name,
             component_model_path,
             gpu_mem_before_loading,
         )
         try:
             component = self.load_customized(
-                component_model_path, server_args, module_name
+                component_model_path, server_args, component_name
             )
             source = "sgl-diffusion"
         except Exception as e:
             if "Unsupported model architecture" in str(e):
                 logger.info(
-                    f"Module: {module_name} doesn't have a customized version yet, using native version"
+                    f"Component: {component_name} doesn't have a customized version yet, using native version"
                 )
             else:
                 traceback.print_exc()
                 logger.error(
-                    f"Error while loading customized {module_name}, falling back to native version"
+                    f"Error while loading customized {component_name}, falling back to native version"
                 )
             # fallback to native version
             component = self.load_native(
@@ -117,13 +117,13 @@ class ComponentLoader(ABC):
             component = component.to(device=target_device)
             source = "native"
             logger.warning(
-                "Native module %s: %s is loaded, performance may be sub-optimal",
-                module_name,
+                "Native component %s: %s is loaded, performance may be sub-optimal",
+                component_name,
                 component.__class__.__name__,
             )
 
         if component is None:
-            logger.error("Load %s failed", module_name)
+            logger.error("Load %s failed", component_name)
             consumed = 0.0
         else:
             if isinstance(component, nn.Module):
@@ -134,7 +134,7 @@ class ComponentLoader(ABC):
                 consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
                 f"Loaded %s: %s ({source} version). model size: %.2f GB, avail mem: %.2f GB",
-                module_name,
+                component_name,
                 component.__class__.__name__,
                 consumed,
                 current_gpu_mem,
@@ -176,7 +176,7 @@ class ComponentLoader(ABC):
             raise ValueError(f"Unsupported library: {transformers_or_diffusers}")
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """
         Load the customized version component, implemented and optimized in SGL-diffusion
@@ -203,33 +203,33 @@ class ComponentLoader(ABC):
             try:
                 importlib.import_module(f".{name}", package=package_name)
             except ImportError as e:
-                logger.warning(f"Failed to import loader module {name}: {e}")
+                logger.warning(f"Failed to import loader component {name}: {e}")
 
         cls._loaders_registered = True
 
     @classmethod
-    def for_module_type(
-        cls, module_type: str, transformers_or_diffusers: str
+    def for_component_type(
+        cls, component_type: str, transformers_or_diffusers: str
     ) -> "ComponentLoader":
         """
-        Factory method to create a component loader for a specific module type.
+        Factory method to create a component loader for a specific component type.
 
         Args:
-            module_type: Type of module (e.g., "vae", "text_encoder", "transformer", "scheduler")
-            transformers_or_diffusers: Whether the module is from transformers or diffusers
+            component_type: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            transformers_or_diffusers: Whether the component is from transformers or diffusers
         """
         cls._ensure_loaders_registered()
 
-        # Map of module types to their loader classes and expected library
-        module_type = _normalize_module_type(module_type)
+        # Map of component types to their loader classes and expected library
+        component_type = _normalize_component_type(component_type)
 
         # NOTE(FlamingoPg): special for LTX-2 models
-        if module_type == "vocoder" or module_type == "connectors":
+        if component_type == "vocoder" or component_type == "connectors":
             transformers_or_diffusers = "diffusers"
 
         # NOTE(CloudRipple): special for MOVA models
         # TODO(CloudRipple): remove most of these special cases after unifying the loading logic
-        if module_type in [
+        if component_type in [
             "audio_vae",
             "audio_dit",
             "dual_tower_bridge",
@@ -238,24 +238,24 @@ class ComponentLoader(ABC):
             transformers_or_diffusers = "diffusers"
 
         if (
-            module_type == "scheduler"
+            component_type == "scheduler"
             and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
         ):
             transformers_or_diffusers = "diffusers"
 
-        if module_type in component_name_to_loader_cls:
-            loader_cls = component_name_to_loader_cls[module_type]
+        if component_type in component_name_to_loader_cls:
+            loader_cls = component_name_to_loader_cls[component_type]
             expected_library = loader_cls_to_expected_library[loader_cls]
-            # Assert that the library matches what's expected for this module type
+            # Assert that the library matches what's expected for this component type
             assert (
                 transformers_or_diffusers == expected_library
-            ), f"{module_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            ), f"{component_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             return loader_cls()
 
-        # For unknown module types, use a generic loader
+        # For unknown component types, use a generic loader
         logger.warning(
-            "No specific loader found for module type: %s. Using generic loader.",
-            module_type,
+            "No specific loader found for component type: %s. Using generic loader.",
+            component_type,
         )
         return GenericComponentLoader(transformers_or_diffusers)
 
@@ -263,11 +263,11 @@ class ComponentLoader(ABC):
 class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
-    module_names = ["image_processor"]
+    component_names = ["image_processor"]
     library = "transformers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
         return AutoImageProcessor.from_pretrained(component_model_path, use_fast=True)
 
@@ -275,8 +275,11 @@ class ImageProcessorLoader(ComponentLoader):
 class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
+    component_names = ["processor"]
+    expected_library = "transformers"
+
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
         return AutoProcessor.from_pretrained(component_model_path)
 
@@ -284,11 +287,11 @@ class AutoProcessorLoader(ComponentLoader):
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
-    module_names = ["tokenizer"]
+    component_names = ["tokenizer"]
     library = "transformers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ) -> Any:
         return AutoTokenizer.from_pretrained(
             component_model_path,
@@ -310,35 +313,37 @@ class PipelineComponentLoader:
     """
 
     @staticmethod
-    def load_module(
-        module_name: str,
+    def load_component(
+        component_name: str,
         component_model_path: str,
         transformers_or_diffusers: str,
         server_args: ServerArgs,
     ):
         """
-        Load a pipeline module.
+        Load a pipeline component.
 
         Args:
-            module_name: Name of the module (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            component_name: Name of the component (e.g., "vae", "text_encoder", "transformer", "scheduler")
             component_model_path: Path to the component model
-            transformers_or_diffusers: Whether the module is from transformers or diffusers
+            transformers_or_diffusers: Whether the component is from transformers or diffusers
 
         """
 
-        # Get the appropriate loader for this module type
-        loader = ComponentLoader.for_module_type(module_name, transformers_or_diffusers)
+        # Get the appropriate loader for this component type
+        loader = ComponentLoader.for_component_type(
+            component_name, transformers_or_diffusers
+        )
 
         try:
-            # Load the module
+            # Load the component
             return loader.load(
                 component_model_path,
                 server_args,
-                module_name,
+                component_name,
                 transformers_or_diffusers,
             )
         except Exception as e:
             logger.error(
-                f"Error while loading component: {module_name}, {component_model_path=}"
+                f"Error while loading component: {component_name}, {component_model_path=}"
             )
             raise e

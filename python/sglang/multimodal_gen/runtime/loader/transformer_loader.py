@@ -8,7 +8,7 @@ from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoade
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
-    _normalize_module_type,
+    _normalize_component_type,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -24,11 +24,11 @@ logger = init_logger(__name__)
 class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
-    module_names = ["transformer", "audio_dit", "video_dit"]
+    component_names = ["transformer", "audio_dit", "video_dit"]
     library = "diffusers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -40,15 +40,15 @@ class TransformerLoader(ComponentLoader):
                 "Only diffusers format is supported."
             )
 
-        module_name = _normalize_module_type(module_name)
-        server_args.model_paths[module_name] = component_model_path
+        component_name = _normalize_component_type(component_name)
+        server_args.model_paths[component_name] = component_model_path
 
-        if module_name in ("transformer", "video_dit"):
+        if component_name in ("transformer", "video_dit"):
             pipeline_dit_config_attr = "dit_config"
-        elif module_name in ("audio_dit",):
+        elif component_name in ("audio_dit",):
             pipeline_dit_config_attr = "audio_dit_config"
         else:
-            raise ValueError(f"Invalid module name: {module_name}")
+            raise ValueError(f"Invalid module name: {component_name}")
         # Config from Diffusers supersedes sgl_diffusion's model config
         dit_config = getattr(server_args.pipeline_config, pipeline_dit_config_attr)
         dit_config.update_model_arch(config)

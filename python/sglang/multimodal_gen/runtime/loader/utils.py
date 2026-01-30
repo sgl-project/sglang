@@ -121,7 +121,7 @@ class skip_init_modules:
             cls.reset_parameters = orig
 
 
-def _normalize_module_type(module_type: str) -> str:
+def _normalize_component_type(module_type: str) -> str:
     """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
     if module_type.endswith("_2"):
         return module_type[:-2]

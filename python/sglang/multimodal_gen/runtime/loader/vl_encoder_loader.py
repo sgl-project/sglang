@@ -9,7 +9,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 class VisionLanguageEncoderLoader(ComponentLoader):
     """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
 
-    module_names = ["vision_language_encoder"]
+    component_names = ["vision_language_encoder"]
     library = "transformers"
 
     def load_customized(

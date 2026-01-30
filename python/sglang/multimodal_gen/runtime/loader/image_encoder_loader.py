@@ -12,7 +12,7 @@ logger = init_logger(__name__)
 
 class ImageEncoderLoader(TextEncoderLoader):
 
-    module_names = ["image_encoder"]
+    component_names = ["image_encoder"]
     library = "transformers"
 
     def should_offload(self, server_args, model_config: ModelConfig | None = None):

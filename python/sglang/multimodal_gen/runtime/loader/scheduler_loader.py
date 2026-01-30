@@ -12,7 +12,7 @@ logger = init_logger(__name__)
 class SchedulerLoader(ComponentLoader):
     """Loader for scheduler."""
 
-    module_names = ["scheduler"]
+    component_names = ["scheduler"]
     library = "diffusers"
 
     def load_customized(

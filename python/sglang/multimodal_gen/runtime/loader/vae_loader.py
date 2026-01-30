@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
-    module_names = ["vae", "audio_vae"]
+    component_names = ["vae", "audio_vae"]
     library = "diffusers"
 
     def should_offload(
@@ -33,7 +33,7 @@ class VAELoader(ComponentLoader):
         return server_args.vae_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
@@ -42,17 +42,19 @@ class VAELoader(ComponentLoader):
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
 
-        server_args.model_paths[module_name] = component_model_path
+        server_args.model_paths[component_name] = component_model_path
 
         logger.debug("HF model config: %s", config)
-        if module_name in ("vae", "video_vae"):
+        if component_name in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
             pipeline_vae_precision = "vae_precision"
-        elif module_name in ("audio_vae",):
+        elif component_name in ("audio_vae",):
             pipeline_vae_config_attr = "audio_vae_config"
             pipeline_vae_precision = "audio_vae_precision"
         else:
-            raise ValueError(f"Unsupported module name for VAE loader: {module_name}")
+            raise ValueError(
+                f"Unsupported module name for VAE loader: {component_name}"
+            )
         vae_config = getattr(server_args.pipeline_config, pipeline_vae_config_attr)
         vae_precision = getattr(server_args.pipeline_config, pipeline_vae_precision)
         vae_config.update_model_arch(config)

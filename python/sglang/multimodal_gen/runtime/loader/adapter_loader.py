@@ -23,7 +23,7 @@ class AdapterLoader(ComponentLoader):
     2) Loads a single safetensors state_dict.
     """
 
-    module_names = ["connectors"]
+    component_names = ["connectors"]
     library = "diffusers"
 
     def load_customized(

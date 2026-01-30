@@ -22,12 +22,12 @@ class BridgeLoader(ComponentLoader):
 
     pipeline_bridge_config_attr: str = "bridge_config"
 
-    module_names = ["dual_tower_bridge"]
+    component_names = ["dual_tower_bridge"]
 
     library = "diffusers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
@@ -37,7 +37,7 @@ class BridgeLoader(ComponentLoader):
                 "Model config does not contain a _class_name attribute. "
                 "Only diffusers format is supported."
             )
-        server_args.model_paths[module_name] = component_model_path
+        server_args.model_paths[component_name] = component_model_path
 
         # Try to get bridge config from pipeline config, fallback to creating one
         bridge_config = getattr(

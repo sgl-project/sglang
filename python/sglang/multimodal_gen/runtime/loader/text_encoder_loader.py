@@ -45,7 +45,7 @@ logger = init_logger(__name__)
 class TextEncoderLoader(ComponentLoader):
     """Loader for text encoders."""
 
-    module_names = ["text_encoder"]
+    component_names = ["text_encoder"]
     library = "transformers"
 
     @dataclasses.dataclass
@@ -168,7 +168,7 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(source, to_cpu)
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
+        self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -188,7 +188,7 @@ class TextEncoderLoader(ComponentLoader):
             return "2" in module_name
 
         # TODO(mick): had to throw an exception for different text-encoder arch
-        if not is_not_first_encoder(module_name):
+        if not is_not_first_encoder(component_name):
             encoder_config = server_args.pipeline_config.text_encoder_configs[0]
             encoder_config.update_model_arch(model_config)
             for key, value in diffusers_pretrained_config.__dict__.items():
