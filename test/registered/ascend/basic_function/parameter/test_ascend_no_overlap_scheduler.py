@@ -1,7 +1,7 @@
 import unittest
 
-from sglang.test.test_utils import CustomTestCase, run_mmlu_test
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase, run_mmlu_test
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 

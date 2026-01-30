@@ -17,7 +17,6 @@ import os
 import random
 import unittest
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -57,6 +56,7 @@ class TestOriginalLogprob(unittest.TestCase):
     [Test Category] Parameter
     [Test Target] SGLANG_RETURN_ORIGINAL_LOGPROB
     """
+
     def setUp(self):
         # ----- HF side (float32 weights) -----
         self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="right")
@@ -147,7 +147,6 @@ class TestOriginalLogprob(unittest.TestCase):
                     attention_backend="ascend",
                     disable_cuda_graph=True,
                 )
-
 
                 for prompt in PROMPTS:
                     random_token_ids = sorted(

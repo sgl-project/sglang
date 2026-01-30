@@ -4,6 +4,7 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,7 +12,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -19,9 +20,9 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestLogLevel(CustomTestCase):
     """Testcase：Verify set log-level parameter, the printed log level is the same as the configured log level and the inference request is successfully processed.
 
-       [Test Category] Parameter
-       [Test Target] --log-level
-       """
+    [Test Category] Parameter
+    [Test Target] --log-level
+    """
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
     OUT_LOG_PATH = "./out_log.txt"
     ERR_LOG_PATH = "./err_log.txt"
@@ -63,8 +64,10 @@ class TestLogLevel(CustomTestCase):
     def test_log_level(self):
         # Verify set --log-level=warning and not set --log-level-http, logs print only warning level (no HTTP info)
         other_args = [
-            "--log-level", "warning",
-            "--attention-backend", "ascend",
+            "--log-level",
+            "warning",
+            "--attention-backend",
+            "ascend",
             "--disable-cuda-graph",
         ]
         log_content = self._launch_server_and_run_infer(other_args)
@@ -73,9 +76,12 @@ class TestLogLevel(CustomTestCase):
     def test_log_http_level(self):
         # Verify set --log-level=warning and set --log-level-http=info, log level print http info
         other_args = [
-            "--log-level", "warning",
-            "--log-level-http", "info",
-            "--attention-backend", "ascend",
+            "--log-level",
+            "warning",
+            "--log-level-http",
+            "info",
+            "--attention-backend",
+            "ascend",
             "--disable-cuda-graph",
         ]
         log_content = self._launch_server_and_run_infer(other_args)

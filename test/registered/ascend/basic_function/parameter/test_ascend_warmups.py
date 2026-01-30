@@ -3,14 +3,14 @@ import unittest
 
 import requests
 
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import MINICPM_O_2_6_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ascend.test_ascend_utils import MINICPM_O_2_6_WEIGHTS_PATH
 
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
@@ -21,22 +21,23 @@ class TestAscendWarmups(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --warmups
     """
+
     model = MINICPM_O_2_6_WEIGHTS_PATH
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
         other_args = [
-                "--trust-remote-code",
-                "--warmups",
-                "voice_chat",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
+            "--trust-remote-code",
+            "--warmups",
+            "voice_chat",
+            "--tp-size",
+            "4",
+            "--mem-fraction-static",
+            "0.8",
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
         ]
         cls.out_log_file = open("./out_log.txt", "w+", encoding="utf-8")
         cls.err_log_file = open("./err_log.txt", "w+", encoding="utf-8")

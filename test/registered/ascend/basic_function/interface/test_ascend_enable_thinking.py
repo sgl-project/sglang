@@ -1,10 +1,10 @@
 import json
 import unittest
 
-import openai
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,9 +12,10 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
+
 
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+
 
 class TestEnableThinking(CustomTestCase):
     """Testcase: Testing with the 'enable_thinking' feature enabled/disabled,
@@ -29,8 +30,7 @@ class TestEnableThinking(CustomTestCase):
         cls.model = QWEN3_30B_A3B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
-        cls.other_args = (
-            [
+        cls.other_args = [
                 "--reasoning-parser",
                 "qwen3",
                 "--attention-backend",
@@ -40,8 +40,7 @@ class TestEnableThinking(CustomTestCase):
                 0.95,
                 "--tp",
                 2,
-            ]
-        )
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -193,6 +192,7 @@ class TestEnableThinking(CustomTestCase):
         self.assertTrue(
             has_content, "The stream response does not contain normal content"
         )
+
 
 if __name__ == "__main__":
     unittest.main()
