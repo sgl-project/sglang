@@ -25,7 +25,7 @@ class Hunyuan3DSamplingParams(SamplingParams):
 
     # Output format
     output_type: str = "trimesh"  # "trimesh" | "latent"
-    output_format: str = "glb"  # "obj" | "glb"
+    output_format: str = "obj"  # "obj" | "glb"
 
     # Paint parameters (when enabled)
     paint_enable: bool = False
