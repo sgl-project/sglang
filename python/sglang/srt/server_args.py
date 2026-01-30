@@ -62,6 +62,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    torch_release,
     wait_port_available,
     xpu_has_xmx_support,
 )
@@ -93,6 +94,7 @@ LOAD_FORMAT_CHOICES = [
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",
+    "mxfp8",
     "gptq",
     "marlin",
     "gptq_marlin",
@@ -143,7 +145,7 @@ ATTENTION_BACKEND_CHOICES = [
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
-DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
+DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
@@ -848,9 +850,14 @@ class ServerArgs:
             if not os.path.exists(self.model_path):
                 from modelscope import snapshot_download
 
-                self.model_path = snapshot_download(self.model_path)
+                self.model_path = snapshot_download(
+                    self.model_path, cache_dir=self.download_dir, revision=self.revision
+                )
                 self.tokenizer_path = snapshot_download(
-                    self.tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                    self.tokenizer_path,
+                    cache_dir=self.download_dir,
+                    revision=self.revision,
+                    ignore_patterns=["*.bin", "*.safetensors"],
                 )
 
         # Mamba scheduler strategy
@@ -1101,7 +1108,7 @@ class ServerArgs:
             list(range(4, 33, 4))
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
-            + list(range(640, 1024 + 1, 64))
+            + list(range(576, 1024 + 1, 64))
             + list(range(1280, 4096 + 1, 256))
             + list(range(4608, self.piecewise_cuda_graph_max_tokens + 1, 512))
         )
@@ -1358,6 +1365,13 @@ class ServerArgs:
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
+                elif (
+                    is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+                ) and is_mxfp4_quant_format:
+                    self.moe_runner_backend = "auto"
+                    logger.warning(
+                        "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
+                    )
                 elif self.ep_size == 1 and is_triton_kernels_available():
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
@@ -1432,15 +1446,17 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch in ["Exaone4ForCausalLM"]:
+        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
-                # https://docs.sglang.ai/advanced_features/attention_backend.html
-                assert self.attention_backend in {
-                    "fa3",
-                    "triton",
-                    "trtllm_mha",
-                }, "fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+                logger.warning(
+                    f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
+                )
                 self.disable_hybrid_swa_memory = True
+                # https://docs.sglang.ai/advanced_features/attention_backend.html
+                accepted_backends = ["fa3", "triton", "trtllm_mha"]
+                assert (
+                    self.attention_backend in accepted_backends
+                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
@@ -2006,6 +2022,14 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.quantization == "mxfp8":
+            if self.moe_runner_backend not in ["auto", "cutlass"]:
+                logger.warning(
+                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    f"Overriding {self.moe_runner_backend!r}."
+                )
+            self.moe_runner_backend = "cutlass"
+
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -2034,14 +2058,18 @@ class ServerArgs:
             logger.warning(
                 "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
             )
-            assert (
-                self.quantization == "fp8"
-            ), "cutlass MoE is only supported with fp8 quantization"
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
             self.moe_runner_backend = "cutlass"
-        if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
+        if self.moe_runner_backend == "cutlass" and self.quantization in [
+            "fp8",
+            "mxfp8",
+        ]:
             assert (
                 self.ep_size == 1
-            ), "FP8 Cutlass MoE is only supported with ep_size == 1"
+            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
@@ -4958,10 +4986,7 @@ class ServerArgs:
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch
 
-            parts = torch.__version__.split("+", 1)[0].split(".")
-            major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            if (major, minor) > (2, 6):
+            if torch_release >= (2, 7):
                 logger.warning(
                     "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
                     f"  Current torch version is {torch.__version__}.\n"
@@ -5029,8 +5054,7 @@ class ServerArgs:
         if self.get_model_config().is_multimodal:
             import torch
 
-            torch_version = torch.__version__.split("+", 1)[0]
-            if torch_version == "2.9.1":
+            if torch_release[:3] == (2, 9, 1):
                 cudnn_version = None
                 try:
                     cudnn_version = torch.backends.cudnn.version()
