@@ -33,18 +33,33 @@ class QuarkConfig(QuantizationConfig):
 
     def __init__(
         self,
-        quant_config: dict[str, Any],
+        quant_config: Optional[dict[str, Any]] = None,
         kv_cache_group: Optional[list[str]] = None,
         kv_cache_config: Optional[dict[str, Any]] = None,
         pack_method: str = "reorder",
+        is_prequantized: bool = False,
+        online_scheme: Optional[str] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
             kv_cache_group = []
+
+        # If online_scheme is specified, create synthetic config for online quantization
+        if online_scheme is not None:
+            if online_scheme == "quark_mxfp4":
+                quant_config = self._create_online_mxfp4_config()
+                is_prequantized = False
+            else:
+                raise ValueError(f"Unsupported online_scheme: {online_scheme}")
+
+        if quant_config is None:
+            raise ValueError("Either quant_config or online_scheme must be provided")
+
         self.quant_config = quant_config
         self.kv_cache_group = kv_cache_group
         self.kv_cache_config = kv_cache_config
         self.pack_method = pack_method
+        self.is_prequantized = is_prequantized
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
 
@@ -156,11 +171,49 @@ class QuarkConfig(QuantizationConfig):
             kv_cache_group=kv_cache_group,
             kv_cache_config=kv_cache_config,
             pack_method=pack_method,
+            is_prequantized=True,
         )
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
         return []
+
+    @staticmethod
+    def _create_online_mxfp4_config() -> dict[str, Any]:
+        """
+        Create a synthetic quant_config for online MXFP4 quantization.
+        """
+        return {
+            "packed_modules_mapping": {
+                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                "gate_up_proj": ["gate_proj", "up_proj"],
+            },
+            "exclude": [],
+            "global_quant_config": {
+                "weight": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": False,
+                    "scale_format": "e8m0",
+                },
+                "input_tensors": {
+                    "dtype": "fp4",
+                    "qscheme": "per_group",
+                    "group_size": 32,
+                    "is_dynamic": True,
+                    "scale_format": "e8m0",
+                },
+                "output_tensors": None,
+                "bias": None,
+            },
+            "layer_quant_config": {},
+            "layer_type_quant_config": {},
+            "export": {
+                "kv_cache_group": [],
+                "pack_method": "reorder",
+            },
+        }
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
         capability_tuple = get_device_capability()
@@ -318,7 +371,11 @@ class QuarkConfig(QuantizationConfig):
         input_config = cast(dict[str, Any], config.get("input_tensors"))
 
         if self._is_mx_fp4(weight_config, input_config):
-            return QuarkW4A4MXFP4(weight_config, input_config)
+            return QuarkW4A4MXFP4(
+                weight_config,
+                input_config,
+                is_checkpoint_mxfp4_serialized=self.is_prequantized,
+            )
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False

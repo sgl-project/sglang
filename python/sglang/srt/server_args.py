@@ -111,9 +111,19 @@ QUANTIZATION_CHOICES = [
     "qoq",
     "w4afp8",
     "mxfp4",
+    "quark_mxfp4",
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark_int4fp8_moe",
+]
+
+# TODO: prune the one above
+ONLINE_QUANTIZATION = [
+    "fp8",
+    "mxfp8",
+    "mxfp4",  # supports only MOE
+    "quark_mxfp4",
     "quark_int4fp8_moe",
 ]
 
