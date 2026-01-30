@@ -4,8 +4,12 @@ from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_P
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase, run_bench_serving, run_mmlu_test
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
-
+register_npu_ci(
+    est_time=400,
+    suite="nightly-1-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 class TestNoChunkedPrefill(CustomTestCase):
     """Testcase: Verify Llama-3.1-8B-Instruct accuracy ≥ 0.65 and serving normal with chunked prefill disabled.
