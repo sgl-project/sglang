@@ -274,8 +274,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context = SimpleContext()
 
                     # Create GenerateReqInput for SGLang
+                    # Use "text" for string prompts (multimodal models),
+                    # "input_ids" for token ID lists (text-only models).
+                    if isinstance(engine_prompt, str):
+                        prompt_kwargs = {"text": engine_prompt}
+                    else:
+                        prompt_kwargs = {"input_ids": engine_prompt}
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
