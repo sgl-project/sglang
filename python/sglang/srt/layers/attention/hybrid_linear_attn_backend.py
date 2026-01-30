@@ -926,8 +926,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Check if SSM states use K-last layout (HV, V, K) for MTP kernel optimization
         # Priority: server_args > model config
         self.ssm_k_last = get_global_server_args().mamba_ssm_k_last
-        # Cache for has_prefix_cache to avoid repeated GPU->CPU sync
-        self._cached_has_prefix_cache = False
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
@@ -943,16 +941,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 GDNAttnBackend._k_last_decode_warning_shown = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Override to pre-compute has_prefix_cache, avoiding GPU-CPU sync in forward_extend."""
+        """Override to initialize forward metadata for GDN backend."""
         super().init_forward_metadata(forward_batch)
-        # Pre-compute has_prefix_cache only for K-last extend mode (not target_verify)
-        if (self.ssm_k_last 
-            and forward_batch.forward_mode.is_extend() 
-            and not forward_batch.forward_mode.is_target_verify()):
-            # This .item() call happens once per batch in init, not per layer in forward
-            self._cached_has_prefix_cache = (forward_batch.extend_prefix_lens > 0).any().item()
-        else:
-            self._cached_has_prefix_cache = False
 
     def forward_decode(
         self,
@@ -1410,26 +1400,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # K-last layout [V, K] (transpose of the FLA Triton kernel state [K, V]).
                 # This matches our mamba pool layout when `ssm_k_last=True`, so we must
                 # NOT transpose the state for FlashInfer.
-                batch_size = cache_indices.shape[0]
                 total_seq_len = query.shape[1]  # query is [1, total_seq_len, H, K]
-                
-                # Check if cache_indices is contiguous to avoid unnecessary copies
-                cache_indices_contiguous = (
-                    batch_size > 0
-                    and torch.equal(
-                        cache_indices,
-                        torch.arange(
-                            batch_size,
-                            device=cache_indices.device,
-                            dtype=cache_indices.dtype,
-                        ),
-                    )
-                )
-
-                # We can avoid state gather/scatter only when:
-                # - the pool state is already float32 (FlashInfer requires float32 state)
-                # - cache_indices are exactly [0, 1, ..., batch_size-1] (so [:batch_size] matches)
-                use_inplace_state = cache_indices_contiguous and ssm_states.dtype == torch.float32
                 
                 # Format conversion: SGLang -> FlashInfer
                 # q/k/v: [1, total_seq_len, H, K] -> [total_seq_len, H, K]
@@ -1460,12 +1431,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 # Prepare initial_state/output_state (FlashInfer requires float32 state).
                 # In K-last mode, ssm_states is already laid out as [V, K] for FlashInfer.
-                if use_inplace_state:
-                    initial_state_fi = ssm_states[:batch_size]
-                    output_state_fi = initial_state_fi  # in-place update is supported
-                else:
-                    initial_state_fi = ssm_states[cache_indices].to(torch.float32)
-                    output_state_fi = initial_state_fi  # in-place update is supported
+                # Always use gather/scatter to avoid GPU-CPU sync from torch.equal() check.
+                initial_state_fi = ssm_states[cache_indices].to(torch.float32)
+                output_state_fi = initial_state_fi  # in-place update is supported
                 
                 # Call FlashInfer prefill kernel
                 # Optional debug logging + NVTX marker for profiling.
@@ -1479,8 +1447,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                             f"layer_id={layer_id} "
                             f"num_q_heads={num_heads} num_v_heads={num_value_heads} "
                             f"head_k_dim={head_k_dim} head_v_dim={head_v_dim} "
-                            f"ssm_states_shape={tuple(ssm_states.shape)} "
-                            f"cache_indices_contiguous={cache_indices_contiguous}"
+                            f"ssm_states_shape={tuple(ssm_states.shape)}"
                         )
 
                 torch_profiler_ctx = (
@@ -1531,46 +1498,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     1, total_seq_len, num_value_heads, head_v_dim
                 )
 
-                # Write back state in pool layout (K-last) if we used a gathered buffer.
-                if not use_inplace_state:
-                    ssm_states[cache_indices] = output_state_fi_result.to(
-                        ssm_states.dtype, copy=False
-                    )
+                # Write back state to pool (K-last layout)
+                ssm_states[cache_indices] = output_state_fi_result.to(
+                    ssm_states.dtype, copy=False
+                )
 
                 # Return early: FlashInfer prefill path is complete
                 return core_attn_out
             
             elif self.ssm_k_last:
-                disable_k_last_inplace_transpose = (
-                    os.getenv("SGLANG_DISABLE_KLAST_INPLACE_TRANSPOSE", "0") == "1"
-                )
-                # has_prefix_cache is pre-computed in init_forward_metadata (no GPU-CPU sync here)
-                has_prefix_cache = self._cached_has_prefix_cache
-
-                # Only safe to use direct K-last buffer when K == V
-                kv_same = head_k_dim == head_v_dim
-                
-                if (not disable_k_last_inplace_transpose) and has_prefix_cache and kv_same:
-                    # Has prefix cache with K==V: use optimized in-place transpose
-                    # Convert K-last -> V-last in-place before kernel
-                    in_place_transpose_indexed(ssm_states, cache_indices)
-                    recurrent_state = ssm_states
-                    recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-                elif has_prefix_cache or not kv_same or disable_k_last_inplace_transpose:
-                    # Has prefix cache with K!=V, or need separate buffer
-                    # Fall back to copy-based approach
-                    batch_size = cache_indices.shape[0]
-                    ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
-                    recurrent_state = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
-                    sequential_indices = torch.arange(batch_size, device=cache_indices.device, dtype=cache_indices.dtype)
-                    recurrent_state_indices_args = {"initial_state_indices": sequential_indices}
-                else:
-                    # No prefix cache: still ensure correct layout for the kernel.
-                    # Pool slots may be reused (e.g., CUDA graph capture), so don't assume zeros.
-                    # Convert K-last -> V-last in-place before kernel, then transpose back after.
-                    in_place_transpose_indexed(ssm_states, cache_indices)
-                    recurrent_state = ssm_states  # Direct reference, no copy
-                    recurrent_state_indices_args = {"initial_state_indices": cache_indices}
+                # Triton prefill kernel fallback (V-last layout).
+                # Use copy-based approach: gather K-last -> transpose to V-last -> scatter back.
+                # This avoids GPU-CPU sync for prefix cache check.
+                batch_size = cache_indices.shape[0]
+                ssm_input = ssm_states[cache_indices]  # [batch, HV, V, K]
+                recurrent_state = ssm_input.transpose(-1, -2).contiguous()  # [batch, HV, K, V]
+                sequential_indices = torch.arange(batch_size, device=cache_indices.device, dtype=cache_indices.dtype)
+                recurrent_state_indices_args = {"initial_state_indices": sequential_indices}
             else:
                 recurrent_state = ssm_states
                 recurrent_state_indices_args = {"initial_state_indices": cache_indices}
@@ -1593,14 +1537,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             
             if self.ssm_k_last:
                 # V-last -> K-last: transpose kernel output back to pool layout
-                # Note: INPLACE_UPDATE=True in kernel, so recurrent_state is updated in-place
-                if recurrent_state is ssm_states:
-                    # Optimization path: kernel wrote directly to ssm_states with V-last semantics
-                    # Use optimized in-place transpose (4-5x faster than PyTorch ops)
-                    in_place_transpose_indexed(ssm_states, cache_indices)
-                else:
-                    # Standard path: recurrent_state is a separate V-last buffer
-                    ssm_states[cache_indices] = recurrent_state.to(ssm_states.dtype, copy=False).transpose(-1, -2)
+                # recurrent_state is a separate V-last buffer (copy-based approach)
+                ssm_states[cache_indices] = recurrent_state.to(ssm_states.dtype, copy=False).transpose(-1, -2)
             elif is_npu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
