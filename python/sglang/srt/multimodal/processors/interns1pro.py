@@ -2,7 +2,6 @@ import time
 from typing import List, Union
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.models.interns1_1 import InternS1_1_ForConditionalGeneration
 from sglang.srt.models.interns1pro import InternS1ProForConditionalGeneration
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
@@ -14,7 +13,6 @@ from sglang.utils import logger
 class InternS1_1ImageProcessor(QwenVLImageProcessor):
     models = [
         InternS1ProForConditionalGeneration,
-        InternS1_1_ForConditionalGeneration,
     ]
 
     def get_mm_data(self, prompt, embeddings, img_grid_thw):
