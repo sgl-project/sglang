@@ -5,9 +5,9 @@ import os
 from typing import Any, Dict, List, Optional
 
 import torch
+
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -21,7 +21,6 @@ from sglang.srt.layers.quantization.int8_kernel import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_device_name,
     is_cpu,
     is_cuda,
     is_hip,
@@ -55,9 +54,7 @@ def support_tensor_descriptor():
     return _support_tensor_descriptor
 
 
-# In theory, swap_ab should benefit all SM90 GPUs.
-# However, since it has only been verified on H20 (not H100/H200),
-# it is currently enabled only on H20.
+# swap_ab benefits SM90 GPUs (H20, H100, H200, etc.) for certain block shapes.
 @functools.lru_cache(maxsize=8)
 def should_enable_swap_ab(
     BLOCK_SIZE_M: int,
@@ -66,17 +63,7 @@ def should_enable_swap_ab(
     if not _is_cuda:
         return False
 
-    @functools.lru_cache(maxsize=1)
-    def is_h20_device_and_sm90_supported():
-        device_name = get_device_name()
-        is_h20_device = (
-            device_name and "H20" in device_name and "H200" not in device_name
-        )
-        return is_h20_device and is_sm90_supported()
-
-    return (
-        is_h20_device_and_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
-    )
+    return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
 
 
 @triton.jit
