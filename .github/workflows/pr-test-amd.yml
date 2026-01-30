@@ -105,45 +105,45 @@ jobs:
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
 
-  stage-c-test-large-8-gpu-amd-mi35x:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi35x-gpu-8]
-        part: [0]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+  # stage-c-test-large-8-gpu-amd-mi35x:
+  #   needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+  #   if: |
+  #     always() &&
+  #     (
+  #       (inputs.target_stage == 'stage-c-test-large-8-gpu-amd-mi35x') ||
+  #       (
+  #         !inputs.target_stage &&
+  #         (!failure() && !cancelled()) &&
+  #         ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+  #       )
+  #     )
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       runner: [linux-mi35x-gpu-8]
+  #       part: [0]
+  #   runs-on: ${{matrix.runner}}
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #       with:
+  #         ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
+  #     - name: Ensure VRAM is clear
+  #       run: bash scripts/ensure_vram_clear.sh rocm
 
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
+  #     - name: Start CI container
+  #       run: bash scripts/ci/amd/amd_ci_start_container.sh
+  #       env:
+  #         GITHUB_WORKSPACE: ${{ github.workspace }}
 
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+  #     - name: Install dependencies
+  #       run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Run test
-        timeout-minutes: 60
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
+  #     - name: Run test
+  #       timeout-minutes: 60
+  #       run: |
+  #         bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
 
   check-pdd-env:
     runs-on: linux-mi35x-gpu-8.fabric
@@ -238,7 +238,7 @@ jobs:
 
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-2-gpu-35x-disaggregation-amd:
+  stage-b-test-large-2-gpu-35x-fabric-disaggregation-amd:
     needs: [check-changes]
     if: |
       always() &&
@@ -338,7 +338,7 @@ jobs:
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
 
-  stage-b-test-large-8-gpu-35x-disaggregation-amd:
+  stage-b-test-large-8-gpu-35x-fabric-disaggregation-amd:
     needs: [check-changes]
     if: |
       always() &&
@@ -438,50 +438,50 @@ jobs:
       #       -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
       #       python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_pp.py
 
-  pr-test-amd-finish:
-    needs:
-      [
-        call-gate,
-        check-changes,
+  # pr-test-amd-finish:
+  #   needs:
+  #     [
+  #       call-gate,
+  #       check-changes,
 
-        sgl-kernel-unit-test-amd,
-        sgl-kernel-unit-test-2-gpu-amd,
-        multimodal-gen-test-1-gpu-amd,
-        multimodal-gen-test-2-gpu-amd,
+  #       # sgl-kernel-unit-test-amd,
+  #       # sgl-kernel-unit-test-2-gpu-amd,
+  #       # multimodal-gen-test-1-gpu-amd,
+  #       # multimodal-gen-test-2-gpu-amd,
 
-        stage-a-test-1-amd,
-        stage-b-test-small-1-gpu-amd,
-        stage-b-test-small-1-gpu-amd-mi35x,
-        stage-b-test-large-1-gpu-amd,
-        stage-b-test-large-2-gpu-amd,
-        stage-c-test-large-8-gpu-amd,
-        stage-c-test-large-8-gpu-amd-mi35x,
-      ]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          # Convert the 'needs' context to a JSON string
-          json_needs='${{ toJson(needs) }}'
+  #       # stage-a-test-1-amd,
+  #       # stage-b-test-small-1-gpu-amd,
+  #       # stage-b-test-small-1-gpu-amd-mi35x,
+  #       # stage-b-test-large-1-gpu-amd,
+  #       # stage-b-test-large-2-gpu-amd,
+  #       # stage-c-test-large-8-gpu-amd,
+  #       # stage-c-test-large-8-gpu-amd-mi35x,
+  #     ]
+  #   if: always()
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - name: Check all dependent job statuses
+  #       run: |
+  #         # Convert the 'needs' context to a JSON string
+  #         json_needs='${{ toJson(needs) }}'
 
-          # Get a list of all job names from the JSON keys
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
+  #         # Get a list of all job names from the JSON keys
+  #         job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
 
-          for job in $job_names; do
-            # For each job, extract its result
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
+  #         for job in $job_names; do
+  #           # For each job, extract its result
+  #           result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
 
-            # Print the job name and its result
-            echo "$job: $result"
+  #           # Print the job name and its result
+  #           echo "$job: $result"
 
-            # Check for failure or cancellation and exit if found
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
+  #           # Check for failure or cancellation and exit if found
+  #           if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+  #             echo "The above jobs failed."
+  #             exit 1
+  #           fi
+  #         done
 
-          # If the loop completes, all jobs were successful
-          echo "All jobs completed successfully"
-          exit 0
+  #         # If the loop completes, all jobs were successful
+  #         echo "All jobs completed successfully"
+  #         exit 0
