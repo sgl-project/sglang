@@ -61,7 +61,7 @@ class HpcOpsMoeQuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
-    block_shape: Optional[List[int]] = None
+    block_quant: Optional[List[int]] = None
     num_local_experts: Optional[int] = None
 
 
