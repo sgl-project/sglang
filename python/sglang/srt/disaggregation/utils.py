@@ -133,7 +133,7 @@ class MetadataBuffers:
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
             # Request validation: store bootstrap_room to detect metadata corruption
-            self.bootstrap_rooms = torch.zeros(
+            self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=torch.int64, device=device
             )
 
@@ -148,7 +148,7 @@ class MetadataBuffers:
             self.output_topk_p.data_ptr(),
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
-            self.bootstrap_rooms.data_ptr(),
+            self.bootstrap_room.data_ptr(),
         ]
         data_lens = [
             self.output_ids.nbytes,
@@ -160,7 +160,7 @@ class MetadataBuffers:
             self.output_topk_p.nbytes,
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
-            self.bootstrap_rooms.nbytes,
+            self.bootstrap_room.nbytes,
         ]
         item_lens = [
             self.output_ids[0].nbytes,
@@ -172,7 +172,7 @@ class MetadataBuffers:
             self.output_topk_p[0].nbytes,
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
-            self.bootstrap_rooms[0].nbytes,
+            self.bootstrap_room[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
 
@@ -187,7 +187,7 @@ class MetadataBuffers:
             self.output_topk_p[idx],
             self.output_topk_index[idx],
             self.output_hidden_states[idx],
-            self.bootstrap_rooms[idx],
+            self.bootstrap_room[idx],
         )
 
     def set_buf(self, req: Req):
@@ -230,7 +230,7 @@ class MetadataBuffers:
                 req.hidden_states_tensor
             )
         # Store bootstrap_room for validation on decode side
-        self.bootstrap_rooms[req.metadata_buffer_index, 0] = (
+        self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
 
