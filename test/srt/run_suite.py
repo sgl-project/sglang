@@ -36,6 +36,7 @@ suites = {
         TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_nvfp4_gemm.py", 360),
+        TestFile("test_deepseek_v32_fp4_4gpu.py", 600),
     ],
     # "per-commit-8-gpu-b200": [
     #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
@@ -63,6 +64,7 @@ suites = {
         TestFile(
             "models/test_qwen3_next_models_pcg.py"
         ),  # Disabled: intermittent failures, see #17039
+        TestFile("ep/test_moriep_small.py"),
     ],
 }
 
@@ -132,6 +134,7 @@ suite_xpu = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_ascend = {
     "per-commit-1-npu-a2": [
+        TestFile("ascend/test_ascend_gptq.py", 400),
         TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
         TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
         TestFile("ascend/test_ascend_hicache_mha.py", 400),

@@ -278,6 +278,11 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
 
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "GlmOcrForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "GlmOcrForConditionalGenerationNextN"
+
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "LongcatFlashForCausalLM"
@@ -935,7 +940,7 @@ class ModelConfig:
         needs_tf_v5 = is_glm_46vmoe
 
         tf_version = version.parse(tf_version_str)
-        required_version = version.parse("5.0.0")
+        required_version = version.parse("5.0.0dev0")
 
         if tf_version < required_version:
             if needs_tf_v5:
@@ -1045,7 +1050,12 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "dtype", None)
+    if isinstance(config, dict):
+        config_dtype = config.get("dtype", None) or config.get("torch_dtype", None)
+        model_type = config.get("model_type", "")
+    else:
+        config_dtype = getattr(config, "dtype", None)
+        model_type = getattr(config, "model_type", "")
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
@@ -1055,11 +1065,11 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type.startswith("gemma"):
-                    if config.model_type == "gemma":
+                if model_type.startswith("gemma"):
+                    if model_type == "gemma":
                         gemma_version = ""
                     else:
-                        gemma_version = config.model_type[5]
+                        gemma_version = model_type[5]
                     logger.info(
                         f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
@@ -1132,6 +1142,7 @@ multimodal_model_archs = [
     "Gemma3nForConditionalGeneration",
     "Glm4vForConditionalGeneration",
     "Glm4vMoeForConditionalGeneration",
+    "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
@@ -1141,6 +1152,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
