@@ -42,6 +42,7 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map: torch.Tensor  # (layers, num_logical_experts, X)
     logical_to_all_physical_map_cpu: torch.Tensor  # CPU copy for performance
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
+    logical_to_physical_probability: torch.Tensor  # (layers, num_logical_experts, X)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
 
@@ -268,6 +269,7 @@ class ExpertLocationMetadata:
             "logical_to_all_physical_map",
             "logical_to_all_physical_map_cpu",
             "logical_to_all_physical_map_num_valid",
+            "logical_to_physical_probability",
             "logical_to_rank_dispatch_physical_map",
         ]:
             other_field = getattr(other, field)
