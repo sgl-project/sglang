@@ -36,6 +36,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -227,6 +228,8 @@ def get_quant_config(
 
     # If the quantization config is not found, use the default config.
     if not possible_config_filenames:
+        if model_config.quantization == "mxfp8":
+            return Fp8Config(use_mxfp8=True, is_checkpoint_fp8_serialized=False)
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))

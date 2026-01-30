@@ -575,7 +575,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
-        if self.device == "cuda":
+        if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
@@ -732,6 +732,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
+        elif self.device == "musa":
+            backend = "mccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -1090,7 +1092,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args.load_format = load_format
         self.load_config = load_config
 
-        if recapture_cuda_graph and self.device == "cuda":
+        if recapture_cuda_graph and (self.device == "cuda" or self.device == "musa"):
             self.init_device_graphs()
 
         logger.info("Update weights end.")
