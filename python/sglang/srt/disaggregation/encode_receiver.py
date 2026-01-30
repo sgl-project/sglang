@@ -59,6 +59,7 @@ def _normalize_embedding_ports(embedding_port):
 
 
 def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
+    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
     channel = grpc.insecure_channel(target)
     stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
@@ -68,7 +69,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
                 receive_url=receive_url,
                 receive_count=receive_count,
             ),
-            timeout=60,
+            timeout=timeout_secs,
         )
     finally:
         channel.close()
