@@ -1774,14 +1774,16 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
 
-                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
+                k = forward_batch.token_to_kv_pool.get_key_buffer(
+                    self.attn_mqa.layer_id
+                )
+
+                q = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
                     k_nope,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
+                    k,
                     forward_batch.out_cache_loc,
                     positions,
                     cos,
@@ -1789,7 +1791,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     self.attn_mqa.k_scale,
                     self.rotary_emb.is_neox_style,
                     q_out_dtype=kv_cache_dtype,
-                )
+                )[0]
 
                 save_kv_cache = False
             else:
