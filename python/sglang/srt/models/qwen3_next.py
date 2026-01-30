@@ -366,10 +366,14 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
-            DUAL_STREAM_TOKEN_THRESHOLD = 0
-        else:
+        if (
+            not _is_npu
+            and self.alt_stream is not None
+            and not get_global_server_args().enable_piecewise_cuda_graph
+        ):
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        else:
+            DUAL_STREAM_TOKEN_THRESHOLD = 0
 
         seq_len, _ = hidden_states.shape
         if (
