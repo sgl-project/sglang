@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 _is_cuda = current_platform.is_cuda()
 
-if not current_platform.is_npu():
+if current_platform.is_cuda() or current_platform.is_hip():
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if current_platform.is_npu():
