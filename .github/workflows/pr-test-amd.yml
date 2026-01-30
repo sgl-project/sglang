@@ -722,7 +722,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
 
   check-pdd-env:
-    runs-on: linux-mi35x-gpu-8
+    runs-on: linux-mi35x-gpu-8.fabric
     steps:
       - name: Find RDMA in CI Runner
         run: |
@@ -829,7 +829,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-2]
+        runner: [linux-mi35x-gpu-8.fabric]
         part: [0]
 
     runs-on: ${{matrix.runner}}
@@ -929,7 +929,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8]
+        runner: [linux-mi35x-gpu-8.fabric]
         part: [0]
 
     runs-on: ${{matrix.runner}}
