@@ -507,6 +507,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
             )
             return StandardCombineInput(hidden_states=output)
 
