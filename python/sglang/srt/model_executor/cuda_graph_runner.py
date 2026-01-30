@@ -75,6 +75,9 @@ from sglang.srt.utils import (
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+# Graph Debug Utils
+from sglang.srt.utils.graph_debug_utils import gdebug
+
 try:
     from kt_kernel import KTMoEWrapper
 
@@ -552,6 +555,9 @@ class CudaGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
+        # Set capture phase for graph debugging
+        gdebug.set_phase("capture", batch_size=bs, token_step=0)
+
         buffers: GraphInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
@@ -780,6 +786,15 @@ class CudaGraphRunner:
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
+        # Set replay phase for graph debugging
+        # Infer token_step from seq_lens (increases after prefill)
+        token_step = (
+            forward_batch.seq_lens[0].item()
+            if forward_batch.seq_lens.numel() > 0
+            else 0
+        )
+        gdebug.set_phase("replay", batch_size=raw_bs, token_step=token_step)
+
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
@@ -860,6 +875,10 @@ class CudaGraphRunner:
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
+        
+        # Flush captured tensors to disk after graph replay
+        gdebug.flush()
+
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
