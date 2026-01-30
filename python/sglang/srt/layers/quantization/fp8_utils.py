@@ -1144,3 +1144,20 @@ def validate_fp8_block_shape(
                     f"{output_partition_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
+
+
+def pad_scale_last_dim(scale_inv: torch.Tensor, required_last_dim: int) -> torch.Tensor:
+    """Pad the last dimension of a 3D scale tensor to required_last_dim if needed."""
+    if scale_inv is None:
+        return scale_inv
+    _, _, last_dim = scale_inv.shape
+    if last_dim % 4 == 0 and last_dim >= required_last_dim:
+        return scale_inv
+    num_e, dim1, dim2 = scale_inv.shape
+    padded = torch.zeros(
+        (num_e, dim1, required_last_dim),
+        dtype=scale_inv.dtype,
+        device=scale_inv.device,
+    )
+    padded[:, :, :dim2] = scale_inv
+    return padded
