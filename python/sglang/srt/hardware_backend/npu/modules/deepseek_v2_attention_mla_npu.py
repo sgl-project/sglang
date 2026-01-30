@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.utils import get_bool_env_var
 
@@ -351,6 +351,13 @@ def forward_dsa_prepare_npu(
 
         # overlap qk norm
         q = m.q_a_layernorm(q)
+        if (
+            _use_ag_after_qlora
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            q = scattered_to_tp_attn_full(q, forward_batch)
+            latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
         q_lora = q.clone()  # required for topk_indices
         q_event = None
         if m.alt_stream is not None:
