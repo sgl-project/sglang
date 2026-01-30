@@ -15,7 +15,6 @@ logger = logging.getLogger(__name__)
 
 NVFP4_E2M1_MAX = 6.0
 NVFP4_FP8_E4M3_MAX = 448.0
-NVFP4_SCALE_DENOM = NVFP4_E2M1_MAX * NVFP4_FP8_E4M3_MAX
 
 
 class Fp4GemmRunnerBackend(Enum):
@@ -101,7 +100,19 @@ def nvfp4_compute_input_scale_and_inv(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.numel() == 0:
         input_scale = x.new_tensor(0.0, dtype=torch.float32)
-    else:
-        input_scale = x.abs().max().to(torch.float32) / NVFP4_SCALE_DENOM
-    input_scale_inv = torch.where(input_scale > 0, 1.0 / input_scale, input_scale)
+        input_scale_inv = x.new_tensor(0.0, dtype=torch.float32)
+        return input_scale, input_scale_inv
+
+    global_amax = x.abs().max().to(torch.float32)
+    global_encode_scale = torch.div(NVFP4_FP8_E4M3_MAX * NVFP4_E2M1_MAX, global_amax)
+    global_encode_scale = torch.clamp(
+        global_encode_scale, max=torch.finfo(torch.float32).max
+    )
+    global_encode_scale = torch.where(
+        global_encode_scale == 0.0, 1.0, global_encode_scale
+    )
+
+    global_decode_scale = torch.div(1.0, global_encode_scale)
+    input_scale = global_decode_scale
+    input_scale_inv = global_encode_scale
     return input_scale, input_scale_inv
