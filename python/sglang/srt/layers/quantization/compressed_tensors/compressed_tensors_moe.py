@@ -372,6 +372,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer.w13_input_scale_quant = torch.nn.Parameter(
             (w13_input_global_scale), requires_grad=False
         )
+        # Preallocate online-scale buffer to avoid cuda graph capture allocations.
+        layer.nvfp4_online_input_scale_inv = torch.empty_like(
+            layer.w13_input_scale_quant
+        )
 
         # w2
         if self.use_flashinfer_trtllm:
@@ -512,9 +516,13 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         g1_scale_c = layer.g1_scale_c
         if nvfp4_online_scale_enabled():
             input_scale, input_scale_inv_scalar = nvfp4_compute_input_scale_and_inv(x)
-            input_scale_inv = torch.full_like(
-                layer.w13_input_scale_quant, input_scale_inv_scalar
-            )
+            if hasattr(layer, "nvfp4_online_input_scale_inv"):
+                input_scale_inv = layer.nvfp4_online_input_scale_inv
+                input_scale_inv.copy_(input_scale_inv_scalar.expand_as(input_scale_inv))
+            else:
+                input_scale_inv = torch.full_like(
+                    layer.w13_input_scale_quant, input_scale_inv_scalar
+                )
             weight_scale_2 = layer.g1_alphas * layer.w13_input_scale_quant
             g1_alphas = input_scale * weight_scale_2
             w2_input_scale_quant = torch.where(

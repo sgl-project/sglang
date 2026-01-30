@@ -453,8 +453,20 @@ def cutlass_moe_fp4(
         orig_a1_gscale = a1_gscale
         orig_w1_alphas = w1_alphas
         input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(a)
-        a1_gscale = torch.full_like(orig_a1_gscale, input_scale_inv)
-        w1_alphas = input_scale * (orig_w1_alphas * orig_a1_gscale)
+        if hasattr(params, "online_a1_gscale"):
+            params.online_a1_gscale.copy_(
+                input_scale_inv.expand_as(params.online_a1_gscale)
+            )
+            a1_gscale = params.online_a1_gscale
+        else:
+            a1_gscale = torch.full_like(orig_a1_gscale, input_scale_inv)
+        if hasattr(params, "online_w1_alphas"):
+            params.online_w1_alphas.copy_(orig_w1_alphas)
+            params.online_w1_alphas.mul_(orig_a1_gscale)
+            params.online_w1_alphas.mul_(input_scale)
+            w1_alphas = params.online_w1_alphas
+        else:
+            w1_alphas = input_scale * (orig_w1_alphas * orig_a1_gscale)
 
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
         a,
@@ -486,8 +498,20 @@ def cutlass_moe_fp4(
         orig_a2_gscale = a2_gscale
         orig_w2_alphas = w2_alphas
         int_scale, int_scale_inv = nvfp4_compute_input_scale_and_inv(intermediate)
-        a2_gscale = torch.full_like(orig_a2_gscale, int_scale_inv)
-        w2_alphas = int_scale * (orig_w2_alphas * orig_a2_gscale)
+        if hasattr(params, "online_a2_gscale"):
+            params.online_a2_gscale.copy_(
+                int_scale_inv.expand_as(params.online_a2_gscale)
+            )
+            a2_gscale = params.online_a2_gscale
+        else:
+            a2_gscale = torch.full_like(orig_a2_gscale, int_scale_inv)
+        if hasattr(params, "online_w2_alphas"):
+            params.online_w2_alphas.copy_(orig_w2_alphas)
+            params.online_w2_alphas.mul_(orig_a2_gscale)
+            params.online_w2_alphas.mul_(int_scale)
+            w2_alphas = params.online_w2_alphas
+        else:
+            w2_alphas = int_scale * (orig_w2_alphas * orig_a2_gscale)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

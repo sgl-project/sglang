@@ -1647,6 +1647,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
 
+        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
+        layer.nvfp4_online_w13_input_scale_quant = torch.empty_like(
+            layer.w13_input_scale_quant
+        )
+        layer.nvfp4_online_g1_alphas = torch.empty_like(layer.g1_alphas)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
@@ -1698,17 +1704,29 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 if input_scale_inv is None:
                     _, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
-                w13_input_scale_quant = torch.full_like(
-                    layer.w13_input_scale_quant, input_scale_inv
-                )
+                if hasattr(layer, "nvfp4_online_w13_input_scale_quant"):
+                    w13_input_scale_quant = layer.nvfp4_online_w13_input_scale_quant
+                    w13_input_scale_quant.copy_(
+                        input_scale_inv.expand_as(w13_input_scale_quant)
+                    )
+                else:
+                    w13_input_scale_quant = torch.full_like(
+                        layer.w13_input_scale_quant, input_scale_inv
+                    )
                 input_scale = torch.where(
                     input_scale_inv > 0,
                     1.0 / input_scale_inv,
                     input_scale_inv,
                 )
-                g1_alphas = input_scale * (
-                    layer.g1_alphas * layer.w13_input_scale_quant
-                )
+                if hasattr(layer, "nvfp4_online_g1_alphas"):
+                    g1_alphas = layer.nvfp4_online_g1_alphas
+                    g1_alphas.copy_(layer.g1_alphas)
+                    g1_alphas.mul_(layer.w13_input_scale_quant)
+                    g1_alphas.mul_(input_scale)
+                else:
+                    g1_alphas = input_scale * (
+                        layer.g1_alphas * layer.w13_input_scale_quant
+                    )
 
             output_dtype = torch.bfloat16
 
