@@ -21,6 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         gpu_arch: ['gfx942', 'gfx950']
+        rocm_version: ['rocm700', 'rocm720']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -68,11 +69,20 @@ jobs:
           echo "Pretend version: ${pretend_version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-            rocm_tag="rocm700-mi30x"
+            rocm_tag="-mi30x"
           elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
-            rocm_tag="rocm700-mi35x"
+            rocm_tag="-mi35x"
           else
             echo "Unsupported gfx arch"
+            exit 1
+          fi
+
+          if [ "${{ matrix.rocm_version }}" = "rocm720" ]; then
+            rocm_tag="rocm720"${rocm_tag}
+          elif [ "${{ matrix.rocm_version }}" = "rocm700" ]; then
+            rocm_tag="rocm700"${rocm_tag}
+          else
+            echo "Unsupported ROCm version"
             exit 1
           fi
 

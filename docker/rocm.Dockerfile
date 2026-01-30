@@ -1,6 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.8-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.8-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
@@ -8,7 +10,9 @@
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -24,6 +28,16 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.9.post1"
 
 # ===============================
+# Base image 942 with rocm720 and args
+FROM $BASE_IMAGE_942_ROCM720 AS gfx942-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.9.post1"
+
+# ===============================
 # Base image 950 and args
 FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
@@ -32,6 +46,17 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.9.post1"
+
+# ===============================
+# Base image 950 with rocm720 and args
+FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT="v0.1.9.post1"
+
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -47,8 +72,8 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
-ARG TRITON_REPO="https://github.com/ROCm/triton.git"
-ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 
@@ -102,11 +127,34 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-RUN pip uninstall -y aiter
+RUN pip uninstall -y aiter \
+ && pip install psutil pybind11 # Required by AITER setup.py
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
+
+# Hot patches for AITER in v0.1.9.post1
+# This is for ROCm 7.2 only, because of the image rebase from vllm
+# to rocm/pytorch.
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
+        cd aiter \
+        && sed -i '290 s/64/128/' csrc/py_itfs_cu/asm_mla.cu \
+        && sed -i '292 s/qh64/qh16/' csrc/py_itfs_cu/asm_mla.cu \
+        && sed -i '293 s/qh64/qh16/' csrc/py_itfs_cu/asm_mla.cu \
+        && sed -i '326 s/64/128/' csrc/py_itfs_cu/asm_mla.cu \
+        && sed -i '328 s/qh64/qh16/' csrc/py_itfs_cu/asm_mla.cu \
+        && sed -i '329 s/qh64/qh16/' csrc/py_itfs_cu/asm_mla.cu \
+        && sed -i '460 s/if.*:/if False:/' aiter/ops/triton/pa_mqa_logits.py; \
+        ;; \
+      *) \
+        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
+        ;; \
+    esac
+
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
@@ -116,17 +164,6 @@ RUN cd aiter \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         fi
-
-# -----------------------
-# Triton (TODO: remove this after Triton is no longer needed)
-RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        pip uninstall -y triton \
-     && git clone ${TRITON_REPO} \
-     && cd triton \
-     && git checkout ${TRITON_COMMIT} \
-     && cd python \
-     && python setup.py install; \
-    fi
 
 # -----------------------
 # Build vLLM
@@ -305,7 +342,24 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # Python tools
 RUN python3 -m pip install --no-cache-dir \
     py-spy \
-    pre-commit
+    pre-commit \
+    tabulate
+
+# -----------------------
+# Triton
+# For ROCm 7.2, this custom build breaks pip dependency management,
+# so future `pip install` will break the ROCm stack.
+# A workaround for this is to reinstall the default triton
+# wheel with the `rocm/pytorch` image in the root directory.
+RUN if [ "$BUILD_TRITON" = "1" ]; then \
+        pip uninstall -y triton \
+     && apt install -y cmake \
+     && git clone ${TRITON_REPO} triton-custom \
+     && cd triton-custom \
+     && git checkout ${TRITON_COMMIT} \
+     && pip install -r python/requirements.txt \
+     && pip install -e .; \
+    fi
 
 # -----------------------
 # MORI (optional)
@@ -377,6 +431,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # -----------------------
 # Performance environment variable.
 
+# Skip CuDNN compatibility check - not applicable for ROCm (uses MIOpen instead)
+ENV SGLANG_DISABLE_CUDNN_CHECK=1
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
