@@ -284,6 +284,12 @@ class Envs:
     MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
+    
+    # SiMM
+    SGLANG_HICACHE_SIMM_CONFIG_PATH = EnvStr(None)
+    SIMM_CLUSTER_MANAGER = EnvStr(None)
+    SIMM_CLNT_THREADPOOL_SIZE = EnvInt(32)
+    SIMM_ENABLE_PROFILE = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
