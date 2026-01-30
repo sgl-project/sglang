@@ -919,6 +919,7 @@ class Glm4MoeModel(nn.Module):
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture = []
 
         self.layers_to_capture = []
 
@@ -957,6 +958,8 @@ class Glm4MoeModel(nn.Module):
 
         aux_hidden_states = []
         for i in range(normal_start_layer, normal_end_layer):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(hidden_states + residual)
