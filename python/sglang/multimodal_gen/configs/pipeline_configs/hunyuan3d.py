@@ -23,7 +23,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     # Shape model configuration
     shape_model_path: Optional[str] = None
 
-    shape_use_safetensors: bool = False
+    shape_use_safetensors: bool = True
     shape_variant: Optional[str] = "fp16"
     shape_num_inference_steps: int = 50
     shape_guidance_scale: float = 5.0
@@ -36,7 +36,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
 
     # VAE configuration
 
-    vae_enable_flashvdm: bool = True
+    vae_enable_flashvdm: bool = False
     vae_flashvdm_topk_mode: str = "mean"
 
     # Conditioner configuration
@@ -45,7 +45,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     conditioner_image_size: int = 518
 
     # Paint model configuration
-    paint_enable: bool = True
+    paint_enable: bool = False
     paint_model_path: Optional[str] = None
 
     paint_num_inference_steps: int = 15
@@ -60,12 +60,3 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
 
     # Output configuration
     output_format: str = "glb"  # 'obj' or 'glb'
-
-
-@dataclass
-class Hunyuan3D21PipelineConfig(Hunyuan3D2PipelineConfig):
-    """Pipeline configuration for Hunyuan3D-2.1."""
-
-    shape_subfolder: str = "hunyuan3d-dit-v2-1"
-    vae_subfolder: str = "hunyuan3d-vae-v2-1"
-    paint_subfolder: str = "hunyuan3d-paintpbr-v2-1"
