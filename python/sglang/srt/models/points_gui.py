@@ -28,7 +28,7 @@ class POINTSGUIModel(POINTSV15ChatModel):
         prefix: str = "",
         **kwargs
     ) -> None:
-        super().__init__()
+        super().__init__(config)
         config.llm_config._attn_implementation = "flash_attention_2"
         config._attn_implementation_autoset = False
         self.config = config
@@ -54,3 +54,6 @@ class POINTSGUIModel(POINTSV15ChatModel):
             quant_config=quant_config,
             prefix=add_prefix("vision_projector", prefix),
         )
+
+
+EntryClass = [POINTSGUIModel]
