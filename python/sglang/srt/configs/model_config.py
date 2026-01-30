@@ -893,9 +893,7 @@ class ModelConfig:
                 )
             if self.quantization not in optimized_quantization_methods:
                 # Don't warn for MXFP4 on SM100 since it has optimized kernels
-                if self.quantization == "mxfp4" and is_sm100_supported():
-                    pass
-                else:
+                if not (self.quantization == "mxfp4" and is_sm100_supported()):
                     logger.warning(
                         "%s quantization is not fully "
                         "optimized yet. The speed can be slower than "
