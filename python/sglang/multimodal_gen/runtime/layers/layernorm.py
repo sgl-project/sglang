@@ -29,7 +29,8 @@ _is_cuda = current_platform.is_cuda()
 
 if not current_platform.is_npu():
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
-else:
+
+if current_platform.is_npu():
     import torch_npu
 
 
