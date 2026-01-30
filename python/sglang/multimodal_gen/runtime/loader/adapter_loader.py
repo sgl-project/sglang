@@ -24,7 +24,7 @@ class AdapterLoader(ComponentLoader):
     """
 
     component_names = ["connectors"]
-    library = "diffusers"
+    expected_library = "diffusers"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args

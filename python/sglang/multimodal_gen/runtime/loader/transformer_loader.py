@@ -25,7 +25,7 @@ class TransformerLoader(ComponentLoader):
     """Shared loader for (video/audio) DiT transformers."""
 
     component_names = ["transformer", "audio_dit", "video_dit"]
-    library = "diffusers"
+    expected_library = "diffusers"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str

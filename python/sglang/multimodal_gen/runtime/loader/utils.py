@@ -165,8 +165,5 @@ def get_memory_usage_of_component(module) -> float | None:
     return round(usage, 2)
 
 
-# ComponentLoader class -> expected library
-loader_cls_to_expected_library: Dict[Type[Any], str] = {}
-
 # component name ->  ComponentLoader class
 component_name_to_loader_cls: Dict[str, Type[Any]] = {}

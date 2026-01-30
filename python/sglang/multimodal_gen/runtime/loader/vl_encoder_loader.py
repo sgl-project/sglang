@@ -10,7 +10,7 @@ class VisionLanguageEncoderLoader(ComponentLoader):
     """Loader for vision language encoder (typically Causal LM or Vision2Seq)."""
 
     component_names = ["vision_language_encoder"]
-    library = "transformers"
+    expected_library = "transformers"
 
     def load_customized(
         self,

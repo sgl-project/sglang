@@ -25,7 +25,7 @@ class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
     component_names = ["vae", "audio_vae"]
-    library = "diffusers"
+    expected_library = "diffusers"
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None

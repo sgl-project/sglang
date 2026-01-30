@@ -23,8 +23,7 @@ class BridgeLoader(ComponentLoader):
     pipeline_bridge_config_attr: str = "bridge_config"
 
     component_names = ["dual_tower_bridge"]
-
-    library = "diffusers"
+    expected_library = "diffusers"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str

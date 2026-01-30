@@ -20,7 +20,7 @@ logger = init_logger(__name__)
 
 class VocoderLoader(ComponentLoader):
     component_names = ["vocoder"]
-    library = "diffusers"
+    expected_library = "diffusers"
 
     def should_offload(
         self, server_args: ServerArgs, model_config: ModelConfig | None = None

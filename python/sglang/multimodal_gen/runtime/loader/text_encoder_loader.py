@@ -46,7 +46,7 @@ class TextEncoderLoader(ComponentLoader):
     """Loader for text encoders."""
 
     component_names = ["text_encoder"]
-    library = "transformers"
+    expected_library = "transformers"
 
     @dataclasses.dataclass
     class Source:

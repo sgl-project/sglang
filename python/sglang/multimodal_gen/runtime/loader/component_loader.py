@@ -7,7 +7,7 @@ import os
 import pkgutil
 import traceback
 from abc import ABC
-from typing import Any
+from typing import Any, Type
 
 import torch
 from diffusers import AutoModel
@@ -20,7 +20,6 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
     get_memory_usage_of_component,
-    loader_cls_to_expected_library,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -46,9 +45,6 @@ class ComponentLoader(ABC):
         register loaders, called when subclass is imported
         """
         super().__init_subclass__(**kwargs)
-        if cls.expected_library:
-            loader_cls_to_expected_library[cls] = cls.expected_library
-
         for component_name in cls.component_names:
             component_name_to_loader_cls[component_name] = cls
 
@@ -209,27 +205,27 @@ class ComponentLoader(ABC):
 
     @classmethod
     def for_component_type(
-        cls, component_type: str, transformers_or_diffusers: str
+        cls, component_name: str, transformers_or_diffusers: str
     ) -> "ComponentLoader":
         """
         Factory method to create a component loader for a specific component type.
 
         Args:
-            component_type: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
+            component_name: Type of component (e.g., "vae", "text_encoder", "transformer", "scheduler")
             transformers_or_diffusers: Whether the component is from transformers or diffusers
         """
         cls._ensure_loaders_registered()
 
         # Map of component types to their loader classes and expected library
-        component_type = _normalize_component_type(component_type)
+        component_name = _normalize_component_type(component_name)
 
         # NOTE(FlamingoPg): special for LTX-2 models
-        if component_type == "vocoder" or component_type == "connectors":
+        if component_name == "vocoder" or component_name == "connectors":
             transformers_or_diffusers = "diffusers"
 
         # NOTE(CloudRipple): special for MOVA models
         # TODO(CloudRipple): remove most of these special cases after unifying the loading logic
-        if component_type in [
+        if component_name in [
             "audio_vae",
             "audio_dit",
             "dual_tower_bridge",
@@ -238,24 +234,26 @@ class ComponentLoader(ABC):
             transformers_or_diffusers = "diffusers"
 
         if (
-            component_type == "scheduler"
+            component_name == "scheduler"
             and transformers_or_diffusers == "mova.diffusion.schedulers.flow_match_pair"
         ):
             transformers_or_diffusers = "diffusers"
 
-        if component_type in component_name_to_loader_cls:
-            loader_cls = component_name_to_loader_cls[component_type]
-            expected_library = loader_cls_to_expected_library[loader_cls]
+        if component_name in component_name_to_loader_cls:
+            loader_cls: Type[ComponentLoader] = component_name_to_loader_cls[
+                component_name
+            ]
+            expected_library = loader_cls.expected_library
             # Assert that the library matches what's expected for this component type
             assert (
                 transformers_or_diffusers == expected_library
-            ), f"{component_type} must be loaded from {expected_library}, got {transformers_or_diffusers}"
+            ), f"{component_name} must be loaded from {expected_library}, got {transformers_or_diffusers}"
             return loader_cls()
 
         # For unknown component types, use a generic loader
         logger.warning(
             "No specific loader found for component type: %s. Using generic loader.",
-            component_type,
+            component_name,
         )
         return GenericComponentLoader(transformers_or_diffusers)
 
@@ -264,7 +262,7 @@ class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
     component_names = ["image_processor"]
-    library = "transformers"
+    expected_library = "transformers"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -288,7 +286,7 @@ class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
 
     component_names = ["tokenizer"]
-    library = "transformers"
+    expected_library = "transformers"
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
