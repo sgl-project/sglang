@@ -41,6 +41,9 @@ ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
 
+# Version override for setuptools_scm (used in nightly builds)
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
 
@@ -157,6 +160,10 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
 # -----------------------
 # Build SGLang
 ARG BUILD_TYPE=all
+
+# Set version for setuptools_scm if provided (for nightly builds)
+ARG SETUPTOOLS_SCM_PRETEND_VERSION
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 
 RUN pip install IPython \
     && pip install orjson \
