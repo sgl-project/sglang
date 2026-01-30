@@ -1729,7 +1729,7 @@ def _validate_weights_after_download(
     return True
 
 
-def _get_lock_file_path(model_name_or_path: str, cache_dir: Optional[str]) -> str:
+def _get_lock_file_path(model_name_or_path: str) -> str:
     """
     Generate a unique lock file path for download coordination.
 
@@ -1739,16 +1739,19 @@ def _get_lock_file_path(model_name_or_path: str, cache_dir: Optional[str]) -> st
 
     Args:
         model_name_or_path: Model identifier
-        cache_dir: Cache directory (used in hash for uniqueness)
 
     Returns:
         Path to the lock file
     """
-    # Create a unique hash based on model name and cache dir
-    unique_key = f"{model_name_or_path}:{cache_dir or 'default'}"
-    key_hash = hashlib.sha256(unique_key.encode()).hexdigest()[:12]
+    # Create a unique hash based on model name only (not cache_dir)
+    # This ensures all processes coordinate on the same lock regardless of
+    # cache_dir configuration differences between processes
+    key_hash = hashlib.sha256(model_name_or_path.encode()).hexdigest()[:16]
 
-    # Try /dev/shm first (shared memory, always supports locking)
+    # Use /dev/shm (shared memory filesystem) for lock files because:
+    # 1. It's always local to the machine (not NFS)
+    # 2. It properly supports file locking
+    # 3. It's shared across all processes on the same machine
     # Fall back to /tmp if /dev/shm doesn't exist
     if os.path.isdir("/dev/shm"):
         return f"/dev/shm/sglang_download_lock_{key_hash}"
@@ -1804,7 +1807,7 @@ def ci_download_with_validation_and_retry(
 
     # Use file-based locking to serialize downloads across all processes
     # This prevents HF hub race conditions with .incomplete files
-    lock_file_path = _get_lock_file_path(model_name_or_path, cache_dir)
+    lock_file_path = _get_lock_file_path(model_name_or_path)
 
     # Log lock file path for debugging
     logger.info(
