@@ -55,6 +55,7 @@ CI_CRITICAL_MODELS = [
     # Qwen models
     "Qwen/Qwen2.5-1.5B-Instruct",
     "Qwen/Qwen2.5-7B-Instruct",
+    "Qwen/Qwen3-30B-A3B",  # Used in test_enable_thinking.py
     # Mistral/Mixtral
     "mistralai/Mistral-7B-Instruct-v0.3",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",  # Used in benchmark tests
