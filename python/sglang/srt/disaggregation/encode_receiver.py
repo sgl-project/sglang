@@ -60,7 +60,7 @@ def _normalize_embedding_ports(embedding_port):
 
 
 def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
-    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
+    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
     stub = SGLangEncoderStub(channel)
     try:
@@ -77,7 +77,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 
 
 def _grpc_encode_request(target, encode_request):
-    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
+    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
     stub = SGLangEncoderStub(channel)
     try:
@@ -100,7 +100,7 @@ def _grpc_encode_request(target, encode_request):
 
 
 def _grpc_send_request(target, request_json):
-    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
+    timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
     stub = SGLangEncoderStub(channel)
     try:
