@@ -91,7 +91,7 @@ def predownload_model(model_id: str) -> bool:
                 "*.txt",
             ],
             # Ignore large files that might not be needed
-            ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot", "consolidated*"],
+            ignore_patterns=["*.bin", "*.msgpack", "*.h5", "consolidated*"],
         )
 
         elapsed = time.time() - start
