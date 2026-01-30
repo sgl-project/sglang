@@ -232,6 +232,7 @@ def load_model_from_full_model_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
     for target_param_name, full_tensor in custom_param_sd.items():
+        print(target_param_name)
         meta_sharded_param = meta_sd.get(target_param_name)
         meta_sharded_param_dtype = meta_sharded_param.dtype
         if meta_sharded_param is None:
@@ -271,7 +272,7 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
-        sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
+        sharded_sd[target_param_name] = nn.Parameter(sharded_tensor, requires_grad=False)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
     unused_keys = set(meta_sd.keys()) - set(sharded_sd.keys())
