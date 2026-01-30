@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     rms_norm_fn,
     triton_one_pass_rms_norm,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
+_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
@@ -235,31 +238,6 @@ class LayerNorm(CustomOp):
         return s
 
 
-class ScaleResidual(nn.Module):
-    """
-    Applies gated residual connection.
-    """
-
-    def __init__(self, prefix: str = ""):
-        super().__init__()
-
-    def forward(
-        self, residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
-    ) -> torch.Tensor:
-        """Apply gated residual connection."""
-        # x.shape: [batch_size, seq_len, inner_dim]
-        if gate.dim() == 4:
-            # gate.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = gate.shape[1]
-            frame_seqlen = x.shape[1] // num_frames
-            return residual + (
-                x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
-            ).flatten(1, 2)
-        else:
-            # gate.shape: [batch_size, 1, inner_dim]
-            return residual + x * gate
-
-
 # adapted from Diffusers: https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/normalization.py
 # NOTE(will): Needed to match behavior of diffusers and wan2.1 even while using
 # FSDP's MixedPrecisionPolicy
@@ -453,7 +431,7 @@ def apply_qk_norm(
     k_eps = k_norm.variance_epsilon
     # Only try fused path on CUDA and when it won't introduce implicit copies.
     if (
-        q.is_cuda
+        _is_cuda
         and allow_inplace
         and (q_eps == k_eps)
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
@@ -468,13 +446,6 @@ def apply_qk_norm(
         )
         return q, k
 
-    # Fallback for AMD/ROCm: apply RMSNorm separately to q and k
-    import warnings
-
-    warnings.warn(
-        "Fused QK-norm not available, using RMSNorm fallback",
-        stacklevel=2,
-    )
     q_shape = q.shape
     k_shape = k.shape
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)

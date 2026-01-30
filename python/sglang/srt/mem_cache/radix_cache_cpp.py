@@ -8,6 +8,8 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
+    EvictResult,
     MatchPrefixParams,
     MatchResult,
 )
@@ -137,14 +139,18 @@ class RadixCacheCpp(BasePrefixCache):
         """
         self.tree.lock_ref(node, True)
 
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
+        num_tokens = params.num_tokens
         evicted_device_indices = self.tree.evict(num_tokens)
+
+        num_evicted = 0
         for indice in evicted_device_indices:
+            num_evicted += len(indice)
             self.token_to_kv_pool_allocator.free(indice)
 
-        # FIXME: not sure about the real evict length here
-        self.update_eviction_metrics(num_tokens, start_time)
+        self.update_eviction_metrics(num_evicted, start_time)
+        return EvictResult(num_tokens_evicted=num_evicted)
 
     def evictable_size(self):
         return self.tree.evictable_size()
