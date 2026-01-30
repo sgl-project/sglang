@@ -16,10 +16,43 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # - stage-c-test-4-gpu-gb200
 # - stage-c-test-deepep-4-gpu
 suites = {
-    # Only files that actually exist and are not in CI
+    # Files managed by CI registry system (test/run_suite.py) - not run by test/srt/run_suite.py
     "__not_in_ci__": [
+        # Nightly/disabled tests
         TestFile("test_mistral_large3_basic.py"),  # Moved to nightly - large model
         TestFile("ep/test_moriep_small.py"),
+        # stage-c-test-4-gpu-h100
+        TestFile("models/test_qwen3_next_models.py"),
+        TestFile("models/test_qwen3_next_models_mtp.py"),
+        TestFile("test_gpt_oss_4gpu.py"),
+        TestFile("test_multi_instance_release_memory_occupation.py"),
+        TestFile("test_pp_single_node.py"),
+        TestFile("test_epd_disaggregation.py"),
+        # stage-c-test-8-gpu-h200
+        TestFile("test_deepseek_v3_basic.py"),
+        TestFile("test_deepseek_v3_mtp.py"),
+        TestFile("test_disaggregation_hybrid_attention.py"),
+        TestFile("test_deepseek_v32_basic.py"),
+        TestFile("test_deepseek_v32_mtp.py"),
+        TestFile("models/test_mimo_models.py"),
+        # stage-c-test-8-gpu-h20
+        TestFile("quant/test_w4a8_deepseek_v3.py"),
+        TestFile("test_disaggregation_different_tp.py"),
+        TestFile("test_disaggregation_pp.py"),
+        TestFile("test_disaggregation_dp_attention.py"),
+        # stage-c-test-4-gpu-b200
+        TestFile("test_deepseek_v3_fp4_4gpu.py"),
+        TestFile("test_fp8_blockwise_gemm.py"),
+        TestFile("test_nvfp4_gemm.py"),
+        TestFile("test_deepseek_v32_fp4_4gpu.py"),
+        # stage-c-test-4-gpu-gb200
+        TestFile("test_deepseek_v3_cutedsl_4gpu.py"),
+        TestFile("test_disaggregation_aarch64.py"),
+        # stage-c-test-deepep-4-gpu
+        TestFile("ep/test_deepep_small.py"),
+        TestFile("ep/test_mooncake_ep_small.py"),
+        # stage-c-test-deepep-8-gpu-h200
+        TestFile("ep/test_deepep_large.py"),
     ],
 }
 
