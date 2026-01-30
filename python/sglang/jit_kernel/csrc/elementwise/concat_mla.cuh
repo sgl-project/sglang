@@ -12,33 +12,33 @@ namespace {
 // ======================= Memory Utilities =======================
 // Adapted from DeepEP: https://github.com/deepseek-ai/DeepEP/blob/main/csrc/kernels/utils.cuh
 
-__forceinline__ __device__ int get_lane_id() {
+SGL_DEVICE int get_lane_id() {
   int lane_id;
   asm("mov.s32 %0, %laneid;" : "=r"(lane_id));
   return lane_id;
 }
 
-__device__ __forceinline__ void st_na_global_v1(const int* ptr, int v) {
+SGL_DEVICE void st_na_global_v1(const int* ptr, int v) {
   asm volatile("st.global.L1::no_allocate.s32 [%0], %1;" ::"l"(ptr), "r"(v) : "memory");
 }
 
-__device__ __forceinline__ void st_na_global_v2(const int2* ptr, const int2& v) {
+SGL_DEVICE void st_na_global_v2(const int2* ptr, const int2& v) {
   asm volatile("st.global.L1::no_allocate.v2.s32 [%0], {%1, %2};" ::"l"(ptr), "r"(v.x), "r"(v.y) : "memory");
 }
 
-__device__ __forceinline__ int ld_na_global_v1(const int* ptr) {
+SGL_DEVICE int ld_na_global_v1(const int* ptr) {
   int r;
   asm volatile("ld.global.nc.L1::no_allocate.s32 %0, [%1];" : "=r"(r) : "l"(ptr));
   return r;
 }
 
-__device__ __forceinline__ int2 ld_na_global_v2(const int2* ptr) {
+SGL_DEVICE int2 ld_na_global_v2(const int2* ptr) {
   int2 r;
   asm volatile("ld.global.nc.L1::no_allocate.v2.s32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(ptr));
   return r;
 }
 
-__device__ __forceinline__ void prefetch_L2(const void* p) {
+SGL_DEVICE void prefetch_L2(const void* p) {
 #if defined(ENABLE_L2_PREFETCH)
   asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
 #endif
@@ -55,9 +55,9 @@ constexpr int HEAD_CHUNK_SIZE = 16;
 constexpr int NUM_HEAD_CHUNKS = NUM_LOCAL_HEADS / HEAD_CHUNK_SIZE;
 
 __global__ void concat_mla_k_kernel(
-    nv_bfloat16* __restrict__ k,
-    const nv_bfloat16* __restrict__ k_nope,
-    const nv_bfloat16* __restrict__ k_rope,
+    bf16_t* __restrict__ k,
+    const bf16_t* __restrict__ k_nope,
+    const bf16_t* __restrict__ k_rope,
     const int num_tokens,
     const int64_t k_stride_0,
     const int k_stride_1,
@@ -72,8 +72,8 @@ __global__ void concat_mla_k_kernel(
 
   using NopeVec = int2;  // 8B/thread, 32 threads = 256B/row
   using RopeVec = int;   // 4B/thread, 32 threads = 128B/row
-  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(nv_bfloat16), "nope vec mismatch");
-  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(nv_bfloat16), "rope vec mismatch");
+  static_assert(sizeof(NopeVec) * 32 == QK_NOPE_HEAD_DIM * sizeof(bf16_t), "nope vec mismatch");
+  static_assert(sizeof(RopeVec) * 32 == QK_ROPE_HEAD_DIM * sizeof(bf16_t), "rope vec mismatch");
 
   const int head_row0 = head_chunk_id * HEAD_CHUNK_SIZE;
 
@@ -174,9 +174,9 @@ struct ConcatMlaKKernel {
 
     LaunchKernel(grid_size, block_size, device.unwrap())(
         concat_mla_k_kernel,
-        static_cast<nv_bfloat16*>(k.data_ptr()),
-        static_cast<const nv_bfloat16*>(k_nope.data_ptr()),
-        static_cast<const nv_bfloat16*>(k_rope.data_ptr()),
+        static_cast<bf16_t*>(k.data_ptr()),
+        static_cast<const bf16_t*>(k_nope.data_ptr()),
+        static_cast<const bf16_t*>(k_rope.data_ptr()),
         num_tokens,
         S0_k.unwrap(),
         static_cast<int>(S1_k.unwrap()),
@@ -193,9 +193,9 @@ constexpr int B_LAST_DIM = 64;
 constexpr int OUT_LAST_DIM = A_LAST_DIM + B_LAST_DIM;
 
 __global__ void concat_mla_absorb_q_kernel(
-    nv_bfloat16* a,
-    nv_bfloat16* b,
-    nv_bfloat16* out,
+    bf16_t* a,
+    bf16_t* b,
+    bf16_t* out,
     const int num_items,
     const int dim_1,
     const int64_t a_stride_0,
@@ -319,9 +319,9 @@ struct ConcatMlaAbsorbQKernel {
 
     LaunchKernel(grid_size, block_size, device.unwrap())(
         concat_mla_absorb_q_kernel,
-        static_cast<nv_bfloat16*>(a.data_ptr()),
-        static_cast<nv_bfloat16*>(b.data_ptr()),
-        static_cast<nv_bfloat16*>(out.data_ptr()),
+        static_cast<bf16_t*>(a.data_ptr()),
+        static_cast<bf16_t*>(b.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
         num_items,
         dim_1,
         S0_a.unwrap(),
