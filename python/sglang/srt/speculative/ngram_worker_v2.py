@@ -89,15 +89,16 @@ class NGRAMWorkerV2(NGRAMWorker):
 
     def _update_ngram_cache_v2(self, batch: ModelWorkerBatch):
         batch_tokens = []
-        prev_token_ids, prev_accept_lens = (
-            batch.spec_info.next_token_ids,
-            batch.spec_info.accept_lens,
-        )
-        if not prev_token_ids.is_cpu:
-            prev_token_ids = prev_token_ids.cpu()
-            prev_accept_lens = prev_accept_lens.cpu()
-        self.prev_token_ids = prev_token_ids.tolist()
-        self.prev_accept_lens = prev_accept_lens.tolist()
+        if batch.forward_mode != ForwardMode.EXTEND:
+            prev_token_ids, prev_accept_lens = (
+                batch.spec_info.next_token_ids,
+                batch.spec_info.accept_lens,
+            )
+            if not prev_token_ids.is_cpu:
+                prev_token_ids = prev_token_ids.cpu()
+                prev_accept_lens = prev_accept_lens.cpu()
+            self.prev_token_ids = prev_token_ids.tolist()
+            self.prev_accept_lens = prev_accept_lens.tolist()
         stride = self.draft_token_num
         for i, req in enumerate(batch.reqs):
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -106,9 +107,12 @@ class NGRAMWorkerV2(NGRAMWorker):
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
             # TODO deal with grammar, where output_id is complete
-            prev_tokens = self.prev_token_ids[
-                i * stride : i * stride + self.prev_accept_lens[i]
-            ]
+            if batch.forward_mode != ForwardMode.EXTEND:
+                prev_tokens = self.prev_token_ids[
+                    i * stride : i * stride + self.prev_accept_lens[i]
+                ]
+            else:
+                prev_tokens = []
             put_ids = self._efficient_concat_last_n(
                 req.origin_input_ids, req.output_ids + prev_tokens, self.branch_length
             )
@@ -273,6 +277,9 @@ class NGRAMWorkerV2(NGRAMWorker):
                 accept_index,
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
+            predict, accept_index = verify_input.filter_invalid_predict(
+                logits_output, predict, accept_index
+            )
             move_accepted_tokens_to_target_kvcache(
                 model_worker_batch,
                 accept_index,

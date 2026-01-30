@@ -224,7 +224,14 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
 
         if has_finished:
             self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
-        self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
+
+        self.filter_invalid_predict(logits_output)
+
+    def filter_invalid_predict(
+        self, logits_output: torch.Tensor, predict, accepted_indices
+    ):
+        accepted_indices = accepted_indices[accepted_indices != -1]
+        self.accepted_indices = accepted_indices
 
         logits_output.next_token_logits = logits_output.next_token_logits[
             self.accepted_indices
@@ -233,7 +240,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             logits_output.hidden_states = logits_output.hidden_states[
                 self.accepted_indices
             ]
-        self.verified_id = self.predict[self.accepted_indices]
+        self.verified_id = predict[self.accepted_indices]
+        return self.verified_id, self.accepted_indices
 
     def _free_cache(
         self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
