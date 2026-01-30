@@ -29,7 +29,7 @@ class TestOverlapSchedule(CustomTestCase):
     def test_radix_attention_chunked_prefill(self):
         run_mmlu_test(
             disable_radix_cache=False,
-            chunked_prefill_size=chunked_prefill_size,
+            chunked_prefill_size=128,
             disable_overlap=True,
         )
 
