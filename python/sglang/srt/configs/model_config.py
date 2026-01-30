@@ -1050,7 +1050,12 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "dtype", None)
+    if isinstance(config, dict):
+        config_dtype = config.get("dtype", None) or config.get("torch_dtype", None)
+        model_type = config.get("model_type", "")
+    else:
+        config_dtype = getattr(config, "dtype", None)
+        model_type = getattr(config, "model_type", "")
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
@@ -1060,11 +1065,11 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type.startswith("gemma"):
-                    if config.model_type == "gemma":
+                if model_type.startswith("gemma"):
+                    if model_type == "gemma":
                         gemma_version = ""
                     else:
-                        gemma_version = config.model_type[5]
+                        gemma_version = model_type[5]
                     logger.info(
                         f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
@@ -1147,6 +1152,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
