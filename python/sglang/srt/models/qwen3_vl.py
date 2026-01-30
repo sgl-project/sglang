@@ -73,20 +73,18 @@ from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
-    cpu_has_amx_support,
     get_int_env_var,
     is_cpu,
     is_npu,
     round_up,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 
-# === Vision Encoder === #
 _is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -126,8 +124,25 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
-        x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        if (
+            self.linear_fc2.tp_size == 1
+            and use_intel_amx_backend(self.linear_fc1)
+            and use_intel_amx_backend(self.linear_fc2)
+        ):
+            x_shape = x.shape
+            out = torch.ops.sgl_kernel.fused_linear_gelu_linear(
+                x.view(-1, x.shape[-1]),
+                self.linear_fc1.weight,
+                self.linear_fc2.weight,
+                self.linear_fc1.bias,
+                self.linear_fc2.bias,
+                True,
+                True,
+            )
+            mlp_output = out.view(x_shape[0], x_shape[1], -1)
+        else:
+            x_fc1, _ = self.linear_fc1(x)
+            mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
 
 
