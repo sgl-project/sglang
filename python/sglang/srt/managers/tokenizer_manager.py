@@ -2068,10 +2068,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         )
         os.makedirs(os.path.dirname(filename), exist_ok=True)
 
+        launch_command = " ".join(sys.argv)
+
         # Write the data to the file
         data_to_dump_with_server_args = {
             "server_args": self.server_args,  # Include server_args in the dump
             "requests": data_to_dump,
+            "launch_command": launch_command,
         }
         with open(filename, "wb") as f:
             pickle.dump(data_to_dump_with_server_args, f)
