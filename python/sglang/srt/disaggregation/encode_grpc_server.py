@@ -31,6 +31,10 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import get_zmq_socket, random_uuid
 
 logger = logging.getLogger(__name__)
+SGLangEncoderServicer = sglang_encoder_pb2_grpc.SglangEncoderServicer
+add_SGLangEncoderServicer_to_server = (
+    sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server
+)
 
 # Shared scheduler receive URL state (use encode_server globals).
 
@@ -68,7 +72,7 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         yield await self.Check(request, context)
 
 
-class SGLangEncoderServer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
+class SGLangEncoderServer(SGLangEncoderServicer):
     """
     gRPC service implementation for SGLang encoder.
     Mirrors the HTTP endpoints in encode_server.py.
@@ -272,9 +276,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         send_sockets=send_sockets,
         server_args=server_args,
     )
-    sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server(
-        encoder_servicer, server
-    )
+    add_SGLangEncoderServicer_to_server(encoder_servicer, server)
 
     # Enable reflection for debugging
     SERVICE_NAMES = (
