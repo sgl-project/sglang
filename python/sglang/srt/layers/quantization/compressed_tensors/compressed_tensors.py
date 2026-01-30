@@ -959,3 +959,21 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights_with_router_logits(layer, dispatch_output)
+
+    def apply_without_routing_weights(
+        self,
+        layer,
+        hidden_states,
+        hidden_states_scale,
+        group_list_type,
+        group_list,
+        output_dtype,
+    ):
+        return layer.scheme.apply_without_routing_weights(
+            layer,
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        )
