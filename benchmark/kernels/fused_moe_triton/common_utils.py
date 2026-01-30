@@ -2,13 +2,13 @@ import json
 from typing import Dict, List, TypedDict
 
 import torch
-from transformers import AutoConfig
 
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
     get_config_file_name,
 )
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.hf_transformers_utils import get_config
 
 
 class BenchmarkConfig(TypedDict):
@@ -36,7 +36,7 @@ def get_model_config(
     disable_shared_experts_fusion: bool = False,
     topk_ids_dir: str = None,
 ) -> Dict:
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    config = get_config(model_name, trust_remote_code=True)
 
     block_shape = None
     if (

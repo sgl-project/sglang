@@ -30,7 +30,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=41, suite="stage-b-test-small-1-gpu")
-register_cuda_ci(est_time=39, suite="stage-b-test-small-1-gpu-5090")
 register_amd_ci(est_time=60, suite="stage-b-test-small-1-gpu-amd")
 
 OUTPUT_DIR = "./profiler_dir"

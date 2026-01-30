@@ -391,7 +391,7 @@ class LoRAMemoryPool:
                 assert (
                     buffer_view.shape == weight.shape
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
-                buffer_view.copy_(weight)
+                buffer_view.copy_(weight, non_blocking=True)
 
         if uid is None:
             for i in range(self.num_layer):

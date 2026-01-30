@@ -212,9 +212,6 @@ class OpenAIServingRerank(OpenAIServingBase):
         self._yes_token_id, self._no_token_id = _get_yes_no_token_ids(
             tokenizer_manager.tokenizer
         )
-        logger.info(
-            f"Reranker yes/no token IDs: yes={self._yes_token_id}, no={self._no_token_id}"
-        )
 
     # NOTE: /v1/rerank is not an official OpenAI endpoint. This module may be moved
     # to another module in the future.
