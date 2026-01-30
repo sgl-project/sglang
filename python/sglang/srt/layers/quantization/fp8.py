@@ -1143,24 +1143,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
 
-        if get_moe_runner_backend().is_hpc_ops():
-            quant_info = HpcOpsMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_scale=(
-                    layer.w13_weight_scale_inv
-                    if self.block_quant
-                    else layer.w13_weight_scale
-                ),
-                w2_scale=(
-                    layer.w2_weight_scale_inv
-                    if self.block_quant
-                    else layer.w2_weight_scale
-                ),
-                block_quant=self.block_quant,
-                num_local_experts=int(getattr(layer, "num_local_experts", 0)),
-            )
-
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
@@ -1333,6 +1315,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
                 block_shape=self.quant_config.weight_block_size,
+            )
+        elif self.runner.runner_backend.is_hpc_ops():
+            quant_info = HpcOpsMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_scale=(
+                    layer.w13_weight_scale_inv
+                    if self.block_quant
+                    else layer.w13_weight_scale
+                ),
+                w2_scale=(
+                    layer.w2_weight_scale_inv
+                    if self.block_quant
+                    else layer.w2_weight_scale
+                ),
+                block_quant=self.block_quant,
+                num_local_experts=int(getattr(layer, "num_local_experts", 0)),
             )
         else:
             raise NotImplementedError(
