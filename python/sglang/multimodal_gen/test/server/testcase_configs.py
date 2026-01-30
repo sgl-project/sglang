@@ -565,6 +565,23 @@ if not current_platform.is_hip():
         )
     )
 
+ONE_GPU_CASES_C: list[DiffusionTestCase] = [
+    # OOM test case, runs very long
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            num_frames=100_000,
+        ),
+    ),
+]
+
 TWO_GPU_CASES_A = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",

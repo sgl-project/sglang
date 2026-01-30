@@ -30,6 +30,7 @@ SUITES = {
         # unit tests (no server needed)
         "../test_sampling_params_validate.py",
         # add new 1-gpu test files here
+        # "test_server_c.py", # OOM test runs very long, exclude by default
     ],
     "2-gpu": [
         "test_server_2_gpu_a.py",

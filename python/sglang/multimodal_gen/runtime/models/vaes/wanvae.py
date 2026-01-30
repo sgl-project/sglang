@@ -1261,7 +1261,9 @@ class AutoencoderKLWan(ParallelTiledVAE):
         return enc
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        if self.use_feature_cache:
+        if self.use_tiling:
+            out = ParallelTiledVAE.decode(self, z)
+        else:
             self.clear_cache()
             iter_ = z.shape[2]
             x = self.post_quant_conv(z)
@@ -1284,8 +1286,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
             out = out.float()
             out = torch.clamp(out, min=-1.0, max=1.0)
             self.clear_cache()
-        else:
-            out = ParallelTiledVAE.decode(self, z)
 
         return out
 
