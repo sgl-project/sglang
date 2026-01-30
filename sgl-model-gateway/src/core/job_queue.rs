@@ -99,47 +99,6 @@ impl Job {
     }
 }
 
-impl JobStatus {
-    fn pending(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "pending".to_string(),
-            message: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-
-    fn processing(job_type: &str, worker_url: &str) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "processing".to_string(),
-            message: None,
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-
-    fn failed(job_type: &str, worker_url: &str, error: String) -> Self {
-        Self {
-            job_type: job_type.to_string(),
-            worker_url: worker_url.to_string(),
-            status: "failed".to_string(),
-            message: Some(error),
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        }
-    }
-}
-
 /// Job queue configuration
 #[derive(Clone, Debug)]
 pub struct JobQueueConfig {

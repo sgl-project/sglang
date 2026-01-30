@@ -52,7 +52,14 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -68,6 +75,8 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 
 
@@ -230,6 +239,13 @@ class MambaPool:
                 )
                 for conv_shape in conv_state_shape
             ]
+
+            if _is_cpu and _cpu_has_amx_support:
+                from sglang.srt.layers.amx_utils import _init_amx_conv_state
+
+                # CPU uses a different layout of conv_state for kernel optimization
+                conv_state = _init_amx_conv_state(conv_state)
+
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,
@@ -373,6 +389,33 @@ class MambaPool:
                 state_tensor[i][0].nbytes for i in range(self.num_mamba_layers)
             ]
         return data_ptrs, data_lens, item_lens
+
+    def get_state_dim_per_tensor(self):
+        """Get the sliceable dimension size for each state tensor.
+
+        For mamba state, the layout is:
+        - conv_state: [num_layers, size+1, conv_dim/tp, conv_kernel-1]
+        - temporal_state: [num_layers, size+1, num_heads/tp, head_dim, state_size]
+
+        The 3rd dimension (index 2) is the one that gets sliced by TP.
+        Returns the size of this dimension for each tensor (repeated for each layer).
+        """
+        state_tensors = []
+        for field in vars(self.mamba_cache):
+            value = getattr(self.mamba_cache, field)
+            if isinstance(value, list):
+                state_tensors.extend(value)
+            else:
+                state_tensors.append(value)
+
+        dim_per_tensor = []
+        for state_tensor in state_tensors:
+            # state_tensor shape: [num_layers, size+1, sliceable_dim, ...]
+            # The sliceable dimension is at index 2 (after num_layers and size)
+            sliceable_dim = state_tensor.shape[2]
+            # Repeat for each layer since we have per-layer data_ptrs
+            dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
+        return dim_per_tensor
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1231,6 +1274,10 @@ class HybridLinearKVPool(KVCache):
             self.mamba_pool.get_contiguous_buf_infos()
         )
         return mamba_data_ptrs, mamba_data_lens, mamba_item_lens
+
+    def get_state_dim_per_tensor(self):
+        """Get the sliceable dimension size for each mamba state tensor."""
+        return self.mamba_pool.get_state_dim_per_tensor()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
