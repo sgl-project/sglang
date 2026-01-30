@@ -276,7 +276,7 @@ class RTNMoEMethod:
     """MoE method for RTN."""
 
     def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoEMethodBase
+        from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
         if not hasattr(cls, "_initialized"):
             original_init = cls.__init__
@@ -508,7 +508,6 @@ class RTNMarlinLinearMethod(LinearMethodBase):
             marlin_make_workspace,
             marlin_permute_scales,
         )
-        from sglang.srt.layers.quantization.utils import replace_parameter
 
         device = layer.weight.device
 
@@ -518,74 +517,16 @@ class RTNMarlinLinearMethod(LinearMethodBase):
         qweight = layer.weight.data.data
         if self.quant_config.weight_bits == 4:
             # Unpack 4-bit weights
-            # Shape: (out, in/2) -> (out, in)
+            # Shape: (out/2, in) -> (out, in/2) -> (out, in)
             from sglang.srt.layers.quantization.rtn_utils import rtn_unpack
 
+            qweight = qweight.view(qweight.shape[0] * 2, -1)
             qweight = rtn_unpack(qweight, 4)
 
         # Transpose to (in, out) for Marlin/GPTQ packing
         qweight = qweight.t().contiguous()
 
         # 2. Pack to GPTQ format (int32)
-        # Shape: (in, out/pack_factor) if we were packing output?
-        # Wait, GPTQ packs along the second dimension (output_dim) in (input, output) layout??
-        # Let's verify pack_cols.
-        # pack_cols(q_w, ... size_k, size_n).
-        # q_w is (size_k, size_n).
-        # q_res is (size_k, size_n // pack_factor).
-        # So it packs along size_n (output dimension).
-        # GPTQLinearMethod creates:
-        # qweight = (input / pack, output).
-        # And gptq_gemm expects (input / pack, output).
-        # BUT Marlin expects (k/16, n*bits/2) (after repack).
-        # And gptq_marlin_repack input format:
-        # It takes `b_q_weight` which comes from GPTQ layer.
-        # GPTQ layer qweight is `(input_size // pack, output_size)`.
-        # So it packs along input dimension??
-        # Let's re-read GPTQLinearMethod.create_weights.
-        # qweight shape: (input_size_per_partition // pack_factor, output_size_per_partition).
-        # This means packing is along input dimension (dim 0).
-        # BUT pack_cols in utils.py implements:
-        # q_res |= q_w[:, i::pack_factor] << num_bits * i
-        # This packs along dim 1 (columns).
-        # CONTRAINDICATION.
-
-        # In GPTQLinearMethod.create_weights:
-        # qweight = PackedvLLMParameter(..., packed_dim=0, ...)
-        # So the STORAGE is packed along dim 0.
-        # But `pack_cols` packs along dim 1.
-        # This implies `q_w` passed to `pack_cols` must be transposed?
-        # `gptq_quantize_weights` calls `quantize_weights`.
-        # `quantize_weights` returns `w_q` of shape `(groupsize, -1)` then restored to `(size_k, size_n)`.
-        # `gptq_quantize_weights` returns `w_q` (size_k, size_n).
-        # Then where is packing?
-        # `gptq.py` doesn't use `pack_cols` in `apply` or `create_weights` directly (it just registers param).
-        # The loading uses `weight_loader` which presumably handles packing if format is 'gptq'.
-        # For RTN, we have unpacked weights.
-
-        # If GPTQ stores (input_size // pack, output_size), then packing is along input.
-        # `pack_rows` packs along dim 0.
-        # `rtn_quantize` with pack=True packs along dim 2 (output dim if batch present, input dim if not??).
-        # RTN w: (out, in). Packed: (out, in/2). Packing along IN (dim 1).
-
-        # So RTN packing matches packing along input dimension for (out, in) tensor.
-        # GPTQ qweight: (in // pack, out).
-        # So if we transpose RTN -> (in // 2, out).
-        # It matches (in // pack, out).
-        # EXCEPT `pack_factor` for GPTQ 4-bit is 8.
-        # RTN pack factor is 2.
-
-        # So we definitely need to repack.
-
-        # We need to create `qweight` of shape `(in // 8, out)`.
-        # `qweight_unpacked` is `(in, out)`.
-        # We need to pack rows (dim 0).
-
-        # `pack_rows` in `utils.py`:
-        # q_res |= q_w[i::pack_factor, :] << num_bits * i
-        # This packs along rows.
-
-        # So I need `pack_rows` equivalent.
 
         input_size = qweight.shape[0]
         output_size = qweight.shape[1]
@@ -630,12 +571,24 @@ class RTNMarlinLinearMethod(LinearMethodBase):
         )
 
         # 5. Replace params
-        replace_parameter(layer, "qweight", marlin_qweight)
-        replace_parameter(layer, "scales", marlin_scales)
-        replace_parameter(layer, "g_idx", marlin_make_empty_g_idx(device))
-        replace_parameter(layer, "g_idx_sort_indices", g_idx_sort_indices)
-        replace_parameter(
-            layer, "qzeros", marlin_make_empty_g_idx(device)
+        # Use register_parameter to match apply() expecting qweight/scales and avoid AttributeError
+        layer.register_parameter(
+            "qweight", torch.nn.Parameter(marlin_qweight, requires_grad=False)
+        )
+        layer.register_parameter(
+            "scales", torch.nn.Parameter(marlin_scales, requires_grad=False)
+        )
+        layer.register_parameter(
+            "g_idx",
+            torch.nn.Parameter(marlin_make_empty_g_idx(device), requires_grad=False),
+        )
+        layer.register_parameter(
+            "g_idx_sort_indices",
+            torch.nn.Parameter(g_idx_sort_indices, requires_grad=False),
+        )
+        layer.register_parameter(
+            "qzeros",
+            torch.nn.Parameter(marlin_make_empty_g_idx(device), requires_grad=False),
         )  # No zeros for RTN
 
         # Clear old params
@@ -709,41 +662,7 @@ class RTNMarlinMoEMethod:
             marlin_moe_permute_scales,
         )
         from sglang.srt.layers.quantization.rtn_utils import rtn_unpack
-        from sglang.srt.layers.quantization.utils import replace_parameter
 
-        # Helper to process weights
-        def process_weight(rtn_param, is_gate_up):
-            # rtn_param data: packed (experts, out, in/2)
-            qweight_packed = rtn_param.data.data
-            if self.quant_config.weight_bits == 4:
-                qweight = rtn_unpack(qweight_packed, 4)
-            else:
-                qweight = qweight_packed
-
-            # Unpacked: (experts, out, in)
-            # Expected by gptq_marlin_moe_repack: (experts, in//pack, out) ??
-            # gptq_marlin_moe_repack calls gptq_marlin_repack per expert.
-            # So we need to provide GPTQ packed format per expert.
-            # Transpose to (experts, in, out)
-            qweight = qweight.transpose(1, 2).contiguous()
-
-            num_experts, inp, out = qweight.shape
-
-            # Pack rows (in dim). (experts, in/pack, out)
-            pack_factor = 32 // self.quant_config.weight_bits
-            q_res = torch.zeros(
-                (num_experts, inp // pack_factor, out),
-                dtype=torch.int32,
-                device=rtn_param.device,
-            )
-            for i in range(pack_factor):
-                q_res |= qweight[:, i::pack_factor, :].to(torch.int32) << (
-                    self.quant_config.weight_bits * i
-                )
-            pass
-            # Wait, pack_rows_torch I wrote earlier was 2D. I need batch support.
-
-        # Implementation of batch pack_rows
         def pack_rows_batch(q_w, num_bits):
             # q_w: (batch, rows, cols)
             pack_factor = 32 // num_bits
@@ -759,11 +678,16 @@ class RTNMarlinMoEMethod:
         # Processing w13
         w13_packed = layer.w13_weight.data.data
         if self.quant_config.weight_bits == 4:
+            # (E, out/2, in) -> (E, out, in/2)
+            w13_packed = w13_packed.view(
+                w13_packed.shape[0], w13_packed.shape[1] * 2, -1
+            )
             w13_unpacked = rtn_unpack(w13_packed, 4)
         else:
             w13_unpacked = w13_packed
 
-        w13_t = w13_unpacked.transpose(1, 2).contiguous()  # (E, in, out)
+        # (E, in, out)
+        w13_t = w13_unpacked.transpose(1, 2).contiguous()
         w13_gptq = pack_rows_batch(w13_t, self.quant_config.weight_bits)
 
         # Sort indices (empty/identity)
@@ -790,6 +714,8 @@ class RTNMarlinMoEMethod:
         # Processing w2
         w2_packed = layer.w2_weight.data.data
         if self.quant_config.weight_bits == 4:
+            # (E, out/2, in) -> (E, out, in/2)
+            w2_packed = w2_packed.view(w2_packed.shape[0], w2_packed.shape[1] * 2, -1)
             w2_unpacked = rtn_unpack(w2_packed, 4)
         else:
             w2_unpacked = w2_packed
@@ -828,25 +754,39 @@ class RTNMarlinMoEMethod:
         )
 
         # Replace
-        replace_parameter(layer, "w13_qweight", marlin_w13_qweight)
-        replace_parameter(layer, "w2_qweight", marlin_w2_qweight)
-        replace_parameter(layer, "w13_scales", marlin_w13_scales)
-        replace_parameter(layer, "w2_scales", marlin_w2_scales)
+        # Use register_parameter for new parameters to avoid AttributeError in replace_parameter
+        layer.register_parameter(
+            "w13_qweight",
+            torch.nn.Parameter(marlin_w13_qweight, requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_qweight", torch.nn.Parameter(marlin_w2_qweight, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w13_scales", torch.nn.Parameter(marlin_w13_scales, requires_grad=False)
+        )
+        layer.register_parameter(
+            "w2_scales", torch.nn.Parameter(marlin_w2_scales, requires_grad=False)
+        )
 
-        replace_parameter(layer, "w13_g_idx_sort_indices", w13_sort_indices)
-        replace_parameter(layer, "w2_g_idx_sort_indices", w2_sort_indices)
+        layer.register_parameter(
+            "w13_g_idx_sort_indices",
+            torch.nn.Parameter(w13_sort_indices, requires_grad=False),
+        )
+        layer.register_parameter(
+            "w2_g_idx_sort_indices",
+            torch.nn.Parameter(w2_sort_indices, requires_grad=False),
+        )
 
         # Set g_idx, zeros to None/Empty
-        replace_parameter(
-            layer,
+        layer.register_parameter(
             "w13_g_idx",
             torch.nn.Parameter(
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
                 requires_grad=False,
             ),
         )
-        replace_parameter(
-            layer,
+        layer.register_parameter(
             "w2_g_idx",
             torch.nn.Parameter(
                 torch.empty((num_experts, 0), dtype=torch.int32, device=device),
