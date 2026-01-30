@@ -1111,7 +1111,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
             except asyncio.TimeoutError:
                 if (
-                    request is not None
+                    not is_stream
+                    and request is not None
                     and not obj.background
                     and await request.is_disconnected()
                 ):
