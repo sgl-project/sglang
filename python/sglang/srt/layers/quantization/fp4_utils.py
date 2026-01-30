@@ -97,19 +97,22 @@ def nvfp4_online_scale_enabled() -> bool:
 
 def nvfp4_compute_input_scale_and_inv(
     x: torch.Tensor,
-    input_scale: torch.Tensor,
-    input_scale_inv: torch.Tensor,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     if x.numel() == 0:
-        input_scale.zero_()
-        input_scale_inv.zero_()
-        return
+        input_scale = x.new_tensor(0.0, dtype=torch.float32)
+        input_scale_inv = x.new_tensor(0.0, dtype=torch.float32)
+        return input_scale, input_scale_inv
 
     global_amax = x.abs().max().to(torch.float32)
-    input_scale_inv.copy_(global_amax)
-    input_scale_inv.reciprocal_()
-    input_scale_inv.mul_(NVFP4_FP8_E4M3_MAX * NVFP4_E2M1_MAX)
-    input_scale_inv.clamp_(max=torch.finfo(torch.float32).max)
-    input_scale_inv.masked_fill_(input_scale_inv == 0.0, 1.0)
-    input_scale.copy_(input_scale_inv)
-    input_scale.reciprocal_()
+    global_encode_scale = torch.div(NVFP4_FP8_E4M3_MAX * NVFP4_E2M1_MAX, global_amax)
+    global_encode_scale = torch.clamp(
+        global_encode_scale, max=torch.finfo(torch.float32).max
+    )
+    global_encode_scale = torch.where(
+        global_encode_scale == 0.0, 1.0, global_encode_scale
+    )
+
+    global_decode_scale = torch.div(1.0, global_encode_scale)
+    input_scale = global_decode_scale
+    input_scale_inv = global_encode_scale
+    return input_scale, input_scale_inv

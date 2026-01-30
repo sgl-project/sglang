@@ -376,12 +376,6 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer.nvfp4_online_input_scale_inv = torch.empty_like(
             layer.w13_input_scale_quant
         )
-        layer.nvfp4_online_input_scale = torch.empty(
-            (), dtype=torch.float32, device=layer.w13_input_scale_quant.device
-        )
-        layer.nvfp4_online_input_scale_inv_scalar = torch.empty(
-            (), dtype=torch.float32, device=layer.w13_input_scale_quant.device
-        )
 
         # w2
         if self.use_flashinfer_trtllm:
@@ -521,9 +515,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         g1_alphas = layer.g1_alphas
         g1_scale_c = layer.g1_scale_c
         if nvfp4_online_scale_enabled():
-            input_scale = layer.nvfp4_online_input_scale
-            input_scale_inv_scalar = layer.nvfp4_online_input_scale_inv_scalar
-            nvfp4_compute_input_scale_and_inv(x, input_scale, input_scale_inv_scalar)
+            input_scale, input_scale_inv_scalar = nvfp4_compute_input_scale_and_inv(x)
             if hasattr(layer, "nvfp4_online_input_scale_inv"):
                 input_scale_inv = layer.nvfp4_online_input_scale_inv
                 input_scale_inv.copy_(input_scale_inv_scalar.expand_as(input_scale_inv))

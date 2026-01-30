@@ -1252,10 +1252,7 @@ class FlashInferFP4MoE(FusedMoE):
             else self.w13_input_scale_quant
         )
         if input_scale_override is None and nvfp4_online_scale_enabled():
-            input_scale = self.nvfp4_online_input_scale_inv
-            nvfp4_compute_input_scale_and_inv(
-                hidden_states, self.nvfp4_online_input_scale, input_scale
-            )
+            _, input_scale = nvfp4_compute_input_scale_and_inv(hidden_states)
 
         # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
         # Only the block scales are computed at runtime
@@ -1315,10 +1312,8 @@ class FlashInferFP4MoE(FusedMoE):
         g1_alphas = self.g1_alphas.data
         g1_scale_c = self.g1_scale_c.data
         if nvfp4_online_scale_enabled():
-            input_scale = self.nvfp4_online_input_scale
-            input_scale_inv = self.nvfp4_online_input_scale_inv
-            nvfp4_compute_input_scale_and_inv(
-                hidden_states, input_scale, input_scale_inv
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(
+                hidden_states
             )
             hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(
                 hidden_states, input_scale_override=input_scale_inv

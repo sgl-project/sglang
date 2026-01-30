@@ -452,9 +452,7 @@ def cutlass_moe_fp4(
     if nvfp4_online_scale_enabled():
         orig_a1_gscale = a1_gscale
         orig_w1_alphas = w1_alphas
-        input_scale = params.online_input_scale
-        input_scale_inv = params.online_input_scale_inv
-        nvfp4_compute_input_scale_and_inv(a, input_scale, input_scale_inv)
+        input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(a)
         if hasattr(params, "online_a1_gscale"):
             params.online_a1_gscale.copy_(
                 input_scale_inv.expand_as(params.online_a1_gscale)
@@ -499,9 +497,7 @@ def cutlass_moe_fp4(
     if nvfp4_online_scale_enabled():
         orig_a2_gscale = a2_gscale
         orig_w2_alphas = w2_alphas
-        int_scale = params.online_intermediate_scale
-        int_scale_inv = params.online_intermediate_scale_inv
-        nvfp4_compute_input_scale_and_inv(intermediate, int_scale, int_scale_inv)
+        int_scale, int_scale_inv = nvfp4_compute_input_scale_and_inv(intermediate)
         if hasattr(params, "online_a2_gscale"):
             params.online_a2_gscale.copy_(
                 int_scale_inv.expand_as(params.online_a2_gscale)

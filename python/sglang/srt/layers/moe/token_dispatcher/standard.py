@@ -97,14 +97,6 @@ class StandardDispatcher(BaseDispatcher):
         )
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
-        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
-        if torch.cuda.is_available():
-            self.nvfp4_online_input_scale = torch.empty(
-                (), dtype=torch.float32, device="cuda"
-            )
-            self.nvfp4_online_input_scale_inv = torch.empty(
-                (), dtype=torch.float32, device="cuda"
-            )
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -116,12 +108,7 @@ class StandardDispatcher(BaseDispatcher):
 
             global_scale = self.quant_config.get("input_global_scale", None)
             if nvfp4_online_scale_enabled():
-                nvfp4_compute_input_scale_and_inv(
-                    hidden_states,
-                    self.nvfp4_online_input_scale,
-                    self.nvfp4_online_input_scale_inv,
-                )
-                global_scale = self.nvfp4_online_input_scale_inv
+                _, global_scale = nvfp4_compute_input_scale_and_inv(hidden_states)
                 self.last_input_scale_inv = global_scale
             else:
                 self.last_input_scale_inv = None

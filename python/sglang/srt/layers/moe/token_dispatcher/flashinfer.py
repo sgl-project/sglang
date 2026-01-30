@@ -170,13 +170,6 @@ class FlashinferDispatcher(BaseDispatcher):
         self.dummy_topk_weights = torch.zeros(
             (1, self.router_topk), dtype=torch.float32, device="cuda"
         )
-        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
-        self.nvfp4_online_input_scale = torch.empty(
-            (), dtype=torch.float32, device="cuda"
-        )
-        self.nvfp4_online_input_scale_inv = torch.empty(
-            (), dtype=torch.float32, device="cuda"
-        )
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -199,10 +192,7 @@ class FlashinferDispatcher(BaseDispatcher):
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if nvfp4_online_scale_enabled():
-            nvfp4_compute_input_scale_and_inv(
-                x, self.nvfp4_online_input_scale, self.nvfp4_online_input_scale_inv
-            )
-            global_scale = self.nvfp4_online_input_scale_inv
+            _, global_scale = nvfp4_compute_input_scale_and_inv(x)
             self.last_input_scale_inv = global_scale
         else:
             self.last_input_scale_inv = None

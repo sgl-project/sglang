@@ -133,13 +133,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             1 / (layer.input_global_scale * layer.weight_global_scale),
             requires_grad=False,
         )
-        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
-        layer.nvfp4_online_input_scale = torch.empty(
-            (), dtype=torch.float32, device=layer.weight_packed.device
-        )
-        layer.nvfp4_online_input_scale_inv = torch.empty(
-            (), dtype=torch.float32, device=layer.weight_packed.device
-        )
 
     def apply_weights(
         self,
@@ -155,9 +148,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         input_global_scale = layer.input_global_scale
         alpha = layer.alpha
         if nvfp4_online_scale_enabled():
-            input_scale = layer.nvfp4_online_input_scale
-            input_scale_inv = layer.nvfp4_online_input_scale_inv
-            nvfp4_compute_input_scale_and_inv(x, input_scale, input_scale_inv)
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
             input_global_scale = input_scale_inv
             alpha = torch.where(
                 layer.weight_global_scale > 0,
