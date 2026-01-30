@@ -126,6 +126,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -1662,6 +1663,7 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
+    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1689,6 +1691,7 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
     )
 
     # Launch a thread to stream the output
