@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -60,7 +61,7 @@ def should_enable_swap_ab(
     BLOCK_SIZE_M: int,
     BLOCK_SIZE_N: int,
 ) -> bool:
-    if not _is_cuda:
+    if not _is_cuda or is_batch_invariant_mode_enabled():
         return False
 
     return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
