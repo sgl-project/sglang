@@ -31,14 +31,13 @@ from sglang.srt.grpc.health_servicer import SGLangHealthServicer
 from sglang.srt.grpc.scheduler_launcher import launch_scheduler_process_only
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
-    GenerateReqInput,
     GetLoadsReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -555,11 +554,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         if not image_urls:
             return
 
-        encode_req = GenerateReqInput(
-            image_data=[ImageData(url=url) for url in image_urls],
+        encode_req = self.mm_receiver.build_and_send_encode_request(
+            image_urls=image_urls,
             rid=grpc_req.request_id,
         )
-        self.mm_receiver.send_encode_request(encode_req)
         tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
         tokenized_req.num_items_assigned = encode_req.num_items_assigned
 
