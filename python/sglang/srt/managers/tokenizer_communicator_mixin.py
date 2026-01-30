@@ -41,6 +41,8 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetKVCacheStateReqInput,
+    GetKVCacheStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
     GetLoadsReqInput,
@@ -233,6 +235,9 @@ class TokenizerCommunicatorMixin:
         self.get_loads_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.get_kv_cache_state_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -330,6 +335,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadsReqOutput,
                     self.get_loads_communicator.handle_recv,
+                ),
+                (
+                    GetKVCacheStateReqOutput,
+                    self.get_kv_cache_state_communicator.handle_recv,
                 ),
             ]
         )
@@ -891,6 +900,30 @@ class TokenizerCommunicatorMixin:
             results = [r for r in results if r.dp_rank == dp_rank]
 
         return results
+
+    async def get_kv_cache_state(
+        self: TokenizerManager,
+        include: Optional[List[str]] = None,
+        request_ids: Optional[List[str]] = None,
+        max_evictions: int = 100,
+    ) -> List[GetKVCacheStateReqOutput]:
+        """
+        Get KV cache state for debugging.
+
+        Args:
+            include: List of sections to include. Options: tree, memory, requests, evictions, all
+            request_ids: Optional filter for specific request IDs
+            max_evictions: Maximum number of recent evictions to return
+
+        Returns:
+            List of GetKVCacheStateReqOutput, one per scheduler
+        """
+        req = GetKVCacheStateReqInput(
+            include=include if include else ["all"],
+            request_ids=request_ids,
+            max_evictions=max_evictions,
+        )
+        return await self.get_kv_cache_state_communicator(req)
 
     async def open_session(
         self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None

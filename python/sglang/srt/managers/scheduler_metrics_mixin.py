@@ -11,10 +11,16 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
+    GetKVCacheStateReqInput,
+    GetKVCacheStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
+    KVCacheEvictionInfo,
+    KVCacheMemoryInfo,
+    KVCacheRequestInfo,
+    KVCacheTreeInfo,
     LoRAMetrics,
     MemoryMetrics,
     QueueMetrics,
@@ -739,6 +745,145 @@ class SchedulerMetricsMixin:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+        )
+
+    def get_kv_cache_state(
+        self: Scheduler, req: GetKVCacheStateReqInput = None
+    ) -> GetKVCacheStateReqOutput:
+        """
+        Get KV cache state for debugging.
+
+        Args:
+            req: Request containing include list and optional request_ids filter
+
+        Returns:
+            GetKVCacheStateReqOutput with tree, memory, and per-request cache info
+        """
+        if req is None:
+            req = GetKVCacheStateReqInput()
+
+        include = set(req.include) if req.include else {"all"}
+        include_all = "all" in include
+
+        tree_info = None
+        if include_all or "tree" in include:
+            pretty_print_str = ""
+            if hasattr(self.tree_cache, "pretty_print"):
+                try:
+                    pretty_print_str = self.tree_cache.pretty_print()
+                except Exception as e:
+                    pretty_print_str = f"Error getting pretty_print: {e}"
+
+            tree_info = KVCacheTreeInfo(
+                total_size=self.tree_cache.total_size(),
+                evictable_size=self.tree_cache.evictable_size(),
+                protected_size=self.tree_cache.protected_size(),
+                pretty_print=pretty_print_str,
+            )
+
+        memory_info = None
+        if include_all or "memory" in include:
+            allocator = self.token_to_kv_pool_allocator
+            available = allocator.available_size()
+            evictable = self.tree_cache.evictable_size()
+            used = self.max_total_num_tokens - available - evictable
+
+            try:
+                kv_cache_bytes = int(allocator.get_kvcache().mem_usage * 1e9)
+            except AttributeError:
+                kv_cache_bytes = 0
+
+            memory_info = KVCacheMemoryInfo(
+                available_slots=available,
+                used_slots=used,
+                total_slots=self.max_total_num_tokens,
+                kv_cache_bytes=kv_cache_bytes,
+                token_capacity=self.max_total_num_tokens,
+            )
+
+        requests_info = None
+        if include_all or "requests" in include:
+            requests_info = []
+            if self.running_batch and self.running_batch.reqs:
+                for r in self.running_batch.reqs:
+                    if req.request_ids is None or r.rid in req.request_ids:
+                        seq_len = len(r.origin_input_ids) + len(r.output_ids)
+                        kv_indices = []
+                        if (
+                            r.req_pool_idx is not None
+                            and hasattr(self, "req_to_token_pool")
+                            and self.req_to_token_pool is not None
+                        ):
+                            try:
+                                kv_indices = self.req_to_token_pool.req_to_token[
+                                    r.req_pool_idx, :seq_len
+                                ].tolist()
+                            except Exception:
+                                pass
+
+                        prefix_len = 0
+                        if hasattr(r, "extend_input_len"):
+                            prefix_len = (
+                                len(r.origin_input_ids) - r.extend_input_len
+                                if r.extend_input_len
+                                else 0
+                            )
+
+                        # Determine request state
+                        if r.finished_reason is not None:
+                            state = "finished"
+                        elif len(r.output_ids) == 0:
+                            state = "prefill"
+                        else:
+                            state = "decode"
+
+                        # Get prefix lookup timestamp (when request entered forward)
+                        prefix_lookup_ts = None
+                        if hasattr(r, "time_stats") and r.time_stats:
+                            # forward_entry_time is when cache lookup happens
+                            if r.time_stats.forward_entry_time > 0:
+                                prefix_lookup_ts = r.time_stats.forward_entry_time
+
+                        requests_info.append(
+                            KVCacheRequestInfo(
+                                request_id=r.rid,
+                                req_pool_idx=r.req_pool_idx if r.req_pool_idx else -1,
+                                kv_indices=kv_indices,
+                                num_tokens=seq_len,
+                                prefix_len=prefix_len,
+                                prefix_lookup_ts=prefix_lookup_ts,
+                                state=state,
+                            )
+                        )
+
+        # Get recent evictions
+        recent_evictions = None
+        if include_all or "evictions" in include:
+            recent_evictions = []
+            if hasattr(self.tree_cache, "get_recent_evictions"):
+                try:
+                    eviction_records = self.tree_cache.get_recent_evictions(
+                        req.max_evictions
+                    )
+                    for er in eviction_records:
+                        recent_evictions.append(
+                            KVCacheEvictionInfo(
+                                timestamp=er.timestamp,
+                                evicted_indices=er.evicted_indices,
+                                num_tokens=er.num_tokens,
+                                reason=er.reason,
+                            )
+                        )
+                except Exception:
+                    pass
+
+        return GetKVCacheStateReqOutput(
+            dp_rank=self.dp_rank,
+            timestamp=time.time(),
+            tree=tree_info,
+            memory=memory_info,
+            requests=requests_info,
+            recent_evictions=recent_evictions,
         )
 
     @contextmanager

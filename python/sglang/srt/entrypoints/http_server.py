@@ -46,7 +46,7 @@ import orjson
 import requests
 import uvicorn
 import uvloop
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
@@ -607,6 +607,38 @@ async def get_load():
         "Please use '/v1/loads' instead."
     )
     return await _global_state.tokenizer_manager.get_load()
+
+
+@app.get("/v1/kv_cache")
+async def get_kv_cache_state(
+    include: Optional[str] = Query(
+        None, description="Sections to include: tree,memory,requests,evictions,all"
+    ),
+    request_ids: Optional[str] = Query(
+        None, description="Comma-separated request IDs to filter"
+    ),
+    max_evictions: int = Query(
+        100, description="Maximum number of recent evictions to return"
+    ),
+):
+    """
+    Get KV cache state for debugging.
+
+    Returns tree cache structure, memory pool stats, per-request cache info,
+    and recent eviction history.
+    """
+    include_list = include.split(",") if include else ["all"]
+    request_id_list = request_ids.split(",") if request_ids else None
+
+    results = await _global_state.tokenizer_manager.get_kv_cache_state(
+        include=include_list,
+        request_ids=request_id_list,
+        max_evictions=max_evictions,
+    )
+
+    return {
+        "kv_cache_state": [dataclasses.asdict(r) for r in results],
+    }
 
 
 # example usage:

@@ -93,6 +93,7 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
+    GetKVCacheStateReqInput,
     GetLoadReqInput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
@@ -1053,6 +1054,7 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
                 (GetLoadsReqInput, self.get_loads),
+                (GetKVCacheStateReqInput, self.get_kv_cache_state),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
             ]

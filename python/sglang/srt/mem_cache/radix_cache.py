@@ -26,7 +26,8 @@ import heapq
 import logging
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
@@ -61,6 +62,16 @@ from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+@dataclass
+class EvictionRecord:
+    """Record of a single eviction event for debugging."""
+
+    timestamp: float
+    evicted_indices: List[int]
+    num_tokens: int
+    reason: str  # memory_pressure, explicit_flush, reset
 
 
 class RadixKey:
@@ -270,6 +281,9 @@ class RadixCache(BasePrefixCache):
 
         self.kv_event_queue = []
 
+        # Ring buffer to track recent evictions for debugging
+        self.eviction_history: deque[EvictionRecord] = deque(maxlen=1000)
+
         if params.enable_metrics:
             self.init_metrics_collector()
 
@@ -324,6 +338,18 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        # Record the reset as an eviction event if there was data
+        old_total = self.total_size() if hasattr(self, "root_node") else 0
+        if old_total > 0:
+            self.eviction_history.append(
+                EvictionRecord(
+                    timestamp=time.time(),
+                    evicted_indices=[],  # Can't track all indices on reset
+                    num_tokens=old_total,
+                    reason="explicit_flush",
+                )
+            )
+
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
@@ -334,6 +360,20 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self._record_all_cleared_event()
+
+    def get_recent_evictions(self, max_count: int = 100) -> List[EvictionRecord]:
+        """Get recent eviction records for debugging.
+
+        Args:
+            max_count: Maximum number of eviction records to return.
+
+        Returns:
+            List of recent eviction records, most recent first.
+        """
+        # Return most recent first
+        records = list(self.eviction_history)
+        records.reverse()
+        return records[:max_count]
 
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
@@ -565,6 +605,7 @@ class RadixCache(BasePrefixCache):
             return EvictResult()
 
         start_time = time.perf_counter()
+        eviction_ts = time.time()
         num_tokens = params.num_tokens
         leaves = self._collect_leaves()
         eviction_heap = [
@@ -573,8 +614,13 @@ class RadixCache(BasePrefixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evicted_indices = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+
+            # Track evicted indices for debugging
+            if x.value is not None and len(x.value) > 0:
+                evicted_indices.extend(x.value.tolist())
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -585,6 +631,17 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        # Record eviction for debugging
+        if num_evicted > 0:
+            self.eviction_history.append(
+                EvictionRecord(
+                    timestamp=eviction_ts,
+                    evicted_indices=evicted_indices,
+                    num_tokens=num_evicted,
+                    reason="memory_pressure",
+                )
+            )
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)

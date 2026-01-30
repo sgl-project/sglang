@@ -1904,6 +1904,83 @@ class GetLoadsReqOutput(BaseReq):
 
 
 @dataclass
+class KVCacheTreeInfo:
+    """Radix tree cache state."""
+
+    total_size: int  # Total cached tokens
+    evictable_size: int  # Tokens that can be evicted (ref_count=0)
+    protected_size: int  # Tokens locked from eviction
+    pretty_print: str  # Human-readable tree structure
+
+
+@dataclass
+class KVCacheMemoryInfo:
+    """Memory pool state."""
+
+    available_slots: int  # Free slots in pool
+    used_slots: int  # Occupied slots
+    total_slots: int  # Total capacity
+    kv_cache_bytes: int  # Memory usage in bytes
+    token_capacity: int  # Max tokens
+
+
+@dataclass
+class KVCacheRequestInfo:
+    """Per-request cache info."""
+
+    request_id: str
+    req_pool_idx: int  # Index in req_to_token pool
+    kv_indices: List[int]  # Actual KV cache slot indices
+    num_tokens: int  # Token count for this request
+    prefix_len: int  # Prefix cache hit length
+    prefix_lookup_ts: Optional[float] = None  # When cache lookup happened
+    state: str = "unknown"  # prefill/decode/finished
+
+
+@dataclass
+class KVCacheEvictionInfo:
+    """Info about a recent eviction event."""
+
+    timestamp: float  # When eviction happened
+    evicted_indices: List[int]  # KV cache slot indices that were evicted
+    num_tokens: int  # Number of tokens evicted
+    reason: str  # memory_pressure, explicit_flush, etc.
+
+
+@dataclass
+class GetKVCacheStateReqInput(BaseReq):
+    """Request to get KV cache state."""
+
+    VALID_SECTIONS = frozenset({"tree", "memory", "requests", "evictions", "all"})
+
+    include: List[str] = field(default_factory=lambda: ["all"])
+    request_ids: Optional[List[str]] = None  # Filter specific requests
+    max_evictions: int = 100  # Max number of recent evictions to return
+
+    def __post_init__(self):
+        """Validate include sections."""
+        if self.include:
+            invalid = set(self.include) - self.VALID_SECTIONS
+            if invalid:
+                raise ValueError(
+                    f"Invalid include sections: {invalid}. "
+                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
+                )
+
+
+@dataclass
+class GetKVCacheStateReqOutput(BaseReq):
+    """KV cache state response."""
+
+    dp_rank: int
+    timestamp: float
+    tree: Optional[KVCacheTreeInfo] = None
+    memory: Optional[KVCacheMemoryInfo] = None
+    requests: Optional[List[KVCacheRequestInfo]] = None
+    recent_evictions: Optional[List[KVCacheEvictionInfo]] = None
+
+
+@dataclass
 class WatchLoadUpdateReq(BaseReq):
     loads: List[GetLoadReqOutput]
 
