@@ -311,7 +311,7 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.seq_lens_list_cumsum = seq_lens_list_cumsum
             self.forward_metadata.seq_lens = forward_batch.seq_lens
             self.forward_metadata.seq_lens_cum_sum = torch.cumsum(
-                forward_batch.deq_lens, dim=0
+                forward_batch.seq_lens, dim=0
             )
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
@@ -910,7 +910,9 @@ class AscendAttnBackend(AttentionBackend):
                         )
                         attn_output = attn_output.transpose(1, 2).contiguous()
                         attn_output = (
-                            attn_output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+                            attn_output.reshape(
+                                -1, layer.tp_q_head_num * layer.v_head_dim
+                            )
                             .contiguous()
                             .squeeze(0)
                         )
