@@ -31,7 +31,6 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     Hunyuan3D2PipelineConfig,
-    Hunyuan3D21PipelineConfig,
     HunyuanConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -477,23 +476,15 @@ def _register_configs():
 
     from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
     from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
-        Hunyuan3DPipeline,
+        Hunyuan3D2Pipeline,
     )
 
     # Hunyuan3D-2.0
     register_configs(
         sampling_param_cls=Hunyuan3DSamplingParams,
         pipeline_config_cls=Hunyuan3D2PipelineConfig,
-        pipeline_cls=Hunyuan3DPipeline,
+        pipeline_cls=Hunyuan3D2Pipeline,
         hf_model_paths=["tencent/Hunyuan3D-2"],
-    )
-
-    # Hunyuan3D-2.1
-    register_configs(
-        sampling_param_cls=Hunyuan3DSamplingParams,
-        pipeline_config_cls=Hunyuan3D21PipelineConfig,
-        pipeline_cls=Hunyuan3DPipeline,
-        hf_model_paths=["tencent/Hunyuan3D-2.1"],
     )
 
     # Wan

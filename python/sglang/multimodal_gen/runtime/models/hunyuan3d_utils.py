@@ -1,7 +1,7 @@
 # Hunyuan 3D is licensed under the TENCENT HUNYUAN NON-COMMERCIAL LICENSE AGREEMENT
 # except for the third-party components listed below.
 # Hunyuan 3D does not impose any additional limitations beyond what is outlined
-# in the repsective licenses of these third-party components.
+# in the respective licenses of these third-party components.
 # Users must comply with all terms and conditions of original licenses of these third-party
 # components and must ensure that the usage of the third party components adheres to
 # all relevant laws and regulations.
@@ -12,7 +12,8 @@
 # fine-tuning enabling code and other elements of the foregoing made publicly available
 # by Tencent in accordance with TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT.
 """
-Image processors for image-to-mesh (I2M) pipelines.
+Copied and adepted from https://github.com/Tencent-Hunyuan/Hunyuan3D-2
+Hunyuan3D utility classes and image processors for image-to-mesh (I2M) pipelines.
 """
 
 import cv2
@@ -31,13 +32,21 @@ def array_to_tensor(np_array):
 
 
 class ImageProcessorV2:
+    """Image processor for Hunyuan3D single-view input."""
+
+    # External module path aliases for compatibility with Hunyuan3D configs
+    _aliases = [
+        "hy3dshape.preprocessors.ImageProcessorV2",
+        "hy3dgen.shapegen.preprocessors.ImageProcessorV2",
+    ]
+
     def __init__(self, size=512, border_ratio=None):
         self.size = size
         self.border_ratio = border_ratio
 
     @staticmethod
     def recenter(image, border_ratio: float = 0.2):
-        """ recenter an image to leave some empty space at the image border.
+        """recenter an image to leave some empty space at the image border.
 
         Args:
             image (ndarray): input image, float/uint8 [H, W, 3/4]
@@ -123,9 +132,15 @@ class ImageProcessorV2:
 
 
 class MVImageProcessorV2(ImageProcessorV2):
-    """
+    """Multi-view image processor for Hunyuan3D.
+
     View order: front, front clockwise 90, back, front clockwise 270.
     """
+
+    # External module path aliases for compatibility with Hunyuan3D configs
+    _aliases = [
+        "hy3dshape.preprocessors.MVImageProcessorV2",
+    ]
 
     return_view_idx = True
 
@@ -164,3 +179,26 @@ IMAGE_PROCESSORS = {
 }
 
 DEFAULT_IMAGEPROCESSOR = "v2"
+
+
+# All tool classes available in this module for resolution
+TOOL_CLASSES = (
+    ImageProcessorV2,
+    MVImageProcessorV2,
+)
+
+
+def resolve_hunyuan3d_tool(target: str):
+    """Resolve a Hunyuan3D tool class by target string."""
+    # First, try to match against _aliases
+    for cls in TOOL_CLASSES:
+        aliases = getattr(cls, "_aliases", [])
+        if target in aliases:
+            return cls
+
+    # Then, try to match against class names
+    for cls in TOOL_CLASSES:
+        if cls.__name__ == target:
+            return cls
+
+    return None
