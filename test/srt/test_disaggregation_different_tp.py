@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -13,6 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
     try_cached_model,
 )
+
+register_cuda_ci(est_time=600, suite="stage-c-test-8-gpu-h20")
 
 
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):

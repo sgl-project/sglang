@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -10,6 +11,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     try_cached_model,
 )
+
+register_cuda_ci(est_time=280, suite="stage-c-test-4-gpu-b200")
 
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 
