@@ -16,7 +16,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_allocation_symmetric,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -272,11 +271,9 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     # step1
     max_len = (total_len + attn_tp_size - 1) // attn_tp_size
     pad_size = max_len - input_.shape[0]
-    with use_symmetric_memory(
-        get_attention_tp_group(), disabled=not is_allocation_symmetric()
-    ):
-        if pad_size > 0:
-            input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
+    if pad_size > 0:
+        input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
+    with use_symmetric_memory(get_attention_tp_group()):
         input_tensor_all = torch.empty(
             max_len * attn_tp_size,
             input_.shape[1],
@@ -331,9 +328,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     |   +-------------------------+
     """
     if is_nsa_prefill_cp_round_robin_split():
-        with use_symmetric_memory(
-            get_attention_tp_group(), disabled=not is_allocation_symmetric()
-        ):
+        with use_symmetric_memory(get_attention_tp_group()):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
             )
