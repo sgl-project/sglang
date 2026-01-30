@@ -1177,11 +1177,49 @@ def validate_cache_lightweight(
             logger.debug("Failed to validate index file %s: %s", index_path, e)
             return False
     else:
-        # No index file, check for at least one shard
-        # *.safetensors already covers model-*.safetensors pattern
-        has_shards = bool(glob_module.glob(os.path.join(snapshot_dir, "*.safetensors")))
-        if not has_shards:
+        # No index file - check for weight files and validate shard completeness
+        safetensors_files = glob_module.glob(
+            os.path.join(snapshot_dir, "*.safetensors")
+        )
+        if not safetensors_files:
             return False
+
+        # Check shard completeness for sharded models (e.g., model-00001-of-00047.safetensors)
+        # Pattern: prefix-NNNNN-of-NNNNN.safetensors
+        shard_pattern = re.compile(r"(.*?)-(\d+)-of-(\d+)\.safetensors$")
+        shard_groups = {}
+
+        for f in safetensors_files:
+            base_name = os.path.basename(f)
+            match = shard_pattern.match(base_name)
+            if match:
+                prefix = match.group(1)
+                shard_id = int(match.group(2))
+                total_shards = int(match.group(3))
+                group_key = f"{prefix}-of-{total_shards}"
+
+                if group_key not in shard_groups:
+                    shard_groups[group_key] = {
+                        "total": total_shards,
+                        "found_shards": set(),
+                    }
+                shard_groups[group_key]["found_shards"].add(shard_id)
+
+        # Validate each shard group has all expected shards
+        for group_key, group_info in shard_groups.items():
+            total_shards = group_info["total"]
+            found_shards = group_info["found_shards"]
+            expected_shards = set(range(1, total_shards + 1))
+            missing_shards = expected_shards - found_shards
+
+            if missing_shards:
+                logger.debug(
+                    "Shard validation failed: missing shards %s in %s for %s",
+                    sorted(missing_shards),
+                    group_key,
+                    snapshot_dir,
+                )
+                return False
 
     # Check hf_quant_config.json if required (for modelopt quantization)
     if requires_hf_quant_config:
