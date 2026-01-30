@@ -11,7 +11,11 @@ from compressed_tensors import CompressionFormat
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A16Int4DynamicMoEMethod,
 )
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
@@ -31,7 +35,11 @@ if TYPE_CHECKING:
     )
 
 
-__all__ = ["CompressedTensorsWNA16MoE", "NPUCompressedTensorsW4A16Int4DynamicMoE"]
+__all__ = [
+    "CompressedTensorsWNA16MoE",
+    "CompressedTensorsWNA16TritonMoE",
+    "NPUCompressedTensorsW4A16Int4DynamicMoE",
+]
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -402,6 +410,70 @@ class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
         return StandardCombineInput(hidden_states=output)
 
 
+class CompressedTensorsWNA16TritonMoE(CompressedTensorsScheme):
+    """ROCm/HIP-compatible W4A16 MoE method using Triton kernels instead of Marlin.
+
+    Inherits weight creation from CompressedTensorsWNA16MoE but converts
+    weights to the uint8-packed format expected by the Triton fused MoE kernel
+    instead of the Marlin-specific format.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_triton_converted", False):
+            return
+
+        num_experts = layer.w13_weight_packed.shape[0]
+
+        # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
+        w13 = layer.w13_weight_packed.data
+        w13 = w13.transpose(1, 2).contiguous().view(torch.uint8)
+        layer.w13_weight_packed = torch.nn.Parameter(w13, requires_grad=False)
+
+        # Convert w2 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
+        w2 = layer.w2_weight_packed.data
+        w2 = w2.transpose(1, 2).contiguous().view(torch.uint8)
+        layer.w2_weight_packed = torch.nn.Parameter(w2, requires_grad=False)
+
+        # Convert w13 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w13_scale = layer.w13_weight_scale.data
+        w13_scale = w13_scale.transpose(1, 2).contiguous()
+        layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+
+        # Convert w2 scales: [E, K//group_size, N] -> [E, N, K//group_size]
+        w2_scale = layer.w2_weight_scale.data
+        w2_scale = w2_scale.transpose(1, 2).contiguous()
+        layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+
+        layer.is_triton_converted = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight_packed,
+            w2_weight=layer.w2_weight_packed,
+            use_int4_w4a16=True,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            block_shape=[0, self.group_size],
+        )
+        return self.runner.run(dispatch_output, quant_info)
+
+
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsScheme):
 
     def __init__(self, quantization_config) -> None:
@@ -419,7 +491,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsScheme):
         self.kernel = NPUW4A16Int4DynamicMoEMethod()
 
     # TODO: See if we can merge this method's logic
-    # with CompressedTensorsWNA16MoEMethod. Need more models and tests.
+    # with CompressedTensorsWNA16MoE. Need more models and tests.
     # @OrangeRedeng @TamirBaydasov
     def create_weights(
         self,
@@ -526,7 +598,7 @@ class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsScheme):
     ):
         self.moe_runner_config = moe_runner_config
 
-    def apply(
+    def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
