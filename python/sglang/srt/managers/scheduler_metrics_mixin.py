@@ -218,6 +218,8 @@ class SchedulerMetricsMixin:
             f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
             f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
+        else:
+            f += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
         logger.info(f)
 
@@ -383,8 +385,15 @@ class SchedulerMetricsMixin:
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 
+        graph_backend = defaultdict(
+            lambda: "cuda graph",
+            {
+                "cpu": "cpu graph",
+                "npu": "npu graph",
+            },
+        )
         msg += (
-            f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
+            f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )

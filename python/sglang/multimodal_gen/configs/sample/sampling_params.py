@@ -95,7 +95,7 @@ class SamplingParams:
         "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     )
     prompt_path: str | None = None
-    output_path: str = "outputs/"
+    output_path: str | None = None
     output_file_name: str | None = None
 
     # Batch info
@@ -126,6 +126,7 @@ class SamplingParams:
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
+    cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
     # TeaCache parameters
@@ -149,6 +150,8 @@ class SamplingParams:
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
+    # if True, suppress verbose logging for this request
+    suppress_logs: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -273,6 +276,11 @@ class SamplingParams:
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
 
+        if self.cfg_normalization is None:
+            self.cfg_normalization = 0.0
+        elif isinstance(self.cfg_normalization, bool):
+            self.cfg_normalization = 1.0 if self.cfg_normalization else 0.0
+
         if self.boundary_ratio is not None:
             if isinstance(self.boundary_ratio, bool) or not isinstance(
                 self.boundary_ratio, (int, float)
@@ -318,7 +326,7 @@ class SamplingParams:
 
         self.data_type = server_args.pipeline_config.task_type.data_type()
 
-        if server_args.output_path is not None:
+        if self.output_path is None and server_args.output_path is not None:
             self.output_path = server_args.output_path
             logger.debug(
                 f"Overriding output_path with server configuration: {self.output_path}"
@@ -417,14 +425,17 @@ class SamplingParams:
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
         from sglang.multimodal_gen.registry import get_model_info
 
-        model_info = get_model_info(model_path)
+        backend = kwargs.pop("backend", None)
+        model_info = get_model_info(model_path, backend=backend)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
-            sampling_params = SamplingParams.from_pretrained(model_path)
+            sampling_params = SamplingParams.from_pretrained(
+                model_path, backend=server_args.backend
+            )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
@@ -463,7 +474,9 @@ class SamplingParams:
                 # Re-raise if it's not a safetensors file issue
                 raise
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        user_kwargs = dict(kwargs)
+        user_kwargs.pop("diffusers_kwargs", None)
+        user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
@@ -638,6 +651,13 @@ class SamplingParams:
             type=float,
             default=SamplingParams.guidance_rescale,
             help="Guidance rescale factor",
+        )
+        parser.add_argument(
+            "--cfg-normalization",
+            type=float,
+            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
+            dest="cfg_normalization",
+            help=("CFG renormalization factor (for Z-Image). "),
         )
         parser.add_argument(
             "--boundary-ratio",
