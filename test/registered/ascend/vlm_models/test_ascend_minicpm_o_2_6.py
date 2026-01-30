@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.test.ascend.test_ascend_utils import MiniCPM_O_2_6_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import MINICPM_O_2_6_WEIGHTS_PATH
 from sglang.test.ascend.vlm_utils import TestVLMModels
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -14,7 +14,7 @@ class TestMiniCPMModelsO(TestVLMModels):
     [Test Target] openbmb/MiniCPM-o-2_6
     """
 
-    model = MiniCPM_O_2_6_WEIGHTS_PATH
+    model = MINICPM_O_2_6_WEIGHTS_PATH
     mmmu_accuracy = 0.2
 
     def test_vlm_mmmu_benchmark(self):

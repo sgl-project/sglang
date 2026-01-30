@@ -15,7 +15,7 @@ class TestOverlapSchedule(CustomTestCase):
     """
 
     def test_no_radix_attention_chunked_prefill(self):
-        metrics = run_mmlu_test(
+        run_mmlu_test(
             disable_radix_cache=True,
             chunked_prefill_size=128,
             disable_overlap=True,

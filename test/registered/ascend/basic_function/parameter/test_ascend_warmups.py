@@ -10,7 +10,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ascend.test_ascend_utils import MiniCPM_O_2_6_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import MINICPM_O_2_6_WEIGHTS_PATH
 
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
@@ -21,7 +21,7 @@ class TestAscendWarmups(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --warmups
     """
-    model = MiniCPM_O_2_6_WEIGHTS_PATH
+    model = MINICPM_O_2_6_WEIGHTS_PATH
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod

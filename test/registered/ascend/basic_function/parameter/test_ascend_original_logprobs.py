@@ -23,12 +23,11 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-from sglang.test.ascend.test_ascend_utils import Llama_3_2_1B_Instruct_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 
 # ------------------------- Configurable via env ------------------------- #
-MODEL_ID = Llama_3_2_1B_Instruct_WEIGHTS_PATH
+MODEL_ID = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 
 PROMPTS = [
     "Hello, my name is",
@@ -52,7 +51,7 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 class TestOriginalLogprob(unittest.TestCase):
-    """Testcase: Verify the behavior and log probability alignment of SGLang under two configurations of the environment variable `SGLANG_RETURN_ORIGINAL_LOGPROB` (True/False), 
+    """Testcase: Verify the behavior and log probability alignment of SGLang under two configurations of the environment variable `SGLANG_RETURN_ORIGINAL_LOGPROB` (True/False),
         by comparing SGLang's output with reference values from Hugging Face.
 
     [Test Category] Parameter
