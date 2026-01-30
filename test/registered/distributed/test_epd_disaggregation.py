@@ -602,6 +602,8 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("OPENAI_API_BASE", None)
         for process in [
             cls.process_lb,
             cls.process_decode,
