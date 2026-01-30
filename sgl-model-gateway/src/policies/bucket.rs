@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{
-    get_healthy_worker_indices, normalize_model_key, BucketConfig, LoadBalancingPolicy,
+    get_healthy_worker_indices, normalize_model_key, BucketConfig, DPLoadManager, LoadBalancingPolicy,
     SelectWorkerInfo,
 };
 use crate::core::Worker;
@@ -22,6 +22,7 @@ pub struct BucketPolicy {
     config: BucketConfig,
     buckets: Arc<DashMap<String, Arc<RwLock<Bucket>>>>,
     adjustment_handle: Option<thread::JoinHandle<()>>,
+    dp_load_manager: DPLoadManager,
 }
 
 impl Default for BucketPolicy {
@@ -76,6 +77,7 @@ impl BucketPolicy {
             config,
             buckets,
             adjustment_handle,
+            dp_load_manager: DPLoadManager::new(),
         }
     }
 
@@ -306,6 +308,18 @@ impl LoadBalancingPolicy for BucketPolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+        self.dp_load_manager.update_dp_loads(loads);
+    }
+
+    fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
+        self.dp_load_manager.get_lowest_dp_load(worker)
+    }
+
+    fn load_increment(&self, worker: &dyn Worker, dp_rank: isize, tokens: isize) {
+        self.dp_load_manager.load_increment(worker, dp_rank, tokens);
     }
 }
 
