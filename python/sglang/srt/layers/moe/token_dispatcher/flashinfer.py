@@ -19,6 +19,10 @@ from sglang.srt.layers.moe.token_dispatcher.flashinfer_utils import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_scale_enabled,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
@@ -187,6 +191,11 @@ class FlashinferDispatcher(BaseDispatcher):
             topk_weights = self.dummy_topk_weights
 
         global_scale = self.quant_config.get("input_global_scale", None)
+        if nvfp4_online_scale_enabled():
+            _, global_scale = nvfp4_compute_input_scale_and_inv(x)
+            self.last_input_scale_inv = global_scale
+        else:
+            self.last_input_scale_inv = None
         if global_scale is not None:
             if x.shape[0] > 0:
                 x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)

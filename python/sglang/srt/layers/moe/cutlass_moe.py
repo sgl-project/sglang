@@ -5,6 +5,10 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams
+from sglang.srt.layers.quantization.fp4_utils import (
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_scale_enabled,
+)
 from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 _is_cuda = is_cuda()
@@ -445,6 +449,13 @@ def cutlass_moe_fp4(
         params.blockscale_offsets,
     )
 
+    if nvfp4_online_scale_enabled():
+        orig_a1_gscale = a1_gscale
+        orig_w1_alphas = w1_alphas
+        input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(a)
+        a1_gscale = torch.full_like(orig_a1_gscale, input_scale_inv)
+        w1_alphas = input_scale * (orig_w1_alphas * orig_a1_gscale)
+
     rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
         a,
         a1_gscale,
@@ -470,6 +481,13 @@ def cutlass_moe_fp4(
         (m_a * num_topk, w1_fp4.shape[1] // 2), device=device, dtype=out_dtype
     )
     silu_and_mul(c1, intermediate)
+
+    if nvfp4_online_scale_enabled():
+        orig_a2_gscale = a2_gscale
+        orig_w2_alphas = w2_alphas
+        int_scale, int_scale_inv = nvfp4_compute_input_scale_and_inv(intermediate)
+        a2_gscale = torch.full_like(orig_a2_gscale, int_scale_inv)
+        w2_alphas = int_scale * (orig_w2_alphas * orig_a2_gscale)
 
     int_fp4, int_blockscale = scaled_fp4_experts_quant(
         intermediate,

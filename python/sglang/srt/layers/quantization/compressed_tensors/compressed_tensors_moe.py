@@ -38,6 +38,10 @@ from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
 )
+from sglang.srt.layers.quantization.fp4_utils import (
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_scale_enabled,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
@@ -503,10 +507,27 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
 
+        input_scale_inv = layer.w13_input_scale_quant
+        g1_alphas = layer.g1_alphas
+        g1_scale_c = layer.g1_scale_c
+        if nvfp4_online_scale_enabled():
+            input_scale, input_scale_inv_scalar = nvfp4_compute_input_scale_and_inv(x)
+            input_scale_inv = torch.full_like(
+                layer.w13_input_scale_quant, input_scale_inv_scalar
+            )
+            weight_scale_2 = layer.g1_alphas * layer.w13_input_scale_quant
+            g1_alphas = input_scale * weight_scale_2
+            w2_input_scale_quant = torch.where(
+                layer.g1_alphas != 0,
+                layer.g1_scale_c / layer.g1_alphas,
+                layer.g1_scale_c,
+            )
+            g1_scale_c = w2_input_scale_quant * g1_alphas
+
         # Quantize input hidden states using fp4_quantize
         hs_fp4_bytes, hs_sf_bytes = fp4_quantize(
             x,
-            layer.w13_input_scale_quant,
+            input_scale_inv,
             self.group_size,  # sf_vec_size
             False,  # use_ue8m0
             False,  # is_sf_swizzled_layout
@@ -562,8 +583,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 torch.float8_e4m3fn
             ),
             gemm2_bias=None,
-            output1_scale_scalar=layer.g1_scale_c,
-            output1_scale_gate_scalar=layer.g1_alphas,
+            output1_scale_scalar=g1_scale_c,
+            output1_scale_gate_scalar=g1_alphas,
             output2_scale_scalar=layer.g2_alphas,
             num_experts=layer.num_experts,
             top_k=topk_config.top_k,
