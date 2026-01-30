@@ -32,9 +32,10 @@ class TestVocabIntersectionMapper(unittest.TestCase):
         """Set up test fixtures."""
         # Draft vocab: tokens A, B, C, D with IDs 0, 1, 2, 3
         self.draft_vocab = {"A": 0, "B": 1, "C": 2, "D": 3}
-        # Target vocab: tokens A, B, E, F with IDs 10, 11, 12, 13
-        # Intersection: A, B (draft 0->target 10, draft 1->target 11)
-        self.target_vocab = {"A": 10, "B": 11, "E": 12, "F": 13}
+        # Target vocab: tokens B, A, E, F with IDs 0, 1, 2, 3
+        # Note: same tokens but different IDs (A is 0 in draft, 1 in target)
+        # Intersection: A, B (draft 0->target 1, draft 1->target 0)
+        self.target_vocab = {"B": 0, "A": 1, "E": 2, "F": 3}
 
         self.draft_tokenizer = MockTokenizer(self.draft_vocab)
         self.target_tokenizer = MockTokenizer(self.target_vocab)
@@ -65,8 +66,8 @@ class TestVocabIntersectionMapper(unittest.TestCase):
         draft_tokens = torch.tensor([0, 1], device=self.device)  # A, B
         target_tokens = mapper.map_draft_to_target(draft_tokens)
 
-        self.assertEqual(target_tokens[0].item(), 10)  # A: 0 -> 10
-        self.assertEqual(target_tokens[1].item(), 11)  # B: 1 -> 11
+        self.assertEqual(target_tokens[0].item(), 1)  # A: draft 0 -> target 1
+        self.assertEqual(target_tokens[1].item(), 0)  # B: draft 1 -> target 0
 
     def test_target_to_draft_mapping(self):
         """Test mapping from target vocab to draft vocab."""
@@ -75,11 +76,11 @@ class TestVocabIntersectionMapper(unittest.TestCase):
         )
 
         # Map target tokens to draft tokens
-        target_tokens = torch.tensor([10, 11], device=self.device)  # A, B
+        target_tokens = torch.tensor([1, 0], device=self.device)  # A, B
         draft_tokens = mapper.map_target_to_draft(target_tokens)
 
-        self.assertEqual(draft_tokens[0].item(), 0)  # A: 10 -> 0
-        self.assertEqual(draft_tokens[1].item(), 1)  # B: 11 -> 1
+        self.assertEqual(draft_tokens[0].item(), 0)  # A: target 1 -> draft 0
+        self.assertEqual(draft_tokens[1].item(), 1)  # B: target 0 -> draft 1
 
     def test_target_to_draft_fallback(self):
         """Test fallback for tokens not in intersection."""
@@ -87,8 +88,8 @@ class TestVocabIntersectionMapper(unittest.TestCase):
             self.draft_tokenizer, self.target_tokenizer, device=self.device
         )
 
-        # Token E (12) is not in intersection, should return fallback_id (default 0)
-        target_tokens = torch.tensor([12], device=self.device)  # E
+        # Token E (target ID 2) is not in intersection, should return fallback_id
+        target_tokens = torch.tensor([2], device=self.device)  # E
         draft_tokens = mapper.map_target_to_draft(target_tokens, fallback_id=0)
 
         self.assertEqual(draft_tokens[0].item(), 0)
