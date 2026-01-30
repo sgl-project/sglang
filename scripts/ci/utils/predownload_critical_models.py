@@ -83,7 +83,13 @@ def predownload_model(model_id: str) -> bool:
             repo_id=model_id,
             # Don't download all files, just the essential ones for model loading
             # This avoids downloading README, etc.
-            allow_patterns=["*.json", "*.safetensors", "*.model", "*.tiktoken", "*.txt"],
+            allow_patterns=[
+                "*.json",
+                "*.safetensors",
+                "*.model",
+                "*.tiktoken",
+                "*.txt",
+            ],
             # Ignore large files that might not be needed
             ignore_patterns=["*.bin", "*.msgpack", "*.h5", "*.ot", "consolidated*"],
         )
