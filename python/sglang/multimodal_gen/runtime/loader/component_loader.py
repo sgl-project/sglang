@@ -961,6 +961,19 @@ class TransformerLoader(ComponentLoader):
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
 
+        print('PROCESS WEIGHTS')
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                quant_method.process_weights_after_loading(module)
+                torch.npu.empty_cache()
+
         assert (
             next(model.parameters()).dtype == default_dtype
         ), "Model dtype does not match default dtype"
