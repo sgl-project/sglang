@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
 
 import torch
 
-from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+from sglang.srt.layers.moe.utils import (
+    MoeA2ABackend,
+    MoeRunnerBackend,
+    RoutingMethodType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import (
@@ -33,6 +37,7 @@ class MoeRunnerConfig:
     top_k: Optional[int] = None
     num_fused_shared_experts: Optional[int] = None
     params_dtype: Optional[torch.dtype] = None
+    routing_method_type: Optional[RoutingMethodType] = None
 
     # Runner configuration
     activation: str = "silu"
