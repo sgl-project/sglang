@@ -1550,7 +1550,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9-aarch64
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 30
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} IS_BLACKWELL=1 GRACE_BLACKWELL=1 bash scripts/ci/cuda/ci_install_deepep.sh
 

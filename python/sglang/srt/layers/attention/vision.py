@@ -596,6 +596,7 @@ class VisionAttention(nn.Module):
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
         use_data_parallel: bool = False,
+        use_dp_attention_reduce: bool = False,
         aux_stream: Optional[torch.cuda.Stream] = None,
         **kwargs,
     ):
@@ -688,6 +689,7 @@ class VisionAttention(nn.Module):
             tp_size=self.tp_size,
             reduce_results=False,
             prefix=add_prefix("proj", prefix),
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()] if aux_stream else []

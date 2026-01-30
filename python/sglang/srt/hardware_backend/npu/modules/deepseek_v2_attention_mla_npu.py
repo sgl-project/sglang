@@ -103,6 +103,10 @@ def forward_mha_prepare_npu(
         k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        # this is for model kimi-vl-a3B-instruct
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            m, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
+        )
 
     q[..., m.qk_nope_head_dim :] = q_pe
 
