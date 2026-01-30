@@ -97,7 +97,6 @@ class TestDeepseekV3FP4PiecewiseCudaGraph(CustomTestCase):
             "flashinfer_trtllm",
             "--quantization",
             "modelopt_fp4",
-            "--enable-piecewise-cuda-graph",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--model-loader-extra-config",

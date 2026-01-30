@@ -1,6 +1,10 @@
 import json
+import os
+import shutil
+import time
 import unittest
 import warnings
+from pathlib import Path
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -21,6 +25,27 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
+
+def _clear_model_cache():
+    """Remove downloaded models from HF hub cache to prevent disk exhaustion."""
+    cache_dir = os.environ.get("HF_HUB_CACHE") or os.environ.get(
+        "HUGGINGFACE_HUB_CACHE"
+    )
+    if not cache_dir:
+        return
+    cache_path = Path(cache_dir)
+    if not cache_path.exists():
+        return
+    # Give the killed process a moment to release file handles
+    time.sleep(2)
+    for entry in cache_path.iterdir():
+        if entry.name.startswith("models--") or entry.name.startswith("datasets--"):
+            try:
+                shutil.rmtree(entry)
+                print(f"[cleanup] Removed {entry.name}")
+            except OSError as e:
+                print(f"[cleanup] Failed to remove {entry.name}: {e}")
+
 
 MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-8B-Instruct": 0.82,
@@ -117,6 +142,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     print(f"Error evaluating {model_setup.model_path}: {error_message}")
                 finally:
                     kill_process_tree(process.pid)
+                    _clear_model_cache()
 
         try:
             with open("results.json", "r") as f:

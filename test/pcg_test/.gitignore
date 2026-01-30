@@ -1,0 +1,4 @@
+logs/
+logs_2gpu/
+logs_4gpu/
+plan/

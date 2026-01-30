@@ -26,7 +26,7 @@ import tqdm
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.compilation_config import CompilationConfig
-from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
+from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
@@ -254,7 +254,7 @@ class PiecewiseCudaGraphRunner:
                     graph_pool=get_global_graph_memory_pool(),
                 )
 
-                with set_compiled(True), enable_piecewise_cuda_graph_compile():
+                with enable_piecewise_cuda_graph_compile():
                     compile_range = (
                         tqdm.tqdm(list(reversed(self.capture_num_tokens)))
                         if get_tensor_model_parallel_rank() == 0
@@ -413,8 +413,7 @@ class PiecewiseCudaGraphRunner:
                             f"Capturing num tokens ({num_tokens=} {avail_mem=:.2f} GB)"
                         )
 
-                    with set_compiled(True):
-                        self.capture_one_batch_size(num_tokens)
+                    self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1
@@ -552,6 +551,13 @@ class PiecewiseCudaGraphRunner:
             self.out_cache_loc.zero_()
             if self.out_cache_loc_swa is not None:
                 self.out_cache_loc_swa.zero_()
+            self.input_ids[num_tokens:static_num_tokens].zero_()
+            self.positions[num_tokens:static_num_tokens].zero_()
+            if self.is_multimodal:
+                self.input_embeds[:, num_tokens:static_num_tokens].zero_()
+            if forward_batch.mrope_positions is not None:
+                self.mrope_positions[:, num_tokens:static_num_tokens].zero_()
+
         bs = forward_batch.batch_size
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -676,6 +682,7 @@ class PiecewiseCudaGraphRunner:
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
+            # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
@@ -685,13 +692,12 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
             ):
-                with set_compiled(True):
-                    output = self.model_runner.model.forward(
-                        static_forward_batch.input_ids,
-                        static_forward_batch.positions,
-                        static_forward_batch,
-                        **kwargs,
-                    )
+                output = self.model_runner.model.forward(
+                    static_forward_batch.input_ids,
+                    static_forward_batch.positions,
+                    static_forward_batch,
+                    **kwargs,
+                )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[

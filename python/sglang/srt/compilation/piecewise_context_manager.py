@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _in_piecewise_cuda_graph = False
 _in_pcg_torch_compile = False
@@ -51,23 +54,11 @@ def set_pcg_capture_stream(stream: torch.cuda.Stream):
 
 @dataclass
 class ForwardContext:
-    def __init__(self):
-        self.forward_batch = None
-        self.attention_layer = None
-        self.quant_config = None
-        self.moe_layers = None
-
-    def set_forward_batch(self, forward_batch: ForwardBatch):
+    def __init__(self, forward_batch: ForwardBatch, attention_layers: List[Any], quant_config: Any, moe_layers: List[Any]):
         self.forward_batch = forward_batch
-
-    def set_attention_layers(self, layers: List[Any]):
-        self.attention_layers = layers
-
-    def set_quant_config(self, quant_config: Any):
+        self.attention_layers = attention_layers
         self.quant_config = quant_config
-
-    def set_moe_layers(self, layers: List[Any]):
-        self.moe_layers = layers
+        self.moe_layers = moe_layers
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -87,11 +78,12 @@ def set_forward_context(
     moe_layers: List[Any],
 ):
     global _forward_context
-    _forward_context = ForwardContext()
-    _forward_context.set_forward_batch(forward_batch)
-    _forward_context.set_attention_layers(attention_layers)
-    _forward_context.set_quant_config(quant_config)
-    _forward_context.set_moe_layers(moe_layers)
+    _forward_context = ForwardContext(
+        forward_batch=forward_batch,
+        attention_layers=attention_layers,
+        quant_config=quant_config,
+        moe_layers=moe_layers,
+    )
     try:
         yield
     finally:

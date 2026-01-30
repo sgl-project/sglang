@@ -1557,6 +1557,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
         return True
 
+
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
@@ -2046,10 +2047,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
-        if (
-            not self.server_args.enable_piecewise_cuda_graph
-            or not self.can_run_piecewise_cuda_graph()
-        ):
+        if self.server_args.disable_piecewise_cuda_graph:
             return
 
         # Collect attention layers and moe layers from the model

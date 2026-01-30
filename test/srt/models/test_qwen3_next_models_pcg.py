@@ -39,9 +39,9 @@ class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
             other_args=[
                 "--tp",
                 "4",
-                "--enable-piecewise-cuda-graph",
-                "--piecewise-cuda-graph-compiler",
-                "eager",
+                # "--enable-piecewise-cuda-graph",
+                # "--piecewise-cuda-graph-compiler",
+                # "eager",
             ],
         )
 

@@ -12,9 +12,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration - 2-GPU tests (80GB GPUs required)
-register_cuda_ci(
-    est_time=160, suite="stage-b-test-large-2-gpu", disabled="see issue #16691"
-)
+register_cuda_ci(est_time=160, suite="stage-b-test-large-2-gpu")
 
 
 class TestPiecewiseCudaGraphTP(CustomTestCase):
@@ -29,7 +27,6 @@ class TestPiecewiseCudaGraphTP(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-piecewise-cuda-graph",
                 "--piecewise-cuda-graph-compiler",
                 "eager",
                 "--tp",

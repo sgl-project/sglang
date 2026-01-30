@@ -593,7 +593,7 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
-    enable_piecewise_cuda_graph: bool = False
+    disable_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
     torch_compile_max_bs: int = 32
     piecewise_cuda_graph_max_tokens: Optional[int] = None
@@ -719,6 +719,9 @@ class ServerArgs:
         self._handle_hpu_backends()
         self._handle_cpu_backends()
         self._handle_npu_backends()
+
+        # Handle piecewise CUDA graph.
+        self._handle_piecewise_cuda_graph()
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
@@ -893,6 +896,34 @@ class ServerArgs:
                 )
                 self.piecewise_cuda_graph_compiler = "eager"
 
+    def _handle_piecewise_cuda_graph(self):
+        # Disable piecewise cuda graph with following conditions:
+        # 1. Speculative decoding
+        if self.speculative_algorithm is not None:
+            self.disable_piecewise_cuda_graph = True
+        # 2. DP attention
+        if self.enable_dp_attention:
+            self.disable_piecewise_cuda_graph = True
+        # 3. Torch compile
+        if self.enable_torch_compile:
+            self.disable_piecewise_cuda_graph = True
+        # 4. Pipeline parallelism
+        if self.pp_size > 1:
+            self.disable_piecewise_cuda_graph = True
+        # 5. Non-CUDA hardware (AMD, NPU, etc.)
+        if is_hip() or is_npu():
+            self.disable_piecewise_cuda_graph = True
+        # 6. MoE A2A backend
+        if self.moe_a2a_backend != "none":
+            self.disable_piecewise_cuda_graph = True
+        # 7. LoRA
+        if self.lora_paths or self.enable_lora:
+            self.disable_piecewise_cuda_graph = True
+        # 8. Multimodal / VLM models
+        if self.get_model_config().is_multimodal:
+            self.disable_piecewise_cuda_graph = True
+        
+
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
@@ -1026,7 +1057,7 @@ class ServerArgs:
                     reserved_mem += self.cuda_graph_max_bs * self.dp_size * 1.5
 
             # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
+            if not self.disable_piecewise_cuda_graph:
                 # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
                 reserved_mem += len(self.piecewise_cuda_graph_tokens) * 8
 
@@ -1253,7 +1284,7 @@ class ServerArgs:
 
             else:
                 # DeepSeek V3/R1/V3.1
-                if self.enable_piecewise_cuda_graph:
+                if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
                 if is_sm100_supported():
@@ -1350,7 +1381,7 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             if self.moe_runner_backend == "auto":
-                if self.enable_piecewise_cuda_graph:
+                if not self.disable_piecewise_cuda_graph:
                     self.moe_runner_backend = "auto"
                     logger.warning(
                         "Enable piecewise CUDA graph, enabling auto MOE kernel."
@@ -2447,7 +2478,7 @@ class ServerArgs:
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
-            if not self.enable_piecewise_cuda_graph:
+            if self.disable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
@@ -4379,9 +4410,9 @@ class ServerArgs:
             help="Enable debug mode for torch compile",
         )
         parser.add_argument(
-            "--enable-piecewise-cuda-graph",
+            "--disable-piecewise-cuda-graph",
             action="store_true",
-            help="Optimize the model with piecewise cuda graph for extend/prefill only. Experimental feature.",
+            help="Disable piecewise cuda graph for extend/prefill.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-tokens",
