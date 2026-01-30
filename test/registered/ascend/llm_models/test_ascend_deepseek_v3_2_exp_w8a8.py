@@ -8,7 +8,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
 
-class TestDeepSeek(GSM8KAscendMixin, CustomTestCase):
+class TestDeepSeekV32(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the vllm-ascend/DeepSeek-V3.2-Exp-W8A8 model on the GSM8K dataset is no less than 0.5.
 
     [Test Category] Model

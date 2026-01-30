@@ -7,7 +7,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
-class TestGemmaModels(TestVLMModels):
+class TestGemma34bModels(TestVLMModels):
     """Testcase: Verify that the inference accuracy of the google/gemma-3-4b-it model on the MMMU dataset is no less than 0.2.
 
     [Test Category] Model
