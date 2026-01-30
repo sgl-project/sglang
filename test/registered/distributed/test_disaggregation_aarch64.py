@@ -1,30 +1,28 @@
+import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     popen_launch_pd_server,
-    try_cached_model,
 )
 
+register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-gb200")
 
-class TestDisaggregationDPAttention(PDDisaggregationServerBase):
-    PREFILL_DP_SIZE = 4
-    DECODE_DP_SIZE = 4
 
+class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        # Temporarily disable JIT DeepGEMM
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+        os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "true"
+        os.environ["MC_FORCE_MNNVL"] = "true"
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
 
         # Non blocking start servers
         cls.start_prefill()
@@ -37,16 +35,19 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         cls.launch_lb()
 
     @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL")
+        os.environ.pop("MC_FORCE_MNNVL")
+        super().tearDownClass()
+
+    @classmethod
     def start_prefill(cls):
         prefill_args = [
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
             "--tp",
-            str(cls.PREFILL_DP_SIZE),
-            "--dp",
-            str(cls.PREFILL_DP_SIZE),
-            "--enable-dp-attention",
+            "2",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -63,12 +64,9 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
             "--disaggregation-mode",
             "decode",
             "--tp",
-            str(cls.DECODE_DP_SIZE),
-            "--dp",
-            str(cls.DECODE_DP_SIZE),
-            "--enable-dp-attention",
+            "2",
             "--base-gpu-id",
-            str(cls.PREFILL_DP_SIZE),
+            "2",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -82,7 +80,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=1400,
+            num_questions=200,
             max_new_tokens=512,
             parallel=128,
             host=f"http://{self.base_host}",
@@ -91,7 +89,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.60)
+        self.assertGreater(metrics["accuracy"], 0.62)
 
 
 if __name__ == "__main__":

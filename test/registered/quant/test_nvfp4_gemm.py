@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,10 +12,12 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
+register_cuda_ci(est_time=360, suite="stage-c-test-4-gpu-b200")
+
+MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
 
-class FP8BlockwiseGemmBase:
+class FP4GemmBase:
     backend = None
 
     @classmethod
@@ -25,7 +28,9 @@ class FP8BlockwiseGemmBase:
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--fp8-gemm-backend",
+            "--quantization",
+            "modelopt_fp4",
+            "--fp4-gemm-backend",
             cls.backend,
         ]
         cls.process = popen_launch_server(
@@ -42,7 +47,7 @@ class FP8BlockwiseGemmBase:
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=8,
+            num_shots=5,
             data_path=None,
             num_questions=1319,
             max_new_tokens=512,
@@ -53,19 +58,26 @@ class FP8BlockwiseGemmBase:
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreaterEqual(metrics["accuracy"], 0.41)
-
-
-class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, unittest.TestCase):
-    backend = "triton"
-
-
-class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
-    backend = "deep_gemm"
+        self.assertGreater(metrics["accuracy"], 0.64)
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, unittest.TestCase):
+class TestFP4GemmAuto(FP4GemmBase, unittest.TestCase):
+    backend = "auto"
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestFP4GemmFlashinferCutlass(FP4GemmBase, unittest.TestCase):
+    backend = "flashinfer_cutlass"
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestFP4GemmFlashinferCudnn(FP4GemmBase, unittest.TestCase):
+    backend = "flashinfer_cudnn"
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
     backend = "flashinfer_trtllm"
 
 

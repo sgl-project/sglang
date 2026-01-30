@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper,
@@ -16,15 +17,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+register_cuda_ci(est_time=350, suite="stage-c-test-4-gpu-h100")
+
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
 ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
-}
-
-# MTP has higher KL divergence threshold
-ACC_THRESHOLDS_MTP = {
-    QWEN3_NEXT_MODEL: {"kl_div": 0.008, "gsm8k": 0.93},
 }
 
 
@@ -41,7 +39,7 @@ def send_request_helper(base_url: str, text: str):
     return response.json()
 
 
-class TestQwen3NextMTP(CustomTestCase):
+class TestQwen3Next(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = QWEN3_NEXT_MODEL
@@ -51,23 +49,14 @@ class TestQwen3NextMTP(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--trust-remote-code",
-                "--speculative-algorithm",
-                "NEXTN",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-                "--tp",
+                "--tp-size",
                 "4",
                 "--chunked-prefill-size",
                 "2048",
                 "--mamba-scheduler-strategy",
-                "no_buffer",
+                "extra_buffer",
+                "--mamba-track-interval",
+                "128",
             ],
         )
 
@@ -104,77 +93,6 @@ class TestQwen3NextMTP(CustomTestCase):
         test_input_output_logprobs_match_decode_cache_hit_helper(
             self.base_url,
             ACC_THRESHOLDS,
-            self.model,
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-
-class TestQwen3NextMTPTopk(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = QWEN3_NEXT_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--speculative-algorithm",
-                "NEXTN",
-                "--speculative-num-steps",
-                "5",
-                "--speculative-eagle-topk",
-                "4",
-                "--speculative-num-draft-tokens",
-                "8",
-                "--mem-fraction-static",
-                "0.8",
-                "--tp",
-                "4",
-                "--chunked-prefill-size",
-                "2048",
-                "--mamba-scheduler-strategy",
-                "extra_buffer",
-                "--mamba-track-interval",
-                "128",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-        self.assertGreaterEqual(
-            metrics["accuracy"], ACC_THRESHOLDS_MTP[self.model]["gsm8k"]
-        )
-
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        test_input_output_logprobs_match_prefill_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS_MTP,
-            self.model,
-            max_samples=32,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        test_input_output_logprobs_match_decode_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS_MTP,
             self.model,
             max_samples=32,
             max_new_tokens=512,

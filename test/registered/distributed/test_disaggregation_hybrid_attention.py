@@ -1,24 +1,26 @@
-import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    is_in_ci,
     popen_launch_pd_server,
-    try_cached_model,
 )
 
+register_cuda_ci(est_time=400, suite="stage-c-test-8-gpu-h200", disabled="TCP fallback flaky")
 
-class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
+
+@unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
+class TestDisaggregationHybridAttentionMamba(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -36,11 +38,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--tp-size",
-            "2",
-            "--pp-size",
-            "2",
-            "--disable-overlap-schedule",
+            "--tp",
+            "4",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -56,8 +55,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--tp-size",
-            "2",
+            "--tp",
+            "4",
             "--base-gpu-id",
             "4",
         ]
@@ -79,19 +78,17 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
-        # Wait a little bit so that the memory check happens.
-        time.sleep(5)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
+class TestDisaggregationHybridAttentionMambaExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -109,12 +106,10 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--tp-size",
-            "2",
-            "--pp-size",
-            "2",
-            "--disable-overlap-schedule",
-            "--enable-dynamic-chunking",
+            "--tp",
+            "4",
+            "--mamba-scheduler-strategy",
+            "extra_buffer",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -130,10 +125,12 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--tp-size",
-            "2",
+            "--tp",
+            "4",
             "--base-gpu-id",
             "4",
+            "--mamba-scheduler-strategy",
+            "extra_buffer",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -153,19 +150,23 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
-        # Wait a little bit so that the memory check happens.
-        time.sleep(5)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
-class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
+@unittest.skipIf(
+    is_in_ci(),
+    "Temporarily disable the flaky test: tcp fallback is not stable currently.",
+)
+class TestDisaggregationHybridAttentionMambaDPDecode(PDDisaggregationServerBase):
+    """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
         # Non blocking start servers
         cls.start_prefill()
@@ -183,11 +184,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
-            "--tp-size",
+            "--tp",
             "2",
-            "--pp-size",
-            "2",
-            "--disable-overlap-schedule",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -203,12 +201,14 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
-            "--tp-size",
+            "--tp",
             "2",
-            "--pp-size",
+            "--dp",
             "2",
+            "--enable-dp-attention",
+            "--enable-dp-lm-head",
             "--base-gpu-id",
-            "4",
+            "2",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -228,12 +228,10 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             host=f"http://{self.base_host}",
             port=int(self.lb_port),
         )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
-        # Wait a little bit so that the memory check happens.
-        time.sleep(5)
+        self.assertGreater(metrics["accuracy"], 0.93)
 
 
 if __name__ == "__main__":
