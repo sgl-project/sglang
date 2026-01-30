@@ -43,6 +43,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 "1",
                 "--log-level",
                 "debug",
+                "--disable-cuda-graph",  # See https://github.com/sgl-project/sglang/issues/18002
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -99,8 +100,8 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        # TODO: should be much higher.
-        self.assertGreater(metrics["accuracy"], 0.01)
+        # Qwen/Qwen3-8B hits >0.9 as well.
+        self.assertGreater(metrics["accuracy"], 0.6)
 
 
 class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
@@ -126,5 +127,4 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        # TODO: should be much higher.
-        self.assertGreater(metrics["accuracy"], 0.02)
+        self.assertGreater(metrics["accuracy"], 0.6)
