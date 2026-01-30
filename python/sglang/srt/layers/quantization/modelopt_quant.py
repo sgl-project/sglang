@@ -1168,6 +1168,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.input_scale_inv = Parameter(
             (1 / input_scale_2).to(torch.float32), requires_grad=False
         )
+        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
+        layer.nvfp4_online_input_scale = torch.empty(
+            (), dtype=torch.float32, device=layer.weight.device
+        )
+        layer.nvfp4_online_input_scale_inv = torch.empty(
+            (), dtype=torch.float32, device=layer.weight.device
+        )
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -1228,7 +1235,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         input_scale_inv = layer.input_scale_inv
         alpha = layer.alpha
         if nvfp4_online_scale_enabled():
-            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+            input_scale = layer.nvfp4_online_input_scale
+            input_scale_inv = layer.nvfp4_online_input_scale_inv
+            nvfp4_compute_input_scale_and_inv(x, input_scale, input_scale_inv)
             alpha = input_scale * layer.weight_scale_2
 
         x_fp4, x_scale_interleaved = fp4_quantize(x, input_scale_inv)
@@ -1652,6 +1661,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale_quant
         )
         layer.nvfp4_online_g1_alphas = torch.empty_like(layer.g1_alphas)
+        layer.nvfp4_online_input_scale = torch.empty(
+            (), dtype=torch.float32, device=layer.w13_input_scale_quant.device
+        )
+        layer.nvfp4_online_input_scale_inv = torch.empty(
+            (), dtype=torch.float32, device=layer.w13_input_scale_quant.device
+        )
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -1703,7 +1718,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     layer.dispatcher, "last_input_scale_inv", None
                 )
                 if input_scale_inv is None:
-                    _, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+                    input_scale = layer.nvfp4_online_input_scale
+                    input_scale_inv = layer.nvfp4_online_input_scale_inv
+                    nvfp4_compute_input_scale_and_inv(x, input_scale, input_scale_inv)
                 if hasattr(layer, "nvfp4_online_w13_input_scale_quant"):
                     w13_input_scale_quant = layer.nvfp4_online_w13_input_scale_quant
                     w13_input_scale_quant.copy_(

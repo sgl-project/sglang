@@ -141,6 +141,18 @@ class CutlassMoEParams:
         )
         # Preallocate NVFP4 online-scale buffers to avoid allocations during cuda graph capture.
         if self.cutlass_moe_type == CutlassMoEType.BlockscaledFP4:
+            self.online_input_scale = torch.empty(
+                (), dtype=torch.float32, device=self.device
+            )
+            self.online_input_scale_inv = torch.empty(
+                (), dtype=torch.float32, device=self.device
+            )
+            self.online_intermediate_scale = torch.empty(
+                (), dtype=torch.float32, device=self.device
+            )
+            self.online_intermediate_scale_inv = torch.empty(
+                (), dtype=torch.float32, device=self.device
+            )
             self.online_a1_gscale = torch.empty(
                 (self.e,), dtype=torch.float32, device=self.device
             )
