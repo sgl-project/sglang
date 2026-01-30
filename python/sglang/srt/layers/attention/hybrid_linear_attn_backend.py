@@ -1,6 +1,5 @@
 import logging
 import os
-from contextlib import nullcontext
 from typing import Optional, Union
 
 import torch
@@ -44,7 +43,6 @@ def _get_cutedsl_gdn_verify():
 # Lazy import for FlashInfer GDN prefill kernel
 _flashinfer_gdn_prefill_available = None
 _flashinfer_chunk_gated_delta_rule = None
-_flashinfer_gdn_prefill_usage_logged = False
 
 
 def _get_flashinfer_gdn_prefill():
@@ -1029,10 +1027,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # K-last decode currently uses V-last Triton kernel.
             # Optimize K==V case with in-place transpose to avoid allocating V-last buffers.
             kv_same = head_k_dim == head_v_dim
-            disable_k_last_inplace_transpose = (
-                os.getenv("SGLANG_DISABLE_KLAST_INPLACE_TRANSPOSE", "0") == "1"
-            )
-            if kv_same and (not disable_k_last_inplace_transpose) and ssm_states.is_contiguous():
+            if kv_same and ssm_states.is_contiguous():
                 # K-last -> V-last in-place for the kernel
                 in_place_transpose_indexed(ssm_states, cache_indices)
                 core_attn_out = fused_sigmoid_gating_delta_rule_update(
@@ -1053,7 +1048,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # V-last -> K-last: transpose back to pool layout
                 in_place_transpose_indexed(ssm_states, cache_indices)
             else:
-                # Fallback: materialize a V-last buffer (needed for K!=V or when transpose is disabled)
+                # Fallback: materialize a V-last buffer (needed for K!=V)
                 valid_mask = cache_indices >= 0
                 if valid_mask.any():
                     valid_cache_indices = cache_indices[valid_mask]
@@ -1319,7 +1314,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # g_log: [1, total_seq_len, num_value_heads] -> alpha: [total_seq_len, num_sab_heads]
                 # FlashInfer expects [total_seq_len, num_sab_heads] where num_sab_heads = max(num_q_heads, num_v_heads)
                 # At this point, num_sab_heads == num_value_heads (checked above), so format matches
-                head_size = head_k_dim  # K == V at this point
                 alpha_fi = torch.exp(g[0]).contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
                 beta_fi = beta[0].contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
                 
@@ -1333,61 +1327,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output_state_fi = initial_state_fi  # in-place update is supported
                 
                 # Call FlashInfer prefill kernel
-                # Optional debug logging + NVTX marker for profiling.
-                # NOTE: Disabled by default to avoid any overhead/log spam.
-                if os.getenv("SGLANG_LOG_FLASHINFER_PREFILL", "0") == "1":
-                    global _flashinfer_gdn_prefill_usage_logged
-                    if not _flashinfer_gdn_prefill_usage_logged:
-                        _flashinfer_gdn_prefill_usage_logged = True
-                        logger.info(
-                            "[flashinfer_gdn_prefill] enabled for GDN prefill: "
-                            f"layer_id={layer_id} "
-                            f"num_q_heads={num_heads} num_v_heads={num_value_heads} "
-                            f"head_k_dim={head_k_dim} head_v_dim={head_v_dim} "
-                            f"ssm_states_shape={tuple(ssm_states.shape)}"
-                        )
-
-                torch_profiler_ctx = (
-                    torch.profiler.record_function("flashinfer_gdn_prefill")
-                    if os.getenv("SGLANG_TORCHRF_FLASHINFER_PREFILL", "0") == "1"
-                    else nullcontext()
+                output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
+                    q=q_fi,
+                    k=k_fi,
+                    v=v_fi,
+                    g=alpha_fi,
+                    beta=beta_fi,
+                    scale=None,  # Will use default 1/sqrt(head_size)
+                    initial_state=initial_state_fi,
+                    output_final_state=True,
+                    cu_seqlens=cu_seqlens_fi,
+                    use_qk_l2norm_in_kernel=True,
+                    output=None,  # Let FlashInfer allocate
+                    output_state=output_state_fi,
                 )
-
-                with torch_profiler_ctx:
-                    if os.getenv("SGLANG_NVTX_FLASHINFER_PREFILL", "0") == "1":
-                        torch.cuda.nvtx.range_push("flashinfer_gdn_prefill")
-                        try:
-                            output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
-                                q=q_fi,
-                                k=k_fi,
-                                v=v_fi,
-                                g=alpha_fi,
-                                beta=beta_fi,
-                                scale=None,  # Will use default 1/sqrt(head_size)
-                                initial_state=initial_state_fi,
-                                output_final_state=True,
-                                cu_seqlens=cu_seqlens_fi,
-                                use_qk_l2norm_in_kernel=True,
-                                output=None,  # Let FlashInfer allocate
-                                output_state=output_state_fi,
-                            )
-                        finally:
-                            torch.cuda.nvtx.range_pop()
-                    else:
-                        output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
-                            q=q_fi,
-                            k=k_fi,
-                            v=v_fi,
-                            g=alpha_fi,
-                            beta=beta_fi,
-                            scale=None,  # Will use default 1/sqrt(head_size)
-                            initial_state=initial_state_fi,
-                            output_final_state=True,
-                            cu_seqlens=cu_seqlens_fi,
-                            use_qk_l2norm_in_kernel=True,
-                            output=None,  # Let FlashInfer allocate
-                            output_state=output_state_fi,
-                        )
 
                 # Process output
                 # output_fi: [total_seq_len, num_o_heads, head_size] -> [1, total_seq_len, num_o_heads, head_size]

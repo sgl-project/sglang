@@ -237,18 +237,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 for _ in range(self.num_wrappers)
             ]
 
-        self.fmha_backend = "auto"
-        # For hybrid GDN models, use default backend (auto/cutlass) for full_attn_backend
-        # Note: FA3 backend has compatibility issues with ragged prefill in FlashInfer PR2405
-        # GDN layers will use FlashInfer GDN prefill kernel (K-last optimized)
-        if model_runner.hybrid_gdn_config is not None:
-            # Use default backend for full_attn_backend in hybrid GDN model
-            # GDN layers will use FlashInfer GDN prefill kernel instead
-            logger.info(
-                "Using default backend for FlashInfer full attention in hybrid GDN model. "
-                "GDN layers will use FlashInfer GDN prefill kernel."
-            )
-        if is_sm100_supported() and model_runner.hybrid_gdn_config is None:
+        fmha_backend = "auto"
+        if is_sm100_supported():
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on B200
             if model_runner.server_args.enable_piecewise_cuda_graph:
@@ -258,9 +248,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     "Using auto backend instead for stability."
                 )
             else:
-                self.fmha_backend = "cutlass"
+                fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-            self.workspace_buffer, "NHD", backend=self.fmha_backend
+            self.workspace_buffer, "NHD", backend=fmha_backend
         )
 
         # Two wrappers: one for sliding window attention and one for full attention.
@@ -274,7 +264,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend=self.fmha_backend,
+                        backend="fa2",
                     )
                 )
                 self.prefill_wrappers_verify.append(
@@ -629,7 +619,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend=self.fmha_backend,
+                        backend="fa2",
                         use_cuda_graph=True,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
@@ -659,7 +649,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend=self.fmha_backend,
+                        backend="fa2",
                         use_cuda_graph=True,
                         qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],

@@ -111,15 +111,23 @@ class Mamba2StateShape:
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
         #   e.g., QWen3-Next: (32, 128, 128)
-        # K-last layout: (HV, V, K) for efficient MTP kernel access
-        # V-last layout: (HV, K, V) for prefill kernel (default)
-        # Note: state_size=K dimension, head_dim=V dimension
+        # V-last layout: (HV, K, V) for Triton decode/prefill kernels (default)
+        # K-last layout: (HV, V, K) for MTP verify + FlashInfer prefill kernels
+        # Note: head_dim is K dimension, state_size is V dimension
         if k_last:
-            # K-last: (HV, V, K) = (HV, head_dim, state_size)
-            temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+            # K-last: (HV, V, K) = (HV, state_size, head_dim)
+            temporal_state_shape = (
+                divide(num_heads, tp_world_size),
+                state_size,
+                head_dim,
+            )
         else:
-            # V-last: (HV, K, V) = (HV, state_size, head_dim)
-            temporal_state_shape = (divide(num_heads, tp_world_size), state_size, head_dim)
+            # V-last: (HV, K, V) = (HV, head_dim, state_size)
+            temporal_state_shape = (
+                divide(num_heads, tp_world_size),
+                head_dim,
+                state_size,
+            )
         return Mamba2StateShape(
             conv=[conv_state_shape],
             temporal=temporal_state_shape,
