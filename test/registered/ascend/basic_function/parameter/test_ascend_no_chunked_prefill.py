@@ -11,6 +11,7 @@ register_npu_ci(
     disabled="run failed",
 )
 
+
 class TestNoChunkedPrefill(CustomTestCase):
     """Testcase: Verify Llama-3.1-8B-Instruct accuracy ≥ 0.65 and serving normal with chunked prefill disabled.
 

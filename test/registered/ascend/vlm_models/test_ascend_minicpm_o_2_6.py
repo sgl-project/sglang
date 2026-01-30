@@ -11,6 +11,7 @@ register_npu_ci(
     disabled="run failed",
 )
 
+
 class TestMiniCPMModelsO(TestVLMModels):
     """Testcase: Verify that the inference accuracy of the openbmb/MiniCPM-o-2_6 model on the MMMU dataset is no less than 0.2.
 

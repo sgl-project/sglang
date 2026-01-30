@@ -19,6 +19,7 @@ register_npu_ci(
     disabled="run failed",
 )
 
+
 class TestAscendWarmups(CustomTestCase):
     """Testcase: Test that the warm-up task runs successfully when the --warmups voice_chat parameter is specified upon service startup.
 

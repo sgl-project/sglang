@@ -12,6 +12,7 @@ register_npu_ci(
     disabled="run failed",
 )
 
+
 class TestGLM49BChat(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the ZhipuAI/glm-4-9b-chat model on the GSM8K dataset is no less than 0.79.
 
