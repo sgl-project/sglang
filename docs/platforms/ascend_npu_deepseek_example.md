@@ -22,7 +22,6 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 #npu acceleration operator
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL_PATH} \
@@ -71,7 +70,6 @@ export HCCL_BUFFSIZE=1536
 #npu acceleration operator
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 export TASK_QUEUE_ENABLE=2
 
 python -m sglang.launch_server \
