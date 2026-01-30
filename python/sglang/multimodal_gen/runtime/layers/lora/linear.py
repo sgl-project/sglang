@@ -31,11 +31,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.utils import get_mixed_precision_state
 
-if not current_platform.is_npu():
-    torch._dynamo.config.recompile_limit = 16
+torch._dynamo.config.recompile_limit = 16
 
 
 class BaseLayerWithLoRA(nn.Module):
