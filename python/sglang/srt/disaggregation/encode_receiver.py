@@ -33,6 +33,7 @@ from sglang.srt.utils import ImageData, get_local_ip_auto, get_zmq_socket_on_hos
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
+SGLangEncoderStub = sglang_encoder_pb2_grpc.SglangEncoderStub
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -61,7 +62,7 @@ def _normalize_embedding_ports(embedding_port):
 def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
     channel = grpc.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = SGLangEncoderStub(channel)
     try:
         stub.SchedulerReceiveUrl(
             sglang_encoder_pb2.SchedulerReceiveUrlRequest(
@@ -78,7 +79,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 def _grpc_encode_request(target, encode_request):
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
     channel = grpc.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = SGLangEncoderStub(channel)
     try:
         response = stub.Encode(
             sglang_encoder_pb2.EncodeRequest(
@@ -101,7 +102,7 @@ def _grpc_encode_request(target, encode_request):
 def _grpc_send_request(target, request_json):
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS
     channel = grpc.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = SGLangEncoderStub(channel)
     try:
         stub.Send(
             sglang_encoder_pb2.SendRequest(
