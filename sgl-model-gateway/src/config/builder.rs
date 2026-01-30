@@ -372,6 +372,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn disable_tokenizer_autoload(mut self, disable: bool) -> Self {
+        self.config.disable_tokenizer_autoload = disable;
+        self
+    }
+
     // ==================== History Backend ====================
 
     pub fn history_backend(mut self, backend: HistoryBackend) -> Self {
