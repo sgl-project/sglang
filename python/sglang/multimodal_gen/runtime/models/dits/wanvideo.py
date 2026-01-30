@@ -395,7 +395,7 @@ class WanTransformerBlock(nn.Module):
         )
 
         # 3. Feed-forward
-        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh", prefix=add_prefix("ffn.net", prefix))
+        self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh", prefix=add_prefix("ffn.net", prefix), quant_config=quant_config)
         self.mlp_residual = MulAdd()
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -999,3 +999,4 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
 
 EntryClass = WanTransformer3DModel
+
