@@ -101,7 +101,8 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
         print(f"{metrics=}")
 
         # Qwen/Qwen3-8B hits >0.9 as well.
-        self.assertGreater(metrics["accuracy"], 0.6)
+        # Original model reference accuracy: ~0.608
+        self.assertGreater(metrics["accuracy"], 0.58)
 
 
 class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
@@ -127,4 +128,5 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.6)
+        # Original model reference accuracy: ~0.626
+        self.assertGreater(metrics["accuracy"], 0.58)
