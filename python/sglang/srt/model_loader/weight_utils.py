@@ -87,35 +87,11 @@ enable_hf_transfer()
 temp_dir = tempfile.gettempdir()
 
 
-def _get_lock_dir_for_ci() -> str:
-    """
-    Get lock directory for CI environments.
-
-    In CI, use /dev/shm (shared memory filesystem) for lock files because:
-    1. It's always local to the machine (not NFS)
-    2. It properly supports file locking
-    3. It's shared across all processes on the same machine
-
-    This prevents race conditions when the HF cache is on NFS or other
-    network filesystems that don't properly support file locking.
-    """
-    if os.path.isdir("/dev/shm"):
-        lock_dir = "/dev/shm/sglang_locks"
-        os.makedirs(lock_dir, exist_ok=True)
-        return lock_dir
-    return temp_dir
-
-
 def get_lock(
     model_name_or_path: str, cache_dir: Optional[str] = None, suffix: str = ""
 ):
-    # In CI, always use /dev/shm for lock files to ensure proper locking
-    # even when cache_dir is on NFS or other network filesystems
-    if is_in_ci():
-        lock_dir = _get_lock_dir_for_ci()
-    else:
-        lock_dir = cache_dir or temp_dir
-        os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
+    lock_dir = cache_dir or temp_dir
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
