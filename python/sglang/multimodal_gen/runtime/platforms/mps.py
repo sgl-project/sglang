@@ -27,6 +27,11 @@ class MpsPlatform(Platform):
     device_control_env_var: str = "MPS_VISIBLE_DEVICES"
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_amp_supported(cls) -> bool:
+        return False
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device("mps")
 
