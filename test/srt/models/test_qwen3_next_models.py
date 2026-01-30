@@ -4,10 +4,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval
-
-register_cuda_ci(est_time=350, suite="stage-c-test-4-gpu-h100")
 from sglang.test.kl_test_utils import (
     test_input_output_logprobs_match_decode_cache_hit_helper,
     test_input_output_logprobs_match_prefill_cache_hit_helper,
