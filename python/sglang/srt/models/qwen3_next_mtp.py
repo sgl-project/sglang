@@ -44,6 +44,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         nn.Module.__init__(self)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            logger.warning(
+                "Overriding Qwen3NextForCausalLMMTP quant config for modelopt_fp4 Qwen3-Next model."
+            )
+            quant_config = None
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_pp_group()
