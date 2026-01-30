@@ -896,11 +896,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 expected_w2_last_dim = ((intermediate_size // 128 + 3) // 4) * 4
                 expected_w13_last_dim = ((hidden_size // 128 + 3) // 4) * 4
 
-                layer.w13_weight_scale_inv = pad_scale_last_dim(
-                    layer.w13_weight_scale_inv, expected_w13_last_dim
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    pad_scale_last_dim(
+                        layer.w13_weight_scale_inv, expected_w13_last_dim
+                    ),
+                    requires_grad=False,
                 )
-                layer.w2_weight_scale_inv = pad_scale_last_dim(
-                    layer.w2_weight_scale_inv, expected_w2_last_dim
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    pad_scale_last_dim(layer.w2_weight_scale_inv, expected_w2_last_dim),
+                    requires_grad=False,
                 )
 
     def process_weights_after_loading(self, layer: Module) -> None:
