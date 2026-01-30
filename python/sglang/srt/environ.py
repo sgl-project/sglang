@@ -441,6 +441,9 @@ class Envs:
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
 
+    # Encoder gRPC
+    SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
