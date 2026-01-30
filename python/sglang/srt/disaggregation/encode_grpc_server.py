@@ -68,7 +68,7 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         yield await self.Check(request, context)
 
 
-class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
+class SGLangEncoderServer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
     """
     gRPC service implementation for SGLang encoder.
     Mirrors the HTTP endpoints in encode_server.py.
@@ -267,7 +267,7 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
     # Create and register encoder service
-    encoder_servicer = SglangEncoderServicer(
+    encoder_servicer = SGLangEncoderServer(
         encoder=encoder,
         send_sockets=send_sockets,
         server_args=server_args,
