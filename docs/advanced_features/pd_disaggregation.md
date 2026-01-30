@@ -262,6 +262,26 @@ python -m sglang.launch_server \
   --max-running-requests 128
 ```
 
+### Advanced Configuration
+
+#### NIXL Backend Selection
+
+By default, NIXL uses the **UCX** backend for KV cache transfers. You can select a different NIXL plugin backend depending on your infrastructure using the environment variable `SGLANG_DISAGGREGATION_NIXL_BACKEND`.
+
+Example: `export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`
+
+**Available backends:** UCX (default), LIBFABRIC, or any installed NIXL plugin.
+
+Example usage:
+```bash
+export SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl \
+  --port 30000
+```
+
 ## ASCEND
 
 ### Usage
