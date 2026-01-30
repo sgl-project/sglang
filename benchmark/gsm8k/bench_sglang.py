@@ -6,10 +6,12 @@ import re
 import time
 
 import numpy as np
+from datasets import load_dataset
 
-from sglang.api import set_default_backend
+from sglang.lang.api import set_default_backend
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
+    dump_bench_raw_result,
     select_sglang_backend,
 )
 from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
@@ -47,11 +49,18 @@ def main(args):
     set_default_backend(select_sglang_backend(args))
 
     # Read data
-    data_path = args.data_path
-    url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-    if not os.path.isfile(data_path):
-        data_path = download_and_cache_file(url)
-    lines = list(read_jsonl(data_path))
+    if args.platinum:
+        print("Loading GSM8K Platinum dataset from HuggingFace...")
+        dataset = load_dataset("madrylab/gsm8k-platinum", "main", split="test")
+        lines = [
+            {"question": item["question"], "answer": item["answer"]} for item in dataset
+        ]
+    else:
+        data_path = args.data_path
+        url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
+        if not os.path.isfile(data_path):
+            data_path = download_and_cache_file(url)
+        lines = list(read_jsonl(data_path))
 
     # Construct prompts
     num_questions = args.num_questions
@@ -115,10 +124,16 @@ def main(args):
 
     # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)
+    dump_bench_raw_result(
+        path=args.raw_result_file,
+        states=states,
+        preds=preds,
+        labels=labels,
+    )
 
     with open(args.result_file, "a") as fout:
         value = {
-            "task": "gsm8k",
+            "task": "gsm8k-platinum" if args.platinum else "gsm8k",
             "backend": args.backend,
             "num_gpus": 1,
             "latency": round(latency, 3),
@@ -137,5 +152,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-shots", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=200)
+    parser.add_argument(
+        "--platinum",
+        action="store_true",
+        help="Use GSM8K Platinum dataset (drop-in replacement with corrected labels)",
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)

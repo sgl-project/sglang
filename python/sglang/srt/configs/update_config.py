@@ -41,22 +41,39 @@ def get_moe_padding_size(weight_block_size):
     return DEFAULT_MOE_PADDING_SIZE
 
 
-def get_num_heads_padding_size(tp_size, weight_block_size):
-    pad_size = (
-        tp_size * 2 if tp_size % 2 == 1 and weight_block_size is not None else tp_size
-    )
+def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
+    pad_size = tp_size
+
+    if weight_block_size is not None and head_dim % weight_block_size[0] != 0:
+        import math
+
+        pad_size = tp_size * (
+            math.lcm(head_dim, weight_block_size[0]) // weight_block_size[0]
+        )
+
     return pad_size
 
 
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
-    if hasattr(model_config.hf_config, attr_name):
+    attr_value = intermediate_padding_size
+    if hasattr(model_config, "hf_config") and hasattr(
+        model_config.hf_config, attr_name
+    ):
         attr_value = getattr(model_config.hf_config, attr_name)
-        if attr_value % intermediate_padding_size != 0:
-            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+    elif hasattr(model_config, attr_name):
+        attr_value = getattr(model_config, attr_name)
 
-            attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
+    if attr_value % intermediate_padding_size != 0:
+        from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+        attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
+        if hasattr(model_config, "hf_config"):
             setattr(model_config.hf_config, attr_name, attr_value)
-            setattr(model_config.hf_text_config, attr_name, attr_value)
+            if hasattr(model_config, "hf_text_config"):
+                setattr(model_config.hf_text_config, attr_name, attr_value)
+        else:
+            setattr(model_config, attr_name, attr_value)
+
     return model_config
 
 
@@ -89,6 +106,13 @@ def adjust_config_with_unaligned_cpu_tp(
             model_config.hf_config.head_dim = (
                 model_config.hidden_size // model_config.num_attention_heads
             )
+        if hasattr(model_config.hf_config, "qk_nope_head_dim") and hasattr(
+            model_config.hf_config, "qk_rope_head_dim"
+        ):
+            model_config.hf_config.qk_head_dim = (
+                model_config.hf_config.qk_nope_head_dim
+                + model_config.hf_config.qk_rope_head_dim
+            )
 
         query_heads_per_kv = (
             model_config.num_attention_heads // model_config.get_total_num_kv_heads()
@@ -96,7 +120,12 @@ def adjust_config_with_unaligned_cpu_tp(
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-        pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+        head_dim = (
+            model_config.hf_config.qk_head_dim
+            if hasattr(model_config.hf_config, "qk_head_dim")
+            else model_config.hf_config.head_dim
+        )
+        pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
         model_config.num_key_value_heads = num_key_value_heads
@@ -118,4 +147,28 @@ def adjust_config_with_unaligned_cpu_tp(
     model_config = update_intermediate_size(
         model_config, "intermediate_size_mlp", intermediate_padding_size
     )
+    if (
+        hasattr(model_config.hf_config, "vision_config")
+        and model_config.hf_config.vision_config.model_type == "siglip_vision_model"
+    ):
+        model_config.hf_config.vision_config.original_num_attention_heads = (
+            model_config.num_attention_heads
+        )
+        if model_config.hf_config.vision_config.num_attention_heads % tp_size != 0:
+            model_config.hf_config.vision_config.head_dim = (
+                model_config.hf_config.vision_config.hidden_size
+                // model_config.hf_config.vision_config.num_attention_heads
+            )
+            from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+            pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+            model_config.hf_config.vision_config.num_attention_heads = pad_vocab_size(
+                model_config.hf_config.vision_config.num_attention_heads, pad_size
+            )
+        model_config.hf_config.vision_config = update_intermediate_size(
+            model_config.hf_config.vision_config,
+            "intermediate_size",
+            intermediate_padding_size,
+        )
+
     return model_config

@@ -1,6 +1,6 @@
 import multiprocessing
 import os
-import subprocess
+import time
 import traceback
 import unittest
 from multiprocessing import Process
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 
 TEST_SUITE = dict(
     model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-    mem_fraction_static=0.85,
+    mem_fraction_static=0.83,
     dp_size=2,
     tp_size=2,
 )
@@ -214,6 +214,9 @@ def _run_sglang_subprocess(
         _mem_usage = get_gpu_memory_gb(rank)
         print(f"GPU{rank} Memory usage after resuming Sgl weights: {_mem_usage}")
         del hf_model
+        hf_model = None
+        torch.cuda.empty_cache()
+        time.sleep(3)
         torch.cuda.empty_cache()
         _curr_usage = get_gpu_memory_gb(rank)
         assert (

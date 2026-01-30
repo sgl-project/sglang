@@ -381,8 +381,8 @@ def test_main(
 
     # Tune combine performance
     best_time, best_results = 1e10, None
-    for nvl_chunk_size in range(1, 5, 1):
-        for rdma_chunk_size in range(8, 33, 4):
+    for nvl_chunk_size in range(1, 8, 1):
+        for rdma_chunk_size in range(12 if num_nodes == 2 else 8, 33, 4):
             config_kwargs = {
                 "num_sms": num_sms,
                 "num_max_nvl_chunked_send_tokens": nvl_chunk_size,

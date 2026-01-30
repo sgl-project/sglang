@@ -1,12 +1,12 @@
 import itertools
-import os
 import unittest
+from functools import lru_cache
 
 import torch
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
@@ -14,10 +14,27 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     static_quant_fp8,
     w8a8_block_fp8_matmul,
 )
-from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+from sglang.srt.layers.quantization.fp8_utils import (
+    input_to_float8,
+    mxfp8_group_quantize,
+    triton_mxfp8_blockscaled_linear,
+)
+from sglang.srt.utils import is_sm100_supported
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
+
+
+# For test
+@lru_cache(maxsize=1)
+def _get_triton_mxfp8_upcast():
+    try:
+        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
+    except Exception as err:
+        raise RuntimeError(
+            "MXFP8 dequantization requires triton_kernels with MXFP8 support."
+        ) from err
+    return upcast_from_mxfp_torch
 
 
 # For test
@@ -415,6 +432,88 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
                 self._w8a8_block_fp8_matmul(*params)
 
 
+def _mxfp8_group_dequant(q: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
+    upcast_from_mxfp_torch = _get_triton_mxfp8_upcast()
+    return upcast_from_mxfp_torch(q, scale_u8, torch.float32, axis=1)
+
+
+class TestMXFP8DenseLinear(CustomTestCase):
+    DTYPES = [torch.bfloat16]
+    M = [1, 127, 128, 129, 255, 256]
+    NKs = [
+        (256, 512),
+        (384, 1024),
+        (512, 2048),
+        (768, 1024),
+    ]
+    SEEDS = [0]
+
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is not available")
+        if not is_sm100_supported():
+            raise unittest.SkipTest("MXFP8 requires Blackwell (SM100+)")
+        torch.set_default_device("cuda")
+
+    def _mxfp8_dense_linear(self, M, NK, dtype, seed):
+        N, K = NK
+        torch.manual_seed(seed)
+
+        input_fp32 = torch.randn((M, K), dtype=torch.float32) / 4
+        input_fp16 = input_fp32.to(dtype)
+
+        weight_fp32 = torch.randn((N, K), dtype=torch.float32) / 4
+        weight_q, weight_scale_u8 = mxfp8_group_quantize(weight_fp32)
+
+        with torch.inference_mode():
+            q_input, input_scale_u8 = mxfp8_group_quantize(input_fp16.to(torch.float32))
+            a_dq = _mxfp8_group_dequant(q_input, input_scale_u8)
+            b_dq = _mxfp8_group_dequant(weight_q, weight_scale_u8)
+            ref_out = torch.matmul(a_dq, b_dq.t()).to(dtype)
+
+            out = triton_mxfp8_blockscaled_linear(
+                input=input_fp16,
+                weight=weight_q,
+                weight_scale=weight_scale_u8,
+            )
+            out_prequant = triton_mxfp8_blockscaled_linear(
+                input=q_input,
+                weight=weight_q,
+                weight_scale=weight_scale_u8,
+                input_scale=input_scale_u8,
+                output_dtype=dtype,
+            )
+
+        self.assertTrue(
+            torch.mean(torch.abs(out.to(torch.float32) - ref_out.to(torch.float32)))
+            / torch.mean(torch.abs(ref_out.to(torch.float32)))
+            < 0.02
+        )
+        self.assertTrue(
+            torch.mean(
+                torch.abs(out_prequant.to(torch.float32) - ref_out.to(torch.float32))
+            )
+            / torch.mean(torch.abs(ref_out.to(torch.float32)))
+            < 0.02
+        )
+
+    def test_mxfp8_dense_linear(self):
+        for params in itertools.product(
+            self.M,
+            self.NKs,
+            self.DTYPES,
+            self.SEEDS,
+        ):
+            with self.subTest(
+                M=params[0],
+                NKs=params[1],
+                dtype=params[2],
+                seed=params[3],
+            ):
+                self._mxfp8_dense_linear(*params)
+
+
 # For test
 def torch_w8a8_block_fp8_moe(a, w1, w2, w1_s, w2_s, score, topk, block_shape):
     """This function performs fused moe with block-wise quantization using native torch."""
@@ -498,11 +597,13 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
         score = torch.randn((M, E), dtype=dtype)
 
         with torch.inference_mode():
+            ref_out = torch_w8a8_block_fp8_moe(
+                a, w1, w2, w1_s, w2_s, score, topk, block_size
+            )
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
-                renormalize=False,
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
             out = fused_moe(
                 a,
@@ -513,9 +614,6 @@ class TestW8A8BlockFP8FusedMoE(CustomTestCase):
                 w1_scale=w1_s,
                 w2_scale=w2_s,
                 block_shape=block_size,
-            )
-            ref_out = torch_w8a8_block_fp8_moe(
-                a, w1, w2, w1_s, w2_s, score, topk, block_size
             )
 
         self.assertTrue(
@@ -578,7 +676,7 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
         try:
-            import deep_gemm
+            import deep_gemm  # noqa: F401
         except ImportError:
             raise unittest.SkipTest("DeepGEMM is not available")
         torch.set_default_device("cuda")
@@ -622,11 +720,11 @@ class TestW8A8BlockFP8BatchedDeepGemm(CustomTestCase):
             w_s,
         )
 
-        from deep_gemm import m_grouped_gemm_fp8_fp8_bf16_nt_masked
+        from deep_gemm import fp8_m_grouped_gemm_nt_masked
 
         with torch.inference_mode():
             ref_out = torch_w8a8_block_fp8_bmm(a, a_s, w, w_s, block_size, dtype)
-            m_grouped_gemm_fp8_fp8_bf16_nt_masked(lhs, rhs, oe, masked_m, expected_m)
+            fp8_m_grouped_gemm_nt_masked(lhs, rhs, oe, masked_m, expected_m)
             out = oe[:, :M, :]
 
         self.assertTrue(

@@ -1,10 +1,10 @@
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
-from sglang.srt import two_batch_overlap
+from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -46,7 +46,7 @@ class TboAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
     ):
         self.primary.init_forward_metadata_capture_cuda_graph(
             bs=bs,
@@ -77,7 +77,7 @@ class TboAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         self.primary.init_forward_metadata_replay_cuda_graph(
@@ -112,7 +112,7 @@ class TboAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        spec_info: Optional[SpecInput],
         # capture args
         capture_num_tokens: int = None,
         # replay args
@@ -185,6 +185,9 @@ class TboAttnBackend(AttentionBackend):
     def forward_decode(self, *args, **kwargs):
         return self.primary.forward_decode(*args, **kwargs)
 
+    def get_indexer_metadata(self, layer_id: int, forward_batch: "ForwardBatch"):
+        return self.primary.get_indexer_metadata(layer_id, forward_batch)
+
 
 def _init_forward_metadata_cuda_graph_split(
     fn_name: str,
@@ -196,7 +199,7 @@ def _init_forward_metadata_cuda_graph_split(
     seq_lens: torch.Tensor,
     encoder_lens: Optional[torch.Tensor],
     forward_mode: "ForwardMode",
-    spec_info: Optional[EagleVerifyInput],
+    spec_info: Optional[SpecInput],
     # capture args
     capture_num_tokens: int = None,
     # replay args

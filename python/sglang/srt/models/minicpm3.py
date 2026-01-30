@@ -37,7 +37,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda
@@ -240,7 +239,9 @@ class MiniCPM3AttentionMLA(nn.Module):
 
         original_shapes = [q_pe.shape, k_pe.shape]
         q_pe, k_pe = self.rotary_emb(
-            positions, q_pe.reshape(q_pe.shape[0], -1), k_pe.reshape(k_pe.shape[0], -1)
+            positions,
+            q_pe.reshape(-1, q_pe.shape[1] * q_pe.shape[2]),
+            k_pe.reshape(-1, k_pe.shape[1] * k_pe.shape[2]),
         )
         q_pe, k_pe = q_pe.view(original_shapes[0]), k_pe.view(original_shapes[1])
         q_input[..., self.kv_lora_rank :] = q_pe

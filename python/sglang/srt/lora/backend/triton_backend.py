@@ -2,18 +2,44 @@ import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
+    embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class TritonLoRABackend(BaseLoRABackend):
+    name = "triton"
 
-    def __init__(self, name: str, batch_info: LoRABatchInfo = None):
-        super().__init__(name, batch_info)
+    def __init__(
+        self,
+        max_loras_per_batch: int,
+        device: torch.device,
+        **kwargs,
+    ):
+        super().__init__(max_loras_per_batch, device)
+
+    def run_lora_a_embedding(
+        self,
+        input_ids: torch.Tensor,
+        weights: torch.Tensor,
+        vocab_size: int,
+        extra_embeddings: torch.Tensor = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run LoRA A embedding lookup using Triton kernel."""
+        return embedding_lora_a_fwd(
+            input_ids=input_ids,
+            weights=weights,
+            batch_info=self.batch_info,
+            vocab_size=vocab_size,
+            extra_embeddings=extra_embeddings,
+        )
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -26,7 +52,7 @@ class TritonLoRABackend(BaseLoRABackend):
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
 
@@ -39,7 +65,7 @@ class TritonLoRABackend(BaseLoRABackend):
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -65,7 +91,7 @@ class TritonLoRABackend(BaseLoRABackend):
         gate_up_lora_b: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -86,3 +112,105 @@ class TritonLoRABackend(BaseLoRABackend):
             base_output,
         )
         return lora_output
+
+    def init_cuda_graph_batch_info(
+        self,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
+    ):
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
+                bs=max_bs_in_cuda_graph,
+                use_cuda_graph=True,
+                num_segments=None,
+                seg_lens=torch.full(
+                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                ),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                max_len=num_tokens_per_bs,
+                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                permutation=None,
+            )
+
+            # Initialize seg_indptr for CUDA graph as they remain constant
+            # across batches.
+            torch.cumsum(
+                self.cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
+                dim=0,
+                out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
+            )
+
+    def prepare_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        weight_indices: list[int],
+        lora_ranks: list[int],
+        scalings: list[float],
+        use_cuda_graph: bool,
+    ):
+        # Use pinned memory to avoid synchronizations during host-to-device transfer
+        weight_indices_tensor = torch.tensor(
+            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+        )
+        lora_ranks_tensor = torch.tensor(
+            lora_ranks, dtype=torch.int32, pin_memory=True, device="cpu"
+        )
+        scalings_tensor = torch.tensor(
+            scalings, dtype=torch.float, pin_memory=True, device="cpu"
+        )
+
+        bs = forward_batch.batch_size
+
+        if use_cuda_graph:
+            assert (
+                self.cuda_graph_batch_info is not None
+            ), "CUDA Graph batch info is not initialized."
+            batch_info = self.cuda_graph_batch_info
+            batch_info.bs = forward_batch.batch_size
+            batch_info.num_segments = forward_batch.batch_size
+        else:
+            max_len = (
+                # Calculate max_len from the CPU copy to avoid D2H transfer.
+                max(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.forward_mode.is_extend()
+                else 1
+            )
+            seg_lens = (
+                forward_batch.extend_seq_lens
+                if forward_batch.forward_mode.is_extend()
+                else torch.ones(bs, dtype=torch.int32, device=self.device)
+            )
+            seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
+            seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+
+            batch_info = LoRABatchInfo(
+                bs=forward_batch.batch_size,
+                num_segments=forward_batch.batch_size,
+                max_len=max_len,
+                use_cuda_graph=False,
+                seg_lens=seg_lens,
+                seg_indptr=seg_indptr,
+                weight_indices=torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                ),
+                lora_ranks=torch.empty(
+                    (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
+                ),
+                scalings=torch.empty(
+                    (self.max_loras_per_batch,), dtype=torch.float, device=self.device
+                ),
+                permutation=None,
+            )
+
+        # Copy to device asynchronously
+        batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
+            lora_ranks_tensor, non_blocking=True
+        )
+        batch_info.scalings[: self.max_loras_per_batch].copy_(
+            scalings_tensor, non_blocking=True
+        )
+        batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
+
+        self.batch_info = batch_info

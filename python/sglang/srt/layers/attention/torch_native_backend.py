@@ -93,6 +93,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                # scaled_dot_product_attention() expects query, key, and value to have the same dtype
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
             per_req_out_redudant = (
                 scaled_dot_product_attention(
                     per_req_query_redudant.unsqueeze(0),
@@ -162,6 +167,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
+            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
+                # scaled_dot_product_attention() expects query, key, and value to have the same dtype
+                per_req_key = per_req_key.to(per_req_query.dtype)
+                per_req_value = per_req_value.to(per_req_query.dtype)
+
             per_req_out = (
                 scaled_dot_product_attention(
                     per_req_query.unsqueeze(0),
@@ -193,10 +203,13 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
+
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -241,10 +254,13 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        if layer.is_cross_attention:
+            cache_loc = forward_batch.encoder_out_cache_loc
+        else:
+            cache_loc = forward_batch.out_cache_loc
+
         if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
