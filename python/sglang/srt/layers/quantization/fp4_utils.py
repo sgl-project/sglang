@@ -95,6 +95,7 @@ def nvfp4_online_scale_enabled() -> bool:
     return envs.SGLANG_NVFP4_ONLINE_SCALE.get()
 
 
+@torch.compile
 def nvfp4_compute_input_scale_and_inv(
     x: torch.Tensor,
     input_scale: torch.Tensor,
