@@ -190,7 +190,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimScheme):
     ):
         self.moe_runner_config = moe_runner_config
 
-    def apply(
+    def apply_weights(
         self,
         layer,
         dispatch_output: "StandardDispatchOutput",
