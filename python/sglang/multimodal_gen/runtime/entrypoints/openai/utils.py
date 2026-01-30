@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 
 logger = init_logger(__name__)
 
+OUTPUT_QUALITY_MAPPER = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+
 
 @dataclasses.dataclass
 class SetLoraReq:
@@ -308,3 +310,10 @@ def add_common_data_to_response(
     response["id"] = request_id
 
     return response
+
+
+def adjust_output_quality(output_quality: str, output_compression: int) -> int:
+    if output_compression is not None:
+        return output_compression
+    else:
+        return OUTPUT_QUALITY_MAPPER.get(output_quality, None)

@@ -284,7 +284,6 @@ def post_process_sample(
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
-                # TODO: make this configurable
                 quality = (
                     output_compression / 10 if output_compression is not None else 5
                 )

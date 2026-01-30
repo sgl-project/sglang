@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     add_common_data_to_response,
+    adjust_output_quality,
     merge_image_input_list,
     process_generation_batch,
     save_image_to_path,
@@ -127,7 +128,9 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-    batch.output_compression = request.output_compression
+    batch.output_compression = adjust_output_quality(
+        request.output_quality, request.output_compression
+    )
     # Add diffusers_kwargs if provided
     if request.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
@@ -218,6 +221,7 @@ async def edits(
     guidance_scale: Optional[float] = Form(None),
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
+    output_quality: Optional[str] = Form(None),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
@@ -271,7 +275,7 @@ async def edits(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-    batch.output_compression = output_compression
+    batch.output_compression = adjust_output_quality(output_quality, output_compression)
     save_file_path_list, result = await process_generation_batch(
         async_scheduler_client, batch
     )

@@ -389,3 +389,87 @@ Notes:
     curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "lora_b", "lora_path": "path/to/B"}'
     ```
 5.  Generate with LoRA B...
+
+### Adjust Output Quality
+
+The server supports adjusting output quality and compression levels for both image and video generation through the `output_quality` and `output_compression` parameters.
+
+#### Parameters
+
+- **`output_quality`** (string, optional): Preset quality level that automatically sets compression. Valid values:
+  - `"maximum"`: Highest quality (100%)
+  - `"high"`: High quality (90%)
+  - `"medium"`: Medium quality (55%)
+  - `"low"`: Lower quality (35%) - smaller file size
+
+- **`output_compression`** (integer, optional): Direct compression level override (0-100). Takes precedence over `output_quality` when provided.
+  - `0`: Lowest quality, smallest file size
+  - `100`: Highest quality, largest file size
+
+#### Image API Usage
+
+**Example with quality preset:**
+
+```bash
+curl -sS -X POST "http://localhost:30000/v1/images/generations" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -d '{
+        "prompt": "A detailed landscape photograph",
+        "size": "1024x1024",
+        "output_quality": "high",
+        "output_format": "jpeg"
+      }'
+```
+
+**Example with custom compression:**
+
+```bash
+curl -sS -X POST "http://localhost:30000/v1/images/generations" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -d '{
+        "prompt": "A detailed landscape photograph",
+        "size": "1024x1024",
+        "output_compression": 85,
+        "output_format": "jpeg"
+      }'
+```
+
+#### Video API Usage
+
+**Example with quality preset:**
+
+```bash
+curl -sS -X POST "http://localhost:30000/v1/videos" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -d '{
+        "prompt": "A cinematic drone shot of mountains",
+        "size": "1280x720",
+        "output_quality": "high"
+      }'
+```
+
+**Example with custom compression:**
+
+```bash
+curl -sS -X POST "http://localhost:30000/v1/videos" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -d '{
+        "prompt": "A cinematic drone shot of mountains",
+        "size": "1280x720",
+        "output_compression": 75
+      }'
+```
+
+
+#### Notes
+
+- **Precedence**: When both `output_quality` and `output_compression` are provided, `output_compression` takes precedence
+- **Format Support**: Quality settings apply to JPEG, and video formats. PNG uses lossless compression and ignores these settings
+- **File Size vs Quality**: Lower compression values (or "low" quality preset) produce smaller files but may show visible artifacts
+- **Default Behavior**: When neither parameter is specified (both are `None`), the system uses format-specific defaults:
+  - **Video**: 50% compression
+  - **Image**: 75% compression
