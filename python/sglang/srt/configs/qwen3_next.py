@@ -277,8 +277,90 @@ class Qwen3NextConfig(PretrainedConfig):
         from sglang.srt.layers.dp_attention import get_attention_tp_size
         from sglang.srt.server_args import get_global_server_args
 
-        # Get k_last setting from server args
-        k_last = get_global_server_args().mamba_ssm_k_last
+        # K-last is only valid when we can run K-last kernels end-to-end:
+        # - Prefill/extend: FlashInfer GDN prefill (K-last state)
+        # - Verify (spec): CuTe DSL GDN verify (K-last state)
+        #
+        # Otherwise we fall back to the default V-last layout and kernels, to avoid any
+        # K<->V transpose overhead or layout mismatches.
+        if not hasattr(self, "_sglang_effective_mamba_ssm_k_last"):
+            server_args = get_global_server_args()
+            k_last_requested = bool(server_args.mamba_ssm_k_last)
+            k_last_effective = False
+            if k_last_requested:
+                # The K-last CuTe DSL verify kernel only supports topk=1.
+                # For topk > 1, we must use V-last kernels end-to-end (no transpose fallback).
+                topk = getattr(server_args, "speculative_eagle_topk", None)
+                if (
+                    server_args.speculative_algorithm is not None
+                    and topk is not None
+                    and topk > 1
+                ):
+                    logger.warning(
+                        "K-last SSM layout requested but unsupported for speculative decoding with "
+                        f"speculative_eagle_topk({topk}) > 1. Falling back to V-last."
+                    )
+                else:
+                    # FlashInfer prefill requires square state matrix (K == V)
+                    kv_same = self.linear_key_head_dim == self.linear_value_head_dim
+                    # FlashInfer expects num_sab_heads = max(num_q_heads, num_v_heads).
+                    # Our state uses HV = num_value_heads, so we require num_q_heads <= num_v_heads.
+                    heads_match = self.linear_num_key_heads <= self.linear_num_value_heads
+
+                    if not kv_same:
+                        logger.warning(
+                            "K-last SSM layout requested but unsupported for this model: "
+                            f"linear_key_head_dim({self.linear_key_head_dim}) != "
+                            f"linear_value_head_dim({self.linear_value_head_dim}). "
+                            "Falling back to V-last."
+                        )
+                    elif not heads_match:
+                        logger.warning(
+                            "K-last SSM layout requested but unsupported for this model: "
+                            f"linear_num_key_heads({self.linear_num_key_heads}) > "
+                            f"linear_num_value_heads({self.linear_num_value_heads}). "
+                            "Falling back to V-last."
+                        )
+                    else:
+                        flashinfer_ok = False
+                        cutedsl_ok = False
+                        try:
+                            import os
+                            import torch
+
+                            os.environ.setdefault(
+                                "FLASHINFER_DISABLE_VERSION_CHECK", "1"
+                            )
+                            from flashinfer.gdn_prefill import (  # noqa: F401
+                                chunk_gated_delta_rule,
+                            )
+
+                            flashinfer_ok = torch.cuda.is_available() and (
+                                torch.cuda.get_device_capability()[0] >= 9
+                            )
+                        except Exception:
+                            flashinfer_ok = False
+
+                        try:
+                            from sglang.jit_kernel.cutedsl_gdn_verify import (
+                                is_cutedsl_gdn_verify_available,
+                            )
+
+                            cutedsl_ok = is_cutedsl_gdn_verify_available()
+                        except Exception:
+                            cutedsl_ok = False
+
+                        k_last_effective = flashinfer_ok and cutedsl_ok
+                        if not k_last_effective:
+                            logger.warning(
+                                "K-last SSM layout requested but required K-last kernels are unavailable "
+                                f"(flashinfer_gdn_prefill={flashinfer_ok}, cutedsl_gdn_verify={cutedsl_ok}). "
+                                "Falling back to V-last."
+                            )
+
+            self._sglang_effective_mamba_ssm_k_last = k_last_effective
+
+        k_last = bool(self._sglang_effective_mamba_ssm_k_last)
 
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
@@ -288,7 +370,7 @@ class Qwen3NextConfig(PretrainedConfig):
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
-            k_last=k_last,  # Use K-last layout for efficient MTP verify kernel
+            k_last=k_last,
         )
 
         return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)

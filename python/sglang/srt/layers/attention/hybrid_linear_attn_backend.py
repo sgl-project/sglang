@@ -923,9 +923,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         assert (
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
-        # Check if SSM states use K-last layout (HV, V, K) for MTP kernel optimization
-        # Priority: server_args > model config
-        self.ssm_k_last = get_global_server_args().mamba_ssm_k_last
+        # Whether the mamba pool uses K-last layout (HV, V, K) for GDN states.
+        # IMPORTANT: derive from the actual configured mamba cache shape so we don't
+        # diverge from the pool layout (e.g., when config disables K-last).
+        cfg = getattr(model_runner, "mambaish_config", None)
+        if cfg is not None:
+            try:
+                self.ssm_k_last = bool(cfg.mamba2_cache_params.shape.k_last)
+            except Exception:
+                self.ssm_k_last = bool(get_global_server_args().mamba_ssm_k_last)
+        else:
+            self.ssm_k_last = bool(get_global_server_args().mamba_ssm_k_last)
+
+        # Cache kernel handles in K-last mode to avoid per-layer checks.
+        self._flashinfer_chunk_gated_delta_rule = None
+        self._cutedsl_gdn_verify_k_last = None
+        if self.ssm_k_last:
+            flashinfer_available, flashinfer_chunk_gdr = _get_flashinfer_gdn_prefill()
+            cutedsl_available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
+            if not flashinfer_available or flashinfer_chunk_gdr is None:
+                raise RuntimeError(
+                    "K-last SSM layout is enabled but FlashInfer GDN prefill is unavailable. "
+                    "Disable --mamba-ssm-k-last or ensure FlashInfer (SM90+) is available."
+                )
+            if not cutedsl_available or cutedsl_gdn_verify_k_last is None:
+                raise RuntimeError(
+                    "K-last SSM layout is enabled but CuTe DSL GDN verify kernel is unavailable. "
+                    "Disable --mamba-ssm-k-last or ensure cutlass/cute is available."
+                )
+            self._flashinfer_chunk_gated_delta_rule = flashinfer_chunk_gdr
+            self._cutedsl_gdn_verify_k_last = cutedsl_gdn_verify_k_last
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
@@ -934,9 +961,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 logger.warning(
                     "K-last SSM layout (--mamba-ssm-k-last) is enabled without speculative decoding. "
                     "This is NOT recommended as there is no K-last decode kernel yet - "
-                    "the V-last Triton kernel will be used with extra transpose overhead, "
-                    "resulting in ~28%% slower decode performance. "
-                    "K-last layout is optimized for speculative decoding (MTP) verify kernel only."
+                    "the V-last Triton decode kernel will be used with extra transpose overhead."
                 )
                 GDNAttnBackend._k_last_decode_warning_shown = True
 
@@ -1209,19 +1234,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
 
         if is_target_verify:
-            # Check if K-last GDN verify kernel should be used
-            disable_k_last_gdn_verify = os.getenv("SGLANG_DISABLE_KLAST_GDN_VERIFY", "0") == "1"
-            use_k_last_gdn = (
-                self.ssm_k_last
-                and retrieve_parent_token is None
-                and not disable_k_last_gdn_verify
-            )
-            if use_k_last_gdn:
-                available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
-                use_k_last_gdn = available
-
-            if use_k_last_gdn:
+            if self.ssm_k_last:
                 # Use K-last CuTe DSL GDN verify kernel (no transpose needed)
+                if retrieve_parent_token is not None:
+                    raise RuntimeError(
+                        "K-last GDN verify kernel only supports topk=1 (retrieve_parent_token=None)."
+                    )
                 batch_size = seq_len // forward_batch.spec_info.draft_token_num
                 draft_token_num = forward_batch.spec_info.draft_token_num
                 query_mtp = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
@@ -1230,7 +1248,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
                 b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
 
-                core_attn_out = cutedsl_gdn_verify_k_last(
+                core_attn_out = self._cutedsl_gdn_verify_k_last(
                     A_log=A_log,
                     a=a_mtp,
                     dt_bias=dt_bias,
@@ -1250,7 +1268,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 core_attn_out = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
                 
             else:
-                # V-last Triton verify kernel (fallback when K-last CuTe DSL kernel unavailable)
+                # V-last Triton verify kernel
                 g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
                 core_attn_out = fused_recurrent_gated_delta_rule_update(
                     q=query,
@@ -1272,27 +1290,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             # Prefill/Extend path
             g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-            
-            # Check if we should use FlashInfer prefill (K-last optimized)
-            use_flashinfer_prefill = False
+
             if self.ssm_k_last:
-                disable_flashinfer_prefill = (
-                    os.getenv("SGLANG_DISABLE_FLASHINFER_PREFILL", "0") == "1"
-                )
-                # FlashInfer requires square state matrix (K == V)
-                kv_same = head_k_dim == head_v_dim
-                # FlashInfer expects num_sab_heads = max(num_q_heads, num_v_heads)
-                # ssm_states has shape [pool_size, HV, V, K] where HV = num_value_heads
-                # In GVA: num_sab_heads = num_v_heads = HV, format matches
-                # In GQA: num_sab_heads = num_q_heads > HV, format doesn't match (fallback to Triton)
-                # For safety, only use FlashInfer when num_sab_heads == num_value_heads (GVA or equal heads)
-                num_sab_heads = max(num_heads, num_value_heads)
-                heads_match = num_sab_heads == num_value_heads
-                if not disable_flashinfer_prefill and kv_same and heads_match:
-                    flashinfer_available, flashinfer_chunk_gdr = _get_flashinfer_gdn_prefill()
-                    use_flashinfer_prefill = flashinfer_available and flashinfer_chunk_gdr is not None
-            
-            if use_flashinfer_prefill:
                 # Use FlashInfer prefill kernel.
                 #
                 # NOTE: FlashInfer's GDN prefill kernel consumes/produces the KV state in
@@ -1320,7 +1319,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # g_log: [1, total_seq_len, num_value_heads] -> alpha: [total_seq_len, num_sab_heads]
                 # FlashInfer expects [total_seq_len, num_sab_heads] where num_sab_heads = max(num_q_heads, num_v_heads)
                 # At this point, num_sab_heads == num_value_heads (checked above), so format matches
-                num_sab_heads = max(num_heads, num_value_heads)  # Should equal num_value_heads at this point
                 head_size = head_k_dim  # K == V at this point
                 alpha_fi = torch.exp(g[0]).contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
                 beta_fi = beta[0].contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
@@ -1359,7 +1357,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     if os.getenv("SGLANG_NVTX_FLASHINFER_PREFILL", "0") == "1":
                         torch.cuda.nvtx.range_push("flashinfer_gdn_prefill")
                         try:
-                            output_fi, output_state_fi_result = flashinfer_chunk_gdr(
+                            output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
                                 q=q_fi,
                                 k=k_fi,
                                 v=v_fi,
@@ -1376,7 +1374,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                         finally:
                             torch.cuda.nvtx.range_pop()
                     else:
-                        output_fi, output_state_fi_result = flashinfer_chunk_gdr(
+                        output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
                             q=q_fi,
                             k=k_fi,
                             v=v_fi,
@@ -1404,8 +1402,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 # Return early: FlashInfer prefill path is complete
                 return core_attn_out
-            
-            # V-last Triton prefill kernel (default path, also fallback when K-last kernel unavailable)
+
+            # V-last Triton prefill kernel
             recurrent_state = ssm_states
             recurrent_state_indices_args = {"initial_state_indices": cache_indices}
             if is_npu():
