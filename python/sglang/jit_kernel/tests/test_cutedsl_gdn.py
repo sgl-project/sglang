@@ -42,7 +42,7 @@ def print_summary_tables():
         for B, dtype_str, triton_mean, triton_std, cutedsl_mean, cutedsl_std, speedup, cutedsl_fused_mean, cutedsl_fused_std, speedup_fused in sorted(_results["performance"]):
             if cutedsl_mean is not None:
                 print(f" {B:>4} | {triton_mean:6.2f}±{triton_std:5.2f} | {cutedsl_mean:7.2f}±{cutedsl_std:5.2f} | {speedup:6.2f}x | ok [cutedsl_gdn, {dtype_str}]")
-            print(f" {B:>4} | {triton_mean:6.2f}±{triton_std:5.2f} | {cutedsl_fused_mean:7.2f}±{cutedsl_fused_std:5.2f} | {speedu_fused:6.2f}x | ok [cutedsl_gdn_transpose, {dtype_str}]")
+            print(f" {B:>4} | {triton_mean:6.2f}±{triton_std:5.2f} | {cutedsl_fused_mean:7.2f}±{cutedsl_fused_std:5.2f} | {speedup_fused:6.2f}x | ok [cutedsl_gdn_transpose, {dtype_str}]")
     
     # MTP Precision results
     if _results["mtp_precision"]:
