@@ -46,7 +46,7 @@ You are welcome to enable various models based on your business requirements.
 | AI-ModelScope/dbrx-instruct                | DBRX (Databricks)              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | baichuan-inc/Baichuan2-13B-Chat            | Baichuan 2 (7B, 13B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | baidu/ERNIE-4.5-21B-A3B-PT                 | ERNIE-4.5 (4.5, 4.5MoE series) | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| openbmb/MiniCPM3-4B                        | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| OpenBMB/MiniCPM3-4B                        | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Kimi/Kimi-K2-Thinking                      | Kimi                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openai/gpt-oss-120b                        | GPTOSS                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
@@ -74,7 +74,7 @@ You are welcome to enable various models based on your business requirements.
 | lmms-lab/llava-onevision-qwen2-7b-ov          | LLaVA-OneVision           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Kimi/Kimi-VL-A3B-Instruct                     | Kimi-VL (A3B)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ZhipuAI/GLM-4.5V                              | GLM-4.5V (106B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| meta-llama/Llama-3.2-11B-Vision-Instruct      | Llama 3.2 Vision (11B)    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| LLM-Research/Llama-3.2-11B-Vision-Instruct    | Llama 3.2 Vision (11B)    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Embedding Models
 
@@ -95,7 +95,7 @@ You are welcome to enable various models based on your business requirements.
 | 	Shanghai_AI_Laboratory/internlm2-7b-reward | InternLM 2 Reward         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Qwen/Qwen2.5-Math-RM-72B                   | Qwen2.5 Reward - Math     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | 	Howeee/Qwen2.5-1.5B-apeach                 | Qwen2.5 Reward - Sequence | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	Skywork/Skywork-Reward-Gemma-2-27B-v0.2    | Gemma 2-27B Reward        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	AI-ModelScope/Skywork-Reward-Gemma-2-27B-v0.2    | Gemma 2-27B Reward  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Rerank Models
 
