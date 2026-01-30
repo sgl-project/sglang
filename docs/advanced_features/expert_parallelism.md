@@ -177,13 +177,13 @@ DeepEP Ascend is the adapted version of the DeepEP communication library for Hua
 It supports the Ant-moving Function (Split the sequence length into rounds for streaming batch transmission) to optimize the buffer size occupied during collective communication in prefill stage, especially for long sequences.
 
 Ant-moving Function can be enabled for both the dispatch and combine phases via the following environment variables:
-- `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS`: Enable ant-moving function in dispatch stage. Indicates the number of tokens transmitted per round on each rank, default 1.
-- `DEEPEP_NORMAL_LONG_SEQ_ROUND`: Enable ant-moving function in dispatch stage. Indicates the number of rounds transmitted on each rank, default 8192
-- `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`: Enable ant-moving function in combine stage, default disabled.
+- `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS`: Enable ant-moving function in dispatch stage. Indicates the number of tokens transmitted per round on each rank, default 8192.
+- `DEEPEP_NORMAL_LONG_SEQ_ROUND`: Enable ant-moving function in dispatch stage. Indicates the number of rounds transmitted on each rank, default 1.
+- `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`: Enable ant-moving function in combine stage, default 0 (means disabled).
 
 `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * DEEPEP_NORMAL_LONG_SEQ_ROUND` means input sequence length. When the input sequence length exceeds 8192, it is recommended to enable the ant-moving function in both dispatch and combine phase.
 
-The environment variable `HCCL_BUFFSIZE` is used to configure the buffer size (MB). Its calculation formula is as follows:
+The environment variable `HCCL_BUFFSIZE` is used to configure the buffer size (MB) actually allocated. Its calculation formula is as follows:
 ```angular2html
 # Enable Ant-moving Function
 HCCL_BUFFSIZE >= 2 * (102MB + 4MB + DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * (hidden_size + hidden_size + hidden_size) * topk) + PADDING_BUFFSIZE
@@ -192,7 +192,7 @@ HCCL_BUFFSIZE >= 2 * (102MB + 4MB + DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS * (h
 HCCL_BUFFSIZE >= 2 * (102MB + 4MB + TOTAL_SEQ_LEN * (hidden_size + hidden_size) * topk) + PADDING_BUFFSIZE
 ```
 Wherein the parameters are described as follows:
-- `hidden_size`: hidden size per token.
+- `hidden_size`: hidden size in model config.
 - `topk`: The number of selected routing experts.
 - `TOTAL_SEQ_LEN`: input sequence length.
 - `PADDING_BUFFSIZE`: A value of 20 or greater is recommended.
