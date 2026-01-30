@@ -1,14 +1,15 @@
 import os
 import subprocess
+import sys
 import threading
 import time
 import unittest
 from pathlib import Path
-import sys
 
 import grpc
 import zmq
 from grpc_health.v1 import health_pb2, health_pb2_grpc
+
 from sglang.srt.utils import get_zmq_socket_on_host, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
@@ -679,9 +680,7 @@ class TestEPDDisaggregationGrpcEncoder(PDDisaggregationServerBase):
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.encode_port = f"{int(cls.lb_port) + 302}"
 
-        print(
-            f"Setting up gRPC EPD encoder: encode={cls.encode_port}"
-        )
+        print(f"Setting up gRPC EPD encoder: encode={cls.encode_port}")
 
         cls.start_encode()
         cls.wait_grpc_ready(cls.base_host, cls.encode_port, cls.process_encode)

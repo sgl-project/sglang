@@ -150,7 +150,9 @@ class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
                 return sglang_encoder_pb2.EncodeResponse()
             elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
                 # Send directly to tokenizer
-                embedding_port = request.embedding_port[0] if request.embedding_port else 0
+                embedding_port = (
+                    request.embedding_port[0] if request.embedding_port else 0
+                )
                 await self.encoder.send(
                     req_id=request.req_id,
                     prefill_host=request.prefill_host,
@@ -181,7 +183,9 @@ class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
                 prefill_host=request.prefill_host,
                 embedding_port=request.embedding_port,
                 session_id=request.session_id if request.session_id else None,
-                buffer_address=request.buffer_address if request.buffer_address else None,
+                buffer_address=(
+                    request.buffer_address if request.buffer_address else None
+                ),
             )
             self.encoder.embedding_to_send.pop(request.req_id, None)
             return sglang_encoder_pb2.SendResponse()
@@ -216,6 +220,7 @@ class SglangEncoderServicer(sglang_encoder_pb2_grpc.SglangEncoderServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return sglang_encoder_pb2.SchedulerReceiveUrlResponse()
+
 
 async def serve_grpc_encoder(server_args: ServerArgs):
     """Start the gRPC encoder server."""
@@ -267,7 +272,9 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         send_sockets=send_sockets,
         server_args=server_args,
     )
-    sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server(encoder_servicer, server)
+    sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server(
+        encoder_servicer, server
+    )
 
     # Enable reflection for debugging
     SERVICE_NAMES = (
