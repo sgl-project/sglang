@@ -1,10 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
 import dataclasses
+import ipaddress
 import os
 import re
+import socket
 import time
+from pathlib import Path
 from typing import Any, List, Optional, Union
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import torch
@@ -14,6 +18,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,
@@ -84,15 +89,243 @@ def _parse_size(size: str) -> tuple[int, int] | tuple[None, None]:
         return None, None
 
 
-async def save_image_to_path(image: Union[UploadFile, str], target_path: str) -> str:
-    input_path = await _maybe_url_image(image, target_path)
+def sanitize_upload_filename(filename: str, fallback: str) -> str:
+    name = os.path.basename(filename or "")
+    if not name or name in {".", ".."}:
+        name = fallback
+
+    stem, ext = os.path.splitext(name)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+    safe_ext = re.sub(r"[^A-Za-z0-9.]+", "", ext)
+    if not safe_stem:
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", fallback).strip("._") or "upload"
+    return f"{safe_stem}{safe_ext}"
+
+
+def ensure_path_within_root(target_path: str, root_dir: str) -> str:
+    root_path = Path(root_dir).resolve()
+    candidate = Path(target_path).resolve()
+    if root_path != candidate and root_path not in candidate.parents:
+        raise ValueError("Upload path escapes the uploads root")
+    return str(candidate)
+
+
+def _parse_allowlist(raw_value: str) -> tuple[set[str], list[ipaddress._BaseNetwork]]:
+    hosts: set[str] = set()
+    networks: list[ipaddress._BaseNetwork] = []
+    for entry in (raw_value or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        if "/" in item:
+            try:
+                networks.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                continue
+        else:
+            hosts.add(item.lower())
+    return hosts, networks
+
+
+def _resolve_host_ips(hostname: str) -> list[ipaddress._BaseAddress]:
+    try:
+        ip = ipaddress.ip_address(hostname)
+        return [ip]
+    except ValueError:
+        pass
+
+    ips: list[ipaddress._BaseAddress] = []
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
+            address = sockaddr[0]
+            try:
+                ips.append(ipaddress.ip_address(address))
+            except ValueError:
+                continue
+    except socket.gaierror:
+        return []
+    return ips
+
+
+def _is_ip_blocked(ip: ipaddress._BaseAddress) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _is_host_allowlisted(
+    hostname: str,
+    ips: list[ipaddress._BaseAddress],
+    allow_hosts: set[str],
+    allow_nets: list[ipaddress._BaseNetwork],
+) -> bool:
+    if hostname in allow_hosts:
+        return True
+    for ip in ips:
+        if any(ip in net for net in allow_nets):
+            return True
+    return False
+
+
+def _get_openai_media_url_policy() -> dict[str, Any]:
+    enabled = get_bool_env_var("SGLANG_OPENAI_MEDIA_URL_FETCH_ENABLED", "true")
+    allowed_schemes = os.getenv("SGLANG_OPENAI_MEDIA_URL_ALLOWED_SCHEMES", "https,http")
+    allowlist_raw = os.getenv("SGLANG_OPENAI_MEDIA_URL_ALLOWLIST", "")
+    default_max_bytes = 50 * 1024 * 1024
+    default_max_redirects = 5
+    default_timeout = 10.0
+    try:
+        max_bytes = int(
+            os.getenv("SGLANG_OPENAI_MEDIA_URL_MAX_BYTES", str(default_max_bytes))
+        )
+    except (TypeError, ValueError):
+        max_bytes = default_max_bytes
+    try:
+        max_redirects = int(
+            os.getenv(
+                "SGLANG_OPENAI_MEDIA_URL_MAX_REDIRECTS", str(default_max_redirects)
+            )
+        )
+    except (TypeError, ValueError):
+        max_redirects = default_max_redirects
+    try:
+        timeout = float(
+            os.getenv("SGLANG_OPENAI_MEDIA_URL_TIMEOUT", str(default_timeout))
+        )
+    except (TypeError, ValueError):
+        timeout = default_timeout
+
+    schemes = {
+        scheme.strip().lower()
+        for scheme in allowed_schemes.split(",")
+        if scheme.strip()
+    }
+    if not schemes:
+        schemes = {"https"}
+    allow_hosts, allow_nets = _parse_allowlist(allowlist_raw)
+    return {
+        "enabled": enabled,
+        "schemes": schemes,
+        "allow_hosts": allow_hosts,
+        "allow_nets": allow_nets,
+        "max_bytes": max_bytes,
+        "max_redirects": max_redirects,
+        "timeout": timeout,
+    }
+
+
+def _validate_media_url_with_policy_and_resolve(
+    url: str, policy: dict[str, Any]
+) -> tuple[Any, str, list[ipaddress._BaseAddress]]:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    hostname = (parsed.hostname or "").lower()
+    if scheme not in policy["schemes"]:
+        raise ValueError(f"URL scheme '{scheme}' is not allowed")
+    if not hostname:
+        raise ValueError("URL host is missing")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        if hostname not in policy["allow_hosts"]:
+            raise ValueError("Localhost URLs are not allowed")
+
+    ips = _resolve_host_ips(hostname)
+    if not ips:
+        raise ValueError("Failed to resolve URL host")
+    if _is_host_allowlisted(hostname, ips, policy["allow_hosts"], policy["allow_nets"]):
+        return parsed, hostname, ips
+    for ip in ips:
+        if _is_ip_blocked(ip):
+            raise ValueError("URL resolves to a private or reserved IP")
+    return parsed, hostname, ips
+
+
+def _build_pinned_media_url_request(
+    parsed: Any, hostname: str, ip: ipaddress._BaseAddress
+) -> tuple[str, dict[str, str], dict[str, Any] | None]:
+    ip_str = str(ip)
+    if ip.version == 6:
+        ip_str = f"[{ip_str}]"
+
+    netloc = ip_str
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo = f"{userinfo}:{parsed.password}"
+        netloc = f"{userinfo}@{netloc}"
+
+    pinned_url = parsed._replace(netloc=netloc).geturl()
+    host_header = hostname
+    if parsed.port:
+        host_header = f"{hostname}:{parsed.port}"
+    headers = {"Host": host_header}
+    extensions = (
+        {"sni_hostname": hostname} if (parsed.scheme or "").lower() == "https" else None
+    )
+    return pinned_url, headers, extensions
+
+
+def _response_peername(response: httpx.Response) -> Any:
+    stream = response.extensions.get("network_stream")
+    if stream is None:
+        return None
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    if get_extra_info is None:
+        return None
+    return get_extra_info("peername")
+
+
+def validate_openai_media_url_peer_ip(
+    peername: Any, allowed_ips: set[ipaddress._BaseAddress]
+) -> None:
+    if not peername:
+        raise ValueError("Failed to determine peer IP")
+    ip_str = peername[0]
+    peer_ip = ipaddress.ip_address(ip_str)
+    if peer_ip not in allowed_ips:
+        raise ValueError("Peer IP does not match DNS-resolved IPs")
+
+
+def _validate_media_url_with_policy(url: str, policy: dict[str, Any]) -> None:
+    _validate_media_url_with_policy_and_resolve(url, policy)
+
+
+def validate_openai_media_url(url: str) -> dict[str, Any]:
+    policy = _get_openai_media_url_policy()
+    if not policy["enabled"]:
+        raise ValueError("Remote media URL fetching is disabled by configuration")
+    _validate_media_url_with_policy(url, policy)
+    return policy
+
+
+async def save_image_to_path(
+    image: Union[UploadFile, str],
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
+    if uploads_root:
+        target_path = ensure_path_within_root(target_path, uploads_root)
+    input_path = await _maybe_url_image(image, target_path, uploads_root=uploads_root)
     if input_path is None:
-        input_path = await _save_upload_to_path(image, target_path)
+        input_path = await _save_upload_to_path(
+            image, target_path, uploads_root=uploads_root
+        )
     return input_path
 
 
 # Helpers
-async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
+async def _save_upload_to_path(
+    upload: UploadFile,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     content = await upload.read()
     with open(target_path, "wb") as f:
@@ -100,69 +333,143 @@ async def _save_upload_to_path(upload: UploadFile, target_path: str) -> str:
     return target_path
 
 
-async def _maybe_url_image(img_url: str, target_path: str) -> str | None:
+async def _maybe_url_image(
+    img_url: str,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str | None:
     if not isinstance(img_url, str):
         return None
 
     if img_url.lower().startswith(("http://", "https://")):
-        # Download image from URL
-        input_path = await _save_url_image_to_path(img_url, target_path)
+        policy = validate_openai_media_url(img_url)
+        input_path = await _save_url_image_to_path(
+            img_url, target_path, policy, uploads_root=uploads_root
+        )
         return input_path
     elif img_url.startswith("data:image"):
         # encode image base64 url
-        input_path = await _save_base64_image_to_path(img_url, target_path)
+        input_path = await _save_base64_image_to_path(
+            img_url, target_path, uploads_root=uploads_root
+        )
         return input_path
     else:
         raise ValueError("Unsupported image url format")
 
 
-async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
+async def _save_url_image_to_path(
+    image_url: str,
+    target_path: str,
+    policy: dict[str, Any] | None = None,
+    uploads_root: str | None = None,
+) -> str:
     """Download image from URL and save to target path."""
-
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-
     try:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(image_url, timeout=10.0)
-            response.raise_for_status()
+        policy = policy or validate_openai_media_url(image_url)
+        current_url = image_url
 
-            # Determine file extension from content type or URL after downloading
-            if not os.path.splitext(target_path)[1]:
-                content_type = response.headers.get("content-type", "").lower()
-
-                url_path = image_url.split("?")[0]
-                _, url_ext = os.path.splitext(url_path)
-                url_ext = url_ext.lower()
-
-                if url_ext in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
-                    ext = ".jpg" if url_ext == ".jpeg" else url_ext
-                elif content_type.startswith("image/"):
-                    if "jpeg" in content_type or "jpg" in content_type:
-                        ext = ".jpg"
-                    elif "png" in content_type:
-                        ext = ".png"
-                    elif "webp" in content_type:
-                        ext = ".webp"
-                    else:
-                        ext = ".jpg"  # Default to jpg
-                elif content_type == "application/octet-stream":
-                    # for octet-stream, if we couldn't get it from URL, default to jpg
-                    ext = ".jpg"
+        async with httpx.AsyncClient(follow_redirects=False) as client:
+            for _ in range(policy["max_redirects"] + 1):
+                parsed, hostname, ips = _validate_media_url_with_policy_and_resolve(
+                    current_url, policy
+                )
+                allowed_ips = set(ips)
+                if (parsed.scheme or "").lower() == "https":
+                    request_url = current_url
+                    headers = None
+                    extensions = None
                 else:
-                    raise ValueError(
-                        f"URL does not point to an image. Content-Type: {content_type}"
+                    pinned_ip = next((ip for ip in ips if ip.version == 4), ips[0])
+                    request_url, headers, extensions = _build_pinned_media_url_request(
+                        parsed, hostname, pinned_ip
                     )
-                target_path = f"{target_path}{ext}"
+                async with client.stream(
+                    "GET",
+                    request_url,
+                    timeout=policy["timeout"],
+                    headers=headers,
+                    extensions=extensions,
+                ) as response:
+                    validate_openai_media_url_peer_ip(
+                        _response_peername(response), allowed_ips
+                    )
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError(
+                                "Redirect response missing location header"
+                            )
+                        current_url = urljoin(current_url, location)
+                        continue
 
-            with open(target_path, "wb") as f:
-                f.write(response.content)
+                    response.raise_for_status()
 
-            return target_path
+                    # Determine file extension from content type or URL after downloading
+                    if not os.path.splitext(target_path)[1]:
+                        content_type = response.headers.get("content-type", "").lower()
+
+                        url_path = current_url.split("?")[0]
+                        _, url_ext = os.path.splitext(url_path)
+                        url_ext = url_ext.lower()
+
+                        if url_ext in {
+                            ".jpg",
+                            ".jpeg",
+                            ".png",
+                            ".webp",
+                            ".gif",
+                            ".bmp",
+                        }:
+                            ext = ".jpg" if url_ext == ".jpeg" else url_ext
+                        elif content_type.startswith("image/"):
+                            if "jpeg" in content_type or "jpg" in content_type:
+                                ext = ".jpg"
+                            elif "png" in content_type:
+                                ext = ".png"
+                            elif "webp" in content_type:
+                                ext = ".webp"
+                            else:
+                                ext = ".jpg"
+                        elif content_type == "application/octet-stream":
+                            ext = ".jpg"
+                        else:
+                            raise ValueError(
+                                f"URL does not point to an image. Content-Type: {content_type}"
+                            )
+                        target_path = f"{target_path}{ext}"
+
+                    if uploads_root:
+                        target_path = ensure_path_within_root(target_path, uploads_root)
+
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+                    content_length = response.headers.get("content-length")
+                    if content_length and int(content_length) > policy["max_bytes"]:
+                        raise ValueError("Remote content exceeds max size limit")
+
+                    total = 0
+                    with open(target_path, "wb") as f:
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > policy["max_bytes"]:
+                                raise ValueError(
+                                    "Remote content exceeds max size limit"
+                                )
+                            f.write(chunk)
+                    return target_path
+
+            raise ValueError("Too many redirects when fetching media URL")
+    except ValueError:
+        raise
     except Exception as e:
-        raise Exception(f"Failed to download image from URL: {str(e)}")
+        raise ValueError(f"Failed to download image from URL: {str(e)}") from e
 
 
-async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
+async def _save_base64_image_to_path(
+    base64_data: str,
+    target_path: str,
+    uploads_root: str | None = None,
+) -> str:
     """Decode base64 image data and save to target path."""
 
     # split `data:[<media-type>][;base64],<data>` to media-type base64 data
@@ -191,6 +498,8 @@ async def _save_base64_image_to_path(base64_data: str, target_path: str) -> str:
     else:
         ext = "jpg"
     target_path = f"{target_path}.{ext}"
+    if uploads_root:
+        target_path = ensure_path_within_root(target_path, uploads_root)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
 
     try:
