@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 from typing import Any, Dict, List, Optional
 
@@ -20,9 +21,11 @@ from sglang.srt.layers.quantization.int8_kernel import (
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
+    get_device_name,
     is_cpu,
     is_cuda,
     is_hip,
+    is_sm90_supported,
 )
 
 try:
@@ -50,6 +53,30 @@ padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 def support_tensor_descriptor():
     return _support_tensor_descriptor
+
+
+# In theory, swap_ab should benefit all SM90 GPUs.
+# However, since it has only been verified on H20 (not H100/H200),
+# it is currently enabled only on H20.
+@functools.lru_cache(maxsize=8)
+def should_enable_swap_ab(
+    BLOCK_SIZE_M: int,
+    BLOCK_SIZE_N: int,
+) -> bool:
+    if not _is_cuda:
+        return False
+
+    @functools.lru_cache(maxsize=1)
+    def is_h20_device_and_sm90_supported():
+        device_name = get_device_name()
+        is_h20_device = (
+            device_name and "H20" in device_name and "H200" not in device_name
+        )
+        return is_h20_device and is_sm90_supported()
+
+    return (
+        is_h20_device_and_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
+    )
 
 
 @triton.jit
@@ -360,6 +387,7 @@ def fused_moe_kernel(
     even_Ks: tl.constexpr,
     c_sorted: tl.constexpr,
     filter_expert: tl.constexpr,
+    swap_ab: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -498,7 +526,10 @@ def fused_moe_kernel(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if swap_ab:
+        accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_M), dtype=tl.float32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
@@ -539,12 +570,17 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                if swap_ab:
+                    a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
+                    a_scale, b_scale = b_scale, a_scale
                 if BLOCK_SIZE_N > group_n:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
                 else:
                     accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
                 if use_fp8_w8a8:
+                    if swap_ab:
+                        a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
                     accumulator += tl.dot(a, b)
@@ -555,6 +591,9 @@ def fused_moe_kernel(
             a_ptrs += BLOCK_SIZE_K * stride_ak
         if b_desc is None:
             b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if swap_ab:
+        accumulator = tl.trans(accumulator, (1, 0))
 
     if use_int8_w8a16:
         accumulator *= b_scale
@@ -614,6 +653,11 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    if use_fp8_w8a8:
+        swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
+    else:
+        swap_ab = False
 
     padded_size = 0
     if use_fp8_w8a8:
@@ -700,8 +744,8 @@ def invoke_fused_moe_kernel(
             B.stride(0),
             B.stride(2),
             B.stride(1),
-            C.stride(1),
-            C.stride(2),
+            C.stride(-2),
+            C.stride(-1),
             B_scale.stride(0),
             B_scale.stride(2),
             B_scale.stride(1),
@@ -786,8 +830,115 @@ def invoke_fused_moe_kernel(
             even_Ks=even_Ks,
             c_sorted=c_sorted,
             filter_expert=filter_expert,
+            swap_ab=swap_ab,
             **config,
         )
+
+
+@triton.jit
+def tanh(x):
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+@triton.jit
+def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
+    """
+    Apply activation function based on compile-time constant.
+
+    Args:
+        x: Input tensor (converted to float32 inside)
+        ACTIVATION_TYPE: Compile-time constant string ("silu" or "gelu")
+
+    Returns:
+        Activated output in the same dtype as input
+    """
+    x = x.to(tl.float32)
+    if ACTIVATION_TYPE == "silu":
+        return x * tl.sigmoid(x)
+    elif ACTIVATION_TYPE == "gelu":
+        kAlpha = 0.7978845608028654
+        return 0.5 * x * (1 + tanh(kAlpha * (x + 0.044715 * x * x * x)))
+    else:
+        raise ValueError(f"Unsupported activation: {ACTIVATION_TYPE}")
+
+
+@triton.jit
+def act_and_mul_kernel(
+    gateup_output,
+    down_input,
+    hidden_size,
+    expert_ids_ptr,
+    expert_step: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
+):
+    """
+    Unified activation and multiply kernel that handles both sorted and unsorted routing,
+    and both SiLU and GELU activations using compile-time constants.
+    """
+    InDtype = gateup_output.dtype.element_ty
+    OutDtype = down_input.dtype.element_ty
+
+    half_hidden_size = hidden_size // 2
+    pid = tl.program_id(0)
+
+    expert_id = tl.load(expert_ids_ptr + pid // expert_step)
+
+    if expert_id == -1:
+        return
+
+    gateup_output_ptr = gateup_output + pid * hidden_size
+    down_input_ptr = down_input + pid * half_hidden_size
+    gate_output_ptr = gateup_output_ptr
+    up_output_ptr = gateup_output_ptr + half_hidden_size
+
+    for start_offset in tl.range(0, half_hidden_size, BLOCK_SIZE):
+        offset = start_offset + tl.arange(0, BLOCK_SIZE)
+        mask = offset < half_hidden_size
+
+        gate_output = tl.load(gate_output_ptr + offset, mask=mask)
+        up_output = tl.load(up_output_ptr + offset, mask=mask)
+
+        gate_output_activated = _apply_activation(gate_output, ACTIVATION_TYPE)
+        gate_output_activated = gate_output_activated.to(InDtype)
+
+        act_mul_output = gate_output_activated * up_output
+        act_mul_output = act_mul_output.to(OutDtype)
+        tl.store(down_input_ptr + offset, act_mul_output, mask=mask)
+
+
+def act_and_mul_triton(
+    gateup_output: torch.Tensor,
+    down_input: torch.Tensor,
+    config: Dict[str, Any],
+    topk_ids: Optional[torch.Tensor] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+    down_moe_use_tma: bool = False,
+    activation: str = "silu",
+) -> None:
+    """
+    Args:
+        gateup_output: Input tensor containing gate and up outputs concatenated
+        down_input: Output tensor for the result
+        config: Configuration dictionary with BLOCK_SIZE_M and BLOCK_SIZE_N
+        topk_ids: Expert IDs for unsorted routing (used when down_moe_use_tma=False)
+        expert_ids: Expert IDs for sorted routing (used when down_moe_use_tma=True)
+        down_moe_use_tma: Whether to use sorted routing layout
+        activation: Activation type ("silu" or "gelu")
+    """
+    grid = (down_input.shape[0],)
+    hidden_size = gateup_output.shape[1]
+    expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
+    expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    act_and_mul_kernel[grid](
+        gateup_output,
+        down_input,
+        hidden_size,
+        expert_ids_row,
+        expert_step,
+        BLOCK_SIZE=512,
+        ACTIVATION_TYPE=activation,
+    )
 
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py

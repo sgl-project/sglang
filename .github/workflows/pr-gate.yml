@@ -55,7 +55,7 @@ jobs:
         run: |
           labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
-            echo "Missing required label 'run-ci'."
+            echo "Missing required label 'run-ci'. See https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests for more details."
             exit 1
           fi
 

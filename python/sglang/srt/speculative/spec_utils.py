@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
@@ -19,6 +19,8 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
@@ -46,6 +48,14 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+
+
+def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
+    if server_args is None:
+        server_args = get_global_server_args()
+
+    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit
@@ -465,13 +475,14 @@ def select_top_k_tokens(
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        if hidden_states is not None:
+            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
         scores = topk_p  # shape: (b, topk)
 
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
+            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -695,3 +706,39 @@ def detect_nan(logits_output: LogitsProcessorOutput):
     if torch.any(torch.isnan(logits)):
         logger.error("Detected errors during sampling! NaN in the logits.")
         raise ValueError("Detected errors during sampling! NaN in the logits.")
+
+
+# Disable torch.compile for this function because it will be
+# even slower.
+# @torch.compile(dynamic=True)
+def get_last_loc_large_page_size_large_top_k(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    speculative_num_steps: int,
+    topk: int,
+    page_size: int,
+):
+    prefix_lens = seq_lens
+    last_page_lens = prefix_lens % page_size
+    num_new_pages_per_topk = (
+        last_page_lens + speculative_num_steps + page_size - 1
+    ) // page_size
+    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
+        page_size * topk
+    )
+    extend_lens = seq_lens - prefix_lens
+    last_loc = get_last_loc(
+        req_to_token,
+        req_pool_indices,
+        prefix_lens,
+    )
+
+    return (
+        prefix_lens,
+        seq_lens,
+        last_loc,
+        num_new_pages_per_topk,
+        extend_lens,
+        last_page_lens,
+    )

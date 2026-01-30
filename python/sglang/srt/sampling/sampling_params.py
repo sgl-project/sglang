@@ -14,8 +14,13 @@
 """Sampling parameters for text generation."""
 
 import logging
-import sre_parse
 from typing import Any, Dict, List, Optional, Union
+
+# sre_parse is deprecated in Python 3.11+, use re._parser instead
+try:
+    import re._parser as sre_parse
+except ImportError:
+    import sre_parse  # Python < 3.11
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
@@ -58,7 +63,7 @@ class SamplingParams:
         custom_params: Optional[Dict[str, Any]] = None,
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
-        sampling_seed: int = 42,
+        sampling_seed: Optional[int] = None,
     ) -> None:
         self.max_new_tokens = max_new_tokens
         self.stop_strs = stop
@@ -146,8 +151,6 @@ class SamplingParams:
                         f"logit_bias must has keys in [0, {vocab_size - 1}], got "
                         f"{token_id}."
                     )
-        if self.sampling_seed is None:
-            raise ValueError("sampling_seed should not be None")
 
         grammars = [
             self.json_schema,

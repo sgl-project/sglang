@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import IntEnum, auto
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -35,7 +35,6 @@ try:
 except ImportError:
     pass
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -48,6 +47,8 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -73,6 +74,11 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
+
+    try:
+        from flashinfer.fused_moe import fused_topk_deepseek
+    except ImportError:
+        fused_topk_deepseek = None
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
@@ -120,32 +126,23 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        return topk_output.format.is_standard()
+        return isinstance(topk_output, StandardTopKOutput)
 
     @staticmethod
     def format_is_triton_kernels(
         topk_output: TopKOutput,
     ) -> TypeGuard[TritonKernelTopKOutput]:
-        return topk_output.format.is_triton_kernels()
+        return isinstance(topk_output, TritonKernelTopKOutput)
 
     @staticmethod
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
-        return topk_output.format.is_bypassed()
+        return isinstance(topk_output, BypassedTopKOutput)
 
 
-class TopKOutputFormat(Enum):
+class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
-
-    def is_standard(self) -> bool:
-        return self == TopKOutputFormat.STANDARD
-
-    def is_triton_kernels(self) -> bool:
-        return self == TopKOutputFormat.TRITON_KERNEL
-
-    def is_bypassed(self) -> bool:
-        return self == TopKOutputFormat.BYPASSED
 
 
 @runtime_checkable
@@ -199,7 +196,7 @@ class BypassedTopKOutput(NamedTuple):
 # -------------------------------- TopK ---------------------------------------
 
 
-class TopK(CustomOp):
+class TopK(MultiPlatformOp):
     """
     Parameters:
     --top_k: The all number of top experts selected per token, including the fused shared expert(s).
@@ -212,6 +209,7 @@ class TopK(CustomOp):
         self,
         top_k: int,
         *,
+        layer_id: Optional[int] = None,
         use_grouped_topk: bool = False,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
@@ -233,6 +231,7 @@ class TopK(CustomOp):
         if use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
 
+        self.layer_id = layer_id
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -260,6 +259,7 @@ class TopK(CustomOp):
         self.topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -309,6 +309,7 @@ class TopK(CustomOp):
             ):
                 topk_output = select_experts(
                     hidden_states=hidden_states,
+                    layer_id=self.layer_id,
                     router_logits=router_logits,
                     topk_config=self.topk_config,
                     num_token_non_padded=num_token_non_padded,
@@ -326,6 +327,7 @@ class TopK(CustomOp):
     ) -> TopKOutput:
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=self.layer_id,
             router_logits=router_logits,
             topk_config=self.topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -735,12 +737,67 @@ def biased_grouped_topk_gpu(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    # TODO: moe_fused_gate kernel is not supported for num_fused_shared_experts > 0 now.
+
+    num_tokens = gating_output.shape[0]
+    num_experts = gating_output.shape[1]
+    experts_per_group = (
+        num_experts // num_expert_group if num_expert_group else num_experts
+    )
+
     if (
         _is_cuda
-        and gating_output.shape[1] // num_expert_group
-        <= 32  # moe_fused_gate kernel ensure that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
-        and is_power_of_two(correction_bias.shape[0])
+        and fused_topk_deepseek is not None
+        and num_fused_shared_experts == 0
+        and is_power_of_two(num_experts)
+        # flashinfer constraints
+        and topk <= 8
+        and topk_group <= num_expert_group
+        and topk_group * num_expert_group >= topk
+        and (
+            (experts_per_group <= 32 and experts_per_group * topk_group <= 128)
+            if num_expert_group > 1
+            else num_experts <= 384
+        )
+    ):
+        # Pre-allocate output tensors (flashinfer mutates them in-place)
+        topk_weights = torch.empty(
+            (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+        )
+        topk_ids = torch.empty(
+            (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+        )
+
+        # flashinfer always applies the scaling_factor internally
+        scaling_factor = 1.0
+        if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
+            scaling_factor = routed_scaling_factor
+
+        # flashinfer's fused_topk_deepseek
+        fused_topk_deepseek(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            scaling_factor,
+            topk_weights,
+            topk_ids,
+            True,
+        )
+
+        if (expert_location_dispatch_info is not None) or (
+            num_token_non_padded is not None
+        ):
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
+        return topk_weights, topk_ids
+
+    elif (
+        _is_cuda
+        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+        and experts_per_group <= 32
+        and is_power_of_two(num_experts)
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
@@ -760,6 +817,7 @@ def biased_grouped_topk_gpu(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
         return topk_weights, topk_ids
+
     elif _use_aiter:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
@@ -856,6 +914,7 @@ def select_experts(
     router_logits: torch.Tensor,
     topk_config: TopKConfig,
     *,
+    layer_id: Optional[int] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
@@ -983,7 +1042,10 @@ def select_experts(
         )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-
+    get_global_experts_capturer().capture(
+        layer_id=layer_id,
+        topk_ids=topk_ids,
+    )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
