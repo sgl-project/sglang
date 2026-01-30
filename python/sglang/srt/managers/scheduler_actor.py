@@ -26,20 +26,15 @@ logger = logging.getLogger(__name__)
 
 def create_scheduler_actor_class():
     """Factory function to create SchedulerActor class with Ray decorator.
-
-    This factory pattern is used to avoid importing Ray at module load time,
-    which allows the module to be imported even when Ray is not installed.
     """
     import ray
 
     @ray.remote
     class SchedulerActor:
-        """
-        Ray actor wrapper for SGLang Scheduler.
+        """Ray actor wrapper for SGLang Scheduler.
 
-        Each actor manages one GPU and runs the full Scheduler + TpModelWorker stack.
-        The actor preserves ZMQ for high-throughput request/response communication.
-        Ray is used only for process lifecycle and resource management.
+        Each actor manages one GPU and runs the Scheduler + TpModelWorker stack.
+        Ray is used for process lifecycle; ZMQ handles request/response communication.
         """
 
         def __init__(
@@ -52,75 +47,17 @@ def create_scheduler_actor_class():
             pp_rank: int,
             dp_rank: Optional[int],
         ):
-            # CRITICAL: Set CUDA_VISIBLE_DEVICES FIRST, before any imports that
-            # might initialize CUDA. Ray with num_gpus=0 clears this env var.
-            import os
-
-            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-            if not cuda_visible or cuda_visible.strip() == "":
-                # Calculate visible GPUs based on tp_size
-                tp_size = server_args.tp_size
-                base_gpu = server_args.base_gpu_id
-                visible_gpus = ",".join(str(base_gpu + i) for i in range(tp_size))
-                os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
-                logger.info(
-                    f"[SchedulerActor TP{tp_rank}] Set CUDA_VISIBLE_DEVICES={visible_gpus}"
-                )
-            else:
-                logger.info(
-                    f"[SchedulerActor TP{tp_rank}] CUDA_VISIBLE_DEVICES already set: {cuda_visible}"
-                )
-
-            # Now import other modules (some may initialize CUDA)
-            import faulthandler
-
-            import setproctitle
-
-            from sglang.srt.environ import envs
-            from sglang.srt.managers.scheduler import Scheduler
-            from sglang.srt.utils import configure_logger, suppress_other_loggers
-            from sglang.srt.utils.common import (
-                get_bool_env_var,
-                numa_bind_to_node,
-                set_gpu_proc_affinity,
+            from sglang.srt.managers.scheduler import (
+                Scheduler,
+                configure_scheduler,
             )
 
-            # Generate logger prefix (same logic as run_scheduler_process)
-            if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
-                dp_rank = int(os.environ["SGLANG_DP_RANK"])
+            # Configure worker (logging, process title, etc.)
+            _, dp_rank = configure_scheduler(
+                server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
+            )
 
-            prefix = ""
-            if dp_rank is not None:
-                prefix += f" DP{dp_rank}"
-            if server_args.pp_size > 1:
-                prefix += f" PP{pp_rank}"
-            if server_args.tp_size > 1:
-                prefix += f" TP{tp_rank}"
-            if server_args.ep_size > 1:
-                prefix += f" EP{moe_ep_rank}"
-
-            # Configure process
-            setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
-            faulthandler.enable()
-
-            # Configure logger
-            configure_logger(server_args, prefix=prefix)
-            suppress_other_loggers()
-
-            # Set cpu affinity to this gpu process
-            if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
-                set_gpu_proc_affinity(
-                    server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
-                )
-            if (
-                numa_node := server_args.numa_node
-            ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-                numa_bind_to_node(numa_node[gpu_id])
-
-            # Create scheduler (this loads the model into GPU)
-            # Note: We use num_gpus=0 in actor options so all GPUs are visible,
-            # allowing NCCL to communicate between actors. Each actor uses its
-            # assigned gpu_id via torch.cuda.set_device().
+            # Create scheduler (loads model into GPU, initializes NCCL)
             self.scheduler = Scheduler(
                 server_args,
                 port_args,
@@ -136,7 +73,6 @@ def create_scheduler_actor_class():
 
         def get_info(self) -> Dict[str, Any]:
             """Return scheduler initialization info for handshake."""
-            # Access attributes directly for compatibility with different sglang versions
             return {
                 "status": "ready",
                 "max_total_num_tokens": self.scheduler.max_total_num_tokens,
@@ -144,18 +80,11 @@ def create_scheduler_actor_class():
             }
 
         def run_event_loop(self) -> None:
-            """
-            Run the scheduler's ZMQ event loop.
-
-            This method blocks until shutdown. The appropriate event loop
-            variant is chosen based on server_args configuration.
-            """
+            """Run the scheduler's event loop. Blocks until shutdown."""
             try:
                 self.scheduler.run_event_loop()
             except Exception as e:
-                logger.error(
-                    f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}"
-                )
+                logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")
                 raise
 
     return SchedulerActor

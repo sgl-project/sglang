@@ -3023,21 +3023,24 @@ class SenderWrapper:
         self.socket.send_pyobj(output)
 
 
-def run_scheduler_process(
+def configure_scheduler(
     server_args: ServerArgs,
-    port_args: PortArgs,
-    gpu_id: int,
     tp_rank: int,
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
-    pipe_writer,
-):
+) -> Tuple[str, Optional[int]]:
+    """Configure scheduler worker: logging, process title, etc.
+
+    Returns:
+        Tuple of (prefix, dp_rank) where dp_rank may be updated from env var.
+    """
     # Generate the logger prefix
-    prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:
         # [For Router] if env var "SGLANG_DP_RANK" exist, set dp_rank to the value of the env var
         dp_rank = int(os.environ["SGLANG_DP_RANK"])
+
+    prefix = ""
     if dp_rank is not None:
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
@@ -3050,12 +3053,30 @@ def run_scheduler_process(
     # Config the process
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
-    kill_itself_when_parent_died()
-    parent_process = psutil.Process().parent()
 
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
+
+    return prefix, dp_rank
+
+
+def run_scheduler_process(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    gpu_id: int,
+    tp_rank: int,
+    moe_ep_rank: int,
+    pp_rank: int,
+    dp_rank: Optional[int],
+    pipe_writer,
+):
+    prefix, dp_rank = configure_scheduler(
+        server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
+    )
+
+    kill_itself_when_parent_died()
+    parent_process = psutil.Process().parent()
 
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):

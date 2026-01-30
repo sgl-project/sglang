@@ -1096,6 +1096,8 @@ def _launch_scheduler_ray_actors(
     import uuid
 
     import ray
+    from ray.util.placement_group import placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
     from sglang.srt.managers.scheduler_actor import create_scheduler_actor_class
 
@@ -1106,6 +1108,10 @@ def _launch_scheduler_ray_actors(
             "Set dp_size=1 or use_ray=False."
         )
 
+    # CRITICAL: Set RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 BEFORE Ray initialization
+    # This prevents Ray from overwriting CUDA_VISIBLE_DEVICES when actors are created,
+    # which is essential for NCCL process group formation in multi-GPU setups.
+    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
     # Initialize Ray if needed
     if not ray.is_initialized():
         ray.init()
@@ -1116,12 +1122,36 @@ def _launch_scheduler_ray_actors(
     # Generate unique instance ID to prevent actor name collisions
     instance_id = uuid.uuid4().hex[:8]
 
-    scheduler_actors = []
-
     # Calculate rank ranges (shared logic with mp version)
     pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
         _calculate_rank_ranges(server_args)
     )
+
+    # Calculate total number of GPUs needed for this node
+    num_gpus_needed = len(pp_rank_range) * len(tp_rank_range)
+
+    # Create a placement group to ensure all actors are co-located on the same node
+    # with the required GPU resources. This is critical for NCCL communication.
+    # Each bundle represents one GPU that will be used by one actor.
+    bundles = [{"GPU": 1} for _ in range(num_gpus_needed)]
+    pg = placement_group(bundles, strategy="STRICT_PACK")
+
+    # Wait for placement group to be ready
+    ray.get(pg.ready())
+    logger.info(
+        f"Created placement group with {num_gpus_needed} GPU bundles for multi-GPU NCCL"
+    )
+
+    # Calculate visible GPUs string for all actors
+    # All actors need to see all GPUs for NCCL to work properly
+    tp_size = server_args.tp_size
+    pp_size = server_args.pp_size
+    base_gpu = server_args.base_gpu_id
+    total_gpus = tp_size * pp_size
+    visible_gpus = ",".join(str(base_gpu + i) for i in range(total_gpus))
+
+    scheduler_actors = []
+    bundle_idx = 0
 
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
@@ -1132,23 +1162,32 @@ def _launch_scheduler_ray_actors(
             )
             moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-            # Create Ray actor with fractional GPU resource request.
-            # Using num_gpus=1/tp_size allows all actors to run on the same GPU pool
-            # while ensuring Ray doesn't clear CUDA_VISIBLE_DEVICES.
-            # Each actor will use its assigned gpu_id via torch.cuda.set_device().
-            # Use unique instance_id to prevent name collisions across multiple SGLang instances
+            # Create Ray actor with placement group scheduling.
+            # The placement group ensures:
+            # 1. All actors are on the same node (STRICT_PACK)
+            # 2. Each actor gets exclusive access to one GPU
             #
-            # CRITICAL: Set CUDA_VISIBLE_DEVICES via runtime_env to ensure all GPUs are
-            # visible for NCCL communication.
-            tp_size = server_args.tp_size
-            base_gpu = server_args.base_gpu_id
-            visible_gpus = ",".join(str(base_gpu + i) for i in range(tp_size))
+            # We use num_gpus=1 to reserve the GPU resource, but set CUDA_VISIBLE_DEVICES
+            # to all GPUs so NCCL can communicate across all of them.
+            # We set num_cpus=0 because placement group bundles only have GPU resources.
+            #
+            # CRITICAL environment variables:
+            # - CUDA_VISIBLE_DEVICES: All GPUs visible for NCCL communication
+            # - NCCL_DEBUG: Set to INFO for debugging NCCL issues
             actor = SchedulerActor.options(
-                num_gpus=0,  # Don't request GPU resources; let Ray inherit CUDA_VISIBLE_DEVICES
+                num_cpus=0,  # Don't request CPU; bundles only have GPU
+                num_gpus=1,  # Reserve 1 GPU per actor via placement group
                 name=f"sglang_scheduler_{instance_id}_pp{pp_rank}_tp{tp_rank}",
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=bundle_idx,
+                ),
                 runtime_env={
                     "env_vars": {
                         "CUDA_VISIBLE_DEVICES": visible_gpus,
+                        # NCCL settings for multi-GPU communication
+                        "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
+                        "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE", "0"),
                     }
                 },
             ).remote(
@@ -1161,6 +1200,7 @@ def _launch_scheduler_ray_actors(
                 dp_rank=0,  # dp_rank=0 when dp_size=1 for consistency with mp mode
             )
             scheduler_actors.append(actor)
+            bundle_idx += 1
 
     # Wait for all schedulers to initialize
     # Unlike mp mode, Ray actors are ready once __init__ completes.
