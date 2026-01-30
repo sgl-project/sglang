@@ -225,7 +225,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
-        self.intermediate_state_indices_list = []  # Pre-allocated for CUDA graph
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -488,10 +487,6 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-            # Pre-allocate intermediate_state_indices: [0, 1, 2, ..., i]
-            self.intermediate_state_indices_list.append(
-                torch.arange(i + 1, dtype=torch.int32, device=self.device)
-            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -534,14 +529,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
-            )
-        elif forward_mode.is_target_verify():
-            # topk == 1, still need intermediate_state_indices for speculative decoding
-            return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -607,14 +594,6 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
-            )
-        elif forward_mode.is_target_verify():
-            # topk == 1, still need intermediate_state_indices for speculative decoding
-            return ForwardMetadata(
-                query_start_loc=self.query_start_loc_list[bs - 1],
-                mamba_cache_indices=self.state_indices_list[bs - 1],
-                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -679,17 +658,11 @@ class MambaAttnBackendBase(AttentionBackend):
             and forward_batch.mamba_track_mask.any()
         ):
             h = h.squeeze(0)
-            # Check if K-last layout is used (for GDNAttnBackend with MTP optimization)
-            ssm_k_last = getattr(self, 'ssm_k_last', False)
 
             if forward_metadata.track_ssm_h_src.numel() > 0:
-                h_to_store = h[forward_metadata.track_ssm_h_src]
-                if ssm_k_last:
-                    # h is V-last from kernel, transpose to K-last for pool
-                    h_to_store = h_to_store.transpose(-1, -2)
-                ssm_states[forward_metadata.track_ssm_h_dst] = h_to_store.to(
-                    ssm_states.dtype, copy=False
-                )
+                ssm_states[forward_metadata.track_ssm_h_dst] = h[
+                    forward_metadata.track_ssm_h_src
+                ].to(ssm_states.dtype, copy=False)
             if forward_metadata.track_ssm_final_src.numel() > 0:
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
@@ -963,10 +936,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 GDNAttnBackend._k_last_decode_warning_shown = True
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Override to initialize forward metadata for GDN backend."""
-        super().init_forward_metadata(forward_batch)
-
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1153,13 +1122,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            # Use pre-allocated indices from CUDA graph state to avoid sync
-            intermediate_state_indices = forward_metadata.intermediate_state_indices
-            if intermediate_state_indices is None:
-                # Fallback for non-CUDA-graph path
-                intermediate_state_indices = torch.arange(
-                    cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-                )
+            intermediate_state_indices = torch.arange(
+                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+            )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
