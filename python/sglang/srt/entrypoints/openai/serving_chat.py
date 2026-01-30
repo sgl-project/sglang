@@ -1196,16 +1196,23 @@ class OpenAIServingChat(OpenAIServingBase):
         """Judge whether the request needs reasoning"""
         if not self.reasoning_parser:
             return False
-        if self.reasoning_parser in ["deepseek-v3", "kimi_k2"]:
+        if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
-            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
             return (
                 not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
+                or request.chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
             )
         return True  # default
 
