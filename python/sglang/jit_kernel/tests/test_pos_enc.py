@@ -18,9 +18,6 @@ def create_test_inputs(
     key = torch.randn(
         batch_size, seq_len, num_kv_heads, head_size, dtype=dtype, device=device
     )
-    value = torch.randn(
-        batch_size, seq_len, num_kv_heads, head_size, dtype=dtype, device=device
-    )
 
     pos_ids = torch.randint(
         0, min(seq_len * 2, 100), (total_tokens,), dtype=torch.long, device=device
@@ -28,9 +25,8 @@ def create_test_inputs(
 
     query = query.view(total_tokens, num_q_heads, head_size)
     key = key.view(total_tokens, num_kv_heads, head_size)
-    value = value.view(total_tokens, num_kv_heads, head_size)
 
-    return query, key, value, pos_ids
+    return query, key, pos_ids
 
 
 def create_cos_sin_cache(rotary_dim, max_position_embeddings, base, dtype, device):
@@ -78,51 +74,55 @@ def get_sgl_rotary_embedding(
     ).to(device)
 
 
-def compare_results(query_jit_out, key_jit_out, query_sgl_out, key_sgl_out, dtype):
+def compare_results(jit_out, sgl_out, dtype):
     """Compare results between JIT and SGL implementations."""
+    if jit_out is None:
+        assert sgl_out is None
+        return
+
+    assert sgl_out is not None
+
     # Check for NaN values
-    assert (
-        not torch.isnan(query_jit_out).any() and not torch.isnan(key_jit_out).any()
-    ), "NaN in JIT results"
-    assert (
-        not torch.isnan(query_sgl_out).any() and not torch.isnan(key_sgl_out).any()
-    ), "NaN in SGL results"
+    assert not torch.isnan(jit_out).any(), "NaN in JIT results"
+    assert not torch.isnan(sgl_out).any(), "NaN in SGL results"
 
     # Compare results
     atol = 1e-2 if dtype != torch.float32 else 1e-5
     rtol = 1e-2 if dtype != torch.float32 else 1e-5
 
-    torch.testing.assert_close(query_jit_out, query_sgl_out, atol=atol, rtol=rtol)
-    torch.testing.assert_close(key_jit_out, key_sgl_out, atol=atol, rtol=rtol)
+    torch.testing.assert_close(jit_out, sgl_out, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize(
-    "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads, save_kv_cache",
+    "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [
         # GPT-OSS cases
         *[
-            (64, 64, 4096, 8000, True, torch.bfloat16, "cuda", bs, sl, 8, 8, skv)
+            (64, 64, 4096, 8000, True, torch.bfloat16, "cuda", bs, sl, 8, 8)
             for bs, sl in [(1, 1), (32, 1), (128, 1), (512, 1), (2, 512), (4, 4096)]
-            for skv in (False, True)
         ],
         # Other cases
-        (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1, False),
-        (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2, False),
-        (512, 128, 311, 10000, True, torch.bfloat16, "cuda", 3, 39, 4, 2, False),
-        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8, False),
-        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4, False),
-        (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2, False),
-        (64, 64, 32, 8000, True, torch.float32, "cuda", 32, 32, 1, 1, False),
-        (256, 128, 4096, 10000, True, torch.float32, "cuda", 2, 512, 4, 2, False),
-        (512, 128, 311, 10000, True, torch.float32, "cuda", 3, 39, 4, 2, False),
-        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 32, 8, False),
-        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 16, 4, False),
-        (512, 128, 311, 10000, False, torch.float32, "cuda", 3, 39, 4, 2, False),
+        (64, 64, 32, 8000, True, torch.bfloat16, "cuda", 32, 32, 1, 1),
+        (256, 128, 4096, 10000, True, torch.bfloat16, "cuda", 2, 512, 4, 2),
+        (512, 128, 311, 10000, True, torch.bfloat16, "cuda", 3, 39, 4, 2),
+        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8),
+        (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4),
+        (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2),
+        (64, 64, 32, 8000, True, torch.float32, "cuda", 32, 32, 1, 1),
+        (256, 128, 4096, 10000, True, torch.float32, "cuda", 2, 512, 4, 2),
+        (512, 128, 311, 10000, True, torch.float32, "cuda", 3, 39, 4, 2),
+        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 32, 8),
+        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 16, 4),
+        (512, 128, 311, 10000, False, torch.float32, "cuda", 3, 39, 4, 2),
         # Additional test cases for different head sizes and dtypes
-        (64, 32, 1024, 10000, True, torch.float16, "cuda", 16, 64, 8, 4, False),
-        (128, 64, 2048, 10000, True, torch.float16, "cuda", 8, 128, 16, 8, False),
-        (256, 128, 4096, 10000, True, torch.float16, "cuda", 4, 256, 8, 4, False),
+        (64, 32, 1024, 10000, True, torch.float16, "cuda", 16, 64, 8, 4),
+        (128, 64, 2048, 10000, True, torch.float16, "cuda", 8, 128, 16, 8),
+        (256, 128, 4096, 10000, True, torch.float16, "cuda", 4, 256, 8, 4),
     ],
+)
+@pytest.mark.parametrize(
+    "key_is_none",
+    [True, False],
 )
 def test_correctness(
     head_size,
@@ -136,11 +136,11 @@ def test_correctness(
     seq_len,
     num_q_heads,
     num_kv_heads,
-    save_kv_cache,
+    key_is_none,
 ):
     """Test correctness of JIT rotary embedding implementation."""
     # Create inputs and caches
-    query, key, _, pos_ids = create_test_inputs(
+    query, key, pos_ids = create_test_inputs(
         head_size, batch_size, seq_len, device, dtype, num_q_heads, num_kv_heads
     )
     cos_sin_cache = create_cos_sin_cache(
@@ -163,6 +163,9 @@ def test_correctness(
     query_jit, key_jit = query.clone(), key.clone()
     query_sgl, key_sgl = query.clone(), key.clone()
 
+    if key_is_none:
+        key_jit = None
+        key_sgl = None
     query_jit_out, key_jit_out = rotary_embedding(
         positions=pos_ids,
         query=query_jit,
@@ -176,7 +179,8 @@ def test_correctness(
         positions=pos_ids, query=query_sgl, key=key_sgl
     )
 
-    compare_results(query_jit_out, key_jit_out, query_sgl_out, key_sgl_out, dtype)
+    compare_results(query_jit_out, query_sgl_out, dtype)
+    compare_results(key_jit_out, key_sgl_out, dtype)
 
 
 @pytest.mark.parametrize(
@@ -208,7 +212,7 @@ def test_performance(
 ):
     """Performance test comparing JIT and SGL implementations with accuracy validation."""
     # Create inputs and caches
-    query, key, _, pos_ids = create_test_inputs(
+    query, key, pos_ids = create_test_inputs(
         head_size, batch_size, seq_len, device, dtype, num_q_heads, num_kv_heads
     )
     cos_sin_cache = create_cos_sin_cache(
@@ -292,7 +296,8 @@ def test_performance(
     )
 
     # Validate accuracy
-    compare_results(query_jit_out, key_jit_out, query_sgl_out, key_sgl_out, dtype)
+    compare_results(query_jit_out, query_sgl_out, dtype)
+    compare_results(key_jit_out, key_sgl_out, dtype)
 
     # Print results
     total_tokens = batch_size * seq_len

@@ -209,7 +209,8 @@ struct RotaryEmbeddingKernel {
                                        // [num_tokens, num_heads * head_size] or
                                        // [batch_size, seq_len, num_heads, head_size] or
                                        // [num_tokens, num_heads, head_size]
-      tvm::ffi::TensorView key,
+      tvm::ffi::Optional<tvm::ffi::TensorView> key,
+      // null or
       // [batch_size, seq_len, num_kv_heads * head_size] or
       // [num_tokens, num_kv_heads * head_size] or
       // [batch_size, seq_len, num_heads, head_size] or
@@ -228,32 +229,32 @@ struct RotaryEmbeddingKernel {
         positions_ndim == 1 || positions_ndim == 2, "positions must have shape [num_tokens] or [batch_size, seq_len]");
     if (positions_ndim == 1) {
       RuntimeCheck(
-          query.size(0) == positions.size(0) && key.size(0) == positions.size(0),
+          query.size(0) == positions.size(0) && (!key.has_value() || key.value().size(0) == positions.size(0)),
           "query, key and positions must have the same number of tokens");
     }
     if (positions_ndim == 2) {
       RuntimeCheck(
-          query.size(0) == positions.size(0) && key.size(0) == positions.size(0) &&
-              query.size(1) == positions.size(1) && key.size(1) == positions.size(1),
+          query.size(0) == positions.size(0) && (!key.has_value() || key.value().size(0) == positions.size(0)) &&
+              query.size(1) == positions.size(1) && (!key.has_value() || key.value().size(1) == positions.size(1)),
           "query, key and positions must have the same batch_size and seq_len");
     }
 
     // Make sure head_size is valid for query and key
     // hidden_size = num_heads * head_size
     int query_hidden_size = query.numel() / num_tokens;
-    int key_hidden_size = key.numel() / num_tokens;
+    int key_hidden_size = key.has_value() ? key.value().numel() / num_tokens : 0;
     RuntimeCheck(query_hidden_size % head_size == 0);
     RuntimeCheck(key_hidden_size % head_size == 0);
 
     // Make sure query and key have consistent number of heads
     int num_heads = query_hidden_size / head_size;
-    int num_kv_heads = key_hidden_size / head_size;
+    int num_kv_heads = key.has_value() ? key_hidden_size / head_size : num_heads;
     RuntimeCheck(num_heads % num_kv_heads == 0);
 
     int rot_dim = cos_sin_cache.size(1);
     int seq_dim_idx = positions_ndim - 1;
     int64_t query_stride = query.stride(seq_dim_idx);
-    int64_t key_stride = key.stride(seq_dim_idx);
+    int64_t key_stride = key.has_value() ? key.value().stride(seq_dim_idx) : 0;
     // Determine head stride: for [*, heads, head_size] use stride of last dim;
     // for flat [*, heads*head_size], heads blocks are contiguous of size
     // head_size
@@ -270,7 +271,7 @@ struct RotaryEmbeddingKernel {
           positions_data_ptr,
           query.dtype(),
           query.data_ptr(),
-          key.data_ptr(),
+          key.has_value() ? key.value().data_ptr() : nullptr,
           cos_sin_cache.data_ptr(),
           rot_dim,
           query_stride,
@@ -286,7 +287,7 @@ struct RotaryEmbeddingKernel {
           positions_data_ptr,
           query.dtype(),
           query.data_ptr(),
-          key.data_ptr(),
+          key.has_value() ? key.value().data_ptr() : nullptr,
           cos_sin_cache.data_ptr(),
           rot_dim,
           query_stride,
