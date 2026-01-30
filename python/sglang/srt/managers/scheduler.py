@@ -127,7 +127,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -1189,6 +1189,7 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = unwrap_shm_features(recv_req)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1544,13 +1545,13 @@ class Scheduler(
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
-            if req.is_prefill_only:
+            if recv_req.return_logprob:
+                # If return_logprob is True, return the logprobs for output tokens by default
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+            elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-            elif recv_req.return_logprob:
-                # If return_logprob is True, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids) - 1
             else:
                 # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1
