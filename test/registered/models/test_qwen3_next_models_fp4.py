@@ -64,5 +64,62 @@ class TestQwen3NextFp4(CustomTestCase):
         )
 
 
+@unittest.skipIf(
+    get_device_sm() < 100, "Test requires CUDA SM 100 or higher (Blackwell)"
+)
+class TestQwen3NextFp4MTP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QWEN3_NEXT_MODEL_FP4
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--chunked-prefill-size",
+                "2048",
+                "--quantization",
+                "modelopt_fp4",
+                "--mamba-scheduler-strategy",
+                "no_buffer",
+                "--speculative-algorithm",
+                "NEXTN",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--mem-fraction-static",
+                "0.8",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreaterEqual(
+            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
