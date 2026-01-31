@@ -1,9 +1,26 @@
 import os
 
+import pytest
+
 print("[CONFTEST] Loading conftest.py at import time")
 
-_GLOBAL_PERF_RESULTS = []
-print(f"[CONFTEST] _GLOBAL_PERF_RESULTS created with id={id(_GLOBAL_PERF_RESULTS)}")
+# Use pytest's stash instead of global variable to avoid double-import issues
+perf_results_key = pytest.StashKey[list]()
+print(f"[CONFTEST] perf_results_key created: {perf_results_key}")
+
+
+def add_perf_results(config, results: list):
+    """Add performance results to the shared stash."""
+    existing = config.stash.get(perf_results_key, [])
+    existing.extend(results)
+    config.stash[perf_results_key] = existing
+    print(f"[CONFTEST] Added {len(results)} results, total now: {len(existing)}")
+
+
+@pytest.fixture(scope="session")
+def pytest_config(request):
+    """Provide access to pytest config for storing perf results."""
+    return request.config
 
 
 def _write_github_step_summary(content: str):
@@ -62,10 +79,10 @@ def pytest_sessionfinish(session):
     This hook is called by pytest at the end of the entire test session.
     It prints a consolidated summary of all performance results.
     """
-    print(
-        f"\n[DEBUG] pytest_sessionfinish called, _GLOBAL_PERF_RESULTS id={id(_GLOBAL_PERF_RESULTS)}, has {len(_GLOBAL_PERF_RESULTS)} entries"
-    )
-    if not _GLOBAL_PERF_RESULTS:
+    # Get results from pytest's stash (shared across all import contexts)
+    results = session.config.stash.get(perf_results_key, [])
+    print(f"\n[DEBUG] pytest_sessionfinish called, has {len(results)} entries")
+    if not results:
         print("[DEBUG] No results collected, skipping summary output")
         return
 
@@ -86,7 +103,7 @@ def pytest_sessionfinish(session):
         + "-" * 20
     )
 
-    for entry in sorted(_GLOBAL_PERF_RESULTS, key=lambda x: x["class_name"]):
+    for entry in sorted(results, key=lambda x: x["class_name"]):
         print(
             f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
             f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f}"
@@ -95,7 +112,7 @@ def pytest_sessionfinish(session):
     print("=" * 91)
 
     print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
-    for entry in sorted(_GLOBAL_PERF_RESULTS, key=lambda x: x["class_name"]):
+    for entry in sorted(results, key=lambda x: x["class_name"]):
         print(f"\n--- Details for {entry['class_name']} / {entry['test_name']} ---")
         stage_report = ", ".join(
             f"{name}:{duration:.2f}ms"
@@ -114,6 +131,6 @@ def pytest_sessionfinish(session):
     print("=" * 91)
 
     # Write to GitHub Step Summary (new behavior for CI monitoring)
-    markdown_report = _generate_diffusion_markdown_report(_GLOBAL_PERF_RESULTS)
+    markdown_report = _generate_diffusion_markdown_report(results)
     if markdown_report:
         _write_github_step_summary(markdown_report)

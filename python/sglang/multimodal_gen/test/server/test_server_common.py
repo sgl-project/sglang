@@ -170,6 +170,7 @@ class DiffusionServerBase:
 
     _perf_results: list[dict[str, Any]] = []
     _improved_baselines: list[dict[str, Any]] = []
+    _pytest_config = None  # Store pytest config for stash access
 
     @classmethod
     def setup_class(cls):
@@ -181,15 +182,18 @@ class DiffusionServerBase:
         print(
             f"\n[DEBUG teardown_class] Called for {cls.__name__}, _perf_results has {len(cls._perf_results)} entries"
         )
-        print(
-            f"[DEBUG teardown_class] _GLOBAL_PERF_RESULTS id={id(conftest._GLOBAL_PERF_RESULTS)} before appending"
-        )
-        for result in cls._perf_results:
-            result["class_name"] = cls.__name__
-            conftest._GLOBAL_PERF_RESULTS.append(result)
-        print(
-            f"[DEBUG teardown_class] After appending, _GLOBAL_PERF_RESULTS id={id(conftest._GLOBAL_PERF_RESULTS)} has {len(conftest._GLOBAL_PERF_RESULTS)} entries total"
-        )
+        if cls._pytest_config:
+            # Add results to pytest stash (shared across all import contexts)
+            for result in cls._perf_results:
+                result["class_name"] = cls.__name__
+            conftest.add_perf_results(cls._pytest_config, cls._perf_results)
+            print(
+                f"[DEBUG teardown_class] Added {len(cls._perf_results)} results to stash"
+            )
+        else:
+            print(
+                "[DEBUG teardown_class] No pytest_config available, skipping stash update"
+            )
 
         if cls._improved_baselines:
             import json
@@ -204,6 +208,11 @@ Consider updating perf_baselines.json with the snippets below:
                     f'\n"{item["id"]}": {json.dumps(item["baseline"], indent=4)},\n'
                 )
             print(output)
+
+    @pytest.fixture(autouse=True)
+    def _capture_pytest_config(self, request):
+        """Capture pytest config for use in teardown_class."""
+        self.__class__._pytest_config = request.config
 
     def _client(self, ctx: ServerContext) -> OpenAI:
         """Get OpenAI client for the server."""
