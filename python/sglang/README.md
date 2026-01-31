@@ -2,6 +2,7 @@
 
 - `eval`: The evaluation utilities.
 - `lang`: The frontend language.
+- `multimodal_gen`: SGLang-Diffusion library.
 - `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
 - `test`: The test utilities.
 - `api.py`: The public APIs.
