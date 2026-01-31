@@ -53,7 +53,7 @@ class TestCrashDump(CustomTestCase):
         # Send multiple requests to trigger the crash
         for i in range(self.NUM_REQUESTS_BEFORE_CRASH * 2):
             try:
-                response = requests.post(
+                requests.post(
                     DEFAULT_URL_FOR_TEST + "/generate",
                     json={
                         "text": f"Hello, this is request {i}.",

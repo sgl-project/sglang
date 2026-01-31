@@ -2,9 +2,8 @@ import argparse
 import bisect
 import json
 import time
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict
 
 parser = argparse.ArgumentParser(
     description="Convert SGLang OTEL trace files to Perfetto format.",

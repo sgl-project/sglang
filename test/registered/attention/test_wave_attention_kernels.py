@@ -100,9 +100,6 @@ class TestWaveAttention(unittest.TestCase):
             ).normal_(mean=0.1, std=0.2)
 
         o_extend = torch.empty((extend_token_num, H_Q, D), dtype=dtype, device="cuda")
-        o_extend_mask = torch.empty(
-            (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
-        )
         o_redundant = torch.empty(
             (extend_token_num, H_Q, D), dtype=dtype, device="cuda"
         )

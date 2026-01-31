@@ -1,8 +1,6 @@
 import random
 import string
-import time
 import unittest
-from typing import Dict, List, Tuple
 
 from tree import MultiTenantRadixTree
 

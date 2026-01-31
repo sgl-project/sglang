@@ -62,7 +62,6 @@ class TestVLMPiecewiseCudaGraph(CustomTestCase):
         tp = 1
         tasks = "mmmu_val"
         batch_size = 32
-        log_suffix = "openai_compatible"
         os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------

@@ -123,7 +123,6 @@ class TestRepeatInterleave:
             )
 
     def test_zero_repeat_edge_case(self):
-        T = 4
         grid_thw = torch.tensor(
             [
                 [0, 4, 4],

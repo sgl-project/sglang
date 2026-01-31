@@ -329,7 +329,7 @@ class TestUpdateWeightsFromDiskParameterized(CustomTestCase):
                 # dp parameter is not explicitly used in this API.
             )
             try:
-                origin_response = self._engine_update_weights_test(engine)
+                self._engine_update_weights_test(engine)
             finally:
                 engine.shutdown()
         elif mode == "Server":
@@ -343,7 +343,7 @@ class TestUpdateWeightsFromDiskParameterized(CustomTestCase):
                 other_args=base_args,
             )
             try:
-                origin_response = self._server_update_weights_test(DEFAULT_URL_FOR_TEST)
+                self._server_update_weights_test(DEFAULT_URL_FOR_TEST)
             finally:
                 kill_process_tree(process.pid)
         else:

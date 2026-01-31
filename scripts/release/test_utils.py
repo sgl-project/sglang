@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import unittest
-from pathlib import Path
 
 from utils import compare_versions, normalize_version, parse_version, validate_version
 

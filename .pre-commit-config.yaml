@@ -30,9 +30,10 @@ repos:
     hooks:
       - id: ruff
         args:
-          - --select=F401,F821
+          - --select=F401,F821,F841
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
+          - --unsafe-fixes
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/|\.github/|scripts/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
