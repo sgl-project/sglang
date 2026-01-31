@@ -136,7 +136,7 @@ class Fp8GemmRunnerBackend(Enum):
     """Enum for FP8 GEMM runner backend selection."""
 
     AUTO = "auto"
-    FLASHINFER = "flashinfer_trtllm"
+    FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -147,7 +147,7 @@ class Fp8GemmRunnerBackend(Enum):
         return self == Fp8GemmRunnerBackend.AUTO
 
     def is_flashinfer(self) -> bool:
-        return self == Fp8GemmRunnerBackend.FLASHINFER
+        return self == Fp8GemmRunnerBackend.FLASHINFER_TRTLLM
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
