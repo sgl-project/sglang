@@ -217,16 +217,15 @@ def init_distributed_environment(
     rank: int = 0,
     distributed_init_method: str = "env://",
     local_rank: int = 0,
-    backend: str = "nccl",
+    backend: str | None = None,
     device_id: torch.device | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if backend == "nccl" and not current_platform.is_cuda_alike():
-        # Use gloo backend for non-CUDA platforms (MPS, CPU)
-        backend = "gloo"
-        logger.info("Using gloo backend for %s platform", current_platform.device_name)
+    if backend is None:
+        backend = current_platform.get_torch_distributed_backend_str()
+        logger.info("Using %s backend for %s platform", backend, current_platform.device_name)
 
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
@@ -242,10 +241,10 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        # For MPS, MUSA, and XPU, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
-            if (current_platform.is_mps() or current_platform.is_musa())
+            if (current_platform.is_mps() or current_platform.is_musa() or current_platform.is_xpu())
             else dict(device_id=device_id)
         )
         torch.distributed.init_process_group(

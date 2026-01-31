@@ -256,9 +256,13 @@ def is_host_cpu_x86() -> bool:
 
 
 def set_cuda_arch():
-    capability = torch.cuda.get_device_capability()
-    arch = f"{capability[0]}.{capability[1]}"
-    os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+    """Set CUDA architecture for compilation. Only applies to CUDA devices."""
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        arch = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
+    # For XPU or other platforms, no arch setting needed
+
 
 
 # env var managements
