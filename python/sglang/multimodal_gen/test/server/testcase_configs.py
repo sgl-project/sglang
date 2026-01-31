@@ -442,7 +442,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -454,7 +453,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             text_encoder_cpu_offload=True,
         ),
@@ -468,7 +466,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -484,7 +481,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=1,
             dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
@@ -518,7 +514,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastHunyuan-diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         DiffusionSamplingParams(
@@ -531,7 +526,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -541,7 +535,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -556,7 +549,6 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
                 modality="video",
-                warmup=0,
                 custom_validator="video",
             ),
             DiffusionSamplingParams(
@@ -571,7 +563,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
         ),
         TI2V_sampling_params,
@@ -581,7 +572,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
         ),
@@ -595,7 +585,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
@@ -608,7 +597,6 @@ TWO_GPU_CASES_A = [
         "wan2_1_t2v_14b_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-14B-Diffusers",
-            warmup=0,
             modality="video",
             num_gpus=2,
             custom_validator="video",
@@ -623,7 +611,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
             cfg_parallel=True,
@@ -642,7 +629,6 @@ if not current_platform.is_hip():
             DiffusionServerArgs(
                 model_path="IPostYellow/TurboWan2.2-I2V-A14B-Diffusers",
                 modality="video",
-                warmup=0,
                 custom_validator="video",
                 num_gpus=2,
                 tp_size=2,
@@ -656,7 +642,6 @@ TWO_GPU_CASES_B = [
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
-            warmup=0,
             modality="video",
             custom_validator="video",
             num_gpus=2,
@@ -669,7 +654,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
@@ -681,7 +665,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
             modality="video",
-            warmup=0,
             custom_validator="video",
             num_gpus=2,
         ),

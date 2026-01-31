@@ -123,7 +123,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
             output_format=sampling_params.output_format,
         )
         if server_args.warmup > 0:
-            if sampling_params.image_path and case.sampling_params.prompt:
+            if server_args.modality == "video":
+                warmup.run_video_warmups(server_args.warmup, sampling_params)
+            elif sampling_params.image_path and case.sampling_params.prompt:
                 # Handle URL or local path
                 image_path_list = sampling_params.image_path
                 if not isinstance(image_path_list, list):
