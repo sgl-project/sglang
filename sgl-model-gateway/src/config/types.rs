@@ -51,6 +51,9 @@ pub struct RouterConfig {
     /// Overrides model_path tokenizer if provided
     pub tokenizer_path: Option<String>,
     pub chat_template: Option<String>,
+    /// Disable automatic tokenizer loading at startup and worker registration
+    #[serde(default)]
+    pub disable_tokenizer_autoload: bool,
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
     /// Required when history_backend = "oracle"
@@ -507,6 +510,7 @@ impl Default for RouterConfig {
             model_path: None,
             tokenizer_path: None,
             chat_template: None,
+            disable_tokenizer_autoload: false,
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,

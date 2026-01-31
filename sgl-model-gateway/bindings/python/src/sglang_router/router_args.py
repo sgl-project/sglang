@@ -96,6 +96,7 @@ class RouterArgs:
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
     chat_template: Optional[str] = None
+    disable_tokenizer_autoload: bool = False
     # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_l0_max_entries: int = 10000
