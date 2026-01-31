@@ -24,14 +24,16 @@ def is_in_ci() -> bool:
     return os.environ.get("SGLANG_IS_IN_CI", "").lower() == "true"
 
 
-def check_gpu_available() -> bool:
-    """Check if CUDA GPU is available."""
+def get_gpu_count() -> int:
+    """Get the number of available CUDA GPUs."""
     try:
         import torch
 
-        return torch.cuda.is_available()
+        if torch.cuda.is_available():
+            return torch.cuda.device_count()
+        return 0
     except ImportError:
-        return False
+        return 0
 
 
 def check_deep_gemm_enabled() -> bool:
@@ -51,8 +53,16 @@ def warmup_deep_gemm():
     print("=" * 60)
 
     # Check prerequisites
-    if not check_gpu_available():
+    gpu_count = get_gpu_count()
+    if gpu_count == 0:
         print("CUDA not available, skipping DeepGEMM warmup")
+        return
+
+    # DeepEP tests require 4+ GPUs, so only warmup on 4+ GPU runners
+    # This avoids running the warmup on 1-GPU runners that don't need it
+    if gpu_count < 4:
+        print(f"Only {gpu_count} GPU(s) available, need 4+ for DeepEP tests")
+        print("Skipping DeepGEMM warmup (not needed for this runner)")
         return
 
     if not check_deep_gemm_enabled():
@@ -65,7 +75,8 @@ def warmup_deep_gemm():
     # This model has different N/K dimensions than full DeepSeek-V3
     test_model = "lmsys/sglang-ci-dsv3-test"
 
-    print(f"\nPre-compiling DeepGEMM kernels for: {test_model}")
+    print(f"\nDetected {gpu_count} GPUs")
+    print(f"Pre-compiling DeepGEMM kernels for: {test_model}")
     print("This may take a few minutes on a fresh runner...")
     print()
 
