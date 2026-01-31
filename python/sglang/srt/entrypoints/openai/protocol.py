@@ -355,7 +355,7 @@ class CompletionStreamResponse(BaseModel):
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
-    type: Literal["text"]
+    type: Literal["text", "input_text"]
     text: str
 
 
@@ -377,9 +377,11 @@ class ChatCompletionMessageContentAudioURL(BaseModel):
 
 
 class ChatCompletionMessageContentImagePart(BaseModel):
-    type: Literal["image_url"]
+    type: Literal["image_url", "input_image"]
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
+    detail: Optional[Literal["high", "low", "auto"]] = "auto"
+    file_id: Optional[str] = None
 
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
