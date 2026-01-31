@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8_utils import cutlass_fp8_supported
-from sglang.srt.utils import is_cuda, is_sm90_supported
+from sglang.srt.utils import is_cuda, is_sm90_supported, is_sm100_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -37,6 +37,7 @@ if is_cuda():
         cutlass_fp4_group_mm,
         cutlass_w4a8_moe_mm,
         es_fp8_blockwise_scaled_grouped_mm,
+        es_sm100_mxfp8_blockscaled_grouped_quant,
         fp8_blockwise_scaled_grouped_mm,
         get_cutlass_w4a8_moe_mm_data,
         prepare_moe_input,
@@ -113,6 +114,8 @@ class CutlassMoeQuantInfo(MoeQuantInfo):
     w13_input_scale: Optional[torch.Tensor] = None
     w2_input_scale: Optional[torch.Tensor] = None
     params: Optional[CutlassMoEParams] = None
+    enable_es: Optional[Tuple[bool, bool]] = (False, False)
+    use_mxfp8: Optional[bool] = False
 
 
 class CutlassRunnerCore(MoeRunnerCore):
@@ -121,8 +124,8 @@ class CutlassRunnerCore(MoeRunnerCore):
 
         if not is_cuda():
             raise RuntimeError("Cutlass runner requires CUDA support.")
-        if not is_sm90_supported():
-            raise RuntimeError("Cutlass runner requires NVIDIA SM90 or newer GPUs.")
+        # if not is_sm90_supported():
+        #     raise RuntimeError("Cutlass runner requires NVIDIA SM90 or newer GPUs.")
         if self.config.activation not in ("silu", None):
             raise ValueError("Cutlass runner currently supports SiLU activation only.")
 
@@ -227,6 +230,7 @@ class CutlassRunnerCore(MoeRunnerCore):
                 expert_offsets=quant_info.expert_offsets,
                 problem_sizes1=quant_info.problem_sizes1,
                 problem_sizes2=quant_info.problem_sizes2,
+                rep_a1_scales=runner_input.rep_aux,
             )
 
         elif moe_type == CutlassMoEType.BlockscaledFP4:
@@ -671,6 +675,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         expert_offsets: torch.Tensor,
         problem_sizes1: torch.Tensor,
         problem_sizes2: torch.Tensor,
+        rep_a1_scales: torch.Tensor,
         use_fp8_blockscale: bool = True,
         enable_es: Tuple[bool, bool] = (False, False),
     ) -> torch.Tensor:
@@ -685,13 +690,13 @@ class CutlassRunnerCore(MoeRunnerCore):
         for grouped matrix multiplication (`fp8_blockwise_scaled_grouped_mm`) and
         data preparation (`prepare_moe_input`, `silu_and_mul`).
 
-        It expects preprocessed shuffled and quantized FP8 input activations with per-token scales,
+        It takes shuffled input activations, quantizes them to FP8 with per-token scales,
         performs the expert computations using FP8 GEMMs with pre-quantized FP8 weights
         (per-block scales), applies the SiLU activation, and returns the raw expert outputs
         for combination.
 
         Args:
-            a (torch.Tensor): Preprocessed shuffled and FP8-quantized input activations. Shape: `(m * topk, k)`,
+            a (torch.Tensor): Preprocessed shuffled input activations. Shape: `(m * topk, k)`,
                 where `m` is the number of tokens and `k` is the hidden size. Expected dtype: `torch.half`
                 or `torch.bfloat16`.
             w1_q (torch.Tensor): Pre-quantized FP8 weight tensor for the first GEMM
@@ -751,8 +756,7 @@ class CutlassRunnerCore(MoeRunnerCore):
         device = a.device
 
         # Input 'a' is already quantized and shuffled
-        rep_a_q = a
-        rep_a1_scales = None  # Scales are handled differently in preprocessed input
+        rep_a_q = a  # check this
 
         c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
         c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
@@ -956,66 +960,143 @@ def pre_permute_standard_to_cutlass(
     topk_weights, topk_ids, _ = topk_output
 
     device = hidden_states.device
-    a_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
-    c_map = torch.empty(topk_ids.numel(), dtype=torch.int32, device=device)
 
     if quant_info.moe_type == CutlassMoEType.BlockscaledFP8:
-        # Validation assertions
-        assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
-        assert quant_info.w13_weight.dtype == torch.float8_e4m3fn
-        assert quant_info.w2_weight.dtype == torch.float8_e4m3fn
-        assert (
-            hidden_states.shape[1] == quant_info.w13_weight.shape[1]
-        ), "Hidden size mismatch w1"
-        assert (
-            quant_info.w13_weight.shape[2] == quant_info.w2_weight.shape[1] * 2
-        ), "Hidden size mismatch w2"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
-        ), "Expert number mismatch"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w2_weight.shape[0]
-        ), "Weights expert number mismatch"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w13_scale.shape[0]
-        ), "w1 scales expert number mismatch"
-        assert (
-            quant_info.w13_weight.shape[0] == quant_info.w2_scale.shape[0]
-        ), "w2 scales expert number mismatch"
-        assert hidden_states.dtype in [
-            torch.half,
-            torch.bfloat16,
-        ], "Invalid input dtype"
+        # Extract variables from quant_info
+        a = hidden_states
+        w1_q = quant_info.w13_weight
+        w2_q = quant_info.w2_weight
+        w1_scale = quant_info.w13_scale
+        w2_scale = quant_info.w2_scale
+        expert_offsets = quant_info.expert_offsets
+        problem_sizes1 = quant_info.problem_sizes1
+        problem_sizes2 = quant_info.problem_sizes2
 
-        num_experts = quant_info.w13_weight.size(0)
-        k = quant_info.w13_weight.size(1)
-        n = quant_info.w2_weight.size(1)
-        m = hidden_states.shape[0]
+        # Get parameters from quant_info, with defaults from original function
+        enable_es = quant_info.enable_es
+        use_mxfp8 = quant_info.use_mxfp8
+
+        # ----------------------------------------------------------
+        assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
+        assert w1_q.dtype == torch.float8_e4m3fn
+        assert w2_q.dtype == torch.float8_e4m3fn
+        assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
+        assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
+        assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
+        assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
+        assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
+        assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
+        assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
+
+        if is_cuda:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+        es_up, es_down = enable_es
+        out_dtype = a.dtype
+        num_experts = w1_q.size(0)
+        m = a.size(0)
+        k = w1_q.size(1)
+        n = w2_q.size(1)
+
+        topk = topk_ids.size(1)
+        device = a.device
+
+        a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+        c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+
+        if use_mxfp8:
+            assert (
+                es_up and es_down
+            ), "MXFP8 requires expert-specialization for both GEMMs"
+            assert is_sm100_supported(), "MXFP8 requires SM100"
+            assert k % 32 == 0, "MXFP8 requires hidden size to be divisible by 32"
+            assert n % 32 == 0, "MXFP8 requires intermediate size to be divisible by 32"
+            assert w1_scale.dtype == torch.uint8, "MXFP8 w1_scale must be uint8"
+            assert w2_scale.dtype == torch.uint8, "MXFP8 w2_scale must be uint8"
+            expected_w1_scale_shape = (
+                num_experts,
+                w1_q.shape[1] // 32,
+                w1_q.shape[2],
+            )
+            expected_w2_scale_shape = (
+                num_experts,
+                w2_q.shape[1] // 32,
+                w2_q.shape[2],
+            )
+            assert (
+                w1_scale.shape == expected_w1_scale_shape
+            ), f"MXFP8 w1_scale must be {expected_w1_scale_shape}, got {w1_scale.shape}"
+            assert (
+                w2_scale.shape == expected_w2_scale_shape
+            ), f"MXFP8 w2_scale must be {expected_w2_scale_shape}, got {w2_scale.shape}"
+
+            mxfp8_blockscale_align = 128
+            total_tokens = m * topk
+            nonzero_experts = min(num_experts, total_tokens)
+            max_total = total_tokens + (mxfp8_blockscale_align - 1) * nonzero_experts
+            max_blockscale = (
+                (max_total + mxfp8_blockscale_align - 1) // mxfp8_blockscale_align
+            ) * mxfp8_blockscale_align
+
+        blockscale_offsets = None
+        if use_mxfp8 and (es_up or es_down):
+            blockscale_offsets = torch.empty(
+                (num_experts + 1,), dtype=torch.int32, device=device
+            )
 
         prepare_moe_input(
             topk_ids,
-            quant_info.expert_offsets,
-            quant_info.problem_sizes1,
-            quant_info.problem_sizes2,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
             a_map,
             c_map,
             num_experts,
             n,
             k,
+            blockscale_offsets,
         )
 
-        # Do shuffling/reordering and quantization
-        shuffled_input = shuffle_rows(hidden_states, a_map, (m * topk_ids.shape[1], k))
+        if use_mxfp8 and es_up:
+            rep_a = shuffle_rows(a, a_map, (m * topk, k))
+            rep_a_q = torch.empty_like(rep_a, dtype=torch.float8_e4m3fn)
+            rep_a1_scales = torch.empty(
+                (max_blockscale, k // 32), dtype=torch.uint8, device=device
+            )
+            es_sm100_mxfp8_blockscaled_grouped_quant(
+                rep_a,
+                problem_sizes1,
+                expert_offsets[:-1],
+                blockscale_offsets[:-1],
+                rep_a_q,
+                rep_a1_scales,
+            )
+        else:
+            a_q, a1_scale = sglang_per_token_group_quant_fp8(a, 128)
+            rep_a_q = shuffle_rows(a_q, a_map, (m * topk, k))
+            rep_a1_scales = shuffle_rows(a1_scale, a_map, (m * topk, int(k / 128)))
 
-        # Quantize the shuffled input
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
+        # c1 = torch.empty((m * topk, n * 2), device=device, dtype=out_dtype)
+        # c2 = torch.empty((m * topk, k), device=device, dtype=out_dtype)
+
+        # a_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
+        # w_sf_layout = torch.empty((num_experts, 5), device=device, dtype=torch.int)
+
+        # ----------------------------------------------------------
+        # Return the prepared input data
+        rep_primary = rep_a_q  # The quantized and shuffled input
+        rep_aux = rep_a1_scales  # The scales for the quantized input
+
+        return CutlassRunnerInput(
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            a_map=a_map,
+            c_map=c_map,
+            rep_primary=rep_primary,
+            rep_aux=rep_aux,
         )
-
-        a_q, a1_scale = sglang_per_token_group_quant_fp8(shuffled_input, 128)
-
-        rep_primary = a_q
-        rep_aux = a1_scale
 
     elif quant_info.moe_type == CutlassMoEType.BlockscaledFP4:
         params = quant_info.params
