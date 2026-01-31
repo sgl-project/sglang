@@ -712,7 +712,6 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         w13_qzeros_2d = layer.w13_qzeros.data.contiguous().reshape(
             -1, layer.w13_qzeros.shape[-1]
         )
-        print("Now in the right path!")
         layer.w13_qzeros = torch.nn.Parameter(
             unpack_from_int32(
                 w13_qzeros_2d,
