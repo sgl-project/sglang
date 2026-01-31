@@ -534,6 +534,9 @@ class ServerArgs:
     # LMCache
     enable_lmcache: bool = False
 
+    # Pegaflow
+    enable_pegaflow: bool = False
+
     # Ktransformers/AMX expert parallelism
     kt_weight_path: Optional[str] = None
     kt_method: Optional[str] = None
@@ -4123,6 +4126,12 @@ class ServerArgs:
             "--enable-lmcache",
             action="store_true",
             help="Using LMCache as an alternative hierarchical cache solution",
+        )
+        # pegaflow
+        parser.add_argument(
+            "--enable-pegaflow",
+            action="store_true",
+            help="Enable pegaflow as an alternative hierarchical cache solution",
         )
 
         # Ktransformer server args
