@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch_npu
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -12,12 +13,47 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator import (
+    ScatterMode,
+    enable_moe_dense_fully_dp,
+    get_attn_tp_context,
+)
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
+
+
+# DSA-only override: allow input_scattered when attn_tp_input_scattered is enabled
+def _use_input_scattered_dsa(
+    m: "DeepseekV2AttentionMLA", forward_batch: "ForwardBatch"
+) -> bool:
+    if get_attn_tp_context().input_scattered:
+        return True
+    if not get_global_server_args().enable_attn_tp_input_scattered:
+        return False
+    if m.q_lora_rank is None:
+        return False
+    return (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend()
+        and forward_batch.input_ids is not None
+        and not forward_batch.can_run_tbo
+        and get_tensor_model_parallel_world_size() > 1
+        and not is_dp_attention_enabled()
+        and get_moe_a2a_backend().is_none()
+        and not enable_moe_dense_fully_dp()
+        and not get_global_server_args().enable_piecewise_cuda_graph
+        and get_global_server_args().speculative_algorithm != "EAGLE3"
+    )
 
 
 # region MHA
@@ -76,7 +112,9 @@ def forward_mha_prepare_npu(
         )
         q_pe = q_pe.reshape(B, -1, m.qk_rope_head_dim)
 
-        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(m.layer_id)
+        ckv_cache, k_rope_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            m.layer_id
+        )
         _, _, k_pe, kv_a = torch_npu.npu_kv_rmsnorm_rope_cache(
             latent_cache.view(-1, 1, 1, m.kv_lora_rank + m.qk_rope_head_dim),  # bnsd
             m.kv_a_layernorm.weight,
@@ -97,7 +135,7 @@ def forward_mha_prepare_npu(
         k_pe = k_pe.reshape(B, -1, m.qk_rope_head_dim)
     else:
         kv_a = m.kv_a_layernorm(kv_a)
-        k_pe = latent_cache[:, :, m.kv_lora_rank:]
+        k_pe = latent_cache[:, :, m.kv_lora_rank :]
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
         forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -281,6 +319,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
 ):
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
         if not hasattr(m, "mla_preprocess"):
@@ -338,14 +377,24 @@ def forward_dsa_prepare_npu(
             q_lora = m.q_a_layernorm(q)
 
     else:
-        fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        use_input_scattered = _use_input_scattered_dsa(m, forward_batch)
+        if use_input_scattered:
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        else:
+            fused_qkv_a_proj_out = get_attn_tp_context().fetch_qkv_latent()
         q, latent_cache = fused_qkv_a_proj_out.split(
             [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
         )
 
         # overlap qk norm
         q = m.q_a_layernorm(q)
-
+        if (
+            use_input_scattered
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            q = scattered_to_tp_attn_full(q, forward_batch)
+            latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
         q_lora = q.clone()  # required for topk_indices
         q_event = None
         if m.alt_stream is not None:
@@ -383,7 +432,7 @@ def forward_dsa_prepare_npu(
             )
 
     topk_indices = m.indexer(
-        hidden_states, q_lora, positions, forward_batch, m.layer_id
+        hidden_states, q_lora, positions, forward_batch, m.layer_id, layer_scatter_modes
     )
 
     return (
@@ -448,6 +497,22 @@ def forward_dsa_core_npu(
 
     output, _ = m.o_proj(attn_bmm_output)
     return output
+
+
+def scattered_to_tp_attn_full(
+    hidden_states: torch.Tensor,
+    forward_batch,
+) -> torch.Tensor:
+    hidden_states, local_hidden_states = (
+        torch.empty(
+            (forward_batch.input_ids.shape[0], hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        ),
+        hidden_states,
+    )
+    attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
+    return hidden_states
 
 
 # endregion
