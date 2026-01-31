@@ -1,3 +1,4 @@
+import asyncio
 import math
 import os
 import re
@@ -44,6 +45,8 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+
+_video_decode_semaphore = asyncio.Semaphore(1)
 
 
 def smart_resize(
@@ -156,7 +159,8 @@ async def preprocess_video(
     )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
-    video_np = vr.get_batch(idx).asnumpy()
+    async with _video_decode_semaphore:
+        video_np = vr.get_batch(idx).asnumpy()
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
 
