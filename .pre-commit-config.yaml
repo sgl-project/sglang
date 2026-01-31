@@ -67,6 +67,13 @@ repos:
           - '--extra-keys=metadata.kernelspec metadata.language_info.version'
   - repo: local
     hooks:
+      - id: cargo-fmt
+        name: cargo fmt (nightly)
+        entry: cargo +nightly fmt --manifest-path sgl-model-gateway/Cargo.toml --
+        language: system
+        types: [rust]
+        files: ^sgl-model-gateway/
+        pass_filenames: false
       - id: sort-ci-permissions
         name: sort CI_PERMISSIONS.json
         entry: python3 .github/update_ci_permission.py --sort-only
