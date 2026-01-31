@@ -64,6 +64,29 @@ def grouped_gemm_nt_f8f8bf16_masked(
             )
 
 
+def grouped_gemm_nt_bf16_masked(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+):
+    num_groups, _, k = a.shape
+    _, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            a,
+            b,
+            d,
+            masked_m,
+            expected_m,
+        )
+
+
 def grouped_gemm_nt_f8f8bf16_contig(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -79,6 +102,17 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+
+
+def grouped_gemm_nt_bf16_contig(
+    a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
+):
+    m, k = a.shape
+    num_groups, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
 
 
 def gemm_nt_f8f8bf16(
