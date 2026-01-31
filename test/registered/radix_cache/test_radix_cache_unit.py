@@ -17,6 +17,7 @@ Usage:
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
 """
 
+from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # CPU-based unit test, runs quickly on any GPU runner
@@ -763,6 +764,14 @@ class TestRadixCache(unittest.TestCase):
 
         # The cache size should be within reasonable bounds of the actual allocated memory.
         self.assertLess(torch_allocated, cache_size_bytes * 2)
+
+    def test_available_and_evictable_str(self):
+        mock_allocator = unittest.mock.Mock()
+        mock_allocator.available_size.return_value = 10
+        cache: RadixCache = RadixCache.create_simulated(mock_allocator=mock_allocator)
+
+        print(cache.available_and_evictable_str())
+        print(available_and_evictable_str(cache))
 
 
 if __name__ == "__main__":
