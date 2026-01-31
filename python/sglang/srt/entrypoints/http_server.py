@@ -348,10 +348,15 @@ async def lifespan(fast_api_app: FastAPI):
 
 
 # Fast API
-app = FastAPI(
-    lifespan=lifespan,
-    openapi_url=None if get_bool_env_var("DISABLE_OPENAPI_DOC") else "/openapi.json",
-)
+if get_bool_env_var("DISABLE_OPENAPI_DOC"):
+    app = FastAPI(
+        lifespan=lifespan,
+        openapi_url=None,
+        docs_url=None,
+        redoc_url=None,
+    )
+else:
+    app = FastAPI(lifespan=lifespan, openapi_url="/openapi.json")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
