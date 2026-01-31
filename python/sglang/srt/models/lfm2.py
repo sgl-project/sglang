@@ -15,18 +15,19 @@ import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+# from sgl_kernel import fused_qk_norm_rope
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
@@ -40,7 +41,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import add_prefix, make_layers
+
+_is_cuda = torch.cuda.is_available()
 
 logger = logging.getLogger(__name__)
 
@@ -86,19 +90,12 @@ class Lfm2MLP(nn.Module):
                     // config.block_multiple_of
                 )
 
-        self.w1 = ColumnParallelLinear(
+        self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            intermediate_size,
+            [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w1", prefix),
-        )
-        self.w3 = ColumnParallelLinear(
-            config.hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("w3", prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.w2 = RowParallelLinear(
             intermediate_size,
@@ -107,16 +104,16 @@ class Lfm2MLP(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("w2", prefix),
         )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.w1(x)
-        up, _ = self.w3(x)
-        out, _ = self.w2(F.silu(gate) * up)
+        gate_up, _ = self.gate_up_proj(x)
+        out, _ = self.w2(self.act_fn(gate_up))
         return out
 
 
 class Lfm2Attention(nn.Module):
-    """Grouped-query attention with RoPE and Q/K layernorm."""
+    """Grouped-query attention with RoPE and Q/K layernorm using two-stream overlap."""
 
     def __init__(
         self,
@@ -125,6 +122,7 @@ class Lfm2Attention(nn.Module):
         attn_layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -168,11 +166,15 @@ class Lfm2Attention(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
+        # QK norm with two-stream overlap support
         self.q_layernorm = RMSNorm(self.head_dim, eps=config.norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=config.norm_eps)
+        self.alt_stream = alt_stream
 
         self.num_local_q_heads = self.qkv_proj.num_heads
         self.num_local_kv_heads = self.qkv_proj.num_kv_heads
+        self.q_size = self.num_local_q_heads * self.head_dim
+        self.kv_size = self.num_local_kv_heads * self.head_dim
 
         self.attn = RadixAttention(
             num_heads=self.num_local_q_heads,
@@ -183,34 +185,59 @@ class Lfm2Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
+        # # Fused QK norm + RoPE parameters
+        # self.rope_theta = rope_theta
+        # self.norm_eps = config.norm_eps
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        T = hidden_states.shape[0]
         qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q_size = self.num_local_q_heads * self.head_dim
-        kv_size = self.num_local_kv_heads * self.head_dim
-        q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
-
-        q = q.reshape(T, self.num_local_q_heads, self.head_dim)
-        k = k.reshape(T, self.num_local_kv_heads, self.head_dim)
-
-        q = self.q_layernorm(q.reshape(-1, self.head_dim)).reshape(
-            T, self.num_local_q_heads, self.head_dim
-        )
-        k = self.k_layernorm(k.reshape(-1, self.head_dim)).reshape(
-            T, self.num_local_kv_heads, self.head_dim
+        # QK norm with two-stream overlap (uses fused kernel when available)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_layernorm,
+            k_norm=self.k_layernorm,
+            head_dim=self.head_dim,
+            alt_stream=self.alt_stream,
         )
 
         q, k = self.rotary_emb(positions, q, k)
 
-        attn_out = self.attn(q.reshape(T, -1), k.reshape(T, -1), v, forward_batch)
+        attn_out = self.attn(q, k, v, forward_batch)
         out, _ = self.out_proj(attn_out)
         return out
+
+        # position_ids = positions.view(-1).to(dtype=torch.int32, device=qkv.device)
+        # fused_qk_norm_rope(
+        #     qkv,
+        #     self.num_local_q_heads,
+        #     self.num_local_kv_heads,
+        #     self.num_local_kv_heads,  # num_heads_v
+        #     self.head_dim,
+        #     self.norm_eps,
+        #     self.q_layernorm.weight,
+        #     self.k_layernorm.weight,
+        #     self.rope_theta,
+        #     True,  # is_neox
+        #     position_ids,
+        #     1.0,  # factor (no scaling)
+        #     1.0,  # low
+        #     1.0,  # high
+        #     1.0,  # attention_factor
+        # )
+        # q_size = self.num_local_q_heads * self.head_dim
+        # kv_size = self.num_local_kv_heads * self.head_dim
+        # q, k, v = torch.split(qkv, [q_size, kv_size, kv_size], dim=-1)
+        # attn_out = self.attn(q, k, v, forward_batch)
+        # out, _ = self.out_proj(attn_out)
+        # return out
 
 
 class Lfm2ShortConv(nn.Module):
@@ -328,6 +355,7 @@ class Lfm2DecoderLayer(nn.Module):
         attn_layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         self.layer_type = config.layer_types[layer_id]
@@ -343,6 +371,7 @@ class Lfm2DecoderLayer(nn.Module):
                 attn_layer_id=attn_layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn", prefix),
+                alt_stream=alt_stream,
             )
         else:
             self.conv = Lfm2ShortConv(
@@ -394,6 +423,9 @@ class Lfm2Model(nn.Module):
         super().__init__()
         self.config = config
 
+        # Create alt_stream for two-stream QK norm overlap
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
+
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -420,6 +452,7 @@ class Lfm2Model(nn.Module):
                 attn_layer_id=attn_layer_ids[idx],
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=alt_stream,
             )
 
         self.layers = make_layers(
@@ -482,7 +515,7 @@ class Lfm2ForCausalLM(nn.Module):
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -503,6 +536,10 @@ class Lfm2ForCausalLM(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
 
         params_dict = dict(self.named_parameters())
