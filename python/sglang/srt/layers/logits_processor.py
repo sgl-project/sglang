@@ -313,10 +313,20 @@ class LogitsProcessor(nn.Module):
         multi_item_indices = (input_ids == delimiter_token).nonzero(as_tuple=True)[
             0
         ] - 1
+
+        # Get token indices for LoRA pruning context
+        # The LoRA layer will use these to determine which adapter to apply to each token
+        pruning_token_indices = multi_item_indices.tolist()
+
         # Extract hidden states at delimiter positions for multi-item scoring
         sliced_hidden = hidden_states[multi_item_indices]
 
-        sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
+        sliced_logits = self._get_logits(
+            sliced_hidden,
+            lm_head,
+            logits_metadata,
+            pruning_token_indices=pruning_token_indices,
+        )
         sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
 
         # Initialize return values
@@ -405,6 +415,7 @@ class LogitsProcessor(nn.Module):
 
         # Get the last hidden states and last logits for the next token prediction
         pruned_states_before_norm: Optional[torch.Tensor] = None
+        pruning_token_indices: Optional[List[int]] = None
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -416,6 +427,7 @@ class LogitsProcessor(nn.Module):
                 aux_pruned_states = [hidden for hidden in aux_hidden_states]
             sample_indices = None
             input_logprob_indices = None
+            # No pruning in decode mode, pruning_token_indices stays None
 
         elif (
             logits_metadata.forward_mode.is_extend()
@@ -438,6 +450,7 @@ class LogitsProcessor(nn.Module):
                     - 1
                 )
             pruned_states = hidden_states[last_index]
+            pruning_token_indices = last_index.tolist()
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:
@@ -474,6 +487,7 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
             token_to_seq_idx = []
+            pruning_token_indices = []
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
                 zip(
@@ -494,6 +508,8 @@ class LogitsProcessor(nn.Module):
                 pruned_states_list.append(
                     hidden_states[pt + start_len : pt + extend_len]
                 )
+                # Track original token indices for LoRA pruning context
+                pruning_token_indices.extend(range(pt + start_len, pt + extend_len))
                 if hidden_states_before_norm is not None:
                     pruned_states_before_norm_list.append(
                         hidden_states_before_norm[pt + start_len : pt + extend_len]
@@ -574,7 +590,12 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                pruning_token_indices=pruning_token_indices,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -616,7 +637,12 @@ class LogitsProcessor(nn.Module):
 
         if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                pruning_token_indices=pruning_token_indices,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -633,6 +659,7 @@ class LogitsProcessor(nn.Module):
                 token_to_seq_idx,
                 lm_head,
                 logits_metadata,
+                pruning_token_indices,
             )
 
         return LogitsProcessorOutput(
@@ -690,6 +717,7 @@ class LogitsProcessor(nn.Module):
         token_to_seq_idx: list[int],
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
+        pruning_token_indices: Optional[List[int]],
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
         """
         compute logprobs for the output token from the hidden states.
@@ -741,7 +769,17 @@ class LogitsProcessor(nn.Module):
 
             # Get the logits for this chunk
             chunk_states = pruned_states[start_idx:end_idx]
-            chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
+            chunk_pruning_indices = (
+                pruning_token_indices[start_idx:end_idx]
+                if pruning_token_indices is not None
+                else None
+            )
+            chunk_logits = self._get_logits(
+                chunk_states,
+                lm_head,
+                logits_metadata,
+                pruning_token_indices=chunk_pruning_indices,
+            )
 
             # Initialize sampled_logits on first chunk
             if i == 0:
@@ -853,6 +891,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
+        pruning_token_indices: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
@@ -870,7 +909,8 @@ class LogitsProcessor(nn.Module):
 
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
-            logits = lm_head(hidden_states)
+            # Pass pruning context directly so LoRA layer can create appropriate batch_info
+            logits = lm_head(hidden_states, pruning_token_indices=pruning_token_indices)
         elif hasattr(lm_head, "weight"):
             if self.use_fp32_lm_head:
                 logits = torch.matmul(

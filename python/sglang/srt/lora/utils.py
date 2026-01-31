@@ -1,6 +1,7 @@
+from bisect import bisect_right
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 
@@ -39,6 +40,36 @@ class LoRABatchInfo:
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
+
+    # Total number of tokens in the batch (sum of all segment lengths)
+    total_tokens: Optional[int] = None
+
+    # Per-sequence adapter indices on CPU, mapping each sequence to its LoRA adapter index.
+    # Used by layers to build pruned batch_info when handling pruned inputs.
+    adapter_indices: Optional[List[int]] = None
+
+    # Original sequence lengths on CPU, used to compute token-to-sequence mapping
+    # when handling pruned inputs.
+    seq_lens_cpu: Optional[List[int]] = None
+
+    def is_pruned_input(self, num_tokens: int) -> bool:
+        """
+        Check if the input tensor has been pruned from the expected size.
+
+        Args:
+            num_tokens: Number of tokens in the input tensor
+
+        Returns:
+            True if input token count doesn't match expected total_tokens
+
+        Raises:
+            ValueError: If total_tokens is None (should always be set)
+        """
+        if self.total_tokens is None:
+            raise ValueError(
+                "total_tokens must be set in LoRABatchInfo before calling is_pruned_input"
+            )
+        return num_tokens != self.total_tokens
 
 
 class LoRAType(Enum):
@@ -155,6 +186,37 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]
 
+# Minimum chunk size for chunked SGMV backend
+MIN_CHUNK_SIZE = 16
+
+
+def get_chunk_size_for_tokens(num_tokens: int, max_chunk_size: int) -> int:
+    """
+    Determine the chunk size based on token count.
+
+    This function heuristically selects a chunk size for the chunked SGMV
+    backend based on the number of tokens in the batch. Larger batches use
+    larger chunks for better parallelism.
+
+    Args:
+        num_tokens: Number of tokens in the batch
+        max_chunk_size: Maximum allowed chunk size
+
+    Returns:
+        The determined chunk size, clamped to [MIN_CHUNK_SIZE, max_chunk_size]
+    """
+    if max_chunk_size <= MIN_CHUNK_SIZE:
+        return MIN_CHUNK_SIZE
+
+    if num_tokens >= 256:
+        chunk_size = 128
+    elif num_tokens >= 64:
+        chunk_size = 32
+    else:  # num_tokens < 64
+        chunk_size = 16
+
+    return min(max_chunk_size, chunk_size)
+
 
 def generate_sequence_lengths(
     forward_batch: ForwardBatch, device: Optional[torch.device] = None
@@ -182,3 +244,60 @@ def generate_sequence_lengths(
         else:
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
     return seg_lens
+
+
+def build_chunked_segments(
+    pruning_token_indices: List[int],
+    boundaries: List[int],
+    adapter_indices: List[int],
+    chunk_size: int,
+) -> Tuple[List[int], List[int]]:
+    """
+    Build chunked segments from pruned token indices.
+
+    Groups consecutive tokens that use the same adapter into segments,
+    splitting at chunk boundaries when a segment exceeds chunk_size.
+
+    Args:
+        pruning_token_indices: Indices of tokens in the pruned input
+        boundaries: Cumulative sequence boundaries (from accumulate(seq_lens))
+        adapter_indices: LoRA adapter index for each sequence
+        chunk_size: Maximum segment length before splitting
+
+    Returns:
+        Tuple of (seg_weight_indices, seg_lens) where:
+            - seg_weight_indices: List of adapter indices, one per segment
+            - seg_lens: List of segment lengths
+    """
+    seg_weight_indices: List[int] = []
+    seg_lens: List[int] = []
+    current_adapter = None
+    current_count = 0
+
+    for token_idx in pruning_token_indices:
+        # Find which sequence this token belongs to using binary search
+        seq_idx = bisect_right(boundaries, token_idx)
+        adapter = adapter_indices[seq_idx]
+
+        if adapter != current_adapter:
+            # Adapter changed, emit previous segment if any
+            if current_count > 0:
+                seg_weight_indices.append(current_adapter)
+                seg_lens.append(current_count)
+            current_adapter = adapter
+            current_count = 1
+        elif current_count == chunk_size:
+            # Same adapter but reached chunk limit, emit and start new chunk
+            seg_weight_indices.append(current_adapter)
+            seg_lens.append(chunk_size)
+            current_count = 1
+        else:
+            # Same adapter, still room in chunk
+            current_count += 1
+
+    # Emit final segment
+    if current_count > 0:
+        seg_weight_indices.append(current_adapter)
+        seg_lens.append(current_count)
+
+    return seg_weight_indices, seg_lens

@@ -6,11 +6,14 @@ from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
 )
-from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
+from sglang.srt.lora.utils import (
+    MIN_CHUNK_SIZE,
+    LoRABatchInfo,
+    generate_sequence_lengths,
+    get_chunk_size_for_tokens,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-
-MIN_CHUNK_SIZE = 16
 
 
 class ChunkedSgmvLoRABackend(BaseLoRABackend):
@@ -54,12 +57,20 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
 
     def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
         return chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=weights,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             num_slices=1,
         )
 
@@ -69,16 +80,20 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         weights: torch.Tensor,
         output_offset: torch.Tensor,
         base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
         # For simple lora B, we use slice offsets [0, output_dim]
         output_dim = weights.shape[-2]
         max_slice_size = output_dim
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
         return chunked_sgmv_lora_expand_forward(
             x=x,
             weights=weights,
-            batch_info=self.batch_info,
+            batch_info=batch_info,
             slice_offsets=output_offset,
             max_slice_size=max_slice_size,
             base_output=base_output,
@@ -161,22 +176,12 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         Returns:
             The determined chunk size
         """
-
-        if self.max_chunk_size <= MIN_CHUNK_SIZE:
-            return MIN_CHUNK_SIZE
-
         num_tokens = (
             forward_batch.extend_num_tokens
             if forward_batch.forward_mode.is_extend()
             else forward_batch.batch_size
         )
-        if num_tokens >= 256:
-            chunk_size = 128
-        elif num_tokens >= 64:
-            chunk_size = 32
-        else:  # num_tokens < 64
-            chunk_size = 16
-        return min(self.max_chunk_size, chunk_size)
+        return get_chunk_size_for_tokens(num_tokens, self.max_chunk_size)
 
     def init_cuda_graph_batch_info(
         self,
@@ -198,7 +203,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 num_segments=None,  # Set per batch
-                max_len=None,  # Not used in CSGMV backend
+                max_len=None,  # Set per batch
             )
 
     def prepare_lora_batch(
@@ -209,6 +214,9 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         scalings: list[float],
         use_cuda_graph: bool,
     ):
+        # Pruning only happens in extend mode and is not supported with CUDA graphs
+        pruning_possible = forward_batch.forward_mode.is_extend() and not use_cuda_graph
+
         chunk_size = self._determine_chunk_size(forward_batch)
 
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
@@ -252,6 +260,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 ),
                 # Not used in chunked kernels
                 seg_lens=None,
+                total_tokens=len(permutation) if pruning_possible else None,
             )
         else:
             batch_info = self.cuda_graph_batch_info
@@ -273,6 +282,16 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
 
         self.batch_info = batch_info
+
+        # Store per-sequence adapter indices and sequence lengths on host for pruned case
+        # Keep as list to avoid GPU sync when looking up during pruning
+        batch_info.adapter_indices = weight_indices
+        batch_info.seq_lens_cpu = (
+            list(forward_batch.extend_seq_lens_cpu) if pruning_possible else None
+        )
+
+        if pruning_possible:
+            assert sum(batch_info.seq_lens_cpu) == batch_info.total_tokens
 
     @staticmethod
     def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):

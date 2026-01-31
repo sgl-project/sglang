@@ -42,19 +42,31 @@ class TritonLoRABackend(BaseLoRABackend):
         )
 
     def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_a_fwd(x, weights, self.batch_info)
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
+        return sgemm_lora_a_fwd(x, weights, batch_info)
 
     def run_lora_b_sgemm(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
+        return sgemm_lora_b_fwd(x, weights, batch_info, base_output)
 
     def run_qkv_lora(
         self,
@@ -162,6 +174,8 @@ class TritonLoRABackend(BaseLoRABackend):
         )
 
         bs = forward_batch.batch_size
+        # Pruning only happens in extend mode and is not supported with CUDA graphs
+        pruning_possible = forward_batch.forward_mode.is_extend() and not use_cuda_graph
 
         if use_cuda_graph:
             assert (
@@ -174,12 +188,12 @@ class TritonLoRABackend(BaseLoRABackend):
             max_len = (
                 # Calculate max_len from the CPU copy to avoid D2H transfer.
                 max(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.forward_mode.is_extend()
+                if pruning_possible
                 else 1
             )
             seg_lens = (
                 forward_batch.extend_seq_lens
-                if forward_batch.forward_mode.is_extend()
+                if pruning_possible
                 else torch.ones(bs, dtype=torch.int32, device=self.device)
             )
             seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
@@ -202,6 +216,9 @@ class TritonLoRABackend(BaseLoRABackend):
                     (self.max_loras_per_batch,), dtype=torch.float, device=self.device
                 ),
                 permutation=None,
+                total_tokens=(
+                    sum(forward_batch.extend_seq_lens_cpu) if pruning_possible else None
+                ),
             )
 
         # Copy to device asynchronously
@@ -214,3 +231,13 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
+
+        # Store per-sequence adapter indices and sequence lengths on host for pruned case
+        # Keep as list to avoid GPU sync when looking up during pruning
+        batch_info.adapter_indices = weight_indices
+        batch_info.seq_lens_cpu = (
+            list(forward_batch.extend_seq_lens_cpu) if pruning_possible else None
+        )
+
+        if pruning_possible:
+            assert sum(batch_info.seq_lens_cpu) == batch_info.total_tokens

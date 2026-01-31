@@ -1,4 +1,6 @@
-from typing import Optional
+import warnings
+from itertools import accumulate
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -21,7 +23,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import (
+    LoRABatchInfo,
+    build_chunked_segments,
+    get_chunk_size_for_tokens,
+)
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -240,8 +246,81 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.lm_head_A_buffer = lm_head_A_buffer  # (num_loras, rank, hidden_dim)
         self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size, rank)
 
+    def _create_pruned_batch_info(
+        self,
+        pruning_token_indices: List[int],
+    ) -> Optional[LoRABatchInfo]:
+        """
+        Create a batch_info for pruned hidden_states.
+
+        Groups consecutive tokens that use the same adapter into segments.
+        Returns None if the backend doesn't support pruned batch info.
+        """
+        backend_name = self.lora_backend.name
+        if backend_name not in ("triton", "csgmv"):
+            warnings.warn(
+                f"LoRA backend '{backend_name}' does not support pruned batch info. "
+                "Skipping pruning for now, but the result may be incorrect. "
+                "Support for this backend should be added in the future."
+            )
+            return None
+
+        batch_info = self.lora_backend.batch_info
+        if batch_info.use_cuda_graph:
+            raise RuntimeError(
+                "Pruned LoRA forward pass is not supported with CUDA graphs. "
+                "Pruning requires dynamically-sized tensors which are incompatible "
+                "with captured CUDA graphs."
+            )
+        device = self.lora_backend.device
+        num_tokens = len(pruning_token_indices)
+
+        # Build sequence boundaries for token-to-sequence lookup
+        seq_lens_cpu = batch_info.seq_lens_cpu
+        adapter_indices = batch_info.adapter_indices
+        boundaries = list(accumulate(seq_lens_cpu))
+
+        # Build chunked segments from pruned token indices
+        max_chunk_size = getattr(self.lora_backend, "max_chunk_size", 128)
+        chunk_size = get_chunk_size_for_tokens(num_tokens, max_chunk_size)
+        seg_weight_indices, seg_lens = build_chunked_segments(
+            pruning_token_indices, boundaries, adapter_indices, chunk_size
+        )
+
+        # Create tensors only at the end
+        num_segments = len(seg_weight_indices)
+        seg_lens_tensor = torch.tensor(seg_lens, dtype=torch.int32, device=device)
+        seg_indptr = torch.zeros(num_segments + 1, dtype=torch.int32, device=device)
+        seg_indptr[1:] = torch.cumsum(seg_lens_tensor, dim=0)
+
+        # Only csgmv backend needs permutation tensor
+        permutation = (
+            torch.arange(num_tokens, dtype=torch.int32, device=device)
+            if backend_name == "csgmv"
+            else None
+        )
+
+        return LoRABatchInfo(
+            bs=num_segments,
+            num_segments=num_segments,
+            max_len=chunk_size,
+            use_cuda_graph=False,
+            seg_indptr=seg_indptr,
+            seg_lens=seg_lens_tensor,
+            weight_indices=torch.tensor(
+                seg_weight_indices, dtype=torch.int32, device=device
+            ),
+            lora_ranks=batch_info.lora_ranks,
+            scalings=batch_info.scalings,
+            permutation=permutation,
+            total_tokens=num_tokens,
+        )
+
     def apply_lora(
-        self, base_output: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        base_output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        pruning_token_indices: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
         Apply LoRA to LM head layer.
@@ -250,9 +329,14 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = hidden @ W^T + hidden @ A^T @ B^T
                            = base_output + (hidden @ A^T) @ B^T
         """
+        # Handle pruned input case
+        pruned_batch_info = None
+        if pruning_token_indices is not None:
+            pruned_batch_info = self._create_pruned_batch_info(pruning_token_indices)
+
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
-            hidden_states, self.lm_head_A_buffer
+            hidden_states, self.lm_head_A_buffer, pruned_batch_info=pruned_batch_info
         )
 
         # Apply lora_B^T: lora_a_output @ B^T
@@ -261,11 +345,16 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             weights=self.lm_head_B_buffer,
             output_offset=self.output_offset,
             base_output=base_output,
+            pruned_batch_info=pruned_batch_info,
         )
 
         return lora_output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        pruning_token_indices: Optional[List[int]] = None,
+    ):
         # Apply base linear transformation
         base_output = F.linear(
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
@@ -273,7 +362,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
 
         # Apply LoRA if set
         if self.set_lora:
-            base_output = self.apply_lora(base_output, hidden_states)
+            base_output = self.apply_lora(
+                base_output, hidden_states, pruning_token_indices
+            )
 
         return base_output
 
