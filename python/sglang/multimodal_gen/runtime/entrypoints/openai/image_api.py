@@ -108,21 +108,24 @@ async def generations(
 ):
 
     request_id = generate_request_id()
-    sampling = _build_sampling_params_from_request(
-        request_id=request_id,
-        prompt=request.prompt,
-        n=request.n or 1,
-        size=request.size,
-        output_format=request.output_format,
-        background=request.background,
-        seed=request.seed,
-        generator_device=request.generator_device,
-        num_inference_steps=request.num_inference_steps,
-        guidance_scale=request.guidance_scale,
-        true_cfg_scale=request.true_cfg_scale,
-        negative_prompt=request.negative_prompt,
-        enable_teacache=request.enable_teacache,
-    )
+    try:
+        sampling = _build_sampling_params_from_request(
+            request_id=request_id,
+            prompt=request.prompt,
+            n=request.n or 1,
+            size=request.size,
+            output_format=request.output_format,
+            background=request.background,
+            seed=request.seed,
+            generator_device=request.generator_device,
+            num_inference_steps=request.num_inference_steps,
+            guidance_scale=request.guidance_scale,
+            true_cfg_scale=request.true_cfg_scale,
+            negative_prompt=request.negative_prompt,
+            enable_teacache=request.enable_teacache,
+        )
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
@@ -248,23 +251,26 @@ async def edits(
             status_code=400, detail=f"Failed to process image source: {str(e)}"
         )
 
-    sampling = _build_sampling_params_from_request(
-        request_id=request_id,
-        prompt=prompt,
-        n=n or 1,
-        size=size,
-        output_format=output_format,
-        background=background,
-        image_path=input_paths,
-        seed=seed,
-        generator_device=generator_device,
-        negative_prompt=negative_prompt,
-        guidance_scale=guidance_scale,
-        true_cfg_scale=true_cfg_scale,
-        num_inference_steps=num_inference_steps,
-        enable_teacache=enable_teacache,
-        num_frames=num_frames,
-    )
+    try:
+        sampling = _build_sampling_params_from_request(
+            request_id=request_id,
+            prompt=prompt,
+            n=n or 1,
+            size=size,
+            output_format=output_format,
+            background=background,
+            image_path=input_paths,
+            seed=seed,
+            generator_device=generator_device,
+            negative_prompt=negative_prompt,
+            guidance_scale=guidance_scale,
+            true_cfg_scale=true_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            enable_teacache=enable_teacache,
+            num_frames=num_frames,
+        )
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
