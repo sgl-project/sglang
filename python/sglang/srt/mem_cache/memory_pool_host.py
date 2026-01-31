@@ -2,7 +2,7 @@ import abc
 import logging
 import threading
 from collections import defaultdict
-from functools import partial, wraps
+from functools import wraps
 from typing import Optional
 
 import psutil
@@ -754,19 +754,29 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.page_size,
                 1,
             )
-            alloc_func = partial(
-                ALLOC_MEMORY_FUNCS[self.device_pool.device],
+            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            self.k_buffer = alloc_func(
+                (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-            self.k_buffer = alloc_func((*base_dims, self.kv_lora_rank))
-            self.v_buffer = alloc_func((*base_dims, self.qk_rope_head_dim))
+            self.v_buffer = alloc_func(
+                (*base_dims, self.qk_rope_head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
             self.index_k_buffer = None
             if self.device_pool.index_head_dim is not None:
                 self.index_k_buffer = alloc_func(
-                    (*base_dims, self.device_pool.index_head_dim)
+                    (*base_dims, self.device_pool.index_head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
                 )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
