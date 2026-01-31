@@ -28,6 +28,19 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+def _get_arch_from_config(config):
+    mindspore_models = import_model_classes("sgl_mindspore.models")
+    architectures = getattr(config, "architectures", [])
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    if not architectures:
+        raise ValueError("No model architectures are specified")
+    for arch in architectures:
+        if arch in mindspore_models:
+            return mindspore_models[arch]
+    raise ValueError(f"Unsupported arch {architectures}")
+
+
 def tensor_torch2ms(x: torch.Tensor):
     if x is None or not isinstance(x, torch.Tensor):
         return x
@@ -178,28 +191,14 @@ class MindSporeForCausalLM(torch.nn.Module):
         arch = self.get_arch(self.config)
         self.model = arch(config=config, quant_config=quant_config)
 
-        self.casual_mask = LowerTriangularMask(
+        self.causal_mask = LowerTriangularMask(
             self.config.param_dtype, self.config.max_position_embeddings
         )
         self.key_cache = []
         self.value_cache = []
 
     def get_arch(self, config):
-        # Get all implemented models
-        mindspore_models = import_model_classes("sgl_mindspore.models")
-
-        # Get arch from config
-        architectures = config.architectures
-        if isinstance(architectures, str):
-            architectures = [architectures]
-        if not architectures:
-            logger.warning("No model architectures are specified")
-
-        for arch in architectures:
-            if arch in mindspore_models:
-                return mindspore_models[arch]
-        if arch is None:
-            raise ValueError(f"Unsupported arch {architectures}")
+        return _get_arch_from_config(config)
 
     @property
     def use_mla(self):
@@ -273,7 +272,7 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         model_inputs["position_ids"] = tensor_torch2ms(positions)
         model_inputs["q_seq_lens"] = ms.Tensor(q_seq_lens, dtype=ms.int32)
-        model_inputs["attention_mask"] = self.casual_mask.gen_attention_mask(
+        model_inputs["attention_mask"] = self.causal_mask.gen_attention_mask(
             is_prefill, model_inputs["position_ids"], q_seq_lens, batch_valid_length
         ).contiguous()
         model_inputs["out_cache_loc"] = tensor_torch2ms(forward_batch.out_cache_loc).to(
@@ -302,6 +301,17 @@ class MindSporeForCausalLM(torch.nn.Module):
         # TODO: npu tensor ms2torch error to be fix, remain issues of torch_npu to get tensor from dlpack
         logits_result = LogitsProcessorOutput(next_token_logits=tensor_ms2torch(logits))
         return logits_result
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        try:
+            arch_cls = _get_arch_from_config(config)
+            method = getattr(arch_cls, "get_model_config_for_expert_location", None)
+            if method is None:
+                return None
+            return method(config)
+        except Exception:
+            return None
 
 
 EntryClass = [MindSporeForCausalLM]
