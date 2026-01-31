@@ -162,8 +162,8 @@ class QWenBlock(nn.Module):
         super().__init__()
         self.ln_1 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         self.attn = QWenAttention(
             config.hidden_size,
             config.num_attention_heads,

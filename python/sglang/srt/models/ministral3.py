@@ -54,11 +54,7 @@ class Ministral3Attention(LlamaAttention):
             bias,
         )
         # Ministral3 specific: llama 4 style scaling beta
-        self.llama_4_scaling_beta = None
-        if hasattr(config, "rope_parameters") and config.rope_parameters:
-            self.llama_4_scaling_beta = config.rope_parameters.get(
-                "llama_4_scaling_beta"
-            )
+        self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
 
         # sliding window
         self.sliding_window = getattr(config, "sliding_window", None)
@@ -107,12 +103,8 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
-            rope_theta=getattr(config, "rope_parameters", {}).get(
-                "rope_theta", 1000000.0
-            ),
-            rope_scaling=getattr(
-                config, "rope_parameters", {}
-            ),  # rope_scaling is rope_parameters in Ministral3Config
+            rope_theta=config.rope_parameters.get("rope_theta", 1000000.0),
+            rope_scaling=config.rope_parameters,  # rope_scaling is rope_parameters in Ministral3Config
             max_position_embeddings=getattr(
                 config, "original_max_position_embeddings", 16384
             ),
