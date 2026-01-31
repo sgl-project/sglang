@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=487, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=587, suite="stage-b-test-large-1-gpu")
 
 PROMPTS = [
     "SGL is a",
@@ -1482,6 +1482,105 @@ class TestLoRADynamicUpdate(CustomTestCase):
             mode=LoRAUpdateTestSessionMode.SERVER, test_cases=test_cases
         )
 
+    def test_lora_added_tokens_size(self):
+        """
+        Test that we correctly handle loading a new adapter that adds tokens to the vocabulary
+        """
+        added_tokens_model = "Qwen/Qwen3-0.6B"
+        no_added_tokens_adapter = "ethicalabs/Flwr-Qwen3-0.6B-Medical-PEFT"
+        added_tokens_adapter = "YoussefHosni/Qwen3-0.6b-2B-Token-arabic-LoRA-finetuned"
+
+        # Test loading adapter that adds tokens on startup
+        with LoRAUpdateTestSession(
+            testcase=self,
+            mode=LoRAUpdateTestSessionMode.SERVER,
+            model_path=added_tokens_model,
+            lora_paths=[
+                {
+                    "lora_name": "no_added_tokens_adapter",
+                    "lora_path": no_added_tokens_adapter,
+                },
+                {
+                    "lora_name": "added_tokens_adapter",
+                    "lora_path": added_tokens_adapter,
+                },
+            ],
+            max_loras_per_batch=2,
+            max_lora_rank=32,
+            lora_target_modules=["all"],
+            enable_lora=True,
+        ) as session:
+            # Verify both adapters are correctly loaded
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+
+            adapter_models = [m for m in response.json()["data"] if m.get("parent")]
+            self.assertEqual(
+                {m["id"] for m in adapter_models},
+                {"no_added_tokens_adapter", "added_tokens_adapter"},
+            )
+
+            # Make sure we can run forward with both adapters
+            result = session.forward(
+                prompts=[PROMPTS[0], PROMPTS[1]],
+                lora_paths=["no_added_tokens_adapter", "added_tokens_adapter"],
+            )
+            print(f"Got output from combined forward pass: {result}")
+
+        # Test dynamically loading adapter that adds tokens
+        with LoRAUpdateTestSession(
+            testcase=self,
+            mode=LoRAUpdateTestSessionMode.SERVER,
+            model_path=added_tokens_model,
+            lora_paths=[
+                {
+                    "lora_name": "no_added_tokens_adapter",
+                    "lora_path": no_added_tokens_adapter,
+                }
+            ],
+            max_loras_per_batch=2,
+            max_lora_rank=32,
+            lora_target_modules=["all"],
+            enable_lora=True,
+        ) as session:
+            # Verify adapter is correctly loaded
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+
+            adapter_models = [m for m in response.json()["data"] if m.get("parent")]
+            self.assertEqual(
+                {m["id"] for m in adapter_models}, {"no_added_tokens_adapter"}
+            )
+
+            # Run one forward request so that adapter weights are loaded into GPU memory
+            result = session.forward(
+                prompts=[PROMPTS[0]],
+                lora_paths=["no_added_tokens_adapter"],
+            )
+            print(f"Got output from no_added_tokens_adapter: {result}")
+
+            # Load adapter that adds tokens to vocab
+            session.load_lora_adapter(
+                lora_name="added_tokens_adapter", lora_path=added_tokens_adapter
+            )
+
+            # Verify both adapters are correctly loaded
+            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
+            self.assertTrue(response.ok, response.text)
+
+            adapter_models = [m for m in response.json()["data"] if m.get("parent")]
+            self.assertEqual(
+                {m["id"] for m in adapter_models},
+                {"no_added_tokens_adapter", "added_tokens_adapter"},
+            )
+
+            # Make sure we can run forward with both adapters
+            result = session.forward(
+                prompts=[PROMPTS[0], PROMPTS[1]],
+                lora_paths=["no_added_tokens_adapter", "added_tokens_adapter"],
+            )
+            print(f"Got output from combined forward pass: {result}")
+
     def test_v1_models_endpoint_with_lora(self):
         """
         Test that /v1/models endpoint returns base model and loaded LoRA adapters.
@@ -1553,54 +1652,6 @@ class TestLoRADynamicUpdate(CustomTestCase):
             adapter_models = [m for m in models_data["data"] if m.get("parent")]
             self.assertEqual(len(adapter_models), 1)
             self.assertEqual(adapter_models[0]["id"], "adapter2")
-
-    def test_update_lora_added_tokens_size(self):
-        """
-        Test that we correctly handle loading a new adapter that adds tokens to the vocabulary
-        """
-        added_tokens_model = "Qwen/Qwen3-0.6B"
-        added_tokens_adapter = "YoussefHosni/Qwen3-0.6b-2B-Token-arabic-LoRA-finetuned"
-
-        with LoRAUpdateTestSession(
-            testcase=self,
-            mode=LoRAUpdateTestSessionMode.SERVER,
-            model_path=added_tokens_model,
-            lora_paths=[],
-            max_loras_per_batch=2,
-            max_lora_rank=32,
-            lora_target_modules=["all"],
-            enable_lora=True,
-        ) as session:
-            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, response.text)
-            models_data = response.json()
-            self.assertEqual(models_data["object"], "list")
-            self.assertEqual(len(models_data["data"]), 1)
-            base_model = models_data["data"][0]
-            self.assertIn("qwen", base_model["id"].lower())
-            self.assertIsNone(base_model.get("parent"))
-
-            session.load_lora_adapter(
-                lora_name="added_tokens_adapter", lora_path=added_tokens_adapter
-            )
-
-            response = requests.get(DEFAULT_URL_FOR_TEST + "/v1/models")
-            self.assertTrue(response.ok, response.text)
-            models_data = response.json()
-            self.assertEqual(len(models_data["data"]), 2)
-
-            # Verify adapter information
-            adapter_models = [m for m in models_data["data"] if m.get("parent")]
-            self.assertEqual(len(adapter_models), 1)
-            self.assertEqual(adapter_models[0]["id"], "added_tokens_adapter")
-            self.assertEqual(adapter_models[0]["root"], added_tokens_adapter)
-            self.assertIsNotNone(adapter_models[0]["parent"])
-
-            result = session.forward(
-                prompts=[PROMPTS[0]],
-                lora_paths=["added_tokens_adapter"],
-            )
-            print(f"Got output from added_tokens_adapter: {result}")
 
 
 if __name__ == "__main__":
