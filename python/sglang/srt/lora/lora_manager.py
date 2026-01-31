@@ -75,7 +75,6 @@ class LoRAManager:
         self.tp_rank: int = tp_rank
         self.lora_added_tokens_size: Optional[int] = None
 
-
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
 
@@ -354,7 +353,6 @@ class LoRAManager:
                         down_lora_a_weights=down_a,
                         down_lora_b_weights=down_b,
                     )
-                    module.max_lora_rank = self.max_lora_rank
                     continue
 
                 target_module = get_target_module_name(
@@ -587,6 +585,7 @@ class LoRAManager:
             if isinstance(module, FusedMoE) and all(
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
+                layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
