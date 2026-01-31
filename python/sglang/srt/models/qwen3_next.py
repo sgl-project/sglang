@@ -46,6 +46,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
     is_cuda,
     is_npu,
     make_layers,
@@ -56,6 +58,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 
 
 import triton
@@ -209,8 +213,16 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.hidden_size = config.hidden_size
-        self.num_v_heads = config.linear_num_value_heads
-        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = (
+            config.linear_num_value_heads
+            if not _is_cpu
+            else config.linear_num_value_heads_cpu
+        )
+        self.num_k_heads = (
+            config.linear_num_key_heads
+            if not _is_cpu
+            else config.linear_num_key_heads_cpu
+        )
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
@@ -306,11 +318,12 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         self.linear_attn = RadixLinearAttention(
             layer_id=layer_id,
-            num_qk_heads=self.num_k_heads // self.attn_tp_size,
+            num_q_heads=self.num_k_heads // self.attn_tp_size,
+            num_k_heads=self.num_k_heads // self.attn_tp_size,
             num_v_heads=self.num_v_heads // self.attn_tp_size,
-            head_qk_dim=self.head_k_dim,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            attention_tp_size=self.attn_tp_size,
             conv_weights=self.conv1d.weight.squeeze(1),
             bias=self.conv1d.bias,
             activation=self.activation,
@@ -365,7 +378,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if _is_cpu or _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -415,7 +428,11 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and is_cuda_graph
+            and not _is_cpu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -423,6 +440,17 @@ class Qwen3GatedDeltaNet(nn.Module):
                 triton.cdiv(self.num_v_heads, self.attn_tp_size),
                 self.head_k_dim,
                 self.head_v_dim,
+            )
+        elif _is_cpu and _is_amx_available:
+            mixed_qkv, z, b, a = (
+                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    self.num_k_heads // self.attn_tp_size,
+                    self.num_v_heads // self.attn_tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
             )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
@@ -432,7 +460,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-
         core_attn_out = self.linear_attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -793,7 +820,7 @@ class Qwen3NextModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         def get_layer(idx: int, prefix: str):

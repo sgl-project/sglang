@@ -3,12 +3,6 @@ name: Nightly Test (Nvidia)
 on:
   schedule:
     - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
-      - "test/run_suite.py"
   workflow_dispatch:
     inputs:
       job_filter:
@@ -66,7 +60,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 60
@@ -86,7 +80,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -112,7 +106,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -134,6 +128,26 @@ jobs:
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h200 --nightly --continue-on-error
 
+      - name: Collect performance metrics
+        if: always()
+        run: |
+          python3 scripts/ci/save_metrics.py \
+            --gpu-config 8-gpu-h200 \
+            --partition ${{ matrix.partition }} \
+            --run-id ${{ github.run_id }} \
+            --output test/metrics-8gpu-h200-partition-${{ matrix.partition }}.json \
+            --search-dir test/performance_profiles_8_gpu \
+            --search-dir test
+
+      - name: Upload partition metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-8gpu-h200-partition-${{ matrix.partition }}
+          path: test/metrics-8gpu-h200-partition-${{ matrix.partition }}.json
+          retention-days: 5
+          if-no-files-found: ignore
+
   # General tests - 8 GPU H20
   nightly-test-general-8-gpu-h20:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-8-gpu-h20')
@@ -148,7 +162,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -174,7 +188,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run common 8-GPU model tests
         if: always()
@@ -186,6 +200,26 @@ jobs:
         run: |
           cd test
           IS_BLACKWELL=1 python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=3
+
+      - name: Collect performance metrics
+        if: always()
+        run: |
+          python3 scripts/ci/save_metrics.py \
+            --gpu-config 8-gpu-b200 \
+            --partition ${{ matrix.partition }} \
+            --run-id ${{ github.run_id }} \
+            --output test/metrics-8gpu-b200-partition-${{ matrix.partition }}.json \
+            --search-dir test/performance_profiles_8_gpu \
+            --search-dir test
+
+      - name: Upload partition metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-8gpu-b200-partition-${{ matrix.partition }}
+          path: test/metrics-8gpu-b200-partition-${{ matrix.partition }}.json
+          retention-days: 5
+          if-no-files-found: ignore
 
   # Text model accuracy tests
   nightly-test-text-accuracy-2-gpu-runner:
@@ -199,7 +233,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run eval test for text models
         timeout-minutes: 120
@@ -219,7 +253,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run performance test for text models
         timeout-minutes: 180
@@ -238,7 +272,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_text_models
+          python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_text_models
 
   # VLM accuracy tests
   nightly-test-vlm-accuracy-2-gpu-runner:
@@ -252,7 +286,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run eval test for VLM models (fixed MMMU-100)
         timeout-minutes: 240
@@ -272,7 +306,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run perf test for VLM models (MMMU)
         timeout-minutes: 240
@@ -291,7 +325,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_vlms
+          python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_vlms
 
   # diffusion performance tests
   nightly-test-multimodal-server-1-gpu:
@@ -310,7 +344,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh diffusion
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
           pip install slack_sdk
 
       - name: Run diffusion server tests
@@ -343,7 +377,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh diffusion
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
           pip install slack_sdk
 
       - name: Run diffusion server tests
@@ -371,7 +405,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 300
@@ -393,7 +427,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
+          IS_BLACKWELL=1 bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 120
@@ -402,6 +436,48 @@ jobs:
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
+
+  # Consolidate performance metrics from all 8-GPU jobs
+  consolidate-metrics:
+    if: github.repository == 'sgl-project/sglang' && always()
+    needs:
+      - nightly-test-general-8-gpu-h200
+      - nightly-test-general-8-gpu-b200
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download all partition metrics
+        uses: actions/download-artifact@v4
+        with:
+          pattern: metrics-*
+          path: metrics/
+          merge-multiple: true
+
+      - name: List downloaded metrics
+        run: |
+          echo "Downloaded metrics files:"
+          find metrics/ -name "*.json" -type f 2>/dev/null || echo "No metrics files found"
+
+      - name: Merge metrics
+        run: |
+          python3 scripts/ci/merge_metrics.py \
+            --input-dir metrics/ \
+            --output consolidated-metrics-${{ github.run_id }}.json \
+            --run-id ${{ github.run_id }} \
+            --commit-sha ${{ github.sha }} \
+            --branch ${{ github.ref_name }}
+
+      - name: Upload consolidated metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-metrics-${{ github.run_id }}
+          path: consolidated-metrics-${{ github.run_id }}.json
+          retention-days: 90
+          if-no-files-found: warn
 
   # Final check job
   check-all-jobs:
@@ -420,6 +496,7 @@ jobs:
       - nightly-test-multimodal-server-2-gpu
       - nightly-test-perf-4-gpu-b200
       - nightly-test-specialized-8-gpu-b200
+      - consolidate-metrics
     runs-on: ubuntu-latest
     steps:
       - name: Check if any job failed
