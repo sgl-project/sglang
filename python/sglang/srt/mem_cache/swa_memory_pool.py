@@ -10,6 +10,9 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.hardware_backend.npu.allocator_npu import (
+    NPUPagedTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 
@@ -232,6 +235,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: SWAKVPool,
         need_sort: bool,
+        is_npu: bool = False,
     ):
         assert isinstance(kvcache, SWAKVPool)
         self._size_full = size
@@ -239,6 +243,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
+        self.is_npu = is_npu
 
         if page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(
@@ -250,6 +255,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa,
+                dtype,
+                device,
+                kvcache.swa_kv_pool,
+                need_sort,
+            )
+        elif self.is_npu:
+            self.full_attn_allocator = NPUPagedTokenToKVPoolAllocator(
+                size,
+                page_size,
+                dtype,
+                device,
+                kvcache.full_kv_pool,
+                need_sort,
+            )
+            self.swa_attn_allocator = NPUPagedTokenToKVPoolAllocator(
+                size_swa,
+                page_size,
                 dtype,
                 device,
                 kvcache.swa_kv_pool,
@@ -347,7 +369,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        if self.is_npu:
+            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = alloc_swa_indices.to(torch.int64)
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
     def alloc_extend(
@@ -387,7 +412,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        if self.is_npu:
+            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = alloc_swa_indices.to(torch.int64)
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -410,7 +438,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        if self.is_npu:
+            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = alloc_swa_indices.to(torch.int64)
+        else:
+            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
