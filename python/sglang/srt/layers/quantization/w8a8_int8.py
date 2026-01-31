@@ -256,7 +256,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
     ):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        tp_size = get_tensor_model_parallel_world_size()
+        get_tensor_model_parallel_world_size()
 
         # WEIGHTS
         w13_weight = torch.nn.Parameter(

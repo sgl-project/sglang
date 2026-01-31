@@ -1584,7 +1584,7 @@ class FlashAttentionForwardSm100:
 
         tStScale = cute.composition(tStSi, cute.make_layout((self.m_block_size, 1)))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
+        cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
 
         tilePlikeFP32 = self.mma_tiler_qk[1] // 32 * self.v_dtype.width
         tStP_layout = cute.composition(
@@ -1908,7 +1908,7 @@ class FlashAttentionForwardSm100:
         """
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
+        cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
         tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
         # Wait for Si
@@ -2026,7 +2026,7 @@ class FlashAttentionForwardSm100:
         )
         thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
 
-        tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
+        [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
         # First iter: no correction is required
@@ -2072,7 +2072,7 @@ class FlashAttentionForwardSm100:
                     )
                 softmax_corr_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                cute.make_fragment(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1

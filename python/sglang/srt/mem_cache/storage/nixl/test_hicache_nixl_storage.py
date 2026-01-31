@@ -71,7 +71,7 @@ class TestNixlUnified(unittest.TestCase):
             if os.path.exists(file_path):
                 os.remove(file_path)
             return True
-        except Exception as e:
+        except Exception:
             return False
 
     def verify_tensors_equal(self, expected: torch.Tensor, actual: torch.Tensor):
@@ -110,7 +110,6 @@ class TestNixlUnified(unittest.TestCase):
         self.verify_tensors_equal(value, retrieved)
 
         # Same test in addr,len mode with another key and dst_tensor
-        key2 = "test_key2"
         dst_tensor2 = torch.zeros_like(value, device="cpu")
         src_addr, src_len = value.data_ptr(), value.numel() * value.element_size()
         dst_addr, dst_len = (

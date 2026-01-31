@@ -375,7 +375,6 @@ class LlamaModel(nn.Module):
             # FIXME(@ying): reduce the number of proxy tensors by not fusing layer norms
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-            deferred_norm = None
 
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):

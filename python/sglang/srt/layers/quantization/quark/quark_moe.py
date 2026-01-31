@@ -171,7 +171,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        float_dtype = torch.get_default_dtype()
+        torch.get_default_dtype()
 
         # Pre-shuffle weight scales
         s0, s1, _ = layer.w13_weight_scale.shape

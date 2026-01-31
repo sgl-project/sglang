@@ -92,7 +92,6 @@ def main(args):
     lines = list(read_jsonl(args.data_path))
 
     # Construct prompts
-    k = args.num_shot
 
     questions = []
     labels = []

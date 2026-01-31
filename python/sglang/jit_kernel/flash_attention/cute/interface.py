@@ -983,7 +983,7 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
-        fa_bwd_sm80 = FlashAttentionBackwardSm80(
+        FlashAttentionBackwardSm80(
             dtype,
             head_dim,
             head_dim_v,

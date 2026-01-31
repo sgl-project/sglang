@@ -760,7 +760,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
 
-            origi_hidden_size = self.hidden_size - self.hidden_pad
+            self.hidden_size - self.hidden_pad
 
             x = torch.nn.functional.pad(
                 x,

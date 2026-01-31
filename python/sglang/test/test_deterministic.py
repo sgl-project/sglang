@@ -521,12 +521,12 @@ def test_deterministic(args):
         )
 
         # We noticed that we cannot call flush cache before any request, otherwise it will hang.
-        warmup_response = send_single(
+        send_single(
             args, input_ids=[1] * 64, max_new_tokens=65, return_full_response=True
         )
 
         # Flush cache first to make sure there is no cache hit from previous tests
-        flush_response = requests.post(f"http://{args.host}:{args.port}/flush_cache")
+        requests.post(f"http://{args.host}:{args.port}/flush_cache")
 
         prefix_len = 100
         print(f"Step 1: Generating random {prefix_len} token IDs...")
@@ -583,7 +583,7 @@ def test_deterministic(args):
         print(f"  Logprob:  {cached_logprob:.10f}")
 
         print(f"\nStep 4: Flushing cache...")
-        flush_response = requests.post(f"http://{args.host}:{args.port}/flush_cache")
+        requests.post(f"http://{args.host}:{args.port}/flush_cache")
 
         print(
             f"\nStep 5: Generating without cache (same 164 tokens prefill, no cache)..."

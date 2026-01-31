@@ -1796,8 +1796,6 @@ class MiniCPMO(MiniCPMBaseModel):
             audio_embeddings = self.get_audio_embedding_streaming(items)
         else:
             audio_embeddings = self.get_audio_embedding(items, chunk_length)
-        bs = len(audio_embeddings)
-        # batch size
         audio_embs = torch.cat(flatten_nested_list(audio_embeddings), dim=0)
 
         return audio_embs

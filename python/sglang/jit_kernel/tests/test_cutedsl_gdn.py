@@ -104,7 +104,7 @@ def test_cutedsl_gdn_precision(B: int):
 def test_cutedsl_gdn_performance(B: int):
     """Benchmark CuTe DSL GDN kernel against Triton reference."""
     torch.manual_seed(2025)
-    T, H, K, V, HV = 1, 16, 128, 128, 32
+    _T, H, K, V, HV = 1, 16, 128, 128, 32
     N = B
     scale = K**-0.5
     is_varlen = True

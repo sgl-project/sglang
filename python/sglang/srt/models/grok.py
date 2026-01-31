@@ -535,9 +535,6 @@ class Grok1DecoderLayer(nn.Module):
         deferred_norm: Optional[RMSNorm] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, RMSNorm]:
 
-        hidden_states_original = hidden_states
-        residual_original = residual
-
         # Self Attention
         if deferred_norm is not None:
             assert residual is not None

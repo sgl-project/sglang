@@ -599,7 +599,6 @@ class MoriEPMoE(DeepEPMoE):
     ):
         num_token = hidden_states.shape[0]
         output_dtype = hidden_states.dtype
-        scale = None
         is_fp8_quant = isinstance(self.quant_method, Fp8MoEMethod)
         is_quark_w4a4 = isinstance(self.quant_method, QuarkW4A4MXFp4MoEMethod)
 

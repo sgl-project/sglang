@@ -429,11 +429,6 @@ class AutoencoderKL(nn.Module):
                 If return_dict is True, a [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain
                 `tuple` is returned.
         """
-        deprecation_message = (
-            "The tiled_encode implementation supporting the `return_dict` parameter is deprecated. In the future, the "
-            "implementation of this method will be replaced with that of `_tiled_encode` and you will no longer be able "
-            "to pass `return_dict`. You will also have to create a `DiagonalGaussianDistribution()` from the returned value."
-        )
         # deprecate("tiled_encode", "1.0.0", deprecation_message, standard_warn=False)
 
         overlap_size = int(self.tile_sample_min_size * (1 - self.tile_overlap_factor))

@@ -531,7 +531,7 @@ class DualTowerConditionalBridge(
             A tuple of ((cos_v, sin_v), (cos_a, sin_a)).
         """
         f_v, h, w = grid_size
-        L_v = f_v * h * w
+        f_v * h * w
         L_a = int(audio_steps)
 
         device = device or next(self.parameters()).device

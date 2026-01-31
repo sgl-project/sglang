@@ -100,12 +100,6 @@ def benchmark_layer_norm_fwd(
 
     # Create output tensor for graph capture
     out_graph = torch.empty_like(x)
-    mean_graph = (
-        torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
-    )
-    rstd_graph = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
 
     # Capture the graph
     graph = torch.cuda.CUDAGraph()
@@ -281,7 +275,7 @@ def main():
         print("CUDA is not available. This benchmark requires a CUDA-enabled GPU.")
         return
 
-    results = benchmark_layer_norm_fwd(**config)
+    benchmark_layer_norm_fwd(**config)
 
     # Collect all results
     all_results = []

@@ -81,7 +81,7 @@ def test_comfyui_flux_pipeline_direct() -> None:
     req.raw_latent_shape = torch.tensor(hidden_states.shape, dtype=torch.long)
 
     clip_dim = 768
-    dummy_clip_embedding = torch.zeros(
+    torch.zeros(
         batch_size,
         77,
         clip_dim,

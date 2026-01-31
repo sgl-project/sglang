@@ -398,7 +398,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     def fast_pos_embed_interpolate(self, grid_thw):
         patch_pos_embeds_permute = []
-        m_size = self.spatial_merge_size
 
         embeds = torch.arange(self.num_grid, device=self.pos_embed.weight.device)
         embeds = (

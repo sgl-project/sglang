@@ -607,7 +607,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input

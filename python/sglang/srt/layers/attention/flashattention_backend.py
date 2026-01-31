@@ -1213,7 +1213,6 @@ class FlashAttentionBackend(AttentionBackend):
                             )
                         )
                 cache_seqlens = metadata.cache_seqlens_int32
-                cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim

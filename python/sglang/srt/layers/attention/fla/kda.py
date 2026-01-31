@@ -65,9 +65,6 @@ def fused_recurrent_kda_fwd(
     else:
         final_state = q.new_empty(T, HV, K, V, dtype=initial_state.dtype)
 
-    stride_init_state_token = initial_state.stride(0)
-    stride_final_state_token = final_state.stride(0)
-
     # if ssm_state_indices is None:
     #     stride_indices_seq, stride_indices_tok = 1, 1
     # elif ssm_state_indices.ndim == 1:

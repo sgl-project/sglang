@@ -295,12 +295,6 @@ class TestMiniCPMV4Logits(VisionLLMLogitsBase):
 
         with torch.no_grad():
             # hf
-            model_inputs = {
-                "input_ids": inputs.input_ids,
-                "image_bound": inputs.image_bound,
-                "pixel_values": inputs.pixel_values,
-                "tgt_sizes": inputs.tgt_sizes,
-            }
             hf_output = self.hf_model.get_input_embeddings()(inputs.input_ids)
 
             # sglang

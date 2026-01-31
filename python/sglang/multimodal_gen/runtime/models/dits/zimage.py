@@ -539,7 +539,6 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         cap_feat = all_cap_feats[0]  # L, D
         pH = pW = patch_size
         pF = f_patch_size
-        device = image.device
 
         all_image_out = []
         all_image_size = []
@@ -600,8 +599,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         cap_feats = encoder_hidden_states
         timestep = 1000.0 - timestep
         t = timestep
-        bsz = 1
-        device = x[0].device
+        x[0].device
         t = self.t_embedder(t)
         adaln_input = t.type_as(x)
         (

@@ -1396,7 +1396,7 @@ class CompressedTensorsWNA16TritonMoEMethod(CompressedTensorsWNA16MoEMethod):
         if getattr(layer, "is_triton_converted", False):
             return
 
-        num_experts = layer.w13_weight_packed.shape[0]
+        layer.w13_weight_packed.shape[0]
 
         # Convert w13 weights: [E, K//8, N] int32 -> [E, N, K//2] uint8
         w13 = layer.w13_weight_packed.data

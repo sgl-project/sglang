@@ -157,7 +157,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:abc"
 
-        with self.assertRaises(ValueError) as context:
+        with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
     @patch("sglang.srt.server_args.is_port_available")

@@ -37,7 +37,6 @@ class KimiK2_5VLImageProcessor(SGLangBaseProcessor):
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
         )
-        prompt = base_output.input_text
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens

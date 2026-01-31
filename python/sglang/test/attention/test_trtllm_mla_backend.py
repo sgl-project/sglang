@@ -386,7 +386,7 @@ class TestTRTLLMMLA(CustomTestCase):
             Tuple of (q_nope, q_rope, k_nope, k_rope, v, cos_sin_cache)
         """
         device = config["device"]
-        target_dtype = dtype_override or config["dtype"]
+        dtype_override or config["dtype"]
 
         # Create separate nope and rope components for Q
         q_nope = torch.randn(
@@ -607,7 +607,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 q_nope_ref, q_rope_ref, k_nope_ref, k_rope_ref, v_ref = (
                     self._create_qkv_tensors(batch_size, config)
                 )
-                q_nope_trt, q_rope_trt, k_nope_trt, k_rope_trt, v_trt = (
+                q_nope_trt, q_rope_trt, k_nope_trt, k_rope_trt, _v_trt = (
                     q_nope_ref.clone(),
                     q_rope_ref.clone(),
                     k_nope_ref.clone(),
@@ -975,7 +975,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
                 for i in range(batch_size):
                     seq_len = seq_lens[i].item()
-                    expected_blocks = backend._calc_padded_blocks(seq_len)
+                    backend._calc_padded_blocks(seq_len)
 
                     # Count valid (non -1) indices for this sequence
                     valid_indices = (block_kv_indices[i] >= 0).sum().item()

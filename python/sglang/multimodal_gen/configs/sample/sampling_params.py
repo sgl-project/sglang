@@ -436,7 +436,7 @@ class SamplingParams:
             sampling_params = SamplingParams.from_pretrained(
                 model_path, backend=server_args.backend
             )
-        except (AttributeError, ValueError) as e:
+        except (AttributeError, ValueError):
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
             if os.path.isfile(model_path) and model_path.endswith(".safetensors"):

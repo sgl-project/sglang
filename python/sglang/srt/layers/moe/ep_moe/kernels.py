@@ -1082,7 +1082,7 @@ def moe_ep_deepgemm_preprocess(
     if block_shape is None:
         block_shape = [128, 128]
     assert len(block_shape) == 2
-    block_n, block_k = block_shape[0], block_shape[1]
+    _block_n, block_k = block_shape[0], block_shape[1]
 
     # TODO: fuse this with the preprocess
     hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)

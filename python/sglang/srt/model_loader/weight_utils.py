@@ -59,7 +59,7 @@ from sglang.utils import is_in_ci
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
-except ImportError as e:
+except ImportError:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)

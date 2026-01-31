@@ -207,7 +207,7 @@ def process_anyres_image(image, processor, grid_pinpoints):
     if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
         try:
             patch_size = processor.size[0]
-        except Exception as e:
+        except Exception:
             patch_size = processor.size["shortest_edge"]
         assert patch_size in [
             224,

@@ -1765,7 +1765,7 @@ def get_npu_memory_capacity():
         import torch_npu  # noqa: F401
 
         return torch.npu.mem_get_info()[1] // 1024 // 1024  # unit: MB
-    except ImportError as e:
+    except ImportError:
         raise ImportError("torch_npu is required when run on npu device.")
 
 
@@ -2015,7 +2015,7 @@ def get_device(device_id: Optional[int] = None) -> str:
                 if device_id == None:
                     return "hpu"
                 return "hpu:{}".format(device_id)
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
@@ -2096,7 +2096,7 @@ def get_compiler_backend(mode=None) -> str:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
             from torchair.configs.compiler_config import CompilerConfig
-        except ImportError as e:
+        except ImportError:
             raise ImportError(
                 "NPU detected, but torchair package is not installed. "
                 "Please install torchair for torch.compile support on NPU."

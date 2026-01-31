@@ -1779,7 +1779,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         if warp_idx_in_wg == 0:
-            q_producer_phase = Int32(1)
+            Int32(1)
             kv_producer_state = pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Producer, self.num_stages
             )

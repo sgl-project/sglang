@@ -138,7 +138,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
-        hidden_states_dtype = running_state["hidden_states_dtype"]
+        running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
 

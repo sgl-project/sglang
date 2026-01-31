@@ -110,12 +110,12 @@ def test_timestep_embedding_perf():
         end = torch.cuda.Event(enable_timing=True)
 
         for _ in range(warmup_times):
-            output_fn = kernel_fn(*args, **kwargs)
+            kernel_fn(*args, **kwargs)
         torch.cuda.synchronize()
 
         start.record()
         for _ in range(repeat_times):
-            output_fn = kernel_fn(*args, **kwargs)
+            kernel_fn(*args, **kwargs)
         end.record()
         end.synchronize()
         return start.elapsed_time(end) / repeat_times

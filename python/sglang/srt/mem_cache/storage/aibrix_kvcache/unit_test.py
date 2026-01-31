@@ -71,7 +71,7 @@ class AIBrixKVCacheStorageTest:
             self.aibrix_kvcache.batch_get(keys, get_tensor)
             for i in range(query_length):
                 assert torch.equal(get_tensor[i], rand_tensor[i].flatten())
-            ret = self.aibrix_kvcache.batch_exists(keys)
+            self.aibrix_kvcache.batch_exists(keys)
             assert self.aibrix_kvcache.batch_exists(keys) == query_length
             assert self.aibrix_kvcache.batch_exists(partial_keys) == partial
             partial_get_tensor = [

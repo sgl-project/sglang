@@ -847,7 +847,7 @@ def test_flash_attn_varlen_output(
             and False
         ):
             g_unpad = torch.randn_like(out_unpad)
-            do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
+            ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
             # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
             #     g_unpad,
@@ -1075,7 +1075,7 @@ def test_flash_attn_kvcache(
             query_padding_mask = None
             q_unpad = q
             qv_unpad = qv
-            cu_seqlens_q, max_seqlen_q = None, None
+            cu_seqlens_q, _max_seqlen_q = None, None
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
@@ -1353,7 +1353,6 @@ def test_flash_attn_kvcache(
             #     )
             # else:
             #     scheduler_metadata = None
-            scheduler_metadata = None
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:

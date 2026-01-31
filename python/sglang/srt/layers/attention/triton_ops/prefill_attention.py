@@ -181,7 +181,7 @@ def context_attention_fwd(
     else:
         BLOCK = 64
 
-    Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+    Lq, Lk, _Lv = q.shape[-1], k.shape[-1], v.shape[-1]
 
     sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]

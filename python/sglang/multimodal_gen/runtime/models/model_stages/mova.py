@@ -796,7 +796,7 @@ class MOVADenoisingStage(PipelineStage):
         """
         min_layers = min(len(visual_dit.blocks), len(self.audio_dit.blocks))
         visual_layers = len(visual_dit.blocks)
-        sp_size = get_sp_world_size()
+        get_sp_world_size()
 
         # Build RoPE frequencies for cross-attention if needed (only used when SP == 1)
         # When SP > 1, we rebuild freqs inside the loop after gathering full sequences

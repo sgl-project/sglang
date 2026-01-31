@@ -307,8 +307,6 @@ def sparse_attention_fwd_kernel_v1(
 
             b_i, g_i = by, bz
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
-            q_i = s_i
-            max_kv_i = q_i
 
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block

@@ -18,7 +18,7 @@ def merge_state_kernel(
     OUTPUT_LSE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
-    num_tokens = tl.num_programs(0)
+    tl.num_programs(0)
     head_idx = tl.program_id(1)
     num_heads = tl.num_programs(1)
 

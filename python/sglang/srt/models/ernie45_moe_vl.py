@@ -372,7 +372,6 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         freq_allocation = getattr(config, "freq_allocation", 20)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         # Self attention.
         self.self_attn = Ernie4_5_VLMoeAttention(
             config=config,

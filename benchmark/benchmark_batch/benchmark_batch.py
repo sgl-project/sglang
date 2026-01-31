@@ -89,7 +89,6 @@ def send_batch_request(endpoint, prompts, gen_tokens, request_id):
         if response.status_code != 200:
             error = response.json()
             raise RuntimeError(f"Request {request_id} failed: {error}")
-        result = response.json()
         elapsed_time = (time.perf_counter() - start_time) * 1000  # Convert to ms
         avg_per_prompt = elapsed_time / len(prompts) if prompts else 0
         return request_id, elapsed_time, avg_per_prompt, True, len(prompts)

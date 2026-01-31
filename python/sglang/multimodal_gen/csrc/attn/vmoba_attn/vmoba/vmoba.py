@@ -239,7 +239,7 @@ def _select_threshold_overall(
     Normalization and sorting happen across all valid entries.
     """
     C, H, S = gate.shape
-    CHS = C * H * S
+    C * H * S
     eps = 1e-6
 
     # LSE‐style normalization globally across all valid entries
@@ -688,7 +688,7 @@ def moba_attn_varlen(
         .expand(-1, num_head, -1)
     )
     amplification_factor = 1e9  # Example factor; adjust as needed.
-    origin_gate = gate.clone()
+    gate.clone()
     gate = gate.clone()
     if select_mode == "topk":
         gate[gate_self_chunk_mask] += amplification_factor
@@ -963,7 +963,7 @@ def generate_data(batch_size, seqlen, num_head, head_dim, dtype):
     random.seed(0)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
-    device = torch.cuda.current_device()
+    torch.cuda.current_device()
 
     q = torch.randn((batch_size, seqlen, num_head, head_dim), requires_grad=True).to(
         dtype=dtype, device="cuda"

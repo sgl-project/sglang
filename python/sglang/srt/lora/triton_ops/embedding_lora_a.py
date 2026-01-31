@@ -130,7 +130,7 @@ def embedding_lora_a_fwd(
     S = input_ids.shape[0]
     num_loras = weights.shape[0]
     rank = weights.shape[1]
-    vocab_size_weights = weights.shape[2]
+    weights.shape[2]
 
     # Block size for rank dimension
     BLOCK_RANK = 128

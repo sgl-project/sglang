@@ -66,7 +66,7 @@ class TestStartProfile(CustomTestCase):
 
     def test_start_profile_1(self):
         """Test /start_profile with start_step and num_steps argument. This have to be the first test for start_step to work"""
-        response = self._start_profile(start_step="15", num_steps=5)
+        self._start_profile(start_step="15", num_steps=5)
 
         self._post_request()
 
@@ -74,7 +74,7 @@ class TestStartProfile(CustomTestCase):
 
     def test_start_profile_2(self):
         """Test /start_profile with no argument"""
-        response = self._start_profile()
+        self._start_profile()
 
         self._post_request()
 
@@ -82,14 +82,14 @@ class TestStartProfile(CustomTestCase):
         self._check_empty_profile_dir()
 
         # Post /stop_profile and check the profile directory is non-empty
-        response = requests.post(
+        requests.post(
             f"{DEFAULT_URL_FOR_TEST}/stop_profile",
         )
         self._check_non_empty_profile_dir()
 
     def test_start_profile_3(self):
         """Test /start_profile with num_steps argument"""
-        response = self._start_profile(num_steps=5)
+        self._start_profile(num_steps=5)
 
         self._post_request()
 
@@ -302,9 +302,7 @@ class TestStartProfileWithNsys(CustomTestCase):
     def test_start_profile_cuda_profiler_with_start_step(self):
         """Test /start_profile with CUDA_PROFILER, start_step, and num_steps"""
         # Use start_step to let server warm up before profiling
-        response = self._start_profile(
-            activities=["CUDA_PROFILER"], start_step=10, num_steps=3
-        )
+        self._start_profile(activities=["CUDA_PROFILER"], start_step=10, num_steps=3)
 
         self._post_request()
 
@@ -313,7 +311,7 @@ class TestStartProfileWithNsys(CustomTestCase):
     def test_start_profile_cuda_profiler(self):
         """Test /start_profile with CUDA_PROFILER activity (no start_step)"""
         # Simple num_steps test - profiling starts immediately
-        response = self._start_profile(activities=["CUDA_PROFILER"], num_steps=5)
+        self._start_profile(activities=["CUDA_PROFILER"], num_steps=5)
 
         self._post_request()
 

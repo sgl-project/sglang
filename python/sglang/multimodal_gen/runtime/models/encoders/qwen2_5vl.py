@@ -52,7 +52,7 @@ from sglang.multimodal_gen.runtime.utils.common import add_prefix
 # limitations under the License.
 """Inference-only Qwen2-VL model compatible with HuggingFace weights."""
 import logging
-from typing import Callable, Iterable, Optional, Tuple, Union
+from typing import Iterable, Optional, Tuple, Union
 
 try:
     from typing import Unpack  # type: ignore[attr-defined]
@@ -71,7 +71,6 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VLRotaryEmbedding,
     Qwen2MLP,
     apply_multimodal_rotary_pos_emb,
-    eager_attention_forward,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,7 +178,6 @@ class Qwen2_5_VLAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface: Callable = eager_attention_forward
         # if self.config._attn_implementation != "eager":
         # attention_interface = ALL_ATTENTION_FUNCTIONS["sdpa"]
         query_states = query_states.transpose(1, 2)

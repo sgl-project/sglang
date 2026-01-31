@@ -172,7 +172,6 @@ def benchmark_config(
 
     w1_scale = None
     w2_scale = None
-    a1_scale = None
     a2_scale = None
     if use_int8_w8a16:
         w1_scale = torch.randn(
@@ -188,7 +187,7 @@ def benchmark_config(
         elif block_shape is None:
             w1_scale = torch.randn(num_experts, dtype=torch.float32)
             w2_scale = torch.randn(num_experts, dtype=torch.float32)
-            a1_scale = torch.randn(1, dtype=torch.float32)
+            torch.randn(1, dtype=torch.float32)
             a2_scale = torch.randn(1, dtype=torch.float32)
         else:
             block_n, block_k = block_shape[0], block_shape[1]
@@ -709,7 +708,7 @@ def main(args: argparse.Namespace):
 
     search_space = get_configs_compute_bound()
     if block_shape is not None:
-        block_n, block_k = block_shape[0], block_shape[1]
+        _block_n, block_k = block_shape[0], block_shape[1]
         search_space = [
             config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
         ]

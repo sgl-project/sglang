@@ -5479,7 +5479,7 @@ class PortArgs:
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
                 if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
-            except ValueError as e:
+            except ValueError:
                 logger.exception(
                     f"Port is already in use. {dist_init_port=} {port_base=} {detokenizer_port=} {nccl_port=} {scheduler_input_port=}"
                 )

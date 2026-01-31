@@ -214,7 +214,6 @@ def _run_sglang_subprocess(
         _mem_usage = get_gpu_memory_gb(rank)
         print(f"GPU{rank} Memory usage after resuming Sgl weights: {_mem_usage}")
         del hf_model
-        hf_model = None
         torch.cuda.empty_cache()
         time.sleep(3)
         torch.cuda.empty_cache()

@@ -540,7 +540,7 @@ class FlashAttentionBackwardSm100:
             )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
-        tma_load_op_multicast = cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)
+        cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)
 
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
@@ -2017,7 +2017,7 @@ class FlashAttentionBackwardSm100:
         thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
         tScP_r2t = thr_copy_r2t.partition_S(tScP)
         tStP_r2t = thr_copy_r2t.partition_D(tStP)
-        tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
+        thr_copy_r2t.partition_S(tdPcdS)
         tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
         # rmem -> smem
         # This part is a bit iffy, we might be making a lot of assumptions here
@@ -2119,10 +2119,8 @@ class FlashAttentionBackwardSm100:
                         subtile_factor=self.subtile_factor,
                         m_block_max=m_block_max,
                     )
-                    m_block_oob = m_block >= m_block_max
                 else:
                     m_block = m_block_min + iter_idx
-                    m_block_oob = False
                     is_full_block = False
                 # Prefetch 1 stage of LSE
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
@@ -2499,9 +2497,9 @@ class FlashAttentionBackwardSm100:
                     subtile_factor=self.subtile_factor,
                     m_block_max=m_block_max,
                 )
-                process_tile = loop_count > Int32(0)
+                loop_count > Int32(0)
             else:
-                process_tile = (
+                (
                     const_expr(not self.is_local and not self.is_varlen_q)
                     or m_block_min < m_block_max
                 )

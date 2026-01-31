@@ -284,7 +284,7 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         dtype = self.kv_cache_dtype
 
-        meta = get_mla_metadata_v1(
+        get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
             self.num_head // nhead_kv,
@@ -567,10 +567,6 @@ class AiterAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
-                extend_no_prefix = False
-            else:
-                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
             if self.use_mla:
                 self.mla_indices_updater_prefill.update(
                     forward_batch.req_pool_indices,

@@ -82,7 +82,7 @@ if _is_cuda:
 
     try:
         from sgl_kernel import kimi_k2_moe_fused_gate
-    except ImportError as e:
+    except ImportError:
         pass
 
 if _is_cuda or _is_hip:

@@ -459,7 +459,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                     return_dict=False,
                 )
-            except Exception as e:
+            except Exception:
                 # If the first attempt fails, try transforming the tools format
                 # This handles models like Mistral that have a different tools input format
                 # that is not compatible with OpenAI's apply_chat_template tool_call format

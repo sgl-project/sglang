@@ -194,7 +194,7 @@ def run_accuracy_simulation() -> None:
 
     total_score = 0
     for sample in samples:
-        formatted = format_longbench_v2_question(sample)
+        format_longbench_v2_question(sample)
         response = correct_responses[sample["_id"]]
         extracted = extract_longbench_v2_answer(response)
         expected = sample["answer"]

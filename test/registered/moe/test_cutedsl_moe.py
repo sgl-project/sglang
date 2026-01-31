@@ -322,7 +322,6 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                 with torch.inference_mode():
                     torch.manual_seed(42)
                     device = "cuda"
-                    dtype = torch.bfloat16
                     num_experts = 8
                     hidden_states = (
                         torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device)

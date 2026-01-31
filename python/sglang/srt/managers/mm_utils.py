@@ -65,7 +65,7 @@ def init_feature_buffer(device):
             num_elements, dtype=torch.float32, device=device
         )
         logger.info(f"Preallocated {size_mb}MB GPU buffer")
-    except RuntimeError as e:
+    except RuntimeError:
         _GPU_FEATURE_BUFFER = None
 
 
@@ -157,7 +157,7 @@ class TransportProxyTensor(torch.Tensor):
                     "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
-            except Exception as e:
+            except Exception:
                 # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
                 state["metadata"]["transport_mode"] = "default"
                 state["tensor_data"] = self.as_subclass(torch.Tensor)

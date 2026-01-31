@@ -243,7 +243,7 @@ class NixlFileManager:
         try:
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
             if not os.path.exists(file_path):
-                with open(file_path, "wb") as f:
+                with open(file_path, "wb"):
                     pass  # Create empty file
             return True
         except Exception as e:

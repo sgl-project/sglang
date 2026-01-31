@@ -1378,7 +1378,7 @@ def run_embeddings_benchmark(
             # Use a token that reliably produces 1 token
             special_token = "<|im_start|>"
             # Verify it's a single token
-            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
+            tokenizer.encode(special_token, add_special_tokens=False)
             text = special_token * num_tokens
             return text
 
@@ -1814,7 +1814,7 @@ def run_mulit_request_test(
                     },
                 },
             )
-            ret = response.json()
+            response.json()
 
         with ThreadPoolExecutor(2) as executor:
             list(executor.map(run_one, list(range(4))))

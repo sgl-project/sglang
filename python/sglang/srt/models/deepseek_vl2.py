@@ -34,7 +34,7 @@ class DeepseekVL2MlpProjector(nn.Module):
         self.config = config
 
         if config.projector_type == "identity":
-            modules = nn.Identity()
+            self.layers = nn.ModuleList([nn.Identity()])
 
         elif config.projector_type == "linear":
             self.layers = nn.ModuleList(
@@ -234,14 +234,6 @@ class DeepseekVL2ForCausalLM(nn.Module):
         return hs
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
-        ]
         params_dict = dict(self.named_parameters())
         weights = list(weights)
         for name, loaded_weight in weights:

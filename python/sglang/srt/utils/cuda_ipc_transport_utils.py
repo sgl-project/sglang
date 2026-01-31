@@ -276,7 +276,7 @@ class CudaIpcTensorTransportProxy:
                 "recons_dtype": info_data.dtype,
             }
             state["tensor_data"] = None
-        except Exception as e:
+        except Exception:
             # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
             state["ipc_extra"] = None
             state["tensor_data"] = data

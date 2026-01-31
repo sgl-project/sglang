@@ -936,7 +936,6 @@ class GptOssForCausalLM(nn.Module):
         weight_name_mapping: dict,
         other_loaded_param_names=[],
     ):
-        tp_rank = get_tensor_model_parallel_rank()
         if is_nextn:
             logging.warning(
                 "Loading weights for nextn is currently not supported in GptOssForCausalLM. "

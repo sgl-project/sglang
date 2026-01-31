@@ -363,7 +363,6 @@ def tune_on_gpu(args_dict):
     ]
 
     start = time.perf_counter()
-    results = {}
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
         print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")

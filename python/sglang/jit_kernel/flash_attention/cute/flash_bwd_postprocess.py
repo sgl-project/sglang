@@ -366,7 +366,7 @@ class FlashAttentionBackwardPostprocess:
             gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
 
             seqlen_q = seqlen.seqlen_q
-            seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
+            cute.round_up(seqlen_q, self.tile_m)
 
             # Step 1: load dQaccum from gmem to smem
             g2s_thr_copy_dQaccum = g2s_tiled_copy_dQaccum.get_slice(tidx)

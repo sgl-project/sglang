@@ -31,7 +31,7 @@ def test():
     # Qwen3-32B
     layer_num = 64
     head_num, head_dim = 8, 128
-    kv_lora_rank, qk_rope_head_dim = 0, 0
+    _kv_lora_rank, _qk_rope_head_dim = 0, 0
     store_dtype = torch.bfloat16
     tokens_per_page = 64
 
@@ -130,7 +130,7 @@ def bench():
     # Qwen3-32B
     layer_num = 64
     head_num, head_dim = 8, 128
-    kv_lora_rank, qk_rope_head_dim = 0, 0
+    _kv_lora_rank, _qk_rope_head_dim = 0, 0
     store_dtype = torch.bfloat16
     tokens_per_page = 64
 
@@ -196,7 +196,7 @@ def allclose():
     # Qwen3-32B
     layer_num = 64
     head_num, head_dim = 8, 128
-    kv_lora_rank, qk_rope_head_dim = 0, 0
+    _kv_lora_rank, _qk_rope_head_dim = 0, 0
     store_dtype = torch.bfloat16
     tokens_per_page = 64
 

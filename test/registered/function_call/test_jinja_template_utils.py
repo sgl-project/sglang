@@ -278,7 +278,7 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         audio_data = []
         modalities = []
 
-        result = process_content_for_template_format(
+        process_content_for_template_format(
             msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
 

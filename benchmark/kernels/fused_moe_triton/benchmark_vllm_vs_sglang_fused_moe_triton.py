@@ -175,7 +175,7 @@ def benchmark(batch_size, provider, model_config, use_fp8_w8a8=False):
         else fused_moe_sglang_api
     )
     for _ in range(10):
-        y = api_func(
+        api_func(
             x,
             w1,
             w2,

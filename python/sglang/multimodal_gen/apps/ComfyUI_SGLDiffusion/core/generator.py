@@ -164,7 +164,7 @@ class SGLDiffusionGenerator:
                 for k in diffusers_keys:
                     if k in sd:
                         new_sd[diffusers_keys[k]] = sd.pop(k)
-        offload_device = model_management.unet_offload_device()
+        model_management.unet_offload_device()
         if dtype is None:
             unet_dtype = model_management.unet_dtype(
                 model_params=parameters,

@@ -417,7 +417,7 @@ def gemm_ptx_partial(
         else cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
     )
     offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(cute.size(tCrA.shape[2]))]
-    offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
+    [offset_a[k] - offset_a[k - 1] for k in range(1, cute.size(tCrA.shape[2]))]
     offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(cute.size(tCrB.shape[2]))]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, cute.size(tCrB.shape[2]))]
 
@@ -646,9 +646,9 @@ def gemm_ptx_partial1(
 
     if const_expr(not is_ts):
         # smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator))
-        smem_desc_start_a_lo = const_expr(smem_desc_base_a_lo)
+        const_expr(smem_desc_base_a_lo)
     else:
-        smem_desc_start_a_lo = None
+        pass
     # smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
     smem_desc_start_b_lo = const_expr(smem_desc_base_b_lo)
     pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"

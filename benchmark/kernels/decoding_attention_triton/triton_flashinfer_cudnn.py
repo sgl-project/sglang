@@ -55,7 +55,6 @@ def decode_attention_sglang(
     req_to_token = torch.arange(0, total_tokens).to(0).int().view(batch_size, kv_len)
     b_req_idx = torch.arange(0, batch_size).to(0).int()
     b_seq_len = torch.full((batch_size,), kv_len, dtype=torch.int32, device="cuda")
-    max_len_in_batch = kv_len
     sm_scale = 1.0 / (head_dim**0.5)
 
     attn_logits = torch.empty(

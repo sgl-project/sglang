@@ -38,7 +38,6 @@ def rms_norm_ref(
     upcast=True,
 ):
     dtype = x.dtype
-    N = x.shape[-1]
     weight = weight.float()
     bias = bias.float() if bias is not None else None
     if upcast:

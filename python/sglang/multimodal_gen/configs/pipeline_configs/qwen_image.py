@@ -493,7 +493,6 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image_size = batch.original_condition_image_size
 
         vae_scale_factor = self.get_vae_scale_factor()
 

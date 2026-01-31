@@ -67,7 +67,7 @@ class Lfm2Config(HFLfm2Config):
         hidden_size = self.hidden_size
         # conv_L_cache in config is kernel_size (e.g., 3)
         conv_kernel = int(self.conv_L_cache)
-        L_cache = conv_kernel - 1  # actual cache size (e.g., 2 for kernel=3)
+        conv_kernel - 1  # actual cache size (e.g., 2 for kernel=3)
 
         # get_attention_tp_size() requires initialization, default to 1 if not available
         try:

@@ -122,8 +122,8 @@ def run_sgl_diffusion_webui(server_args: ServerArgs):
     with gr.Blocks() as demo:
         gr.Markdown("# 🚀 SGLang Diffusion Application")
         with gr.Row():
-            launched_model_box = gr.Textbox(label="Model", value=server_args.model_path)
-            task_name_box = gr.Textbox(label="Task name", value=task_name)
+            gr.Textbox(label="Model", value=server_args.model_path)
+            gr.Textbox(label="Task name", value=task_name)
 
         with gr.Row():
             with gr.Column(scale=4):

@@ -657,8 +657,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self._current_timestep = None
         self._interrupt = False
 
-        batch_size = 1
-
         device = get_local_torch_device()
 
         if ar_condition_images is not None:

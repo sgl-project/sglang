@@ -296,7 +296,7 @@ def flash_decode_attention_fwd(
     logit_cap=0.0,
 ):
     BLOCK_SEQ = 256
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    q.shape[1] // v_buffer.shape[1]
     # batch_size = q.shape[0]
 
     block_seq_num = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
@@ -438,7 +438,7 @@ def _sparse_fwd_kernel_flash_decode_stage2(
 
     off_q = cur_batch * stride_qbs + cur_head * stride_qh + offs_d
 
-    block_n_size = (
+    (
         tl.where(
             cur_batch_end_index - cur_batch_start_index <= 0,
             0,
@@ -716,7 +716,7 @@ def flash_decode_sparse_attention_fwd(
     BLOCK_SEQ=256,
 ):
     # TODO(Andy): Tune BLOCK_SEQ & BLOCK_D
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    q.shape[1] // v_buffer.shape[1]
     # batch_size = q.shape[0]
 
     # Step 1: BGEMV approximate attention (page implementation)

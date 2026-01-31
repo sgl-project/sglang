@@ -27,7 +27,6 @@ class QwenImageExecutor(SGLDiffusionExecutor):
     def _pack_latents(self, x):
         """Process hidden states for QwenImage model."""
         bs, c, t, h, w = x.shape
-        patch_size = self.patch_size
         latents = comfy.ldm.common_dit.pad_to_patch_size(
             x, (1, self.patch_size, self.patch_size)
         )

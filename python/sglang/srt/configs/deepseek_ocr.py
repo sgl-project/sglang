@@ -253,7 +253,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
     def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
         """play the role of format_messages_v2 and get_images_info in the last version"""
-        tokenized_data = []
         masked_tokenized_data = []  # labels
         images_list = []
         images_seq_mask = []

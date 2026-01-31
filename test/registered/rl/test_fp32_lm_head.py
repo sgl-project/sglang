@@ -86,7 +86,7 @@ class TestLMHeadFP32(unittest.TestCase):
         with patch("torch.matmul", new=probe_matmul), patch(
             "torch.nn.functional.linear", new=probe_linear
         ):
-            logits = logprocessor._get_logits(hidden_state, head, meta)
+            logprocessor._get_logits(hidden_state, head, meta)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)
         self.assertTrue(state["called"], "no call lm head matlmul/linear")
         self.assertEqual(state["a"], expected_a_dtype)

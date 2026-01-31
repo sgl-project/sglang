@@ -40,8 +40,8 @@ def fn_hack_non_strided(k, k_nope, k_rope):
     k_flatten_view = k.flatten()
     k_flatten_view[: k_nope.numel()] = k_nope.flatten()
 
-    k2 = k_flatten_view[k_nope.numel() :].view(k_rope.numel(), -1)
-    k2 = k_rope.flatten()[:, None]
+    k_flatten_view[k_nope.numel() :].view(k_rope.numel(), -1)
+    k_rope.flatten()[:, None]
 
 
 @torch.compile(dynamic=True)

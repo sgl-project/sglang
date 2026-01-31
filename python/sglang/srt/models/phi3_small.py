@@ -180,23 +180,6 @@ class Phi3SmallSelfAttention(nn.Module):
         self.blocksparse_num_local_blocks = config.blocksparse_num_local_blocks
         self.blocksparse_vert_stride = config.blocksparse_vert_stride
 
-        use_dense_attn = (
-            getattr(self.config, "dense_attention_every_n_layers", None)
-            and (self.layer_id + 1) % self.config.dense_attention_every_n_layers == 0
-        )
-
-        bs_params = None
-        if not use_dense_attn:
-            bs_params = {
-                "max_seqlen": self.max_position_embeddings,
-                "num_heads": self.num_heads_per_partition,
-                "num_kv_heads": self.num_kv_heads_per_partion,
-                "block_size": self.sparse_block_size,
-                "local_blocks": self.local_blocks,
-                "vert_stride": self.vert_stride,
-                "homo_head": self.homo_heads,
-            }
-
         self.attn = RadixAttention(
             self.num_heads_per_partition,
             self.head_dim,

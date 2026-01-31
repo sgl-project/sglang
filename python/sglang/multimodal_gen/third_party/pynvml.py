@@ -2888,7 +2888,7 @@ def _LoadNvmlLibrary():
                                     "System32/nvml.dll",
                                 )
                             )
-                        except OSError as ose:
+                        except OSError:
                             # If nvml.dll is not found in System32, it should be in ProgramFiles
                             # load nvml.dll from %ProgramFiles%/NVIDIA Corporation/NVSMI/nvml.dll
                             nvmlLib = CDLL(
@@ -2900,7 +2900,7 @@ def _LoadNvmlLibrary():
                     else:
                         # assume linux
                         nvmlLib = CDLL("libnvidia-ml.so.1")
-                except OSError as ose:
+                except OSError:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
                 if nvmlLib == None:
                     _nvmlCheckReturn(NVML_ERROR_LIBRARY_NOT_FOUND)
@@ -6291,13 +6291,13 @@ nvmlClockOffset_v1 = 0x1000018
 
 def nvmlDeviceGetClockOffsets(device, info):
     fn = _nvmlGetFunctionPointer("nvmlDeviceGetClockOffsets")
-    ret = fn(device, info)
+    fn(device, info)
     return NVML_SUCCESS
 
 
 def nvmlDeviceSetClockOffsets(device, info):
     fn = _nvmlGetFunctionPointer("nvmlDeviceSetClockOffsets")
-    ret = fn(device, info)
+    fn(device, info)
     return NVML_SUCCESS
 
 
@@ -6901,7 +6901,7 @@ def nvmlDeviceSetPowerManagementLimit_v2(
     c_powerValue.powerScope = c_powerScope
     c_powerValue.powerValueMw = c_uint(powerLimit)
     fn = _nvmlGetFunctionPointer("nvmlDeviceSetPowerManagementLimit_v2")
-    ret = fn(device, byref(c_powerValue))
+    fn(device, byref(c_powerValue))
     return NVML_SUCCESS
 
 

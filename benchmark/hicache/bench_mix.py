@@ -262,10 +262,9 @@ class UserGenerator:
         if len(self.multiturn_queue) == 0:
             self.multiturn_queue.append(user_data)
         else:
-            i = len(self.multiturn_queue)
+            len(self.multiturn_queue)
             for idx, d in enumerate(self.multiturn_queue):
                 if user_data.start < d.start:
-                    i = idx
                     break
             self.multiturn_queue.insert(idx, user_data)
 
@@ -556,7 +555,7 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO)
         logger.info("use log_level info")
-    performance_data = WorkloadGenerator(args).run()
+    WorkloadGenerator(args).run()
 
     # Close debug log file if it was opened
     if debug_log_file:

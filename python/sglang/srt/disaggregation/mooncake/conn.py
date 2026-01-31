@@ -422,7 +422,7 @@ class MooncakeKVManager(CommonKVManager):
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         num_kv_heads = self.kv_args.kv_head_num
-        num_layers = len(self.kv_args.kv_data_ptrs)
+        len(self.kv_args.kv_data_ptrs)
         page_size = self.kv_args.page_size
 
         # Calculate head distribution

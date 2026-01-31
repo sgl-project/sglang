@@ -368,11 +368,11 @@ def rpd_to_chrome_trace(
             if row[0] == "0":  # Frame start
                 if key not in stacks:
                     stacks[key] = []
-                stack = stacks[key].append((row[1], row[4]))
+                stacks[key].append((row[1], row[4]))
                 # print(f"0: new api frame: pid_tid={key} -> stack={stacks}")
 
             elif row[0] == "1":  # Frame end
-                completed = stacks[key].pop()
+                stacks[key].pop()
                 # print(f"1: end api frame: pid_tid={key} -> stack={stacks}")
 
             elif row[0] == "2":  # API + Op

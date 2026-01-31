@@ -269,21 +269,21 @@ class LTX2AVDenoisingStage(DenoisingStage):
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
-        extra_step_kwargs = prepared_vars["extra_step_kwargs"]
+        prepared_vars["extra_step_kwargs"]
         target_dtype = prepared_vars["target_dtype"]
         autocast_enabled = prepared_vars["autocast_enabled"]
         timesteps = prepared_vars["timesteps"]
         num_inference_steps = prepared_vars["num_inference_steps"]
         num_warmup_steps = prepared_vars["num_warmup_steps"]
-        image_kwargs = prepared_vars["image_kwargs"]
-        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        neg_cond_kwargs = prepared_vars["neg_cond_kwargs"]
+        prepared_vars["image_kwargs"]
+        prepared_vars["pos_cond_kwargs"]
+        prepared_vars["neg_cond_kwargs"]
         latents = prepared_vars["latents"]
         boundary_timestep = prepared_vars["boundary_timestep"]
         z = prepared_vars["z"]
         reserved_frames_mask = prepared_vars["reserved_frames_mask"]
-        seq_len = prepared_vars["seq_len"]
-        guidance = prepared_vars["guidance"]
+        prepared_vars["seq_len"]
+        prepared_vars["guidance"]
 
         audio_latents = batch.audio_latents
         audio_scheduler = copy.deepcopy(self.scheduler)

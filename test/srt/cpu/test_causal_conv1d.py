@@ -81,7 +81,7 @@ def causal_conv1d_update_ref(
 
     x = x.unsqueeze(-1)
     batch, dim, seqlen = x.shape
-    width = weight.shape[1]
+    weight.shape[1]
     state_len = conv_state.shape[-1]
 
     x_new = torch.cat([conv_state, x], dim=-1)

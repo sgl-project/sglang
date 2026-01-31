@@ -251,7 +251,7 @@ class TestSpecUtils(unittest.TestCase):
         extend_lens = torch.tensor([extend_lens_num], dtype=torch.int32, device=device)
         num_new_pages_per_topk = torch.tensor([2], dtype=torch.int32, device=device)
         out_cache_loc = torch.arange(11, 11 + extend_lens_num, device=device)
-        last_page_lens = torch.tensor([3], dtype=torch.int32, device=device)
+        torch.tensor([3], dtype=torch.int32, device=device)
         duplicate_cache_len = 0
         target_cache_loc = None
         source_cache_loc = None

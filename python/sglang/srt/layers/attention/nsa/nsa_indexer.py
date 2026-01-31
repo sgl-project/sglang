@@ -830,8 +830,6 @@ class Indexer(MultiPlatformOp):
         weights = weights.squeeze(-1)
 
         # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
-        k_fp8_list = []
-        k_scale_list = []
 
         topk_indices_list = []
 
@@ -1142,7 +1140,7 @@ class Indexer(MultiPlatformOp):
                 q = self.wq_b(q_lora)[
                     0
                 ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                wq_b_event = self.alt_stream.record_event()
+                self.alt_stream.record_event()
                 q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
                 q_pe, q_nope = torch.split(
                     q,

@@ -928,7 +928,6 @@ class Step3VLForConditionalGeneration(nn.Module):
                         continue
 
                     part_name = weight_name.split(".")[-2]
-                    fake_weight_name = name.replace(part_name, weight_name[:-1])
                     actual_param_name = name.replace(part_name + ".", param_name)
                     param = params_dict[actual_param_name]
                     weight_loader = param.weight_loader
@@ -977,7 +976,6 @@ class Step3VLForConditionalGeneration(nn.Module):
                         if not match_expert_and_shard_ids(name, weight_name):
                             continue
                         part_name = weight_name.split(".")[-2]
-                        fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
                         param = params_dict[actual_param_name]
                         weight_loader = param.weight_loader

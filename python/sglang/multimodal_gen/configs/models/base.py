@@ -73,7 +73,7 @@ class ModelConfig:
         Update arch_config with source_model_dict
         """
         arch_config = self.arch_config
-        valid_fields = {f.name for f in fields(arch_config)}
+        {f.name for f in fields(arch_config)}
 
         for key, value in source_model_dict.items():
             setattr(arch_config, key, value)

@@ -229,7 +229,7 @@ class XIELU(MultiPlatformOp):
                 )
                 self._xielu_cuda_fn = self._xielu_cuda
             logger.warning_once(msg)
-        except Exception as err:
+        except Exception:
             pass
             # logger.warning_once(
             #     "CUDA-fused xIELU not available (%s) –"

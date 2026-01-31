@@ -93,7 +93,7 @@ def tree_search(question, num_branches, call_generate):
     for plan in plan_forks:
         sol_forks = execute_plan(plan, num_branches, call_generate)
         for sol in sol_forks:
-            score_forks = reflect_solution(sol, num_branches, call_generate)
+            reflect_solution(sol, num_branches, call_generate)
         solutions.append(sol_forks)
 
     return solutions

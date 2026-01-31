@@ -278,7 +278,7 @@ class Hf3fsMetadataServer:
         """Delete keys from metadata."""
         data = await self._read_json(request)
         metadata = self.get_rank_metadata(rank)
-        count = metadata.delete_keys(data["keys"])
+        metadata.delete_keys(data["keys"])
         return Response(status_code=204)
 
     async def clear(self, rank: int):

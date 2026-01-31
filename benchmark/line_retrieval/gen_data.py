@@ -19,7 +19,7 @@ def generate_lines(random_words, num_lines, redirect_ratio):
 
     # Raw lines
     visited_indices = set([None])
-    visited_values = set([None])
+    set([None])
 
     lines = []
     redirects = []

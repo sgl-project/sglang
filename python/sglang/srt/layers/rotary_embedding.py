@@ -1497,7 +1497,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ), "save kv cache is not supported for MRotaryEmbedding."
         assert positions.ndim == 1 or positions.ndim == 2
 
-        num_tokens = positions.shape[-1]
+        positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:

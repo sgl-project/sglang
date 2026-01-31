@@ -175,7 +175,7 @@ def _convert_qwen_image_standard(
 
         out[new_name] = tensor
 
-    sample = _sample_keys(out.keys(), 20)
+    _sample_keys(out.keys(), 20)
     return out
 
 
