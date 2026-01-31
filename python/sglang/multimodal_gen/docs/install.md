@@ -2,7 +2,9 @@
 
 You can install sglang-diffusion using one of the methods below.
 
-This page primarily applies to common NVIDIA GPU platforms. For AMD Instinct/ROCm environments see the dedicated [ROCm quickstart](install_rocm.md), which lists the exact steps (including kernel builds) we used to validate sgl-diffusion on MI300X.
+This page primarily applies to common NVIDIA GPU platforms.
+* For AMD Instinct/ROCm environments see the dedicated [ROCm quickstart](install_rocm.md), which lists the exact steps (including kernel builds) we used to validate sgl-diffusion on MI300X.
+* For Moore Threads GPU (MTGPU) with the MUSA software stack, see the [MUSA quickstart](install_musa.md), which lists the exact steps we used to validate sgl-diffusion on MTT S5000.
 
 ## Method 1: With pip or uv
 
