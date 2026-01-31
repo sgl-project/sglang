@@ -279,4 +279,4 @@ sgl-kernel/third_party/*/include_musa/
 sgl-kernel/third_party/
 
 # MUSA core dump files
-core_*
+*.mudmp
