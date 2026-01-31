@@ -63,7 +63,7 @@ BS_LIST = [2**n for n in range(0, 14)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
 N_K_LIST = [2, 4]
 N_Q_LIST = [8, 16]
-HEAD_DIM_LIST = [64, 128, 256]
+HEAD_DIM_LIST = [64, 128, 256, 512, 1024]
 DEVICE = "cuda"
 DTYPE = torch.bfloat16
 
