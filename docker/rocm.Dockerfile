@@ -168,9 +168,9 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
 # Build SGLang
 ARG BUILD_TYPE=all
 
-# Set version for setuptools_scm if provided (for nightly builds)
+# Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
+# pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 
 RUN pip install IPython \
     && pip install orjson \
@@ -195,9 +195,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip]"; \
        fi
 
 RUN python -m pip cache purge
