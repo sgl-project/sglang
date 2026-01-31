@@ -12,12 +12,14 @@ class DllmConfig:
         block_size: int,
         mask_id: int,
         max_running_requests: int,
+        first_done_first_out_mode: bool,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
         self.block_size = block_size
         self.mask_id = mask_id
         self.max_running_requests = max_running_requests
+        self.first_done_first_out_mode = first_done_first_out_mode
 
     @staticmethod
     def from_server_args(
@@ -61,10 +63,18 @@ class DllmConfig:
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
 
+        # Lazy import to avoid circular dependency
+        from sglang.srt.dllm.algorithm import get_algorithm_fdfo_requirement
+
+        first_done_first_out_mode = get_algorithm_fdfo_requirement(
+            server_args.dllm_algorithm
+        )
+
         return DllmConfig(
             algorithm=server_args.dllm_algorithm,
             algorithm_config=algorithm_config,
             block_size=block_size,
             mask_id=mask_id,
             max_running_requests=max_running_requests,
+            first_done_first_out_mode=first_done_first_out_mode,
         )
