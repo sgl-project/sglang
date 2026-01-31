@@ -1507,13 +1507,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pattern = getattr(config, "mtp_hybrid_override_pattern", None)
             if pattern is not None and "M" not in pattern:
                 return None
-        if isinstance(
-            config,
-            FalconH1Config | NemotronHConfig | Lfm2Config | GraniteMoeHybridConfig,
-        ):
+        if isinstance(config, FalconH1Config | NemotronHConfig | Lfm2Config):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
+
+        if isinstance(config, GraniteMoeHybridConfig):
+            has_mamba = any(
+                layer_type == "mamba"
+                for layer_type in getattr(config, "layer_types", [])
+            )
+            if not has_mamba:
+                return None
+            else:
+                return config
+
         return None
 
     @property
