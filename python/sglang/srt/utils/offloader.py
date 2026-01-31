@@ -452,6 +452,9 @@ def _move_param_to_meta(module, param_name):
             data=new_data,
             requires_grad=False,
         )
+        empty_weight_loader = lambda *args, **kwargs: None
+        weight_loader = getattr(old_param, "weight_loader", empty_weight_loader)
+        setattr(new_param, "weight_loader", weight_loader)
     else:
         raise ValueError(f"Unknown {old_param_type=} {old_param=}")
 

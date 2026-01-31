@@ -2313,6 +2313,7 @@ class SafeUnpickler(pickle.Unpickler):
         "multiprocessing.resource_sharer.",
         "multiprocessing.reduction.",
         "pickletools.",
+        "torch_npu.multiprocessing.reductions.",
         # --- PEFT / LoRA ---
         "peft.",
         "transformers.",
