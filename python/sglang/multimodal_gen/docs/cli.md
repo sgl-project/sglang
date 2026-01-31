@@ -233,6 +233,7 @@ SGLang diffusion supports a **diffusers backend** that allows you to run any dif
 | `--vae-slicing` | flag | Enable VAE slicing for lower memory usage (decodes slice-by-slice). |
 | `--dit-precision` | `fp16`, `bf16`, `fp32` | Precision for the diffusion transformer. |
 | `--vae-precision` | `fp16`, `bf16`, `fp32` | Precision for the VAE. |
+| `--model-offload` | flag | Enable model CPU offloading for diffusers pipelines to reduce GPU memory usage. |
 
 ### Example: Running Ovis-Image-7B
 
