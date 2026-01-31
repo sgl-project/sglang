@@ -444,6 +444,8 @@ class TpModelWorker(BaseTpWorker):
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
+        forward_batch.debug_event = model_worker_batch.debug_event
+
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
@@ -459,6 +461,8 @@ class TpModelWorker(BaseTpWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
+            if hasattr(forward_batch, "debug_tensor"):
+                batch_result.debug_tensor = forward_batch.debug_tensor
 
             if is_verify:
                 # Skip sampling and return logits for target forward

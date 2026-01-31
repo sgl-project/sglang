@@ -859,6 +859,25 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+
+        if hasattr(forward_batch, "debug_event"):
+            # self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+            # self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+            # self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+            # self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
+            # self.positions[:raw_num_token].copy_(forward_batch.positions)
+            debug_tensor = {}
+            debug_tensor["input_ids"] = forward_batch.input_ids.clone()
+            # debug_tensor["seq_lens"] = forward_batch.seq_lens.clone()
+            # debug_tensor["out_cache_loc"] = forward_batch.out_cache_loc.clone()
+            # debug_tensor["positions"] = forward_batch.positions.clone()
+            # debug_tensor["req_pool_indices"] = forward_batch.req_pool_indices.clone()
+            logger.debug(
+                f"[DEBUG] Recording debug event {id(forward_batch.debug_event)} after forward metadata init"
+            )
+            forward_batch.debug_event.record()
+            forward_batch.debug_tensor = debug_tensor
+
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 

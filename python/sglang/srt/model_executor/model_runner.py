@@ -1994,6 +1994,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch,
                 **kwargs,
             )
+
             return logits_output_or_pp_proxy_tensors
 
         torch.get_device_module(self.device).synchronize()
@@ -2172,6 +2173,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
         return self.model.forward(
             forward_batch.input_ids,
             forward_batch.positions,
@@ -2377,6 +2379,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:

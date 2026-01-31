@@ -1670,6 +1670,8 @@ def run_and_check_memory_leak(
         str(chunked_prefill_size),
         "--log-level",
         "debug",
+        "--disable-cuda-graph-padding",
+        # "--disable-cuda-graph",
     ]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]

@@ -960,9 +960,9 @@ class Scheduler(
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
-        self.default_stream: CudaStream = self.device_module.current_stream()
+        self.schedule_stream: CudaStream = self.device_module.current_stream()
         if self.device == "cpu":
-            self.default_stream.synchronize = lambda: None  # No-op for CPU
+            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
@@ -2265,8 +2265,12 @@ class Scheduler(
                 future_indices = self.future_map.alloc_future_indices(bs)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.default_stream)
+                    self.forward_stream.wait_stream(self.schedule_stream)
+
+                    debug_event = self.device_module.Event()
+                    logger.debug(f"creating new debug event {id(debug_event)}")
                     self.future_map.resolve_future(model_worker_batch)
+                    model_worker_batch.debug_event = debug_event
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
@@ -2274,6 +2278,7 @@ class Scheduler(
                         )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
+                    batch_result.debug_event = debug_event
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
@@ -2341,7 +2346,7 @@ class Scheduler(
             if self.enable_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.default_stream)
+                    self.forward_stream.wait_stream(self.schedule_stream)
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
                     )
@@ -2381,7 +2386,7 @@ class Scheduler(
             return
 
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.default_stream)
+            self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
@@ -2967,6 +2972,35 @@ class SenderWrapper:
         self.socket.send_pyobj(output)
 
 
+def dispatch_event_loop(scheduler: Scheduler):
+    # Dispatch to the appropriate event loop based on the disaggregation mode
+    server_args = scheduler.server_args
+    disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    if disaggregation_mode == DisaggregationMode.NULL:
+        if scheduler.enable_pdmux:
+            scheduler.event_loop_pdmux()
+        elif server_args.pp_size > 1:
+            scheduler.event_loop_pp()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap()
+        else:
+            scheduler.event_loop_normal()
+    elif disaggregation_mode == DisaggregationMode.PREFILL:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp_disagg_prefill()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_prefill()
+        else:
+            scheduler.event_loop_normal_disagg_prefill()
+    elif disaggregation_mode == DisaggregationMode.DECODE:
+        if server_args.pp_size > 1:
+            scheduler.event_loop_pp_disagg_decode()
+        elif scheduler.enable_overlap:
+            scheduler.event_loop_overlap_disagg_decode()
+        else:
+            scheduler.event_loop_normal_disagg_decode()
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -3052,32 +3086,10 @@ def run_scheduler_process(
 
         pipe_writer.send(result_dict)
 
-        # Dispatch to the appropriate event loop based on the disaggregation mode
-        disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
-        if disaggregation_mode == DisaggregationMode.NULL:
-            if scheduler.enable_pdmux:
-                scheduler.event_loop_pdmux()
-            elif server_args.pp_size > 1:
-                scheduler.event_loop_pp()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap()
-            else:
-                scheduler.event_loop_normal()
-        elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if server_args.pp_size > 1:
-                scheduler.event_loop_pp_disagg_prefill()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_prefill()
-            else:
-                scheduler.event_loop_normal_disagg_prefill()
-
-        elif disaggregation_mode == DisaggregationMode.DECODE:
-            if server_args.pp_size > 1:
-                scheduler.event_loop_pp_disagg_decode()
-            elif scheduler.enable_overlap:
-                scheduler.event_loop_overlap_disagg_decode()
-            else:
-                scheduler.event_loop_normal_disagg_decode()
+        schedule_stream: CudaStream = scheduler.device_module.Stream(priority=0)
+        schedule_stream_ctx = CudaStreamContext(schedule_stream)
+        with schedule_stream_ctx:
+            dispatch_event_loop(scheduler)
 
     except Exception:
         traceback = get_exception_traceback()
