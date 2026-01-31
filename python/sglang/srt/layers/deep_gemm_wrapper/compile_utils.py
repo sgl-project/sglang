@@ -66,6 +66,7 @@ class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
+    GEMM_NN_BF16 = auto()
 
 
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
@@ -186,6 +187,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GEMM_NN_BF16: _Bf16GemmNnWarmupExecutor,
         }[kernel_type](**kwargs)
 
     @staticmethod
@@ -196,6 +198,8 @@ class _BaseWarmupExecutor:
         _GB = 1 << 30
         if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
             return (max_m * k + n * k + max_m * n * 2) / _GB
+        elif kernel_type == DeepGemmKernelType.GEMM_NN_BF16:
+            return (2 * (max_m * k + n * k + max_m * n)) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
@@ -285,6 +289,16 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
+
+
+class _Bf16GemmNnWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.b = torch.empty((k, n), device="cuda", dtype=torch.bfloat16)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.bf16_gemm_nn(self.a[:m], self.b, self.out[:m])
 
 
 @contextmanager

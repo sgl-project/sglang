@@ -102,6 +102,21 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nn_bf16(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+    c: Optional[torch.Tensor] = None,
+):
+    m, k = lhs.shape
+    _, n = rhs.shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NN_BF16
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.bf16_gemm_nn(lhs, rhs, out, c)
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
