@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch_npu
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_fia_nz,
@@ -12,15 +13,47 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
-from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.layers.communicator import (
+    ScatterMode,
+    enable_moe_dense_fully_dp,
+    get_attn_tp_context,
+)
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
-_use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
+
+
+# DSA-only override: allow input_scattered when attn_tp_input_scattered is enabled
+def _use_input_scattered_dsa(
+    m: "DeepseekV2AttentionMLA", forward_batch: "ForwardBatch"
+) -> bool:
+    if get_attn_tp_context().input_scattered:
+        return True
+    if not get_global_server_args().enable_attn_tp_input_scattered:
+        return False
+    if m.q_lora_rank is None:
+        return False
+    return (
+        forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and not forward_batch.forward_mode.is_draft_extend()
+        and forward_batch.input_ids is not None
+        and not forward_batch.can_run_tbo
+        and get_tensor_model_parallel_world_size() > 1
+        and not is_dp_attention_enabled()
+        and get_moe_a2a_backend().is_none()
+        and not enable_moe_dense_fully_dp()
+        and not get_global_server_args().enable_piecewise_cuda_graph
+        and get_global_server_args().speculative_algorithm != "EAGLE3"
+    )
 
 
 # region MHA
@@ -344,7 +377,11 @@ def forward_dsa_prepare_npu(
             q_lora = m.q_a_layernorm(q)
 
     else:
-        fused_qkv_a_proj_out = get_attn_tp_context().fetch_qkv_latent()
+        use_input_scattered = _use_input_scattered_dsa(m, forward_batch)
+        if use_input_scattered:
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        else:
+            fused_qkv_a_proj_out = get_attn_tp_context().fetch_qkv_latent()
         q, latent_cache = fused_qkv_a_proj_out.split(
             [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
         )
@@ -352,7 +389,7 @@ def forward_dsa_prepare_npu(
         # overlap qk norm
         q = m.q_a_layernorm(q)
         if (
-            _use_ag_after_qlora
+            use_input_scattered
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
