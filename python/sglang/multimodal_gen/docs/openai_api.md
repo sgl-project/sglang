@@ -396,13 +396,13 @@ The server supports adjusting output quality and compression levels for both ima
 
 #### Parameters
 
-- **`output_quality`** (string, optional): Preset quality level that automatically sets compression. Valid values:
+- **`output_quality`** (string, optional): Preset quality level that automatically sets compression. **Default is `None`**. Valid values:
   - `"maximum"`: Highest quality (100%)
   - `"high"`: High quality (90%)
   - `"medium"`: Medium quality (55%)
   - `"low"`: Lower quality (35%) - smaller file size
 
-- **`output_compression`** (integer, optional): Direct compression level override (0-100). Takes precedence over `output_quality` when provided.
+- **`output_compression`** (integer, optional): Direct compression level override (0-100). **Default is `None`**. When both `output_quality` and `output_compression` are `None`, automatically uses **50 for video** and **75 for image**. Takes precedence over `output_quality` when provided.
   - `0`: Lowest quality, smallest file size
   - `100`: Highest quality, largest file size
 
