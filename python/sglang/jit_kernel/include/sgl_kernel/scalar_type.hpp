@@ -2,6 +2,9 @@
 
 #include <cassert>
 #include <stdexcept>
+#ifndef __CUDACC__
+#include <variant>
+#endif
 
 namespace host {
 
@@ -168,6 +171,7 @@ class ScalarType {
     return bias != 0;
   }
 
+#ifndef __CUDACC__
  private:
   double _floating_point_max() const {
     assert(mantissa <= 52 && exponent <= 11);
@@ -245,7 +249,9 @@ class ScalarType {
   constexpr std::variant<int64_t, double> min() const {
     return std::visit([this](auto x) -> std::variant<int64_t, double> { return {x - bias}; }, _raw_min());
   }
+#endif  // __CUDACC__
 
+ public:
   std::string str() const {
     /* naming generally follows: https://github.com/jax-ml/ml_dtypes
      * for floating point types (leading f) the scheme is:
