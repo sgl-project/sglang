@@ -233,9 +233,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
-    # Which decode worker to route to
-    decode_dp_rank: Optional[int] = None
-
     # Which prefill DP rank holds KV cache
     prefill_dp_rank: Optional[int] = None
 
@@ -746,9 +743,6 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
-
-    # Which decode worker to route to
-    decode_dp_rank: Optional[int] = None
 
     # Which prefill DP rank holds KV cache
     prefill_dp_rank: Optional[int] = None

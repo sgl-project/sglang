@@ -476,29 +476,9 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
-        if self.server_args.disaggregation_mode == "prefill":
-            target_rank = req.prefill_dp_rank
-            source_field = "prefill_dp_rank"
-        else:  # "decode" or "null"
-            target_rank = req.decode_dp_rank
-            source_field = "decode_dp_rank"
-
-        if target_rank is None:
-            target_rank = req.data_parallel_rank
-            source_field = "data_parallel_rank"
-
-        if target_rank is not None:
-            # Validate rank is in bounds
-            if target_rank < 0 or target_rank >= len(self.workers):
-                logger.error(
-                    f"Invalid {source_field}={target_rank}, must be in [0, {len(self.workers)})"
-                )
-                return False
-
-            logger.debug(f"Direct routing to DP rank {target_rank}")
-            self.workers[target_rank].send_pyobj(req)
-            return True
-        return False
+        if req.data_parallel_rank is not None:
+            logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
+            self.workers[req.data_parallel_rank].send_pyobj(req)
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

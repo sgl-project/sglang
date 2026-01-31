@@ -1,5 +1,5 @@
 """
-Test explicit decode_dp_rank and prefill_dp_rank routing in disaggregated mode.
+Test explicit prefill_dp_rank for heterogeneous prefill/decode DP configurations.
 """
 
 import unittest
@@ -18,14 +18,14 @@ from sglang.test.test_utils import (
 
 class TestExternalDPRanks(PDDisaggregationServerBase):
     """
-    Test explicit DP rank routing with heterogeneous prefill/decode DP sizes.
+    Test explicit prefill_dp_rank for heterogeneous prefill/decode DP sizes.
 
     Setup:
     - Prefill: 2 DP ranks
     - Decode: 4 DP ranks
 
-    This tests the core functionality: independent control of decode and prefill
-    DP ranks for heterogeneous configurations.
+    This tests that data_parallel_rank routes to decode workers and
+    prefill_dp_rank specifies which prefill worker has the KV cache.
     """
 
     PREFILL_DP_SIZE = 2
@@ -90,15 +90,15 @@ class TestExternalDPRanks(PDDisaggregationServerBase):
         """
         Test heterogeneous DP configuration: 2 prefill workers, 4 decode workers.
 
-        Tests that decode_dp_rank and prefill_dp_rank can be specified independently
-        to route requests across workers with different DP sizes.
+        Tests that data_parallel_rank routes to decode workers and prefill_dp_rank
+        specifies which prefill worker holds the KV cache.
         """
         test_cases = [
             # (decode_rank, prefill_rank, description)
             (0, 0, "Decode#0 <- Prefill#0"),
             (1, 1, "Decode#1 <- Prefill#1"),
-            (2, 0, "Decode#2 <- Prefill#0"),  # Wrap to prefill worker 0
-            (3, 1, "Decode#3 <- Prefill#1"),  # Wrap to prefill worker 1
+            (2, 0, "Decode#2 <- Prefill#0"),  # 4 decode workers, 2 prefill workers
+            (3, 1, "Decode#3 <- Prefill#1"),  # 4 decode workers, 2 prefill workers
         ]
 
         for decode_rank, prefill_rank, desc in test_cases:
@@ -108,8 +108,8 @@ class TestExternalDPRanks(PDDisaggregationServerBase):
                     json={
                         "text": f"Test: {desc}",
                         "sampling_params": {"max_new_tokens": 10, "temperature": 0},
-                        "decode_dp_rank": decode_rank,
-                        "prefill_dp_rank": prefill_rank,
+                        "data_parallel_rank": decode_rank,  # Routes to decode worker
+                        "prefill_dp_rank": prefill_rank,    # KV source from prefill worker
                     },
                 )
                 self.assertEqual(response.status_code, 200, f"Failed for {desc}")
@@ -117,29 +117,34 @@ class TestExternalDPRanks(PDDisaggregationServerBase):
                 self.assertIn("text", result)
 
     def test_backward_compatibility(self):
-        """Test that old data_parallel_rank field still works."""
+        """Test that data_parallel_rank works for routing (backwards compatible)."""
         response = requests.post(
             self.lb_url + "/generate",
             json={
                 "text": "Backward compatibility test",
                 "sampling_params": {"max_new_tokens": 10, "temperature": 0},
-                "data_parallel_rank": 1,  # Old field should still work
+                "data_parallel_rank": 1,  # Routes to decode worker #1
             },
         )
         self.assertEqual(response.status_code, 200)
         result = response.json()
         self.assertIn("text", result)
 
-    def test_new_fields_override_old(self):
-        """Test that new fields take precedence over data_parallel_rank."""
+    def test_prefill_dp_rank_only(self):
+        """
+        Test that prefill_dp_rank can be specified alone.
+
+        When only prefill_dp_rank is provided, the router uses its default
+        load balancing for decode worker selection, but the decode worker
+        will fetch KV from the specified prefill worker.
+        """
         response = requests.post(
             self.lb_url + "/generate",
             json={
-                "text": "Priority test",
+                "text": "Prefill rank only test",
                 "sampling_params": {"max_new_tokens": 10, "temperature": 0},
-                "data_parallel_rank": 0,  # Should be ignored
-                "decode_dp_rank": 2,  # Should be used
-                "prefill_dp_rank": 1,  # Should be used
+                "prefill_dp_rank": 1,  # Fetch KV from prefill worker #1
+                # No data_parallel_rank - router chooses decode worker
             },
         )
         self.assertEqual(response.status_code, 200)

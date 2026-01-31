@@ -517,7 +517,6 @@ class Req:
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         data_parallel_rank: Optional[int] = None,
-        decode_dp_rank: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
@@ -761,7 +760,6 @@ class Req:
         self.data_parallel_rank: Optional[int] = data_parallel_rank
 
         # Explicit DP rank control
-        self.decode_dp_rank: Optional[int] = decode_dp_rank
         self.prefill_dp_rank: Optional[int] = prefill_dp_rank
 
         # the start index of the sent kv cache
