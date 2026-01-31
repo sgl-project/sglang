@@ -8,6 +8,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
+import grpc
 import torch
 import zmq
 import zmq.asyncio
@@ -15,6 +16,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
@@ -27,6 +29,81 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
+
+def _is_grpc_url(url: str) -> bool:
+    return url.startswith("grpc://") or url.startswith("grpcs://")
+
+
+def _grpc_target(url: str) -> str:
+    if url.startswith("grpc://"):
+        return url[len("grpc://") :]
+    if url.startswith("grpcs://"):
+        return url[len("grpcs://") :]
+    return url
+
+
+def _normalize_embedding_ports(embedding_port):
+    if embedding_port is None:
+        return []
+    if isinstance(embedding_port, list):
+        return embedding_port
+    return [embedding_port]
+
+
+def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
+    channel = grpc.insecure_channel(target)
+    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    try:
+        stub.SchedulerReceiveUrl(
+            sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+                req_id=req_id,
+                receive_url=receive_url,
+                receive_count=receive_count,
+            ),
+            timeout=60,
+        )
+    finally:
+        channel.close()
+
+
+def _grpc_encode_request(target, encode_request):
+    channel = grpc.insecure_channel(target)
+    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    try:
+        response = stub.Encode(
+            sglang_encoder_pb2.EncodeRequest(
+                mm_items=encode_request["mm_items"],
+                req_id=encode_request["req_id"],
+                num_parts=encode_request["num_parts"],
+                part_idx=encode_request["part_idx"],
+                prefill_host=encode_request["prefill_host"],
+                embedding_port=_normalize_embedding_ports(
+                    encode_request["embedding_port"]
+                ),
+            ),
+            timeout=1800,
+        )
+        return response
+    finally:
+        channel.close()
+
+
+def _grpc_send_request(target, request_json):
+    channel = grpc.insecure_channel(target)
+    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    try:
+        stub.Send(
+            sglang_encoder_pb2.SendRequest(
+                req_id=request_json["req_id"],
+                prefill_host=request_json["prefill_host"],
+                embedding_port=request_json["embedding_port"],
+                session_id=request_json["session_id"],
+                buffer_address=request_json["buffer_address"],
+            ),
+            timeout=1800,
+        )
+    finally:
+        channel.close()
 
 class EmbeddingData:
     def __init__(
@@ -156,16 +233,25 @@ class WaitingImageRequest:
                     if assigned_num == 0:
                         continue
                     encoder_url = self.encoder_urls[idx]
-                    target_url = f"{encoder_url}/scheduler_receive_url"
                     payload = {
                         "req_id": req_id,
                         "receive_count": receive_count,
                         "receive_url": f"{host_name}:{embedding_port}",
                     }
 
-                    logger.info(f"Preparing to send  to {target_url}")
-
-                    task = _send_single_request(session, target_url, payload)
+                    if _is_grpc_url(encoder_url):
+                        task = asyncio.to_thread(
+                            _grpc_scheduler_receive_url,
+                            _grpc_target(encoder_url),
+                            req_id,
+                            payload["receive_url"],
+                            receive_count,
+                        )
+                        target_url = f"{encoder_url}/SchedulerReceiveUrl"
+                    else:
+                        target_url = f"{encoder_url}/scheduler_receive_url"
+                        task = _send_single_request(session, target_url, payload)
+                    logger.info(f"Preparing to send to {target_url}")
                     tasks.append(task)
 
                 if not tasks:
@@ -463,75 +549,127 @@ class MMReceiver:
             cum_idx += 1
             cum_num_items += assigned_num
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(
-                total=1800
-            )  # Add timeout for request reliability
-        ) as session:
-            # Send encode requests
+        http_requests = []
+        grpc_requests = []
+        for encode_request in encode_requests:
+            encoder_url = self.encode_urls[encode_request["encoder_idx"]]
+            if _is_grpc_url(encoder_url):
+                grpc_requests.append((encode_request, _grpc_target(encoder_url)))
+            else:
+                http_requests.append((encode_request, encoder_url))
 
-            tasks = [
-                session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
-                    json=encode_request,
+        response_json_list_unsort = []
+        if http_requests:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=1800
+                )  # Add timeout for request reliability
+            ) as session:
+                tasks = [
+                    session.post(
+                        f"{encoder_url}/{endpoint_encode}",
+                        json=encode_request,
+                    )
+                    for encode_request, encoder_url in http_requests
+                ]
+                responses = await asyncio.gather(*tasks)
+                for response in responses:
+                    if response.status != 200:
+                        try:
+                            err_data = await response.json()
+                            msg = err_data.get("message", "Unknown encoder error")
+                        except Exception:
+                            msg = await response.text()
+                        logger.error(
+                            f"Encoder returned error {response.status}: {msg}"
+                        )
+                        return
+                response_json_list_unsort.extend(
+                    [await response.json() for response in responses]
                 )
-                for encode_request in encode_requests
+
+        if grpc_requests:
+            grpc_tasks = [
+                asyncio.to_thread(
+                    _grpc_encode_request,
+                    target,
+                    encode_request,
+                )
+                for encode_request, target in grpc_requests
             ]
+            grpc_responses = await asyncio.gather(*grpc_tasks)
+            for (encode_request, _), response in zip(grpc_requests, grpc_responses):
+                if self.encoder_transfer_backend == "zmq_to_scheduler":
+                    response_json_list_unsort.append(None)
+                    continue
+                response_json_list_unsort.append(
+                    {
+                        "req_id": encode_request["req_id"],
+                        "prefill_host": encode_request["prefill_host"],
+                        "embedding_port": encode_request["embedding_port"],
+                        "encoder_idx": encode_request["encoder_idx"],
+                        "part_idx": encode_request["part_idx"],
+                        "embedding_size": response.embedding_size,
+                        "embedding_len": response.embedding_len,
+                        "embedding_dim": response.embedding_dim,
+                    }
+                )
 
-            responses = await asyncio.gather(*tasks)
-            for response in responses:
-                if response.status != 200:
-                    try:
-                        err_data = await response.json()
-                        msg = err_data.get("message", "Unknown encoder error")
-                    except:
-                        msg = await response.text()
+        # zmq backend: return is None
+        if None in response_json_list_unsort:
+            return
 
-                    logger.error(f"Encoder returned error {response.status}: {msg}")
-                    return
-            response_json_list_unsort = [
-                await response.json() for response in responses
-            ]
+        # mooncake backend: send bootstrap info
 
-            # zmq backend: return is None
-            if None in response_json_list_unsort:
-                return
+        embedding_size_list_sort = [None for _ in range(num_parts)]
+        embedding_length_tot = 0
+        response_json_list_sort = [None for _ in range(num_parts)]
+        for response_json in response_json_list_unsort:
+            idx = response_json["part_idx"]
+            embedding_size_list_sort[idx] = response_json["embedding_size"]
+            embedding_length_tot += response_json["embedding_len"]
+            response_json_list_sort[idx] = response_json
 
-            # mooncake backend: send bootstrap info
-
-            embedding_size_list_sort = [None for _ in range(num_parts)]
-            embedding_length_tot = 0
-            response_json_list_sort = [None for _ in range(num_parts)]
-            for response_json in response_json_list_unsort:
-                idx = response_json["part_idx"]
-                embedding_size_list_sort[idx] = response_json["embedding_size"]
-                embedding_length_tot += response_json["embedding_len"]
-                response_json_list_sort[idx] = response_json
-
-            offset = 0
-            metadata_tasks = []
-            buffer_address = await self.allocate_embedding_buffer(
-                req_id,
-                embedding_length_tot,
-                response_json_list_sort[0]["embedding_dim"],
-            )
-            for idx in range(len(tasks)):
-                response_json = response_json_list_sort[idx]
-                buffer_address_adjust = offset + buffer_address
+        offset = 0
+        buffer_address = await self.allocate_embedding_buffer(
+            req_id,
+            embedding_length_tot,
+            response_json_list_sort[0]["embedding_dim"],
+        )
+        http_metadata_tasks = []
+        grpc_metadata_tasks = []
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=1800)
+        ) as session:
+            for response_json in response_json_list_sort:
                 response_json.update(
                     {
                         "session_id": self.embeddings_engine.session_id,
-                        "buffer_address": buffer_address_adjust,
+                        "buffer_address": offset + buffer_address,
                     }
                 )
-                metadata_tasks.append(
-                    session.post(
-                        f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
-                        json=response_json,
+                encoder_url = self.encode_urls[response_json["encoder_idx"]]
+                if _is_grpc_url(encoder_url):
+                    grpc_metadata_tasks.append(
+                        asyncio.to_thread(
+                            _grpc_send_request,
+                            _grpc_target(encoder_url),
+                            response_json,
+                        )
                     )
-                )
-                offset += embedding_size_list_sort[idx]
-            await asyncio.gather(*metadata_tasks)
+                else:
+                    http_metadata_tasks.append(
+                        session.post(
+                            f"{encoder_url}/{endpoint_send}",
+                            json=response_json,
+                        )
+                    )
+                offset += embedding_size_list_sort[response_json["part_idx"]]
+
+            if http_metadata_tasks:
+                await asyncio.gather(*http_metadata_tasks)
+        if grpc_metadata_tasks:
+            await asyncio.gather(*grpc_metadata_tasks)
 
     # For mooncake
     async def allocate_embedding_buffer(self, req_id, embedding_length, embedding_dim):
