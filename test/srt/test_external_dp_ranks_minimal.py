@@ -97,8 +97,8 @@ class TestExternalDPRanks(PDDisaggregationServerBase):
             # (decode_rank, prefill_rank, description)
             (0, 0, "Decode#0 <- Prefill#0"),
             (1, 1, "Decode#1 <- Prefill#1"),
-            (2, 0, "Decode#2 <- Prefill#0"),  # 4 decode workers, 2 prefill workers
-            (3, 1, "Decode#3 <- Prefill#1"),  # 4 decode workers, 2 prefill workers
+            (2, 0, "Decode#2 <- Prefill#0"),  # More decode than prefill workers
+            (3, 1, "Decode#3 <- Prefill#1"),
         ]
 
         for decode_rank, prefill_rank, desc in test_cases:
