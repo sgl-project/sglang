@@ -536,7 +536,16 @@ def pre_permute_deepep_normal_to_deep_gemm(
             device=hidden_states.device,
             dtype=torch.float32,
         )
-    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    # DeepGEMM uses negative values in m_indices to mark completely invalid /
+    # padded blocks that should be skipped. We always initialize m_indices to
+    # -1 so any row that is not explicitly written by the scatter kernel will
+    # be treated as invalid and skipped by DeepGEMM's scheduler.
+    m_indices = torch.full(
+        (all_tokens,),
+        fill_value=-1,
+        device=hidden_states.device,
+        dtype=torch.int32,
+    )
     output_index = torch.empty_like(topk_ids)
 
     if get_offloader().forbid_copy_engine_usage:
