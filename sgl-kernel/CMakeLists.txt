@@ -97,6 +97,15 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flash-attention)
 
+# hpc-ops
+FetchContent_Declare(
+    repo-hpc-ops
+    GIT_REPOSITORY https://github.com/Tencent/hpc-ops
+    GIT_TAG        8e3ea9e359874f6b30a04830b7c2fc4da38d1e08
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-hpc-ops)
+
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
