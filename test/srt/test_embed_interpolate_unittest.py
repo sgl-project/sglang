@@ -71,9 +71,10 @@ class TestEmbedInterpolate(unittest.TestCase):
             norm_eps=1e-6,
             prefix="visual",
         )
-        embeddings = model.fast_pos_embed_interpolate(
-            [(t, s, s) for t, s in zip(t_dim, s_dim)]
+        grid_thw = torch.tensor(
+            [(t, s, s) for t, s in zip(t_dim, s_dim)], dtype=torch.int32
         )
+        embeddings = model.fast_pos_embed_interpolate(grid_thw)
 
         embeddings_s0 = embeddings[: s_dim[0] * s_dim[0], :]
         embeddings_s1 = embeddings[s_dim[0] * s_dim[0] : 2 * s_dim[0] * s_dim[0], :]
