@@ -8,10 +8,13 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
+    get_attention_tp_size,
     get_dp_local_info,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -163,6 +166,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         num_fused_shared_experts: int,
         device: str,
     ):
+        self.device = device
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
@@ -178,7 +182,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             num_hidden_layers=self.num_hidden_layers,
             num_experts_per_tok=self.num_experts_per_tok,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            device=device,
+            device=self.device,
         )
 
     def _sync_fwd_experts_buffer_DtoH(
@@ -187,7 +191,29 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         can_run_graph: bool,
         cuda_graph_batch: int,
     ):
-        if is_dp_attention_enabled():
+        # we need to have the topk at each rank being TP_ATTN_FULL
+        # With Deepep enabled, mlp mode is SCATTERED
+        if get_moe_a2a_backend().is_deepep():
+            scattered_bsz = -(
+                -forward_batch.out_cache_loc.shape[0] // get_attention_tp_size()
+            )
+            gathered_bsz = scattered_bsz * get_attention_tp_size()
+            temp_buffer = torch.empty(
+                (
+                    gathered_bsz,
+                    *self.device_cache.buffer.shape[1:],
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            attn_tp_all_gather_into_tensor(
+                temp_buffer,
+                self.device_cache.buffer[:scattered_bsz],
+            )
+            self.device_cache.buffer[:gathered_bsz] = temp_buffer
+
+        # with only dp attn enabled, it is FULL (so slicing below)
+        if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
             # handle with cuda graph padding
             if can_run_graph:
