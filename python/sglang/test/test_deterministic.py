@@ -401,7 +401,7 @@ class TokenIdsAndLogprobs:
                         f"    Mean absolute logprob diff (divergent): {mean_abs_logr:.10e}"
                     )
                 else:
-                    print("    Divergent tokens: 0/{}".format(total_count))
+                    print(f"    Divergent tokens: 0/{total_count}")
 
         return token_match and logprobs_match
 
