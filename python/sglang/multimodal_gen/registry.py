@@ -367,6 +367,16 @@ def get_model_info(
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
+    # Detect quantized models and warn the user
+    is_quantized = any(q in model_path.lower() for q in ["-4bit", "-awq", "-gptq"])
+    if is_quantized and backend != Backend.DIFFUSERS:
+        logger.warning(
+            "Detected a quantized model format ('%s'). "
+            "The native sglang-diffusion engine currently only supports BF16/FP16. "
+            "If you encounter errors, please use '--backend diffusers'.",
+            model_path,
+        )
+
     # 2. Get pipeline class from model's model_index.json
     try:
         if os.path.exists(model_path):
@@ -623,48 +633,34 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
-        model_detectors=[
-            lambda hf_id: "qwen-image" in hf_id.lower()
-            and "edit" not in hf_id.lower()
-            and "layered" not in hf_id.lower()
-        ],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-2512"],
-        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
-        model_detectors=[
-            lambda hf_id: "qwen-image-edit" in hf_id.lower()
-            and "2509" not in hf_id.lower()
-            and "2511" not in hf_id.lower()
-        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
-        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
-        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
-        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
     )
 
     register_configs(
