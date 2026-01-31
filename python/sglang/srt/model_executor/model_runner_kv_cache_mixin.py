@@ -280,7 +280,7 @@ class ModelRunnerKVCacheMixin:
         )
         assert (
             denominator > 0
-        ), f"Invalid denominator={denominator} for memory-based allocation"
+        ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
 
         self.full_max_total_num_tokens = int(total_memory / denominator)
         self.swa_max_total_num_tokens = int(
