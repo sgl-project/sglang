@@ -34,7 +34,7 @@ class TestProfileMerger(unittest.TestCase):
         # Test TP-only
         filename = f"{self.profile_id}-TP-0.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
-        self.assertEqual(rank_info, {"tp_rank": 0})
+        self.assertEqual(rank_info, {"tp_rank": 0, "process_type": "scheduler"})
         label = self.merger._create_rank_label(rank_info)
         self.assertEqual(label, "[TP00]")
 
@@ -42,7 +42,14 @@ class TestProfileMerger(unittest.TestCase):
         filename = f"{self.profile_id}-TP-1-DP-2-PP-3-EP-4.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
         self.assertEqual(
-            rank_info, {"tp_rank": 1, "dp_rank": 2, "pp_rank": 3, "ep_rank": 4}
+            rank_info,
+            {
+                "tp_rank": 1,
+                "dp_rank": 2,
+                "pp_rank": 3,
+                "ep_rank": 4,
+                "process_type": "scheduler",
+            },
         )
         label = self.merger._create_rank_label(rank_info)
         self.assertEqual(label, "[TP01-DP02-PP03-EP04]")
@@ -50,14 +57,23 @@ class TestProfileMerger(unittest.TestCase):
         # Test partial ranks
         filename = f"{self.profile_id}-TP-0-DP-1.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
-        self.assertEqual(rank_info, {"tp_rank": 0, "dp_rank": 1})
+        self.assertEqual(
+            rank_info, {"tp_rank": 0, "dp_rank": 1, "process_type": "scheduler"}
+        )
         label = self.merger._create_rank_label(rank_info)
         self.assertEqual(label, "[TP00-DP01]")
 
-        # Test no ranks
+        # Test host trace
+        filename = f"{self.profile_id}-host.trace.json.gz"
+        rank_info = self.merger._extract_rank_info(filename)
+        self.assertEqual(rank_info, {"process_type": "host"})
+        label = self.merger._create_rank_label(rank_info)
+        self.assertEqual(label, "[Host]")
+
+        # Test no ranks (no TP- or -host in filename)
         filename = f"{self.profile_id}.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
-        self.assertEqual(rank_info, {})
+        self.assertEqual(rank_info, {"process_type": "scheduler"})
         label = self.merger._create_rank_label(rank_info)
         self.assertEqual(label, "[Unknown]")
 
@@ -79,15 +95,21 @@ class TestProfileMerger(unittest.TestCase):
         self.assertEqual(sort_idx, 83)
 
     def test_rank_sort_key(self):
-        # Full ranks: TP-1, DP-2, PP-3, EP-4 → sorted as (DP, EP, PP, TP)
+        # Full ranks: TP-1, DP-2, PP-3, EP-4 → sorted as (is_host, DP, EP, PP, TP)
+        # is_host=0 for scheduler traces
         filename = f"{self.profile_id}-TP-1-DP-2-PP-3-EP-4.trace.json.gz"
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (2, 4, 3, 1))
+        self.assertEqual(sort_key, (0, 2, 4, 3, 1))
 
-        # Missing ranks: only TP-1 → sorted as (DP=0, EP=0, PP=0, TP=1)
+        # Missing ranks: only TP-1 → sorted as (is_host=0, DP=0, EP=0, PP=0, TP=1)
         filename = f"{self.profile_id}-TP-1.trace.json.gz"
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (0, 0, 0, 1))
+        self.assertEqual(sort_key, (0, 0, 0, 0, 1))
+
+        # Host trace: is_host=1 (sorts after scheduler traces)
+        filename = f"{self.profile_id}-host.trace.json.gz"
+        sort_key = self.merger._get_rank_sort_key(filename)
+        self.assertEqual(sort_key, (1, 0, 0, 0, 0))
 
     def test_discover_trace_files(self):
         # Create mock trace files
@@ -291,14 +313,20 @@ class TestProfileMergerEdgeCases(unittest.TestCase):
         # Test rank extraction with missing ranks
         filename = f"{self.profile_id}-TP-0.trace.json.gz"
         rank_info = self.merger._extract_rank_info(filename)
-        self.assertEqual(rank_info, {"tp_rank": 0})
+        self.assertEqual(rank_info, {"tp_rank": 0, "process_type": "scheduler"})
 
         # Test rank label creation with missing ranks
-        label = self.merger._create_rank_label({"tp_rank": 0})
+        label = self.merger._create_rank_label(
+            {"tp_rank": 0, "process_type": "scheduler"}
+        )
         self.assertEqual(label, "[TP00]")
 
-        label = self.merger._create_rank_label({})
+        label = self.merger._create_rank_label({"process_type": "scheduler"})
         self.assertEqual(label, "[Unknown]")
+
+        # Test host label
+        label = self.merger._create_rank_label({"process_type": "host"})
+        self.assertEqual(label, "[Host]")
 
         # Test sort index calculation
         sort_idx = self.merger._calculate_sort_index({"tp_rank": 0}, 83)
@@ -307,9 +335,9 @@ class TestProfileMergerEdgeCases(unittest.TestCase):
         sort_idx = self.merger._calculate_sort_index({}, 83)
         self.assertEqual(sort_idx, 83)
 
-        # Test sort key generation
+        # Test sort key generation (is_host=0, DP=0, EP=0, PP=0, TP=0)
         sort_key = self.merger._get_rank_sort_key(filename)
-        self.assertEqual(sort_key, (0, 0, 0, 0))
+        self.assertEqual(sort_key, (0, 0, 0, 0, 0))
 
         # Test _maybe_cast_int with various inputs
         self.assertIsNone(self.merger._maybe_cast_int(None))
