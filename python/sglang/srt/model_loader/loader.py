@@ -2485,7 +2485,7 @@ class IncModelLoader(DefaultModelLoader):
                     "sym": True,
                     "act_bits": 8,
                     "act_data_type": "int",
-                    "act_group_size": 0,
+                    "act_group_size": -1,
                     "act_dynamic": True,
                     "act_sym": True,
                 },
@@ -2509,7 +2509,7 @@ class IncModelLoader(DefaultModelLoader):
         except ImportError:
             logger.error(
                 "auto-round library not found. "
-                "Please install it to use AutoRound quantization."
+                "Please install it using `pip install auto-round` to use AutoRound quantization."
             )
             raise
 
