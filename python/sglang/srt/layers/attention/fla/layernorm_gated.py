@@ -14,9 +14,17 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.utils import cdiv, device_context, is_npu, next_power_of_2
+from sglang.srt.utils import (
+    cdiv,
+    cpu_has_amx_support,
+    device_context,
+    is_cpu,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_npu = is_npu()
+_use_cpu = is_cpu() and cpu_has_amx_support()
 
 
 def rms_norm_ref(
@@ -392,13 +400,21 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        return layernorm_fn(
-            x,
-            self.weight,
-            self.bias,
-            z=z,
-            eps=self.eps,
-            group_size=self.group_size,
-            norm_before_gate=self.norm_before_gate,
-            is_rms_norm=True,
-        )
+        if _use_cpu:
+            assert (
+                self.norm_before_gate and self.group_size is None
+            ), "CPU rmsnorm_gated currently only supports norm before gate without group size"
+            return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
+                x, self.weight, z, self.eps
+            )
+        else:
+            return layernorm_fn(
+                x,
+                self.weight,
+                self.bias,
+                z=z,
+                eps=self.eps,
+                group_size=self.group_size,
+                norm_before_gate=self.norm_before_gate,
+                is_rms_norm=True,
+            )

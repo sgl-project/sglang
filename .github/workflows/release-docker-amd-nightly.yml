@@ -43,8 +43,16 @@ jobs:
             exit 1
           fi
 
+          # Get short commit hash of current HEAD
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+
+          # Compose pretend version for setuptools_scm: e.g., 0.5.8.dev20260129+g1a2b3c4
+          PRETEND_VERSION="${VERSION}.dev${{ env.DATE }}+g${COMMIT_HASH}"
+
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "pretend_version=${PRETEND_VERSION}" >> $GITHUB_OUTPUT
           echo "Detected version: ${VERSION}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
 
       - name: Login to Docker Hub
         uses: docker/login-action@v2
@@ -55,7 +63,9 @@ jobs:
       - name: Build and Push
         run: |
           version=${{ steps.version.outputs.version }}
+          pretend_version=${{ steps.version.outputs.pretend_version }}
           echo "Version: ${version}"
+          echo "Pretend version: ${pretend_version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
             rocm_tag="rocm700-mi30x"
@@ -68,7 +78,7 @@ jobs:
 
           tag=v${version}-${rocm_tag}
 
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
   # Temporarily disable docker cache seeding until performant storage is in place

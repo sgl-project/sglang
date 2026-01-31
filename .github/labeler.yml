@@ -108,3 +108,10 @@ deterministic:
 piecewise-cuda-graph:
   - changed-files:
     - any-glob-to-any-file: 'python/sglang/srt/compilation/**/*'
+
+# Moore Threads specific
+mthreads:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*mthreads*'
+      - '**/*musa*'

@@ -541,11 +541,11 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             )
         hidden_states, _ = self.x_embedder(hidden_states)
 
-        temb = (
-            self.time_text_embed(timestep, pooled_projections)
-            if guidance is None
-            else self.time_text_embed(timestep, guidance, pooled_projections)
-        )
+        # Only pass guidance to time_text_embed if the model supports it
+        if self.config.guidance_embeds and guidance is not None:
+            temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = self.time_text_embed(timestep, pooled_projections)
 
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 

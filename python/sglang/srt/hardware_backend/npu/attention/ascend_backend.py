@@ -11,13 +11,15 @@ from sgl_kernel_npu.attention.sinks_attention import (
 )
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
+    AscendTorchNativeAttnBackend,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -223,7 +225,7 @@ class AscendAttnBackend(AttentionBackend):
             self.q_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         else:
             self.use_alibi = getattr(model_runner.model_config, "use_alibi", False)
-        self.native_attn = TorchNativeAttnBackend(model_runner)
+        self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -751,10 +753,15 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
-            if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+            # In cross attention layer, when there is no vision input,the values of k and v is None
+            if save_kv_cache and k is not None and v is not None:
+                # support cross attention
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
                 )
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -812,7 +819,13 @@ class AscendAttnBackend(AttentionBackend):
                 ):
                     causal = False
 
-                if layer.qk_head_dim <= 128 and causal:
+                # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
+                # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
+                if (
+                    layer.qk_head_dim <= 128
+                    and causal
+                    and forward_batch.encoder_lens is None
+                ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
                         attn_output = torch.empty(
@@ -860,7 +873,8 @@ class AscendAttnBackend(AttentionBackend):
                     q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
-                    self.native_attn._run_sdpa_forward_extend(
+                    # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
+                    attn_output = self.native_attn.run_sdpa_forward_extend(
                         q_,
                         o_,
                         k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
@@ -870,9 +884,14 @@ class AscendAttnBackend(AttentionBackend):
                         forward_batch.seq_lens,
                         forward_batch.extend_prefix_lens,
                         forward_batch.extend_seq_lens,
+                        forward_batch.encoder_lens,
+                        is_cross_attention=layer.is_cross_attention,
                         scaling=layer.scaling,
                         enable_gqa=use_gqa,
                         causal=causal,
+                    )
+                    attn_output = attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
                     )
         elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             num_token_padding = q.shape[0]
@@ -1440,10 +1459,15 @@ class AscendAttnBackend(AttentionBackend):
             )
 
         if not self.use_mla:
-            if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, forward_batch.out_cache_loc, k, v
+            # In cross attention layer, when there is no vision input,the values of k and v is None
+            if save_kv_cache and k is not None and v is not None:
+                # support cross attention
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
                 )
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
             num_tokens = q.shape[0]
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
@@ -1492,7 +1516,9 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
-            else:
+            # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
+            # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
+            elif forward_batch.encoder_lens is None:
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
@@ -1526,6 +1552,33 @@ class AscendAttnBackend(AttentionBackend):
                         slopes=slopes,
                         is_extend=False,
                     )
+            else:
+                if layer.qk_head_dim != layer.v_head_dim:
+                    attn_output = q.new_empty(
+                        (q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+                    )
+                else:
+                    attn_output = torch.empty_like(q)
+
+                use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+                q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                o_ = attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+                attn_output = self.native_attn.run_sdpa_forward_decode(
+                    q_,
+                    o_,
+                    k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    forward_batch.req_to_token_pool.req_to_token,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.encoder_lens,
+                    is_cross_attention=layer.is_cross_attention,
+                    scaling=layer.scaling,
+                    enable_gqa=use_gqa,
+                    causal=False,
+                )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             if save_kv_cache:
