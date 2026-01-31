@@ -13,44 +13,14 @@
 # ==============================================================================
 """Inference-only LFM2-VL model compatible with HuggingFace weights."""
 
-import json
 import logging
-import time
 from typing import Iterable, List, Optional, Tuple
 
 import torch
-
-# #region agent log
-_DEBUG_LOG_PATH = "/sgl-workspace/sglang/.cursor/debug.log"
-_DEBUG_SESSION = "lfm2vl-debug"
-_DEBUG_CALL_COUNT = 0
-
-
-def _dbg(hypothesis_id, location, message, data=None):
-    global _DEBUG_CALL_COUNT
-    _DEBUG_CALL_COUNT += 1
-    entry = {
-        "sessionId": _DEBUG_SESSION,
-        "runId": "initial",
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": time.time(),
-        "callNum": _DEBUG_CALL_COUNT,
-    }
-    try:
-        import os
-
-        os.makedirs(os.path.dirname(_DEBUG_LOG_PATH), exist_ok=True)
-        with open(_DEBUG_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-    except Exception:
-        pass
-
-
-# #endregion
 from torch import nn
+from transformers import PreTrainedModel
+from transformers.activations import ACT2FN
+from transformers.models.auto.modeling_auto import AutoModel
 
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -68,9 +38,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm2 import Lfm2ForCausalLM
 from sglang.srt.utils import add_prefix
-from transformers import PreTrainedModel
-from transformers.activations import ACT2FN
-from transformers.models.auto.modeling_auto import AutoModel
 
 logger = logging.getLogger(__name__)
 
@@ -155,38 +122,8 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
     def pad_input_ids(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
     ) -> List[int]:
-        # #region agent log
-        _dbg(
-            "H5",
-            "pad_input_ids:entry",
-            "Padding input_ids for mm tokens",
-            {
-                "input_ids_len_before": len(input_ids),
-                "image_token_id": self.config.image_token_id,
-                "image_token_count_before": sum(
-                    1 for t in input_ids if t == self.config.image_token_id
-                ),
-                "mm_items_count": (
-                    len(mm_inputs.mm_items) if hasattr(mm_inputs, "mm_items") else 0
-                ),
-            },
-        )
-        # #endregion
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         result = pattern.pad_input_tokens(input_ids, mm_inputs)
-        # #region agent log
-        _dbg(
-            "H5",
-            "pad_input_ids:exit",
-            "After padding",
-            {
-                "input_ids_len_after": len(result),
-                "image_token_count_after": sum(
-                    1 for t in result if t == self.config.image_token_id
-                ),
-            },
-        )
-        # #endregion
         return result
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -198,27 +135,6 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
         Handles SigLip2's NaFlex variable-resolution output by unpadding
         features using the attention mask and reshaping per spatial_shapes.
         """
-        # #region agent log
-        _dbg(
-            "H3",
-            "get_image_feature:entry",
-            "Called with items",
-            {
-                "num_items": len(items),
-                "item_modalities": [str(item.modality) for item in items],
-                "item_has_feature": [item.feature is not None for item in items],
-                "item_has_attn_mask": [
-                    hasattr(item, "pixel_attention_mask")
-                    and item.pixel_attention_mask is not None
-                    for item in items
-                ],
-                "item_has_spatial": [
-                    hasattr(item, "spatial_shapes") and item.spatial_shapes is not None
-                    for item in items
-                ],
-            },
-        )
-        # #endregion
         all_pixel_values = flatten_nested_list([item.feature for item in items])
         all_pixel_attention_masks = flatten_nested_list(
             [item.pixel_attention_mask for item in items]
@@ -240,26 +156,6 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
             if shapes_batch.dim() == 1:
                 shapes_batch = shapes_batch.unsqueeze(0)
 
-            # #region agent log
-            _dbg(
-                "H4",
-                "get_image_feature:pre_vit",
-                "Tensors before vision tower",
-                {
-                    "pv_shape": list(pixel_values_batch.shape),
-                    "pv_dtype": str(pixel_values_batch.dtype),
-                    "pv_device": str(pixel_values_batch.device),
-                    "pv_mean": float(pixel_values_batch.float().mean()),
-                    "pv_std": float(pixel_values_batch.float().std()),
-                    "attn_shape": list(attn_mask_batch.shape),
-                    "attn_sum_per_img": attn_mask_batch.sum(dim=1).tolist(),
-                    "shapes_batch": shapes_batch.tolist(),
-                    "vt_device": str(self.vision_tower.device),
-                    "vt_dtype": str(self.vision_tower.dtype),
-                },
-            )
-            # #endregion
-
             pixel_values_batch = pixel_values_batch.to(
                 device=self.vision_tower.device,
                 dtype=self.vision_tower.dtype,
@@ -275,23 +171,6 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
                 return_dict=True,
             )
             last_hidden_state = vision_outputs.last_hidden_state
-
-            # #region agent log
-            _dbg(
-                "H1",
-                "get_image_feature:post_vit",
-                "Vision tower output",
-                {
-                    "lhs_shape": list(last_hidden_state.shape),
-                    "lhs_dtype": str(last_hidden_state.dtype),
-                    "lhs_mean": float(last_hidden_state.float().mean()),
-                    "lhs_std": float(last_hidden_state.float().std()),
-                    "lhs_has_nan": bool(last_hidden_state.isnan().any()),
-                    "lhs_has_inf": bool(last_hidden_state.isinf().any()),
-                    "lhs_abs_max": float(last_hidden_state.float().abs().max()),
-                },
-            )
-            # #endregion
 
             # Unpad and project each image
             img_feature_lengths = attn_mask_batch.sum(dim=1)
@@ -314,41 +193,9 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
                 img_embedding = img_embedding.reshape(-1, img_embedding.size(-1))
                 image_features_list.append(img_embedding)
 
-                # #region agent log
-                if img_idx == 0:
-                    _dbg(
-                        "H5",
-                        "get_image_feature:per_image",
-                        "First image embedding",
-                        {
-                            "feat_len": feat_len,
-                            "h": int(h),
-                            "w": int(w),
-                            "reshape_to": [1, int(h), int(w), -1],
-                            "proj_output_shape": list(img_embedding.shape),
-                            "proj_mean": float(img_embedding.float().mean()),
-                            "proj_std": float(img_embedding.float().std()),
-                            "proj_has_nan": bool(img_embedding.isnan().any()),
-                        },
-                    )
-                # #endregion
-
-        # #region agent log
         if image_features_list:
-            final = torch.cat(image_features_list, dim=0)
-            _dbg(
-                "H5",
-                "get_image_feature:exit",
-                "Final concatenated features",
-                {
-                    "final_shape": list(final.shape),
-                    "final_dtype": str(final.dtype),
-                    "final_mean": float(final.float().mean()),
-                    "final_std": float(final.float().std()),
-                },
-            )
-            return final
-        # #endregion
+            return torch.cat(image_features_list, dim=0)
+
         return torch.tensor(
             [], device=self.vision_tower.device, dtype=self.vision_tower.dtype
         )
@@ -362,23 +209,6 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
         input_embeds: torch.Tensor = None,
         **kwargs,
     ):
-        # #region agent log
-        _dbg(
-            "H2",
-            "forward:entry",
-            "Forward called",
-            {
-                "input_ids_shape": list(input_ids.shape),
-                "forward_mode": str(forward_batch.forward_mode),
-                "has_mm_inputs": forward_batch.mm_inputs is not None,
-                "mm_inputs_count": (
-                    len([m for m in forward_batch.mm_inputs if m is not None])
-                    if forward_batch.mm_inputs
-                    else 0
-                ),
-            },
-        )
-        # #endregion
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -422,64 +252,20 @@ class Lfm2VlForConditionalGeneration(PreTrainedModel):
         params_dict = dict(self.named_parameters())
 
         # Load vision tower weights
-        # #region agent log
-        _vt_loaded = 0
-        _vt_skipped = []
-        # #endregion
         for name, loaded_weight in vision_weights:
             if name not in params_dict:
-                # #region agent log
-                _vt_skipped.append(name)
-                # #endregion
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            # #region agent log
-            _vt_loaded += 1
-            # #endregion
-        # #region agent log
-        _dbg(
-            "H1",
-            "load_weights:vision",
-            "Vision tower weight loading complete",
-            {
-                "loaded": _vt_loaded,
-                "skipped": _vt_skipped[:10],
-                "total_vision_weights": len(vision_weights),
-            },
-        )
-        # #endregion
 
         # Load projector weights
-        # #region agent log
-        _pj_loaded = 0
-        _pj_skipped = []
-        # #endregion
         for name, loaded_weight in projector_weights:
             if name not in params_dict:
-                # #region agent log
-                _pj_skipped.append(name)
-                # #endregion
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
-            # #region agent log
-            _pj_loaded += 1
-            # #endregion
-        # #region agent log
-        _dbg(
-            "H1",
-            "load_weights:projector",
-            "Projector weight loading complete",
-            {
-                "loaded": _pj_loaded,
-                "skipped": _pj_skipped,
-                "total_projector_weights": len(projector_weights),
-            },
-        )
-        # #endregion
 
         # Load language model weights via Lfm2ForCausalLM.load_weights
         # Strip the "language_model." prefix since Lfm2ForCausalLM expects

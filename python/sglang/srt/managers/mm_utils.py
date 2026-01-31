@@ -1036,41 +1036,6 @@ def embed_mm_inputs(
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
-        # #region agent log
-        try:
-            import json as _json
-            import os as _os
-            import time as _time
-
-            _os.makedirs("/sgl-workspace/sglang/.cursor", exist_ok=True)
-            _entry = {
-                "sessionId": "lfm2vl-debug",
-                "runId": "initial",
-                "hypothesisId": "H2",
-                "location": "embed_mm_inputs:scatter",
-                "message": "Scattering embeddings into input_embeds",
-                "data": {
-                    "modality": str(modality),
-                    "embedding_shape": list(embedding.shape),
-                    "num_indices": len(indices),
-                    "indices_sample": indices[:5].tolist(),
-                    "input_embeds_shape": list(input_embeds.shape),
-                    "embed_mean_before": (
-                        float(input_embeds[indices[:1]].float().mean())
-                        if len(indices) > 0
-                        else None
-                    ),
-                    "new_embed_mean": float(embedding.float().mean()),
-                    "new_embed_std": float(embedding.float().std()),
-                    "MISMATCH_embedding_vs_indices": len(indices) != embedding.shape[0],
-                },
-                "timestamp": _time.time(),
-            }
-            with open("/sgl-workspace/sglang/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps(_entry, default=str) + "\n")
-        except Exception:
-            pass
-        # #endregion
         input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
         if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
