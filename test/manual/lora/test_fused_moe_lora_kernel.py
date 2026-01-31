@@ -143,7 +143,7 @@ def use_fused_moe_lora_kernel(
     lora_ids = torch.arange(max_loras + 2, dtype=torch.int32)
 
     # call kernel
-    ops.moe_lora_align_block_size(
+    moe_align_block_size(
         topk_ids,
         token_lora_mapping,
         num_experts,
