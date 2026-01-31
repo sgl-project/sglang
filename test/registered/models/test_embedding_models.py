@@ -1,13 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-# Embedding model tests
-register_cuda_ci(est_time=73, suite="stage-b-test-small-1-gpu")
-register_amd_ci(
-    est_time=73,
-    suite="stage-b-test-small-1-gpu-amd",
-    disabled="see https://github.com/sgl-project/sglang/issues/11127",
-)
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -30,6 +20,7 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -37,6 +28,14 @@ from sglang.test.test_utils import (
     is_in_amd_ci,
     is_in_ci,
 )
+
+# Embedding model tests
+register_amd_ci(
+    est_time=73,
+    suite="stage-b-test-small-1-gpu-amd",
+    disabled="see https://github.com/sgl-project/sglang/issues/11127",
+)
+register_cuda_ci(est_time=73, suite="stage-b-test-small-1-gpu")
 
 MODEL_TO_CONFIG = {
     "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),

@@ -96,6 +96,7 @@ from sglang.srt.model_loader.weight_utils import (
     get_quant_config,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
+    maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
@@ -261,7 +262,7 @@ def _initialize_model(
     hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
     # pass mappings by reference to quant_config
     if hf_to_sglang_mapper is not None and quant_config is not None:
-        quant_config.apply_sglang_mapper(hf_to_sglang_mapper)
+        quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
     # Build kwargs conditionally
     kwargs = {
@@ -321,6 +322,9 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
+        model_config: Optional["ModelConfig"] = None
+        """The model configuration (for checking architecture, etc)."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -328,7 +332,11 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config.revision,
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                model_config=model_config,
             )
+
+    counter_before_loading_weights: float = 0.0
+    counter_after_loading_weights: float = 0.0
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -471,6 +479,15 @@ class DefaultModelLoader(BaseModelLoader):
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+
+        if use_safetensors and source.model_config is not None:
+            hf_weights_files = maybe_add_mtp_safetensors(
+                hf_weights_files,
+                hf_folder,
+                "model.safetensors.index.json",
+                source.model_config.hf_config,
+            )
+
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -530,6 +547,9 @@ class DefaultModelLoader(BaseModelLoader):
                 filtered_weights.append((source.prefix + new_name, tensor))
             return tuple(filtered_weights)
 
+        if self.counter_before_loading_weights == 0.0:
+            logger.info("Beginning to load weights")
+            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -566,7 +586,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         hf_config = AutoConfig.from_pretrained(
-            model_config.model_path, trust_remote_code=True
+            model_config.model_path,
+            trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
@@ -599,6 +621,7 @@ class DefaultModelLoader(BaseModelLoader):
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         # Handle both legacy modelopt_quant and unified quantization flags
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
@@ -646,6 +669,11 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        self.counter_after_loading_weights = time.perf_counter()
+        logger.info(
+            "Loading weights took %.2f seconds",
+            self.counter_after_loading_weights - self.counter_before_loading_weights,
+        )
         return model.eval()
 
     @staticmethod

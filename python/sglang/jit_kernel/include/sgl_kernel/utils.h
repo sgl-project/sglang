@@ -121,16 +121,14 @@ namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T, std::integral... U>
-inline auto offset(T* ptr, U... offset) -> void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+inline auto offset(void* ptr, U... offset) -> void* {
+  return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T, std::integral... U>
-inline auto offset(const T* ptr, U... offset) -> const void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<const char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+inline auto offset(const void* ptr, U... offset) -> const void* {
+  return static_cast<const T*>(ptr) + (... + offset);
 }
 
 }  // namespace pointer
