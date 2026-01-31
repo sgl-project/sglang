@@ -55,7 +55,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import get_available_device_memory, is_npu, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +391,7 @@ class PiecewiseCudaGraphRunner:
         ), graph_capture() as graph_capture_context:
             stream = graph_capture_context.stream
             with set_pcg_capture_stream(stream):
-                avail_mem = get_available_gpu_memory(
+                avail_mem = get_available_device_memory(
                     self.model_runner.device,
                     self.model_runner.gpu_id,
                     empty_cache=False,
@@ -404,7 +404,7 @@ class PiecewiseCudaGraphRunner:
                 )
                 for i, num_tokens in enumerate(capture_range):
                     if get_tensor_model_parallel_rank() == 0:
-                        avail_mem = get_available_gpu_memory(
+                        avail_mem = get_available_device_memory(
                             self.model_runner.device,
                             self.model_runner.gpu_id,
                             empty_cache=False,
