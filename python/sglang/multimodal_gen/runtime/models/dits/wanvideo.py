@@ -183,18 +183,13 @@ class WanT2VCrossAttention(WanSelfAttention):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
         # Sparse attention backends should not be used for cross-attention
-        if supported_attention_backends is not None:
-            supported_attention_backends = {
-                b
-                for b in supported_attention_backends
-                if b
-                not in {
-                    AttentionBackendEnum.SLIDING_TILE_ATTN,
-                    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                    AttentionBackendEnum.VMOBA_ATTN,
-                    AttentionBackendEnum.SLA_ATTN,
-                    AttentionBackendEnum.SAGE_SLA_ATTN,
-                }
+        if supported_attention_backends:
+            supported_attention_backends -= {
+                AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                AttentionBackendEnum.VMOBA_ATTN,
+                AttentionBackendEnum.SLA_ATTN,
+                AttentionBackendEnum.SAGE_SLA_ATTN,
             }
         super().__init__(
             dim,
@@ -254,18 +249,13 @@ class WanI2VCrossAttention(WanSelfAttention):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ) -> None:
         # Sparse attention backends should not be used for cross-attention
-        if supported_attention_backends is not None:
-            supported_attention_backends = {
-                b
-                for b in supported_attention_backends
-                if b
-                not in {
-                    AttentionBackendEnum.SLIDING_TILE_ATTN,
-                    AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                    AttentionBackendEnum.VMOBA_ATTN,
-                    AttentionBackendEnum.SLA_ATTN,
-                    AttentionBackendEnum.SAGE_SLA_ATTN,
-                }
+        if supported_attention_backends:
+            supported_attention_backends -= {
+                AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+                AttentionBackendEnum.VMOBA_ATTN,
+                AttentionBackendEnum.SLA_ATTN,
+                AttentionBackendEnum.SAGE_SLA_ATTN,
             }
         super().__init__(
             dim,
