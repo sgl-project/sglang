@@ -75,7 +75,9 @@ def _expected_misses(
     return num_misses
 
 
-def _build_transfer_tasks(batch: int, num_top_k: int, page_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _build_transfer_tasks(
+    batch: int, num_top_k: int, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
     tasks_per_block = num_top_k * page_size
     stride_per_block = tasks_per_block + 1
     max_transfer_tasks = batch * stride_per_block
@@ -145,13 +147,13 @@ def test_sparse_lru_end_to_end(
     device_buffer_locs = torch.empty(
         (batch_size, 1, hot_buffer_size), dtype=torch.int32, device=device
     )
-    lru_slots = torch.arange(
-        hot_buffer_size - 1, dtype=torch.int16, device=device
-    ).reshape(1, 1, -1).repeat(batch_size, 1, 1)
-
-    token_ids = torch.arange(
-        mem_pool_host.size, dtype=dtype, device="cpu"
+    lru_slots = (
+        torch.arange(hot_buffer_size - 1, dtype=torch.int16, device=device)
+        .reshape(1, 1, -1)
+        .repeat(batch_size, 1, 1)
     )
+
+    token_ids = torch.arange(mem_pool_host.size, dtype=dtype, device="cpu")
     feature_dim = mem_pool_host.kv_buffer[layer_id].shape[-1]
     token_ids = token_ids.view(-1, 1).repeat(1, feature_dim)
     mem_pool_host.kv_buffer[layer_id][: mem_pool_host.size, 0].copy_(token_ids)
@@ -183,7 +185,9 @@ def test_sparse_lru_end_to_end(
     top_k_device_locs = torch.full(
         (batch_size, num_top_k), -1, dtype=torch.int32, device=device
     )
-    page_table = torch.zeros(batch_size, host_token_count, dtype=torch.int32, device=device)
+    page_table = torch.zeros(
+        batch_size, host_token_count, dtype=torch.int32, device=device
+    )
     diff_map = torch.full(
         (batch_size, host_token_count), -1, dtype=torch.int16, device=device
     )
@@ -225,17 +229,15 @@ def test_sparse_lru_end_to_end(
             if desired_min >= max_seq_len:
                 seq_len = max_seq_len
             else:
-                seq_len = int(
-                    torch.randint(desired_min, max_seq_len, (1,)).item()
-                )
+                seq_len = int(torch.randint(desired_min, max_seq_len, (1,)).item())
             seq_lens[b] = seq_len
             newest_token = seq_len - 1
             newest_tokens.append(newest_token)
 
             if prev_top_k_cpu[b] is None:
-                curr_tokens = torch.randperm(
-                    seq_len, device=device, dtype=torch.int32
-                )[:num_top_k]
+                curr_tokens = torch.randperm(seq_len, device=device, dtype=torch.int32)[
+                    :num_top_k
+                ]
                 if newest_token not in curr_tokens:
                     curr_tokens[-1] = newest_token
             else:
@@ -306,13 +308,17 @@ def test_sparse_lru_end_to_end(
             )
 
             # Ensure newest_token is not duplicated in the LRU region.
-            lru_region = device_buffer_tokens[b, 0, : newest_slot]
+            lru_region = device_buffer_tokens[b, 0, :newest_slot]
             dup_mask = lru_region == newest_token
             if dup_mask.any():
                 lru_tokens = set(lru_region.tolist())
                 topk_set = set(curr_tokens.tolist())
                 replacement = (newest_token + 1) % host_token_count
-                while replacement in lru_tokens or replacement in topk_set or replacement == newest_token:
+                while (
+                    replacement in lru_tokens
+                    or replacement in topk_set
+                    or replacement == newest_token
+                ):
                     replacement = (replacement + 1) % host_token_count
                 lru_region[dup_mask] = replacement
                 rep_host_loc = int(host_cache_locs[b, replacement].item())
@@ -425,9 +431,9 @@ def test_sparse_lru_end_to_end(
                             "seq_len",
                             int(seq_lens[b].item()),
                         )
-                    assert diff_count == diff_target, (
-                        f"topk diff {diff_count} != {diff_target}"
-                    )
+                    assert (
+                        diff_count == diff_target
+                    ), f"topk diff {diff_count} != {diff_target}"
 
                     expected_misses = _expected_misses(
                         pre_lrus[b],
@@ -439,9 +445,9 @@ def test_sparse_lru_end_to_end(
                     count_idx = b * stride_per_block + tasks_per_block
                     task_count = int(transfer_tasks_src[count_idx].item())
                     round_transfer_tasks += task_count
-                    assert task_count == expected_misses * page_size, (
-                        f"transfer cnt {task_count} != {expected_misses}"
-                    )
+                    assert (
+                        task_count == expected_misses * page_size
+                    ), f"transfer cnt {task_count} != {expected_misses}"
 
                 for i in range(num_top_k):
                     token_id = int(top_k_tokens[b, i].item())

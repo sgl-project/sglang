@@ -306,7 +306,6 @@ class SparseCoordinator:
                 len(host_indices) == req_seqlen
             ), f"Host indices mismatch: {len(host_indices)} != {req_seqlen}"
 
-
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """
         Handle forward pass begin event. Called before each forward pass starts.
@@ -551,15 +550,15 @@ class SparseCoordinator:
         hierarchical_sparse_masks = self.states.hierarchical_sparse_enabled[
             req_pool_indices
         ]
-        
+
         truncated_indices = hierarchical_sparse_masks.nonzero(as_tuple=True)[0]
         non_truncated_indices = (~hierarchical_sparse_masks).nonzero(as_tuple=True)[0]
-        
+
         out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
-        
+
         num_truncated = truncated_indices.shape[0]
         num_non_truncated = non_truncated_indices.shape[0]
-        
+
         if num_truncated > 0:
             if self.algorithm.topk_mode() == "page":
                 decode_offsets = locs[truncated_indices]
@@ -568,17 +567,17 @@ class SparseCoordinator:
                 )
             else:
                 rolling_positions = torch.full(
-                    (num_truncated,), 
+                    (num_truncated,),
                     kv_truncated_len - 1,
                     dtype=torch.int32,
-                    device=batch.device
+                    device=batch.device,
                 )
-            
+
             out_cache_loc[truncated_indices] = batch.req_to_token_pool.req_to_token[
                 batch.req_pool_indices[truncated_indices],
                 rolling_positions,
             ]
-        
+
         if num_non_truncated > 0:
             if batch.tree_cache.page_size == 1:
                 non_truncated_out = alloc_tokens_func(
@@ -598,7 +597,7 @@ class SparseCoordinator:
                     last_loc=non_truncated_last_loc,
                     token_per_req=token_per_req,
                 )
-            
+
             out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
             batch.req_to_token_pool.write(
                 (
@@ -607,12 +606,12 @@ class SparseCoordinator:
                 ),
                 out_cache_loc[non_truncated_indices],
             )
-        
+
         from sglang.srt.disaggregation.decode import NSADecodeReqToTokenPool
-        
+
         if isinstance(batch.req_to_token_pool, NSADecodeReqToTokenPool):
             self._alloc_for_nsa_index_k(batch, token_per_req, seq_lens_next, locs)
-        
+
         return out_cache_loc
 
     def _alloc_for_nsa_index_k(
