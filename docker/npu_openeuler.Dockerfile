@@ -5,11 +5,9 @@ ARG PYTHON_VERSION=py3.11
 
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
-# Update pip & apt sources
 ARG CANN_VERSION
 ARG DEVICE_TYPE
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
-ARG APTMIRROR=""
 ARG PYTORCH_VERSION="2.8.0"
 ARG TORCHVISION_VERSION="0.23.0"
 ARG PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl"
@@ -20,7 +18,6 @@ ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=2026.01.21
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
-ARG DEVICE_TYPE
 
 WORKDIR /workspace
 
