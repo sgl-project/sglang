@@ -276,6 +276,7 @@ class ServerArgs:
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
@@ -727,6 +728,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.lora_nickname,
             help="The nickname for the LoRA adapter to launch with",
+        )
+        parser.add_argument(
+            "--lora-scale",
+            type=float,
+            default=ServerArgs.lora_scale,
+            help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)

@@ -2,6 +2,9 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
+# Usage (to build SGLang ROCm + Mori docker image):
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -40,6 +43,9 @@ ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
 ARG SGL_BRANCH=${SGL_DEFAULT}
+
+# Version override for setuptools_scm (used in nightly builds)
+ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 
 ARG TRITON_REPO="https://github.com/ROCm/triton.git"
 ARG TRITON_COMMIT="improve_fa_decode_3.0.0"
@@ -157,6 +163,10 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
 # -----------------------
 # Build SGLang
 ARG BUILD_TYPE=all
+
+# Set version for setuptools_scm if provided (for nightly builds)
+ARG SETUPTOOLS_SCM_PRETEND_VERSION
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 
 RUN pip install IPython \
     && pip install orjson \
