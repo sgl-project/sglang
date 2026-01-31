@@ -607,11 +607,6 @@ class SparseCoordinator:
                 out_cache_loc[non_truncated_indices],
             )
 
-        from sglang.srt.disaggregation.decode import NSADecodeReqToTokenPool
-
-        if isinstance(batch.req_to_token_pool, NSADecodeReqToTokenPool):
-            self._alloc_for_nsa_index_k(batch, token_per_req, seq_lens_next, locs)
-
         return out_cache_loc
 
     def _alloc_for_nsa_index_k(
