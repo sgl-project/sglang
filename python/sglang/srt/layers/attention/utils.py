@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.server_args import get_global_server_args
+
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
@@ -277,3 +279,6 @@ def pad_sequence_with_mask(
     )
 
     return B, output, attn_mask
+
+def is_enable_prefill_cp():
+    return get_global_server_args().prefill_context_parallel_size > 1

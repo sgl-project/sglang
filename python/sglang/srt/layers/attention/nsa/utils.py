@@ -42,7 +42,7 @@ def is_nsa_enable_prefill_cp():
 
 
 @dataclass
-class NSAContextParallelMetadata:
+class ContextParallelMetadata:
 
     split_list: List[int] = None
     max_rank_len: List[int] = None
@@ -334,7 +334,7 @@ def prepare_input_dp_with_cp_dsa(
         device="cuda", dtype=torch.int32
     )
 
-    nsa_cp_metadata = NSAContextParallelMetadata(
+    nsa_cp_metadata = ContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
         zigzag_index=zigzag_index,

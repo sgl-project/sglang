@@ -261,6 +261,7 @@ class TpModelWorker(BaseTpWorker):
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
             nccl_port=nccl_port,
+            pcp_size=server_args.prefill_context_parallel_size,
             dp_rank=dp_rank,
             server_args=server_args,
             is_draft_worker=is_draft_worker,

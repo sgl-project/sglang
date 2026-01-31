@@ -589,6 +589,8 @@ class ServerArgs:
     enable_nsa_prefill_context_parallel: bool = False
     enable_fused_qk_norm_rope: bool = False
 
+    prefill_context_parallel_size: int = 1
+
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
     dynamic_batch_tokenizer_batch_size: int = 32
@@ -4296,6 +4298,14 @@ class ServerArgs:
             help="The output folder for dumping tensors.",
         )
         parser.add_argument(
+            "--prefill-context-parallel-size",
+            "--pcp-size",
+            type=int,
+            default=ServerArgs.prefill_context_parallel_size,
+            help="The context parallel size used in the long sequence prefill phase of DeepSeek v3.2.",
+        )
+
+        parser.add_argument(
             "--debug-tensor-dump-layers",
             type=int,
             nargs="+",
@@ -4541,7 +4551,8 @@ class ServerArgs:
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
-
+        if args.__contains__("pcp_size"):
+            args.prefill_context_parallel_size = args.pcp_size
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
@@ -4591,9 +4602,21 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        assert (
-            self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        if not is_npu:
+            assert (
+                self.tp_size * self.pp_size
+            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        else:
+            if self.prefill_context_parallel_size > 1:
+                assert (
+                    self.disaggregation_mode!="decode"
+                ), "Prefill context parallelism is not supported in decode mode"
+                assert (
+                    self.chunked_prefill_size is None or self.chunked_prefill_size == -1
+                ), "Prefill context parallelism is not supported in chunked prefill mode"    
+            assert (
+                self.tp_size * self.pp_size * self.prefill_context_parallel_size
+            ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.pp_size > 1:
             assert (

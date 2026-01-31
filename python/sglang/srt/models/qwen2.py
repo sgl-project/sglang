@@ -27,7 +27,21 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_attn_tp_all_gather_reorganazied_into_tensor,
+    cp_split_and_rebuild_data,
+    enable_prefill_cp,
+    is_nsa_enable_prefill_cp,
+    prepare_input_dp_with_cp_dsa,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -184,8 +198,85 @@ class Qwen2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        
+        if (
+            forward_batch.forward_mode.is_prefill()
+            and is_nsa_enable_prefill_cp()
+            and enable_prefill_cp(forward_batch, is_nsa_enable_prefill_cp())
+        ):
+            return self.forward_pcp(q, k, v, forward_batch)
+        
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
+        return output
+
+    def forward_pcp(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """
+        Prefill Context Parallelism (PCP) forward pass for Qwen2.
+        
+        This method implements Zigzag-based Context Parallelism for the prefill phase:
+        1. All-Gather K and V across CP ranks to get global KV
+        2. Rerange K and V to natural order for KV cache writing
+        3. Compute attention with local Q (chunked) and global KV (natural order)
+        4. Rerange attention output to natural order
+        
+        Args:
+            q: Local query tensor after RoPE (already chunked by Zigzag)
+            k: Local key tensor after RoPE (already chunked by Zigzag)
+            v: Local value tensor after RoPE (already chunked by Zigzag)
+            forward_batch: Forward batch containing CP metadata
+        
+        Returns:
+            Attention output in natural order
+        """
+        cp_size = get_attention_tp_size()
+        
+        k_global = cp_attn_tp_all_gather_reorganazied_into_tensor(
+            k,
+            forward_batch.nsa_cp_metadata.total_seq_lens,
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        
+        v_global = cp_attn_tp_all_gather_reorganazied_into_tensor(
+            v,
+            forward_batch.nsa_cp_metadata.total_seq_lens,
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        
+        k_natural = cp_all_gather_rerange_output(
+            k_global.contiguous(),
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        
+        v_natural = cp_all_gather_rerange_output(
+            v_global.contiguous(),
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        
+        attn_output = self.attn(q, k_natural, v_natural, forward_batch)
+        
+        output_natural = cp_all_gather_rerange_output(
+            attn_output.contiguous(),
+            cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        
+        output, _ = self.o_proj(output_natural)
         return output
 
 
@@ -352,6 +443,9 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        if enable_prefill_cp(forward_batch, is_nsa_enable_prefill_cp()):
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
@@ -475,6 +569,14 @@ class Qwen2ForCausalLM(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        
+        # Context Parallelism support
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attention_tp_size()
+        else:
+            self.cp_rank = self.cp_size = None
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embedding(input_ids)
@@ -492,6 +594,19 @@ class Qwen2ForCausalLM(nn.Module):
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        if self.nsa_enable_prefill_cp:
+            # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+            # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+            # seq data needs to be divided and recombined at twice the size of cp_size.
+            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
+            if can_cp_split(cur_cp_seq_len, self.cp_size, False, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    torch.tensor(len(input_ids)),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
+        
         hidden_states = self.model(
             input_ids,
             positions,
