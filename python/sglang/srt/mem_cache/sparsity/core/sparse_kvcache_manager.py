@@ -9,7 +9,6 @@ from sglang.jit_kernel.sparse import (
     load_cache_to_device_buffer,
     load_cache_to_device_buffer_mla,
 )
-from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_module
 

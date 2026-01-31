@@ -117,8 +117,6 @@ __always_inline __device__ void store_vec(void* __restrict__ dst, const Tp& vec)
 
 namespace {
 
-#define DEBUG_SPARSE_IMA 0
-
 constexpr int WARP_SIZE = 32;
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 
@@ -307,74 +305,42 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int32_t s_total_hits;
   __shared__ int32_t s_total_evictable;
   __shared__ int32_t s_newest_hit;
-  __shared__ int32_t s_top_k_max;
   __shared__ bool s_lru_bitmap[HOT_BUFFER_SIZE];
   __shared__ int16_t s_lru_slots_out[LRU_SIZE];
-#if DEBUG_SPARSE_IMA
-  __shared__ int s_debug_once;
-  __shared__ int s_debug_count;
-#endif
 
-  // Initialize shared memory
+  // Initialize shared memory counters used across phases.
   if (tid == 0) {
     s_total_misses = 0;
     s_total_hits = 0;
     s_total_evictable = 0;
     s_newest_hit = 0;
-    s_top_k_max = 0;
-#if DEBUG_SPARSE_IMA
-    s_debug_once = 0;
-    s_debug_count = 0;
-#endif
   }
 
   const int newest_slot = HOT_BUFFER_SIZE - 1;
   // For page-wise topk, use page id.
   const int32_t newest_token =
-      (seq_len >= 0)
-          ? static_cast<int32_t>((page_size > 1) ? (seq_len / page_size) : seq_len)
-          : -1;
+      (seq_len >= 0) ? static_cast<int32_t>((page_size > 1) ? (seq_len / page_size) : seq_len) : -1;
   int32_t top_k_max_value = 0;
 
+  // Build diff_map for top-k tokens and reset shared buffers.
   for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
     if (i < NUM_TOP_K) {
       int32_t top_k_val = my_top_k_tokens[i];
-#if DEBUG_SPARSE_IMA
-      if ((top_k_val < 0 || top_k_val >= diff_map_stride) &&
-          atomicAdd(&s_debug_count, 1) < 8) {
-        printf("[ima bad topk] bid=%d rid=%lld idx=%d val=%d diff_map=%lld\n",
-               bid, (long long)rid, i, (int)top_k_val, (long long)diff_map_stride);
-      }
-#endif
       my_diff_map[top_k_val] = i;
       s_top_k_tokens[i] = top_k_val;
       top_k_max_value = max(top_k_max_value, top_k_val);
     }
     s_lru_bitmap[i] = false;
-#if DEBUG_SPARSE_IMA
-    // no-op: keep shared memory usage low for debug builds
-#endif
   }
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     s_evictable_slots[i] = -1;
   }
 
   top_k_max_value = blockReduceMaxInt(top_k_max_value);
-  if (tid == 0) {
-    s_top_k_max = top_k_max_value;
-#if DEBUG_SPARSE_IMA
-    if (atomicAdd(&s_debug_count, 1) < 8) {
-      const int newest_topk_idx =
-          (newest_token >= 0 && newest_token < diff_map_stride) ? my_diff_map[newest_token] : -1;
-      printf("[ima newest state] bid=%d rid=%lld seq_len=%lld newest_token=%d newest_idx=%d newest_slot=%d token_at_slot=%d\n",
-             bid, (long long)rid, (long long)seq_len, (int)newest_token, newest_topk_idx,
-             newest_slot, (int)my_device_buffer_tokens[newest_slot]);
-    }
-#endif
-  }
   __syncthreads();
 
-  // If topk includes seq_len - 1, bind it to newest_slot and mark as hit.
+  // If topk includes the latest token, bind it to newest_slot and mark as hit.
+  // newest_slot is excluded from LRU tracking and always reserved for seq_len - 1.
   if (tid == 0 && newest_token >= 0 && newest_token < diff_map_stride) {
     const int newest_topk_idx = my_diff_map[newest_token];
     if (newest_topk_idx >= 0) {
@@ -401,25 +367,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     const bool has_valid_slot = has_valid_chunk && (slot_idx < LRU_SIZE);
     const int32_t buf_slot = has_valid_slot ? static_cast<int32_t>(my_lru_slots[slot_idx]) : -1;
     const bool has_valid_buf_slot = has_valid_slot && (buf_slot >= 0) && (buf_slot < HOT_BUFFER_SIZE);
-#if DEBUG_SPARSE_IMA
-    if (has_valid_slot && !has_valid_buf_slot) {
-      if (atomicCAS(&s_debug_once, 0, 1) == 0) {
-        printf("[ima bad buf_slot] bid=%d rid=%lld slot_idx=%d buf_slot=%d hot=%d\n",
-               bid, (long long)rid, slot_idx, (int)buf_slot, HOT_BUFFER_SIZE);
-      }
-    }
-#endif
-
-
     int32_t my_buffer_token = has_valid_buf_slot ? my_device_buffer_tokens[buf_slot] : -1;
     int my_found_top_k_idx = my_buffer_token >= 0 ? my_diff_map[my_buffer_token] : -1;
-#if DEBUG_SPARSE_IMA
-    if ((my_buffer_token < 0 || my_buffer_token >= diff_map_stride) &&
-        atomicAdd(&s_debug_count, 1) < 8) {
-      printf("[ima bad buffer token] bid=%d rid=%lld slot=%d token=%d diff_map=%lld\n",
-             bid, (long long)rid, (int)buf_slot, (int)my_buffer_token, (long long)diff_map_stride);
-    }
-#endif
 
     // Record hits
     if (my_found_top_k_idx >= 0 && has_valid_buf_slot) {
@@ -465,14 +414,14 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  // Move staged hits to the tail so hits are most recent.
+  // Move staged hits to the tail so hits are most recent in LRU order.
   for (int i = s_total_hits - 1 - tid; i >= 0; i -= BLOCK_SIZE) {
     const int dst = LRU_SIZE - s_total_hits + i;
     s_lru_slots_out[dst] = s_lru_slots_out[i];
   }
   __syncthreads();
 
-  // Second pass to collect evictable slots
+  // Second pass to collect evictable slots (excluding newest_slot).
   for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
     s_chunk_offset[i] = 0;
   }
@@ -487,15 +436,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     const bool has_valid_slot = has_valid_chunk && (slot_idx < LRU_SIZE);
     const int32_t buf_slot = has_valid_slot ? static_cast<int32_t>(my_lru_slots[slot_idx]) : -1;
     const bool has_valid_buf_slot = has_valid_slot && (buf_slot >= 0) && (buf_slot < HOT_BUFFER_SIZE);
-#if DEBUG_SPARSE_IMA
-    if (has_valid_slot && !has_valid_buf_slot) {
-      if (atomicCAS(&s_debug_once, 0, 1) == 0) {
-        printf("[ima bad buf_slot evict] bid=%d rid=%lld slot_idx=%d buf_slot=%d hot=%d\n",
-               bid, (long long)rid, slot_idx, (int)buf_slot, HOT_BUFFER_SIZE);
-      }
-    }
-#endif
-
     bool is_evictable = has_valid_buf_slot && (buf_slot != newest_slot) && !s_lru_bitmap[buf_slot];
     int local_evictable_offset = 0;
     if (warp_id == 0) {
@@ -540,18 +480,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   __syncthreads();
   if (tid == 0) {
     s_total_evictable = total_evictable;
-#if DEBUG_SPARSE_IMA
-    if (atomicAdd(&s_debug_count, 1) < 8) {
-      const int num_misses = NUM_TOP_K - s_total_hits;
-      printf("[ima summary] bid=%d rid=%lld hits=%d num_misses=%d evictable=%d\n",
-             bid, (long long)rid, s_total_hits, num_misses, s_total_evictable);
-      printf("[ima evictable head] %d %d %d %d\n",
-             (int)s_evictable_slots[0],
-             (int)s_evictable_slots[1],
-             (int)s_evictable_slots[2],
-             (int)s_evictable_slots[3]);
-    }
-#endif
   }
 
   for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
@@ -563,7 +491,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       my_lru_slots[i] = s_lru_slots_out[i];
     }
   }
-  // Reset offsets for next phase
+  // Reset offsets for the miss counting phase.
   for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
     s_chunk_offset[i] = 0;
   }
@@ -589,7 +517,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       }
     }
 
-    // Intra-warp communication for miss counting
+    // Intra-warp communication for miss counting.
     const unsigned int miss_mask = __ballot_sync(0xFFFFFFFF, is_miss);
     if (warp_id == 0) {
       const int base_chunk = iter * NUM_WARPS;
@@ -614,13 +542,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     }
     __syncthreads();
 
+    // Clamp misses to the number of available evictable slots.
     if (tid == 0 && s_total_misses > s_total_evictable) {
-#if DEBUG_SPARSE_IMA
-      if (atomicAdd(&s_debug_count, 1) < 8) {
-        printf("[ima miss clamp] bid=%d rid=%lld misses=%d evictable=%d\n",
-               bid, (long long)rid, s_total_misses, s_total_evictable);
-      }
-#endif
       s_total_misses = s_total_evictable;
     }
     __syncthreads();
@@ -628,12 +551,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
       if (miss_offset >= s_total_evictable) {
-#if DEBUG_SPARSE_IMA
-        if (atomicAdd(&s_debug_count, 1) < 8) {
-          printf("[ima miss overflow] bid=%d rid=%lld miss_offset=%d evictable=%d\n",
-                 bid, (long long)rid, miss_offset, s_total_evictable);
-        }
-#endif
         continue;
       }
       int evict_slot = s_evictable_slots[miss_offset];
@@ -641,38 +558,8 @@ __global__ void load_cache_to_device_buffer_kernel(
       if (evict_slot >= 0 && evict_slot < HOT_BUFFER_SIZE) {
         my_top_k_device_locs[my_token_idx] = my_device_buffer_locs[evict_slot];
         my_device_buffer_tokens[evict_slot] = my_token;
-#if DEBUG_SPARSE_IMA
-        if (atomicAdd(&s_debug_count, 1) < 8) {
-          for (int i = 0; i < HOT_BUFFER_SIZE; ++i) {
-            if (i != evict_slot && my_device_buffer_tokens[i] == my_token) {
-              printf("[ima dup token post] bid=%d rid=%lld token=%d slot=%d other=%d\n",
-                     bid, (long long)rid, (int)my_token, (int)evict_slot, i);
-              break;
-            }
-          }
-        }
-#endif
       } else {
         my_top_k_device_locs[my_token_idx] = -1;
-#if DEBUG_SPARSE_IMA
-        if (atomicAdd(&s_debug_count, 1) < 8) {
-          const int num_misses = NUM_TOP_K - s_total_hits;
-          printf("[ima bad evict_slot] bid=%d rid=%lld miss_offset=%d evict_slot=%d hot=%d\n",
-                 bid, (long long)rid, miss_offset, evict_slot, HOT_BUFFER_SIZE);
-          printf("[ima state] hits=%d misses=%d num_misses=%d total_evictable=%d\n",
-                 s_total_hits, s_total_misses, num_misses, s_total_evictable);
-          printf("[ima evictable head] %d %d %d %d\n",
-                 (int)s_evictable_slots[0],
-                 (int)s_evictable_slots[1],
-                 (int)s_evictable_slots[2],
-                 (int)s_evictable_slots[3]);
-          printf("[ima lru head] %d %d %d %d\n",
-                 (int)s_lru_slots_out[0],
-                 (int)s_lru_slots_out[1],
-                 (int)s_lru_slots_out[2],
-                 (int)s_lru_slots_out[3]);
-        }
-#endif
       }
     }
     __syncthreads();
@@ -682,6 +569,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int64_t stride_per_block = tasks_per_block + 1;
   const int64_t block_base = bid * stride_per_block;
 
+  // Emit transfer tasks for each miss (page_size items per miss).
   for (int miss_idx = tid; miss_idx < s_total_misses; miss_idx += BLOCK_SIZE) {
     const int32_t miss_token = s_missed_tokens[miss_idx];
     const int evict_slot = s_evictable_slots[miss_idx];
@@ -695,26 +583,6 @@ __global__ void load_cache_to_device_buffer_kernel(
         transfer_tasks_src[task_idx] = src_loc;
         transfer_tasks_dst[task_idx] = dst_loc;
       }
-    } else {
-#if DEBUG_SPARSE_IMA
-      if (atomicAdd(&s_debug_count, 1) < 8) {
-        const int num_misses = NUM_TOP_K - s_total_hits;
-        printf("[ima bad miss] bid=%d rid=%lld miss_idx=%d miss_token=%d evict_slot=%d\n",
-               bid, (long long)rid, miss_idx, (int)miss_token, (int)evict_slot);
-        printf("[ima state] hits=%d misses=%d num_misses=%d total_evictable=%d\n",
-               s_total_hits, s_total_misses, num_misses, s_total_evictable);
-        printf("[ima evictable head] %d %d %d %d\n",
-               (int)s_evictable_slots[0],
-               (int)s_evictable_slots[1],
-               (int)s_evictable_slots[2],
-               (int)s_evictable_slots[3]);
-        printf("[ima lru head] %d %d %d %d\n",
-               (int)s_lru_slots_out[0],
-               (int)s_lru_slots_out[1],
-               (int)s_lru_slots_out[2],
-               (int)s_lru_slots_out[3]);
-      }
-#endif
     }
   }
 

@@ -19,7 +19,9 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
 ) -> Module:
-    args = make_cpp_args(item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla)
+    args = make_cpp_args(
+        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla
+    )
     return load_jit(
         "sparse_cache",
         *args,
