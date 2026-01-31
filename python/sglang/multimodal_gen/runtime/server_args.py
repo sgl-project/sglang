@@ -439,6 +439,7 @@ class ServerArgs:
             self.attention_backend_config = self._parse_attention_backend_config(
                 self.attention_backend_config
             )
+            print(f"{self.attention_backend_config=}")
 
         # handle warmup
         if self.warmup_resolutions is not None:
@@ -612,7 +613,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
-            + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+                 + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
 
         # warmup
@@ -621,8 +622,8 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.warmup,
             help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
-            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
-            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+                 "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+                 "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
         )
         parser.add_argument(
             "--warmup-resolutions",
@@ -642,7 +643,7 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
-            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+                 "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",
@@ -674,20 +675,12 @@ class ServerArgs:
             "--pin-cpu-memory",
             action=StoreBoolean,
             help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+                 "Should be enabled in almost all cases",
         )
         parser.add_argument(
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
-        )
-
-        # VSA parameters
-        parser.add_argument(
-            "--VSA-sparsity",
-            type=float,
-            default=ServerArgs.VSA_sparsity,
-            help="Validation sparsity for VSA",
         )
 
         # Master port for distributed inference
@@ -770,7 +763,7 @@ class ServerArgs:
             choices=Backend.choices(),
             default=ServerArgs.backend.value,
             help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
-            "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
+                 "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
         return parser
 
@@ -949,8 +942,8 @@ class ServerArgs:
 
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend not in (
-                "fa",
-                "sage_attn",
+                    "fa",
+                    "sage_attn",
             ):
                 raise ValueError(
                     "Ring Attention is only supported for flash attention or sage attention backend for now"
