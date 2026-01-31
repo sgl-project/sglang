@@ -444,15 +444,69 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         lora_a_stacked = [lora_info.gate_up_lora_a_weights]
         lora_b_stacked = [lora_info.gate_up_lora_b_weights]
 
+        # Define shrink_config for LoRA alignment
+        shrink_config = {"BLOCK_SIZE_M": 64}  # Default block size, can be made configurable
+
+        # Call moe_lora_align_block_size before the LoRA gate_up_proj delta path
+        # Prepare inputs for the kernel
+        block_size_m = shrink_config["BLOCK_SIZE_M"]
+        max_loras = len(lora_info.lora_ranks)
+        num_tokens = M
+        topk_num = topk_ids.shape[1]
+
+        # Calculate max_num_tokens_padded
+        max_num_tokens_padded = topk_ids.numel() + lora_info.num_experts * (block_size_m - 1)
+        max_num_tokens_padded = ((max_num_tokens_padded + block_size_m - 1) // block_size_m) * block_size_m
+        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
+
+        # Initialize output tensors (using torch.empty like the reference implementation)
+        device = topk_ids.device
+        sorted_token_ids_lora = torch.empty(
+            (max_loras * max_num_tokens_padded,),
+            dtype=torch.int32,
+            device=device,
+        )
+        expert_ids_lora = torch.empty(
+            (max_loras * max_num_m_blocks,),
+            dtype=torch.int32,
+            device=device,
+        )
+        num_tokens_post_padded_lora = torch.empty((max_loras,), dtype=torch.int32, device=device)
+
+        # Create token-to-LoRA mapping (assuming all tokens use LoRA 0 for now)
+        token_lora_mapping = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
+        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
+
+        # Call the kernel directly
+        torch.ops.sgl_kernel.moe_lora_align_block_size(
+            topk_ids,
+            token_lora_mapping,
+            lora_info.num_experts,
+            block_size_m,
+            max_loras,
+            max_num_tokens_padded,
+            max_num_m_blocks,
+            sorted_token_ids_lora,
+            expert_ids_lora,
+            num_tokens_post_padded_lora,
+            lora_info.adapter_enabled,
+            lora_ids,
+            None,  # expert_map, set to None for now
+        )
+
+        max_loras = len(lora_info.lora_ranks)
+        expert_ids_lora = expert_ids_lora.view(max_loras, -1)
+        sorted_token_ids_lora = sorted_token_ids_lora.view(max_loras, -1)
+
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=hidden_states,
             lora_a_stacked=lora_a_stacked,
             lora_b_stacked=lora_b_stacked,
             topk_weights=topk_weights,  # Use actual routing weights
-            sorted_token_ids=lora_info.token_ids.unsqueeze(0),
-            expert_ids=lora_info.expert_ids.unsqueeze(0),
-            num_tokens_post_padded=num_tokens_post_padded_formatted,
+            sorted_token_ids=sorted_token_ids_lora,
+            expert_ids=expert_ids_lora,
+            num_tokens_post_padded=num_tokens_post_padded_lora,
             max_lora_rank=actual_max_lora_rank,
             top_k_num=top_k,
             lora_ids=lora_info.lora_ids,
@@ -525,69 +579,15 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         lora_a_stacked = [lora_info.down_lora_a_weights]
         lora_b_stacked = [lora_info.down_lora_b_weights]
 
-        # Define shrink_config for LoRA alignment
-        shrink_config = {"BLOCK_SIZE_M": 64}  # Default block size, can be made configurable
-
-        # Call moe_lora_align_block_size before the LoRA down_proj delta path
-        # Prepare inputs for the kernel
-        block_size_m = shrink_config["BLOCK_SIZE_M"]
-        max_loras = len(lora_info.lora_ranks)
-        num_tokens = M
-        topk_num = topk_ids.shape[1]
-
-        # Calculate max_num_tokens_padded
-        max_num_tokens_padded = topk_ids.numel() + lora_info.num_experts * (block_size_m - 1)
-        max_num_tokens_padded = ((max_num_tokens_padded + block_size_m - 1) // block_size_m) * block_size_m
-        max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
-
-        # Initialize output tensors (using torch.empty like the reference implementation)
-        device = topk_ids.device
-        sorted_token_ids_lora = torch.empty(
-            (max_loras * max_num_tokens_padded,),
-            dtype=torch.int32,
-            device=device,
-        )
-        expert_ids_lora = torch.empty(
-            (max_loras * max_num_m_blocks,),
-            dtype=torch.int32,
-            device=device,
-        )
-        num_tokens_post_padded_lora = torch.empty((max_loras,), dtype=torch.int32, device=device)
-
-        # Create token-to-LoRA mapping (assuming all tokens use LoRA 0 for now)
-        token_lora_mapping = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
-        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
-
-        # Call the kernel directly
-        torch.ops.sgl_kernel.moe_lora_align_block_size(
-            topk_ids,
-            token_lora_mapping,
-            lora_info.num_experts,
-            block_size_m,
-            max_loras,
-            max_num_tokens_padded,
-            max_num_m_blocks,
-            sorted_token_ids_lora,
-            expert_ids_lora,
-            num_tokens_post_padded_lora,
-            lora_info.adapter_enabled,
-            lora_ids,
-            None,  # expert_map, set to None for now
-        )
-
-        max_loras = len(lora_info.lora_ranks)
-        expert_ids_lora = expert_ids_lora.view(max_loras, -1)
-        sorted_token_ids_lora = sorted_token_ids_lora.view(max_loras, -1)
-
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=intermediate_input,
             lora_a_stacked=lora_a_stacked,
             lora_b_stacked=lora_b_stacked,
             topk_weights=topk_weights,  # Use the routing weights passed to this function
-            sorted_token_ids=sorted_token_ids_lora,
-            expert_ids=expert_ids_lora,
-            num_tokens_post_padded=num_tokens_post_padded_lora,
+            sorted_token_ids=lora_info.token_ids.unsqueeze(0),
+            expert_ids=lora_info.expert_ids.unsqueeze(0),
+            num_tokens_post_padded=num_tokens_post_padded_formatted,
             max_lora_rank=actual_max_lora_rank,
             top_k_num=top_k,
             lora_ids=lora_info.lora_ids,
