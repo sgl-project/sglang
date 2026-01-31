@@ -22,6 +22,7 @@ import signal
 import subprocess
 import argparse
 import shutil
+import requests
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -167,7 +168,33 @@ def wait_for_server(timeout: int = 1800):
     return False
 
 
-def run_benchmark(model_path: str, num_prompts: int, input_len: int, output_len: int, result_file: str, seed: int = 42):
+def start_profiling(output_dir: str, num_steps: int = 5, activities: list = None):
+    """Start torch profiling via HTTP API."""
+    if activities is None:
+        activities = ["CPU", "GPU"]
+    
+    url = f"http://{SERVER_HOST}:{SERVER_PORT}/start_profile"
+    json_data = {
+        "output_dir": output_dir,
+        "num_steps": str(num_steps),
+        "activities": activities,
+        "profile_by_stage": False,
+        "merge_profiles": False,
+    }
+    
+    print(f"Starting profiler: {num_steps} steps, activities={activities}, output_dir={output_dir}")
+    try:
+        response = requests.post(url=url, json=json_data, timeout=300)
+        response.raise_for_status()
+        print(f"Profiler completed. Traces saved to: {output_dir}")
+        return True
+    except Exception as e:
+        print(f"Warning: Profiling failed: {e}")
+        return False
+
+
+def run_benchmark(model_path: str, num_prompts: int, input_len: int, output_len: int, result_file: str, seed: int = 42, 
+                  enable_profile: bool = False, profile_num_steps: int = 5, profile_activities: list = None, profile_output_dir: str = None):
     """Run benchmark."""
     print(f"\nRunning benchmark: {num_prompts} prompts (seed={seed})...")
     
@@ -188,6 +215,13 @@ def run_benchmark(model_path: str, num_prompts: int, input_len: int, output_len:
     env["PYTHONPATH"] = f"{SGLANG_GDN_PATH}/python:{env.get('PYTHONPATH', '')}"
     
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1200)
+    
+    # Run profiling if enabled
+    if enable_profile and profile_output_dir:
+        print("\n" + "="*60)
+        print("Running profiling...")
+        print("="*60)
+        start_profiling(profile_output_dir, profile_num_steps, profile_activities or ["CPU", "GPU"])
     
     # Save benchmark output
     output_file = result_file.replace(".jsonl", "_output.txt")
@@ -424,6 +458,24 @@ def main():
     parser.add_argument("--mmlu-num-examples", type=int, default=1000)
     parser.add_argument("--mmlu-num-threads", type=int, default=128)
     parser.add_argument("--mmlu-max-tokens", type=int, default=512)
+    # Torch profiling
+    parser.add_argument(
+        "--enable-profile",
+        action="store_true",
+        help="Enable torch profiling after benchmark",
+    )
+    parser.add_argument(
+        "--profile-num-steps",
+        type=int,
+        default=5,
+        help="Number of forward steps to profile (default: 5)",
+    )
+    parser.add_argument(
+        "--profile-activities",
+        nargs="+",
+        default=["CPU", "GPU"],
+        help="Profiling activities: CPU, GPU, MEM (default: CPU GPU)",
+    )
     args = parser.parse_args()
 
     # Update global host/port for this run
@@ -490,7 +542,11 @@ def main():
                         args.model_path,
                         args.num_prompts, args.input_len, args.output_len,
                         os.path.join(log_dir, "benchmark_klast.jsonl"),
-                        seed=args.seed
+                        seed=args.seed,
+                        enable_profile=args.enable_profile,
+                        profile_num_steps=args.profile_num_steps,
+                        profile_activities=args.profile_activities,
+                        profile_output_dir=os.path.join(log_dir, "profile_klast") if args.enable_profile else None
                     )
             cleanup_server(process)
             time.sleep(5)
@@ -531,7 +587,11 @@ def main():
                         args.model_path,
                         args.num_prompts, args.input_len, args.output_len,
                         os.path.join(log_dir, "benchmark_vlast.jsonl"),
-                        seed=args.seed
+                        seed=args.seed,
+                        enable_profile=args.enable_profile,
+                        profile_num_steps=args.profile_num_steps,
+                        profile_activities=args.profile_activities,
+                        profile_output_dir=os.path.join(log_dir, "profile_vlast") if args.enable_profile else None
                     )
             cleanup_server(process)
         
