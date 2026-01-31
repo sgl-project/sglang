@@ -1,15 +1,14 @@
-from collections import defaultdict
-from datetime import datetime
 import json
 import logging
 import os
 import re
 import time
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-import requests
 import torch
 
 from sglang.srt.environ import envs
@@ -18,11 +17,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 # Third Party
 try:
-    from simm.kv import Store, BlockView, register_mr, set_flag
+    from simm.kv import BlockView, Store, register_mr, set_flag
 except ImportError as e:
     raise ImportError(
         "Please install simm by following the instructions at "
@@ -55,12 +54,8 @@ class SiMMConfig:
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
 
-        if (
-            "manager_address" not in config
-        ):
-            raise ValueError(
-                "Manager_address is required in config file"
-            )
+        if "manager_address" not in config:
+            raise ValueError("Manager_address is required in config file")
 
         return SiMMConfig(
             manager_address=config.get(
@@ -71,13 +66,12 @@ class SiMMConfig:
             ),
             enable_profile=config.get(
                 "enable_profile", envs.SIMM_ENABLE_PROFILE.default
-            )
+            ),
         )
 
     @staticmethod
     def load_from_env() -> "SiMMConfig":
-        """Load config from a file specified in the environment variable.
-        """
+        """Load config from a file specified in the environment variable."""
         # other required environment variables...
         if not envs.SIMM_CLUSTER_MANAGER.is_set():
             raise ValueError(
@@ -93,12 +87,8 @@ class SiMMConfig:
     @staticmethod
     def load_from_extra_config(extra_config: dict) -> "SiMMConfig":
         """Load config from extra_config dictionary."""
-        if (
-            "manager_address" not in extra_config
-        ):
-            raise ValueError(
-                "manager_address is required in extra_config"
-            )
+        if "manager_address" not in extra_config:
+            raise ValueError("manager_address is required in extra_config")
 
         return SiMMConfig(
             manager_address=extra_config.get(
@@ -109,7 +99,7 @@ class SiMMConfig:
             ),
             enable_profile=extra_config.get(
                 "enable_profile", envs.SIMM_ENABLE_PROFILE.default
-            )
+            ),
         )
 
 
@@ -119,9 +109,9 @@ def get_current_process_numa() -> int:
     """
     try:
         # get current cpu
-        with open("/proc/self/stat", 'r') as f:
+        with open("/proc/self/stat", "r") as f:
             stat_data = f.read()
-        
+
         # the 39th field is processor
         fields = stat_data.split()
         if len(fields) < 39:
@@ -131,15 +121,16 @@ def get_current_process_numa() -> int:
         if os.path.exists(numa_path) and os.path.islink(numa_path):
             link_target = os.readlink(numa_path)
             # parse numa node from path
-            match = re.search(r'node(\d+)$', link_target)
+            match = re.search(r"node(\d+)$", link_target)
             if match:
                 return int(match.group(1))
-        
+
         return -1
     except Exception:
         return -1
 
-def get_numa_nic_mapping() -> Dict[int, List[str]] :
+
+def get_numa_nic_mapping() -> Dict[int, List[str]]:
     """
     Return value: Dict[numa_node, List(rdma_device_name)]
     """
@@ -156,7 +147,7 @@ def get_numa_nic_mapping() -> Dict[int, List[str]] :
 
         try:
             if os.path.exists(numa_path):
-                with open(numa_path, 'r') as f:
+                with open(numa_path, "r") as f:
                     content = f.read().strip()
                     numa_node = int(content)
         except (IOError, ValueError):
@@ -178,7 +169,10 @@ class HiCacheSiMM(HiCacheStorage):
                 else None
             )
             # Load configuration with manager_address prioritized from extra_config if available
-            if extra_config is not None and extra_config.get("manager_address") is not None:
+            if (
+                extra_config is not None
+                and extra_config.get("manager_address") is not None
+            ):
                 # Load from extra_config
                 self.config = SiMMConfig.load_from_extra_config(extra_config)
                 logger.info("SiMM Configuration loaded from extra_config successfully.")
@@ -204,16 +198,18 @@ class HiCacheSiMM(HiCacheStorage):
             if current_numa >= 0:
                 rdma_devices = nic_mapping.get(current_numa)
                 if rdma_devices is not None and len(rdma_devices) > 0:
-                    rdma_device_str = ','.join(rdma_devices)
+                    rdma_device_str = ",".join(rdma_devices)
                     os.environ["SICL_NET_DEVICES"] = rdma_device_str
                     logger.info(f"SiMM using rdma {rdma_device_str}")
 
             # Set simm log path: /var/log/simm/{filename_ts}-{pid}/simm_clnt.log
             filename_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            log_file_path: str = f"/var/log/simm/{filename_ts}-{os.getpid()}/simm_clnt.log"
-            
-            cm_ip = self.config.manager_address.split(':')[0]
-            cm_port = self.config.manager_address.split(':')[1]
+            log_file_path: str = (
+                f"/var/log/simm/{filename_ts}-{os.getpid()}/simm_clnt.log"
+            )
+
+            cm_ip = self.config.manager_address.split(":")[0]
+            cm_port = self.config.manager_address.split(":")[1]
             set_flag("cm_primary_node_ip", cm_ip)
             set_flag("cm_primary_node_port", cm_port)
             set_flag("clnt_log_file", log_file_path)
@@ -259,7 +255,9 @@ class HiCacheSiMM(HiCacheStorage):
         logger.info("begin warm up SiMM client")
         start_time = time.perf_counter_ns()
         warmup_key = "sglang_simm_warmup_key" + uuid.uuid4().hex
-        warmup_tensor = torch.frombuffer(bytearray(warmup_key.encode()), dtype=torch.uint8)
+        warmup_tensor = torch.frombuffer(
+            bytearray(warmup_key.encode()), dtype=torch.uint8
+        )
         warmup_size = 4 * 1024  # 4 KB
         block = self.store.allocate(warmup_size)
         block_ = block.as_ref()
@@ -273,7 +271,9 @@ class HiCacheSiMM(HiCacheStorage):
             logger.warning(f"SiMM client warmup get key {warmup_key} failed")
         if not all(got_block.as_ref()[: len(warmup_key)] == warmup_tensor):
             logger.warning(f"SiMM client warmup key {warmup_key} data wrong")
-        logger.info(f"finish SiMM client warm up, cost {(time.perf_counter_ns() - start_time)/1000:.2f} us")
+        logger.info(
+            f"finish SiMM client warm up, cost {(time.perf_counter_ns() - start_time)/1000:.2f} us"
+        )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -286,9 +286,7 @@ class HiCacheSiMM(HiCacheStorage):
             self.mr_ext = register_mr(buffer)
             if self.mr_ext is None:
                 logger.error(f"Failed to register buffer")
-                raise RuntimeError(
-                    f"Failed to register buffer to SiMM"
-                )
+                raise RuntimeError(f"Failed to register buffer to SiMM")
         except TypeError as err:
             logger.error("Failed to register buffer to SiMM: %s", err)
             raise TypeError("SiMM Register Buffer Error.") from err
@@ -548,7 +546,9 @@ class HiCacheSiMM(HiCacheStorage):
     ) -> List[int]:
         block_views = []
         for i in range(len(buffer_ptrs)):
-            block_view = BlockView.from_buffer(buffer_ptrs[i], buffer_sizes[i], self.mr_ext)
+            block_view = BlockView.from_buffer(
+                buffer_ptrs[i], buffer_sizes[i], self.mr_ext
+            )
             block_views.append(block_view)
         return self.store.mput(key_strs, block_views)
 
@@ -557,7 +557,9 @@ class HiCacheSiMM(HiCacheStorage):
     ) -> List[int]:
         block_views = []
         for i in range(len(buffer_ptrs)):
-            block_view = BlockView.from_buffer(buffer_ptrs[i], buffer_sizes[i], self.mr_ext)
+            block_view = BlockView.from_buffer(
+                buffer_ptrs[i], buffer_sizes[i], self.mr_ext
+            )
             block_views.append(block_view)
         return self.store.mget(key_strs, block_views)
 
