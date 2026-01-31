@@ -573,6 +573,7 @@ def traverse_tree(
     draft_tokens: torch.Tensor,
     grammar: BaseGrammarObject,
     allocate_token_bitmask: torch.Tensor,
+    vocab_size: Optional[int] = None,
 ):
     """
     Traverse the tree constructed by the draft model to generate the logits mask.
@@ -594,10 +595,13 @@ def traverse_tree(
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             curr_token_id = draft_tokens[curr]
-            # 32 boolean bitmask values are packed into 32-bit integers
-            accepted = (
-                parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
-            ) != 0
+            if vocab_size and curr_token_id >= vocab_size:
+                accepted = False
+            else:
+                # 32 boolean bitmask values are packed into 32-bit integers
+                accepted = (
+                    parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
+                ) != 0
 
         if accepted:
             if curr != 0:
@@ -670,6 +674,7 @@ def generate_token_bitmask(
                 allocate_token_bitmask[
                     i * num_draft_tokens : (i + 1) * num_draft_tokens
                 ],
+                vocab_size=vocab_size,
             )
             tree_traverse_time = time.perf_counter() - s
             if tree_traverse_time > TREE_TRAVERSE_TIME_THRESHOLD:

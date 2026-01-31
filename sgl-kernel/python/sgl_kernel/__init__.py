@@ -32,7 +32,6 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     rotary_embedding,
     silu_and_mul,
-    timestep_embedding,
 )
 from sgl_kernel.expert_specialization import (
     es_fp8_blockwise_scaled_grouped_mm,
@@ -79,7 +78,13 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
-from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
+from sgl_kernel.mamba import (
+    causal_conv1d_fn_cpu,
+    causal_conv1d_fwd,
+    causal_conv1d_update,
+    causal_conv1d_update_cpu,
+    chunk_gated_delta_rule_cpu,
+)
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,

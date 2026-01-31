@@ -84,6 +84,7 @@ wfaas = "1.0.0"
 data-connector = "1.0.0"
 smg-mcp = "1.0.0"
 smg-wasm = "1.0.0"
+smg-mesh = "1.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2.2"
 openssl = "0.10.73"
@@ -141,6 +142,10 @@ tonic-v12 = { version = "0.12.3", package = "tonic" }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 
+[[bench]]
+name = "consistent_hash_bench"
+harness = false
+path = "benches/consistent_hash_bench.rs"
 [[bench]]
 name = "wasm_middleware_latency"
 harness = false

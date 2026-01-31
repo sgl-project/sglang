@@ -287,7 +287,7 @@ jobs:
 
       - name: Run E2E tests
         run: |
-          bash scripts/killall_sglang.sh "nuk_gpus"
+          bash scripts/killall_sglang.sh all
           cd sgl-model-gateway
           ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
 

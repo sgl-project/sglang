@@ -63,6 +63,51 @@ class TestAbort(CustomTestCase):
         )
 
 
+class TestAbortWithApiKey(CustomTestCase):
+    def workload_func(self, base_url, model, api_key: str):
+        def process_func():
+            def run_one(_):
+                prompt = """
+                System: You are a helpful assistant.
+                User: What is the capital of France?
+                Assistant: The capital of France is
+                """
+
+                response = requests.post(
+                    f"{base_url}/generate",
+                    json={
+                        "text": prompt,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": 2048,
+                        },
+                    },
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                response.json()
+
+            with ThreadPoolExecutor(16) as executor:
+                list(executor.map(run_one, list(range(16))))
+
+        p = multiprocessing.Process(target=process_func)
+        p.start()
+        time.sleep(0.5)
+        p.terminate()
+        time.sleep(10)
+
+    def test_memory_leak_with_api_key(self):
+        api_key = "test-api-key"
+        run_and_check_memory_leak(
+            lambda base_url, model: self.workload_func(base_url, model, api_key),
+            disable_radix_cache=False,
+            enable_mixed_chunk=False,
+            disable_overlap=False,
+            chunked_prefill_size=8192,
+            assert_has_abort=True,
+            api_key=api_key,
+        )
+
+
 class TestAbortAll(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -236,6 +281,42 @@ class TestAbortWithQueueTimeout(CustomTestCase):
                     error_count += 1
                     self.assertEqual(result["code"], 503)
             self.assertEqual(error_count, 1)
+
+
+class TestAbortWithForwardTimeout(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_FORWARD_TIMEOUT_MS.override(
+            1
+        ), envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--skip-server-warmup"],
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_forward_timeout(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Today is ",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 512,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        result = response.json()
+        self.assertEqual(result["object"], "error")
+        self.assertEqual(result["code"], 503)
 
 
 if __name__ == "__main__":

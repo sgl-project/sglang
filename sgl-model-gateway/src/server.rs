@@ -16,6 +16,9 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use smg_mesh::{
+    rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
+};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 
@@ -28,16 +31,6 @@ use crate::{
         worker::WorkerType,
         worker_manager::WorkerManager,
         Job,
-    },
-    mesh::{
-        endpoints::{
-            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
-            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
-            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
-        },
-        rate_limit_window::RateLimitWindow,
-        service::{MeshServerConfig, MeshServerHandler},
-        sync::MeshSyncManager,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -58,7 +51,17 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
+    routers::{
+        conversations,
+        mesh::{
+            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
+            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
+            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
+        },
+        parse,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
+    },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},

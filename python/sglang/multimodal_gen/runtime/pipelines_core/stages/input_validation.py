@@ -11,6 +11,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -45,6 +46,25 @@ class InputValidationStage(PipelineStage):
     def __init__(self, vae_image_processor=None):
         super().__init__()
         self.vae_image_processor = vae_image_processor
+
+    @staticmethod
+    def _calculate_dimensions_from_area(
+        max_area: float, aspect_ratio: float, mod_value: int
+    ) -> tuple[int, int]:
+        """
+        Calculate output dimensions based on maximum area and aspect ratio.
+
+        Args:
+            max_area: Maximum area constraint for the output
+            aspect_ratio: Target aspect ratio (height/width)
+            mod_value: Value to round dimensions to (typically vae_scale * patch_size)
+
+        Returns:
+            Tuple of (width, height) rounded to multiples of mod_value
+        """
+        height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+        width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        return width, height
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
         """Generate seeds for the inference"""
@@ -138,7 +158,7 @@ class InputValidationStage(PipelineStage):
 
             scale = max(ow / iw, oh / ih)
             img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-            logger.info("resized img height: %s, img width: %s", img.height, img.width)
+            logger.debug("resized img height: %s, img width: %s", img.height, img.width)
 
             # center-crop
             x1 = (img.width - ow) // 2
@@ -168,12 +188,44 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
-            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+            width, height = self._calculate_dimensions_from_area(
+                max_area, aspect_ratio, mod_value
+            )
 
             batch.condition_image = batch.condition_image.resize((width, height))
             batch.height = height
             batch.width = width
+
+        elif issubclass(type(server_args.pipeline_config), MOVAPipelineConfig):
+            # resize image only, MOVA
+            image = batch.condition_image
+            if isinstance(image, list):
+                image = image[0]  # not support multi image input yet.
+
+            max_area = server_args.pipeline_config.max_area
+            if hasattr(batch, "height") and hasattr(batch, "width"):
+                aspect_ratio = batch.height / batch.width
+            else:
+                aspect_ratio = (
+                    batch.sampling_params.height / batch.sampling_params.width
+                )
+            mod_value = (
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+                * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
+            )
+            width, height = self._calculate_dimensions_from_area(
+                max_area, aspect_ratio, mod_value
+            )
+
+            config = server_args.pipeline_config
+            image, (final_w, final_h) = (
+                server_args.pipeline_config.preprocess_condition_image(
+                    image, width, height, self.vae_image_processor
+                )
+            )
+            batch.condition_image = image
+            batch.width = final_w
+            batch.height = final_h
 
     def forward(
         self,

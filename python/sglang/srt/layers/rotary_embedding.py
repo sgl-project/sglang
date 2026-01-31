@@ -17,9 +17,11 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -31,6 +33,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
@@ -119,6 +122,7 @@ class RotaryEmbedding(MultiPlatformOp):
             and not (_is_cpu)
             and not (_is_xpu)
             and not (_is_npu)
+            and not (_is_musa)
         ):
             if _is_cuda or _is_hip:
                 from sgl_kernel import rotary_embedding
@@ -819,7 +823,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda" if not _is_npu else "npu",
+        device: Optional[str] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -836,7 +840,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self.sin_cached_total = None
         self.cos_cached = None
         self.sin_cached = None
-        self.device = device
+        self.device = device if device is not None else get_device()
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
