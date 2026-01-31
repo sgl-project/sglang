@@ -3,7 +3,17 @@ import os
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+
+if current_platform.is_npu():
+    import torch_npu
+
+    patches = [
+        ["profiler.profile", torch_npu.profiler.profile],
+        ["profiler.schedule", torch_npu.profiler.schedule],
+    ]
+    torch_npu._apply_patches(patches)
 
 logger = init_logger(__name__)
 
@@ -42,12 +52,18 @@ class SGLDiffusionProfiler:
         activities = [torch.profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
+        if current_platform.is_npu():
+            activities.append(torch_npu.profiler.ProfilerActivity.NPU)
 
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
             with_stack=True,
-            on_trace_ready=None,
+            on_trace_ready=(
+                None
+                if not current_platform.is_npu()
+                else torch_npu.profiler.tensorboard_trace_handler(self.log_dir)
+            ),
         )
         if self.full_profile:
             # profile all stages
@@ -108,6 +124,8 @@ class SGLDiffusionProfiler:
         logger.info("Stopping Profiler...")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        if current_platform.is_npu():
+            torch.npu.synchronize()
         self.profiler.stop()
 
         if export_trace:
@@ -129,7 +147,8 @@ class SGLDiffusionProfiler:
                     f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
                 )
             )
-            self.profiler.export_chrome_trace(trace_path)
+            if not current_platform.is_npu():
+                self.profiler.export_chrome_trace(trace_path)
 
             if self._check_trace_integrity(trace_path):
                 logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
