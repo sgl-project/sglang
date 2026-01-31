@@ -6,8 +6,8 @@ MindSpore is a high-performance AI framework optimized for Ascend NPUs. This doc
 
 ## Requirements
 
-MindSpore currently only supports Ascend NPU devices. Users need to first install Ascend CANN software packages.
-The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com). The recommended version is 8.3.RC2.
+MindSpore currently only supports Ascend NPU devices. Users need to first install CANN 8.5.
+The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com).
 
 ## Supported Models
 
