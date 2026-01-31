@@ -319,7 +319,10 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     DiffusionTestCase(
         "qwen_image_t2i",
         DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image", modality="image", warmup=True
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup=True,
+            # model_path="Qwen/Qwen-Image", modality="image"
         ),
         T2I_sampling_params,
     ),
@@ -434,6 +437,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
             custom_validator="video",
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -446,6 +450,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             modality="video",
             custom_validator="video",
             text_encoder_cpu_offload=True,
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -458,6 +463,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
             modality="video",
             custom_validator="video",
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -475,6 +481,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             custom_validator="video",
             num_gpus=1,
             dynamic_lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
@@ -505,6 +512,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             model_path="FastVideo/FastHunyuan-diffusers",
             modality="video",
             custom_validator="video",
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -517,6 +525,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             model_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
             modality="video",
             custom_validator="video",
+            warmup=True,
         ),
         TI2V_sampling_params,
     ),
@@ -526,6 +535,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             model_path="FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
             modality="video",
             custom_validator="video",
+            warmup=True,
         ),
         TI2V_sampling_params,
     ),
@@ -540,6 +550,7 @@ if not current_platform.is_hip():
                 model_path="IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
                 modality="video",
                 custom_validator="video",
+                warmup=True,
             ),
             DiffusionSamplingParams(
                 prompt=T2V_PROMPT,
@@ -554,6 +565,7 @@ TWO_GPU_CASES_A = [
             model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             modality="video",
             custom_validator="video",
+            warmup=True,
         ),
         TI2V_sampling_params,
     ),
@@ -564,6 +576,7 @@ TWO_GPU_CASES_A = [
             modality="video",
             custom_validator="video",
             num_gpus=2,
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -578,6 +591,7 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
             num_gpus=2,
             lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
@@ -590,6 +604,7 @@ TWO_GPU_CASES_A = [
             modality="video",
             num_gpus=2,
             custom_validator="video",
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -604,6 +619,7 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
             num_gpus=2,
             cfg_parallel=True,
+            warmup=True,
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
@@ -622,6 +638,7 @@ if not current_platform.is_hip():
                 custom_validator="video",
                 num_gpus=2,
                 tp_size=2,
+                warmup=True,
             ),
             TURBOWAN_I2V_sampling_params,
         )
@@ -635,6 +652,7 @@ TWO_GPU_CASES_B = [
             modality="video",
             custom_validator="video",
             num_gpus=2,
+            warmup=True,
         ),
         TI2V_sampling_params,
     ),
@@ -647,6 +665,7 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
+            warmup=True,
         ),
         TI2V_sampling_params,
     ),
@@ -657,6 +676,7 @@ TWO_GPU_CASES_B = [
             modality="video",
             custom_validator="video",
             num_gpus=2,
+            warmup=True,
         ),
         TI2V_sampling_params,
     ),
