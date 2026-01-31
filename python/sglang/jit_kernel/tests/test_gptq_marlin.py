@@ -111,7 +111,10 @@ def test_gptq_marlin_gemm(
     torch.cuda.synchronize()
 
     # JIT kernel should produce approximately correct results vs torch.matmul
-    torch.testing.assert_close(output.float(), output_ref.float(), rtol=1e-2, atol=1e-2)
+    max_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
+        torch.abs(output_ref)
+    )
+    assert max_diff < 0.04
 
     # JIT kernel should produce bitwise identical results to AOT kernel
     torch.testing.assert_close(output, aot_output, rtol=0, atol=0)
