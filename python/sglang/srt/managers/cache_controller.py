@@ -472,7 +472,7 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic"]) or (
+            if (self.storage_backend_type in ["file", "hf3fs", "mooncake", "eic"]) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -789,9 +789,14 @@ class HiCacheController:
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ):
+        """Zero-copy batch get: read data directly into host memory tensors."""
+        if not hash_values:
+            return
+
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
+
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -800,6 +805,7 @@ class HiCacheController:
                 )
                 break
             inc += self.page_size
+
         operation.increment(inc)
 
     # todo: deprecate
@@ -982,9 +988,10 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
-        return all(
-            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+        results = self.storage_backend.batch_set_v1(
+            hash_values, host_indices, extra_info
         )
+        return all(results)
 
     # Backup batch by batch
     def _page_backup(self, operation):
