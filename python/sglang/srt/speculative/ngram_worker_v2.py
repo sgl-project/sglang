@@ -277,9 +277,22 @@ class NGRAMWorkerV2(NGRAMWorker):
                 accept_index,
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
-            predict, accept_index = verify_input.filter_invalid_predict(
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
+            # use accept_index to get valid predict
+            predict = verify_input.filter_invalid_predict(
                 logits_output, predict, accept_index
             )
+            # pad predict to [bs, num_draft_token], can be rewritten as a kernel
+            verify_next_token_ids = torch.zeros(
+                bs, self.draft_token_num, dtype=torch.int32
+            ).to(device=self.device, non_blocking=True)
+            for i in range(len(model_worker_batch.reqs)):
+                acc_len = accept_length[i]
+                start = i * self.draft_token_num
+                verify_next_token_ids[i, :acc_len] = predict[start : start + acc_len]
+            # copy kvcache will not use the new_seq_lens
             move_accepted_tokens_to_target_kvcache(
                 model_worker_batch,
                 accept_index,
@@ -287,11 +300,8 @@ class NGRAMWorkerV2(NGRAMWorker):
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
 
             model_worker_batch.forward_mode = ForwardMode.DECODE
-            verify_next_token_ids = predict
 
         else:
             batch_result = self.target_worker.forward_batch_generation(
