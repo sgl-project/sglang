@@ -81,6 +81,7 @@ class WanVAEConfig(VAEConfig):
     use_tiling: bool = False
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
+    use_parallel_decode: bool = False
 
     def __post_init__(self):
         self.blend_num_frames = (
