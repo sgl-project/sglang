@@ -1,5 +1,8 @@
 import time
-from typing import Any, Dict, List, Optional
+import uuid
+from abc import ABC
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -77,7 +80,7 @@ class VideoGenerationsRequest(BaseModel):
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
     num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = 1.0
+    guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
     true_cfg_scale: Optional[float] = (
         None  # for CFG vs guidance distillation (e.g., QwenImage)
@@ -95,3 +98,23 @@ class VideoListResponse(BaseModel):
 
 class VideoRemixRequest(BaseModel):
     prompt: str
+
+
+@dataclass
+class BaseReq(ABC):
+    rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
+
+    def regenerate_rid(self):
+        """Generate a new request ID and return it."""
+        if isinstance(self.rid, list):
+            self.rid = [uuid.uuid4().hex for _ in range(len(self.rid))]
+        else:
+            self.rid = uuid.uuid4().hex
+        return self.rid
+
+
+@dataclass
+class VertexGenerateReqInput(BaseReq):
+    instances: List[dict]
+    parameters: Optional[dict] = None

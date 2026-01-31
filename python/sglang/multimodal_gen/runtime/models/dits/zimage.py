@@ -4,7 +4,6 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
@@ -26,6 +25,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -170,26 +170,18 @@ class ZImageAttention(nn.Module):
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
         if self.qk_norm:
-            if (
-                q.is_cuda
-                and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
-                and can_use_fused_inplace_qknorm(self.head_dim, q.dtype)
-            ):
-                q, k = apply_qk_norm(
-                    q=q,
-                    k=k,
-                    q_norm=self.norm_q,
-                    k_norm=self.norm_k,
-                    head_dim=self.head_dim,
-                    allow_inplace=True,
-                )
-            else:
-                q = self.norm_q(q)
-                k = self.norm_k(k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            if q.is_cuda and q.shape == k.shape:
+            if _is_cuda and q.shape == k.shape:
                 cos_sin_cache = torch.cat(
                     [
                         cos.to(dtype=torch.float32).contiguous(),

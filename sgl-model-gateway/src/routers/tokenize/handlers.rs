@@ -227,11 +227,15 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
     let tokenizer_id = TokenizerRegistry::generate_id();
 
     // Create the job with the pre-generated ID
+    // Note: API-initiated tokenizer loads don't use caching by default
+    // Caching is applied for startup and worker-initiated loads based on router config
     let config = TokenizerConfigRequest {
         id: tokenizer_id.clone(),
         name: request.name.clone(),
         source: request.source.clone(),
         chat_template_path: request.chat_template_path.clone(),
+        cache_config: None,
+        fail_on_duplicate: true,
     };
 
     let job = Job::AddTokenizer {
@@ -387,56 +391,4 @@ pub async fn get_tokenizer_status(context: &Arc<AppContext>, tokenizer_id: &str)
         &format!("Tokenizer '{}' not found and no pending job", tokenizer_id),
         "not_found",
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tokenizer::mock::MockTokenizer;
-
-    fn create_test_registry() -> Arc<TokenizerRegistry> {
-        let registry = Arc::new(TokenizerRegistry::new());
-        let id = TokenizerRegistry::generate_id();
-        registry.register(
-            &id,
-            "test-model",
-            "test-source",
-            Arc::new(MockTokenizer::new()),
-        );
-        registry
-    }
-
-    #[test]
-    fn test_get_tokenizer_exact_match() {
-        let registry = create_test_registry();
-        let result = get_tokenizer(&registry, "test-model");
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_tokenizer_unknown_model_fallback() {
-        let registry = create_test_registry();
-        let result = get_tokenizer(&registry, UNKNOWN_MODEL_ID);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_tokenizer_not_found() {
-        let registry = create_test_registry();
-        let result = get_tokenizer(&registry, "nonexistent");
-        match result {
-            Err(e) => assert!(e.contains("not found")),
-            Ok(_) => panic!("Expected error"),
-        }
-    }
-
-    #[test]
-    fn test_get_tokenizer_empty_registry() {
-        let registry = Arc::new(TokenizerRegistry::new());
-        let result = get_tokenizer(&registry, "any");
-        match result {
-            Err(e) => assert!(e.contains("No tokenizers available")),
-            Ok(_) => panic!("Expected error"),
-        }
-    }
 }

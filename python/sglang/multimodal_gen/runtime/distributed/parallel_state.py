@@ -242,8 +242,12 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS, don't pass device_id as it doesn't support device indices
-        extra_args = {} if current_platform.is_mps() else dict(device_id=device_id)
+        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
+        extra_args = (
+            {}
+            if (current_platform.is_mps() or current_platform.is_musa())
+            else dict(device_id=device_id)
+        )
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
