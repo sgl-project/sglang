@@ -49,10 +49,19 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+    use_intel_amx_backend,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_cpu = is_cpu() and cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 
@@ -68,12 +77,18 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 
+elif _is_cpu:
+    from sglang.srt.layers.amx_utils import (
+        CPUQuantMethod,
+        _amx_process_weight_after_loading,
+    )
+
 elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP, CPU and XPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +141,10 @@ class AWQConfig(QuantizationConfig):
         return "awq"
 
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16] if not _is_npu else [torch.float16, torch.bfloat16]
+        if _is_npu or _is_cpu:
+            return [torch.float16, torch.bfloat16]
+        else:
+            return [torch.float16]
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -175,6 +193,8 @@ class AWQConfig(QuantizationConfig):
             if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
+        elif isinstance(layer, FusedMoE):
+            return AWQMoEMethod(self) if not _is_cpu else AWQMoEIntelAMXMethod(self)
         return None
 
 
@@ -428,9 +448,14 @@ class AWQLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        if _is_cpu:
+            _amx_process_weight_after_loading(
+                layer, ["qweight", "qzeros", "scales"], None, "awq"
+            )
+        else:
+            layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
+            layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
+            layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
     def apply(
         self,
@@ -438,6 +463,15 @@ class AWQLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+                x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                bias,
+            )
+
         qweight = layer.qweight
         scales = layer.scales
         qzeros = layer.qzeros
@@ -941,6 +975,55 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             topk_ids=topk_ids,
             top_k=topk_ids.shape[1],
             use_wna16=True,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+class AWQMoEIntelAMXMethod(AWQMoEMethod):
+    def __init__(self, quant_config: AWQConfig):
+        self.quant_config = quant_config
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        _amx_process_weight_after_loading(
+            layer, ["w13_qweight", "w13_qzeros", "w13_scales"], None, "awq"
+        )
+        _amx_process_weight_after_loading(
+            layer, ["w2_qweight", "w2_qzeros", "w2_scales"], None, "awq"
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+        output = torch.ops.sgl_kernel.fused_experts_cpu(
+            x,
+            layer.w13_qweight,
+            layer.w2_qweight,
+            topk_weights,
+            topk_ids,
+            False,  # inplace See [Note] inplace should be False in fused_experts.
+            CPUQuantMethod.INT4_W4A8,
+            layer.w13_scales,  # w1_scale
+            layer.w2_scales,  # w2_scale
+            layer.w13_qzeros,
+            layer.w2_qzeros,
+            None,  # block_size
+            True,  # is_vnni
         )
         return StandardCombineInput(hidden_states=output)
 
