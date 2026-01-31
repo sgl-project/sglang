@@ -70,16 +70,12 @@ global_workspace_buffer = None
 
 # Control whether to use fused metadata copy kernel (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
-_USE_FUSED_METADATA_COPY = os.environ.get(
-    "SGLANG_USE_FUSED_METADATA_COPY", "1"
-).lower() in ("1", "true")
+_USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get()
 
 # Control whether to verify fused metadata copy against individual copies (default: disabled)
 # Set SGLANG_VERIFY_FUSED_METADATA_COPY=1 or true to enable verification
 # This will crash with detailed error message if any inconsistency is detected
-_VERIFY_FUSED_METADATA_COPY = os.environ.get(
-    "SGLANG_VERIFY_FUSED_METADATA_COPY", "0"
-).lower() in ("1", "true")
+_VERIFY_FUSED_METADATA_COPY = envs.SGLANG_VERIFY_FUSED_METADATA_COPY.get()
 
 
 @dataclass(frozen=True)
