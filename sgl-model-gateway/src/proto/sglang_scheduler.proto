@@ -29,6 +29,19 @@ service SglangScheduler {
   // Get comprehensive load metrics
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
+  // =====================
+  // Encoder RPCs (for EPD mode)
+  // =====================
+
+  // Encode multimodal items (images/videos/audio) - for encoder workers in EPD mode
+  rpc Encode(EncodeRequest) returns (EncodeResponse);
+
+  // Send encoded embeddings to prefill server (for mooncake backend)
+  rpc EncodeSend(EncodeSendRequest) returns (EncodeSendResponse);
+
+  // Register scheduler receive URL (for zmq_to_scheduler backend)
+  rpc SchedulerReceiveUrl(SchedulerReceiveUrlRequest) returns (SchedulerReceiveUrlResponse);
+
 }
 
 // =====================
@@ -130,6 +143,9 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
+
+  // For EPD mode: whether prefill should wait for image embeddings from encoder
+  optional bool need_wait_for_image = 18;
 }
 
 message TokenizedInput {
@@ -564,3 +580,70 @@ message AggregateMetrics {
   double avg_throughput = 5;
   double avg_utilization = 6;
 }
+
+// =====================
+// Encoder Messages (for EPD mode)
+// =====================
+
+message EncodeRequest {
+  // List of multimodal item URLs or data URIs (images, videos, audio)
+  repeated string mm_items = 1;
+
+  // Unique request identifier
+  string req_id = 2;
+
+  // Number of parts for distributed encoding
+  int32 num_parts = 3;
+
+  // Current part index
+  int32 part_idx = 4;
+
+  // Prefill server host for ZMQ transfer
+  string prefill_host = 5;
+
+  // Embedding ports for ZMQ transfer (multiple for distributed)
+  repeated int32 embedding_port = 6;
+}
+
+message EncodeResponse {
+  // Size of embedding in bytes (for mooncake backend)
+  int64 embedding_size = 1;
+
+  // Number of embedding vectors (sequence length)
+  int64 embedding_len = 2;
+
+  // Dimension of each embedding vector
+  int64 embedding_dim = 3;
+}
+
+message EncodeSendRequest {
+  // Request identifier
+  string req_id = 1;
+
+  // Prefill server host
+  string prefill_host = 2;
+
+  // Embedding port for ZMQ transfer
+  int32 embedding_port = 3;
+
+  // Mooncake session ID (for mooncake backend)
+  string session_id = 4;
+
+  // Mooncake buffer address for RDMA transfer
+  int64 buffer_address = 5;
+}
+
+message EncodeSendResponse {}
+
+message SchedulerReceiveUrlRequest {
+  // Request identifier
+  string req_id = 1;
+
+  // URL where scheduler expects to receive embeddings
+  string receive_url = 2;
+
+  // Expected number of receive endpoints
+  int32 receive_count = 3;
+}
+
+message SchedulerReceiveUrlResponse {}

@@ -56,6 +56,17 @@ MODEL_SPECS: dict[str, dict] = {
             "--context-length=1000"
         ],  # Faster startup, prevents memory issues
     },
+    "qwen-vl-7b": {
+        "model": _resolve_model_path("Qwen/Qwen2.5-VL-7B-Instruct"),
+        "memory_gb": 22,
+        "tp": 1,
+        "features": ["chat", "streaming"],
+        "worker_args": ["--trust-remote-code"],
+        "env": {
+            "SGLANG_IS_FLASHINFER_AVAILABLE": "0",
+            "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
+        },
+    },
     # Reasoning model
     "deepseek-7b": {
         "model": _resolve_model_path("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"),

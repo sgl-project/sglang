@@ -36,6 +36,7 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     - @pytest.mark.model("model-id"): Override default model
     - @pytest.mark.workers(count=1): Number of regular workers behind router
     - @pytest.mark.workers(prefill=1, decode=1): PD worker configuration
+    - @pytest.mark.workers(encode=1, prefill=1, decode=1): EPD worker configuration
     - @pytest.mark.gateway(policy="round_robin", timeout=60): Gateway configuration
 
     Returns:
@@ -73,7 +74,9 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
 
     # Get worker configuration from marker
     workers_config = get_marker_kwargs(
-        request, "workers", defaults={"count": 1, "prefill": None, "decode": None}
+        request,
+        "workers",
+        defaults={"count": 1, "prefill": None, "decode": None, "encode": None},
     )
 
     # Get gateway configuration from marker
@@ -90,6 +93,13 @@ def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
     # PD disaggregation backend
     if backend_name == "pd":
         yield from _setup_pd_backend(
+            request, model_pool, model_id, workers_config, gateway_config
+        )
+        return
+
+    # EPD disaggregation backend
+    if backend_name == "epd":
+        yield from _setup_epd_backend(
             request, model_pool, model_id, workers_config, gateway_config
         )
         return
@@ -142,8 +152,12 @@ def _setup_pd_backend(
 
     # Try to use pre-launched PD workers, or launch additional ones if needed
     # get_workers_by_type auto-acquires all returned workers
-    existing_prefills = model_pool.get_workers_by_type(model_id, WorkerType.PREFILL)
-    existing_decodes = model_pool.get_workers_by_type(model_id, WorkerType.DECODE)
+    existing_prefills = model_pool.get_workers_by_type(
+        model_id, WorkerType.PREFILL, mode=ConnectionMode.HTTP
+    )
+    existing_decodes = model_pool.get_workers_by_type(
+        model_id, WorkerType.DECODE, mode=ConnectionMode.HTTP
+    )
 
     # Calculate how many more we need
     missing_prefill = max(0, num_prefill - len(existing_prefills))
@@ -259,6 +273,174 @@ def _setup_pd_backend(
         gateway.shutdown()
         # Release references to allow eviction
         for worker in prefills + decodes:
+            worker.release()
+
+
+def _setup_epd_backend(
+    request: pytest.FixtureRequest,
+    model_pool: "ModelPool",
+    model_id: str,
+    workers_config: dict,
+    gateway_config: dict,
+):
+    """Setup EPD disaggregation backend."""
+    import openai
+    from infra import ConnectionMode, Gateway, WorkerIdentity, WorkerType
+
+    try:
+        import sgl_kernel  # noqa: F401
+    except Exception as e:
+        pytest.fail(f"EPD e2e requires sgl_kernel but it is not available: {e}")
+
+    try:
+        import torch
+    except Exception as e:
+        pytest.fail(f"EPD e2e requires torch: {e}")
+
+    if not torch.cuda.is_available():
+        pytest.fail("EPD e2e requires CUDA backend")
+
+    logger.info("Setting up EPD backend for model %s", model_id)
+
+    num_encode = workers_config.get("encode") or 1
+    num_prefill = workers_config.get("prefill") or 1
+    num_decode = workers_config.get("decode") or 1
+    mode = ConnectionMode.GRPC
+
+    existing_encodes = model_pool.get_workers_by_type(
+        model_id, WorkerType.ENCODE, mode=mode
+    )
+    existing_prefills = model_pool.get_workers_by_type(
+        model_id, WorkerType.PREFILL, mode=mode
+    )
+    existing_decodes = model_pool.get_workers_by_type(
+        model_id, WorkerType.DECODE, mode=mode
+    )
+
+    encodes = existing_encodes
+    prefills = existing_prefills
+    decodes = existing_decodes
+    gateway: Gateway | None = None
+
+    try:
+        if len(existing_encodes) >= num_encode:
+            encodes = existing_encodes[:num_encode]
+            for w in existing_encodes[num_encode:]:
+                w.release()
+        else:
+            encodes = existing_encodes
+
+        if len(existing_prefills) >= num_prefill:
+            prefills = existing_prefills[:num_prefill]
+            for w in existing_prefills[num_prefill:]:
+                w.release()
+        else:
+            prefills = existing_prefills
+
+        if len(existing_decodes) >= num_decode:
+            decodes = existing_decodes[:num_decode]
+            for w in existing_decodes[num_decode:]:
+                w.release()
+        else:
+            decodes = existing_decodes
+
+        missing_encode = max(0, num_encode - len(encodes))
+        missing_prefill = max(0, num_prefill - len(prefills))
+        missing_decode = max(0, num_decode - len(decodes))
+
+        workers_to_launch: list[WorkerIdentity] = []
+        for i in range(missing_encode):
+            workers_to_launch.append(
+                WorkerIdentity(model_id, mode, WorkerType.ENCODE, len(encodes) + i)
+            )
+        for i in range(missing_prefill):
+            workers_to_launch.append(
+                WorkerIdentity(model_id, mode, WorkerType.PREFILL, len(prefills) + i)
+            )
+        for i in range(missing_decode):
+            workers_to_launch.append(
+                WorkerIdentity(model_id, mode, WorkerType.DECODE, len(decodes) + i)
+            )
+
+        if workers_to_launch:
+            encoder_urls = [w.worker_url for w in encodes]
+            new_instances = model_pool.launch_workers(
+                workers_to_launch,
+                startup_timeout=300,
+                encoder_urls=encoder_urls,
+            )
+            if not new_instances:
+                pytest.fail(
+                    "Failed to launch EPD workers: insufficient GPUs or startup timeout"
+                )
+
+            for inst in new_instances:
+                inst.acquire()
+
+            encodes.extend(
+                [w for w in new_instances if w.worker_type == WorkerType.ENCODE]
+            )
+            prefills.extend(
+                [w for w in new_instances if w.worker_type == WorkerType.PREFILL]
+            )
+            decodes.extend(
+                [w for w in new_instances if w.worker_type == WorkerType.DECODE]
+            )
+
+        if len(encodes) < num_encode or len(prefills) < num_prefill or len(decodes) < num_decode:
+            for w in encodes + prefills + decodes:
+                w.release()
+            pytest.fail(
+                "EPD setup incomplete: have %d encode, %d prefill, %d decode "
+                "(need %d encode, %d prefill, %d decode)"
+                % (
+                    len(encodes),
+                    len(prefills),
+                    len(decodes),
+                    num_encode,
+                    num_prefill,
+                    num_decode,
+                )
+            )
+
+        model_path = encodes[0].model_path
+
+        gateway = Gateway()
+        gateway.start(
+            encode_workers=encodes,
+            prefill_workers=prefills,
+            decode_workers=decodes,
+            model_path=model_path,
+            policy=gateway_config["policy"],
+            timeout=gateway_config["timeout"],
+            extra_args=gateway_config["extra_args"],
+        )
+
+        client = openai.OpenAI(
+            base_url=f"{gateway.base_url}/v1",
+            api_key="not-used",
+        )
+
+        logger.info(
+            "Setup EPD backend: model=%s, %d encode + %d prefill + %d decode, "
+            "gateway=%s, policy=%s",
+            model_id,
+            len(encodes),
+            len(prefills),
+            len(decodes),
+            gateway.base_url,
+            gateway_config["policy"],
+        )
+
+        yield "epd", model_path, client, gateway
+    finally:
+        logger.info("Tearing down EPD gateway")
+        if gateway is not None:
+            try:
+                gateway.shutdown()
+            except Exception:
+                pass
+        for worker in encodes + prefills + decodes:
             worker.release()
 
 
