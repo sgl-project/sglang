@@ -2266,12 +2266,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
 
-            # Skip SWA eviction during decode when piecewise CUDA graph is enabled
-            # because evicting KV cache during decode can cause issues with captured
-            # CUDA graph memory addresses.
             if (
                 self.forward_mode.is_decode()
                 and server_args.enable_piecewise_cuda_graph
+                and not self.tree_cache.is_chunk_cache()
             ):
                 return
 
