@@ -2266,6 +2266,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sliding_window_size = self.tree_cache.sliding_window_size
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
+                    # Skip SWA eviction during decode when piecewise CUDA graph is enabled
+                    # because evicting KV cache during decode can cause issues with captured
+                    # CUDA graph memory addresses.
+                    server_args = get_global_server_args()
+                    if server_args.enable_piecewise_cuda_graph:
+                        continue
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
                     # 2. Evict swa every window_size tokens to reduce the overhead.
