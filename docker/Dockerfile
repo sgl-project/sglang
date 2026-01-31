@@ -24,7 +24,8 @@ ARG FLASHINFER_VERSION=0.6.2
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
-    FLASHINFER_VERSION=${FLASHINFER_VERSION}
+    FLASHINFER_VERSION=${FLASHINFER_VERSION} \
+    TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
 
 # Add GKE default lib and bin locations
 ENV PATH="${PATH}:/usr/local/nvidia/bin" \
@@ -173,6 +174,7 @@ ARG GRACE_BLACKWELL
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH
 ARG DEEPEP_COMMIT
 ARG TRITON_LANG_COMMIT
+ARG TRITON_VERSION=3.6.0
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
@@ -419,6 +421,11 @@ COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
 
+# Install Triton
+RUN if [ -n "${TRITON_VERSION}" ]; then \
+        python3 -m pip install triton==${TRITON_VERSION} --force-reinstall --no-deps; \
+    fi
+
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
         rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
@@ -456,7 +463,8 @@ ARG GDRCOPY_VERSION=2.5.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
-    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
+    GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/ \
+    TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
 
 # Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
