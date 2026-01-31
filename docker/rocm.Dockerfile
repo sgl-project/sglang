@@ -98,6 +98,10 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # AITER
+# Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
+# (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
+# leak into AITER's version when AITER uses setuptools_scm)
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
