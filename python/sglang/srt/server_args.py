@@ -1627,6 +1627,7 @@ class ServerArgs:
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
             "JetVLMForConditionalGeneration",
+            "GraniteMoeHybridForCausalLM",
         ]:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,

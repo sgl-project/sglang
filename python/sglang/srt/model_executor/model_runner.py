@@ -33,6 +33,7 @@ from torch import nn
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
+    GraniteMoeHybridConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
