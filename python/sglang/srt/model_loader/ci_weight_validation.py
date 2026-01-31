@@ -1845,6 +1845,10 @@ def ci_download_with_validation_and_retry(
                 tqdm_class=DisabledTqdm,
                 revision=revision,
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                # Force single-threaded downloads to prevent race conditions on NFS
+                # HF hub defaults to max_workers=8, which can cause .incomplete file
+                # conflicts when multiple threads operate on the same files
+                max_workers=1,
             )
 
             # Validate downloaded files to catch corruption early
