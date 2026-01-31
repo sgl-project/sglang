@@ -2,6 +2,9 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
+# Usage (to build SGLang ROCm + Mori docker image):
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
