@@ -310,15 +310,14 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-def is_nvidia_cublas_cu12_version_ge_12_9():
+def is_nvidia_cublas_version_ge_12_9():
     """
-    temporary fix for issue #11272
+    temporary fix for issue #11272 (cublas 12.9+)
     """
-    try:
-        installed_version = version("nvidia-cublas-cu12")
-    except PackageNotFoundError:
-        return False
-    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
+    for pkg in ("nvidia-cublas", "nvidia-cublas-cu12"):
+        if check_pkg_version_at_least(pkg, "12.9"):
+            return True
+    return False
 
 
 def random_uuid() -> str:
