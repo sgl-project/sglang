@@ -676,6 +676,13 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
+        # add per user request
+        spaces_between_special_tokens = (
+            True
+            if self.chat_template_kwargs is None
+            else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
+        )
+
         sampling_params = {
             "temperature": get_param("temperature"),
             "max_new_tokens": self.max_completion_tokens or self.max_tokens,
@@ -698,6 +705,7 @@ class ChatCompletionRequest(BaseModel):
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
             "sampling_seed": self.seed,
+            "spaces_between_special_tokens": spaces_between_special_tokens,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
