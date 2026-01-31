@@ -22,12 +22,16 @@ if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
+from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
+    scattered_to_tp_attn_full,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
     NSA_DUAL_STREAM,
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
 )
+from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -35,11 +39,7 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import scattered_to_tp_attn_full
-from sglang.srt.utils import get_bool_env_var
-from sglang.srt.layers.communicator import ScatterMode
 
-_use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -1038,7 +1038,7 @@ class Indexer(CustomOp):
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
         if (
-            _use_ag_after_qlora
+            get_attn_tp_context().input_scattered
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
@@ -1088,7 +1088,9 @@ class Indexer(CustomOp):
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
-                actual_seq_lengths_q = forward_batch.attn_backend.forward_metadata.seq_lens_cum_sum
+                actual_seq_lengths_q = (
+                    forward_batch.attn_backend.forward_metadata.seq_lens_cum_sum
+                )
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -1123,7 +1125,7 @@ class Indexer(CustomOp):
             torch.npu.current_stream().wait_event(q_rope_event)
         torch.npu.current_stream().wait_event(weights_event)
         if (
-            _use_ag_after_qlora
+            get_attn_tp_context().input_scattered
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
