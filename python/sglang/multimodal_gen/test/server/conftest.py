@@ -4,16 +4,24 @@ import pytest
 
 print("[CONFTEST] Loading conftest.py at import time")
 
-# Use pytest's stash instead of global variable to avoid double-import issues
-perf_results_key = pytest.StashKey[list]()
-print(f"[CONFTEST] perf_results_key created: {perf_results_key}")
+
+def pytest_configure(config):
+    """
+    Create the perf results StashKey once and store it in config.
+    This hook runs once per test session, before module double-import issues.
+    """
+    if not hasattr(config, "_diffusion_perf_key"):
+        config._diffusion_perf_key = pytest.StashKey[list]()
+        print(f"[CONFTEST] Created perf_results_key: {config._diffusion_perf_key}")
 
 
 def add_perf_results(config, results: list):
     """Add performance results to the shared stash."""
-    existing = config.stash.get(perf_results_key, [])
+    # Get the shared key from config (created once in pytest_configure)
+    key = config._diffusion_perf_key
+    existing = config.stash.get(key, [])
     existing.extend(results)
-    config.stash[perf_results_key] = existing
+    config.stash[key] = existing
     print(f"[CONFTEST] Added {len(results)} results, total now: {len(existing)}")
 
 
@@ -29,6 +37,18 @@ def _write_github_step_summary(content: str):
     if summary_file:
         with open(summary_file, "a") as f:
             f.write(content)
+
+
+def _write_results_json(results: list, output_path: str = "diffusion-results.json"):
+    """Write performance results to JSON file for CI artifact collection."""
+    import json
+
+    try:
+        with open(output_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"[CONFTEST] Wrote results to {output_path}")
+    except Exception as e:
+        print(f"[CONFTEST] Failed to write results JSON: {e}")
 
 
 def _generate_diffusion_markdown_report(results: list) -> str:
@@ -79,8 +99,9 @@ def pytest_sessionfinish(session):
     This hook is called by pytest at the end of the entire test session.
     It prints a consolidated summary of all performance results.
     """
-    # Get results from pytest's stash (shared across all import contexts)
-    results = session.config.stash.get(perf_results_key, [])
+    # Get results from stash using the shared key from config
+    key = session.config._diffusion_perf_key
+    results = session.config.stash.get(key, [])
     print(f"\n[DEBUG] pytest_sessionfinish called, has {len(results)} entries")
     if not results:
         print("[DEBUG] No results collected, skipping summary output")
@@ -134,3 +155,6 @@ def pytest_sessionfinish(session):
     markdown_report = _generate_diffusion_markdown_report(results)
     if markdown_report:
         _write_github_step_summary(markdown_report)
+
+    # Write results to JSON file for CI artifact collection
+    _write_results_json(results)
