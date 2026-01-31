@@ -98,8 +98,9 @@ def test_sparse_lru_end_to_end(
     hot_buffer_size: int = 4096,
     rounds: int = 6,
     warmup: int = 4,
+    block_size: int = 512,
 ) -> None:
-    device = "cuda"
+    device = "cuda" 
     torch.manual_seed(0)
     diff_target = int(num_top_k * diff_ratio)
     assert diff_target > 0, "diff_ratio too small for current top_k"
@@ -197,7 +198,6 @@ def test_sparse_lru_end_to_end(
         batch_size, num_top_k, page_size
     )
 
-    block_size = 512 if num_top_k >= 1024 else 256
     _jit_sparse_module(
         item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla=True
     )
@@ -488,6 +488,7 @@ if __name__ == "__main__":
     parser.add_argument("--hot_buffer_size", type=int, default=4096)
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--warmup", type=int, default=4)
+    parser.add_argument("--block_size", type=int, default=512)
     args = parser.parse_args()
 
     test_sparse_lru_end_to_end(
@@ -497,4 +498,5 @@ if __name__ == "__main__":
         hot_buffer_size=args.hot_buffer_size,
         rounds=args.rounds,
         warmup=args.warmup,
+        block_size=args.block_size,
     )

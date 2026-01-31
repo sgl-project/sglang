@@ -320,7 +320,6 @@ __global__ void load_cache_to_device_buffer_kernel(
   // For page-wise topk, use page id.
   const int32_t newest_token =
       (seq_len >= 0) ? static_cast<int32_t>((page_size > 1) ? (seq_len / page_size) : seq_len) : -1;
-  int32_t top_k_max_value = 0;
 
   // Build diff_map for top-k tokens and reset shared buffers.
   for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
@@ -328,7 +327,6 @@ __global__ void load_cache_to_device_buffer_kernel(
       int32_t top_k_val = my_top_k_tokens[i];
       my_diff_map[top_k_val] = i;
       s_top_k_tokens[i] = top_k_val;
-      top_k_max_value = max(top_k_max_value, top_k_val);
     }
     s_lru_bitmap[i] = false;
   }
@@ -336,7 +334,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     s_evictable_slots[i] = -1;
   }
 
-  top_k_max_value = blockReduceMaxInt(top_k_max_value);
   __syncthreads();
 
   // If topk includes the latest token, bind it to newest_slot and mark as hit.
