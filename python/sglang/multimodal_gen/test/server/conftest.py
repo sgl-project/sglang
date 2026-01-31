@@ -18,7 +18,7 @@ def add_perf_results(config, results: list):
 
 
 @pytest.fixture(scope="session")
-def pytest_config(request):
+def perf_config(request):
     """Provide access to pytest config for storing perf results."""
     return request.config
 
