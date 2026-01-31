@@ -1,3 +1,4 @@
+import logging
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -11,8 +12,10 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+logger = logging.getLogger(__name__)
+
 TEST_MODEL_MATRIX = {
-    "Qwen/Qwen3-30B-A3B-GPTQ-Int4": {
+    "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-GPTQ-Int4": {
         "accuracy": 0.85,
     },
 }
@@ -38,7 +41,7 @@ class TestAscendGPTQMoEInt4(CustomTestCase):
     def test_a_gsm8k(self):
         for model in self.models:
             with self.subTest(model=model):
-                print(f"##=== Testing accuracy: {model} ===##")
+                logger.info(f"##=== Testing accuracy: {model} ===##")
 
                 process = popen_launch_server(
                     model,
