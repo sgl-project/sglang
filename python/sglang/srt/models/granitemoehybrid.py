@@ -67,7 +67,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
-                params_dtype=config.torch_dtype,
+                # params_dtype=config.torch_dtype,
                 quant_config=quant_config,
                 tp_size=get_tensor_model_parallel_world_size(),
                 prefix=f"{prefix}.block_sparse_moe",
@@ -127,7 +127,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
                 hidden_states = self.shared_mlp(hidden_states)
         hidden_states = residual + hidden_states * self.residual_multiplier
 
-        return output, residual
+        return hidden_states, residual
 
 
 class GraniteMoeHybridAttention(nn.Module):
@@ -180,11 +180,19 @@ class GraniteMoeHybridAttention(nn.Module):
         )
 
         if config.position_embedding_type == "rope":
+            # self.rotary_emb = get_rope(
+            #     self.head_dim,
+            #     max_position=config.max_position_embeddings,
+            #     rope_parameters=config.rope_parameters,
+            #     is_neox_style=True,
+            # )
+
             self.rotary_emb = get_rope(
-                self.head_dim,
+                head_size=self.head_dim,
+                rotary_dim=self.head_dim,  # its not in the config
                 max_position=config.max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=True,
+                base=config.rope_theta,
+                rope_scaling=config.rope_scaling,
             )
         else:
             self.rotary_emb = None
@@ -252,7 +260,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 layer_id=layer_idx,
-                params_dtype=config.torch_dtype,
+                # params_dtype=config.torch_dtype,
                 quant_config=quant_config,
                 tp_size=get_tensor_model_parallel_world_size(),
                 prefix=f"{prefix}.block_sparse_moe",
@@ -342,11 +350,11 @@ class GraniteMoeHybridModel(nn.Module):
         self.embedding_multiplier = config.embedding_multiplier
 
         def get_layer(idx: int, prefix: str):
-            # layer_idx = int(prefix.rsplit(".", 1)[1])
-            layer_class = ALL_DECODER_LAYER_TYPES[config.layer_types[idx]]
+            layer_idx = int(prefix.rsplit(".", 1)[1])
+            layer_class = ALL_DECODER_LAYER_TYPES[config.layer_types[layer_idx]]
             return layer_class(
                 config,
-                idx,
+                layer_idx,
                 quant_config=quant_config,
                 prefix=prefix,
             )
