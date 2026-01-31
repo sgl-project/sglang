@@ -62,6 +62,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def release_req_to_metadata_buffer(
+    req: Req, allocator: ReqToMetadataIdxAllocator
+) -> None:
+    """
+    Release the metadata buffer index allocated for a request in prefill disaggregation mode.
+
+    This function safely releases the metadata buffer index if it was allocated.
+
+    Args:
+        req: The request object that may have a metadata_buffer_index allocated
+        allocator: The ReqToMetadataIdxAllocator instance to free the index
+    """
+    if (
+        hasattr(req, "metadata_buffer_index")
+        and req.metadata_buffer_index is not None
+        and req.metadata_buffer_index >= 0
+    ):
+        allocator.free(req.metadata_buffer_index)
+        req.metadata_buffer_index = -1
+
+
 class PrefillBootstrapQueue:
     """
     Store the requests in bootstrapping
@@ -592,8 +613,9 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req: Req
             req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
-            self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
-            req.metadata_buffer_index = -1
+            release_req_to_metadata_buffer(
+                req, self.req_to_metadata_buffer_idx_allocator
+            )
             trace_slice(
                 RequestStage.PREFILL_TRANSFER_KV_CACHE, req.rid, thread_finish_flag=True
             )
