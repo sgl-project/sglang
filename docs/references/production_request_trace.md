@@ -47,7 +47,7 @@ This section explains how to configure the request tracing and export the trace 
     * The OpenTelemetry Collector also exports trace data in JSON format to /tmp/otel_trace.json. In a follow-up patch, we will provide a tool to convert this data into a Perfetto-compatible format, enabling visualization of requests in the Perfetto UI.
 
 6. Dynamically adjust trace level
-    The trace level accepts configurable values from `0` to `3`, The meanings of different trace level values are as follows:
+    The trace level accepts configurable values from `0` to `3`. The meanings of different trace level values are as follows:
     ```
     0: disable tracing
     1: Trace important slices
@@ -58,14 +58,14 @@ This section explains how to configure the request tracing and export the trace 
     ```bash
     curl http://0.0.0.0:30000/set_trace_level?level=2
     ```
-    Replace `0.0.0.0:30000` with your actual server address, and replace `level=2` with with the level you want to set.
+    Replace `0.0.0.0:30000` with your actual server address, and replace `level=2` with the level you want to set.
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
 ## How to add Tracing for slices you're interested in?(API introduction)
 We have already inserted instrumentation points in the tokenizer and scheduler main threads. If you wish to trace additional request execution segments or perform finer-grained tracing, please use the APIs from the tracing package as described below.
 
-**All of the following implementations are done in python/sglang/srt/obervality/req_time_stats.py. If you want to add another slice, please do it here.**
+**All of the following implementations are done in python/sglang/srt/observability/req_time_stats.py. If you want to add another slice, please do it here.**
 
 1. Initialization
 
