@@ -2,17 +2,22 @@
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/siglip/modeling_siglip.py
 
 from functools import partial
-from typing import Optional, Type, Union
+from typing import Iterable, Optional, Type, Union
 
 import torch
 import torch.nn as nn
 from transformers import SiglipVisionConfig
 
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.utils import add_prefix
 
 
@@ -165,13 +170,17 @@ class SiglipEncoder(nn.Module):
         self,
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
 
         self.config = config
 
-        num_hidden_layers = config.num_hidden_layers
+        if num_hidden_layers_override is None:
+            num_hidden_layers = config.num_hidden_layers
+        else:
+            num_hidden_layers = num_hidden_layers_override
         norm_layer = partial(nn.LayerNorm, eps=config.layer_norm_eps)
         self.layers = nn.ModuleList(
             [
@@ -213,6 +222,7 @@ class SiglipVisionTransformer(nn.Module):
         self,
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -225,6 +235,7 @@ class SiglipVisionTransformer(nn.Module):
         self.encoder = SiglipEncoder(
             config=config,
             quant_config=quant_config,
+            num_hidden_layers_override=num_hidden_layers_override,
             prefix=add_prefix("encoder", prefix),
         )
 
@@ -236,7 +247,13 @@ class SiglipVisionTransformer(nn.Module):
             )
 
         # VisionAttention in SiglipEncoderLayer is multihead attention
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        # If possible, skip post_layernorm to conserve memory
+        require_post_norm = len(self.encoder.layers) == num_hidden_layers
+
+        if require_post_norm:
+            self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+        else:
+            self.post_layernorm = None
 
     @property
     def device(self) -> torch.device:
@@ -266,11 +283,17 @@ class SiglipVisionModel(nn.Module):
         self,
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        num_hidden_layers_override: Optional[int] = None,
         prefix: str = "",
     ):
         super().__init__()
+
+        self.quant_config = quant_config
         self.vision_model = SiglipVisionTransformer(
-            config, quant_config, prefix=add_prefix("vision_model", prefix)
+            config,
+            quant_config,
+            num_hidden_layers_override=num_hidden_layers_override,
+            prefix=add_prefix("vision_model", prefix),
         )
 
     @property
@@ -279,3 +302,85 @@ class SiglipVisionModel(nn.Module):
 
     def forward(self, pixel_values: torch.Tensor):
         return self.vision_model(pixel_values)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        layer_count = len(self.vision_model.encoder.layers)
+
+        for name, loaded_weight in weights:
+            # post_layernorm is optional in SiglipVisionModel
+            if (
+                name.startswith("vision_model.post_layernorm")
+                and self.vision_model.post_layernorm is None
+            ):
+                continue
+
+            # omit layers when num_hidden_layers_override is set
+            if name.startswith("vision_model.encoder.layers"):
+                layer_idx = int(name.split(".")[3])
+                if layer_idx >= layer_count:
+                    continue
+
+            # Check if this is a scale parameter that needs remapping first
+            if name.endswith((".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                # Try to remap the scale name first
+                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped_name is not None and remapped_name in params_dict:
+                    # Successfully remapped, use the remapped name
+                    param = params_dict[remapped_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(remapped_name)
+                    continue
+                # If remapping failed, continue with normal processing
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                param = params_dict[name]
+                param = maybe_swap_ffn_param(
+                    name, param, loaded_weight, params_dict, self.quant_config
+                )
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
+
+
+def maybe_swap_ffn_param(
+    name: str,
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    params_dict: dict[str, torch.Tensor],
+    quant_config: QuantizationConfig,
+) -> torch.Tensor:
+    if not (quant_config and quant_config.get_name() == "gguf") or ".fc" not in name:
+        return param
+    # Some GGUF models have fc1 and fc2 weights swapped
+    tp_size = get_tensor_model_parallel_world_size()
+    output_dim = getattr(param, "output_dim", 0)
+    output_size = param.size(output_dim) * tp_size
+    weight_out_size = loaded_weight.size(output_dim)
+    if ".fc1." in name and output_size != weight_out_size:
+        new_name = name.replace(".fc1.", ".fc2.")
+        param = params_dict[new_name]
+    elif ".fc2." in name and output_size != weight_out_size:
+        new_name = name.replace(".fc2.", ".fc1.")
+        param = params_dict[new_name]
+    return param
