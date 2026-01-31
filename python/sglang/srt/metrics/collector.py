@@ -73,6 +73,8 @@ class TimeStats:
     prefill_end_time_host: float = 0.0
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
+    # Number of prefill retries for this request
+    prefill_retry_count: int = 0
 
     # Timestamp when prefill phase finishes, obtained from `time.time()`.
     # Note that this differs from the other `_time` fields tracked by the
@@ -139,7 +141,8 @@ class TimeStats:
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f}MB"
+                f"transfer_total={self.transfer_total_mb:.2f}MB, "
+                f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -453,6 +456,11 @@ class SchedulerMetricsCollector:
         self.num_transfer_failed_reqs = Counter(
             name="sglang:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_prefill_retries_total = Counter(
+            name="sglang:num_prefill_retries_total",
+            documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
         self.kv_transfer_speed_gb_s = Gauge(
@@ -853,6 +861,10 @@ class SchedulerMetricsCollector:
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_prefill_retries(self, count: int) -> None:
+        if count > 0:
+            self.num_prefill_retries_total.labels(**self.labels).inc(count)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}

@@ -149,6 +149,7 @@ class DiffusionServerArgs:
     tp_size: int | None = None
     ulysses_degree: int | None = None
     ring_degree: int | None = None
+    cfg_parallel: bool | None = None
     # LoRA
     lora_path: str | None = (
         None  # LoRA adapter path (HF repo or local path, loaded at startup)
@@ -163,7 +164,9 @@ class DiffusionServerArgs:
     enable_warmup: bool = False
 
     dit_layerwise_offload: bool = False
+    dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
+    text_encoder_cpu_offload: bool = False
 
 
 @dataclass(frozen=True)
@@ -188,6 +191,9 @@ class DiffusionSamplingParams:
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
 
     num_outputs_per_prompt: int = 1
+
+    # TeaCache acceleration
+    enable_teacache: bool = False
 
 
 @dataclass(frozen=True)
@@ -347,6 +353,14 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "flux_2_klein_image_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-klein-4B",
+            modality="image",
+        ),
+        T2I_sampling_params,
+    ),
     # TODO: replace with a faster model to test the --dit-layerwise-offload
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
     # so we do one warmup and send one request instead
@@ -356,6 +370,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             model_path="black-forest-labs/FLUX.2-dev",
             modality="image",
             dit_layerwise_offload=True,
+            dit_offload_prefetch_size=2,
         ),
         T2I_sampling_params,
     ),
@@ -432,6 +447,33 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
+        ),
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            text_encoder_cpu_offload=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+        ),
+    ),
+    # TeaCache acceleration test for Wan video model
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_teacache_enabled",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            enable_teacache=True,
         ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
@@ -574,6 +616,20 @@ TWO_GPU_CASES_A = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
             output_size="832x480",
+        ),
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1.3b_cfg_parallel",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup=0,
+            custom_validator="video",
+            num_gpus=2,
+            cfg_parallel=True,
+        ),
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
         ),
     ),
 ]
