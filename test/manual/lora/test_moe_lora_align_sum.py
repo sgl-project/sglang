@@ -1,10 +1,29 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py
 import random
-
+import os
 import pytest
 import torch
+from torch.utils.cpp_extension import load
 
-from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+# ==============================================================================
+# 1. JIT Compile the Kernel
+# ==============================================================================
+# Pointing specifically to the path you provided
+source_path = ".."
+
+print(f"Loading kernel from: {source_path}")
+
+# Check if file exists to avoid confusing compilation errors
+if not os.path.exists(source_path):
+    raise FileNotFoundError(f"Could not find CUDA file at {source_path}")
+
+moe_ops = load(
+    name="moe_lora_ops_jit",
+    sources=[source_path],
+    extra_cuda_cflags=["-O3"],
+    verbose=True,
+)
+print("Kernel loaded successfully.")
 
 
 def round_up(x, base):
@@ -63,7 +82,7 @@ def test_moe_lora_align_block_size(
     lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device="cuda")
 
     # call kernel
-    moe_align_block_size(
+    moe_ops.moe_lora_align_block_size(
         topk_ids,
         token_lora_mapping,
         num_experts,
@@ -76,6 +95,7 @@ def test_moe_lora_align_block_size(
         num_tokens_post_pad,
         adapter_enabled,
         lora_ids,
+        None,
     )
 
     # verify values
