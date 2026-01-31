@@ -227,17 +227,37 @@ def get_rdma_devices_args():
             )
 
     # 3. Generate RDMA device names
-    # Protect against division by zero when n_rdma > 8
-    if n_rdma > 8:
+    # Detect total GPUs on the node (not just visible ones)
+    try:
+        import torch
+
+        total_gpus = torch.cuda.device_count()
+    except Exception:
+        total_gpus = 8  # Fallback to common 8-GPU setup
+
+    # Handle edge cases
+    if total_gpus == 0:
+        total_gpus = 8
+    if n_rdma > total_gpus:
         logger.warning(
-            "More than 8 RDMA devices detected (%d), using first and middle device",
+            "More RDMA devices (%d) than GPUs (%d), using first and middle device",
             n_rdma,
+            total_gpus,
         )
         return ",".join(_pick_default_pair(rdma_all_devices))
 
+    # Calculate how many GPUs share each RDMA device
+    gpus_per_rdma = max(1, total_gpus // n_rdma)
+    logger.warning(
+        "GPU-to-RDMA mapping: total_gpus=%d, n_rdma=%d, gpus_per_rdma=%d",
+        total_gpus,
+        n_rdma,
+        gpus_per_rdma,
+    )
+
     rdma_devices = []
     for gpu_idx in gpu_indices:
-        nic_index = gpu_idx // (8 // n_rdma)
+        nic_index = min(gpu_idx // gpus_per_rdma, n_rdma - 1)
         rdma_devices.append(rdma_all_devices[nic_index])
 
     if not rdma_devices:
