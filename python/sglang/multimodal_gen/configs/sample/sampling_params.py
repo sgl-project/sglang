@@ -126,6 +126,7 @@ class SamplingParams:
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
+    cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
     # TeaCache parameters
@@ -149,6 +150,8 @@ class SamplingParams:
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
+    # if True, suppress verbose logging for this request
+    suppress_logs: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -272,6 +275,11 @@ class SamplingParams:
         _finite_non_negative_float(
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
+
+        if self.cfg_normalization is None:
+            self.cfg_normalization = 0.0
+        elif isinstance(self.cfg_normalization, bool):
+            self.cfg_normalization = 1.0 if self.cfg_normalization else 0.0
 
         if self.boundary_ratio is not None:
             if isinstance(self.boundary_ratio, bool) or not isinstance(
@@ -417,14 +425,17 @@ class SamplingParams:
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
         from sglang.multimodal_gen.registry import get_model_info
 
-        model_info = get_model_info(model_path)
+        backend = kwargs.pop("backend", None)
+        model_info = get_model_info(model_path, backend=backend)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
-            sampling_params = SamplingParams.from_pretrained(model_path)
+            sampling_params = SamplingParams.from_pretrained(
+                model_path, backend=server_args.backend
+            )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
@@ -640,6 +651,13 @@ class SamplingParams:
             type=float,
             default=SamplingParams.guidance_rescale,
             help="Guidance rescale factor",
+        )
+        parser.add_argument(
+            "--cfg-normalization",
+            type=float,
+            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
+            dest="cfg_normalization",
+            help=("CFG renormalization factor (for Z-Image). "),
         )
         parser.add_argument(
             "--boundary-ratio",
