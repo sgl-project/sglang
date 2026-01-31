@@ -1,14 +1,13 @@
-"""AMD Nightly performance benchmark for DeepSeek-V3.2 model (MTP variant).
+"""AMD Nightly performance benchmark for DeepSeek-V3.2 model (basic variant).
 
-This test benchmarks the DeepSeek-V3.2 model with MTP (EAGLE speculative decoding)
-configuration on 8 GPUs.
+This test benchmarks the DeepSeek-V3.2 model with basic TP=8 configuration on 8 GPUs.
 
 The model path can be configured via DEEPSEEK_V32_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-deepseek-v32-mtp suite
+Registry: nightly-perf-8-gpu-deepseek-v32-basic suite
 
 Example usage:
-    DEEPSEEK_V32_MODEL_PATH=deepseek-ai/DeepSeek-V3.2 python -m pytest test_deepseek_v32_mtp_perf_amd.py -v
+    DEEPSEEK_V32_MODEL_PATH=deepseek-ai/DeepSeek-V3.2 python -m pytest test_deepseek_v32_basic_perf_amd.py -v
 """
 
 import os
@@ -20,9 +19,9 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-# Register for AMD CI - DeepSeek-V3.2 MTP benchmark (~120 min)
+# Register for AMD CI - DeepSeek-V3.2 basic benchmark (~90 min)
 register_amd_ci(
-    est_time=7200, suite="nightly-perf-8-gpu-deepseek-v32-mtp", nightly=True
+    est_time=5400, suite="nightly-perf-8-gpu-deepseek-v32-basic", nightly=True
 )
 
 
@@ -61,13 +60,13 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 DEEPSEEK_V32_MODEL_PATH = os.environ.get(
     "DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"
 )
-PROFILE_DIR = "performance_profiles_deepseek_v32_mtp_mi325"
+PROFILE_DIR = "performance_profiles_deepseek_v32_basic_mi325"
 
 
-class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
-    """AMD Nightly performance benchmark for DeepSeek-V3.2 model (MTP variant).
+class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
+    """AMD Nightly performance benchmark for DeepSeek-V3.2 model (basic variant).
 
-    Tests the DeepSeek-V3.2 model with MTP (EAGLE speculative decoding) on MI325/MI300X.
+    Tests the DeepSeek-V3.2 model with basic TP=8 configuration on MI325/MI300X.
     """
 
     @classmethod
@@ -78,10 +77,10 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
-        # MTP variant configuration for DeepSeek-V3.2
-        # MI325 uses aiter attention backend + EAGLE speculative decoding
+        # Basic variant configuration for DeepSeek-V3.2
+        # MI325 uses aiter attention backend
         cls.variant_config = {
-            "name": "mtp",
+            "name": "basic",
             "other_args": [
                 "--trust-remote-code",
                 "--tp",
@@ -90,16 +89,8 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 "aiter",
                 "--chunked-prefill-size",
                 "131072",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
                 "--mem-fraction-static",
-                "0.7",
+                "0.85",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true}',
                 "--watchdog-timeout",
@@ -114,7 +105,7 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_one_batch(self):
-        """Run benchmark for MTP variant."""
+        """Run benchmark for basic variant."""
         try:
             result_tuple = self.runner.run_benchmark_for_model(
                 model_path=self.model,
@@ -124,6 +115,7 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 other_args=self.variant_config["other_args"],
                 variant=self.variant_config["name"],
                 extra_bench_args=["--trust-remote-code"],
+                enable_profile=False,  # Disable profiling for AMD tests
             )
             results = result_tuple[0]
             success = result_tuple[1]
@@ -140,7 +132,9 @@ class TestNightlyDeepseekV32MTPPerformance(unittest.TestCase):
                 )
 
             if not success:
-                raise AssertionError(f"Benchmark failed for {self.model} (MTP variant)")
+                raise AssertionError(
+                    f"Benchmark failed for {self.model} (basic variant)"
+                )
         finally:
             self.runner.write_final_report()
 
