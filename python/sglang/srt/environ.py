@@ -179,6 +179,7 @@ class Envs:
 
     # CuTe DSL GDN Decode
     SGLANG_USE_CUTEDSL_GDN_DECODE = EnvBool(False)
+    SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE = EnvBool(False)
 
     # Test & Debug
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)

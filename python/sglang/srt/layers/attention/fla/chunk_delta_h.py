@@ -55,6 +55,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    TRANSPOSE_STATE: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -101,23 +102,37 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # load initial state
     if USE_INITIAL_STATE:
-        p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-        if K > 64:
-            p_h0_2 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
-        if K > 128:
-            p_h0_3 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
-        if K > 192:
-            p_h0_4 = tl.make_block_ptr(
-                h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+        if not TRANSPOSE_STATE:
+            p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+            b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+            if K > 64:
+                p_h0_2 = tl.make_block_ptr(
+                    h0, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                )
+                b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+            if K > 128:
+                p_h0_3 = tl.make_block_ptr(
+                    h0, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                )
+                b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+            if K > 192:
+                p_h0_4 = tl.make_block_ptr(
+                    h0, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                )
+                b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
+        else:
+            # Column major: shape (K, V), stride (1, K)
+            p_h0_1 = tl.make_block_ptr(h0, (K, V), (1, K), (0, i_v * BV), (64, BV), (0, 1))
+            b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
+            if K > 64:
+                p_h0_2 = tl.make_block_ptr(h0, (K, V), (1, K), (64, i_v * BV), (64, BV), (0, 1))
+                b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+            if K > 128:
+                p_h0_3 = tl.make_block_ptr(h0, (K, V), (1, K), (128, i_v * BV), (64, BV), (0, 1))
+                b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
+            if K > 192:
+                p_h0_4 = tl.make_block_ptr(h0, (K, V), (1, K), (192, i_v * BV), (64, BV), (0, 1))
+                b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
     # main recurrence
     for i_t in range(NT):
@@ -252,23 +267,37 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
 
     # epilogue
     if INPLACE_UPDATE:
-        p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
-        tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-        if K > 64:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-        if K > 128:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-        if K > 192:
-            p_ht = tl.make_block_ptr(
-                ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
-            )
-            tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+        if not TRANSPOSE_STATE:
+            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+            tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_ht = tl.make_block_ptr(
+                    ht, (K, V), (V, 1), (64, i_v * BV), (64, BV), (1, 0)
+                )
+                tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_ht = tl.make_block_ptr(
+                    ht, (K, V), (V, 1), (128, i_v * BV), (64, BV), (1, 0)
+                )
+                tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_ht = tl.make_block_ptr(
+                    ht, (K, V), (V, 1), (192, i_v * BV), (64, BV), (1, 0)
+                )
+                tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+        else:
+            # Column major: shape (K, V), stride (1, K)
+            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (0, i_v * BV), (64, BV), (0, 1))
+            tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 64:
+                p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (64, i_v * BV), (64, BV), (0, 1))
+                tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 128:
+                p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (128, i_v * BV), (64, BV), (0, 1))
+                tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+            if K > 192:
+                p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (192, i_v * BV), (64, BV), (0, 1))
+                tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_gated_delta_rule_fwd_h(
@@ -281,6 +310,7 @@ def chunk_gated_delta_rule_fwd_h(
     initial_state_indices: Optional[torch.Tensor] = None,
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    transpose_state: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -334,6 +364,7 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
+        TRANSPOSE_STATE=transpose_state,
         num_warps=4,
         num_stages=2,
     )
