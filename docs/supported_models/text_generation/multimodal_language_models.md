@@ -50,6 +50,8 @@ in the GitHub search bar.
 | **NVIDIA Nemotron Nano 2.0 VL** | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | NVIDIA Nemotron Nano v2 VL enables multi-image reasoning and video understanding, along with strong document intelligence, visual Q&A and summarization capabilities. It builds on Nemotron Nano V2, a hybrid Mamba-Transformer LLM, in order to achieve higher inference throughput in long document and video scenarios. | Use `--trust-remote-code`. You may need to adjust `--max-mamba-cache-size` [default is 512] to fit memory constraints. |
 | **Ernie4.5-VL** | `baidu/ERNIE-4.5-VL-28B-A3B-PT`              | Baidu's vision-language models(28B,424B). Support image and video comprehension, and also support thinking.                                                                     |  |
 | **JetVLM** |  | JetVLM is an vision-language model designed for high-performance multimodal understanding and generation tasks built upon Jet-Nemotron. | Coming soon |
+| **Step3-VL** (10B) | `stepfun-ai/Step3-VL-10B` | StepFun's lightweight open-source 10B parameter VLM for multimodal intelligence, excelling in visual perception, complex reasoning, and human alignment. |  |
+| **Qwen3-Omni** | `Qwen/Qwen3-Omni-30B-A3B-Instruct` |  Alibaba's omni-modal MoE model. Currently supports the **Thinker** component (multimodal understanding for text, images, audio, and video), while the **Talker** component (audio generation) is not yet supported. |  |
 
 ## Video Input Support
 
