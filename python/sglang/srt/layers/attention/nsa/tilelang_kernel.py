@@ -4,21 +4,28 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.utils import is_gfx95_supported, is_hip
 
 tilelang.set_log_level("WARNING")
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-    tilelang.PassConfigKey.TL_DISABLE_FAST_MATH: True,
 }
-
-BF16 = "bfloat16"
-FP8 = "float8_e4m3"
-FP32 = "float32"
+# TL_DISABLE_FAST_MATH has deprecated in v0.1.7.post1 tilelang
+if hasattr(tilelang.PassConfigKey, "TL_DISABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_DISABLE_FAST_MATH] = True
+elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
+    pass_configs[tilelang.PassConfigKey.TL_ENABLE_FAST_MATH] = False
 
 _is_hip = is_hip()
+_is_gfx95_supported = is_gfx95_supported()
+_is_fp8_fnuz = is_fp8_fnuz()
+
+BF16 = "bfloat16"
+FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
+FP32 = "float32"
 
 
 def fast_log2_ceil(x):
@@ -42,8 +49,8 @@ def act_quant_kernel(
     N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
 ):
     M = T.symbolic("M")
-    fp8_min = -448.0
-    fp8_max = 448.0
+    fp8_min = -224.0 if _is_fp8_fnuz else -448.0
+    fp8_max = 224.0 if _is_fp8_fnuz else 448.0
     fp8_max_inv = 1 / fp8_max
     num_stages = 0 if round_scale else 2
     blk_m = 32
@@ -108,7 +115,10 @@ def act_quant(
         x.size(-1) % block_size == 0
     ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
     N = x.size(-1)
-    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    if _is_fp8_fnuz:
+        y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
+    else:
+        y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     kernel = act_quant_kernel(N, round_scale=scale_fmt is not None)
     kernel(x.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
@@ -777,9 +787,21 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk == 2048
     if _is_hip:
-        kernel = sparse_attention_fwd_kernel_v1(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
-        )
+        if _is_gfx95_supported:
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
+            )
+        else:  # reduce LDS usage on gfx942 target
+            kernel = sparse_attention_fwd_kernel_v1(
+                num_heads,
+                d_v,
+                tail_dim,
+                topk,
+                sm_scale=sm_scale,
+                block_I=32,
+                num_stages=1,
+                threads=128,
+            )
     else:
         kernel = sparse_attention_fwd_kernel_v2(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
