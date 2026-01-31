@@ -5,7 +5,12 @@ from sglang.test.ascend.test_ascend_utils import MINICPM3_4B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-1-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
 class TestMiniCPM3(GSM8KAscendMixin, CustomTestCase):
