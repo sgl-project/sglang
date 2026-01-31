@@ -109,7 +109,7 @@ class TestExternalDPRanks(PDDisaggregationServerBase):
                         "text": f"Test: {desc}",
                         "sampling_params": {"max_new_tokens": 10, "temperature": 0},
                         "data_parallel_rank": decode_rank,  # Routes to decode worker
-                        "prefill_dp_rank": prefill_rank,    # KV source from prefill worker
+                        "prefill_dp_rank": prefill_rank,  # KV source from prefill worker
                     },
                 )
                 self.assertEqual(response.status_code, 200, f"Failed for {desc}")
