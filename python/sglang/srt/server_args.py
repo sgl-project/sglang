@@ -520,6 +520,7 @@ class ServerArgs:
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
+    enable_hierarchical_cache_direct: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
@@ -2450,6 +2451,10 @@ class ServerArgs:
             ), "Cannot set --disaggregation-decode-dp for the decode engine."
 
             self.disable_radix_cache = True
+            self.enable_hierarchical_cache = False
+            if self.enable_hierarchical_cache_direct:
+                os.environ["SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT"] = "1"
+                self.enable_hierarchical_cache_direct = False
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
@@ -2578,12 +2583,23 @@ class ServerArgs:
         )
 
     def _handle_cache_compatibility(self):
+        if self.enable_hierarchical_cache and self.enable_hierarchical_cache_direct:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and enable-hierarchical-cache-direct are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_hierarchical_cache_direct and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache-direct and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -4150,6 +4166,11 @@ class ServerArgs:
             help="The layout of host memory pool for hierarchical cache.",
         )
         parser.add_argument(
+            "--enable-hierarchical-cache-direct",
+            action="store_true",
+            help="Enable hierarchical cache direct for directly copy between HBM and distributed kv pool",
+        )
+        parser.add_argument(
             "--disable-hicache-numa-detect",
             action="store_true",
             help="Disable binding the process to the NUMA node closest to the active CUDA device when hierarchical cache is enabled.",
@@ -4157,7 +4178,16 @@ class ServerArgs:
         parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
+            choices=[
+                "file",
+                "mooncake",
+                "hf3fs",
+                "nixl",
+                "aibrix",
+                "dynamic",
+                "eic",
+                "memcache",
+            ],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "

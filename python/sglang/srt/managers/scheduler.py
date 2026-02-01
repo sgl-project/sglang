@@ -40,9 +40,6 @@ from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-    DecodeKVCacheOffloadManager,
-)
 from sglang.srt.disaggregation.encode_receiver import MMReceiver
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -310,9 +307,13 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
+        self.enable_hierarchical_cache_direct = (
+            server_args.enable_hierarchical_cache_direct
+        )
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
+        self.need_prefetch_storage = self.enable_hicache_storage
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -636,6 +637,7 @@ class Scheduler(
             ),
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
+            gpu_id=self.gpu_id,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
@@ -671,6 +673,16 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
+            elif self.enable_hierarchical_cache_direct:
+                from sglang.srt.mem_cache.hiradix_cache_direct import HiRadixCacheDirect
+
+                self.tree_cache = HiRadixCacheDirect(
+                    params=params, server_args=server_args
+                )
+                self.need_prefetch_storage = False
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -698,12 +710,26 @@ class Scheduler(
             server_args.disaggregation_mode == "decode"
             and server_args.disaggregation_decode_enable_offload_kvcache
         ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+            if envs.SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT.get():
+                from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+                    DecodeKVCacheOffloadManagerDirect,
+                )
+
+                offload_class = DecodeKVCacheOffloadManagerDirect
+            else:
+                from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+                    DecodeKVCacheOffloadManager,
+                )
+
+                offload_class = DecodeKVCacheOffloadManager
+
+            self.decode_offload_manager = offload_class(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=params.tp_cache_group,
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
+                params=params,
             )
         else:
             self.decode_offload_manager = None
@@ -1581,7 +1607,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and self.need_prefetch_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
@@ -1936,7 +1962,7 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hierarchical_cache_direct:
             self.tree_cache.check_hicache_events()
 
         # Get priority queue
@@ -2043,7 +2069,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_hierarchical_cache_direct
+                    ):
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
@@ -2422,7 +2451,7 @@ class Scheduler(
         return FlushCacheReqOutput(success=success)
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache or self.enable_hierarchical_cache_direct:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
             if_success = True
