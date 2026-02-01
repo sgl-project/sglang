@@ -10,6 +10,8 @@ python3 benchmark/mtbench/bench_sglang_eagle.py --num-questions 80 --parallel 1
 import argparse
 import json
 import os
+import random
+import numpy as np
 import time
 import uuid
 
@@ -99,13 +101,59 @@ def main(args):
 
     has_verify = "spec_verify_ct" in rets[0].get_meta_info("answer_1")
     if has_verify:
-        num_verify_tokens = sum(
-            s.get_meta_info("answer_1")["spec_verify_ct"]
-            + s.get_meta_info("answer_2")["spec_verify_ct"]
-            for s in rets
-        )
+        # Only count tokens and verify steps from answers that actually used SD
+        num_sd_tokens = 0
+        num_verify_tokens = 0
+        num_sd_answers = 0
+        num_non_sd_answers = 0
+        acceptance_lengths = []  # Per-answer acceptance lengths
+        
+        for i, s in enumerate(rets):
+            for answer_key in ["answer_1", "answer_2"]:
+                meta = s.get_meta_info(answer_key)
+                verify_ct = meta.get("spec_verify_ct", 0)
+                
+                # Use sd_completion_tokens if available (excludes non-SD tokens)
+                # Otherwise fall back to completion_tokens for backwards compatibility
+                if "sd_completion_tokens" in meta:
+                    sd_tokens = meta["sd_completion_tokens"]
+                else:
+                    # Fallback: only count completion_tokens if SD was used
+                    sd_tokens = meta["completion_tokens"] if verify_ct > 0 else 0
+                
+                # Debug: print first few to see what's happening
+                if i < 3:
+                    completion_tokens = meta["completion_tokens"]
+                    print(f"Q{i} {answer_key}: spec_verify_ct={verify_ct}, completion_tokens={completion_tokens}, sd_tokens={sd_tokens}")
+                
+                # Only include this answer if it used SD (spec_verify_ct > 0)
+                if verify_ct > 0:
+                    num_sd_tokens += sd_tokens
+                    num_verify_tokens += verify_ct
+                    num_sd_answers += 1
+                    acceptance_lengths.append(sd_tokens / verify_ct)
+                else:
+                    num_non_sd_answers += 1
 
-        accept_length = num_output_tokens / num_verify_tokens
+        print(f"\n[DEBUG] SD answers: {num_sd_answers}, Non-SD answers: {num_non_sd_answers}")
+        print(f"[DEBUG] SD tokens: {num_sd_tokens}, Verify steps: {num_verify_tokens}")
+        print(f"[DEBUG] Total tokens (all): {num_output_tokens}")
+        
+        if acceptance_lengths:
+            print(f"[DEBUG] Acceptance lengths: {sorted(acceptance_lengths)}")
+            print(f"[DEBUG] Length of Acceptance Lengths: {len(acceptance_lengths)}")
+            print(f"[DEBUG] Per-answer acceptance length:")
+            print(f"  Min: {min(acceptance_lengths):.2f}")
+            print(f"  Max: {max(acceptance_lengths):.2f}")
+            print(f"  Median: {np.median(acceptance_lengths):.2f}")
+            print(f"  Mean: {np.mean(acceptance_lengths):.2f}")
+
+        # Calculate acceptance length only for SD cases
+        if num_verify_tokens > 0:
+            accept_length = num_sd_tokens / num_verify_tokens
+        else:
+            # No SD was used at all
+            accept_length = 1.0
     else:
         accept_length = 1.0
 

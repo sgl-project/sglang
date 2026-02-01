@@ -1844,6 +1844,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Always set spec_verify_ct if it exists in recv_obj
             meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+            # Set sd_completion_tokens if available (for accurate acceptance length with adaptive SD)
+            if hasattr(recv_obj, "sd_completion_tokens") and len(recv_obj.sd_completion_tokens) > i:
+                meta_info["sd_completion_tokens"] = recv_obj.sd_completion_tokens[i]
+
             if (
                 recv_obj.spec_verify_ct[i] > 0
                 and hasattr(recv_obj, "spec_accepted_tokens")

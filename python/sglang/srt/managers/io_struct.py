@@ -114,6 +114,10 @@ class SpeculativeDecodingMetricsMixin:
     # Verify count: number of verification forward passes
     spec_verify_ct: List[int]
 
+    # SD completion tokens: Number of tokens generated during SD phases only
+    # (excludes tokens from non-SD fallback in adaptive SD)
+    sd_completion_tokens: List[int]
+
     # Accepted tokens: Number of accepted tokens during speculative decoding
     spec_accepted_tokens: List[int]
 

@@ -736,12 +736,6 @@ class EAGLEWorker(TpModelWorker):
                         self.target_worker.model_runner.attn_backend = old_attn
                         self.target_worker.model_runner.graph_runner = old_graph
                 
-                # Increment spec_verify_ct for each request in normal decode mode
-                # to ensure correct acceptance length calculation (completion_tokens / spec_verify_ct)
-                # When spec is disabled, we treat each decode step as "1 token verified"
-                for req in batch.reqs:
-                    req.spec_verify_ct += 1
-                
                 return GenerationBatchResult(
                     logits_output=batch_result.logits_output,
                     next_token_ids=batch_result.next_token_ids,
