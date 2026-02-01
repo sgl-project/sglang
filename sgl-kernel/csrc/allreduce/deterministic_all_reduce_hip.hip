@@ -1,3 +1,4 @@
+#include "hip/hip_runtime.h"
 // Deterministic All-Reduce for ROCm/HIP
 //
 // This is a wrapper that forces the use of the existing 1-stage all-reduce kernel

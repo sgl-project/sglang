@@ -132,11 +132,18 @@ class Glm4MoeLiteMLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        # Some quantization wrappers store the underlying parameter as `weight_packed`.
+        # Some quantization wrappers store the underlying parameter under a
+        # different name (e.g., weight_packed or qweight).
         if not hasattr(self.gate_up_proj, "weight"):
-            self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+            if hasattr(self.gate_up_proj, "weight_packed"):
+                self.gate_up_proj.weight = getattr(self.gate_up_proj, "weight_packed")
+            elif hasattr(self.gate_up_proj, "qweight"):
+                self.gate_up_proj.weight = getattr(self.gate_up_proj, "qweight")
         if not hasattr(self.down_proj, "weight"):
-            self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+            if hasattr(self.down_proj, "weight_packed"):
+                self.down_proj.weight = getattr(self.down_proj, "weight_packed")
+            elif hasattr(self.down_proj, "qweight"):
+                self.down_proj.weight = getattr(self.down_proj, "qweight")
 
         if (
             gemm_output_zero_allocator is not None
@@ -440,7 +447,7 @@ class Glm4MoeLiteModel(DeepseekV2Model):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()

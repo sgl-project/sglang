@@ -193,10 +193,9 @@ class MoeWNA16Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
-        if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
-            return UnquantizedLinearMethod()
-        elif isinstance(layer, LinearBase):
-
+        if isinstance(layer, LinearBase):
+            if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
+                return UnquantizedLinearMethod()
             if self.linear_quant_method == "gptq":
                 if self.use_marlin:
                     return GPTQMarlinConfig.from_config(
