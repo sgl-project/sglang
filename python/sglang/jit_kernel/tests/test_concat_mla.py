@@ -88,10 +88,16 @@ NUM_TOKENS_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
 def test_concat_mla_k_jit_vs_torch(num_tokens: int) -> None:
     """Test JIT kernel against PyTorch reference."""
-    k_jit = torch.empty(num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE)
-    k_torch = torch.empty(num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    k_jit = torch.empty(
+        num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
+    )
+    k_torch = torch.empty(
+        num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
+    )
 
-    k_nope = torch.randn(num_tokens, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    k_nope = torch.randn(
+        num_tokens, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, device=DEVICE, dtype=DTYPE
+    )
     k_rope = torch.randn(num_tokens, 1, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=DTYPE)
 
     torch_concat_mla_k(k_torch, k_nope, k_rope)
@@ -103,10 +109,16 @@ def test_concat_mla_k_jit_vs_torch(num_tokens: int) -> None:
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
 def test_concat_mla_k_jit_vs_aot(num_tokens: int) -> None:
     """Test JIT kernel against AOT kernel for bitwise equivalence."""
-    k_jit = torch.empty(num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE)
-    k_aot = torch.empty(num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    k_jit = torch.empty(
+        num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
+    )
+    k_aot = torch.empty(
+        num_tokens, NUM_LOCAL_HEADS, K_HEAD_DIM, device=DEVICE, dtype=DTYPE
+    )
 
-    k_nope = torch.randn(num_tokens, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, device=DEVICE, dtype=DTYPE)
+    k_nope = torch.randn(
+        num_tokens, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM, device=DEVICE, dtype=DTYPE
+    )
     k_rope = torch.randn(num_tokens, 1, QK_ROPE_HEAD_DIM, device=DEVICE, dtype=DTYPE)
 
     sgl_kernel_concat_mla_k(k_aot, k_nope, k_rope)

@@ -1,5 +1,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -138,11 +139,7 @@ struct ConcatMlaKKernel {
     D_rope.set_value(QK_ROPE_HEAD_DIM);
 
     // Verify k: [num_tokens, num_heads, k_head_dim]
-    TensorMatcher({N, H, D})
-        .with_strides({S0_k, S1_k, 1})
-        .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
-        .verify(k);
+    TensorMatcher({N, H, D}).with_strides({S0_k, S1_k, 1}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(k);
 
     // Verify k_nope: [num_tokens, num_heads, nope_head_dim]
     TensorMatcher({N, H, D_nope})
@@ -159,12 +156,9 @@ struct ConcatMlaKKernel {
         .verify(k_rope);
 
     // Check alignment
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "Tensor k must be 16-byte aligned");
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(k_nope.data_ptr()) % 16 == 0, "Tensor k_nope must be 16-byte aligned");
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(k_rope.data_ptr()) % 16 == 0, "Tensor k_rope must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(k.data_ptr()) % 16 == 0, "Tensor k must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(k_nope.data_ptr()) % 16 == 0, "Tensor k_nope must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(k_rope.data_ptr()) % 16 == 0, "Tensor k_rope must be 16-byte aligned");
 
     const int num_tokens = static_cast<int>(N.unwrap());
 
@@ -295,20 +289,15 @@ struct ConcatMlaAbsorbQKernel {
         .verify(out);
 
     // Check alignment
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0, "Tensor a must be 16-byte aligned");
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0, "Tensor b must be 16-byte aligned");
-    RuntimeCheck(
-        reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "Tensor out must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(a.data_ptr()) % 16 == 0, "Tensor a must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(b.data_ptr()) % 16 == 0, "Tensor b must be 16-byte aligned");
+    RuntimeCheck(reinterpret_cast<uintptr_t>(out.data_ptr()) % 16 == 0, "Tensor out must be 16-byte aligned");
 
     // Verify dimensions match: a.size(0) * a.size(1) == b.size(0) * b.size(1)
     RuntimeCheck(
         N0_a.unwrap() * N1_a.unwrap() == N0_b.unwrap() * N1_b.unwrap(),
         "Dimension mismatch: a.size(0) * a.size(1) must equal b.size(0) * b.size(1)");
-    RuntimeCheck(
-        N1_a.unwrap() == N1_b.unwrap(),
-        "Dimension mismatch: a.size(1) must equal b.size(1)");
+    RuntimeCheck(N1_a.unwrap() == N1_b.unwrap(), "Dimension mismatch: a.size(1) must equal b.size(1)");
 
     const int num_items = static_cast<int>(N0_a.unwrap() * N1_a.unwrap());
     const int dim_1 = static_cast<int>(N1_a.unwrap());
