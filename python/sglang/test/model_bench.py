@@ -140,7 +140,7 @@ class ModelBench(ABC):
         self._init_attention_backend()
 
         logger.info(
-            f"ModelBench initialized for {self._server_args.model_path}, class: {self._model_class}"
+            f"ModelBench initialized for {self._server_args.model_path}, class: {self._model_class}, quant_config: {self._quant_config}"
         )
 
         return self

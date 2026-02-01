@@ -56,19 +56,23 @@ class FusedActivationPass(SGLangPatternMatcherInductorPass):
                 _out_base_index=0,
                 _all_bases=[out],
             )
-            sgl_per_tensor_quant_fp8 = auto_functionalized_v2(
-                torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default,
+            per_tensor_quant_fp8 = auto_functionalized_v2(
+                torch.ops.sglang.per_tensor_quant_fp8.default,
                 input=silu_and_mul[1],
-                output_s=o_scale,
                 is_static=True,
                 _output_q_base_index=0,
-                _all_bases=[output_q],
+                _output_s_base_index=1,
+                _all_bases=[output_q, o_scale],
             )
-            return sgl_per_tensor_quant_fp8[1]
+            return (
+                per_tensor_quant_fp8[1],
+                per_tensor_quant_fp8[2],
+            )
 
         def replacement(x, w, x_scale, w_scale, o_scale, out, output_q):
-            return torch.ops.sglang.fused_swiglu.default(
-                x, w, x_scale, w_scale, o_scale
+            return (
+                torch.ops.sglang.fused_swiglu.default(x, w, x_scale, w_scale, o_scale),
+                o_scale,
             )
 
         example_inputs = [
@@ -77,8 +81,8 @@ class FusedActivationPass(SGLangPatternMatcherInductorPass):
             torch.empty(()).cuda(),  # X_Scale
             torch.empty(()).cuda(),  # W_Scale
             torch.empty(()).cuda(),  # O_Scale
-            torch.empty(16, 8).to(dtype=torch.float16).cuda(),  # out
-            torch.empty(16, 8).to(dtype=torch.float16).cuda(),  # output_q
+            torch.empty(16, 8).half().cuda(),  # out
+            torch.empty(16, 8).to(dtype=torch.float8_e4m3fn).cuda(),  # output_q
         ]
 
         self.register_replacement_pattern(pattern, replacement, example_inputs)

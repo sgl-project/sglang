@@ -1,4 +1,5 @@
 import torch
+from sgl_kernel.utils import is_arch_support_pdl
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
 from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
@@ -12,20 +13,23 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
                 input=x,
                 weight=weight,
                 eps=eps,
-                enable_pdl=False,
+                enable_pdl=is_arch_support_pdl(),
                 _output_base_index=0,
                 _all_bases=[rms_result],
             )
 
-            sgl_per_tensor_quant_fp8 = auto_functionalized_v2(
-                torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default,
+            per_tensor_quant_fp8 = auto_functionalized_v2(
+                torch.ops.sglang.per_tensor_quant_fp8.default,
                 input=rmsnorm[1],
-                output_s=scale,
                 is_static=True,
                 _output_q_base_index=0,
-                _all_bases=[output],
+                _output_s_base_index=1,
+                _all_bases=[output, scale],
             )
-            return sgl_per_tensor_quant_fp8[1]
+            return (
+                per_tensor_quant_fp8[1],
+                per_tensor_quant_fp8[2],
+            )
 
         def replacement(x, rms_result, weight, scale, eps, output):
             rms_norm_static_fp8_quant = auto_functionalized_v2(
@@ -37,7 +41,7 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
                 _result_base_index=0,
                 _all_bases=[output],
             )
-            return rms_norm_static_fp8_quant[1]
+            return rms_norm_static_fp8_quant[1], scale
 
         example_inputs = [
             torch.empty(16, 16).half().cuda(),
@@ -58,23 +62,24 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
                 torch.ops.sgl_kernel.fused_add_rmsnorm.default,
                 weight=weight,
                 eps=eps,
-                enable_pdl=False,
+                enable_pdl=is_arch_support_pdl(),
                 _input_base_index=0,
                 _residual_base_index=1,
                 _all_bases=[x, residual],
             )
 
-            sgl_per_tensor_quant_fp8 = auto_functionalized_v2(
-                torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8.default,
+            per_tensor_quant_fp8 = auto_functionalized_v2(
+                torch.ops.sglang.per_tensor_quant_fp8.default,
                 input=fused_add_rmsnorm[1],
-                output_s=scale,
                 is_static=True,
                 _output_q_base_index=0,
-                _all_bases=[result],
+                _output_s_base_index=1,
+                _all_bases=[result, scale],
             )
 
             return (
-                sgl_per_tensor_quant_fp8[1],
+                per_tensor_quant_fp8[1],
+                per_tensor_quant_fp8[2],
                 fused_add_rmsnorm[1],
                 fused_add_rmsnorm[2],
             )
@@ -92,6 +97,7 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
             )
             return (
                 fused_add_rms_norm_static_fp8_quant[1],
+                scale,
                 fused_add_rms_norm_static_fp8_quant[2],
                 fused_add_rms_norm_static_fp8_quant[2],
             )

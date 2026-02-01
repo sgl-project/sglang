@@ -65,8 +65,8 @@ class DummyAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        """Simulated graph break"""
-        torch._dynamo.graph_break()
+        out_view = self.out.view(-1)
+        out_view[0] = q.view(-1)[0] + k.view(-1)[0] + v.view(-1)[0]
         return self.out
 
     def forward_extend(
@@ -78,6 +78,6 @@ class DummyAttentionBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        """Simulated graph break"""
-        torch._dynamo.graph_break()
+        out_view = self.out.view(-1)
+        out_view[0] = q.view(-1)[0] + k.view(-1)[0] + v.view(-1)[0]
         return self.out

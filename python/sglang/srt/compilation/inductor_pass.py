@@ -127,7 +127,13 @@ class SGLangInductorPass(InductorPass):
         self.pass_name = self.__class__.__name__
 
     def dump_graph(self, graph: torch.fx.Graph, stage: str):
-        lazy_format_graph_code(stage, graph.owning_module)
+        return lazy_format_graph_code(
+            stage,
+            graph.owning_module,
+            include_stride=True,
+            include_device=True,
+            colored=True,
+        )
 
     def begin(self):
         self._start_time = time.perf_counter_ns()
@@ -157,16 +163,14 @@ class SGLangPatternMatcherInductorPass(SGLangInductorPass):
 
     def __call__(self, graph: torch.fx.graph):
         if self.pass_config.enable_torch_compile_graph_trace_logs:
-            graph_before_str = str(self.dump_graph(graph, f"Before_{self.pass_name}"))
+            logger.info("%s", str(self.dump_graph(graph, f"Before_{self.pass_name}")))
 
         self.begin()
         count = self.patterns.apply(graph)
         self.end_and_log(count)
 
         if count > 0 and self.pass_config.enable_torch_compile_graph_trace_logs:
-            graph_after_str = str(self.dump_graph(graph, f"After_{self.pass_name}"))
-            logger.info("%s", graph_before_str)
-            logger.info("%s", graph_after_str)
+            logger.info("%s", str(self.dump_graph(graph, f"After_{self.pass_name}")))
 
     @abstractmethod
     def build_pass(self) -> None:

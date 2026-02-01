@@ -58,13 +58,10 @@ def test_fused_add_rmsnorm_quant_pass(model, model_initializer):
         enable_torch_compile=True,
         enable_torch_compile_fusion=True,
         disable_fused_activation_pass=True,
+        enable_torch_compile_graph_trace_logs=True,
         nccl_port=12345
         + int(os.environ.get("PYTEST_XDIST_WORKER", "gw0").split("gw")[1]),
     )
-
-    # NOTE: Uncomment these lines for graph debugging
-    # server_args.log_level = "debug"
-    # server_args.enable_torch_compile_graph_trace_logs = True
 
     bench_args = ModelBenchArgs(
         num_tokens=1,
@@ -89,8 +86,12 @@ def test_fused_add_rmsnorm_quant_pass(model, model_initializer):
         code = "\n".join(source_codes)
 
         torch.testing.assert_close(ref_res, res)
+
         assert "sgl_kernel.fused_add_rms_norm_static_fp8_quant" in code
         assert "sgl_kernel.fused_add_rmsnorm" not in code
+
+        assert "sgl_kernel.rms_norm_static_fp8_quant" in code
+        assert "sgl_kernel.rmsnorm" not in code
 
 
 if __name__ == "__main__":
