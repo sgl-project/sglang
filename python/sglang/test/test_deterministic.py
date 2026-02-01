@@ -320,6 +320,9 @@ class TokenIdsAndLogprobs:
     token_ids: List[int]
     logprobs: List[float]
 
+    # Logprob differences smaller than this are treated as non-divergent.
+    DIVERGENCE_EPS = 0.0
+
     def __add__(self, other):
         return TokenIdsAndLogprobs(
             token_ids=self.token_ids + other.token_ids,
@@ -381,13 +384,24 @@ class TokenIdsAndLogprobs:
 
                 # K3 approximation: KL(A||B) ≈ (exp(logr) - 1) - logr, where logr = log_a - log_b
                 logr = logprobs_a - logprobs_b
-                kl_per_token = (np.exp(logr) - 1) - logr
-                kl_mean = np.mean(kl_per_token)
-                kl_max = np.max(kl_per_token)
+                diverge_mask = np.abs(logr) > cls.DIVERGENCE_EPS
+                diverge_count = int(np.count_nonzero(diverge_mask))
+                total_count = int(logr.shape[0])
 
-                print(f"    KL(A||B) mean: {kl_mean:.10e}")
-                print(f"    KL(A||B) max : {kl_max:.10e}")
-                print(f"    Mean absolute logprob diff: {np.mean(np.abs(logr)):.10e}")
+                if diverge_count > 0:
+                    kl_per_token = (np.exp(logr) - 1) - logr
+                    kl_divergent = kl_per_token[diverge_mask]
+                    kl_mean = float(np.mean(kl_divergent))
+                    kl_max = float(np.max(kl_divergent))
+                    mean_abs_logr = float(np.mean(np.abs(logr[diverge_mask])))
+                    print(f"    Divergent tokens: {diverge_count}/{total_count}")
+                    print(f"    KL(A||B) mean (divergent): {kl_mean:.10e}")
+                    print(f"    KL(A||B) max  (divergent): {kl_max:.10e}")
+                    print(
+                        f"    Mean absolute logprob diff (divergent): {mean_abs_logr:.10e}"
+                    )
+                else:
+                    print(f"    Divergent tokens: 0/{total_count}")
 
         return token_match and logprobs_match
 
