@@ -75,4 +75,3 @@ make export-all
   - Reuse the launched server as much as possible to reduce server launch time.
 - Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
 - Follow the existing examples to learn how to launch a server, send a query and other common styles.
-
