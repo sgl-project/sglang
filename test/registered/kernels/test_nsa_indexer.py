@@ -1,14 +1,11 @@
 import unittest
-from typing import Optional
+from typing import Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
-
 from sglang.srt.layers import dp_attention as _dp_attn
+from sglang.test.ci.ci_register import register_cuda_ci
 
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
@@ -27,6 +24,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
+register_cuda_ci(est_time=2, suite="stage-b-test-small-1-gpu")
+
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
     "device": "cuda",
@@ -42,6 +41,7 @@ DEFAULT_CONFIG = {
     "q_lora_rank": 1536,
     "kv_lora_rank": 512,
     "qk_rope_head_dim": 64,
+    "qk_nope_head_dim": 128,
     "max_position_embeddings": 163840,
     "rope_theta": 10000.0,
     "layer_id": 0,
@@ -80,6 +80,22 @@ class MockIndexerMetadata(BaseIndexerMetadata):
             )
         return page_table
 
+    def get_page_table_1(self) -> torch.Tensor:
+        """Return: (batch_size, num_blocks) int32, page table with page size 1."""
+        # Create a simple page table for testing with page size 1
+        max_seq_len = max(self.seq_lens)
+        num_blocks = max_seq_len  # Page size 1 means num_blocks == max_seq_len
+        page_table = torch.zeros(
+            (self.batch_size, num_blocks), dtype=torch.int32, device=self.device
+        )
+        for i in range(self.batch_size):
+            # Simple linear mapping: block i maps to page i
+            num_blocks_needed = self.seq_lens[i]
+            page_table[i, :num_blocks_needed] = torch.arange(
+                num_blocks_needed, device=self.device
+            )
+        return page_table
+
     def get_seqlens_expanded(self) -> torch.Tensor:
         """Return: (sum_extend_seq_len,) int32 tensor"""
         # For extend mode, each new token attends to progressively more tokens
@@ -89,11 +105,49 @@ class MockIndexerMetadata(BaseIndexerMetadata):
             result.extend(range(1, seq_len + 1))
         return torch.tensor(result, dtype=torch.int32, device=self.device)
 
+    def get_indexer_kvcache_range(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return: (tokens, ), (tokens, ) int32, k_start and k_end in kv cache for each token.
+        For extend mode, token i attends to tokens [0, i].
+        """
+        ks_list = []
+        ke_list = []
+        k_offset = 0
+        for seq_len in self.seq_lens:
+            # For a sequence being extended from position 0 to seq_len
+            # Token i attends to [k_offset, k_offset + i + 1)
+            ks = torch.full((seq_len,), k_offset, dtype=torch.int32, device=self.device)
+            ke = torch.arange(
+                k_offset + 1,
+                k_offset + seq_len + 1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            ks_list.append(ks)
+            ke_list.append(ke)
+            k_offset += seq_len
+        return torch.cat(ks_list, dim=0), torch.cat(ke_list, dim=0)
+
+    def get_indexer_seq_len_cpu(self) -> torch.Tensor:
+        """Return: seq lens for each batch."""
+        return torch.tensor(self.seq_lens, dtype=torch.int32, device="cpu")
+
+    def get_token_to_batch_idx(self) -> torch.Tensor:
+        """Return: batch idx for each token."""
+        result = []
+        for batch_idx, seq_len in enumerate(self.seq_lens):
+            result.extend([batch_idx] * seq_len)
+        return torch.tensor(result, dtype=torch.int32, device=self.device)
+
     def topk_transform(
         self,
         logits: torch.Tensor,
         topk: int,
         ks: Optional[torch.Tensor] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[torch.Tensor] = None,
+        topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform topk selection on the logits.
@@ -137,6 +191,7 @@ class MockModelRunner:
                 "num_attention_heads": 128,
                 "kv_lora_rank": self.config["kv_lora_rank"],
                 "qk_rope_head_dim": self.config["qk_rope_head_dim"],
+                "qk_nope_head_dim": self.config["qk_nope_head_dim"],
                 "hf_config": hf_config,
             },
         )()
