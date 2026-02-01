@@ -280,3 +280,6 @@ sgl-kernel/third_party/
 
 # MUSA core dump files
 core_*
+
+# PCG stress test artifacts
+test/pcg_test/

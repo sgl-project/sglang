@@ -10,6 +10,7 @@
 
 set -uo pipefail
 
+export HF_TOKEN=""
 export HF_HOME="/home/tensormesh/yuwei/huggingface"
 export HF_HUB_CACHE="/home/tensormesh/yuwei/huggingface/hub"
 export HUGGINGFACE_HUB_CACHE="/home/tensormesh/yuwei/huggingface/hub"
