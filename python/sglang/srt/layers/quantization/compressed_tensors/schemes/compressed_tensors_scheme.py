@@ -16,7 +16,6 @@ class CompressedTensorsScheme(ABC):
     """
 
     @classmethod
-    @abstractmethod
     def get_min_capability(cls) -> int:
         """
         Get minimum device capability.
