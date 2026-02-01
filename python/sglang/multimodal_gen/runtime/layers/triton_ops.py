@@ -8,6 +8,8 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 
 @triton.autotune(
     configs=[
@@ -524,8 +526,14 @@ def triton_autotune_configs():
     max_threads_per_block = 1024
     # Default to warp size 32 if not defined by device
     warp_size = getattr(
-        torch.cuda.get_device_properties(torch.cuda.current_device()), "warp_size", 32
+        torch.get_device_module().get_device_properties(
+            torch.get_device_module().current_device()
+        ),
+        "warp_size",
+        32,
     )
+    if warp_size is None:
+        warp_size = 32
     # Autotune for warp counts which are powers of 2 and do not exceed thread per block limit
     return [
         triton.Config({}, num_warps=warp_count)
@@ -820,7 +828,7 @@ def _layer_norm_fwd_impl(
     BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
     if N > BLOCK_N:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    with torch.cuda.device(x.device.index):
+    with torch.get_device_module().device(x.device.index):
         torch.library.wrap_triton(_layer_norm_fwd_1pass_kernel)[(M,)](
             x,
             out,
@@ -1166,3 +1174,31 @@ def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
             BLOCK_SIZE_SEQ=BLOCK_SIZE_SEQ,
         )
     return y
+
+
+if current_platform.is_npu():
+    # TODO: remove this when triton ascend bug is fixed
+    def fuse_scale_shift_native(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return x * (1 + scale) + shift
+
+    fuse_scale_shift_kernel = fuse_scale_shift_native
+
+    # TODO: remove this when triton ascend bug is fixed
+    def apply_rotary_embedding_native(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
+    ) -> torch.Tensor:
+        cos = cos.unsqueeze(-2).to(x.dtype)
+        sin = sin.unsqueeze(-2).to(x.dtype)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    apply_rotary_embedding = apply_rotary_embedding_native
