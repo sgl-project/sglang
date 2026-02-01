@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -78,15 +77,11 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             out = run_once_fn()
         return out
 
-    def _get_update_attr_name(self, model_runner):
-        if self.bs < get_attention_tp_size():
-            return self.attr_name[AttentionArch.MLA]
-        return self.attr_name[model_runner.model_config.attention_arch]
+    def _get_update_attr_name(self):
+        return self.attr_name[AttentionArch.MLA]
 
-    def _get_update_attr_type(self, model_runner):
-        if self.bs < get_attention_tp_size():
-            return self.attr_type[AttentionArch.MLA]
-        return self.attr_type[model_runner.model_config.attention_arch]
+    def _get_update_attr_type(self):
+        return self.attr_type[AttentionArch.MLA]
 
     def _replay_update(self, seq_lens):
         if isinstance(self.update_attr_type, torch.Tensor):
@@ -97,8 +92,8 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
         )
 
     def _replay(self, forward_batch: ForwardBatch):
-        self.update_attr_name = self._get_update_attr_name(self.model_runner)
-        self.update_attr_type = self._get_update_attr_type(self.model_runner)
+        self.update_attr_name = self._get_update_attr_name()
+        self.update_attr_type = self._get_update_attr_type()
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
