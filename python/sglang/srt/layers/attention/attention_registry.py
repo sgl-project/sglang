@@ -230,3 +230,18 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("hpc")
+def create_hpc_backend(runner):
+    assert not runner.use_mla_backend, (
+        "HPC attention backend does not support MLA models. "
+        "Please use a different backend."
+    )
+    assert not runner.model_config.is_encoder_decoder, (
+        "HPC attention backend does not support encoder-decoder models. "
+        "Please use `--attention-backend flashinfer`."
+    )
+    from sglang.srt.layers.attention.hpc_backend import HpcAttentionBackend
+
+    return HpcAttentionBackend(runner)
