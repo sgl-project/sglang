@@ -84,6 +84,7 @@ class MiMoMTP(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
