@@ -34,6 +34,7 @@ jobs:
       - name: Run Failure Analysis
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_PAT_FOR_RUNNER_ADMIN: ${{ secrets.GH_PAT_FOR_RUNNER_ADMIN }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |

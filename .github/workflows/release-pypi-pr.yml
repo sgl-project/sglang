@@ -38,8 +38,13 @@ jobs:
       - name: Generate PR wheel version
         id: gen_version
         run: |
-          # Get base version from version.py
-          BASE_VERSION=$(cat python/sglang/version.py | cut -d'"' -f2)
+          # Get base version from setuptools_scm
+          cd python
+          pip install setuptools-scm
+          FULL_VERSION=$(python -c "from setuptools_scm import get_version; print(get_version(root='..'))")
+          # Strip any existing .dev or + suffix to get clean base version
+          BASE_VERSION=$(echo "$FULL_VERSION" | sed 's/\.dev.*//;s/+.*//')
+          cd ..
 
           # Get commit info
           COMMIT_HASH=$(git rev-parse --short HEAD)
@@ -68,15 +73,17 @@ jobs:
       - name: Update pyproject.toml with PR wheel version
         run: |
           cd python
-          BASE_VERSION=$(cat sglang/version.py | cut -d'"' -f2)
           WHEEL_VERSION="${{ steps.gen_version.outputs.wheel_version }}"
 
-          # Update version (temporary, not committed)
-          sed -i "s/version = \"${BASE_VERSION}\"/version = \"${WHEEL_VERSION}\"/" pyproject.toml
+          # Update pyproject.toml to use static version instead of dynamic
+          # Remove 'version' from dynamic list and add static version
+          sed -i 's/dynamic = \["version"\]/dynamic = []/' pyproject.toml
+          sed -i "/^name = \"sglang\"/a version = \"${WHEEL_VERSION}\"" pyproject.toml
 
           # Verify update
           echo "Updated version in pyproject.toml:"
           grep "^version" pyproject.toml
+          grep "^dynamic" pyproject.toml
 
       - name: Install build dependencies
         run: |
@@ -132,9 +139,14 @@ jobs:
             Build date: ${{ needs.build-pr-wheel.outputs.build_date }}
             Version: ${{ needs.build-pr-wheel.outputs.wheel_version }}
 
-            **Installation via index:**
+            **Installation via index (pip):**
             ```bash
-            pip install sglang=={version} --index-url https://sgl-project.github.io/whl/pr/
+            pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/
+            ```
+
+            **Installation via index (uv):**
+            ```bash
+            uv pip install sglang==${{ needs.build-pr-wheel.outputs.wheel_version }} --index-url https://sgl-project.github.io/whl/pr/ --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
             ```
 
             **Direct installation:**

@@ -38,9 +38,7 @@ class ConditioningStage(PipelineStage):
         """
         Apply conditioning to the diffusion process.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The batch with applied conditioning.
