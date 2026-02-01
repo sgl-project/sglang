@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -902,12 +902,14 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                logger.warning(
-                    "%s quantization is not fully "
-                    "optimized yet. The speed can be slower than "
-                    "non-quantized models.",
-                    self.quantization,
-                )
+                # Don't warn for MXFP4 on SM100 since it has optimized kernels
+                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                    logger.warning(
+                        "%s quantization is not fully "
+                        "optimized yet. The speed can be slower than "
+                        "non-quantized models.",
+                        self.quantization,
+                    )
 
     def _verify_dual_chunk_attention_config(self) -> None:
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
