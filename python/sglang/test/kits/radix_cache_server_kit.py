@@ -1,9 +1,15 @@
+import os
 import random
+import time
 
 import requests
 
 
 def gen_radix_tree(num_nodes=400, chunk_len=256):
+    # Use seed from environment or generate one for reproducibility
+    seed = int(os.environ.get("TEST_SEED", int(time.time() * 1000) % (2**31)))
+    random.seed(seed)
+    print(f"[DEBUG radix_cache] gen_radix_tree using seed={seed}")
     num0 = num_nodes // 2
     num1 = num_nodes - num0
     nodes = [{"input_ids": [37] * 117, "decode_len": 217}]
@@ -39,6 +45,16 @@ def gen_radix_tree(num_nodes=400, chunk_len=256):
 
 def run_radix_attention_test(base_url: str):
     nodes = gen_radix_tree()
+
+    # Debug: log test data statistics
+    input_lens = [len(node["input_ids"]) for node in nodes]
+    decode_lens = [node["decode_len"] for node in nodes]
+    print(
+        f"[DEBUG radix_cache] num_nodes={len(nodes)}, "
+        f"input_lens: min={min(input_lens)}, max={max(input_lens)}, avg={sum(input_lens)/len(input_lens):.1f}, "
+        f"decode_lens: min={min(decode_lens)}, max={max(decode_lens)}, avg={sum(decode_lens)/len(decode_lens):.1f}"
+    )
+
     data = {
         "input_ids": [node["input_ids"] for node in nodes],
         "sampling_params": [

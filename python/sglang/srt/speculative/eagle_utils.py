@@ -1,3 +1,4 @@
+import logging
 import math
 from enum import IntEnum
 from typing import List, Optional
@@ -5,6 +6,8 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -27,6 +30,22 @@ def organize_draft_results(
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values
+
+    # Debug: validate gather indices before operation
+    # Skip during CUDA graph capture to avoid sync issues
+    if not torch.cuda.is_current_stream_capturing():
+        max_index = top_scores_index.max().item()
+        token_list_dim = ss_token_list.size(1)
+        if max_index >= token_list_dim:
+            logger.error(
+                f"[DEBUG EAGLE organize_draft_results] Index out of bounds! "
+                f"max_index={max_index} >= token_list_dim={token_list_dim}, "
+                f"score_list.shape={score_list.shape}, "
+                f"ss_token_list.shape={ss_token_list.shape}, "
+                f"top_scores_index.shape={top_scores_index.shape}, "
+                f"num_draft_token={num_draft_token}"
+            )
+
     draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     if len(parents_list) > 1:

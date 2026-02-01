@@ -320,6 +320,23 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         )
         top_scores_index = top_scores.indices
         top_scores_index = torch.sort(top_scores_index).values
+
+        # Debug: validate gather indices before operation
+        # Skip during CUDA graph capture to avoid sync issues
+        if not torch.cuda.is_current_stream_capturing():
+            max_index = top_scores_index.max().item()
+            token_list_dim = ss_token_list.size(1)
+            if max_index >= token_list_dim:
+                logging.error(
+                    f"[DEBUG MultiLayerEAGLE] Index out of bounds! "
+                    f"max_index={max_index} >= token_list_dim={token_list_dim}, "
+                    f"score_list.shape={score_list.shape}, "
+                    f"ss_token_list.shape={ss_token_list.shape}, "
+                    f"top_scores_index.shape={top_scores_index.shape}, "
+                    f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                    f"topk={self.topk}, num_steps={self.speculative_num_steps}"
+                )
+
         draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
         if len(parents_list) > 1:
