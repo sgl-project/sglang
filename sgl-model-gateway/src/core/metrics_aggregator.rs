@@ -53,16 +53,16 @@ fn merge_exposition(
     a: PrometheusExposition,
     b: PrometheusExposition,
 ) -> anyhow::Result<PrometheusExposition> {
-    let mut ans = a;
+    let mut answer = a;
     for (name, family_b) in b.families.into_iter() {
-        let family_merged = if let Some(family_a) = ans.families.remove(&name) {
+        let family_merged = if let Some(family_a) = answer.families.remove(&name) {
             merge_family(family_a, family_b)?
         } else {
             family_b
         };
-        ans.families.insert(name, family_merged);
+        answer.families.insert(name, family_merged);
     }
-    Ok(ans)
+    Ok(answer)
 }
 
 fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<PrometheusFamily> {

@@ -113,8 +113,8 @@ def tree_search(question, num_branches, call_generate):
 
     solutions = []
     for sol in ref_states:
-        ans = get_final_answer(sol, num_branches, call_generate)
-        solutions.append(ans)
+        answer = get_final_answer(sol, num_branches, call_generate)
+        solutions.append(answer)
 
     return solutions
 
