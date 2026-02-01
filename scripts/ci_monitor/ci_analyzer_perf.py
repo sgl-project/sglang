@@ -17,7 +17,6 @@ from typing import Dict, List, Optional
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import pandas as pd
 import requests
 from matplotlib import rcParams
 
@@ -194,7 +193,6 @@ class SGLangPerfAnalyzer:
 
     def _get_sampled_runs(self, limit: int) -> List[Dict]:
         """Uniform sampling method for 30-day coverage"""
-        from datetime import datetime, timedelta
 
         # Uniform sampling across 30 days
         sampled_runs = self._sample_time_period(limit, days_back=30, uniform=True)

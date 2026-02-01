@@ -36,15 +36,11 @@ class TestSharedExpert(CustomTestCase):
 
     def _bf16_shared_expert(self, m, n, k, routed_scaling_factor):
         dtype = torch.bfloat16
-        prepack = True
 
         hidden_states = torch.randn(m, k, dtype=dtype) / k
         w1 = torch.randn(2 * n, k, dtype=dtype)
         w2 = torch.randn(k, n, dtype=dtype)
         fused_output = torch.randn(m, k, dtype=dtype) / k
-
-        # fused moe mutates content in hs
-        hidden_states2 = hidden_states.clone()
 
         # bfloat16
         ref = torch_naive_moe(
@@ -89,7 +85,6 @@ class TestSharedExpert(CustomTestCase):
 
     def _int8_shared_expert(self, m, n, k, routed_scaling_factor):
         dtype = torch.bfloat16
-        prepack = True
 
         hidden_states = torch.randn(m, k, dtype=dtype) / k
         w1 = torch.randn(2 * n, k, dtype=dtype)
@@ -147,7 +142,6 @@ class TestSharedExpert(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         dtype = torch.bfloat16
-        prepack = True
 
         a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
 

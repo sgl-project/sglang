@@ -44,7 +44,7 @@ def test_server_args_config_parser(merger):
 
     try:
         # Test config parser directly
-        config_args = merger._parse_yaml_config(config_file)
+        merger._parse_yaml_config(config_file)
 
         # Test merging with CLI args
         cli_args = ["--config", config_file, "--max-running-requests", "128"]

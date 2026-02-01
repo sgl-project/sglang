@@ -41,7 +41,7 @@ class TestAbort(CustomTestCase):
                         },
                     },
                 )
-                ret = response.json()
+                response.json()
 
             with ThreadPoolExecutor(16) as executor:
                 list(executor.map(run_one, list(range(16))))

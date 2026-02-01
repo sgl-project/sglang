@@ -10,7 +10,6 @@ Run this after clearing pre-built AITER kernels from the Docker image.
 """
 
 import os
-import sys
 import time
 
 # Ensure AITER is enabled

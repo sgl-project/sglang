@@ -1085,9 +1085,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
         # Second call: Add just partial closing tag - state machine will buffer this
         # without producing JSON (it's waiting to see if </arg_value> is complete)
         func_args_2 = func_args_1 + "<"  # Add partial tag
-        result_2 = detector._process_arguments_streaming(
-            "test_func", func_args_2, tools
-        )
+        detector._process_arguments_streaming("test_func", func_args_2, tools)
 
         # This is the critical test: if _streamed_raw_length is NOT updated when
         # json_increment is empty, then detector._streamed_raw_length will still be

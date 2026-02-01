@@ -1087,7 +1087,7 @@ class TestKimiK2Detector(unittest.TestCase):
         ]
 
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.detector.parse_streaming_increment(chunk, self.tools)
 
         # After processing all chunks, the buffer should be empty and current_tool_id should be reset
         self.assertEqual(self.detector._buffer, "")
@@ -2099,7 +2099,7 @@ class TestGlm4MoeDetector(unittest.TestCase):
             "</tool_call>",
         ]
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.detector.parse_streaming_increment(chunk, self.tools)
         self.assertEqual(self.detector.current_tool_id, 1)
 
     def test_invalid_tool_call(self):
@@ -2390,7 +2390,7 @@ class TestGlm47MoeDetector(unittest.TestCase):
             "</tool_call>",
         ]
         for chunk in chunks:
-            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            self.detector.parse_streaming_increment(chunk, self.tools)
         self.assertEqual(self.detector.current_tool_id, 1)
 
     def test_invalid_tool_call(self):
@@ -2822,7 +2822,7 @@ class TestJsonArrayParser(unittest.TestCase):
         """Test parsing 3 tool calls in separate chunks with commas at the end"""
         # First tool call: 2 chunks
         chunk1_1 = '[{"name": "get_weather", "parameters": '
-        result1_1 = self.detector.parse_streaming_increment(chunk1_1, self.tools)
+        self.detector.parse_streaming_increment(chunk1_1, self.tools)
         chunk1_2 = '{"location": "Tokyo"}},'
         result1_2 = self.detector.parse_streaming_increment(chunk1_2, self.tools)
         self.assertIsInstance(result1_2, StreamingParseResult)
@@ -2830,7 +2830,7 @@ class TestJsonArrayParser(unittest.TestCase):
 
         # Second tool call: 2 chunks
         chunk2_1 = '{"name": "search", "parameters": '
-        result2_1 = self.detector.parse_streaming_increment(chunk2_1, self.tools)
+        self.detector.parse_streaming_increment(chunk2_1, self.tools)
         chunk2_2 = '{"query": "restaurants"}},'
         result2_2 = self.detector.parse_streaming_increment(chunk2_2, self.tools)
         self.assertIsInstance(result2_2, StreamingParseResult)
@@ -2838,7 +2838,7 @@ class TestJsonArrayParser(unittest.TestCase):
 
         # Third tool call: 2 chunks
         chunk3_1 = '{"name": "get_weather", "parameters": '
-        result3_1 = self.detector.parse_streaming_increment(chunk3_1, self.tools)
+        self.detector.parse_streaming_increment(chunk3_1, self.tools)
         chunk3_2 = '{"location": "Paris"}}]'
         result3_2 = self.detector.parse_streaming_increment(chunk3_2, self.tools)
         self.assertIsInstance(result3_2, StreamingParseResult)
