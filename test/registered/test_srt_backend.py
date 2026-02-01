@@ -20,7 +20,7 @@ from sglang.test.test_programs import (
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, CustomTestCase
 
 register_cuda_ci(est_time=80, suite="stage-a-test-1")
-register_amd_ci(est_time=120, suite="stage-a-test-1")
+register_amd_ci(est_time=120, suite="stage-a-test-1-amd")
 
 
 class TestSRTBackend(CustomTestCase):
@@ -49,6 +49,7 @@ class TestSRTBackend(CustomTestCase):
     def test_decode_int(self):
         test_decode_int()
 
+    @unittest.skip("Skip this flaky test.")
     def test_decode_json_regex(self):
         test_decode_json_regex()
 

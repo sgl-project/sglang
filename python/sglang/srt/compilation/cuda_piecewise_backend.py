@@ -3,33 +3,21 @@
 import dataclasses
 import logging
 from contextlib import ExitStack
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional
 from unittest.mock import patch
 
 import torch
 import torch.fx as fx
-from sgl_kernel import weak_ref_tensor
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_pcg_capture_stream,
+    is_in_pcg_torch_compile,
+)
+from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
 logger = logging.getLogger(__name__)
-
-
-def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]]
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
-    """
-    Convenience function to create weak references to tensors,
-    for single tensor, list of tensors or tuple of tensors.
-    """
-    if isinstance(tensors, torch.Tensor):
-        return weak_ref_tensor(tensors)
-    if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
-    if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
-    raise ValueError("Invalid type for tensors")
 
 
 @dataclasses.dataclass
@@ -121,6 +109,10 @@ class CUDAPiecewiseBackend:
             self.first_run_finished = True
             self.check_for_ending_compilation()
             return self.compiled_graph_for_general_shape(*args)
+
+        if len(self.sym_shape_indices) == 0:
+            return self.compiled_graph_for_general_shape(*args)
+
         runtime_shape = args[self.sym_shape_indices[0]]
         if runtime_shape not in self.concrete_size_entries:
             # we don't need to do anything for this shape
@@ -148,11 +140,8 @@ class CUDAPiecewiseBackend:
             if self.is_last_graph and not self.to_be_compiled_sizes:
                 self.check_for_ending_compilation()
 
-        # Skip CUDA graphs if this entry doesn't use them OR
-        # if we're supposed to skip them globally
-        # skip_cuda_graphs = get_forward_context().skip_cuda_graphs
-        # if not entry.use_cudagraph or skip_cuda_graphs:
-        #     return entry.runnable(*args)
+        if is_in_pcg_torch_compile():
+            return entry.runnable(*args)
 
         if entry.cudagraph is None:
             if entry.num_finished_warmup < 1:  # noqa
@@ -176,9 +165,12 @@ class CUDAPiecewiseBackend:
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
-
                 # mind-exploding: carefully manage the reference and memory.
-                with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+                stream = get_pcg_capture_stream()
+                assert (
+                    stream is not None
+                ), "PCG capture stream is not set, please check if runtime recompilation happened"
+                with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
                     if self.is_last_graph:
@@ -210,6 +202,5 @@ class CUDAPiecewiseBackend:
                 "Input addresses for cudagraphs are different during replay."
                 f" Expected {entry.input_addresses}, got {new_input_addresses}"
             )
-
         entry.cudagraph.replay()
         return entry.output

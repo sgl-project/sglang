@@ -14,7 +14,6 @@ from sglang.test.test_utils import (
 )
 
 
-@unittest.skip("See https://github.com/sgl-project/sglang/issues/12533")
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -24,7 +23,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--trust-remote-code",
             "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.89",
+            "0.8",
             "--max-prefill-tokens",
             "16384",
             "--max-running-requests",

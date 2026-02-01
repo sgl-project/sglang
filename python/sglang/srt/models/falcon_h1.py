@@ -198,15 +198,17 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        # FalconH1 all layers are sparse and have no nextn now
+        # FalconH1 all layers are dense and have no nextn now
         self.is_layer_sparse = False
         is_previous_layer_sparse = False
+        is_next_layer_sparse = False
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
             is_layer_sparse=self.is_layer_sparse,
             is_previous_layer_sparse=is_previous_layer_sparse,
+            is_next_layer_sparse=is_next_layer_sparse,
         )
 
         self.feed_forward = FalconH1MLP(
@@ -392,7 +394,7 @@ class FalconH1Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
 
         def get_layer(idx: int, prefix: str):

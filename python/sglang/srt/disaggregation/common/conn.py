@@ -92,6 +92,7 @@ class CommonKVManager(BaseKVManager):
             self.prefill_attn_tp_size_table: Dict[str, int] = {}
             self.prefill_dp_size_table: Dict[str, int] = {}
             self.prefill_pp_size_table: Dict[str, int] = {}
+            self.prefill_page_size_table: Dict[str, Optional[int]] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -127,6 +128,7 @@ class CommonKVManager(BaseKVManager):
             "system_dp_rank": self.system_dp_rank,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "page_size": self.kv_args.page_size,
         }
 
         try:
@@ -153,27 +155,46 @@ class CommonKVManager(BaseKVManager):
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], List[int], List[int], int]:
-        # pp is not supported on the decode side yet
         start_layer = self.kv_args.prefill_start_layer
         num_kv_layers = len(src_kv_ptrs) // 2
         end_layer = start_layer + num_kv_layers
         dst_num_total_layers = len(dst_kv_ptrs) // 2
         src_k_ptrs = src_kv_ptrs[:num_kv_layers]
         src_v_ptrs = src_kv_ptrs[num_kv_layers:]
-        dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
-        dst_v_ptrs = dst_kv_ptrs[
-            dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
-        ]
+        if num_kv_layers == dst_num_total_layers:
+            dst_k_ptrs = dst_kv_ptrs[:dst_num_total_layers]
+            dst_v_ptrs = dst_kv_ptrs[dst_num_total_layers:]
+        elif (
+            num_kv_layers < dst_num_total_layers
+            and dst_num_total_layers % num_kv_layers != 0
+        ):
+            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
+            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
+            multiplier_ratio = dst_num_total_layers // num_kv_layers
+            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            v_ptr_offset = num_kv_layers * multiplier_ratio
+            dst_v_ptrs = dst_kv_ptrs[
+                v_ptr_offset + start_layer : v_ptr_offset + end_layer
+            ]
+        else:
+            # Decode pp size should be equal to prefill pp size or 1
+            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            dst_v_ptrs = dst_kv_ptrs[
+                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+            ]
         layers_current_pp_stage = len(src_k_ptrs)
         return src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
-        # pp is not supported on the decode side yet
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + len(src_kv_ptrs)
-        sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+        if len(src_kv_ptrs) == len(dst_kv_ptrs):
+            sliced_dst_kv_ptrs = dst_kv_ptrs
+        else:
+            # Decode pp size should be equal to prefill pp size or 1
+            sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         layers_current_pp_stage = len(src_kv_ptrs)
         return src_kv_ptrs, sliced_dst_kv_ptrs, layers_current_pp_stage
 
@@ -236,6 +257,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.prefill_attn_tp_size,
                 self.prefill_dp_size,
                 self.prefill_pp_size,
+                self.prefill_page_size,
             ) = self._get_prefill_parallel_info_from_server()
             if (
                 self.prefill_attn_tp_size is None
@@ -249,19 +271,33 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 self.bootstrap_infos = None
                 return
-            else:
-                logger.debug(
-                    f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size}"
-                )
-                self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = (
-                    self.prefill_attn_tp_size
-                )
-                self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = (
-                    self.prefill_dp_size
-                )
-                self.kv_mgr.prefill_pp_size_table[self.bootstrap_addr] = (
-                    self.prefill_pp_size
-                )
+
+            if self.prefill_page_size is not None:
+                decode_page_size = self.kv_mgr.kv_args.page_size
+                if self.prefill_page_size != decode_page_size:
+                    error_msg = (
+                        f"Page size mismatch: prefill server has page_size={self.prefill_page_size}, "
+                        f"but decode server has page_size={decode_page_size}. "
+                        f"Both servers must use the same --page-size value."
+                    )
+                    logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+            logger.debug(
+                f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_attn_tp_size} PP size:{self.prefill_pp_size} Page size:{self.prefill_page_size}"
+            )
+            self.kv_mgr.prefill_attn_tp_size_table[self.bootstrap_addr] = (
+                self.prefill_attn_tp_size
+            )
+            self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = (
+                self.prefill_dp_size
+            )
+            self.kv_mgr.prefill_pp_size_table[self.bootstrap_addr] = (
+                self.prefill_pp_size
+            )
+            self.kv_mgr.prefill_page_size_table[self.bootstrap_addr] = (
+                self.prefill_page_size
+            )
         else:
             self.prefill_attn_tp_size = self.kv_mgr.prefill_attn_tp_size_table[
                 self.bootstrap_addr
@@ -272,9 +308,11 @@ class CommonKVReceiver(BaseKVReceiver):
             self.prefill_pp_size = self.kv_mgr.prefill_pp_size_table[
                 self.bootstrap_addr
             ]
+            self.prefill_page_size = self.kv_mgr.prefill_page_size_table.get(
+                self.bootstrap_addr
+            )
 
-        # Currently, we don't allow prefill instance and decode instance to
-        # have different TP sizes per DP rank, except for models using MLA.
+        # Handling for PD with different TP sizes per DP rank
         if self.kv_mgr.attn_tp_size == self.prefill_attn_tp_size:
             self.target_tp_rank = (
                 self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
@@ -335,8 +373,18 @@ class CommonKVReceiver(BaseKVReceiver):
         else:
             self.prefill_dp_rank = bootstrap_room % self.prefill_dp_size
 
-        # FIXME: alias here: target_dp_group -> prefill_dp_rank
         self.target_dp_group = self.prefill_dp_rank
+
+        # Decode pp size should be equal to prefill pp size or 1
+        assert (
+            self.kv_mgr.pp_size == self.prefill_pp_size or self.kv_mgr.pp_size == 1
+        ), (
+            f"Decode pp size ({self.kv_mgr.pp_size}) should be equal to prefill pp size ({self.prefill_pp_size}) or 1",
+        )
+        if self.prefill_pp_size == self.kv_mgr.pp_size:
+            self.target_pp_ranks = [self.kv_mgr.pp_rank]
+        else:
+            self.target_pp_ranks = [rank for rank in range(self.prefill_pp_size)]
 
         self.kv_mgr.required_prefill_response_num_table[self.bootstrap_room] = (
             self.required_prefill_response_num
@@ -349,7 +397,8 @@ class CommonKVReceiver(BaseKVReceiver):
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
             for target_tp_rank in self.target_tp_ranks:
-                for target_pp_rank in range(self.prefill_pp_size):
+                # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
+                for target_pp_rank in reversed(self.target_pp_ranks):
                     bootstrap_info = self._get_bootstrap_info_from_server(
                         target_tp_rank, self.target_dp_group, target_pp_rank
                     )
@@ -406,7 +455,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
     def _get_prefill_parallel_info_from_server(
         self,
-    ) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    ) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
         """Fetch the prefill parallel info from the bootstrap server."""
         try:
             url = f"http://{self.bootstrap_addr}/route?engine_rank={-1}&target_dp_group={-1}&target_pp_rank={-1}"
@@ -417,15 +466,16 @@ class CommonKVReceiver(BaseKVReceiver):
                     int(prefill_parallel_info["prefill_attn_tp_size"]),
                     int(prefill_parallel_info["prefill_dp_size"]),
                     int(prefill_parallel_info["prefill_pp_size"]),
+                    int(prefill_parallel_info["prefill_page_size"]),
                 )
             else:
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
                 )
-                return None, None, None
+                return None, None, None, None
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
-            return None, None, None
+            return None, None, None, None
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
@@ -467,6 +517,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.pp_size = None
         self.attn_tp_size = None
         self.dp_size = None
+        self.page_size = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]
         ] = {}
@@ -509,6 +560,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         system_dp_rank = data["system_dp_rank"]
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
+        page_size = int(data["page_size"])
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -518,6 +570,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.pp_size is None:
             self.pp_size = pp_size
+
+        if self.page_size is None and page_size is not None:
+            self.page_size = page_size
 
         if role == "Prefill":
             if system_dp_size == 1:
@@ -559,6 +614,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "prefill_attn_tp_size": self.attn_tp_size,
                 "prefill_dp_size": self.dp_size,
                 "prefill_pp_size": self.pp_size,
+                "prefill_page_size": self.page_size,
             }
             return web.json_response(prefill_parallel_info, status=200)
 

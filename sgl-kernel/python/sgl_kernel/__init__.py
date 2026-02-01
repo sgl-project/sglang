@@ -30,9 +30,14 @@ from sgl_kernel.elementwise import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     rmsnorm,
+    rotary_embedding,
     silu_and_mul,
 )
-from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
+from sgl_kernel.expert_specialization import (
+    es_fp8_blockwise_scaled_grouped_mm,
+    es_sm100_mxfp8_blockscaled_grouped_mm,
+    es_sm100_mxfp8_blockscaled_grouped_quant,
+)
 from sgl_kernel.fused_moe import moe_wna16_marlin_gemm
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -73,7 +78,13 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
-from sgl_kernel.mamba import causal_conv1d_fwd, causal_conv1d_update
+from sgl_kernel.mamba import (
+    causal_conv1d_fn_cpu,
+    causal_conv1d_fwd,
+    causal_conv1d_update,
+    causal_conv1d_update_cpu,
+    chunk_gated_delta_rule_cpu,
+)
 from sgl_kernel.marlin import (
     awq_marlin_moe_repack,
     awq_marlin_repack,

@@ -78,4 +78,6 @@ def test_unknown_tool_name_forwarded(caplog):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    import sys
+
+    sys.exit(pytest.main([__file__]))
