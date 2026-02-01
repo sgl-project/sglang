@@ -13,7 +13,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils.common import calc_diff, get_bool_env_var
 
 if ENABLE_JIT_DEEPGEMM:
-    import deep_gemm
+    from sglang.srt.layers import deep_gemm_wrapper
 
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"
@@ -246,7 +246,7 @@ def _matmul_persistent_deepgemm(
     out = torch.empty((M, N), device=a.device, dtype=dtype)
 
     try:
-        deep_gemm.bf16_gemm_nn(a, b, out)
+        deep_gemm_wrapper.gemm_nn_bf16(a, b, out)
     except RuntimeError as e:
         raise RuntimeError(
             f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
