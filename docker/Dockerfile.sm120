@@ -1,0 +1,111 @@
+# SM120 (RTX 5090/6000 Pro Blackwell) MXFP4 Support Dockerfile
+#
+# This extends the anthropic-test Dockerfile with patched triton_kernels
+# that enables MXFP4 quantization on SM120 GPUs (which lack cluster TMA).
+#
+# Build (from sglang repo root):
+#   ./docker/build-sm120.sh
+#
+# Or manually:
+#   docker build -f docker/Dockerfile.sm120 \
+#     -t registry.k8s.hq.droidcraft.org/droidcraft/sglang:sm120 \
+#     --build-arg BASE_IMAGE=registry.k8s.hq.droidcraft.org/droidcraft/sglang-anthropic-base:latest .
+
+# =============================================================================
+# STAGE 1: Base image with all dependencies and cubins (heavy, cached)
+# =============================================================================
+ARG CUDA_VERSION=12.9.1
+ARG BASE_IMAGE=base
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+
+ARG DEEPEP_VERSION=v1.2.1
+ARG BUILD_PARALLEL=4
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_HOME=/usr/local/cuda
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_PARALLEL}
+ENV MAKEFLAGS="-j${BUILD_PARALLEL}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    wget \
+    curl \
+    git \
+    build-essential \
+    cmake \
+    ninja-build \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    libibverbs-dev \
+    librdmacm-dev \
+    libnuma-dev \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
+    && wget https://bootstrap.pypa.io/get-pip.py \
+    && python3 get-pip.py \
+    && rm get-pip.py \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+ENV UV_VERSION=0.8.13
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+ARG BUILD_PARALLEL
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone --depth=1 --branch ${DEEPEP_VERSION} https://github.com/deepseek-ai/DeepEP.git /tmp/DeepEP \
+    && cd /tmp/DeepEP \
+    && pip install torch==2.8.0 --extra-index-url https://download.pytorch.org/whl/cu129 \
+    && TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0a" \
+       MAX_JOBS=${BUILD_PARALLEL} \
+       pip install --no-build-isolation . \
+    && rm -rf /tmp/DeepEP
+
+WORKDIR /sgl-workspace
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    pip install sglang[all] \
+    --extra-index-url https://download.pytorch.org/whl/cu129 \
+    && pip uninstall -y sglang
+
+ARG BUILD_PARALLEL
+RUN FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_PARALLEL} \
+    FLASHINFER_LOGGING_LEVEL=warning \
+    python -m flashinfer --download-cubin || true
+
+# =============================================================================
+# STAGE 2: Dev image with SM120 MXFP4 support
+# =============================================================================
+FROM ${BASE_IMAGE} AS dev
+
+WORKDIR /sgl-workspace/sglang
+
+# Copy sglang code
+COPY python /sgl-workspace/sglang/python
+COPY test /sgl-workspace/sglang/test
+
+# Install sglang in editable mode
+RUN --mount=type=cache,target=/root/.cache/uv \
+    cd /sgl-workspace/sglang/python && \
+    uv pip install --system -e ".[dev]" \
+    --extra-index-url https://download.pytorch.org/whl/cu129 \
+    --index-strategy unsafe-best-match
+
+# Install pre-built Triton and triton_kernels wheels for SM120 MXFP4 support
+# Wheels must be built first with: ./docker/build-wheels.sh
+COPY docker/wheels /tmp/wheels
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall -y triton triton-nightly triton-kernels || true && \
+    pip install /tmp/wheels/*.whl --force-reinstall && \
+    rm -rf /tmp/wheels
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["python", "-m", "sglang.launch_server", "--help"]

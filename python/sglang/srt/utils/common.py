@@ -82,6 +82,7 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
+from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -1193,6 +1194,35 @@ def rank0_log(msg: str):
 
     if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
+
+
+def add_api_key_middleware(app, api_key: str):
+    @app.middleware("http")
+    async def authentication(request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path.startswith("/health") or request.url.path.startswith(
+            "/metrics"
+        ):
+            return await call_next(request)
+        # Accept both OpenAI-style (Authorization: Bearer) and Anthropic-style (x-api-key) auth
+        auth_header = request.headers.get("Authorization")
+        x_api_key = request.headers.get("x-api-key")
+        if auth_header == "Bearer " + api_key or x_api_key == api_key:
+            return await call_next(request)
+        return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
+
+
+def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
+    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        if not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
+            model_path = snapshot_download(model_path)
+            tokenizer_path = snapshot_download(
+                tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+            )
+    return model_path, tokenizer_path
 
 
 def configure_logger(server_args, prefix: str = ""):
