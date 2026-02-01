@@ -1232,8 +1232,9 @@ class ChunkSizePredictor:
 
     def fit(self, seq_lens: List[int], latencies: List[float]):
         """Fit quadratic coefficients f(l) = al^2 + bl + c from data points."""
-        L = np.array(seq_lens, dtype=np.float64)
-        T = np.array(latencies, dtype=np.float64)
+        # Skip the first data point to reduce fitting bias, as the first run is slower without warmup
+        L = np.array(seq_lens[1:], dtype=np.float64)
+        T = np.array(latencies[1:], dtype=np.float64)
 
         if len(L) < 8:
             raise ValueError(
@@ -1289,7 +1290,7 @@ class ChunkSizePredictor:
                 + self.constant_coeff_c
             )
 
-        self.target_latency = f(float(base_chunk_size)) - f(0.0)
+        self.target_latency = f(float(base_chunk_size))
 
         if self.target_latency <= 0:
             raise ValueError(
