@@ -956,7 +956,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                if "model.language_model.model." in name:
+                    name = name.replace("model.language_model.model.", "model.")
+                elif "model.language_model.lm_head." in name:
+                    name = name.replace("model.language_model.lm_head.", "lm_head.")
+                else:
+                    name = name.replace("model.language_model.", "model.")
             layer_id = get_layer_id(name)
 
             if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
