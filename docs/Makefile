@@ -11,6 +11,9 @@ help:
 	@echo ""
 	@echo "Additional targets:"
 	@echo "  serve       to build and serve documentation with auto-build and live reload"
+	@echo "  markdown    to build Markdown documentation for downstream consumption"
+	@echo "  export      to export source documentation files (md/rst/ipynb)"
+	@echo "  export-all  to run compile, export, and markdown in sequence"
 
 # Compile Notebook files and record execution time
 compile:
@@ -47,7 +50,37 @@ serve:
 		--watch $(SOURCEDIR) \
 		--re-ignore ".*\.(ipynb_checkpoints|pyc|pyo|pyd|git)"
 
-.PHONY: help Makefile compile clean serve
+# Build Markdown documentation for downstream consumption (RAG, LLM, etc.)
+markdown:
+	@echo "Building Markdown documentation..."
+	@$(SPHINXBUILD) -M markdown "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
+	@echo "Markdown documentation built in $(BUILDDIR)/markdown/"
+
+# Export source documentation files to a structured directory
+export:
+	@echo "Exporting documentation source files..."
+	@mkdir -p $(BUILDDIR)/export
+	@find $(SOURCEDIR) -path "$(BUILDDIR)" -prune -o \( -name "*.md" -o -name "*.rst" -o -name "*.ipynb" \) -type f -print | \
+		while read f; do \
+			rel=$${f#./}; \
+			mkdir -p "$(BUILDDIR)/export/$$(dirname $$rel)"; \
+			cp "$$f" "$(BUILDDIR)/export/$$rel"; \
+		done
+	@echo "Documentation exported to $(BUILDDIR)/export/"
+	@echo "Files exported: $$(find $(BUILDDIR)/export -type f | wc -l | tr -d ' ')"
+
+# Full export pipeline: compile notebooks, export sources, build markdown
+export-all: compile export markdown
+	@echo ""
+	@echo "==============================================="
+	@echo "Full documentation export complete!"
+	@echo "==============================================="
+	@echo "  - Executed notebooks: source files (in-place)"
+	@echo "  - Source export:      $(BUILDDIR)/export/"
+	@echo "  - Markdown output:    $(BUILDDIR)/markdown/"
+	@echo ""
+
+.PHONY: help Makefile compile clean serve markdown export export-all
 
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
@@ -56,3 +89,4 @@ clean:
 	find . -name "*.ipynb" -exec nbstripout {} \;
 	rm -rf $(BUILDDIR)
 	rm -rf logs
+

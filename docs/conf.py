@@ -29,6 +29,7 @@ extensions = [
     "sphinxcontrib.mermaid",
     "nbsphinx",
     "sphinx.ext.mathjax",
+    "sphinx_markdown_builder",
 ]
 
 nbsphinx_allow_errors = True

@@ -45,6 +45,26 @@ find . -name '*.ipynb' -exec nbstripout {} \;
 # After these checks pass, push your changes and open a PR on your branch
 pre-commit run --all-files
 ```
+
+### Export for Downstream Integration
+
+For downstream systems like RAG pipelines, LLM-based tools, or internal documentation platforms, use the export targets:
+
+```bash
+# Export source files (md/rst/ipynb) to _build/export/
+make export
+
+# Build Markdown output from Sphinx to _build/markdown/
+make markdown
+
+# Full pipeline: compile notebooks, export sources, build markdown
+make export-all
+```
+
+**Output directories:**
+- `_build/export/` - Original source files (Markdown, RST, Jupyter Notebooks)
+- `_build/markdown/` - Rendered Markdown output from Sphinx (all formats converted to MD)
+
 ---
 
 ## Documentation Style Guidelines
@@ -55,3 +75,4 @@ pre-commit run --all-files
   - Reuse the launched server as much as possible to reduce server launch time.
 - Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
 - Follow the existing examples to learn how to launch a server, send a query and other common styles.
+
