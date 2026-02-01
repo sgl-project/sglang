@@ -45,14 +45,40 @@ Some backends require additional configuration. You can pass these parameters vi
 - A JSON string (e.g., `'{"sparsity": 0.5}'`).
 - Key-value pairs (e.g., `"sparsity=0.5,enable_x=true"`).
 
-Example:
-```bash
-# Using key-value pairs
-sglang generate ... --attention-backend video_sparse_attn --attention-backend-config "sparsity=0.7"
+### Supported Configuration Parameters
 
-# Using a config file
-sglang generate ... --attention-backend vmoba_attn --attention-backend-config ./moba_config.json
-```
+#### Sliding Tile Attention (`sliding_tile_attn`)
+
+| Parameter | Type | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `mask_strategy_file_path` | `str` | **Required.** Path to the mask strategy JSON file. | - |
+| `sta_mode` | `str` | Mode of STA. | `STA_inference` |
+| `skip_time_steps` | `int` | Number of steps to use full attention before switching to sparse attention. | `15` |
+
+#### Video Sparse Attention (`video_sparse_attn`)
+
+| Parameter | Type | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `sparsity` | `float` | Validation sparsity (0.0 - 1.0). | `0.0` |
+
+#### V-MoBA (`vmoba_attn`)
+
+| Parameter | Type | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `temporal_chunk_size` | `int` | Chunk size for temporal dimension. | - |
+| `temporal_topk` | `int` | Top-K tokens to select in temporal dimension. | - |
+| `spatial_chunk_size` | `list[int]` | Chunk size for spatial dimension (H, W). | - |
+| `spatial_topk` | `int` | Top-K tokens to select in spatial dimension. | - |
+| `st_chunk_size` | `list[int]` | Chunk size for spatiotemporal dimension (T, H, W). | - |
+| `st_topk` | `int` | Top-K tokens to select in spatiotemporal dimension. | - |
+| `moba_select_mode` | `str` | Selection mode (e.g., `threshold`). | `threshold` |
+| `moba_threshold` | `float` | Threshold value for selection. | `0.25` |
+| `moba_threshold_type` | `str` | Type of thresholding (e.g., `query_head`). | `query_head` |
+| `first_full_step` | `int` | Number of initial steps to use full attention. | `12` |
+| `first_full_layer` | `int` | Number of initial layers to use full attention. | `0` |
+| `temporal_layer` | `int` | Number of temporal layers. | `1` |
+| `spatial_layer` | `int` | Number of spatial layers. | `1` |
+| `st_layer` | `int` | Number of spatiotemporal layers. | `1` |
 
 ## Platform support matrix
 
