@@ -361,16 +361,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 if self.use_triton_kernels
                 else MoeRunnerBackend.TRITON
             )
-            if (
-                _use_deepgemm_bf16_gemm
-                and not _is_hip
-                and not _is_npu
-                and moe_runner_config.params_dtype == torch.bfloat16
-            ):
-                from sglang.srt.layers import deep_gemm_wrapper
-
-                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-                    backend = MoeRunnerBackend.DEEP_GEMM
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
