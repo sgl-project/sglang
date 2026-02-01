@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -241,6 +241,11 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        override_config_file = (
+            server_args.decrypted_draft_config_file
+            if is_draft_model
+            else server_args.decrypted_config_file
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -254,7 +259,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
-            override_config_file=server_args.decrypted_config_file,
+            override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
@@ -310,6 +315,10 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
@@ -898,12 +907,14 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                logger.warning(
-                    "%s quantization is not fully "
-                    "optimized yet. The speed can be slower than "
-                    "non-quantized models.",
-                    self.quantization,
-                )
+                # Don't warn for MXFP4 on SM100 since it has optimized kernels
+                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                    logger.warning(
+                        "%s quantization is not fully "
+                        "optimized yet. The speed can be slower than "
+                        "non-quantized models.",
+                        self.quantization,
+                    )
 
     def _verify_dual_chunk_attention_config(self) -> None:
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
@@ -1050,7 +1061,12 @@ def _get_and_verify_dtype(
 ) -> torch.dtype:
     # NOTE: getattr(config, "torch_dtype", torch.float32) is not correct
     # because config.torch_dtype can be None.
-    config_dtype = getattr(config, "dtype", None)
+    if isinstance(config, dict):
+        config_dtype = config.get("dtype", None) or config.get("torch_dtype", None)
+        model_type = config.get("model_type", "")
+    else:
+        config_dtype = getattr(config, "dtype", None)
+        model_type = getattr(config, "model_type", "")
     if isinstance(config_dtype, str):
         config_dtype = _STR_DTYPE_TO_TORCH_DTYPE.get(config_dtype, None)
     if config_dtype is None:
@@ -1060,11 +1076,11 @@ def _get_and_verify_dtype(
         dtype = dtype.lower()
         if dtype == "auto":
             if config_dtype == torch.float32:
-                if config.model_type.startswith("gemma"):
-                    if config.model_type == "gemma":
+                if model_type.startswith("gemma"):
+                    if model_type == "gemma":
                         gemma_version = ""
                     else:
-                        gemma_version = config.model_type[5]
+                        gemma_version = model_type[5]
                     logger.info(
                         f"For Gemma {gemma_version}, we downcast float32 to bfloat16 instead "
                         "of float16 by default. Please specify `dtype` if you "
@@ -1147,6 +1163,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
