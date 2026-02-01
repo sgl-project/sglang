@@ -18,11 +18,15 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
 from sglang.srt.layers.moe.moe_runner.triton import (
     TritonMoeQuantInfo,
     TritonRunnerInput,
 )
-from sglang.srt.lora.lora_moe_runners import LoRAInfo, TritonRunnerCoreWithLoRA
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.lora.lora_moe_runners import LoRAInfo
 from sglang.srt.utils import set_random_seed
 
 
@@ -254,12 +258,28 @@ def test_lora_moe_runner(
         gemm1_clamp_limit=None,
         routed_scaling_factor=1.0,
         apply_router_weight_on_input=False,
+        num_local_experts=num_experts,
     )
 
-    runner = TritonRunnerCoreWithLoRA(config)
-    running_state = {"config": {}}
+    # Create StandardTopKOutput for DispatchOutput
+    router_logits = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)  # Dummy logits
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
+    )
 
-    lora_output = runner.run(runner_input, quant_info, running_state, lora_info=lora_info)
+    # Create StandardDispatchOutput
+    dispatch_output = StandardDispatchOutput(
+        hidden_states=hidden_states,
+        hidden_states_scale=None,
+        topk_output=topk_output,
+    )
+
+    # Test the full MoeRunner flow with LoRA enabled
+    runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
+    combine_input = runner.run(dispatch_output, quant_info, lora_info)
+    lora_output = combine_input
 
     torch_output = torch_naive_moe_with_lora(
         hidden_states, w13, w2, b13, b2, topk_weights, topk_ids, lora_info
