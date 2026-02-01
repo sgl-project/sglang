@@ -392,6 +392,17 @@ class ModelConfig:
             self.head_dim,
         )
 
+        self.swa_head_dim = getattr(
+            self.hf_text_config,
+            "swa_head_dim",
+            self.head_dim,
+        )
+        self.swa_v_head_dim = getattr(
+            self.hf_text_config,
+            "swa_v_head_dim",
+            self.v_head_dim,
+        )
+
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
@@ -592,12 +603,11 @@ class ModelConfig:
 
     def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
-        if not self.is_hybrid_swa_compress:
-            return 0
-
-        # For MiMoV2FlashForCausalLM models
-        total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
+            return max(1, total_num_kv_heads // tensor_parallel_size)
+        else:
+            return self.get_num_kv_heads(tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
