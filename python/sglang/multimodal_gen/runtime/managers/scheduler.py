@@ -161,6 +161,9 @@ class Scheduler:
         replies to all clients, only on rank 0
         """
 
+        if self.receiver is None:
+            return
+
         if self.enable_batching and self.batch_scheduler:
             # TODO record memory usage
             batch_size = len(output_batch.output)
@@ -179,7 +182,7 @@ class Scheduler:
                 self.receiver.send_multipart([ident, b"", pickle.dumps(single)])
                 idx += per_req_count
 
-        elif not is_warmup and self.receiver and identities and identities[0]:
+        elif not is_warmup and identities and identities[0]:
             self.receiver.send_multipart(
                 [identities[0], b"", pickle.dumps(output_batch)]
             )
@@ -198,14 +201,11 @@ class Scheduler:
                 return None
 
             identities, per_req_num_outputs, merged_req, config = result
-            # Return in expected format - the merged req with first identity
-            # return [(identities[0], merged_req)]
             return identities, per_req_num_outputs, merged_req
         else:
             if not self.waiting_queue:
                 return None
-            item = self.waiting_queue.popleft()
-            return item
+            return self.waiting_queue.popleft()
 
     def _add_requests_to_queue(self, requests: List[tuple[bytes, Any]]) -> None:
         """
@@ -215,7 +215,15 @@ class Scheduler:
         for identity, req in requests:
             if isinstance(req, Req):
                 if self.enable_batching and self.batch_scheduler is not None:
-                    self.batch_scheduler.add_request(identity, req)
+                    try:
+                        self.batch_scheduler.add_request(identity, req)
+                    except ValueError as e:
+                        # Send error response back to client immediately
+                        logger.warning(f"Rejecting request: {e}")
+                        if self.receiver:
+                            self.receiver.send_multipart(
+                                [identity, b"", pickle.dumps(OutputBatch(error=str(e)))]
+                            )
                 else:
                     self.waiting_queue.append((identity, req.batch_size, req))
 

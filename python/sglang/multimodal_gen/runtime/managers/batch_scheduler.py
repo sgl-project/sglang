@@ -129,6 +129,11 @@ class BatchScheduler:
 
     def add_request(self, identity: bytes, req: "Req") -> None:
         """Add a new request to the appropriate bucket."""
+        if req.batch_size > self.max_batch_size:
+            raise ValueError(
+                f"Request batch size ({req.batch_size}) exceeds max_batch_size ({self.max_batch_size})"
+            )
+
         config = RequestConfig.from_req(req)
         queued = QueuedRequest(identity=identity, req=req, config=config)
         self._buckets[config].append(queued)
