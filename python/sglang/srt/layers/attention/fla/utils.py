@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 COMPILER_MODE = os.getenv("FLA_COMPILER_MODE") == "1"
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
+FLA_CUMSUM_SCALAR_VECTORIZATION = os.getenv("FLA_CUMSUM_SCALAR_VECTORIZATION", "1") == "1"
 
 
 @lru_cache(maxsize=1)
@@ -267,7 +268,12 @@ use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 # Nvidia Ampere or newer, haven't check AMD and intel yet.
 is_tf32_supported = is_nvidia and torch.cuda.get_device_capability(0)[0] >= 8
 is_gather_supported = hasattr(triton.language, "gather")
+IS_GLUON_SUPPORTED = (is_nvidia and torch.cuda.get_device_capability(0)[0] >= 10) \
+    and os.environ.get('FLA_USE_GLUON', '1') == '1' \
+    and version.parse(triton.__version__) >= version.parse("3.6.0")
 
+if IS_GLUON_SUPPORTED:
+    logger.info('Gluon is supported, using Gluon by default. Set FLA_USE_GLUON=0 to disable.')
 
 def get_all_max_shared_mem():
     try:

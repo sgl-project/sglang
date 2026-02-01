@@ -10,7 +10,25 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
-from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper
+from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper, IS_GLUON_SUPPORTED
+
+if IS_GLUON_SUPPORTED:
+    try:
+        from triton.experimental.gluon import language as gl
+        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+        from sglang.srt.layers.attention.fla.gluon.chunk_o_gluon import chunk_fwd_kernel_o_gluon
+
+    except ImportError as e:
+        raise ImportError(
+            f">>> Failed to import Gluon in current triton version {triton.__version__} and "
+            f">>> Platform {torch.cuda.get_device_capability()}.\n"
+            f">>> Gluon/Blackwell features require: \n"
+            f">>> 1. Triton >= 3.6.0\n"
+            f">>> 2. NVIDIA GPU (compute capability >= 10.0)\n"
+            f">>> Error: {e}\n"
+            f">>> Set FLA_USE_GLUON=0 to disable and continue."
+        ) from e
+
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -135,7 +153,7 @@ def chunk_fwd_o(
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     chunk_indices = (
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
@@ -145,30 +163,75 @@ def chunk_fwd_o(
 
     o = torch.zeros_like(v)
 
-    def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, B * H)
+    if IS_GLUON_SUPPORTED:
+        BK = 128 if K >= 128 else 64
+        BV = 128 if V >= 128 else 64
+        IS_VARLEN = cu_seqlens is not None
+        num_warps = 8 if BT >= 128 else 4
 
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=128,
-        BV=64,
-        USE_G=g is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
-    )
+        gl_dtype = gl.bfloat16 if q.dtype == torch.bfloat16 else gl.float16
+        qk_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BK], gl_dtype)
+        vo_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BV], gl_dtype)
+        h_layout = gl.NVMMASharedLayout.get_default_for([1, 1, 1, BK, BV], gl_dtype)
+        q_desc = TensorDescriptor.from_tensor(q, [1, BT, 1, BK], qk_layout)
+        k_desc = TensorDescriptor.from_tensor(k, [1, BT, 1, BK], qk_layout)
+        v_desc = TensorDescriptor.from_tensor(v, [1, BT, 1, BV], vo_layout)
+        h_desc = TensorDescriptor.from_tensor(h, [1, 1, 1, BK, BV], h_layout)
+        if IS_VARLEN:
+            o_layout = gl.NVMMASharedLayout.get_default_for([BT, BV], gl_dtype)
+            o_desc = TensorDescriptor.from_tensor(o.view(B * T, H * V), [1, BV], o_layout)
+        else:
+            o_desc = TensorDescriptor.from_tensor(o, [1, BT, 1, BV], vo_layout)
+
+        grid = (triton.cdiv(V, BV), NT, B * H)
+        chunk_fwd_kernel_o_gluon[grid](
+            q_desc=q_desc,
+            k_desc=k_desc,
+            v_desc=v_desc,
+            h_desc=h_desc,
+            o_desc=o_desc,
+            g=g,
+            g_gamma=None,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            scale=scale,
+            T=T,
+            H=H,
+            HK=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            USE_G=g is not None,
+            IS_VARLEN=IS_VARLEN,
+            num_warps=num_warps,
+        )
+    else:
+        def grid(meta):
+            return (triton.cdiv(V, meta["BV"]), NT, B * H)
+
+        chunk_fwd_kernel_o[grid](
+            q,
+            k,
+            v,
+            h,
+            g,
+            o,
+            cu_seqlens,
+            chunk_indices,
+            scale,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=128,
+            BV=64,
+            USE_G=g is not None,
+            IS_VARLEN=cu_seqlens is not None,
+            num_warps=4,
+            num_stages=2,
+        )
     return o
