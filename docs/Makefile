@@ -60,10 +60,10 @@ markdown:
 export:
 	@echo "Exporting documentation source files..."
 	@mkdir -p $(BUILDDIR)/export
-	@find $(SOURCEDIR) -path "$(BUILDDIR)" -prune -o \( -name "*.md" -o -name "*.rst" -o -name "*.ipynb" \) -type f -print | \
-		while read f; do \
+	@find $(SOURCEDIR) -path "$(BUILDDIR)" -prune -o \( -name "*.md" -o -name "*.rst" -o -name "*.ipynb" \) -type f -print0 | \
+		while IFS= read -r -d '' f; do \
 			rel=$${f#./}; \
-			mkdir -p "$(BUILDDIR)/export/$$(dirname $$rel)"; \
+			mkdir -p "$(BUILDDIR)/export/$$(dirname "$$rel")"; \
 			cp "$$f" "$(BUILDDIR)/export/$$rel"; \
 		done
 	@echo "Documentation exported to $(BUILDDIR)/export/"
