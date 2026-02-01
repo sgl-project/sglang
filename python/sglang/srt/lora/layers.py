@@ -718,9 +718,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Create LoRA-aware runner if not already created
+        # Create LoRA-enabled MoeRunner if not already created
         if self._lora_runner is None:
-            self._lora_runner = TritonRunnerCoreWithLoRA(base_layer.moe_runner_config)
+            from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+            self._lora_runner = MoeRunner(
+                base_layer.moe_runner.runner_backend,
+                base_layer.moe_runner_config,
+                lora_enabled=True
+            )
 
         # Build quant info (for unquantized, this is straightforward)
         quant_info = TritonMoeQuantInfo(
@@ -730,25 +735,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             b2=getattr(base_layer, "w2_weight_bias", None),
         )
 
-        # Get running state (includes config from pre-permute)
-        from sglang.srt.layers.moe.moe_runner.triton import (
-            pre_permute_standard_to_triton,
-        )
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-
-        running_state = {}
-        runner_input = pre_permute_standard_to_triton(
-            dispatch_output, quant_info, base_layer.moe_runner_config, running_state
-        )
-
-        # Run with LoRA integration
-        runner_output = self._lora_runner.run(
-            runner_input, quant_info, running_state, lora_info
+        # Run with LoRA integration using the MoeRunner infrastructure
+        combine_input = self._lora_runner.run(
+            dispatch_output, quant_info, lora_info=lora_info
         )
 
         # Combine and return
-        combine_input = StandardCombineInput(hidden_states=runner_output.hidden_states)
-
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
         final_hidden_states = final_hidden_states[
             ..., :origin_hidden_states_dim

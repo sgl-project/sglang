@@ -25,14 +25,19 @@ logger = logging.getLogger(__name__)
 
 class MoeRunner:
 
-    def __init__(self, runner_backend: MoeRunnerBackend, config: MoeRunnerConfig):
+    def __init__(self, runner_backend: MoeRunnerBackend, config: MoeRunnerConfig, lora_enabled: bool = False):
         self.runner_backend = runner_backend
         self.config = config
+        self.lora_enabled = lora_enabled
 
         self.fused_func = None
 
         if runner_backend.is_triton():
-            self.runner_core = TritonRunnerCore(config)
+            if lora_enabled:
+                from sglang.srt.lora.lora_moe_runners import TritonRunnerCoreWithLoRA
+                self.runner_core = TritonRunnerCoreWithLoRA(config)
+            else:
+                self.runner_core = TritonRunnerCore(config)
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
@@ -44,19 +49,21 @@ class MoeRunner:
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
-        a2a_backend_name = get_moe_a2a_backend().value
-        runner_backend_name = runner_backend.value
+        # Skip fused func if LoRA is enabled (LoRA requires non-fused path)
+        if not lora_enabled:
+            a2a_backend_name = get_moe_a2a_backend().value
+            runner_backend_name = runner_backend.value
 
-        # TODO(cwan): add a server argument to disable fused func
-        self.fused_func = FusedOpPool.get_fused_func(
-            a2a_backend_name, runner_backend_name
-        )
-
-        if self.runner_core is None and self.fused_func is None:
-            raise NotImplementedError(
-                f"Runner backend {runner_backend} requires a fused func for a2a backend "
-                f"{a2a_backend_name}, but none is registered."
+            # TODO(cwan): add a server argument to disable fused func
+            self.fused_func = FusedOpPool.get_fused_func(
+                a2a_backend_name, runner_backend_name
             )
+
+            if self.runner_core is None and self.fused_func is None:
+                raise NotImplementedError(
+                    f"Runner backend {runner_backend} requires a fused func for a2a backend "
+                    f"{a2a_backend_name}, but none is registered."
+                )
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
@@ -71,10 +78,10 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
+        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
 
-        if self.fused_func is not None:
+        if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
         assert self.runner_core is not None
@@ -93,7 +100,12 @@ class MoeRunner:
         runner_input = self.pre_permute_func(
             dispatch_output, quant_info, self.config, running_state
         )
-        runner_output = self.runner_core.run(runner_input, quant_info, running_state)
+
+        # Pass lora_info to runner_core if LoRA is enabled
+        if self.lora_enabled:
+            runner_output = self.runner_core.run(runner_input, quant_info, running_state, lora_info)
+        else:
+            runner_output = self.runner_core.run(runner_input, quant_info, running_state)
 
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value

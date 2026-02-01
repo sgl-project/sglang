@@ -445,7 +445,9 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         lora_b_stacked = [lora_info.gate_up_lora_b_weights]
 
         # Define shrink_config for LoRA alignment
-        shrink_config = {"BLOCK_SIZE_M": 64}  # Default block size, can be made configurable
+        shrink_config = {
+            "BLOCK_SIZE_M": 64
+        }  # Default block size, can be made configurable
 
         # Call moe_lora_align_block_size before the LoRA gate_up_proj delta path
         # Prepare inputs for the kernel
@@ -455,8 +457,12 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         topk_num = topk_ids.shape[1]
 
         # Calculate max_num_tokens_padded
-        max_num_tokens_padded = topk_ids.numel() + lora_info.num_experts * (block_size_m - 1)
-        max_num_tokens_padded = ((max_num_tokens_padded + block_size_m - 1) // block_size_m) * block_size_m
+        max_num_tokens_padded = topk_ids.numel() + lora_info.num_experts * (
+            block_size_m - 1
+        )
+        max_num_tokens_padded = (
+            (max_num_tokens_padded + block_size_m - 1) // block_size_m
+        ) * block_size_m
         max_num_m_blocks = (max_num_tokens_padded + block_size_m - 1) // block_size_m
 
         # Initialize output tensors (using torch.empty like the reference implementation)
@@ -471,10 +477,14 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             dtype=torch.int32,
             device=device,
         )
-        num_tokens_post_padded_lora = torch.empty((max_loras,), dtype=torch.int32, device=device)
+        num_tokens_post_padded_lora = torch.empty(
+            (max_loras,), dtype=torch.int32, device=device
+        )
 
         # Create token-to-LoRA mapping (assuming all tokens use LoRA 0 for now)
-        token_lora_mapping = torch.zeros((num_tokens,), dtype=torch.int32, device=device)
+        token_lora_mapping = torch.zeros(
+            (num_tokens,), dtype=torch.int32, device=device
+        )
         lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         # Call the kernel directly
