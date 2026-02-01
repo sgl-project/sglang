@@ -99,6 +99,7 @@ torch = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+runai = ["runai-model-streamer[s3,gcs]>=0.15.5"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",
@@ -143,6 +144,7 @@ test = [
   "pytest",
   "pytest-cov",
   "diff-cover",
+  "runai-model-streamer[gcs]>=0.15.5",
   "sentence_transformers",
   "tabulate",
 ]
@@ -152,6 +154,7 @@ dev = ["sglang[test]"]
 all = [
   "sglang[diffusion]",
   "sglang[tracing]",
+  "sglang[runai]",
 ]
 
 [tool.uv.extra-build-dependencies]
