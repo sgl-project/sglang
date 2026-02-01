@@ -420,6 +420,19 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_spec_v2:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+        else:
+            # for normal spec decoding: unify next_token_ids format
+            next_token_ids = []
+            cum_num_token_ids = 0
+
+            for i, req in enumerate(batch.reqs):
+                accept_length = result.accept_length_per_req_cpu[i]
+                next_token_ids.append(
+                    result.next_token_ids[
+                        cum_num_token_ids : cum_num_token_ids + accept_length + 1
+                    ].tolist()
+                )
+                cum_num_token_ids += accept_length + 1
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -459,6 +472,14 @@ class SchedulerOutputProcessorMixin:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+
+            # update reasoning tokens
+            if (
+                req.require_reasoning
+                and self.tokenizer
+                and hasattr(self.tokenizer, "think_end_id")
+            ):
+                req.update_reasoning_tokens(next_token_id, self.tokenizer.think_end_id)
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -521,14 +542,6 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-
-            # update reasoning tokens
-            if (
-                req.require_reasoning
-                and self.tokenizer
-                and hasattr(self.tokenizer, "think_end_id")
-            ):
-                req.update_reasoning_tokens(next_token_id, self.tokenizer.think_end_id)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()

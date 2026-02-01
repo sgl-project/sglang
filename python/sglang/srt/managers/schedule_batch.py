@@ -1186,6 +1186,7 @@ class Req:
                 self.reasoning_tokens += 1
                 if tok_id == think_end_id:
                     self._is_reasoning_over = True
+                    break
 
     def __repr__(self):
         return (
