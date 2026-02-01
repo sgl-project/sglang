@@ -4,6 +4,10 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 
+#ifdef USE_ROCM
+#include <ATen/hip/impl/HIPStreamMasqueradingAsCUDA.h>
+#endif
+
 #include "custom_all_reduce.cuh"
 
 // Fake pointer type, must match fptr_t type in ops.h.
