@@ -17,7 +17,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_HEALTH_CHECK_TIMEOUT`             | Timeout for health check in seconds                                                                                              | `20`                         |
 | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` | The interval of passes to collect the metric of selected count of physical experts on each layer and GPU rank. 0 means disabled. | `0`                          |
 | `SGLANG_FORWARD_UNKNOWN_TOOLS`            | Forward unknown tool calls to clients instead of dropping them                                                                   | `false` (drop unknown tools) |
-| `SGLANG_QUEUED_TIMEOUT_MS`                | Timeout (in ms) for requests in the waiting queue                                                                                | `-1` |
+| `SGLANG_QUEUED_TIMEOUT_MS`                | Timeout (in ms) for requests in the waiting queue                                                                                | `-1`                         |
+| `SGLANG_FORWARD_TIMEOUT_MS`               | Timeout (in ms) for requests in the forward batch                                                                                | `-1`                         |
 
 ## Performance Tuning
 

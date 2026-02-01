@@ -248,7 +248,7 @@ class ComposedPipelineBase(ABC):
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
 
-        components = {}
+        loaded_components = {}
         for module_name, (
             transformers_or_diffusers,
             architecture,
@@ -266,7 +266,7 @@ class ComposedPipelineBase(ABC):
                 continue
             if loaded_modules is not None and module_name in loaded_modules:
                 logger.info("Using module %s already provided", module_name)
-                components[module_name] = loaded_modules[module_name]
+                loaded_components[module_name] = loaded_modules[module_name]
                 continue
 
             # we load the module from the extra config module map if it exists
@@ -288,8 +288,8 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
-            module, memory_usage = PipelineComponentLoader.load_module(
-                module_name=load_module_name,
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
@@ -297,20 +297,23 @@ class ComposedPipelineBase(ABC):
 
             self.memory_usages[load_module_name] = memory_usage
 
-            if module_name in components:
+            if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
-            components[module_name] = module
+            loaded_components[module_name] = module
 
         # Check if all required modules were loaded
         for module_name in required_modules:
-            if module_name not in components or components[module_name] is None:
+            if (
+                module_name not in loaded_components
+                or loaded_components[module_name] is None
+            ):
                 raise ValueError(
-                    f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
+                    f"Required module: {module_name} was not found in loaded modules: {list(loaded_components.keys())}"
                 )
 
         logger.debug("Memory usage of loaded modules: %s", self.memory_usages)
 
-        return components
+        return loaded_components
 
     def add_stage(self, stage_name: str, stage: PipelineStage):
         assert self.modules is not None, "No modules are registered"

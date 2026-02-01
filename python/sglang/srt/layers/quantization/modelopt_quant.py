@@ -141,13 +141,11 @@ def fp4_gemm(
     fp4_backend = get_fp4_gemm_runner_backend()
     if enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-        backend = fp4_backend.get_flashinfer_backend()
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            if backend in ("auto", "cudnn"):
-                logger.warning_once(
-                    "CUDA graph capture detected: forcing FlashInfer FP4 GEMM backend to cutlass."
-                )
-                backend = "cutlass"
+        backend = (
+            fp4_backend.get_flashinfer_backend()
+            if not fp4_backend.is_auto()
+            else "cutlass"
+        )
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
