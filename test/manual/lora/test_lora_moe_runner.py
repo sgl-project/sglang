@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import random
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -277,9 +278,14 @@ def test_lora_moe_runner(
     )
 
     # Test the full MoeRunner flow with LoRA enabled
-    runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
-    combine_input = runner.run(dispatch_output, quant_info, lora_info)
-    lora_output = combine_input
+    # Mock global server args to avoid dependency on server initialization
+    class MockServerArgs:
+        enable_deterministic_inference = False
+
+    with patch('sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args', return_value=MockServerArgs()):
+        runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
+        combine_input = runner.run(dispatch_output, quant_info, lora_info)
+        lora_output = combine_input
 
     torch_output = torch_naive_moe_with_lora(
         hidden_states, w13, w2, b13, b2, topk_weights, topk_ids, lora_info
