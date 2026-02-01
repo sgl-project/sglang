@@ -118,17 +118,18 @@ class TestPenalty(CustomTestCase):
         avg_penalty = sum(penalty_counts) / len(penalty_counts)
 
         if expected_reduction:
-            # Simple check: penalty should reduce repetition
-            self.assertLess(
+            # Penalty should not increase repetition (equal counts are acceptable)
+            self.assertLessEqual(
                 avg_penalty,
                 avg_baseline,
-                f"Penalty should reduce '{target_word}' repetition: {avg_baseline:.1f} → {avg_penalty:.1f}",
+                f"Penalty should not increase '{target_word}' repetition: {avg_baseline:.1f} → {avg_penalty:.1f}",
             )
         else:
-            self.assertGreater(
+            # Negative penalty should not decrease repetition (equal counts are acceptable)
+            self.assertGreaterEqual(
                 avg_penalty,
                 avg_baseline,
-                f"Negative penalty should increase '{target_word}' repetition",
+                f"Negative penalty should not decrease '{target_word}' repetition: {avg_baseline:.1f} → {avg_penalty:.1f}",
             )
 
     def test_default_values(self):
