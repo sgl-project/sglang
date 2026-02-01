@@ -92,6 +92,63 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
+@dataclasses.dataclass
+class SchedulerLaunchResult:
+    """Unified result from launching schedulers (mp or Ray mode).
+
+    This abstraction hides the mode-specific details, providing a common interface
+    for both multiprocessing and Ray-based scheduler launching.
+    """
+
+    scheduler_infos: List[Dict]
+
+    # Ray mode fields
+    _actors: Optional[List] = None
+    _event_loop_refs: Optional[List] = None
+
+    # mp mode fields
+    _procs: Optional[List] = None
+    _pipe_readers: Optional[List] = None
+
+    @property
+    def actors(self) -> Optional[List]:
+        """Ray actors (None for mp mode). Exposed for Engine to store."""
+        return self._actors
+
+    @property
+    def event_loop_refs(self) -> Optional[List]:
+        """Ray event loop ObjectRefs (None for mp mode). Exposed for Engine to store."""
+        return self._event_loop_refs
+
+    def wait_for_ready(self) -> None:
+        """Wait for schedulers to be ready (mp mode only, no-op for Ray).
+
+        In Ray mode, schedulers are already ready when this object is created
+        (ray.get() was called during launch). In mp mode, we need to wait for
+        pipe messages from the subprocesses.
+        """
+        if self._procs is not None and self._pipe_readers is not None:
+            # mp mode: wait for pipe messages
+            infos = _wait_for_scheduler_ready(self._pipe_readers, self._procs)
+            self.scheduler_infos.extend(infos)
+
+    def wait_for_completion(self) -> None:
+        """Block until all schedulers terminate (used for non-zero rank nodes)."""
+        if self._actors is not None:
+            import ray
+
+            try:
+                ray.get(self._event_loop_refs)
+            except Exception as e:
+                logger.error(f"Ray scheduler actor terminated with error: {e}")
+        elif self._procs is not None:
+            for proc in self._procs:
+                proc.join()
+                logger.error(
+                    f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+                )
+
+
 def init_tokenizer_manager(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -154,16 +211,22 @@ class Engine(EngineBase):
         logger.info(f"{server_args=}")
 
         # Shutdown the subprocesses automatically when the program exits
-        atexit.register(self.shutdown)
+        # Store the atexit function so we can unregister it later
+        self._shutdown_called = False
+        self._atexit_handler = lambda: self._atexit_shutdown()
+        atexit.register(self._atexit_handler)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_infos, port_args = (
-            _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=self.init_tokenizer_manager_func,
-                run_scheduler_process_func=self.run_scheduler_process_func,
-                run_detokenizer_process_func=self.run_detokenizer_process_func,
-            )
+        (
+            tokenizer_manager,
+            template_manager,
+            scheduler_infos,
+            port_args,
+        ) = _launch_workers(
+            server_args=server_args,
+            init_tokenizer_manager_func=self.init_tokenizer_manager_func,
+            run_scheduler_process_func=self.run_scheduler_process_func,
+            run_detokenizer_process_func=self.run_detokenizer_process_func,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -434,8 +497,28 @@ class Engine(EngineBase):
         ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
+    def _atexit_shutdown(self):
+        """Atexit handler - skips Ray actor killing to avoid C++ crashes."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        # Just clean up other processes; Ray will handle its own actor cleanup.
+        kill_process_tree(os.getpid(), include_parent=False)
+
     def shutdown(self):
         """Shutdown the engine"""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+
+        # Unregister atexit handler since we're shutting down explicitly
+        try:
+            atexit.unregister(self._atexit_handler)
+        except Exception:
+            pass
+
+        # Kill all other child processes
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
@@ -861,11 +944,59 @@ def _wait_for_scheduler_ready(
     return scheduler_infos
 
 
-def _launch_scheduler_processes(
+def _launch_schedulers(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
-):
+) -> SchedulerLaunchResult:
+    """Launch schedulers using Ray actors or mp.Process.
+
+    Returns:
+        SchedulerLaunchResult that abstracts the mode-specific details.
+        For Ray mode, scheduler_infos is already populated.
+        For mp mode, call result.wait_for_ready() to populate scheduler_infos.
+    """
+    if server_args.use_ray:
+        return _launch_scheduler_ray_actors(server_args, port_args)
+    else:
+        return _launch_scheduler_processes_mp(
+            server_args, port_args, run_scheduler_process_func
+        )
+
+
+def _calculate_rank_ranges(server_args: ServerArgs):
+    """Calculate pp_rank_range and tp_rank_range for the current node.
+
+    This helper is shared by both mp and Ray scheduler launching functions.
+    """
+    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+    pp_rank_range = range(
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+    )
+
+    nnodes_per_tp_group = nnodes_per_pp_rank
+    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_rank_range = range(
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+    )
+
+    return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _launch_scheduler_processes_mp(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    run_scheduler_process_func: Callable,
+) -> SchedulerLaunchResult:
+    """Launch scheduler processes using multiprocessing.
+
+    Returns:
+        SchedulerLaunchResult with _procs and _pipe_readers set.
+        scheduler_infos will be empty; call result.wait_for_ready() to populate it.
+    """
     scheduler_procs = []
 
     if server_args.dp_size == 1:
@@ -875,18 +1006,8 @@ def _launch_scheduler_processes(
         )
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
-        )
-
-        nnodes_per_tp_group = nnodes_per_pp_rank
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+            _calculate_rank_ranges(server_args)
         )
 
         for pp_rank in pp_rank_range:
@@ -936,18 +1057,157 @@ def _launch_scheduler_processes(
         proc.start()
         scheduler_procs.append(proc)
 
-    return scheduler_procs, scheduler_pipe_readers
+    return SchedulerLaunchResult(
+        scheduler_infos=[],
+        _procs=scheduler_procs,
+        _pipe_readers=scheduler_pipe_readers,
+    )
 
 
-def _launch_subprocesses(
+def _launch_scheduler_ray_actors(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+) -> SchedulerLaunchResult:
+    """Launch scheduler processes as Ray actors.
+
+    Returns:
+        SchedulerLaunchResult with scheduler_infos already populated (Ray actors
+        are ready once __init__ completes, so no separate wait_for_ready needed).
+    """
+    import uuid
+
+    import ray
+    from ray.util.placement_group import placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    from sglang.srt.managers.scheduler_actor import create_scheduler_actor_class
+
+    # TODO(xyuzh): Implement Ray support for dp_size > 1
+    if server_args.dp_size > 1:
+        raise NotImplementedError(
+            "Ray support for dp_size > 1 is not yet implemented. "
+            "Set dp_size=1 or use_ray=False."
+        )
+
+    # Set RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 BEFORE Ray initialization
+    # This prevents Ray from overwriting CUDA_VISIBLE_DEVICES when actors are created.
+    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+    # Initialize Ray if needed
+    if not ray.is_initialized():
+        ray.init()
+
+    # Get the actor class
+    SchedulerActor = create_scheduler_actor_class()
+
+    # Generate unique instance ID to prevent actor name collisions
+    instance_id = uuid.uuid4().hex[:8]
+
+    # Calculate rank ranges (shared logic with mp version)
+    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+        _calculate_rank_ranges(server_args)
+    )
+
+    # Calculate total number of GPUs needed for this node
+    num_gpus_needed = len(pp_rank_range) * len(tp_rank_range)
+
+    # Create a placement group to ensure all actors are co-located on the same node
+    bundles = [{"GPU": 1} for _ in range(num_gpus_needed)]
+    pg = placement_group(bundles, strategy="STRICT_PACK")
+
+    # Wait for placement group to be ready
+    ray.get(pg.ready())
+
+    # Calculate visible GPUs string for all actors
+    # All actors need to see all GPUs for NCCL to work properly
+    tp_size = server_args.tp_size
+    pp_size = server_args.pp_size
+    base_gpu = server_args.base_gpu_id
+    total_gpus = tp_size * pp_size
+    visible_gpus = ",".join(str(base_gpu + i) for i in range(total_gpus))
+
+    scheduler_actors = []
+    bundle_idx = 0
+
+    for pp_rank in pp_rank_range:
+        for tp_rank in tp_rank_range:
+            gpu_id = (
+                server_args.base_gpu_id
+                + ((pp_rank % pp_size_per_node) * tp_size_per_node)
+                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+            )
+            moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+
+            # Create Ray actor with placement group scheduling.
+            # The placement group ensures:
+            # 1. All actors are on the same node (STRICT_PACK)
+            # 2. Each actor gets exclusive access to one GPU
+            #
+            # We use num_gpus=1 to reserve the GPU resource, but set CUDA_VISIBLE_DEVICES
+            # to all GPUs so NCCL can communicate across all of them.
+            # We set num_cpus=0 because placement group bundles only have GPU resources.
+            actor = SchedulerActor.options(
+                num_cpus=0,  # Don't request CPU; bundles only have GPU
+                num_gpus=1,  # Reserve 1 GPU per actor via placement group
+                name=f"sglang_scheduler_{instance_id}_pp{pp_rank}_tp{tp_rank}",
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_bundle_index=bundle_idx,
+                ),
+                runtime_env={
+                    "env_vars": {
+                        "CUDA_VISIBLE_DEVICES": visible_gpus,
+                    }
+                },
+            ).remote(
+                server_args=server_args,
+                port_args=port_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=pp_rank,
+                dp_rank=0,  # dp_rank=0 when dp_size=1 for consistency with mp mode
+            )
+            scheduler_actors.append(actor)
+            bundle_idx += 1
+
+    # Wait for all schedulers to initialize
+    # If initialization fails, ray.get() raises RayActorError.
+    try:
+        scheduler_infos = ray.get(
+            [actor.get_info.remote() for actor in scheduler_actors]
+        )
+    except ray.exceptions.RayActorError as e:
+        raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
+
+    # Start event loops (non-blocking - returns immediately)
+    # Keep refs to detect when actors terminate
+    event_loop_refs = [actor.run_event_loop.remote() for actor in scheduler_actors]
+
+    return SchedulerLaunchResult(
+        scheduler_infos=scheduler_infos,
+        _actors=scheduler_actors,
+        _event_loop_refs=event_loop_refs,
+    )
+
+
+def _launch_workers(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable,
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
-) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs]:
+) -> Tuple[
+    TokenizerManager,
+    TemplateManager,
+    Tuple[Dict],
+    PortArgs,
+]:
     """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
+    or Ray actors), and the DetokenizerManager in another subprocess.
+
+    Returns:
+        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -959,8 +1219,8 @@ def _launch_subprocesses(
         port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
-    # Launch scheduler processes
-    scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
+    # Launch schedulers (unified interface for both mp and Ray modes)
+    scheduler_result = _launch_schedulers(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
@@ -970,24 +1230,30 @@ def _launch_subprocesses(
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        scheduler_infos = _wait_for_scheduler_ready(
-            scheduler_pipe_readers, scheduler_procs
-        )
+        # Wait for schedulers to be ready (no-op for Ray, waits for pipe in mp mode)
+        scheduler_result.wait_for_ready()
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, scheduler_infos, port_args
+            return (
+                None,
+                None,
+                scheduler_result.scheduler_infos,
+                port_args,
+            )
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
         )
 
-        for proc in scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
-        return None, None, scheduler_infos, port_args
+        # Wait for schedulers to terminate (they shouldn't normally)
+        scheduler_result.wait_for_completion()
+        return (
+            None,
+            None,
+            scheduler_result.scheduler_infos,
+            port_args,
+        )
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -1009,10 +1275,17 @@ def _launch_subprocesses(
         tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
         template_manager = None
 
-    # Wait for the model to finish loading
-    scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+    # Wait for the model to finish loading (no-op for Ray, waits for pipe in mp mode)
+    scheduler_result.wait_for_ready()
 
     # Get back some info from scheduler to tokenizer_manager
-    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+    tokenizer_manager.max_req_input_len = scheduler_result.scheduler_infos[0][
+        "max_req_input_len"
+    ]
 
-    return tokenizer_manager, template_manager, scheduler_infos, port_args
+    return (
+        tokenizer_manager,
+        template_manager,
+        scheduler_result.scheduler_infos,
+        port_args,
+    )
