@@ -508,6 +508,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         expert_ids_lora = expert_ids_lora.view(max_loras, -1)
         sorted_token_ids_lora = sorted_token_ids_lora.view(max_loras, -1)
 
+        # TODO: Jonahbernard: we need some way to pass these on to the down_proj delta path
+        lora_info.expert_ids = expert_ids_lora
+        lora_info.token_ids = sorted_token_ids_lora  # it could be an issue overwriting these two fields here.
+
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=hidden_states,
@@ -570,7 +574,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         # Create num_tokens_post_padded tensor for vLLM kernel
         # It expects shape (max_loras,) with the same value for each LoRA
         num_loras = len(lora_info.lora_ranks)
-        num_tokens_post_padded_formatted = num_tokens_post_padded.expand(num_loras)
         actual_max_lora_rank = lora_info.max_lora_rank
 
         # Handle multi-LoRA: stack weights for all loaded LoRAs
@@ -595,9 +598,9 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             lora_a_stacked=lora_a_stacked,
             lora_b_stacked=lora_b_stacked,
             topk_weights=topk_weights,  # Use the routing weights passed to this function
-            sorted_token_ids=lora_info.token_ids.unsqueeze(0),
-            expert_ids=lora_info.expert_ids.unsqueeze(0),
-            num_tokens_post_padded=num_tokens_post_padded_formatted,
+            sorted_token_ids=lora_info.token_ids,  # this is the token_ids from the previous stage
+            expert_ids=lora_info.expert_ids,  # this is the expert_ids from the previous stage
+            num_tokens_post_padded=num_tokens_post_padded,
             max_lora_rank=actual_max_lora_rank,
             top_k_num=top_k,
             lora_ids=lora_info.lora_ids,
