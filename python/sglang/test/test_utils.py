@@ -37,7 +37,9 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_cuda,
     is_port_available,
+    is_xpu,
     kill_process_tree,
     retry,
 )
@@ -2241,6 +2243,44 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def get_gpu_count():
+    if get_device() == "cpu":
+        gpu_count = 0
+    else:
+        gpu_count = torch.accelerator.device_count()
+    return gpu_count
+
+
+def empty_gpu_cache():
+    """
+    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
+    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    """
+    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
+        return torch.accelerator.empty_cache()
+
+    # CUDA
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+
+    # XPU (Intel)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+        return
+
+    return
+
+
+def get_gpu_memory_gb():
+    if is_cuda():
+        return torch.cuda.device_memory_used() / 1024**3
+    elif is_xpu():
+        return torch.xpu.memory_allocated() / 1024**3
+    else:
+        return 0
 
 
 def run_doctests(obj: Callable[..., Any] | ModuleType):
