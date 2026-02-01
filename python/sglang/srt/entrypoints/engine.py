@@ -222,8 +222,6 @@ class Engine(EngineBase):
             template_manager,
             scheduler_infos,
             port_args,
-            scheduler_actors,
-            event_loop_refs,
         ) = _launch_workers(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -234,11 +232,6 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
-        # Ray mode attributes (None for mp mode)
-        self.scheduler_actors = scheduler_actors  # List of Ray actors for Ray mode
-        self.event_loop_refs = (
-            event_loop_refs  # List of Ray ObjectRefs for health monitoring
-        )
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
                 scheduler_infos
@@ -511,7 +504,6 @@ class Engine(EngineBase):
         self._shutdown_called = True
 
         # Just clean up other processes; Ray will handle its own actor cleanup.
-        self.scheduler_actors = None
         kill_process_tree(os.getpid(), include_parent=False)
 
     def shutdown(self):
@@ -525,16 +517,6 @@ class Engine(EngineBase):
             atexit.unregister(self._atexit_handler)
         except Exception:
             pass
-
-        # Kill Ray actors if using Ray mode
-        if self.server_args.use_ray and self.scheduler_actors:
-            # Clear references - actors will be cleaned up by Ray when driver exits.
-            # We intentionally don't call ray.kill() here because:
-            # 1. It can crash with "Cannot find actor handle" if actor already exited
-            # 2. Ray automatically cleans up actors when the driver process exits
-            # 3. For Anyscale jobs, actors are cleaned up when the job ends
-            self.scheduler_actors = None
-            self.event_loop_refs = None
 
         # Kill all other child processes
         kill_process_tree(os.getpid(), include_parent=False)
@@ -1219,18 +1201,13 @@ def _launch_workers(
     TemplateManager,
     Tuple[Dict],
     PortArgs,
-    Optional[List],
-    Optional[List],
 ]:
     """
     Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
     or Ray actors), and the DetokenizerManager in another subprocess.
 
     Returns:
-        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args,
-                  scheduler_actors, event_loop_refs).
-        - scheduler_actors: None for mp mode, list of Ray actors for Ray mode
-        - event_loop_refs: None for mp mode, list of Ray ObjectRefs for Ray mode
+        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -1263,8 +1240,6 @@ def _launch_workers(
                 None,
                 scheduler_result.scheduler_infos,
                 port_args,
-                scheduler_result.actors,
-                scheduler_result.event_loop_refs,
             )
 
         launch_dummy_health_check_server(
@@ -1278,8 +1253,6 @@ def _launch_workers(
             None,
             scheduler_result.scheduler_infos,
             port_args,
-            scheduler_result.actors,
-            scheduler_result.event_loop_refs,
         )
 
     # Launch detokenizer process
@@ -1315,6 +1288,4 @@ def _launch_workers(
         template_manager,
         scheduler_result.scheduler_infos,
         port_args,
-        scheduler_result.actors,
-        scheduler_result.event_loop_refs,
     )
