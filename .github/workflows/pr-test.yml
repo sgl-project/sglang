@@ -1438,7 +1438,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
@@ -1483,7 +1483,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
@@ -1528,7 +1528,7 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Install dependencies
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_deepep.sh
 
