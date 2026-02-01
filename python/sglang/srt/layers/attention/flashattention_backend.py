@@ -15,15 +15,25 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import get_compiler_backend
+from sglang.srt.utils import get_compiler_backend, get_mate_scheduler_metadata, is_musa
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
-from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
+
+_is_musa = is_musa()
+if not _is_musa:
+    from sgl_kernel.flash_attn import (
+        flash_attn_varlen_func as flash_attn_varlen_func_fa3,
+    )
+    from sgl_kernel.flash_attn import (
+        flash_attn_with_kvcache as flash_attn_with_kvcache_fa3,
+    )
+else:
+    from mate import flash_attn_varlen_func as flash_attn_varlen_func_fa3
+    from mate import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
 
 flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
@@ -347,6 +357,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+        self.num_hidden_layers = model_runner.model_config.num_hidden_layers
+        self.first_k_dense_replace = model_runner.model_config.first_k_dense_replace
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
@@ -832,6 +844,16 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        scheduler_metadata = None
+        if _is_musa:
+            scheduler_metadata = get_mate_scheduler_metadata(
+                layer.layer_id,
+                self.num_hidden_layers,
+                self.device,
+                self.first_k_dense_replace,
+                forward_batch.can_run_tbo,
+            )
+
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -895,6 +917,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
                 num_splits=self.num_splits,
+                scheduler_metadata=scheduler_metadata,
                 **kwargs,
             )
 
@@ -922,6 +945,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1037,6 +1061,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1059,6 +1084,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            scheduler_metadata=scheduler_metadata,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -1136,6 +1162,16 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        scheduler_metadata = None
+        if _is_musa:
+            scheduler_metadata = get_mate_scheduler_metadata(
+                layer.layer_id,
+                self.num_hidden_layers,
+                self.device,
+                self.first_k_dense_replace,
+                forward_batch.can_run_tbo,
+            )
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1179,6 +1215,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
                     **kwargs,
                 )
             elif use_local_attn:
@@ -1199,6 +1236,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
                     **kwargs,
                 )
             else:
@@ -1236,6 +1274,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
                     **kwargs,
                 )
                 if use_cascade_attn:
@@ -1258,6 +1297,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            scheduler_metadata=scheduler_metadata,
                             **kwargs,
                         )
                     )
@@ -1314,6 +1354,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                scheduler_metadata=scheduler_metadata,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1335,6 +1376,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    scheduler_metadata=scheduler_metadata,
                 )
                 o, _ = merge_state_v2(
                     o,

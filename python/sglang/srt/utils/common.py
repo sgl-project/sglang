@@ -195,6 +195,60 @@ def is_musa() -> bool:
     return hasattr(torch.version, "musa") and torch.version.musa is not None
 
 
+MATE_WORKSPACE_BUFFER: torch.Tensor | None = None
+
+
+def get_mate_scheduler_metadata(
+    layer_id: int,
+    num_hidden_layers: int,
+    device: torch.device,
+    first_k_dense_replace: int = 0,
+    can_run_tbo: bool = False,
+) -> Optional[Tuple[torch.Tensor, bool]]:
+    """Returns scheduler metadata (workspace buffer and initialization status) for
+       MATE's FA3 compatibility interface.
+
+       Note: This function is specifically designed for MUSA platform.
+
+    Args:
+        layer_id: Model layer index (0-based)
+        num_hidden_layers: Total number of layers in the model
+        device: Target device for workspace allocation
+        first_k_dense_replace: Number of dense layers preceding MoE layers in MoE models
+        can_run_tbo: Whether two-batch overlap mode is currently active
+
+    Returns:
+        Tuple[torch.Tensor, bool]: (workspace_buffer, is_initialized) for MATE scheduler,
+                                  or None if not running on MUSA platform.
+    """
+    if not is_musa():
+        return None
+    # Lazy initialization of workspace buffer
+    global MATE_WORKSPACE_BUFFER
+    if MATE_WORKSPACE_BUFFER is None:
+        MATE_WORKSPACE_BUFFER = torch.empty(
+            128 * 1024 * 1024, device=device, dtype=torch.uint8
+        )
+
+    from sglang.srt.distributed import get_pp_group, get_pp_indices
+
+    pp_group = get_pp_group()
+
+    # Calculate pipeline parallel partitioning boundaries for current rank
+    layer_start_id, _ = get_pp_indices(
+        num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
+    )
+    # In TBO mode, the first k dense layers bypass MATE initialization
+    if can_run_tbo and layer_start_id == 0:
+        layer_start_id += first_k_dense_replace
+
+    # Determine MATE initialization status for current layer
+    # Only the first layer in each pipeline stage requires initialization
+    is_initialized = layer_id > layer_start_id
+
+    return MATE_WORKSPACE_BUFFER, is_initialized
+
+
 def is_float4_e2m1fn_x2(dtype) -> bool:
     """Check if dtype is float4_e2m1fn_x2 and CUDA is available."""
     target_dtype = getattr(torch, "float4_e2m1fn_x2", None)
