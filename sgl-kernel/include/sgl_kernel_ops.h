@@ -432,6 +432,34 @@ void silu_and_mul_scaled_fp4_experts_quant(
     torch::Tensor const& input_global_scale,
     torch::Tensor const& mask,
     bool use_silu_and_mul);
+/*
+ * From csrc/ngram_embedding
+ */
+void compute_n_gram_ids(
+    int64_t ne_n,
+    int64_t ne_k,
+    at::Tensor ne_weights,
+    at::Tensor ne_mods,
+    at::Tensor exclusive_ne_embeder_size_sums,
+    at::Tensor tokens,
+    at::Tensor exclusive_req_len_sums,
+    at::Tensor ne_token_table,
+    at::Tensor row_indices,
+    at::Tensor column_starts,
+    at::Tensor n_gram_ids,
+    int64_t cuda_stream = 0
+);
+
+void update_token_table(
+    at::Tensor tokens,
+    at::Tensor ne_token_table,
+    at::Tensor row_indices,
+    at::Tensor column_starts,
+    at::Tensor req_lens,
+    at::Tensor ignore_tokens,
+    int64_t cuda_stream = 0
+);
+
 
 /*
  * From csrc/moe/cutlass_moe/w4a8
