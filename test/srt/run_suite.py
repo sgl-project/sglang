@@ -12,10 +12,8 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # have been migrated to stage-c suites in test/registered/ using the CI registry system.
 suites = {
     # quantization_test suite migrated to test/registered/quant/
-    "__not_in_ci__": [
-        TestFile("test_mistral_large3_basic.py"),
-        TestFile("ep/test_moriep_small.py"),
-    ],
+    # All CUDA tests migrated to test/registered/
+    "__not_in_ci__": [],
 }
 
 # Add AMD tests
