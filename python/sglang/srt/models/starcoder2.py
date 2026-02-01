@@ -26,7 +26,6 @@ from typing import Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import Starcoder2Config
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
@@ -47,6 +46,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import Starcoder2Config
 
 
 class Starcoder2Attention(nn.Module):
@@ -80,7 +80,7 @@ class Starcoder2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.max_position_embeddings = config.max_position_embeddings
         self.use_bias = config.use_bias
 

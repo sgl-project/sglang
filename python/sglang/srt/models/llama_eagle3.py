@@ -24,7 +24,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
@@ -38,6 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+from transformers import LlamaConfig
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -111,14 +111,13 @@ class LlamaModel(nn.Module):
         super().__init__()
         self.config = config
 
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         self.is_mrope_enabled = (
-            hasattr(config, "rope_scaling")
-            and config.rope_scaling is not None
-            and "mrope_section" in config.rope_scaling
+            rope_scaling is not None and "mrope_section" in rope_scaling
         )
         # fix rope_scaling for qwen2.5-vl
         if self.is_mrope_enabled:
-            config.rope_scaling["rope_type"] = "default"
+            config.rope_parameters["rope_scaling"]["rope_type"] = "default"
 
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(

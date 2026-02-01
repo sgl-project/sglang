@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
@@ -38,6 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from transformers import PretrainedConfig
 
 
 class GemmaMLP(nn.Module):
@@ -172,7 +172,7 @@ class GemmaDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             layer_id=layer_id,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters.get("rope_theta", 10000),
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )

@@ -20,7 +20,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -47,6 +46,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from transformers import PretrainedConfig
 
 _is_cuda = is_cuda()
 
@@ -98,7 +98,7 @@ class Olmo2Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
 
         # Attention input projection. Projects x -> (q, k, v)
         self.qkv_proj = QKVParallelLinear(

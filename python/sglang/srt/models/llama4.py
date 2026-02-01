@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import Llama4TextConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -59,6 +58,7 @@ from sglang.srt.utils import (
     make_layers,
 )
 from sglang.srt.utils.common import get_current_device_stream_fast
+from transformers import Llama4TextConfig
 
 _is_cuda = is_cuda()
 
@@ -362,8 +362,8 @@ class Llama4DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_theta
-        rope_scaling = config.rope_scaling
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         max_position_embeddings = config.max_position_embeddings
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()

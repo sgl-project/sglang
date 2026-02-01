@@ -21,7 +21,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import GraniteConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -44,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
+from transformers import GraniteConfig
 
 logger = logging.getLogger(__name__)
 
@@ -187,8 +187,8 @@ class GraniteDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.residual_multiplier = config.residual_multiplier
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):

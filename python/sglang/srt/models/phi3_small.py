@@ -3,8 +3,6 @@ from typing import Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import Phi3Config
-from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -26,6 +24,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import Phi3Config
+from transformers.configuration_utils import PretrainedConfig
 
 
 @torch.jit.script
@@ -153,8 +153,8 @@ class Phi3SmallSelfAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        if getattr(self.config, "rope_scaling", None) is not None:
-            rope_scaling = self.config.rope_scaling
+        rope_scaling = self.config.rope_parameters.get("rope_scaling")
+        if rope_scaling is not None:
             for key in rope_scaling:
                 if isinstance(rope_scaling[key], list):
                     rope_scaling[key] = tuple(rope_scaling[key])

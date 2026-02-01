@@ -4,7 +4,6 @@ from typing import Iterable, Optional
 
 import torch
 from torch import nn
-from transformers import GraniteConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -27,6 +26,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models import mixtral
 from sglang.srt.utils import add_prefix
+from transformers import GraniteConfig
 
 
 class GraniteMoeMoE(nn.Module):
@@ -187,7 +187,7 @@ class GraniteMoeDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.self_attn = GraniteMoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,

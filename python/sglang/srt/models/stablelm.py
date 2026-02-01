@@ -23,7 +23,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -43,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_npu
+from transformers import PretrainedConfig
 
 _is_npu = is_npu()
 
@@ -144,14 +144,14 @@ class StablelmAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters.get("rope_theta", 10000),
             )
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.rotary_ndims,
                 max_position=self.config.max_position_embeddings,
-                base=self.config.rope_theta,
+                base=self.config.rope_parameters.get("rope_theta", 10000),
                 dtype=torch.float32,
             )
         self.attn = RadixAttention(

@@ -24,7 +24,6 @@ from typing import Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
@@ -82,6 +81,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from transformers import PretrainedConfig
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -497,8 +497,8 @@ class BailingMoEAttention(nn.Module):
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_theta,
-            rope_scaling=config.rope_scaling,
+            base=config.rope_parameters.get("rope_theta", 10000),
+            rope_scaling=config.rope_parameters.get("rope_scaling"),
         )
 
         self.attn = RadixAttention(

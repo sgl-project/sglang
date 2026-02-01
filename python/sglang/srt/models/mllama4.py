@@ -8,11 +8,6 @@ from typing import List, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import Llama4Config, Llama4VisionConfig
-from transformers.models.llama4.modeling_llama4 import (
-    Llama4MultiModalProjector,
-    vision_apply_rotary_emb,
-)
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import (
@@ -35,6 +30,11 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu
+from transformers import Llama4Config, Llama4VisionConfig
+from transformers.models.llama4.modeling_llama4 import (
+    Llama4MultiModalProjector,
+    vision_apply_rotary_emb,
+)
 
 _is_cpu = is_cpu()
 
@@ -305,7 +305,7 @@ class Llama4VisionRotaryEmbedding(nn.Module):
         frequencies_y = img_idx // idx  # get the coordinates of the 2d matrix along y
         freq_dim = config.hidden_size // config.num_attention_heads // 2
         rope_freq = 1.0 / (
-            config.rope_theta
+            config.rope_parameters.get("rope_theta", 10000)
             ** (torch.arange(0, freq_dim, 2)[: (freq_dim // 2)].float() / freq_dim)
         )
         freqs_x = (

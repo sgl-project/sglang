@@ -139,13 +139,13 @@ class Lfm2Attention(nn.Module):
         if rope_parameters is not None and "rope_theta" in rope_parameters:
             rope_theta = rope_parameters["rope_theta"]
         else:
-            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_theta = config.rope_parameters.get("rope_theta", 10000)
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
             max_position=getattr(config, "max_position_embeddings", 8192),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_scaling=config.rope_parameters.get("rope_scaling"),
             base=rope_theta,
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
@@ -432,10 +432,10 @@ class Lfm2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = (
-            inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+            input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
         )
 
         residual = None
@@ -482,16 +482,19 @@ class Lfm2ForCausalLM(nn.Module):
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
 
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

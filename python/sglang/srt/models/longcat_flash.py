@@ -328,7 +328,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                     v_head_dim=config.v_head_dim,
                     q_lora_rank=config.q_lora_rank,
                     kv_lora_rank=config.kv_lora_rank,
-                    rope_theta=config.rope_theta,
+                    rope_theta=config.rope_parameters.get("rope_theta", 10000),
                     rope_scaling=None,
                     max_position_embeddings=config.max_position_embeddings,
                     quant_config=(

@@ -19,7 +19,6 @@ from typing import Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
@@ -40,6 +39,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import PretrainedConfig
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -200,7 +200,7 @@ class Gemma2DecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            rope_theta=config.rope_theta,
+            rope_theta=config.rope_parameters.get("rope_theta", 10000),
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
