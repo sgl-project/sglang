@@ -265,6 +265,8 @@ class Envs:
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
+    # enable decode instance extending distributed kv pool
+    SGLANG_ENABLE_DECODE_KVCACHE_OFFLOAD_DIRECT = EnvBool(False)
 
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
