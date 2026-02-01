@@ -44,6 +44,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_MM_PRECOMPUTE_HASH` | Enable precomputing of hash values for MultimodalDataItem | `false` |
 | `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH` | Enable NCCL for gathering when preparing mlp sync batch under overlap scheduler (without this flag gloo is used for gathering) | `false` |
 | `SGLANG_SYMM_MEM_PREALLOC_GB_SIZE` | Size of preallocated GPU buffer (in GB) for NCCL symmetric memory pool to limit memory fragmentation. Only have an effect when server arg `--enable-symm-mem` is set. | `4` |
+| `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithom of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)
