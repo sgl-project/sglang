@@ -485,13 +485,10 @@ class Scheduler(
             )[0]
 
     def init_moe_gemm_config(self):
-        hf_config = self.model_config.hf_config
-
-        # For mm model, check text_config
-        if hasattr(hf_config, "text_config"):
-            config_to_check = hf_config.text_config
-        else:
-            config_to_check = hf_config
+        # For the MM models, check the text_config for MoE settings
+        config_to_check = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
 
         if hasattr(config_to_check, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
