@@ -58,7 +58,12 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject_cpu.toml"
               - "test/**"
-              - "sgl-kernel/**"
+              # Only trigger on CPU-specific sgl-kernel changes
+              - "sgl-kernel/pyproject_cpu.toml"
+              - "sgl-kernel/csrc/cpu/**"
+              - "sgl-kernel/python/**"
+              - "sgl-kernel/include/**"
+              - "sgl-kernel/tests/**"
               - ".github/workflows/pr-test-xeon.yml"
               - "docker/xeon.Dockerfile"
 
