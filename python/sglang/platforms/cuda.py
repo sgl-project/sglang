@@ -226,15 +226,6 @@ class CudaPlatformBase(Platform):
     # Backend Selection
     # =========================================================================
 
-    def get_default_attention_backend(self, model_config: Any = None) -> str:
-        return "flashinfer"
-
-    def get_default_sampling_backend(self) -> str:
-        return "flashinfer"
-
-    def get_default_moe_runner_backend(self) -> str:
-        return "triton"
-
     @classmethod
     def get_attn_backend_cls_str(
         cls,

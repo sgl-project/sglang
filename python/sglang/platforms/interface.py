@@ -382,15 +382,24 @@ class Platform:
 
     def get_default_attention_backend(self, model_config: Any = None) -> str:
         """Get the default attention backend for this platform."""
-        return "torch_native"
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.get_default_attention_backend() is not implemented. "
+            "This method is reserved for future use in Phase 6 (Server Args Integration)."
+        )
 
     def get_default_sampling_backend(self) -> str:
         """Get the default sampling backend for this platform."""
-        return "pytorch"
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.get_default_sampling_backend() is not implemented. "
+            "This method is reserved for future use in Phase 6 (Server Args Integration)."
+        )
 
     def get_default_moe_runner_backend(self) -> str:
         """Get the default MOE runner backend for this platform."""
-        return "triton"
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.get_default_moe_runner_backend() is not implemented. "
+            "This method is reserved for future use in Phase 6 (Server Args Integration)."
+        )
 
     @classmethod
     def get_attn_backend_cls_str(
