@@ -69,5 +69,10 @@ class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, unittest.TestCa
     backend = "flashinfer_trtllm"
 
 
+@unittest.skipIf(get_device_sm() != 90, "Test requires CUDA SM 90")
+class TestFP8BlockwiseGemmFlashinferDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
+    backend = "flashinfer_deepgemm"
+
+
 if __name__ == "__main__":
     unittest.main()
