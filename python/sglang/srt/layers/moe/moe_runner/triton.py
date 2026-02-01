@@ -36,6 +36,8 @@ _use_aiter = bool(int(os.getenv("SGLANG_USE_AITER", "0")))
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
+_vllm_moe_available = False
+
 if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
@@ -48,7 +50,13 @@ if _is_cuda or _is_hip:
                     "aiter is required when SGLANG_USE_AITER is set to True"
                 )
         else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
+            try:
+                from vllm import _custom_ops as vllm_ops  # moe_sum
+
+                _vllm_moe_available = True
+            except ImportError:
+                # Will use triton fallback
+                pass
 elif _is_cpu and _is_cpu_amx_available:
     pass
 
@@ -307,10 +315,21 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
-            else:
+            elif _vllm_moe_available:
                 vllm_ops.moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
+                )
+            else:
+                # Triton fallback when vllm is not available
+                from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+                    moe_sum_reduce_triton,
+                )
+
+                moe_sum_reduce_triton(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    1.0,  # routed_scaling_factor
                 )
         else:
             vllm_ops.moe_sum(

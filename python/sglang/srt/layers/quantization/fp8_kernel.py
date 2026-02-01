@@ -63,6 +63,8 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = False
 
+_vllm_available = False
+
 if _is_hip:
     if _use_aiter:
         try:
@@ -74,10 +76,14 @@ if _is_hip:
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
+        # Try to import vllm for fp8 quant ops, but don't fail immediately
+        # The functions will raise ImportError when actually called if vllm is not available
         try:
             import vllm._C  # noqa: F401
+
+            _vllm_available = True
         except ImportError:
-            raise ImportError("vllm is required when SGLANG_USE_AITER is set to False")
+            pass
 
 logger = logging.getLogger(__name__)
 
@@ -1532,6 +1538,54 @@ Raises:
 """
 if _is_hip:
 
+    def _triton_dynamic_per_token_quant_fp8(output, input, scale):
+        """Triton fallback for dynamic per-token FP8 quantization."""
+        M, N = input.shape
+        BLOCK = triton.next_power_of_2(N)
+        num_warps = min(max(BLOCK // 256, 1), 8)
+        eps = 1e-10
+        if _is_hip:
+            bit8_max = 224.0
+        else:
+            bit8_max = fp8_max
+        bit8_min = -bit8_max
+        _per_token_group_quant_8bit[(M,)](
+            input,
+            output,
+            scale,
+            N,  # group_size = N (per token)
+            N,
+            eps,
+            bit8_min=bit8_min,
+            bit8_max=bit8_max,
+            BLOCK=BLOCK,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+
+    def _triton_dynamic_per_tensor_quant_fp8(output, input, scale):
+        """Triton fallback for dynamic per-tensor FP8 quantization."""
+        # Compute scale from input
+        eps = 1e-10
+        if _is_hip:
+            bit8_max = 224.0
+        else:
+            bit8_max = fp8_max
+        absmax = torch.max(torch.abs(input)).item()
+        scale_val = max(absmax, eps) / bit8_max
+        scale.fill_(scale_val)
+        # Quantize with computed scale
+        output.copy_((input / scale_val).clamp(-bit8_max, bit8_max).to(output.dtype))
+
+    def _triton_static_quant_fp8(output, input, scale):
+        """Triton fallback for static FP8 quantization."""
+        if _is_hip:
+            bit8_max = 224.0
+        else:
+            bit8_max = fp8_max
+        scale_val = scale.item()
+        output.copy_((input / scale_val).clamp(-bit8_max, bit8_max).to(output.dtype))
+
     def scaled_fp8_quant(
         input: torch.Tensor,
         scale: Optional[torch.Tensor] = None,
@@ -1552,16 +1606,22 @@ if _is_hip:
                 )
                 if _use_aiter:
                     dynamic_per_token_scaled_quant(output, input, scale)
-                else:
+                elif _vllm_available:
                     torch.ops._C.dynamic_per_token_scaled_fp8_quant(
                         output, input.contiguous(), scale, None
+                    )
+                else:
+                    _triton_dynamic_per_token_quant_fp8(
+                        output, input.contiguous(), scale
                     )
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
                     dynamic_per_tensor_quant(output, input, scale)
-                else:
+                elif _vllm_available:
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
+                else:
+                    _triton_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
             assert (
@@ -1569,8 +1629,10 @@ if _is_hip:
             ), f"Expected scalar scale, got numel={scale.numel()}"
             if _use_aiter:
                 static_per_tensor_quant(output, input, scale)
-            else:
+            elif _vllm_available:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
+            else:
+                _triton_static_quant_fp8(output, input, scale)
 
         return output, scale
 
