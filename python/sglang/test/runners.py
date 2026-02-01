@@ -557,6 +557,7 @@ class SRTRunner:
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
+        enable_torch_compile: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -615,6 +616,7 @@ class SRTRunner:
             enable_lora=enable_lora,
             enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loaded_loras=max_loaded_loras,
+            enable_torch_compile=enable_torch_compile,
             json_model_override_args=(
                 json.dumps(json_model_override_args)
                 if json_model_override_args
