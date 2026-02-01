@@ -435,7 +435,7 @@ class ServerArgs:
 
         # normalize attention_backend_config
         if self.attention_backend_config is None:
-            self.attention_backend_config = {}
+            self.attention_backend_config = addict.Dict()
         elif isinstance(self.attention_backend_config, str):
             self.attention_backend_config = addict.Dict(
                 self._parse_attention_backend_config(self.attention_backend_config)
