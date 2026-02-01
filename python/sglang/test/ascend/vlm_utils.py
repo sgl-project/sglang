@@ -30,13 +30,13 @@ class TestVLMModels(CustomTestCase):
         "--tp-size",
         4,
     ]
+    timeout_for_server_launch = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
     @classmethod
     def setUpClass(cls):
         # Removed argument parsing from here
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.time_out = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
         # Set OpenAI API key and base URL environment variables. Needed for lmm-evals to work.
         os.environ["OPENAI_API_KEY"] = cls.api_key
@@ -134,7 +134,7 @@ class TestVLMModels(CustomTestCase):
             process = popen_launch_server(
                 self.model,
                 base_url=self.base_url,
-                timeout=self.time_out,
+                timeout=self.timeout_for_server_launch,
                 api_key=self.api_key,
                 other_args=self.other_args,
                 env=process_env,
