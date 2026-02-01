@@ -2695,6 +2695,288 @@ class ModelOptModelLoader(DefaultModelLoader):
         return model.eval()
 
 
+class RunaiModelStreamerLoader(BaseModelLoader):
+    """
+    Model loader that uses Runai Model Streamer to load a model.
+
+    Supports object storage (S3, GCS) with lazy weight streaming.
+
+    Configuration (via load_config.model_loader_extra_config):
+        - distributed (bool): Enable distributed streaming - True by default for url paths (object storage)
+        - concurrency (int): Number of concurrent downloads
+        - memory_limit (int): Memory limit for streaming buffer
+
+    Note: Metadata files must be pre-downloaded via
+    ObjectStorageModel.download_and_get_path() before instantiation.
+    """
+
+    @dataclasses.dataclass
+    class Source:
+        """A source for weights."""
+
+        model_or_path: str
+        """The model ID or path."""
+
+        revision: Optional[str]
+        """The optional model revision."""
+
+        prefix: str = ""
+        """A prefix to prepend to all weights."""
+
+        fall_back_to_pt: bool = True
+        """Whether .pt weights can be used."""
+
+        model_config: Optional["ModelConfig"] = None
+        """The model configuration (for checking architecture, etc)."""
+
+        @classmethod
+        def init_new(cls, model_config: ModelConfig, model):
+            model_weights = model_config.model_path
+            if hasattr(model_config, "model_weights"):
+                model_weights = model_config.model_weights
+            return cls(
+                model_weights,
+                model_config.revision,
+                prefix="",
+                fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                model_config=model_config,
+            )
+
+    def __init__(self, load_config: LoadConfig):
+        super().__init__(load_config)
+        extra_config = load_config.model_loader_extra_config
+        allowed_keys = {"distributed", "concurrency", "memory_limit"}
+        unexpected_keys = set(extra_config.keys()) - allowed_keys
+
+        if unexpected_keys:
+            raise ValueError(
+                f"Unexpected extra config keys for load format "
+                f"{load_config.load_format}: "
+                f"{unexpected_keys}"
+            )
+
+        set_runai_streamer_env(load_config)
+
+        self._is_distributed = None
+        if load_config.model_loader_extra_config:
+            extra_config = load_config.model_loader_extra_config
+
+            if "distributed" in extra_config and isinstance(
+                extra_config.get("distributed"), bool
+            ):
+                self._is_distributed = extra_config.get("distributed")
+
+    def _maybe_download_from_modelscope(
+        self, model: str, revision: Optional[str]
+    ) -> Optional[str]:
+        """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
+
+        Returns the path to the downloaded model, or None if the model is not
+        downloaded from ModelScope."""
+        if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+            # download model from ModelScope hub,
+            # lazy import so that modelscope is not required for normal use.
+            # pylint: disable=C.
+            from modelscope.hub.snapshot_download import snapshot_download
+
+            if not os.path.exists(model):
+                model_path = snapshot_download(
+                    model_id=model,
+                    cache_dir=self.load_config.download_dir,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    revision=revision,
+                    ignore_file_pattern=self.load_config.ignore_patterns,
+                )
+            else:
+                model_path = model
+            return model_path
+        return None
+
+    def _prepare_weights(
+        self, model_name_or_path: str, revision: Optional[str]
+    ) -> Tuple[str, List[str]]:
+        """Prepare weights for the model.
+
+        If the model is not local, it will be downloaded."""
+        from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+
+        model_name_or_path = (
+            self._maybe_download_from_modelscope(model_name_or_path, revision)
+            or model_name_or_path
+        )
+
+        is_object_storage_path = is_runai_obj_uri(model_name_or_path)
+        if self._is_distributed is None:
+            self._is_distributed = is_object_storage_path
+        is_local = os.path.isdir(model_name_or_path)
+        safetensors_pattern = "*.safetensors"
+        index_file = SAFE_WEIGHTS_INDEX_NAME
+
+        hf_folder = (
+            model_name_or_path
+            if (is_local or is_object_storage_path)
+            else download_weights_from_hf(
+                model_name_or_path,
+                self.load_config.download_dir,
+                [safetensors_pattern],
+                revision,
+                ignore_patterns=self.load_config.ignore_patterns,
+            )
+        )
+
+        server_args = get_global_server_args()
+        if server_args and server_args.model_checksum is not None:
+            from sglang.srt.utils.model_file_verifier import verify
+
+            checksums_source = server_args.model_checksum or model_name_or_path
+            verify(model_path=hf_folder, checksums_source=checksums_source)
+
+        hf_weights_files = list_safetensors(path=hf_folder)
+
+        # For models like Mistral-7B-Instruct-v0.3
+        # there are both sharded safetensors files and a consolidated
+        # safetensors file. Using both breaks.
+        # Here, we download the `model.safetensors.index.json` and filter
+        # any files not found in the index.
+        if not is_local and not is_object_storage_path:
+            download_safetensors_index_file_from_hf(
+                model_name_or_path,
+                index_file,
+                self.load_config.download_dir,
+                revision,
+            )
+        hf_weights_files = filter_duplicate_safetensors_files(
+            hf_weights_files, hf_folder, index_file
+        )
+
+        if len(hf_weights_files) == 0:
+            raise RuntimeError(
+                f"Cannot find any model weights with `{model_name_or_path}`"
+            )
+
+        return hf_folder, hf_weights_files
+
+    def _get_weights_iterator(
+        self, source: "Source"
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """Get an iterator for the model weights based on the load format."""
+        from sglang.srt.model_loader.weight_utils import (
+            runai_safetensors_weights_iterator,
+        )
+
+        hf_folder, hf_weights_files = self._prepare_weights(
+            source.model_or_path, source.revision
+        )
+
+        if source.model_config is not None:
+            hf_weights_files = maybe_add_mtp_safetensors(
+                hf_weights_files,
+                hf_folder,
+                "model.safetensors.index.json",
+                source.model_config.hf_config,
+            )
+
+        weights_iterator = runai_safetensors_weights_iterator(
+            hf_weights_files, self._is_distributed, self.target_device_str
+        )
+
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            def filter_weights(original_weights_iterator):
+                pattern = r"model.mtp.layers.(\d+)."
+                for name, tensor in original_weights_iterator:
+                    group = re.match(pattern, name)
+                    if group is not None:
+                        idx = int(group.group(1))
+                        if idx != self.load_config.draft_model_idx:
+                            continue
+                        new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                    else:
+                        new_name = name
+                    yield (new_name, tensor)
+
+            weights_iterator = filter_weights(weights_iterator)
+
+        def apply_prefix(original_weights_iterator):
+            yield from (
+                (source.prefix + name, tensor)
+                for (name, tensor) in original_weights_iterator
+            )
+
+        return apply_prefix(weights_iterator)
+
+    def _get_all_weights(
+        self,
+        model_config: ModelConfig,
+        model: nn.Module,
+    ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+
+        primary_weights = RunaiModelStreamerLoader.Source.init_new(model_config, model)
+        yield from self._get_weights_iterator(primary_weights)
+
+        secondary_weights = cast(
+            Iterable[RunaiModelStreamerLoader.Source],
+            getattr(model, "secondary_weights", ()),
+        )
+        for source in secondary_weights:
+            yield from self._get_weights_iterator(source)
+
+    def download_model(self, model_config: ModelConfig) -> None:
+        self._prepare_weights(model_config.model_path, model_config.revision)
+
+    def load_model(
+        self,
+        *,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> nn.Module:
+
+        if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
+            # Load base model using shared method
+            raise NotImplementedError(
+                "Runai Model Streamer Loader does not support ModelOpt quantization yet"
+            )
+
+        if device_config.device_type == "cuda":
+            self.target_device_str = (
+                device_config.device_type + ":" + str(device_config.gpu_id)
+            )
+        else:
+            self.target_device_str = "cpu"
+
+        target_device = torch.device(device_config.device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                model = _initialize_model(
+                    model_config,
+                    self.load_config,
+                )
+
+            self.load_weights_and_postprocess(
+                model, self._get_all_weights(model_config, model), target_device
+            )
+
+        return model.eval()
+
+    @staticmethod
+    def load_weights_and_postprocess(model, weights, target_device):
+        model.load_weights(weights)
+
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is not None:
+                # When quant methods need to process weights after loading
+                # (for repacking, quantizing, etc), they expect parameters
+                # to be on the global target device. This scope is for the
+                # case where cpu offloading is used, where we will move the
+                # parameters onto device for processing and back off after.
+                with device_loading_context(module, target_device):
+                    quant_method.process_weights_after_loading(module)
+                if _is_npu:
+                    torch.npu.empty_cache()
+
+
 def get_model_loader(
     load_config: LoadConfig, model_config: Optional[ModelConfig] = None
 ) -> BaseModelLoader:
@@ -2776,5 +3058,8 @@ def get_model_loader(
             return module.PrivateModelLoader(load_config)
         except ImportError:
             raise ValueError("Failed to import sglang.private.private_model_loader")
+
+    if load_config.load_format == LoadFormat.RUNAI_STREAMER:
+        return RunaiModelStreamerLoader(load_config)
 
     return DefaultModelLoader(load_config)
