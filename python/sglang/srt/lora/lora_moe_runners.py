@@ -66,6 +66,9 @@ class LoRAInfo:
     expert_ids: torch.Tensor  # [num_dispatched] - expert IDs
     lora_ids: torch.Tensor  # [num_dispatched] - LoRA adapter IDs
 
+    # Original per-token LoRA mapping (unsorted)
+    token_lora_indices: torch.Tensor  # [num_tokens] - LoRA adapter ID for each token
+
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
     lora_scalings: torch.Tensor  # [num_loras]
@@ -481,10 +484,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             (max_loras,), dtype=torch.int32, device=device
         )
 
-        # Create token-to-LoRA mapping (assuming all tokens use LoRA 0 for now)
-        token_lora_mapping = torch.zeros(
-            (num_tokens,), dtype=torch.int32, device=device
-        )
+        # Use the actual token-to-LoRA mapping from the forward batch
+        token_lora_mapping = lora_info.token_lora_indices.to(dtype=torch.int32, device=device)
         lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         # Call the kernel directly

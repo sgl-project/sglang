@@ -24,8 +24,12 @@ logger = logging.getLogger(__name__)
 
 
 class MoeRunner:
-
-    def __init__(self, runner_backend: MoeRunnerBackend, config: MoeRunnerConfig, lora_enabled: bool = False):
+    def __init__(
+        self,
+        runner_backend: MoeRunnerBackend,
+        config: MoeRunnerConfig,
+        lora_enabled: bool = False,
+    ):
         self.runner_backend = runner_backend
         self.config = config
         self.lora_enabled = lora_enabled
@@ -35,6 +39,7 @@ class MoeRunner:
         if runner_backend.is_triton():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runners import TritonRunnerCoreWithLoRA
+
                 self.runner_core = TritonRunnerCoreWithLoRA(config)
             else:
                 self.runner_core = TritonRunnerCore(config)
@@ -80,7 +85,6 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
-
         if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
@@ -103,9 +107,13 @@ class MoeRunner:
 
         # Pass lora_info to runner_core if LoRA is enabled
         if self.lora_enabled:
-            runner_output = self.runner_core.run(runner_input, quant_info, running_state, lora_info)
+            runner_output = self.runner_core.run(
+                runner_input, quant_info, running_state, lora_info
+            )
         else:
-            runner_output = self.runner_core.run(runner_input, quant_info, running_state)
+            runner_output = self.runner_core.run(
+                runner_input, quant_info, running_state
+            )
 
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value

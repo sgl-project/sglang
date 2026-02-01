@@ -647,7 +647,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         # Create adapter_enabled tensor for the current batch
         # All LoRAs in the batch are enabled by definition
-        adapter_enabled = torch.ones(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
+        adapter_enabled = torch.ones(
+            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+        )
 
         # Use precomputed per-token LoRA indices from forward batch
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
@@ -667,6 +669,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             token_ids=token_ids,
             expert_ids=expert_ids,
             lora_ids=lora_ids,
+            token_lora_indices=lora_indices,
             lora_ranks=lora_ranks,
             lora_scalings=scalings,
             adapter_enabled=adapter_enabled,
@@ -721,10 +724,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Create LoRA-enabled MoeRunner if not already created
         if self._lora_runner is None:
             from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+
             self._lora_runner = MoeRunner(
                 base_layer.quant_method.runner.runner_backend,
                 base_layer.moe_runner_config,
-                lora_enabled=True
+                lora_enabled=True,
             )
 
         # Build quant info (for unquantized, this is straightforward)
