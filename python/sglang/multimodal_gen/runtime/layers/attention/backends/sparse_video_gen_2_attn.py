@@ -21,7 +21,6 @@ try:
     )
     from svg.kmeans_utils import (
         batch_kmeans_Euclid,
-        density_calculation,
         dynamic_block_sparse_fwd_flashinfer,
         identify_dynamic_map,
     )
@@ -74,9 +73,6 @@ class Svg2LayerCache:
     k_centroids: torch.Tensor | None = None
     centroids_initialized: bool = False
 
-    # density cache for head reordering (if head parallel is enabled, we need to do load balancing)
-    density: torch.Tensor | None = None
-
 
 @dataclass
 class Svg2Cache:
@@ -107,7 +103,6 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     frame_size: int
     cache: Svg2Cache
     prompt_length: int | None = None
-    calculate_density: bool = False
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
 
@@ -145,7 +140,6 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
         first_times_fp: float,
         context_length: int = 0,
         prompt_length: int | None = None,
-        calculate_density: bool = False,
         **kwargs: dict[str, Any],
     ) -> SparseVideoGen2AttentionMetadata:
         raw_shape = tuple(raw_latent_shape)
@@ -182,7 +176,6 @@ class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
             num_frame=num_frame,
             frame_size=frame_size,
             cache=cache,
-            calculate_density=calculate_density,
         )
 
 
@@ -205,6 +198,8 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
         if not svg2_available:
             raise ImportError(
                 "Sparse Video Gen 2 attention backend requires svg package to be installed"
+                "Please install it by following the instructions at "
+                "https://github.com/svg-project/Sparse-VideoGen"
             )
         self.prefix = prefix
         self.layer_idx = self._get_layer_idx(prefix)
@@ -556,11 +551,6 @@ class SparseVideoGen2AttentionImpl(AttentionImpl):
             attn_output = apply_inverse_permutation_triton(
                 output_permuted, q_sorted_indices, dim=2
             )
-
-            if attn_metadata.calculate_density:
-                densities = density_calculation(dyn_map, qc_sz_s, kc_sz_s)
-                layer_cache = attn_metadata.cache.get_layer(self.layer_idx)
-                layer_cache.density = densities  # [batch_size, num_heads]
 
             res = attn_output.reshape(batch_size, num_heads, seq_len, dim).transpose(
                 1, 2
