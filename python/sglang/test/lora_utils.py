@@ -733,6 +733,7 @@ def run_lora_batch_splitting_equivalence_test(
     attention_backend: str = "torch_native",
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
+    lora_drain_wait_threshold: float = 0.0,
 ):
     """
     Test that SRT correctly handles batch splitting with multiple LoRA adapters.
@@ -750,6 +751,9 @@ def run_lora_batch_splitting_equivalence_test(
         attention_backend: Attention backend to use
         disable_cuda_graph: Whether to disable CUDA graph
         disable_radix_cache: Whether to disable radix cache
+        lora_drain_wait_threshold: When any LoRA adapter request waits longer than
+            this threshold (in seconds), the scheduler will selectively drain one
+            running adapter to make room. Set to 0 to disable draining (default).
     """
     max_loras_per_batch = 2
 
@@ -762,9 +766,14 @@ def run_lora_batch_splitting_equivalence_test(
         max_new_tokens = 64
         base_path = model_case.base
 
+        maybe_drain_info = (
+            f", lora_drain_wait_threshold={lora_drain_wait_threshold}"
+            if lora_drain_wait_threshold > 0
+            else ""
+        )
         print(
             f"\n========== Testing batch splitting on base '{base_path}', "
-            f"dtype={torch_dtype} =========="
+            f"dtype={torch_dtype}{maybe_drain_info} =========="
         )
 
         prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
@@ -807,6 +816,7 @@ def run_lora_batch_splitting_equivalence_test(
             attention_backend=attention_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            lora_drain_wait_threshold=lora_drain_wait_threshold,
         ) as srt_runner:
             for batch_idx, (batch_prompts, lora_paths) in enumerate(test_cases):
                 print(f"\n--- Batch {batch_idx + 1} ---")

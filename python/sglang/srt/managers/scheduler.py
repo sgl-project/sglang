@@ -382,9 +382,14 @@ class Scheduler(
         # Init request dispatcher
         self.init_request_dispatcher()
 
-        # Init LoRA scheduler for fair scheduling
-        if self.enable_lora:
-            self.lora_drainer = LoRADrainer(server_args.max_loras_per_batch)
+        # Init LoRA drainer for fair scheduling
+        if self.server_args.lora_drain_wait_threshold > 0.0:
+            self.lora_drainer = LoRADrainer(
+                server_args.max_loras_per_batch,
+                server_args.lora_drain_wait_threshold,
+            )
+        else:
+            self.lora_drainer = None
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
@@ -2000,10 +2005,11 @@ class Scheduler(
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
-            self.lora_drainer.update_draining_state(
-                self.waiting_queue,
-                self.running_batch.reqs,
-            )
+            if self.lora_drainer:
+                self.lora_drainer.update_draining_state(
+                    self.waiting_queue,
+                    self.running_batch.reqs,
+                )
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
@@ -2159,7 +2165,7 @@ class Scheduler(
         1. The drainer allows scheduling (based on draining state)
         2. The LoRA adapter can be loaded (either already running or can be added)
         """
-        if not self.lora_drainer.can_schedule(req):
+        if self.lora_drainer and not self.lora_drainer.can_schedule(req):
             return False
 
         if req.lora_id in running_loras:

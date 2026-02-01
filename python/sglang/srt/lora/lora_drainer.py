@@ -22,7 +22,6 @@ from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
-MAX_WAIT_TIME_SECS = 3.0
 DRAIN_SCHEDULE_TOLERANCE = 1.2
 
 
@@ -38,10 +37,9 @@ class AdapterStats:
         self.max_wait_time_secs = 0.0
         self.max_remaining_tokens = 0
 
-    @property
-    def is_starving(self):
+    def is_starving(self, drain_wait_threshold: float):
         return (
-            self.max_wait_time_secs > MAX_WAIT_TIME_SECS and self.num_waiting_reqs > 0
+            self.max_wait_time_secs > drain_wait_threshold and self.num_waiting_reqs > 0
         )
 
 
@@ -53,8 +51,9 @@ class LoRADrainer:
     - Maximum number of tokens needed for running requests for each adapter
     """
 
-    def __init__(self, max_loras_per_batch: int):
+    def __init__(self, max_loras_per_batch: int, max_wait_time_secs: float = 0.0):
         self.max_loras_per_batch = max_loras_per_batch
+        self.max_wait_time_secs = max_wait_time_secs
         self.adapter_to_stats: Dict[Optional[str], AdapterStats] = defaultdict(
             AdapterStats
         )
@@ -115,7 +114,7 @@ class LoRADrainer:
         starving_adapters = set()
         draining_for_adapters = set()
         for adapter_id, stats in self.adapter_to_stats.items():
-            if stats.is_starving:
+            if stats.is_starving(self.max_wait_time_secs):
                 starving_adapters.add(adapter_id)
 
             draining_for_adapter = stats.is_draining_for
