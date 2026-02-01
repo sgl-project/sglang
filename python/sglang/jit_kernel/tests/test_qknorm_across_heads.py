@@ -60,13 +60,13 @@ def test_qknorm_across_heads(batch_size: int, hidden_dim: int) -> None:
     k = torch.randn(batch_size, hidden_dim, device=DEVICE, dtype=DTYPE)
     q_weight = torch.randn(hidden_dim, device=DEVICE, dtype=DTYPE)
     k_weight = torch.randn(hidden_dim, device=DEVICE, dtype=DTYPE)
-    
+
     q_k_jit = (q.clone(), k.clone())
     q_k_aot = (q.clone(), k.clone())
-    
+
     sglang_jit_qknorm_across_heads(q_k_jit[0], q_k_jit[1], q_weight, k_weight)
     sglang_aot_qknorm_across_heads(q_k_aot[0], q_k_aot[1], q_weight, k_weight)
-    
+
     triton.testing.assert_close(q_k_jit[0], q_k_aot[0], atol=1e-2, rtol=1e-2)
     triton.testing.assert_close(q_k_jit[1], q_k_aot[1], atol=1e-2, rtol=1e-2)
 

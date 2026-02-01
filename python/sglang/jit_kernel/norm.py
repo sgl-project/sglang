@@ -56,7 +56,9 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
         "qknorm_across_heads",
         *args,
         cuda_files=["elementwise/qknorm_across_heads.cuh"],
-        cuda_wrappers=[("qknorm_across_heads", f"QKNormAcrossHeadsKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("qknorm_across_heads", f"QKNormAcrossHeadsKernel<{args}>::run")
+        ],
     )
 
 
@@ -119,7 +121,7 @@ def fused_inplace_qknorm_across_heads(
 ) -> None:
     """
     Fused inplace QK normalization across all heads.
-    
+
     Args:
         q: Query tensor of shape [batch_size, num_heads * head_dim]
         k: Key tensor of shape [batch_size, num_heads * head_dim]

@@ -52,8 +52,12 @@ SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_square_sum)
 
 template <typename T, int VEC_SIZE_IN_BYTE>
 __global__ void qknorm_across_heads_reg_kernel(
-    T* __restrict__ q, T* __restrict__ k, const T* __restrict__ q_weight, 
-    const T* __restrict__ k_weight, int vec_hidden_size, float eps) {
+    T* __restrict__ q,
+    T* __restrict__ k,
+    const T* __restrict__ q_weight,
+    const T* __restrict__ k_weight,
+    int vec_hidden_size,
+    float eps) {
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
 
   __shared__ float shared_memory[64];  // Used for CTA reduce, store both Q and K rsqrt
@@ -104,15 +108,17 @@ __global__ void qknorm_across_heads_reg_kernel(
   float* buffer_k = shared_memory + 32;  // [32, 63] for K
 
   // ========== Reduction phase: Compute rsqrt for both Q and K ==========
-  
+
   // Step 0: Warp Reduce for Q
-  float warp_sum_q = cooperative_groups::reduce(cg_warp, acc_square_q.x + acc_square_q.y, cooperative_groups::plus<float>());
+  float warp_sum_q =
+      cooperative_groups::reduce(cg_warp, acc_square_q.x + acc_square_q.y, cooperative_groups::plus<float>());
   if (threadIdx.x % 32 == 0) {
     buffer_q[threadIdx.x / 32] = warp_sum_q;
   }
 
   // Step 0: Warp Reduce for K
-  float warp_sum_k = cooperative_groups::reduce(cg_warp, acc_square_k.x + acc_square_k.y, cooperative_groups::plus<float>());
+  float warp_sum_k =
+      cooperative_groups::reduce(cg_warp, acc_square_k.x + acc_square_k.y, cooperative_groups::plus<float>());
   if (threadIdx.x % 32 == 0) {
     buffer_k[threadIdx.x / 32] = warp_sum_k;
   }
@@ -125,7 +131,7 @@ __global__ void qknorm_across_heads_reg_kernel(
         cg_warp, (threadIdx.x < blockDim.x / 32) ? buffer_q[threadIdx.x] : 0.0f, cooperative_groups::plus<float>());
     buffer_q[threadIdx.x] =
         rsqrtf(eps + cta_sum_q * (1.0f / static_cast<float>(vec_hidden_size * (VEC_SIZE_IN_BYTE / sizeof(T)))));
-    
+
     // CTA Reduce for K
     float cta_sum_k = cooperative_groups::reduce(
         cg_warp, (threadIdx.x < blockDim.x / 32) ? buffer_k[threadIdx.x] : 0.0f, cooperative_groups::plus<float>());
@@ -135,7 +141,7 @@ __global__ void qknorm_across_heads_reg_kernel(
   __syncthreads();
 
   // ========== Apply normalization phase: Compute and write back Q and K ==========
-  
+
   if (threadIdx.x < vec_hidden_size) {
     // Apply RMSNorm for Q
     float rsqrt_q = buffer_q[threadIdx.x / 32];
@@ -205,9 +211,9 @@ struct QKNormAcrossHeadsKernel {
           elements_in_vec);
 
       // Launch single kernel for both q and k
-      auto kernel =
-          max_vec_size_byte == 32 ? qknorm_across_heads_reg_kernel<DType, 32> : qknorm_across_heads_reg_kernel<DType, 16>;
-      
+      auto kernel = max_vec_size_byte == 32 ? qknorm_across_heads_reg_kernel<DType, 32>
+                                            : qknorm_across_heads_reg_kernel<DType, 16>;
+
       LaunchKernel(static_cast<uint>(N.unwrap()), threads, device.unwrap())
           .enable_pdl(false)(
               kernel,
