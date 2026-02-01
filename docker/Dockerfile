@@ -417,8 +417,7 @@ RUN CMAKE_VERSION=3.31.1 \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
-ARG RUNAI_MODEL_STREAMER_VERSION=">=0.15.4"
-RUN python3 -m pip install "runai-model-streamer[s3,gcs]${RUNAI_MODEL_STREAMER_VERSION}"
+RUN python3 -m pip install -e ".[runai]"
 
 # Install just
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
