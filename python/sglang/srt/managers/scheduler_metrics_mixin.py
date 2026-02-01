@@ -109,6 +109,8 @@ class SchedulerMetricsMixin:
             }
             if dp_rank is not None:
                 labels["dp_rank"] = dp_rank
+            if self.server_args.extra_metric_labels:
+                labels.update(self.server_args.extra_metric_labels)
             self.metrics_collector = SchedulerMetricsCollector(
                 labels=labels,
                 enable_lora=self.enable_lora,

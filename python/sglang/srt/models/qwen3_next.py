@@ -547,12 +547,18 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -769,10 +775,16 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs: Any,
     ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -844,6 +856,14 @@ class Qwen3NextModel(nn.Module):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -862,6 +882,7 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = None
+        aux_hidden_states = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -871,6 +892,11 @@ class Qwen3NextModel(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None
+                    ),
                 )
 
         if not forward_batch.forward_mode.is_idle():
@@ -879,7 +905,10 @@ class Qwen3NextModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class HybridLayerType(enum.Enum):
@@ -915,6 +944,8 @@ class Qwen3NextForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -939,8 +970,12 @@ class Qwen3NextForCausalLM(nn.Module):
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def get_embed_and_head(self):
@@ -951,6 +986,21 @@ class Qwen3NextForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -1070,6 +1120,23 @@ class Qwen3NextForCausalLM(nn.Module):
             num_logical_experts=config.num_experts,
             num_groups=None,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.set_eagle3_layers_to_capture(
+                [
+                    2,
+                    num_layers // 2,
+                    num_layers - 3,
+                ]
+            )  # Specific layers for EAGLE3 support
+        else:
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
 
 EntryClass = Qwen3NextForCausalLM
