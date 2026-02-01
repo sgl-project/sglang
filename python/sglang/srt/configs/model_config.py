@@ -241,6 +241,11 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        override_config_file = (
+            server_args.decrypted_draft_config_file
+            if is_draft_model
+            else server_args.decrypted_config_file
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -254,7 +259,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
-            override_config_file=server_args.decrypted_config_file,
+            override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
