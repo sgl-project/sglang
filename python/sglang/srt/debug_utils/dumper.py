@@ -250,8 +250,8 @@ class _DumperRpcHandler:
 def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHandle"]]:
     import zmq
 
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    rank = _get_rank()
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
     port = base_port + rank
     local_addr = f"tcp://{_get_local_ip_by_remote()}:{port}"
 
@@ -274,8 +274,11 @@ def _create_zmq_rpc_handles(handler, base_port: int) -> Optional[List["_ZmqRpcHa
     thread.start()
     print(f"[Dumper.ZmqRpc] rank={rank} server started at {local_addr}")
 
-    all_addresses = [None] * world_size
-    dist.all_gather_object(all_addresses, local_addr)
+    if dist.is_initialized():
+        all_addresses = [None] * world_size
+        dist.all_gather_object(all_addresses, local_addr)
+    else:
+        all_addresses = [local_addr]
     print(f"[Dumper.ZmqRpc] rank={rank} all_addresses={all_addresses}")
 
     if rank == 0:

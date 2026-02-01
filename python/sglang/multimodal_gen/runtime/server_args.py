@@ -8,15 +8,16 @@ import argparse
 import dataclasses
 import inspect
 import json
+import math
 import os
 import random
 import sys
 import tempfile
-from contextlib import contextmanager
 from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -143,13 +144,100 @@ def _sanitize_for_logging(obj: Any, key_hint: str | None = None) -> Any:
         return "<unserializable>"
 
 
+class ExecutionMode(str, Enum):
+    """
+    Enumeration for different pipeline modes.
+
+    Inherits from str to allow string comparison for backward compatibility.
+    """
+
+    INFERENCE = "inference"
+
+    @classmethod
+    def from_string(cls, value: str) -> "ExecutionMode":
+        """Convert string to ExecutionMode enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid mode: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [mode.value for mode in cls]
+
+
+class WorkloadType(str, Enum):
+    """
+    Enumeration for different workload types.
+
+    Inherits from str to allow string comparison for backward compatibility.
+    """
+
+    I2V = "i2v"  # Image to Video
+    T2V = "t2v"  # Text to Video
+    T2I = "t2i"  # Text to Image
+    I2I = "i2i"  # Image to Image
+
+    @classmethod
+    def from_string(cls, value: str) -> "WorkloadType":
+        """Convert string to WorkloadType enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid workload type: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [workload.value for workload in cls]
+
+
+class Backend(str, Enum):
+    """
+    Enumeration for different model backends.
+    - AUTO: Automatically select backend (prefer sglang native, fallback to diffusers)
+    - SGLANG: Use sglang's native optimized implementation
+    - DIFFUSERS: Use vanilla diffusers pipeline (supports all diffusers models)
+    """
+
+    AUTO = "auto"
+    SGLANG = "sglang"
+    DIFFUSERS = "diffusers"
+
+    @classmethod
+    def from_string(cls, value: str) -> "Backend":
+        """Convert string to Backend enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid backend: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [backend.value for backend in cls]
+
+
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
 
+    # Model backend (sglang native or diffusers)
+    backend: Backend = Backend.AUTO
+
     # Attention
     attention_backend: str = None
+    cache_dit_config: str | dict[str, Any] | None = (
+        None  # cache-dit config for diffusers
+    )
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -179,10 +267,16 @@ class ServerArgs:
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
+    # Pipeline override
+    pipeline_class_name: str | None = (
+        None  # Override pipeline class from model_index.json
+    )
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
@@ -193,11 +287,15 @@ class ServerArgs:
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
     dit_layerwise_offload: bool | None = None
+    dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = None
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+
+    # ComfyUI integration
+    comfyui_mode: bool = False
 
     # STA (Sliding Tile Attention) parameters
     mask_strategy_file_path: str | None = None
@@ -206,6 +304,10 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+
+    # warmup
+    warmup: bool = False
+    warmup_resolutions: list[str] = None
 
     disable_autocast: bool | None = None
 
@@ -230,6 +332,8 @@ class ServerArgs:
 
     scheduler_port: int = 5555
 
+    output_path: str | None = "outputs/"
+
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
 
@@ -239,6 +343,11 @@ class ServerArgs:
         default_factory=lambda: {
             "transformer": True,
             "vae": True,
+            "video_vae": True,
+            "audio_vae": True,
+            "video_dit": True,
+            "audio_dit": True,
+            "dual_tower_bridge": True,
         }
     )
 
@@ -276,10 +385,14 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = False
         else:
-            self.dit_cpu_offload = True
-            self.text_encoder_cpu_offload = True
-            self.image_encoder_cpu_offload = True
-            self.vae_cpu_offload = True
+            if self.dit_cpu_offload is None:
+                self.dit_cpu_offload = True
+            if self.text_encoder_cpu_offload is None:
+                self.text_encoder_cpu_offload = True
+            if self.image_encoder_cpu_offload is None:
+                self.image_encoder_cpu_offload = True
+            if self.vae_cpu_offload is None:
+                self.vae_cpu_offload = True
 
     def __post_init__(self):
         # configure logger before use
@@ -289,6 +402,15 @@ class ServerArgs:
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+
+        # handle warmup
+        if self.warmup_resolutions is not None:
+            self.warmup = True
+
+        if self.warmup:
+            logger.info(
+                "Warmup enabled, the launch time is expected to be longer than usual"
+            )
 
         # network initialization: port and host
         self.port = self.settle_port(self.port)
@@ -339,8 +461,25 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
-            help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
+            help=(
+                "The attention backend to use. For SGLang-native pipelines, use "
+                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
+                "use diffusers attention backend names such as flash, _flash_3_hub, "
+                "sage, or xformers."
+            ),
+        )
+        parser.add_argument(
+            "--diffusers-attention-backend",
+            type=str,
+            dest="attention_backend",
+            default=None,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--cache-dit-config",
+            type=str,
+            default=ServerArgs.cache_dit_config,
+            help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
         )
 
         # HuggingFace specific parameters
@@ -456,6 +595,24 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
+
+        # warmup
+        parser.add_argument(
+            "--warmup",
+            action=StoreBoolean,
+            default=ServerArgs.warmup,
+            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
+            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
+            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+        )
+        parser.add_argument(
+            "--warmup-resolutions",
+            type=str,
+            nargs="+",
+            default=ServerArgs.warmup_resolutions,
+            help="Specify resolutions for server to warmup. e.g., `--warmup-resolutions 256x256, 720x720`",
+        )
+
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -467,6 +624,12 @@ class ServerArgs:
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
             "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+        )
+        parser.add_argument(
+            "--dit-offload-prefetch-size",
+            type=float,
+            default=ServerArgs.dit_offload_prefetch_size,
+            help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
         parser.add_argument(
             "--use-fsdp-inference",
@@ -546,6 +709,12 @@ class ServerArgs:
             default=ServerArgs.webui_port,
             help="Whether to use webui for better display",
         )
+        parser.add_argument(
+            "--output-path",
+            type=str,
+            default=ServerArgs.output_path,
+            help="Directory path to save generated images/videos",
+        )
 
         # LoRA
         parser.add_argument(
@@ -560,6 +729,12 @@ class ServerArgs:
             default=ServerArgs.lora_nickname,
             help="The nickname for the LoRA adapter to launch with",
         )
+        parser.add_argument(
+            "--lora-scale",
+            type=float,
+            default=ServerArgs.lora_scale,
+            help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 
@@ -569,6 +744,14 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+        parser.add_argument(
+            "--backend",
+            type=str,
+            choices=Backend.choices(),
+            default=ServerArgs.backend.value,
+            help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
+            "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
         )
         return parser
 
@@ -594,17 +777,6 @@ class ServerArgs:
     ) -> int:
         """
         Find an available port with retry logic.
-
-        Args:
-            port: Initial port to check
-            port_inc: Port increment for each attempt
-            max_attempts: Maximum number of attempts to find an available port
-
-        Returns:
-            An available port number
-
-        Raises:
-            RuntimeError: If no available port is found after max_attempts
         """
         attempts = 0
         original_port = port
@@ -687,6 +859,16 @@ class ServerArgs:
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "ServerArgs":
+        # Convert mode string to enum if necessary
+        if "mode" in kwargs and isinstance(kwargs["mode"], str):
+            kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
+        # Convert workload_type string to enum if necessary
+        if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
+            kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
+        # Convert backend string to enum if necessary
+        if "backend" in kwargs and isinstance(kwargs["backend"], str):
+            kwargs["backend"] = Backend.from_string(kwargs["backend"])
+
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
@@ -747,14 +929,17 @@ class ServerArgs:
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
-            if self.attention_backend is not None and self.attention_backend != "fa":
+            if self.attention_backend is not None and self.attention_backend not in (
+                "fa",
+                "sage_attn",
+            ):
                 raise ValueError(
-                    "Ring Attention is only supported for flash attention backend for now"
+                    "Ring Attention is only supported for flash attention or sage attention backend for now"
                 )
-            else:
+            if self.attention_backend is None:
                 self.attention_backend = "fa"
                 logger.info(
-                    "Ring Attention is currently only supported for flash attention, attention_backend has been automatically set to flash attention"
+                    "Ring Attention is currently only supported for flash attention or sage attention; attention_backend has been automatically set to flash attention"
                 )
 
         if self.sp_degree == -1:
@@ -779,11 +964,42 @@ class ServerArgs:
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
+        # layerwise offload
         if current_platform.is_mps():
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
 
+        if self.dit_offload_prefetch_size > 1 and (
+            isinstance(self.dit_offload_prefetch_size, float)
+            and not self.dit_offload_prefetch_size.is_integer()
+        ):
+            self.dit_offload_prefetch_size = int(
+                math.floor(self.dit_offload_prefetch_size)
+            )
+            logger.info(
+                f"Invalid --dit-offload-prefetch-size value passed, truncated to: {self.dit_offload_prefetch_size}"
+            )
+        if 0.5 <= self.dit_offload_prefetch_size < 1.0:
+            logger.info(
+                f"We do not recommend --dit-offload-prefetch-size to be between 0.5 and 1.0"
+            )
+
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            # TODO: need a better way to tell this
+            if (
+                "wan" in self.pipeline_config.__class__.__name__.lower()
+                and self.dit_layerwise_offload is None
+                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            ):
+                logger.info(
+                    "Automatically enable dit_layerwise_offload for Wan for best performance"
+                )
+                self.dit_layerwise_offload = True
+
         if self.dit_layerwise_offload:
+            assert (
+                self.dit_offload_prefetch_size >= 0.0
+            ), "dit_offload_prefetch_size must be non-negative"
             if self.use_fsdp_inference:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling use_fsdp_inference."
@@ -794,7 +1010,7 @@ class ServerArgs:
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )
                 self.dit_cpu_offload = False
-            if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
+            if envs.SGLANG_CACHE_DIT_ENABLED:
                 raise ValueError(
                     "dit_layerwise_offload cannot be enabled together with cache-dit. "
                     "cache-dit may reuse skipped blocks whose weights have been released by layerwise offload, "
@@ -833,7 +1049,7 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
-        if self.attention_backend is None:
+        if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
             self._set_default_attention_backend()
 
         # parallelism
@@ -851,9 +1067,9 @@ class ServerArgs:
             has_sp = self.sp_degree > 1
             has_tp = self.tp_size > 1
             if has_sp and has_tp:
-                raise ValueError(
-                    "cache-dit does not support hybrid parallelism (SP + TP). "
-                    "Please use either sequence parallelism or tensor parallelism, not both."
+                logger.warning(
+                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
+                    "Proceeding anyway (SGLang integration may support this mode)."
                 )
 
     def _set_default_attention_backend(self) -> None:
@@ -911,47 +1127,18 @@ class PortArgs:
         )
 
 
-# TODO: not sure what _current_server_args is for, using a _global_server_args instead
-_current_server_args = None
 _global_server_args = None
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the inference arguments from the command line arguments.
-
-    Args:
-        argv: The command line arguments. Typically, it should be `sys.argv[1:]`
-            to ensure compatibility with `parse_args` when no arguments are passed.
-
-    Returns:
-        The inference arguments.
     """
     parser = FlexibleArgumentParser()
     ServerArgs.add_cli_args(parser)
     raw_args = parser.parse_args(argv)
     server_args = ServerArgs.from_cli_args(raw_args)
-    global _current_server_args
-    _current_server_args = server_args
     return server_args
-
-
-@contextmanager
-def set_current_server_args(server_args: ServerArgs):
-    """
-    Temporarily set the current sgl_diffusion config.
-    Used during model initialization.
-    We save the current sgl_diffusion config in a global variable,
-    so that all modules can access it, e.g. custom ops
-    can access the sgl_diffusion config to determine how to dispatch.
-    """
-    global _current_server_args
-    old_server_args = _current_server_args
-    try:
-        _current_server_args = server_args
-        yield
-    finally:
-        _current_server_args = old_server_args
 
 
 def set_global_server_args(server_args: ServerArgs):
@@ -962,17 +1149,7 @@ def set_global_server_args(server_args: ServerArgs):
     _global_server_args = server_args
 
 
-def get_current_server_args() -> ServerArgs | None:
-    if _current_server_args is None:
-        # in ci, usually when we test custom ops/modules directly,
-        # we don't set the sgl_diffusion config. In that case, we set a default
-        # config.
-        # TODO(will): may need to handle this for CI.
-        raise ValueError("Current sgl_diffusion args is not set.")
-    return _current_server_args
-
-
-def get_global_server_args() -> ServerArgs | None:
+def get_global_server_args() -> ServerArgs:
     if _global_server_args is None:
         # in ci, usually when we test custom ops/modules directly,
         # we don't set the sgl_diffusion config. In that case, we set a default

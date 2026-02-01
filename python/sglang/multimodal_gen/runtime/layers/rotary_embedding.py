@@ -69,14 +69,32 @@ def apply_flashinfer_rope_qk_inplace(
 
     try:
         from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
-    except Exception as e:
-        raise RuntimeError(
-            "flashinfer is required for apply_flashinfer_rope_qk_inplace. "
-            "Please install flashinfer or disable this optimization."
-        ) from e
+    except ImportError:
+        # Triton fallback for AMD/ROCm where FlashInfer is not available
+        import warnings
+
+        warnings.warn(
+            "FlashInfer not available, using Triton fallback for RoPE",
+            stacklevel=2,
+        )
+        half_size = cos_sin_cache.shape[-1] // 2
+        if positions is None:
+            cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
+            sin = cos_sin_cache[:seqlen, half_size:].to(q.dtype)
+            cos = cos.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+            sin = sin.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+        else:
+            positions = positions.to(cos_sin_cache.device).view(-1)
+            cos = cos_sin_cache[positions, :half_size].to(q.dtype)
+            sin = cos_sin_cache[positions, half_size:].to(q.dtype)
+        q_flat = q.reshape(bsz * seqlen, nheads, d)
+        k_flat = k.reshape(bsz * seqlen, nheads, d)
+        q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
+        k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
+        return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
 
     if positions is None:
-        pos_1d = torch.arange(seqlen, device="cpu", dtype=torch.long)
+        pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
         positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
     else:
         if not (
@@ -89,8 +107,6 @@ def apply_flashinfer_rope_qk_inplace(
             raise ValueError(
                 f"positions length must be bsz*seqlen={bsz*seqlen}, got {positions.numel()}"
             )
-
-    positions = positions.to(q.device, non_blocking=True)
 
     q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
     k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
@@ -239,6 +255,38 @@ class RotaryEmbedding(CustomOp):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+
+class LinearScalingRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int | float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_factor: float,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = t / self.scaling_factor
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
 
 class OneDRotaryEmbedding(torch.nn.Module):
@@ -933,10 +981,23 @@ def get_rope(
         rope_scaling_args = None
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+    max_position_embeddings = max_position
+    rope_type = None
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))
+        if rope_type in (None, "default"):
+            rope_scaling = None
+        elif rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            original_max = rope_scaling.get("original_max_position_embeddings", None)
+            if original_max is not None:
+                max_position_embeddings = max(
+                    max_position_embeddings, int(float(original_max) * factor)
+                )
     key = (
         head_size,
         rotary_dim,
-        max_position,
+        max_position_embeddings,
         base,
         is_neox_style,
         rope_scaling_args,
@@ -947,9 +1008,21 @@ def get_rope(
 
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
     else:
-        raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
+        if rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            rotary_emb = LinearScalingRotaryEmbedding(
+                head_size=head_size,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position_embeddings,
+                base=base,
+                is_neox_style=is_neox_style,
+                dtype=dtype,
+                scaling_factor=factor,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb

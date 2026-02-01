@@ -28,8 +28,8 @@ from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
-    enable_prefill_cp,
     is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.dp_attention import (
@@ -46,11 +46,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.deepseek_v2 import (
-    DeepseekV2DecoderLayer,
-    DeepseekV3ForCausalLM,
-    enable_nextn_moe_bf16_cast_to_fp8,
-)
+from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
+from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -89,7 +86,7 @@ class DeepseekModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -160,7 +157,7 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
-        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+        if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
@@ -178,7 +175,7 @@ class DeepseekModelNextN(nn.Module):
             else:
                 hidden_states = self.shared_head.norm(hidden_states)
 
-            if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            if nsa_use_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
                 # allgather + rerrange
                 hidden_states = cp_all_gather_rerange_output(
                     hidden_states,
@@ -235,10 +232,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.nsa_enable_prefill_cp:
-            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
-            if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
+            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
                 forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
-                    torch.tensor(len(input_ids)),
+                    len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
