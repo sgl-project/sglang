@@ -21,6 +21,7 @@ from diffusers import DiffusionPipeline
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -391,12 +392,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
-        device_map = self._get_device_map(server_args)
-        logger.info(
-            "Loading diffusers pipeline with dtype=%s, device_map=%s",
-            dtype,
-            device_map,
-        )
+        logger.info("Loading diffusers pipeline with dtype=%s", dtype)
 
         # Build common kwargs for from_pretrained
         load_kwargs = {
@@ -404,11 +400,6 @@ class DiffusersPipeline(ComposedPipelineBase):
             "trust_remote_code": server_args.trust_remote_code,
             "revision": server_args.revision,
         }
-
-        # Add device_map for direct GPU loading and parallel shard loading
-        # This warms up CUDA caching allocator and enables parallel loading via accelerate
-        if device_map is not None:
-            load_kwargs["device_map"] = device_map
 
         # Add quantization config if provided (e.g., BitsAndBytesConfig for 4/8-bit)
         config = server_args.pipeline_config
@@ -458,22 +449,13 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        # Only move to device if device_map wasn't used (already on device)
-        if device_map is None:
-            if torch.cuda.is_available():
-                pipe = pipe.to("cuda")
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                pipe = pipe.to("mps")
-
+        pipe = pipe.to(get_local_torch_device())
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
-
         # Apply attention backend if specified
         self._apply_attention_backend(pipe, server_args)
-
         # Apply cache-dit acceleration if configured
         pipe = self._apply_cache_dit(pipe, server_args)
-
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
@@ -580,14 +562,6 @@ class DiffusersPipeline(ComposedPipelineBase):
 
         logger.info("Enabled cache-dit for diffusers pipeline")
         return pipe
-
-    def _get_device_map(self, server_args: ServerArgs) -> str | None:
-        """
-        Determine device_map for pipeline loading.
-        """
-        if not torch.cuda.is_available():
-            return None
-        return "cuda"
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
         """
