@@ -644,7 +644,7 @@ class SchedulerPPMixin:
                         req.req_pool_idx, : len(req.fill_ids)
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
-                    self.req_to_token_pool.free(req.req_pool_idx)
+                    self.req_to_token_pool.free(req)
 
             logger.info(
                 f"[PP Dynamic Chunk] [PP0] Profiled {len(seq_lens)} samples: "
