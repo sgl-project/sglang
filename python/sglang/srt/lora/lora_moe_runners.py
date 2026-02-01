@@ -592,6 +592,11 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         lora_a_stacked = [lora_info.down_lora_a_weights]
         lora_b_stacked = [lora_info.down_lora_b_weights]
 
+        # TODO: Jonahbernard: is this variable needed?
+        num_tokens_post_padded_lora = torch.empty(
+            (max_loras,), dtype=torch.int32, device=topk_weights.device
+        )
+
         fused_moe_lora(
             output=intermediate_cache,
             qcurr_hidden_states=intermediate_input,
@@ -600,7 +605,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             topk_weights=topk_weights,  # Use the routing weights passed to this function
             sorted_token_ids=lora_info.token_ids,  # this is the token_ids from the previous stage
             expert_ids=lora_info.expert_ids,  # this is the expert_ids from the previous stage
-            num_tokens_post_padded=num_tokens_post_padded,
+            num_tokens_post_padded=num_tokens_post_padded_lora,
             max_lora_rank=actual_max_lora_rank,
             top_k_num=top_k,
             lora_ids=lora_info.lora_ids,

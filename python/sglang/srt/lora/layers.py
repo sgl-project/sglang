@@ -722,7 +722,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         if self._lora_runner is None:
             from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
             self._lora_runner = MoeRunner(
-                base_layer.moe_runner.runner_backend,
+                base_layer.quant_method.runner.runner_backend,
                 base_layer.moe_runner_config,
                 lora_enabled=True
             )

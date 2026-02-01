@@ -50,7 +50,7 @@ def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
     return token_lora_mapping
 
 
-def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int):
+def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int, dtype=torch.float32):
     assert top_k_num <= num_experts, "top_k_num must be <= num_experts"
 
     expert_indices = torch.empty((num_tokens, top_k_num), dtype=torch.int32)
@@ -58,14 +58,14 @@ def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int):
         selected = torch.randperm(num_experts)[:top_k_num]
         expert_indices[i] = selected
 
-    expert_weights = torch.rand((num_tokens, top_k_num), dtype=torch.float32)
+    expert_weights = torch.rand((num_tokens, top_k_num), dtype=dtype)
     expert_weights = expert_weights / expert_weights.sum(dim=1, keepdim=True)
 
     return expert_indices, expert_weights
 
 
-def sample_data(num_tokens: int, num_sequences: int, max_loras: int, num_experts: int, top_k_num: int):
-    topk_ids, topk_weights = assign_experts_to_tokens(num_tokens, num_experts, top_k_num)
+def sample_data(num_tokens: int, num_sequences: int, max_loras: int, num_experts: int, top_k_num: int, dtype=torch.float32):
+    topk_ids, topk_weights = assign_experts_to_tokens(num_tokens, num_experts, top_k_num, dtype)
     token_lora_mapping = assign_loras_to_tokens(num_tokens, num_sequences, max_loras)
     return topk_ids, topk_weights, token_lora_mapping
 
@@ -205,7 +205,7 @@ def test_lora_moe_runner(
 
     num_sequences = 4
     topk_ids, topk_weights, token_lora_mapping = sample_data(
-        num_tokens, num_sequences, max_loras, num_experts, top_k_num
+        num_tokens, num_sequences, max_loras, num_experts, top_k_num, dtype
     )
 
     gate_up_dim = intermediate_dim * 2
