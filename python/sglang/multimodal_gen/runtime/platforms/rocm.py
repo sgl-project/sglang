@@ -96,7 +96,7 @@ class RocmPlatform(Platform):
             logger.info("Using Torch SDPA backend.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        elif selected_backend in (AttentionBackendEnum.FA, None):
+        elif selected_backend in (AttentionBackendEnum.FA2, None):
             pass
 
         elif selected_backend == AttentionBackendEnum.AITER:
@@ -121,7 +121,7 @@ class RocmPlatform(Platform):
                 f"Invalid attention backend for {cls.device_name}: {selected_backend}"
             )
 
-        target_backend = AttentionBackendEnum.FA
+        target_backend = AttentionBackendEnum.FA2
         if dtype not in (torch.float16, torch.bfloat16):
             logger.info(
                 "Cannot use FlashAttention backend for dtype other than "
@@ -129,15 +129,15 @@ class RocmPlatform(Platform):
             )
             target_backend = AttentionBackendEnum.TORCH_SDPA
 
-        if target_backend == AttentionBackendEnum.FA:
+        if target_backend == AttentionBackendEnum.FA2:
             try:
                 import flash_attn  # noqa: F401
 
-                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
-                    FlashAttentionBackend,
+                from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+                    FlashAttention2Backend,
                 )
 
-                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                supported_sizes = FlashAttention2Backend.get_supported_head_sizes()
                 if head_size not in supported_sizes:
                     logger.info(
                         "Cannot use FlashAttention-2 backend for head size %d.",
@@ -160,7 +160,7 @@ class RocmPlatform(Platform):
 
         logger.info("Using Flash Attention backend.")
 
-        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
