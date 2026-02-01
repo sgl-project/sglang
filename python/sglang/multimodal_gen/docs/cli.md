@@ -22,6 +22,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
 - `--attention-backend {BACKEND}`: Attention backend to use. For SGLang-native pipelines use `fa`, `torch_sdpa`, `sage_attn`, etc. For diffusers pipelines use diffusers backend names like `flash`, `_flash_3_hub`, `sage`, `xformers`.
+- `--attention-backend-config {CONFIG}`: Configuration for the attention backend. Can be a JSON string (e.g., '{"k": "v"}'), a path to a JSON/YAML file, or key=value pairs (e.g., "k=v,k2=v2").
 - `--cache-dit-config {PATH}`: Path to a Cache-DiT YAML/JSON config (diffusers backend only)
 - `--dit-precision {DTYPE}`: Precision for the DiT model (currently supports fp32, fp16, and bf16).
 
