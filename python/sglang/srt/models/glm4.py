@@ -51,7 +51,6 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
 )
-from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.utils import add_prefix, make_layers
 
 Glm4Config = None
@@ -415,7 +414,7 @@ class Glm4Model(nn.Module):
                 )
 
 
-class Glm4ForCausalLM(nn.Module, RemapParamsMixin):
+class Glm4ForCausalLM(nn.Module):
     def __init__(
         self,
         config: Glm4Config,

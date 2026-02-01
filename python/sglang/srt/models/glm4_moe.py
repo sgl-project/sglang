@@ -75,7 +75,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.remap_params_mixin import RemapParamsMixin
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -989,7 +988,7 @@ class Glm4MoeModel(nn.Module):
         return hidden_states, aux_hidden_states
 
 
-class Glm4MoeForCausalLM(nn.Module, RemapParamsMixin):
+class Glm4MoeForCausalLM(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,

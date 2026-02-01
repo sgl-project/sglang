@@ -1,37 +1,36 @@
-"""Unit tests for RemapParamsMixin.map_weight_name()."""
+"""Unit tests for ParameterMapper."""
 
 import pytest
 
-from sglang.srt.models.remap_params_mixin import RemapParamsMixin
-
-
-class DummyModel(RemapParamsMixin):
-    def __init__(self):
-        self.stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        # 2 experts with 3 shards each (gate, down, up)
-        self.expert_params_mapping = [
-            ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
-            ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
-            ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
-            ("experts.w13_", "experts.1.gate_proj.", 1, "w1"),
-            ("experts.w2_", "experts.1.down_proj.", 1, "w2"),
-            ("experts.w13_", "experts.1.up_proj.", 1, "w3"),
-        ]
+from sglang.srt.model_loader.parameter_mapper import ParameterMapper
 
 
 @pytest.fixture
-def model():
-    return DummyModel()
+def mapper():
+    stacked_params_mapping = [
+        ("qkv_proj", "q_proj", "q"),
+        ("qkv_proj", "k_proj", "k"),
+        ("qkv_proj", "v_proj", "v"),
+        ("gate_up_proj", "gate_proj", 0),
+        ("gate_up_proj", "up_proj", 1),
+    ]
+    expert_params_mapping = [
+        ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
+        ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
+        ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
+        ("experts.w13_", "experts.1.gate_proj.", 1, "w1"),
+        ("experts.w2_", "experts.1.down_proj.", 1, "w2"),
+        ("experts.w13_", "experts.1.up_proj.", 1, "w3"),
+    ]
+    return ParameterMapper(
+        stacked_params_mapping=stacked_params_mapping,
+        expert_params_mapping=expert_params_mapping,
+        num_local_experts=2,
+    )
 
 
 @pytest.mark.parametrize(
-    "ckpt_name,expected_mapped,expected_shard,expected_num_shards,expected_expert,expected_num_experts",
+    "ckpt_name,expected_mapped,expected_shard,expected_num_shards,expected_expert,expected_num_local_experts",
     [
         # QKV fusion
         (
@@ -40,7 +39,7 @@ def model():
             "q",
             3,
             None,
-            0,
+            None,
         ),
         (
             "layers.0.attn.k_proj.weight",
@@ -48,7 +47,7 @@ def model():
             "k",
             3,
             None,
-            0,
+            None,
         ),
         (
             "layers.0.attn.v_proj.weight",
@@ -56,7 +55,7 @@ def model():
             "v",
             3,
             None,
-            0,
+            None,
         ),
         # Gate/Up fusion
         (
@@ -65,7 +64,7 @@ def model():
             0,
             2,
             None,
-            0,
+            None,
         ),
         (
             "layers.2.mlp.up_proj.weight",
@@ -73,14 +72,14 @@ def model():
             1,
             2,
             None,
-            0,
+            None,
         ),
-        # Expert weights (MoE) - now with 2 experts
+        # Expert weights (MoE) - w13_ has 2 shards (w1, w3), w2_ has 1 shard (w2)
         (
             "model.layers.0.mlp.experts.0.gate_proj.weight",
             "model.layers.0.mlp.experts.w13_weight",
             "w1",
-            1,
+            2,
             0,
             2,
         ),
@@ -96,7 +95,7 @@ def model():
             "model.layers.0.mlp.experts.0.up_proj.weight",
             "model.layers.0.mlp.experts.w13_weight",
             "w3",
-            1,
+            2,
             0,
             2,
         ),
@@ -104,7 +103,7 @@ def model():
             "model.layers.0.mlp.experts.1.gate_proj.weight",
             "model.layers.0.mlp.experts.w13_weight",
             "w1",
-            1,
+            2,
             1,
             2,
         ),
@@ -115,9 +114,9 @@ def model():
             None,
             1,
             None,
-            0,
+            None,
         ),
-        ("embed_tokens.weight", "embed_tokens.weight", None, 1, None, 0),
+        ("embed_tokens.weight", "embed_tokens.weight", None, 1, None, None),
         # Scale remapping - Standard patterns
         (
             "model.layers.0.self_attn.k_scale",
@@ -125,7 +124,7 @@ def model():
             None,
             1,
             None,
-            0,
+            None,
         ),
         (
             "model.layers.0.self_attn.v_scale",
@@ -133,22 +132,22 @@ def model():
             None,
             1,
             None,
-            0,
+            None,
         ),
     ],
 )
 def test_map_weight_name(
-    model,
+    mapper,
     ckpt_name,
     expected_mapped,
     expected_shard,
     expected_num_shards,
     expected_expert,
-    expected_num_experts,
+    expected_num_local_experts,
 ):
-    mapped, shard, num_shards, expert, num_experts = model.map_weight_name(ckpt_name)
-    assert mapped == expected_mapped
-    assert shard == expected_shard
-    assert num_shards == expected_num_shards
-    assert expert == expected_expert
-    assert num_experts == expected_num_experts
+    result = mapper.map(ckpt_name)
+    assert result.sglang_name == expected_mapped
+    assert result.shard_id == expected_shard
+    assert result.num_shards == expected_num_shards
+    assert result.expert_id == expected_expert
+    assert result.num_local_experts == expected_num_local_experts
