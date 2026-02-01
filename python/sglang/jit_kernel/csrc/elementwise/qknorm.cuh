@@ -39,14 +39,16 @@ constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
 template <typename packed_t>
 SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_rms) {
-  float2 valf = device::cast<fp32x2_t, packed_t>(val);
-  float2 weightf = device::cast<fp32x2_t, packed_t>(weight);
-  return device::cast<packed_t, fp32x2_t>(
+  using namespace device;
+  float2 valf = cast<fp32x2_t, packed_t>(val);
+  float2 weightf = cast<fp32x2_t, packed_t>(weight);
+  return cast<packed_t, fp32x2_t>(
       make_float2(valf.x * weightf.x * rsqrt_rms, valf.y * weightf.y * rsqrt_rms));
 }
 
 template <typename T, int VEC_SIZE_IN_BYTE, int64_t kHeadDim, bool kUsePDL>
 __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
+  using namespace device;
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
   constexpr int elements_in_vec = VEC_SIZE_IN_BYTE / sizeof(T);
   constexpr int vec_head_dim = kHeadDim / elements_in_vec;
@@ -56,8 +58,8 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
   
   __shared__ float shared_memory[32];
   
-  using vec_t = typename device::VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
-  using packed_t = typename device::VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
+  using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
+  using packed_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
   
   const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
   
@@ -91,7 +93,7 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
       
       #pragma unroll
       for (int i = 0; i < inner_loop; i++) {
-        float2 val = device::cast<fp32x2_t, packed_t>(v_input[i]);
+        float2 val = cast<fp32x2_t, packed_t>(v_input[i]);
         acc_square.x += val.x * val.x;
         acc_square.y += val.y * val.y;
       }
@@ -113,7 +115,7 @@ __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
           cg_warp, 
           (threadIdx.x < blockDim.x / 32) ? buffer[threadIdx.x] : 0.0f, 
           cooperative_groups::plus<float>());
-      buffer[threadIdx.x] = device::math::rsqrt(eps + cta_sum / kHeadDim);
+      buffer[threadIdx.x] = math::rsqrt(eps + cta_sum / kHeadDim);
     }
     __syncthreads();
     
