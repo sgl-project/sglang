@@ -119,6 +119,19 @@ def get_user_message(content: str) -> Message:
     return Message.from_role_and_content(Role.USER, content)
 
 
+def _extract_text(content_part: dict) -> str:
+    """Extract text from a Responses API content part.
+
+    The OpenAI Responses API uses ``type: "input_text"`` with a ``text``
+    field, while the Chat Completions API uses ``type: "text"``.  This
+    helper normalizes both formats so callers can always read the text.
+    """
+    part_type = content_part.get("type", "")
+    if part_type in ("text", "input_text"):
+        return content_part.get("text", "")
+    return content_part.get("text", "")
+
+
 def parse_response_input(
     response_msg: ResponseInputOutputItem,
     prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]],
@@ -139,7 +152,9 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, text_prefix + content)
         else:
-            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
+            contents = [
+                TextContent(text=text_prefix + _extract_text(c)) for c in content
+            ]
             msg = Message.from_role_and_contents(role, contents)
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]
