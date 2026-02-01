@@ -120,11 +120,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_metrics_collector(self):
         from sglang.srt.server_args import get_global_server_args
-        
+
         server_args = get_global_server_args()
-        labels = {
-            "cache_type": self.__class__.__name__
-        }
+        labels = {"cache_type": self.__class__.__name__}
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
