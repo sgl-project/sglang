@@ -263,6 +263,7 @@ class BaseDispatcher(ABC):
 
     def __init__(self):
         self.quant_config: Optional[dict] = None
+        self.last_input_scale_inv: Optional[torch.Tensor] = None
 
         # Overlap args
         self.overlap_args: Optional[CombineOverlapArgs] = None

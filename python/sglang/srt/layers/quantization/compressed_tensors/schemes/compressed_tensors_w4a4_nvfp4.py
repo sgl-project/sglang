@@ -15,7 +15,11 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_scale_enabled,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
@@ -141,7 +145,18 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         output_shape = [x.shape[0], w_n]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        input_global_scale = layer.input_global_scale
+        alpha = layer.alpha
+        if nvfp4_online_scale_enabled():
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+            input_global_scale = input_scale_inv
+            alpha = torch.where(
+                layer.weight_global_scale > 0,
+                input_scale / layer.weight_global_scale,
+                layer.weight_global_scale,
+            )
+
+        x_fp4, x_blockscale = fp4_quantize(x, input_global_scale)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8
@@ -159,7 +174,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             w,
             x_blockscale,
             w_blockscale,
-            layer.alpha,
+            alpha,
             output_dtype,
             w_n,
         )

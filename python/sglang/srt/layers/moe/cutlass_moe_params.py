@@ -139,6 +139,20 @@ class CutlassMoEParams:
         self.b_scales_ptrs = torch.empty(
             (self.e,), dtype=torch.int64, device=self.device
         )
+        # Preallocate NVFP4 online-scale buffers to avoid allocations during cuda graph capture.
+        if self.cutlass_moe_type == CutlassMoEType.BlockscaledFP4:
+            self.online_a1_gscale = torch.empty(
+                (self.e,), dtype=torch.float32, device=self.device
+            )
+            self.online_a2_gscale = torch.empty(
+                (self.e,), dtype=torch.float32, device=self.device
+            )
+            self.online_w1_alphas = torch.empty(
+                (self.e,), dtype=torch.float32, device=self.device
+            )
+            self.online_w2_alphas = torch.empty(
+                (self.e,), dtype=torch.float32, device=self.device
+            )
 
     def to_gemm1_args(self) -> dict:
         return {
