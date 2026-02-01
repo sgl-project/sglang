@@ -11,7 +11,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Fused operators for activation layers."""
+"""
+Fused Activation Layers - Migrated to Platform Abstraction
+============================================================
+
+This module demonstrates **RFC Feature #3: Platform-specific Op / Kernel Resolution**
+applied to real model layer code.
+
+MIGRATION GUIDE - Before vs After:
+----------------------------------
+
+BEFORE (old pattern - scattered platform checks):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    # Module-level platform detection
+    _is_cuda = is_cuda()
+    _is_npu = is_npu()
+    _is_hpu = is_hpu()
+    _is_xpu = is_xpu()
+    _is_hip = is_hip()
+    _is_cpu_amx_available = ...
+
+    # Conditional kernel imports
+    if _is_cuda or _is_xpu:
+        from sgl_kernel import silu_and_mul, gelu_and_mul, gelu_tanh_and_mul
+
+    # Scattered if-else in each layer
+    class SiluAndMul(nn.Module):
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            if _is_cuda:
+                silu_and_mul(x, out)
+            elif _is_npu:
+                import torch_npu
+                return torch_npu.npu_swiglu(x)
+            elif _is_cpu_amx_available:
+                return torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+            else:
+                # native fallback
+                return F.silu(x[..., :d]) * x[..., d:]
+
+AFTER (new pattern - clean platform abstraction):
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+    # Simple, type-safe imports
+    from sglang.srt.ops import silu_and_mul, gelu_and_mul, gelu_tanh_and_mul
+    from sglang.srt.platforms import current_platform
+
+    # Use MultiPlatformOp base class for method dispatch
+    class SiluAndMul(MultiPlatformOp):
+        def forward_native(self, x):
+            return F.silu(x[..., :d]) * x[..., d:]
+
+        def forward_cuda(self, x):
+            silu_and_mul(x, out)  # Platform-agnostic op!
+            return out
+
+        def forward_npu(self, x):
+            return current_platform.modules.npu_swiglu(x)
+
+        def forward_cpu(self, x):
+            if current_platform.has_amx:
+                return torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+            return self.forward_native(x)
+
+BENEFITS:
+---------
+1. **No scattered if-else** - Platform dispatch is automatic via MultiPlatformOp
+2. **Clean imports** - `from sglang.srt.ops import silu_and_mul` works everywhere
+3. **Full IDE support** - Ops have docstrings, type hints, autocompletion
+4. **Type safety** - Platform functions accessed via `current_platform.modules`
+5. **Easy to add platforms** - Just add `forward_<platform>()` method
+6. **Easy to add ops** - Register in Platform._init_ops(), define in ops/
+
+KEY PATTERNS USED HERE:
+-----------------------
+1. `from sglang.srt.ops import ...` - Platform-agnostic op functions
+2. `current_platform.modules.<func>` - Platform-specific functions (npu_swiglu, etc.)
+3. `current_platform.has_amx` - Platform properties (CPU-specific check)
+4. `MultiPlatformOp` base class - Automatic method dispatch by device type
+"""
 
 import logging
 import math
@@ -28,79 +106,122 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+
+# MultiPlatformOp provides automatic forward_<device>() dispatch
 from sglang.srt.layers.utils import MultiPlatformOp
+
+# =============================================================================
+# NEW PATTERN: Clean imports from sglang.srt.ops
+# =============================================================================
+# These ops automatically dispatch to the correct platform kernel:
+# - CUDA → sgl_kernel.silu_and_mul
+# - ROCm → sgl_kernel.silu_and_mul (HIP version)
+# - NPU  → torch_npu.npu_swiglu (wrapped)
+# - CPU  → native PyTorch fallback (or AMX kernel if available)
+from sglang.srt.ops import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+
+# Access platform-specific properties and modules
+from sglang.srt.platforms import current_platform
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import set_weight_attrs
 from sglang.utils import resolve_obj_by_qualname
-
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_is_hip = is_hip()
-_is_xpu = is_xpu()
-
-if _is_cuda or _is_xpu:
-    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
-
-if is_npu():
-    import torch_npu
 
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# EXAMPLE: SiluAndMul - MultiPlatformOp with Platform-Agnostic Ops
+# =============================================================================
+# This class demonstrates the new pattern:
+# - Inherits from MultiPlatformOp for automatic device dispatch
+# - Uses silu_and_mul from sglang.srt.ops (platform-agnostic)
+# - Accesses platform-specific functions via current_platform.modules
+# - Checks platform properties via current_platform.has_amx
+
+
 class SiluAndMul(MultiPlatformOp):
+    """Fused SiLU activation with element-wise multiply (SwiGLU).
+
+    Used in LLaMA, Mistral, DeepSeek and other SwiGLU-based models.
+
+    MultiPlatformOp automatically calls the right forward_<device>() method:
+    - forward_cuda() on NVIDIA CUDA
+    - forward_hip() on AMD ROCm
+    - forward_npu() on Huawei Ascend
+    - forward_cpu() on CPU
+    - forward_native() as fallback
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        """Pure PyTorch fallback - works on any device."""
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_with_op(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward using the platform-dispatched op.
+
+        Note: silu_and_mul() is imported from sglang.srt.ops.
+        It automatically uses the correct kernel for the current platform.
+        """
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+        silu_and_mul(x, out)  # <-- Platform-agnostic op!
         return out
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        """CUDA: Use platform-dispatched silu_and_mul (sgl_kernel)."""
+        return self._forward_with_op(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        """ROCm: Use platform-dispatched silu_and_mul (sgl_kernel HIP)."""
+        return self._forward_with_op(x)
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        """MUSA: Uses nn.SwishGLU which is optimized for Moore Threads."""
+        return nn.SwishGLU()(x)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cpu_amx_available:
-            out = torch.ops.sgl_kernel.silu_and_mul_cpu(x)
-            return out
-        else:
-            return self.forward_native(x)
+        """CPU: Check for AMX support via current_platform.has_amx."""
+        if current_platform.has_amx:
+            # Intel AMX kernel available
+            return torch.ops.sgl_kernel.silu_and_mul_cpu(x)
+        # No AMX - fall back to native PyTorch
+        return self.forward_native(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch_npu.npu_swiglu(x)
-        return out
+        """NPU: Access torch_npu.npu_swiglu via current_platform.modules."""
+        # current_platform.modules provides type-safe access to vendor functions
+        return current_platform.modules.npu_swiglu(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
+        """XPU: Use platform-dispatched silu_and_mul (sgl_kernel)."""
+        return self._forward_with_op(x)
+
+
+# =============================================================================
+# EXAMPLE: GeluAndMul - Similar pattern for GELU activation
+# =============================================================================
 
 
 class GeluAndMul(MultiPlatformOp):
+    """Fused GELU activation with element-wise multiply (GEGLU).
+
+    Used in models with GEGLU feed-forward networks.
+    Supports both exact GELU and tanh approximation.
+    """
+
     def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
 
-    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_with_op(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward using the platform-dispatched ops."""
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
@@ -117,21 +238,26 @@ class GeluAndMul(MultiPlatformOp):
         return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        if _is_cpu_amx_available and self.approximate == "tanh":
-            return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
-        elif _is_cpu_amx_available and self.approximate == "none":
-            return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
-        else:
-            return self.forward_native(x)
+        # CPU platform handles AMX detection internally
+        if current_platform.has_amx:
+            if self.approximate == "tanh":
+                return torch.ops.sgl_kernel.gelu_tanh_and_mul_cpu(x)
+            elif self.approximate == "none":
+                return torch.ops.sgl_kernel.gelu_and_mul_cpu(x)
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(x)
+        return self._forward_with_op(x)
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_with_op(x)
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self._forward_impl(x)
+        return self._forward_with_op(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        y_npu, gelu_npu = torch_npu.npu_geglu(
+        # Access torch_npu.npu_geglu through platform modules
+        y_npu, _ = current_platform.modules.npu_geglu(
             x,
             dim=-1,
             approximate=1 if self.approximate == "tanh" else 0,
@@ -170,11 +296,13 @@ class QuickGELU(MultiPlatformOp):
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        gelu_quick(x, out)
+        # Access gelu_quick through platform modules
+        current_platform.modules.gelu_quick(x, out)
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        return torch_npu.npu_fast_gelu(x)
+        # Access torch_npu.npu_fast_gelu through platform modules
+        return current_platform.modules.npu_fast_gelu(x)
 
 
 class XIELU(MultiPlatformOp):
