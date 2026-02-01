@@ -65,6 +65,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_BF16_MASKED = auto()
+    GROUPED_GEMM_NT_BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_BF16 = auto()
     GEMM_NN_BF16 = auto()
@@ -130,7 +132,10 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        if kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG,
+        ):
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
@@ -188,6 +193,8 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _GroupedBf16ContWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _GroupedBf16MaskedWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16: _Bf16GemmNtWarmupExecutor,
             DeepGemmKernelType.GEMM_NN_BF16: _Bf16GemmNnWarmupExecutor,
         }[kernel_type](**kwargs)
@@ -205,6 +212,14 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NN_BF16,
         ):
             return (2 * (max_m * k + n * k + max_m * n)) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
+            return (2 * (max_m * k + num_groups * n * k + max_m * n) + max_m * 4) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
+            return (
+                2
+                * (num_groups * max_m * k + num_groups * n * k + num_groups * max_m * n)
+                + num_groups * 4
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
@@ -292,6 +307,43 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             self.out,
             masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            expected_m=m,
+        )
+
+
+class _GroupedBf16ContWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
+            self.a[:m],
+            self.b,
+            self.out[:m],
+            m_indices=self.m_indices[:m],
+        )
+
+
+class _GroupedBf16MaskedWarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.a = torch.empty(
+            (num_groups, max_m, k), device="cuda", dtype=torch.bfloat16
+        )
+        self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            self.a,
+            self.b,
+            self.out,
+            masked_m=self.masked_m,
             expected_m=m,
         )
 

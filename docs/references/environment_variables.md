@@ -57,7 +57,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DG_CACHE_DIR` | Directory for caching compiled DeepGEMM kernels | `~/.cache/deep_gemm` |
 | `SGL_DG_USE_NVRTC` | Use NVRTC (instead of Triton) for JIT compilation (Experimental) | `"0"` |
 | `SGL_USE_DEEPGEMM_BMM` | Use DeepGEMM for Batched Matrix Multiplication (BMM) operations | `"false"` |
-| `SGLANG_USE_DEEPGEMM_BF16_GEMM` | Use DeepGEMM for BF16 GEMM in unquantized linear layers | `"false"` |
+| `SGLANG_USE_DEEPGEMM_BF16_GEMM` | Use DeepGEMM for BF16 GEMM in unquantized linear layers; also enables BF16 DeepGEMM for MoE when the runner backend resolves to `deep_gemm` (auto may choose other backends) | `"false"` |
 
 ## DeepEP Configuration
 

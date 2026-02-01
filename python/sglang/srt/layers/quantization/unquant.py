@@ -354,11 +354,23 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+            if (
+                _use_deepgemm_bf16_gemm
+                and not _is_hip
+                and not _is_npu
+                and moe_runner_config.params_dtype == torch.bfloat16
+            ):
+                from sglang.srt.layers import deep_gemm_wrapper
+
+                if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                    backend = MoeRunnerBackend.DEEP_GEMM
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
@@ -418,7 +430,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )[0]
             return StandardCombineInput(hidden_states=output)
         else:
-            if _use_aiter:
+            if backend.is_deep_gemm():
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    DeepGemmMoeQuantInfo,
+                )
+
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=False,
+                )
+                return self.runner.run(dispatch_output, quant_info)
+            elif _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:
