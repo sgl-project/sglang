@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -97,6 +98,8 @@ class MetadataBuffers:
         elif self.custom_mem_pool:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
+        elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
+            device = "cuda"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
