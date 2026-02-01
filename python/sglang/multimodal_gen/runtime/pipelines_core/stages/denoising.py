@@ -1178,7 +1178,7 @@ class DenoisingStage(PipelineStage):
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=float(server_args.attention_backend_config.VSA_sparsity),
+                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
                 device=get_local_torch_device(),
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
@@ -1383,12 +1383,11 @@ class DenoisingStage(PipelineStage):
         """
         # TODO(kevin): STA mask search, currently only support Wan2.1 with 69x768x1280
         try:
-            STA_mode = STA_Mode(server_args.attention_backend_config.STA_mode)
+            STA_mode = STA_Mode[server_args.attention_backend_config.STA_mode]
         except Exception as e:
             logger.error(f"Passed STA_mode: {STA_mode} doesn't exist")
             raise e
-        print(f"{STA_mode=}")
-        skip_time_steps = int(server_args.attention_backend_config.skip_time_steps)
+        skip_time_steps = server_args.attention_backend_config.skip_time_steps
         if batch.timesteps is None:
             raise ValueError("Timesteps must be provided")
         timesteps_num = batch.timesteps.shape[0]

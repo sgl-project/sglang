@@ -213,7 +213,7 @@ def prepare_request(
     """
     req = Req(
         sampling_params=sampling_params,
-        VSA_sparsity=float(server_args.attention_backend_config.VSA_sparsity),
+        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
     try:
         diffusers_kwargs = sampling_params.diffusers_kwargs
