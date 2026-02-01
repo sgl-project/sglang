@@ -1,8 +1,76 @@
+from typing import Optional
+
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
 from torch._higher_order_ops.auto_functionalize import auto_functionalized_v2
 
 from sglang.srt.compilation.inductor_pass import SGLangPatternMatcherInductorPass
+from sglang.srt.utils import direct_register_custom_op, get_bool_env_var
+
+_use_flashinfer_rmsnorm_quant_ops = get_bool_env_var(
+    "SGLANG_USE_FLASHINFER_RMSNORM_QUANT_OPS"
+)
+
+if _use_flashinfer_rmsnorm_quant_ops:
+    import flashinfer
+
+    def _flashinfer_rms_norm_quant(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        return flashinfer.norm.rmsnorm_quant(out, input, weight, scale, eps, enable_pdl)
+
+    def _flashinfer_rms_norm_quant_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        eps: float,
+        enable_pdl: Optional[bool],
+    ) -> None:
+        pass
+
+    direct_register_custom_op(
+        op_name="flashinfer_rmsnorm_quant",
+        op_func=_flashinfer_rms_norm_quant,
+        mutates_args=["out"],
+        fake_impl=_flashinfer_rms_norm_quant_fake,
+    )
+
+    def _flashinfer_fused_add_rmsnorm_quant(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> torch.Tensor:
+        return flashinfer.norm.fused_add_rmsnorm_quant(
+            out, input, residual, weight, scale, eps, enable_pdl
+        )
+
+    def _flashinfer_fused_add_rmsnorm_quant_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+        eps: float = 1e-6,
+        enable_pdl: Optional[bool] = None,
+    ) -> None:
+        pass
+
+    direct_register_custom_op(
+        op_name="flashinfer_fused_add_rmsnorm_quant",
+        op_func=_flashinfer_fused_add_rmsnorm_quant,
+        mutates_args=["out", "residual"],
+        fake_impl=_flashinfer_fused_add_rmsnorm_quant_fake,
+    )
 
 
 class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
@@ -32,15 +100,27 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
             )
 
         def replacement(x, rms_result, weight, scale, eps, output):
-            rms_norm_static_fp8_quant = auto_functionalized_v2(
-                torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default,
-                input=x,
-                weight=weight,
-                scale=scale,
-                epsilon=eps,
-                _result_base_index=0,
-                _all_bases=[output],
-            )
+            if _use_flashinfer_rmsnorm_quant_ops:
+                rms_norm_static_fp8_quant = auto_functionalized_v2(
+                    torch.ops.sglang.flashinfer_rmsnorm_quant.default,
+                    input=x,
+                    weight=weight,
+                    scale=scale,
+                    eps=eps,
+                    enable_pdl=is_arch_support_pdl(),
+                    _out_base_index=0,
+                    _all_bases=[output],
+                )
+            else:
+                rms_norm_static_fp8_quant = auto_functionalized_v2(
+                    torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default,
+                    input=x,
+                    weight=weight,
+                    scale=scale,
+                    epsilon=eps,
+                    _result_base_index=0,
+                    _all_bases=[output],
+                )
             return rms_norm_static_fp8_quant[1], scale
 
         example_inputs = [
@@ -85,16 +165,29 @@ class RMSNormQuantPass(SGLangPatternMatcherInductorPass):
             )
 
         def replacement(x, residual, weight, scale, result, eps):
-            fused_add_rms_norm_static_fp8_quant = auto_functionalized_v2(
-                torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default,
-                input=x,
-                weight=weight,
-                scale=scale,
-                epsilon=eps,
-                _result_base_index=0,
-                _residual_base_index=1,
-                _all_bases=[result, residual],
-            )
+            if _use_flashinfer_rmsnorm_quant_ops:
+                fused_add_rms_norm_static_fp8_quant = auto_functionalized_v2(
+                    torch.ops.sglang.flashinfer_fused_add_rmsnorm_quant.default,
+                    input=x,
+                    weight=weight,
+                    scale=scale,
+                    eps=eps,
+                    enable_pdl=is_arch_support_pdl(),
+                    _out_base_index=0,
+                    _residual_base_index=1,
+                    _all_bases=[result, residual],
+                )
+            else:
+                fused_add_rms_norm_static_fp8_quant = auto_functionalized_v2(
+                    torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default,
+                    input=x,
+                    weight=weight,
+                    scale=scale,
+                    epsilon=eps,
+                    _result_base_index=0,
+                    _residual_base_index=1,
+                    _all_bases=[result, residual],
+                )
             return (
                 fused_add_rms_norm_static_fp8_quant[1],
                 scale,
