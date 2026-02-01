@@ -3,13 +3,17 @@
 
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/tile.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
 
 #include <sgl_kernel/impl/norm.cuh>
 
+#include <cooperative_groups/reduce.h>
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cooperative_groups.h>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -33,44 +37,105 @@ struct QKNormParams {
 constexpr uint32_t kWarpsPerBlock = 4;
 constexpr uint32_t kThreadsPerBlock = kWarpsPerBlock * device::kWarpThreads;
 
-template <int64_t kHeadDim, bool kUsePDL, typename Float>
+template <typename packed_t>
+SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_rms) {
+  float2 valf = device::cast<fp32x2_t, packed_t>(val);
+  float2 weightf = device::cast<fp32x2_t, packed_t>(weight);
+  return device::cast<packed_t, fp32x2_t>(
+      make_float2(valf.x * weightf.x * rsqrt_rms, valf.y * weightf.y * rsqrt_rms));
+}
+
+template <typename T, int VEC_SIZE_IN_BYTE, int64_t kHeadDim, bool kUsePDL>
 __global__ void fused_qknorm(const QKNormParams __grid_constant__ params) {
-  using namespace device;
-  using Storage = norm::StorageType<Float, kHeadDim>;
-
-  static_assert(sizeof(Float) == 2, "Only support FP16/BF16");
+  constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
+  constexpr int elements_in_vec = VEC_SIZE_IN_BYTE / sizeof(T);
+  constexpr int vec_head_dim = kHeadDim / elements_in_vec;
+  
+  static_assert(sizeof(T) == 2, "Only support FP16/BF16");
+  static_assert(kHeadDim % elements_in_vec == 0, "head_dim must be divisible by elements_in_vec");
+  
+  __shared__ float shared_memory[32];
+  
+  using vec_t = typename device::VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
+  using packed_t = typename device::VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
+  
   const auto& [q, k, q_stride, k_stride, num_qo_heads, num_kv_heads, eps, q_weight, k_weight, num_tokens] = params;
-
-  const auto num_blks = gridDim.x;
-  const auto num_workers = num_blks * kWarpsPerBlock;
+  
   const auto num_q_and_k_heads = num_qo_heads + num_kv_heads;
-  const auto num_works = num_q_and_k_heads * num_tokens;
-  const auto start_worker_id = blockIdx.x * kWarpsPerBlock + threadIdx.x / kWarpThreads;
-  const auto gmem = tile::Memory<Storage>::warp();
-
+  
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
-
-  for (auto idx = start_worker_id; idx < num_works; idx += num_workers) {
+  
+  // Each block processes one head of one token
+  for (uint32_t idx = blockIdx.x; idx < num_q_and_k_heads * num_tokens; idx += gridDim.x) {
     const int64_t token_id = idx / num_q_and_k_heads;
     const int64_t head_id = idx % num_q_and_k_heads;
     const auto load_q = head_id < num_qo_heads;
-    const auto input = load_q ? pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))
-                              : pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim));
-    const auto weight = load_q ? q_weight : k_weight;
-    const auto input_vec = gmem.load(input);
-    const auto weight_vec = gmem.load(weight);
-    const auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
-    gmem.store(input, output_vec);
+    
+    T* input_ptr = load_q ? 
+        reinterpret_cast<T*>(pointer::offset(q, 2 * (token_id * q_stride + head_id * kHeadDim))) :
+        reinterpret_cast<T*>(pointer::offset(k, 2 * (token_id * k_stride + head_id * kHeadDim)));
+    const T* weight_ptr = reinterpret_cast<const T*>(load_q ? q_weight : k_weight);
+    
+    vec_t v_input;
+    vec_t v_weight;
+    
+    float2 acc_square = make_float2(0.0f, 0.0f);  // Sum of squares for each thread
+    
+    // Load and compute sum of squares
+    if (threadIdx.x < vec_head_dim) {
+      vec_t* p_input = reinterpret_cast<vec_t*>(input_ptr);
+      const vec_t* p_weight = reinterpret_cast<const vec_t*>(weight_ptr);
+      
+      v_input = p_input[threadIdx.x];
+      v_weight = p_weight[threadIdx.x];
+      
+      #pragma unroll
+      for (int i = 0; i < inner_loop; i++) {
+        float2 val = device::cast<fp32x2_t, packed_t>(v_input[i]);
+        acc_square.x += val.x * val.x;
+        acc_square.y += val.y * val.y;
+      }
+    }
+    
+    // Step 0: Warp reduce
+    auto cg_warp = cooperative_groups::tiled_partition<32>(cooperative_groups::this_thread_block());
+    float warp_sum = cooperative_groups::reduce(cg_warp, acc_square.x + acc_square.y, cooperative_groups::plus<float>());
+    
+    float* buffer = shared_memory;
+    if (threadIdx.x % 32 == 0) {
+      buffer[threadIdx.x / 32] = warp_sum;  // Write warp_sum to buffer
+    }
+    
+    // Step 1: CTA reduce
+    __syncthreads();
+    if (threadIdx.x < 32) {
+      float cta_sum = cooperative_groups::reduce(
+          cg_warp, 
+          (threadIdx.x < blockDim.x / 32) ? buffer[threadIdx.x] : 0.0f, 
+          cooperative_groups::plus<float>());
+      buffer[threadIdx.x] = device::math::rsqrt(eps + cta_sum / kHeadDim);
+    }
+    __syncthreads();
+    
+    if (threadIdx.x < vec_head_dim) {
+      float rsqrt_rms = buffer[threadIdx.x / 32];
+      vec_t v_out;
+      #pragma unroll
+      for (int i = 0; i < inner_loop; i++) {
+        v_out[i] = rms(v_input[i], v_weight[i], rsqrt_rms);
+      }
+      vec_t* p_out = reinterpret_cast<vec_t*>(input_ptr);
+      p_out[threadIdx.x] = v_out;
+    }
   }
-
-  PDLTriggerSecondary<kUsePDL>();  // launch secondary kernel
+  
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 template <int64_t kHeadDim, bool kUsePDL, typename DType>
 struct QKNormKernel {
   static_assert(std::is_same_v<DType, fp16_t> || std::is_same_v<DType, bf16_t>);
   static_assert(!host::norm::should_use_cta<DType, kHeadDim>(), "Head dim too large for QKNorm");
-  static constexpr auto kernel = fused_qknorm<kHeadDim, kUsePDL, DType>;
 
   static void
   run(const tvm::ffi::TensorView q,
@@ -124,16 +189,37 @@ struct QKNormKernel {
         .num_tokens = num_tokens,
     };
 
-    static const uint32_t max_occupancy = runtime::get_blocks_per_sm(kernel, kThreadsPerBlock);
-    static const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
-
-    // choose kernel based on dtype
+    auto cc_major = host::runtime::get_cc_major(device.unwrap().device_id);
     const auto num_works = (num_qo_heads + num_kv_heads) * num_tokens;
-    const auto needed_blocks = div_ceil(num_works, kWarpsPerBlock);
-
-    // we use persistent kernel, which limit the number of blocks to reduce overhead
-    const auto num_blocks = std::min(kNumSM * max_occupancy, needed_blocks);
-    LaunchKernel(num_blocks, kThreadsPerBlock, device.unwrap())  //
+    int max_vec_size_byte = cc_major >= 10 ? 32 : 16;
+    int elements_in_vec = max_vec_size_byte / sizeof(DType);
+    
+    host::RuntimeCheck(
+        kHeadDim % elements_in_vec == 0,
+        "head_dim",
+        kHeadDim,
+        " can not align to elements_in_vec ",
+        elements_in_vec);
+    
+    int vec_head_dim = kHeadDim / elements_in_vec;
+    uint threads = (vec_head_dim + 31) / 32 * 32;
+    
+    host::RuntimeCheck(
+        threads <= kThreadsPerBlock,
+        "Required threads ",
+        threads,
+        " exceeds max threads per block ",
+        kThreadsPerBlock);
+    
+    static const uint32_t kNumSM = runtime::get_sm_count(device.unwrap().device_id);
+    
+    auto kernel = max_vec_size_byte == 32 ? 
+        fused_qknorm<DType, 32, kHeadDim, kUsePDL> : 
+        fused_qknorm<DType, 16, kHeadDim, kUsePDL>;
+    uint32_t max_occupancy = runtime::get_blocks_per_sm(kernel, threads);
+    uint32_t num_blocks = std::min(kNumSM * max_occupancy, num_works);
+    
+    LaunchKernel(num_blocks, threads, device.unwrap())
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };

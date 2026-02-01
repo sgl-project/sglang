@@ -15,33 +15,6 @@
 
 namespace {
 
-template <typename T, int VEC_SIZE_IN_BYTE>
-struct VecTypeTrait;
-
-template <>
-struct VecTypeTrait<bf16_t, 16> {
-  using packed_t = packed_t<bf16_t>;
-  using vec_t = device::AlignedVector<packed_t, 4>;
-};
-
-template <>
-struct VecTypeTrait<fp16_t, 16> {
-  using packed_t = packed_t<fp16_t>;
-  using vec_t = device::AlignedVector<packed_t, 4>;
-};
-
-template <>
-struct VecTypeTrait<bf16_t, 32> {
-  using packed_t = packed_t<bf16_t>;
-  using vec_t = device::AlignedVector<packed_t, 8>;
-};
-
-template <>
-struct VecTypeTrait<fp16_t, 32> {
-  using packed_t = packed_t<fp16_t>;
-  using vec_t = device::AlignedVector<packed_t, 8>;
-};
-
 template <typename packed_t>
 SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_square_sum) {
   float2 valf = device::cast<fp32x2_t, packed_t>(val);
@@ -57,8 +30,8 @@ __global__ void fused_add_rmsnorm_reg_kernel(
 
   __shared__ float shared_memory[32];  // Used for CTA reduce
 
-  using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
-  using packed_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
+  using vec_t = typename device::VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
+  using packed_t = typename device::VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
   vec_t v;         // Save input
   vec_t v_res;     // Save residual
   vec_t v_weight;  // Save weight
