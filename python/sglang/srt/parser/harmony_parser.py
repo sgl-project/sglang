@@ -1,6 +1,25 @@
+"""
+HarmonyParser - Finite State Machine Implementation
+
+This module implements a parser for the Harmony format using a Finite State Machine (FSM)
+architecture. The FSM provides true streaming capabilities with minimal blocking latency
+and robust error handling.
+
+Key Features:
+- Streaming states (ANALYSIS, FINAL, SIMPLE_REASONING) emit events immediately
+- Buffering states (COMMENTARY, JSON) wait for structural markers before processing
+- Implicit close mechanism for robust recovery from malformed content
+- Support for constrained decoding patterns
+"""
+
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterator, List, Optional, Tuple
+
+# ============================================================================
+# Existing Data Structures (preserved for backward compatibility)
+# ============================================================================
 
 
 @dataclass
@@ -9,7 +28,7 @@ class Event:
 
     event_type: str
     content: str
-    raw_text: str = None  # Original text including structural markers
+    raw_text: str | None = None  # Original text including structural markers
 
 
 @dataclass
@@ -19,6 +38,49 @@ class Token:
     type: str
     start: int
     end: int
+
+
+class SemanticBuffer:
+    """
+    Buffer that understands Harmony format semantics.
+    Maintains events to track parsing state in streaming.
+    """
+
+    def __init__(self):
+        self._buffer: str = ""  # Unparsed text
+        self._accumulated: str = ""  # Full accumulated text for raw_text extraction
+        self._emitted_events: List[Event] = []
+
+    def append(self, text: str):
+        """Add text to buffer."""
+        self._buffer += text
+        self._accumulated += text
+
+    def add_emitted_event(self, event: Event):
+        """Track an event that has been emitted."""
+        self._emitted_events.append(event)
+
+    def reset(self):
+        """Reset the buffer state."""
+        self._buffer = ""
+        self._accumulated = ""
+        self._emitted_events = []
+
+    def get_emitted_events(self) -> List[Event]:
+        """Get all events that have been emitted."""
+        return self._emitted_events.copy()
+
+    def get_buffer(self) -> str:
+        """Get the unparsed buffer content."""
+        return self._buffer
+
+    def get_accumulated(self) -> str:
+        """Get the full accumulated text."""
+        return self._accumulated
+
+    def set_buffer(self, buffer: str):
+        """Set the buffer content (used after strategy returns remaining)."""
+        self._buffer = buffer
 
 
 def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
@@ -41,6 +103,636 @@ def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
     if max_hold == 0:
         return text, ""
     return text[:-max_hold], text[-max_hold:]
+
+
+# ============================================================================
+# FSM Data Structures
+# ============================================================================
+
+
+class ParserState(Enum):
+    """Parser states for the finite state machine.
+
+    Each state defines how the parser handles incoming text and which transitions
+    are valid.
+
+    IDLE:
+        Initial state. Treats text as 'normal' output.
+        Transitions to other states upon encountering specific markers.
+
+    IN_ANALYSIS:
+        Inside an analysis/reasoning block (<|channel|>analysis).
+        Behavior: Stream text as 'reasoning' events immediately.
+
+    IN_COMMENTARY:
+        Inside a tool call header (<|channel|>commentary).
+        Behavior: Buffer text to identify tool parameters or next state.
+
+    IN_JSON:
+        Inside tool parameters (<|constrain|>).
+        Behavior: Buffer text to parse complete JSON object.
+
+    IN_FINAL:
+        Inside the final response block (<|channel|>final).
+        Behavior: Stream text as 'normal' events immediately.
+
+    IN_SIMPLE_REASONING:
+        Special mode for constrained decoding (e.g., [reasoning] <|end|> [json]).
+        Behavior: Stream text as 'reasoning' events immediately.
+        Transitions to IDLE upon encountering <|end|>.
+    """
+
+    IDLE = 0
+    IN_ANALYSIS = 1
+    IN_COMMENTARY = 2
+    IN_JSON = 3
+    IN_FINAL = 4
+    IN_SIMPLE_REASONING = 5
+
+
+class MarkerType(Enum):
+    """Type of structural markers in the Harmony format."""
+
+    START = "<|start|>"
+    CHANNEL = "<|channel|>"
+    MESSAGE = "<|message|>"
+    CONSTRAIN = "<|constrain|>"
+    END = "<|end|>"
+    CALL = "<|call|>"
+    RETURN = "<|return|>"
+
+
+@dataclass
+class StateMachineContext:
+    """Context for the finite state machine.
+
+    Maintains current parsing state and any buffered content.
+    """
+
+    state: ParserState = ParserState.IDLE
+    current_buffer: str = ""  # Buffer for buffering states (COMMENTARY, JSON)
+    tool_call_start: int = -1  # Start position of tool call for raw_text extraction
+
+
+# ============================================================================
+# Finite State Machine Implementation
+# ============================================================================
+
+
+class HarmonyStateMachine:
+    """Core finite state machine for parsing Harmony format.
+
+    The FSM processes input token-by-token, transitioning states based on
+    atomic markers and emitting appropriate events.
+
+    Key behaviors:
+    - Streaming states emit text immediately (IN_ANALYSIS, IN_FINAL, IN_SIMPLE_REASONING)
+    - Buffering states wait for structural markers (IN_COMMENTARY, IN_JSON)
+    - Implicit close mechanism handles missing <|end|> tags
+    - Constrained decoding support via IN_SIMPLE_REASONING state
+    """
+
+    def __init__(self, initial_state: ParserState = ParserState.IDLE):
+        """Initialize the state machine with the given initial state."""
+        self.context = StateMachineContext(state=initial_state)
+
+    def reset(self):
+        """Reset the state machine to initial state."""
+        self.context.state = ParserState.IDLE
+        self.context.current_buffer = ""
+        self.context.tool_name = ""
+        self.context.tool_target = ""
+
+    def process_tokens(
+        self, tokens: List[Token], full_text: str
+    ) -> Tuple[List[Event], int]:
+        """Process a list of tokens and return (events, next_pos_to_process).
+
+        Args:
+            tokens: List of Token objects to process
+            full_text: The full text for extracting token content
+
+        Returns:
+            Tuple of (list of events emitted, position to resume processing)
+        """
+        events = []
+        pos = 0
+        max_iterations = len(tokens) * 2  # Prevent infinite loops
+        iterations = 0
+
+        while pos < len(tokens) and iterations < max_iterations:
+            token = tokens[pos]
+            new_events, new_pos = self._process_token(token, tokens, pos, full_text)
+            events.extend(new_events)
+
+            # Check if we need to re-process the current token (for implicit close)
+            if new_pos == pos and self.context.state == ParserState.IDLE:
+                # Implicit close occurred, re-process the same token in IDLE state
+                # This should only happen once per token
+                iterations += 1
+                pos = pos  # Will process the same token again
+            else:
+                pos = new_pos
+                iterations += 1
+
+            # Break if we've processed all tokens or hit a boundary that needs holding
+            if pos >= len(tokens):
+                break
+
+        return events, pos
+
+    def _process_token(
+        self, token: Token, tokens: List[Token], pos: int, full_text: str
+    ) -> Tuple[List[Event], int]:
+        """Process a single token based on current state.
+
+        Returns:
+            Tuple of (events emitted, next position to process)
+        """
+        token_type = token.type
+        state = self.context.state
+
+        # Handle TEXT tokens
+        if token_type == "TEXT":
+            return self._handle_text_token(token, tokens, pos, full_text)
+
+        # Handle structural markers
+        marker_type = self._token_type_to_marker_type(token_type)
+        if marker_type is not None:
+            return self._handle_marker_token(marker_type, token, tokens, pos, full_text)
+
+        # Unknown token type - skip it
+        return [], pos + 1
+
+    def _handle_text_token(
+        self, token: Token, tokens: List[Token], pos: int, full_text: str
+    ) -> Tuple[List[Event], int]:
+        """Handle TEXT tokens based on current state."""
+        text_content = full_text[token.start : token.end]
+        state = self.context.state
+
+        # Streaming states: emit immediately
+        if state == ParserState.IDLE:
+            # Check if this text is a system keyword after <|start|> marker
+            if self._is_system_keyword_after_start(
+                full_text, tokens, pos, text_content
+            ):
+                return [], pos + 1
+
+            # Check if we should hold (partial token at end)
+            if pos == len(tokens) - 1:
+                emit, hold = prefix_hold(text_content, self._get_guard_tokens())
+                if emit:
+                    return [Event("normal", emit)], pos + 1
+                else:
+                    return [], pos  # Hold for next chunk
+            else:
+                # Check if this is commentary filler between blocks
+                if self._is_commentary_filler_between_blocks(full_text, tokens, pos):
+                    return [], pos + 1
+                elif self._is_standalone_structural_token(text_content):
+                    return [], pos + 1
+                else:
+                    return [Event("normal", text_content)], pos + 1
+
+        elif state == ParserState.IN_ANALYSIS:
+            return [Event("reasoning", text_content)], pos + 1
+
+        elif state == ParserState.IN_FINAL:
+            return [Event("normal", text_content)], pos + 1
+
+        elif state == ParserState.IN_SIMPLE_REASONING:
+            return [Event("reasoning", text_content)], pos + 1
+
+        # Buffering states: accumulate text
+        elif state in (ParserState.IN_COMMENTARY, ParserState.IN_JSON):
+            self.context.current_buffer += text_content
+            return [], pos + 1
+
+        return [], pos + 1
+
+    def _handle_marker_token(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle structural marker tokens based on current state."""
+        state = self.context.state
+
+        # Implicit close: START or CHANNEL markers in non-IDLE states
+        if marker_type in (MarkerType.START, MarkerType.CHANNEL):
+            if state != ParserState.IDLE:
+                return self._handle_implicit_close(
+                    marker_type, token, tokens, pos, full_text
+                )
+
+        # State-specific transitions
+        if state == ParserState.IDLE:
+            return self._handle_from_idle(marker_type, token, tokens, pos, full_text)
+
+        elif state == ParserState.IN_ANALYSIS:
+            return self._handle_from_analysis(
+                marker_type, token, tokens, pos, full_text
+            )
+
+        elif state == ParserState.IN_COMMENTARY:
+            return self._handle_from_commentary(
+                marker_type, token, tokens, pos, full_text
+            )
+
+        elif state == ParserState.IN_JSON:
+            return self._handle_from_json(marker_type, token, tokens, pos, full_text)
+
+        elif state == ParserState.IN_FINAL:
+            return self._handle_from_final(marker_type, token, tokens, pos, full_text)
+
+        elif state == ParserState.IN_SIMPLE_REASONING:
+            return self._handle_from_simple_reasoning(
+                marker_type, token, tokens, pos, full_text
+            )
+
+        return [], pos + 1
+
+    def _handle_from_idle(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle markers from IDLE state."""
+
+        # Check for <channel>type pattern
+        if marker_type == MarkerType.CHANNEL:
+            if pos + 1 >= len(tokens):
+                return [], pos  # Hold partial if we don't have the type yet
+
+            next_token = tokens[pos + 1]
+            if next_token.type == "TEXT":
+                # Extract channel text, but EXCLUDE the channel marker itself
+                # The channel_text includes <channel>...</>, so we need to strip it
+                raw_channel_text = full_text[next_token.start : next_token.end]
+
+                # Remove the channel marker from the text
+                # Pattern: <|channel|>type to=target or <|channel|>type
+                if raw_channel_text.startswith("<|channel|>"):
+                    # Strip the <|channel|> prefix
+                    channel_text = raw_channel_text[
+                        11:
+                    ].strip()  # 11 = len("<|channel|>")
+                else:
+                    channel_text = raw_channel_text.strip()
+
+                # Check if this is a tool call (contains 'to=')
+                # Pattern: type to=target or type
+                is_tool_call = re.search(r"(?:\s|^)to=", channel_text) is not None
+
+                # Extract the base channel type (first word)
+                channel_parts = channel_text.split()
+                base_channel_type = channel_parts[0].lower() if channel_parts else ""
+
+                # Valid channel types
+                valid_channels = {"analysis", "commentary", "final"}
+
+                # Exact match check for known channel types
+                # Only accept known channel types (analysis, commentary, final)
+                # Unknown channel types return empty events (skip tokens up to MESSAGE)
+                if base_channel_type in valid_channels:
+                    if is_tool_call:
+                        # Built-in tool call (e.g., "analysis to=browser.search" or "commentary to=functions.get_weather")
+                        # Use COMMENTARY state to buffer the tool info and wait for CONSTRAIN marker
+                        self.context.state = ParserState.IN_COMMENTARY
+                        # Record tool call start position for raw_text extraction
+                        self.context.tool_call_start = token.start
+                        # Skip CHANNEL and TEXT tokens (channel name + tool name)
+                        # Let CONSTRAIN marker trigger the transition to IN_JSON state
+                        return [], pos + 2  # Skip CHANNEL and following TEXT
+                    elif base_channel_type == "analysis":
+                        # Regular analysis block
+                        self.context.state = ParserState.IN_ANALYSIS
+                        return [], self._skip_to_after_message(tokens, pos)
+                    elif base_channel_type == "commentary":
+                        # Regular commentary block
+                        self.context.state = ParserState.IN_COMMENTARY
+                        return [], self._skip_to_after_message(tokens, pos)
+                    elif base_channel_type == "final":
+                        # Final block
+                        self.context.state = ParserState.IN_FINAL
+                        return [], self._skip_to_after_message(tokens, pos)
+                elif (
+                    any(vc.startswith(base_channel_type) for vc in valid_channels)
+                    and pos + 1 == len(tokens) - 1
+                ):
+                    # Partial match of a valid channel type (e.g. "comment" of "commentary")
+                    # AND this is the last token available.
+                    # Hold to wait for more text.
+                    return [], pos
+                else:
+                    # Unknown channel type - skip all tokens up to END (ignore content)
+                    return [], self._skip_to_after_end(tokens, pos)
+
+        # <|start|> with following text - check for tool response pattern
+        if marker_type == MarkerType.START:
+            if pos + 1 >= len(tokens):
+                return [], pos  # Hold partial
+
+            next_token = tokens[pos + 1]
+            if next_token.type == "TEXT":
+                text_content = full_text[next_token.start : next_token.end].strip()
+                # Check for tool response pattern: "function_name to=target"
+                # Pattern: looks like "functions.get_weather to=assistant" or "tool_name to=target"
+                # Should NOT start with system keywords like "assistant", "user", "system"
+                if " to=" in text_content and "(" not in text_content:
+                    # Check if this is NOT a system keyword
+                    system_keywords = {"assistant", "user", "system"}
+                    if not text_content.lower().startswith(tuple(system_keywords)):
+                        # This is a tool response, skip START and function name
+                        # Let subsequent content (including MESSAGE marker and JSON) be processed as normal
+                        return [], pos + 2
+
+        # <|start|> just skip (handle as structural marker)
+        if marker_type == MarkerType.START:
+            return [], pos + 1
+
+        # Other markers in IDLE state - skip
+        return [], pos + 1
+
+    def _handle_from_analysis(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle markers from IN_ANALYSIS state."""
+
+        if marker_type == MarkerType.END:
+            # End reasoning
+            self.context.state = ParserState.IDLE
+            return [], pos + 1
+
+        elif marker_type == MarkerType.CONSTRAIN:
+            # CONSTRAIN marks the start of tool call parameters
+            # This should close the analysis state (implicit close)
+            # and transition to JSON state for buffering parameters
+            self.context.state = ParserState.IDLE
+            # Re-process the CONSTRAIN marker in IDLE state
+            return [], pos  # Return same position to re-process
+
+        elif marker_type == MarkerType.CALL:
+            # Built-in tool (no args)
+            # Content is in current_buffer (may need to handle this)
+            tool_content = self.context.current_buffer.strip()
+            # Use tool_call_start if available, otherwise fall back to full text
+            if self.context.tool_call_start >= 0:
+                raw_text = full_text[self.context.tool_call_start : token.end]
+            else:
+                raw_text = full_text[: token.end]
+            self.context.current_buffer = ""
+            self.context.tool_call_start = -1
+            self.context.state = ParserState.IDLE
+            return [Event("tool_call", tool_content, raw_text)], pos + 1
+
+        # START/CHANNEL should trigger implicit close, handled elsewhere
+        return [], pos + 1
+
+    def _handle_from_commentary(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle markers from IN_COMMENTARY state."""
+
+        if marker_type == MarkerType.CONSTRAIN:
+            # Transition to JSON state
+            self.context.state = ParserState.IN_JSON
+            # Skip constraint type (e.g., "json") that follows CONSTRAIN
+            if pos + 1 < len(tokens) and tokens[pos + 1].type == "TEXT":
+                return [], pos + 2  # Skip CONSTRAIN and constraint type
+            return [], pos + 1
+
+        elif marker_type == MarkerType.END:
+            # End commentary block - emit buffered content as normal event
+            normal_content = self.context.current_buffer.strip()
+            self.context.current_buffer = ""
+            self.context.state = ParserState.IDLE
+            if normal_content:
+                return [Event("normal", normal_content)], pos + 1
+            return [], pos + 1
+
+        elif marker_type == MarkerType.CALL:
+            # Tool call without params
+            tool_content = self.context.current_buffer.strip()
+            # Use tool_call_start if available, otherwise fall back to full text
+            if self.context.tool_call_start >= 0:
+                raw_text = full_text[self.context.tool_call_start : token.end]
+            else:
+                raw_text = full_text[: token.end]
+            self.context.current_buffer = ""
+            self.context.tool_call_start = -1
+            self.context.state = ParserState.IDLE
+            return [Event("tool_call", tool_content, raw_text)], pos + 1
+
+        # START/CHANNEL should trigger implicit close, handled elsewhere
+        return [], pos + 1
+
+    def _handle_from_json(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle markers from IN_JSON state."""
+
+        if marker_type == MarkerType.CALL:
+            # Parse JSON and emit tool_call
+            json_content = self.context.current_buffer.strip()
+            # Use tool_call_start if available, otherwise fall back to full text
+            if self.context.tool_call_start >= 0:
+                raw_text = full_text[self.context.tool_call_start : token.end]
+            else:
+                raw_text = full_text[: token.end]
+            self.context.current_buffer = ""
+            self.context.tool_call_start = -1
+            self.context.state = ParserState.IDLE
+            return [Event("tool_call", json_content, raw_text)], pos + 1
+
+        # START/CHANNEL should trigger implicit close, handled elsewhere
+        return [], pos + 1
+
+    def _handle_from_final(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle markers from IN_FINAL state."""
+
+        if marker_type in (MarkerType.RETURN, MarkerType.END):
+            # End response
+            self.context.state = ParserState.IDLE
+            # Include trailing TEXT after RETURN if present
+            if marker_type == MarkerType.RETURN and pos + 1 < len(tokens):
+                next_token = tokens[pos + 1]
+                if next_token.type == "TEXT":
+                    return [
+                        Event("normal", full_text[next_token.start : next_token.end])
+                    ], pos + 2
+            return [], pos + 1
+
+        # START/CHANNEL should trigger implicit close, handled elsewhere
+        return [], pos + 1
+
+    def _handle_from_simple_reasoning(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle markers from IN_SIMPLE_REASONING state."""
+
+        if marker_type == MarkerType.END:
+            # Switch track to IDLE for structured output
+            self.context.state = ParserState.IDLE
+            return [], pos + 1
+
+        # Other markers are unusual in this mode but pass through
+        return [], pos + 1
+
+    def _handle_implicit_close(
+        self,
+        marker_type: MarkerType,
+        token: Token,
+        tokens: List[Token],
+        pos: int,
+        full_text: str,
+    ) -> Tuple[List[Event], int]:
+        """Handle implicit close when START or CHANNEL encounters non-IDLE state."""
+        old_state = self.context.state
+
+        if old_state in (
+            ParserState.IN_ANALYSIS,
+            ParserState.IN_FINAL,
+            ParserState.IN_SIMPLE_REASONING,
+        ):
+            # Streaming states: simple reset to IDLE
+            self.context.state = ParserState.IDLE
+            # Re-process the same token in IDLE state
+            return [], pos  # Return same position to re-process
+
+        elif old_state in (ParserState.IN_COMMENTARY, ParserState.IN_JSON):
+            # Buffering states: discard incomplete buffer and reset
+            self.context.current_buffer = ""
+            self.context.state = ParserState.IDLE
+            # Re-process the same token in IDLE state
+            return [], pos  # Return same position to re-process
+
+        return [], pos + 1
+
+    def _skip_to_after_message(self, tokens: List[Token], start_pos: int) -> int:
+        """Find the position after MESSAGE token."""
+        pos = start_pos + 1  # Skip CHANNEL
+        while pos < len(tokens):
+            if tokens[pos].type == "MESSAGE":
+                return pos + 1  # Return position after MESSAGE
+            pos += 1
+        return pos
+
+    def _skip_to_after_end(self, tokens: List[Token], start_pos: int) -> int:
+        """Find the position after END token."""
+        pos = start_pos + 1
+        while pos < len(tokens):
+            if tokens[pos].type == "END":
+                return pos + 1
+            pos += 1
+        return pos
+
+    def _token_type_to_marker_type(self, token_type: str) -> Optional[MarkerType]:
+        """Convert token type string to MarkerType enum."""
+        type_map = {
+            "START": MarkerType.START,
+            "CHANNEL": MarkerType.CHANNEL,
+            "MESSAGE": MarkerType.MESSAGE,
+            "CONSTRAIN": MarkerType.CONSTRAIN,
+            "END": MarkerType.END,
+            "CALL": MarkerType.CALL,
+            "RETURN": MarkerType.RETURN,
+        }
+        return type_map.get(token_type)
+
+    def _get_guard_tokens(self) -> List[str]:
+        """Get list of guard tokens for prefix_hold."""
+        return [
+            "<|start|>",
+            "<|channel|>",
+            "<|message|>",
+            "<|constrain|>",
+            "<|end|>",
+            "<|call|>",
+            "<|return|>",
+        ]
+
+    def _is_commentary_filler_between_blocks(
+        self, text: str, tokens: List[Token], pos: int
+    ) -> bool:
+        """Check if this is commentary filler between blocks."""
+        current_token = tokens[pos]
+        current_text = text[current_token.start : current_token.end].strip()
+
+        if pos > 0 and pos + 1 < len(tokens):
+            prev_token = tokens[pos - 1]
+            next_token = tokens[pos + 1]
+
+            if (
+                prev_token.type == "CALL"
+                and next_token.type == "CHANNEL"
+                and current_text.lower() == "commentary"
+            ):
+                return True
+
+        return False
+
+    def _is_system_keyword_after_start(
+        self, text: str, tokens: List[Token], pos: int, text_content: str
+    ) -> bool:
+        """
+        Check if this text is a system keyword that should not be emitted as normal content.
+
+        In Harmony format, <|start|>marker is a common pattern where 'marker' is
+        a system keyword like 'assistant' that should be skipped, not emitted as text.
+        """
+        # Check if previous token is START
+        if pos > 0 and tokens[pos - 1].type == "START":
+            # Check if text is a known system keyword
+            system_keywords = {"assistant", "user", "system"}
+            if text_content.strip().lower() in system_keywords:
+                return True
+        return False
+
+    def _is_standalone_structural_token(self, content: str) -> bool:
+        """Check if content is a standalone structural token."""
+        content_stripped = content.strip()
+        structural_tokens = self._get_guard_tokens()
+        return content_stripped in structural_tokens
+
+
+# ============================================================================
+# Helper: Token Iterator
+# ============================================================================
 
 
 def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
@@ -77,13 +769,37 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
                 found_token = True
                 break
         if not found_token:
+            # When markers are split (e.g., "<|chan" + "nel|>"), we need to
+            # handle them correctly. The key insight is:
+            # - If we can find a closing "|>" that completes a marker, do so
+            # - Otherwise, we might have a partial marker that should be held
             tail = text[marker_pos:]
-            is_partial = any(lit.startswith(tail) for lit in TOKENS)
-            if is_partial:
-                # Hold whole tail (partial token)
-                yield Token("TEXT", marker_pos, len(text))
-                pos = len(text)
-                break
+
+            # First check if we can find a closing "|>" that would complete a marker
+            close_pos = tail.find("|>")
+
+            if close_pos != -1:
+                # We have a closing "|>", check if it completes a known token
+                # The full potential token would be text[marker_pos:marker_pos + close_pos + 2]
+                full_token_candidate = text[marker_pos : marker_pos + close_pos + 2]
+
+                if full_token_candidate in TOKENS:
+                    # This is a complete marker! Emit it and move on.
+                    yield Token(
+                        TOKENS[full_token_candidate],
+                        marker_pos,
+                        marker_pos + close_pos + 2,
+                    )
+                    pos = marker_pos + close_pos + 2
+                    break
+                else:
+                    # Has closing "|>" but not a known token - emit text up to close
+                    # This handles cases like "<|something|>" where "something" isn't a keyword
+                    yield Token("TEXT", marker_pos, marker_pos + close_pos + 2)
+                    pos = marker_pos + close_pos + 2
+
+                    # Continue to next iteration to process rest
+                    continue
             else:
                 # Unknown token like <|weird|> ...
                 has_unknown_tokens = True
@@ -120,300 +836,91 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
                 break
 
 
-class CanonicalStrategy:
-    """Parses the canonical Harmony format with channel markers."""
+# ============================================================================
+# Strategy Classes
+# ============================================================================
 
-    def __init__(self):
-        self.guard_tokens = [
-            "<|start|>",
-            "<|channel|>",
-            "<|message|>",
-            "<|constrain|>",
-            "<|end|>",
-            "<|call|>",
-            "<|return|>",
-        ]
+
+class CanonicalStrategy:
+    """Strategy using the finite state machine for parsing Harmony format.
+
+    This strategy provides true streaming with minimal blocking latency.
+    It uses HarmonyStateMachine to process tokens and manage state transitions.
+    Replaces the old block-matching-based CanonicalStrategy.
+    """
+
+    def __init__(self, constrained_decoding: bool = False):
+        """Initialize the Canonical strategy (FSM-based).
+
+        Args:
+            constrained_decoding: If True, start in IN_SIMPLE_REASONING state
+        """
+        initial_state = (
+            ParserState.IN_SIMPLE_REASONING
+            if constrained_decoding
+            else ParserState.IDLE
+        )
+        self.fsm = HarmonyStateMachine(initial_state=initial_state)
+        self.accumulated_text = ""  # Track accumulated text for raw_text extraction
+        self.last_remaining = ""  # Track remaining text from last parse call
+        self.processed_len = 0  # Track position up to which text has been processed
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
-        events = []
-        tokens = list(iter_tokens(text))
+        """Parse text using the FSM and return (events, remaining).
+
+        Args:
+            text: The text chunk to parse (may be cumulative from SemanticBuffer)
+
+        Returns:
+            Tuple of (list of events, remaining unparsed text)
+        """
+        # Accumulate ALL text seen so far (not just current buffer)
+        # This is needed for raw_text extraction in buffering states (COMMENTARY, JSON)
+        # where tool_call_start might be from a previous chunk
+        if not hasattr(self, "full_accumulated"):
+            self.full_accumulated = ""
+
+        # Update full_accumulated efficiently
+        if self.last_remaining and text.startswith(self.last_remaining):
+            # Text contains previous remaining content, only append the new part
+            new_text = text[len(self.last_remaining) :]
+            self.full_accumulated += new_text
+        else:
+            # First call or discontinuity (should generally match if using SemanticBuffer)
+            # If text doesn't start with last_remaining, we assume it's new content or
+            # the buffer was reset/modified externally, so we append all of it.
+            # In standard usage with HarmonyParser, text starts with last_remaining.
+            self.full_accumulated += text
+
+        # Also update simpler accumulated pointer for consistency
+        self.accumulated_text = self.full_accumulated
+
+        # Tokenize starting from where we left off (processed_len)
+        # This ensures we re-process any held tokens from the previous call
+        tokens = list(iter_tokens(self.full_accumulated, start_pos=self.processed_len))
 
         if not tokens:
-            return events, ""
+            self.last_remaining = ""
+            return [], ""
 
-        pos = 0
-        while pos < len(tokens):
-            token = tokens[pos]
+        # Use full_accumulated for FSM processing (for raw_text extraction with absolute positions)
+        events, next_pos = self.fsm.process_tokens(tokens, self.full_accumulated)
 
-            if token.type == "TEXT":
-                # Check if this might be incomplete
-                if pos == len(tokens) - 1:  # Last token
-                    emit, hold = prefix_hold(
-                        text[token.start : token.end], self.guard_tokens
-                    )
-                    if emit:
-                        events.append(Event("normal", emit))
-                    return events, hold
-                else:
-                    # Check if this might be commentary filler between blocks
-                    if self._is_commentary_filler_between_blocks(text, tokens, pos):
-                        # Skip this filler text - don't emit as normal content
-                        pos += 1
-                    else:
-                        content = text[token.start : token.end]
-                        # Skip standalone structural tokens that shouldn't be emitted as normal text
-                        if not self._is_standalone_structural_token(content):
-                            events.append(Event("normal", content))
-                        pos += 1
-
-            elif token.type in ("START", "CHANNEL"):
-                # Parse a channel block starting here
-                block_result = self._parse_block(text, tokens, pos)
-                if block_result is None:
-                    # Incomplete block - check if we can emit partial reasoning content
-                    partial_result = self._parse_partial_analysis(text, tokens, pos)
-                    if partial_result:
-                        event, remaining_text = partial_result
-                        events.append(event)
-                        return events, remaining_text
-                    # No partial content, hold entire remaining text
-                    remaining_start = tokens[pos].start
-                    return events, text[remaining_start:]
-                event, new_pos = block_result
-                if event:
-                    events.append(event)
-                pos = new_pos
-
-            else:
-                # Check if this might be commentary filler between blocks
-                if self._is_commentary_filler_between_blocks(text, tokens, pos):
-                    # Skip this filler text - don't emit as normal content
-                    pos += 1
-                else:
-                    # Unexpected token - only emit as text if it's not a standalone structural token
-                    content = text[token.start : token.end]
-                    if not self._is_standalone_structural_token(content):
-                        events.append(Event("normal", content))
-                    pos += 1
-
-        return events, ""
-
-    def _parse_partial_analysis(
-        self, text: str, tokens: List[Token], start_pos: int
-    ) -> Optional[Tuple[Event, str]]:
-        """Try to parse partial analysis content for incremental streaming."""
-        pos = start_pos
-
-        # Skip <|start|> if present
-        if pos < len(tokens) and tokens[pos].type == "START":
-            pos += 1
-
-        # Look for <|channel|> followed by analysis
-        channel_pos = None
-        message_pos = None
-
-        for i in range(pos, len(tokens)):
-            if tokens[i].type == "CHANNEL" and channel_pos is None:
-                channel_pos = i
-            elif tokens[i].type == "MESSAGE":
-                message_pos = i
-                break
-
-        if channel_pos is None or message_pos is None:
-            return None
-
-        # Extract channel type
-        channel_start = (
-            tokens[channel_pos + 1].start
-            if channel_pos + 1 < len(tokens)
-            else tokens[channel_pos].end
-        )
-        channel_end = tokens[message_pos].start
-        channel_header = text[channel_start:channel_end]
-
-        channel_type = self._extract_channel_type(channel_header)
-        if channel_type != "analysis":
-            return None  # Only stream analysis content - tool calls wait for completion
-
-        # Extract partial content after <|message|>
-        content_start = tokens[message_pos].end
-        content = text[content_start:]
-
-        # Return partial reasoning content and preserve the channel structure for next parse
-        remaining_text = text[tokens[start_pos].start : content_start]
-        return Event("reasoning", content), remaining_text
-
-    def _extract_channel_type(self, header_text: str) -> Optional[str]:
-        """Extract channel type from header, ignoring other attributes like to=... or <|constrain|>..."""
-        # Look for channel type at the start of the header (case insensitive)
-        header_clean = header_text.strip()
-
-        if header_clean.lower().startswith("analysis"):
-            return "analysis"
-        elif header_clean.lower().startswith("commentary"):
-            return "commentary"
-        elif header_clean.lower().startswith("final"):
-            return "final"
+        # Update processed_len based on how many tokens were processed
+        if next_pos >= len(tokens):
+            # All tokens processed
+            self.processed_len = len(self.full_accumulated)
+            remaining = ""
         else:
-            return None  # Unknown channel type
+            # Stopped early (held token), update processed_len to start of the first unprocessed token
+            remaining_start = tokens[next_pos].start
+            self.processed_len = remaining_start
+            remaining = self.full_accumulated[remaining_start:]
 
-    def _parse_block(
-        self, text: str, tokens: List[Token], start_pos: int
-    ) -> Optional[Tuple[Optional[Event], int]]:
-        """Parse a channel block. Returns (event, next_pos) or None if incomplete."""
-        pos = start_pos
+        # Update last_remaining for next call
+        self.last_remaining = remaining
 
-        # Skip <|start|> if present
-        if pos < len(tokens) and tokens[pos].type == "START":
-            pos += 1
-
-        # Look for <|channel|> or <|message|> (tool responses go direct to message)
-        channel_pos = None
-        message_pos = None
-
-        for i in range(pos, len(tokens)):
-            if tokens[i].type == "CHANNEL" and channel_pos is None:
-                channel_pos = i
-            elif tokens[i].type == "MESSAGE":
-                message_pos = i
-                break
-
-        if message_pos is None:
-            return None  # No message token found
-
-        # If no channel found, this is a tool response - treat as normal text
-        if channel_pos is None:
-            content_start = tokens[message_pos].end
-            # Find end token after message
-            end_token_pos = None
-            for i in range(message_pos + 1, len(tokens)):
-                if tokens[i].type in ("END", "CALL", "RETURN"):
-                    end_token_pos = i
-                    break
-            if end_token_pos is None:
-                return None  # Incomplete
-            content = text[content_start : tokens[end_token_pos].start]
-            return Event("normal", content), end_token_pos + 1
-
-        # Standard channel block processing - message_pos is already found above
-        pos = channel_pos + 1  # Skip CHANNEL token
-
-        # Extract channel type from header (ignoring other attributes like to=... or <|constrain|>...)
-        channel_start = tokens[pos].start if pos < len(tokens) else tokens[pos - 1].end
-        channel_end = tokens[message_pos].start
-        channel_header = text[channel_start:channel_end]
-
-        channel_type = self._extract_channel_type(channel_header)
-        if not channel_type:
-            return None  # Unknown or malformed channel
-
-        pos = message_pos + 1  # Skip MESSAGE token
-
-        # Find content and end token
-        content_start = tokens[message_pos].end
-        end_pos = pos
-
-        # Each channel type has specific valid end tokens
-        if channel_type == "final":
-            while end_pos < len(tokens) and tokens[end_pos].type != "RETURN":
-                end_pos += 1
-        elif channel_type == "analysis":
-            while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
-                end_pos += 1
-        else:  # commentary
-            while end_pos < len(tokens) and tokens[end_pos].type not in ("END", "CALL"):
-                end_pos += 1
-
-        if end_pos >= len(tokens):
-            # No end token found
-            if channel_type == "final":
-                # Final blocks can end at end of input without requiring <|return|>
-                content = text[content_start:]
-                return Event("normal", content), end_pos
-            return None  # Analysis and commentary need proper end tokens
-
-        end_token = tokens[end_pos]
-        content = text[content_start : end_token.start]
-
-        # Create event based on channel and end token
-        if channel_type == "analysis":
-            if end_token.type == "CALL":
-                # Built-in tools (browser, python) use analysis channel with <|call|>
-                raw_text = text[tokens[start_pos].start : end_token.end]
-                return Event("tool_call", content.strip(), raw_text), end_pos + 1
-            else:
-                return Event("reasoning", content), end_pos + 1
-        elif channel_type == "commentary":
-            if end_token.type == "CALL":
-                raw_text = text[tokens[start_pos].start : end_token.end]
-                return Event("tool_call", content.strip(), raw_text), end_pos + 1
-            else:
-                return Event("normal", content), end_pos + 1
-        elif channel_type == "final":
-            # For final blocks, include any trailing TEXT immediately after <|return|>
-            final_content = content
-            if end_token.type == "RETURN" and end_pos + 1 < len(tokens):
-                next_token = tokens[end_pos + 1]
-                if next_token.type == "TEXT":
-                    final_content += text[next_token.start : next_token.end]
-                    return Event("normal", final_content), end_pos + 2
-            return Event("normal", final_content), end_pos + 1
-
-        return None, end_pos + 1
-
-    def _is_commentary_filler_between_blocks(
-        self, text: str, tokens: List[Token], pos: int
-    ) -> bool:
-        """Check if this is commentary filler text or problematic structural tokens in malformed sequences."""
-        current_token = tokens[pos]
-        current_text = text[current_token.start : current_token.end].strip()
-
-        # Check for commentary filler between CALL and CHANNEL
-        if pos > 0 and pos + 1 < len(tokens):
-            prev_token = tokens[pos - 1]
-            next_token = tokens[pos + 1]
-
-            # Check if we have CALL -> TEXT("commentary") -> CHANNEL pattern
-            if (
-                prev_token.type == "CALL"
-                and next_token.type == "CHANNEL"
-                and current_text.lower() == "commentary"
-            ):
-                return True
-
-        # Check for problematic patterns after CALL tokens (malformed sequences)
-        if pos > 0:
-            prev_token = tokens[pos - 1]
-
-            # Only filter structural tokens that appear immediately after CALL in malformed sequences
-            # These patterns indicate the content is malformed and the structural tokens are noise
-            if prev_token.type == "CALL":
-                # Filter MESSAGE tokens after CALL (should not happen in well-formed content)
-                if current_token.type == "MESSAGE":
-                    return True
-
-                # Filter standalone "commentary" text after CALL
-                if (
-                    current_token.type == "TEXT"
-                    and current_text.lower() == "commentary"
-                ):
-                    return True
-
-        return False
-
-    def _is_standalone_structural_token(self, content: str) -> bool:
-        """Check if content is just a standalone structural token that should be filtered."""
-        content_stripped = content.strip()
-        structural_tokens = [
-            "<|start|>",
-            "<|channel|>",
-            "<|message|>",
-            "<|constrain|>",
-            "<|end|>",
-            "<|call|>",
-            "<|return|>",
-        ]
-        return content_stripped in structural_tokens
+        return events, remaining
 
 
 class TextStrategy:
@@ -498,91 +1005,250 @@ class TextStrategy:
         return events, hold
 
 
-class HarmonyParser:
-    """Facade for parsing Harmony format, switching between strategies."""
+class EndMarkerOnlyStrategy:
+    """Strategy for handling content with only <|end|> marker (no <|channel|>)."""
 
     def __init__(self):
+        self._end_marker_seen = False
+
+    def parse(self, buffer: str) -> Tuple[List[Event], str]:
+        """
+        Parse buffer that contains <|end|> marker without preceding <|channel|>.
+
+        This handles the fallback case where the model outputs:
+        [reasoning content]<|end|>[normal content]
+
+        Returns:
+            Tuple of (events list, remaining buffer)
+        """
+        events = []
+
+        if self._end_marker_seen:
+            # Already seen <|end|>, all subsequent content is normal
+            if buffer:
+                events.append(
+                    Event(
+                        event_type="normal",
+                        content=buffer,
+                        raw_text=buffer,
+                    )
+                )
+            remaining = ""
+        elif "<|end|>" in buffer:
+            # First time seeing <|end|>, split the content
+            self._end_marker_seen = True
+            splits = buffer.split("<|end|>", maxsplit=1)
+            reasoning_text = splits[0]
+            normal_text = splits[1]
+
+            # Create reasoning event if there's content before <|end|>
+            if reasoning_text:
+                events.append(
+                    Event(
+                        event_type="reasoning",
+                        content=reasoning_text,
+                        raw_text=reasoning_text,
+                    )
+                )
+
+            # Create normal event if there's content after <|end|>
+            if normal_text:
+                events.append(
+                    Event(
+                        event_type="normal",
+                        content=normal_text,
+                        raw_text=normal_text,
+                    )
+                )
+
+            # Consume entire buffer since we've parsed it all
+            remaining = ""
+        else:
+            # Haven't seen <|end|> yet, hold the buffer
+            remaining = buffer
+
+        return events, remaining
+
+
+# ============================================================================
+# Main HarmonyParser Class (Facade)
+# ============================================================================
+
+
+class HarmonyParser:
+    """Facade for parsing Harmony format, switching between strategies.
+
+    The parser automatically detects the format type and selects the appropriate
+    strategy:
+    - FSMStrategy with canonical markers (<|channel|>, <|start|>)
+    - TextStrategy with text-based markers (analysis, commentary)
+    - EndMarkerOnlyStrategy with only <|end|> marker
+    - ConstrainedDecodingStrategy for constrained decoding mode
+
+    The parser maintains a semantic buffer that tracks both raw text and
+    emitted events, enabling sophisticated filtering and recovery logic.
+    """
+
+    _COMMENTARY_FILTER_HISTORY_WINDOW = 5
+
+    def __init__(self, constrained_decoding: bool = False):
+        """Initialize HarmonyParser.
+
+        Args:
+            constrained_decoding: If True, use constrained decoding mode.
+                                  In this mode, starts in IN_SIMPLE_REASONING state
+                                  for immediate streaming of reasoning content.
+        """
         self.strategy = None
-        self._buffer = ""
-        self._should_filter_commentary = (
-            False  # Track if we should filter commentary in next chunks
-        )
-        self._partial_commentary = (
-            ""  # Track partial commentary being built across chunks
-        )
+        self._buffer = SemanticBuffer()
+        self._partial_commentary = ""
+        self._constrained_decoding = constrained_decoding
 
     def parse(self, chunk: str) -> List[Event]:
-        self._buffer += chunk
+        """Parse a chunk of text and return list of events.
+
+        Args:
+            chunk: The text chunk to parse
+
+        Returns:
+            List of Event objects emitted from this chunk
+        """
+        # Append new chunk to semantic buffer
+        self._buffer.append(chunk)
 
         if self.strategy is None:
-            if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
-                self.strategy = CanonicalStrategy()
+            if (
+                "<|channel|>" in self._buffer.get_buffer()
+                or "<|start|>" in self._buffer.get_buffer()
+            ):
+                # Use Canonical strategy (FSM-based) with canonical markers
+                self.strategy = CanonicalStrategy(
+                    constrained_decoding=self._constrained_decoding
+                )
             elif re.search(
                 r"(?:^|\s)(?:assistant)?\s*(analysis|commentary|assistantfinal)",
-                self._buffer,
+                self._buffer.get_buffer(),
                 re.IGNORECASE,
             ):
                 self.strategy = TextStrategy()
+            elif "<|end|>" in self._buffer.get_buffer():
+                # Fallback: EndMarkerOnlyStrategy for content with only <|end|> marker
+                self.strategy = EndMarkerOnlyStrategy()
+            elif self._constrained_decoding:
+                # Constrained decoding mode with explicit flag
+                self.strategy = CanonicalStrategy(constrained_decoding=True)
             else:
                 # Not yet determined, hold
                 return []
 
-        if hasattr(self.strategy, "set_buffer_context"):
-            # Provide full buffer context to strategy for smarter whitespace handling
-            self.strategy.set_buffer_context(self._buffer)
-
-        events, remaining = self.strategy.parse(self._buffer)
+        # Parse the buffer content
+        # Note: For CanonicalStrategy, buffer IS the accumulated text (managed by SemanticBuffer)
+        buffer = self._buffer.get_buffer()
+        events, remaining = self.strategy.parse(buffer)
 
         # Check if we should start filtering commentary (after <|call|> token or tool_call event)
-        buffer_has_call_token = self._buffer.rstrip().endswith("<|call|>")
+        buffer_has_call_token = self._buffer.get_buffer().rstrip().endswith("<|call|>")
 
-        self._buffer = remaining
+        # Update buffer with the remaining unparsed content for the next chunk.
+        self._buffer.set_buffer(remaining)
 
-        # Filter events for streaming case
-        filtered_events = []
-        for event in events:
-            should_filter = False
+        # Filter events using unified filtering logic
+        filtered_events = self._filter_events(events, buffer_has_call_token)
 
-            if event.event_type == "normal":
-                # Check if we're in a commentary filtering state
-                if self._should_filter_commentary or self._partial_commentary:
-                    # Try to build partial commentary
-                    potential_commentary = (
-                        self._partial_commentary + event.content.strip().lower()
-                    )
-
-                    if potential_commentary == "commentary":
-                        # Complete commentary found - filter it
-                        should_filter = True
-                        self._partial_commentary = ""  # Reset
-                        self._should_filter_commentary = False  # Done filtering
-                    elif "commentary".startswith(potential_commentary):
-                        # Partial match - accumulate and filter this chunk
-                        should_filter = True
-                        self._partial_commentary = potential_commentary
-                    else:
-                        # Not commentary - reset and keep the event
-                        self._partial_commentary = ""
-                        self._should_filter_commentary = False
-                else:
-                    # Not in commentary filtering state - reset partial state
-                    self._partial_commentary = ""
-
-            if should_filter:
-                # Skip this commentary filler
-                continue
-
-            # Update filtering state based on events and buffer state
-            if event.event_type == "tool_call":
-                self._should_filter_commentary = (
-                    True  # Filter commentary after tool calls
-                )
-                self._partial_commentary = ""  # Reset on tool call
-            elif buffer_has_call_token:
-                self._should_filter_commentary = (
-                    True  # Filter commentary after <|call|> token
-                )
-
-            filtered_events.append(event)
+        # Track all filtered events in the semantic buffer
+        for event in filtered_events:
+            self._buffer.add_emitted_event(event)
 
         return filtered_events
+
+    def _filter_events(
+        self, events: List[Event], buffer_has_call_token: bool
+    ) -> List[Event]:
+        """
+        Filter events, handling commentary filler and other filtering logic.
+        Uses event history to determine filtering state.
+        """
+        filtered = []
+        emitted_history = self._buffer.get_emitted_events()
+
+        for event in events:
+            if event is None:
+                continue
+
+            # Check if this commentary event should be filtered
+            if self._should_filter_commentary_event(event, emitted_history):
+                continue
+
+            # Update partial commentary state based on filtering result
+            if event.event_type == "tool_call":
+                self._partial_commentary = ""  # Reset partial commentary on tool call
+            elif buffer_has_call_token and event.event_type == "normal":
+                # If buffer ends with <|call|>, we're in a filtering state
+                # Keep _partial_commentary as-is for cross-chunk matching
+                pass
+
+            filtered.append(event)
+
+        return filtered
+
+    def _should_filter_commentary_event(
+        self, event: Event, history: List[Event]
+    ) -> bool:
+        """
+        Determine if a commentary event should be filtered.
+        Uses both event history and partial commentary state for cross-chunk matching.
+        """
+        if event.event_type != "normal":
+            return False
+
+        # Check if we're in a commentary filtering state based on history
+        should_filter = self._is_in_commentary_filtering_state(history)
+
+        if not should_filter and not self._partial_commentary:
+            # Not in filtering state and no partial commentary - don't filter
+            self._partial_commentary = ""
+            return False
+
+        # Try to match "commentary" keyword across chunks
+        potential_commentary = self._partial_commentary + event.content.strip().lower()
+
+        if potential_commentary == "commentary":
+            # Complete "commentary" keyword found - filter it and reset state
+            self._partial_commentary = ""
+            return True
+        elif "commentary".startswith(potential_commentary):
+            # Partial match - accumulate and filter this chunk
+            self._partial_commentary = potential_commentary
+            return True
+        else:
+            # Not a commentary keyword - reset and keep the event
+            self._partial_commentary = ""
+            return False
+
+    def _is_in_commentary_filtering_state(self, history: List[Event]) -> bool:
+        """
+        Determine if we should be filtering commentary based on event history.
+        Returns True if we recently emitted a tool_call event or content ending with <|call|>.
+        """
+        # Check the last few events in history (most recent ones first)
+        # We only need to check a small window to avoid expensive full scans
+        check_limit = min(self._COMMENTARY_FILTER_HISTORY_WINDOW, len(history))
+
+        for event in reversed(history[-check_limit:]):
+            if event.event_type == "tool_call":
+                return True
+            if event.event_type == "normal" and "<|call|>" in event.content:
+                return True
+            # Found a non-tool_call, non-call-content event - stop checking
+            if event.event_type in ("reasoning", "normal"):
+                # Only stop if it's actual content (not empty)
+                if event.content.strip():
+                    break
+
+        return False
+
+    def reset(self):
+        """Reset the parser state for a new parsing session."""
+        self.strategy = None
+        self._buffer = SemanticBuffer()
+        self._partial_commentary = ""
