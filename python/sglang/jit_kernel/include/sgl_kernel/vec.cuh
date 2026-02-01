@@ -1,5 +1,4 @@
 #pragma once
-#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cstddef>
@@ -84,33 +83,6 @@ struct AlignedVector {
 
  private:
   storage_t m_storage;
-};
-
-template <typename T, int VEC_SIZE_IN_BYTE>
-struct VecTypeTrait;
-
-template <>
-struct VecTypeTrait<bf16_t, 16> {
-  using packed_t = packed_t<bf16_t>;
-  using vec_t = AlignedVector<packed_t, 4>;
-};
-
-template <>
-struct VecTypeTrait<fp16_t, 16> {
-  using packed_t = packed_t<fp16_t>;
-  using vec_t = AlignedVector<packed_t, 4>;
-};
-
-template <>
-struct VecTypeTrait<bf16_t, 32> {
-  using packed_t = packed_t<bf16_t>;
-  using vec_t = AlignedVector<packed_t, 8>;
-};
-
-template <>
-struct VecTypeTrait<fp16_t, 32> {
-  using packed_t = packed_t<fp16_t>;
-  using vec_t = AlignedVector<packed_t, 8>;
 };
 
 }  // namespace device
