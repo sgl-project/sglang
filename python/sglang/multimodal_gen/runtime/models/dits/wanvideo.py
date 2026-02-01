@@ -184,12 +184,8 @@ class WanT2VCrossAttention(WanSelfAttention):
     ) -> None:
         # Sparse attention backends should not be used for cross-attention
         if supported_attention_backends:
-            supported_attention_backends -= {
-                AttentionBackendEnum.SLIDING_TILE_ATTN,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.SLA_ATTN,
-                AttentionBackendEnum.SAGE_SLA_ATTN,
+            supported_attention_backends = {
+                b for b in supported_attention_backends if not b.is_sparse
             }
         super().__init__(
             dim,
@@ -250,12 +246,8 @@ class WanI2VCrossAttention(WanSelfAttention):
     ) -> None:
         # Sparse attention backends should not be used for cross-attention
         if supported_attention_backends:
-            supported_attention_backends -= {
-                AttentionBackendEnum.SLIDING_TILE_ATTN,
-                AttentionBackendEnum.VIDEO_SPARSE_ATTN,
-                AttentionBackendEnum.VMOBA_ATTN,
-                AttentionBackendEnum.SLA_ATTN,
-                AttentionBackendEnum.SAGE_SLA_ATTN,
+            supported_attention_backends = {
+                b for b in supported_attention_backends if not b.is_sparse
             }
         super().__init__(
             dim,
