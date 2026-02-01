@@ -44,6 +44,7 @@ class TestMistralLarge3(unittest.TestCase):
         base_args = [
             "--tp=8",
             "--attention-backend=trtllm_mla",
+            "--moe-runner-backend=flashinfer_trtllm",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--chat-template=mistral",

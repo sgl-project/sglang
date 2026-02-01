@@ -30,6 +30,8 @@ class TestMistralLarge3Basic(CustomTestCase):
             "8",
             "--attention-backend",
             "trtllm_mla",
+            "--moe-runner-backend",
+            "flashinfer_trtllm",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--chat-template",
