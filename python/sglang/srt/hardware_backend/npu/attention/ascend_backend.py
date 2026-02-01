@@ -628,7 +628,7 @@ class AscendAttnBackend(AttentionBackend):
             if self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
-                actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
+                actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
                 if (

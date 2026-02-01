@@ -769,6 +769,15 @@ class MLATokenToKVPoolHost(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
+            self.index_k_buffer = None
+            if self.device_pool.index_head_dim is not None:
+                self.index_k_buffer = alloc_func(
+                    (*base_dims, self.device_pool.index_head_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
             return self.k_buffer
@@ -844,6 +853,8 @@ class MLATokenToKVPoolHost(HostKVCache):
                         host_k=self.k_buffer,
                         device_v=device_pool.v_buffer,
                         host_v=self.v_buffer,
+                        device_index_k=device_pool.index_k_buffer,
+                        host_index_k=self.index_k_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
                     )
@@ -905,6 +916,8 @@ class MLATokenToKVPoolHost(HostKVCache):
                     host_k=self.k_buffer,
                     device_v=device_pool.v_buffer,
                     host_v=self.v_buffer,
+                    device_index_k=device_pool.index_k_buffer,
+                    host_index_k=self.index_k_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,
                 )
