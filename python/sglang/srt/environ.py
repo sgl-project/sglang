@@ -339,6 +339,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_USE_DEEPGEMM_BF16_GEMM = EnvBool(False)
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
     # DeepEP
