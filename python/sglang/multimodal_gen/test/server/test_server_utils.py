@@ -250,11 +250,13 @@ class ServerManager:
         port: int,
         wait_deadline: float = 1200.0,
         extra_args: str = "",
+        env_vars: dict[str, str] | None = None,
     ):
         self.model = model
         self.port = port
         self.wait_deadline = wait_deadline
         self.extra_args = extra_args
+        self.env_vars = env_vars or {}
 
     def _wait_for_rocm_gpu_memory_clear(self, max_wait: float = 60.0) -> None:
         """ROCm-specific: Wait for GPU memory to be mostly free before starting.
@@ -346,6 +348,9 @@ class ServerManager:
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
+
+        # Apply custom environment variables
+        env.update(self.env_vars)
 
         # TODO: unify with run_command
         logger.info(f"Running command: {shlex.join(command)}")
@@ -455,6 +460,7 @@ class WarmupRunner:
         model: str,
         prompt: str,
         output_size: str,
+        output_format: str = None,
     ):
         self.client = OpenAI(
             api_key="sglang-anything",
@@ -463,6 +469,7 @@ class WarmupRunner:
         self.model = model
         self.prompt = prompt
         self.output_size = output_size
+        self.output_format = output_format
 
     def run_text_warmups(self, count: int) -> None:
         """Run text-to-image warmup requests."""
@@ -511,6 +518,7 @@ class WarmupRunner:
                     n=1,
                     size=self.output_size,
                     response_format="b64_json",
+                    output_format=self.output_format,
                 )
             finally:
                 for img in images:
@@ -835,12 +843,18 @@ def get_generate_fn(
         req_output_format = None  # Not specified in current request
         req_background = None  # Not specified in current request
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
             n=n,
             size=output_size,
             response_format="b64_json",
+            extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
         validate_image(result.data[0].b64_json)
@@ -898,8 +912,15 @@ def get_generate_fn(
         image_paths = new_image_paths
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = (
+            sampling_params.output_format
+        )  # Not specified in current request
         req_background = None  # Not specified in current request
+
+        # Build extra_body for optional features
+        extra_body = {"num_frames": sampling_params.num_frames}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
 
         images = [open(image_path, "rb") for image_path in image_paths]
         try:
@@ -910,6 +931,8 @@ def get_generate_fn(
                 n=n,
                 size=output_size,
                 response_format="b64_json",
+                output_format=req_output_format,
+                extra_body=extra_body,
             )
         finally:
             for img in images:
@@ -954,7 +977,6 @@ def get_generate_fn(
         """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
-
         # Handle both single URL and list of URLs
         image_urls = sampling_params.image_path
         if not isinstance(image_urls, list):
@@ -968,7 +990,9 @@ def get_generate_fn(
                 )
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = (
+            sampling_params.output_format
+        )  # Not specified in current request
         req_background = None  # Not specified in current request
 
         response = client.images.with_raw_response.edit(
@@ -978,7 +1002,8 @@ def get_generate_fn(
             n=n,
             size=sampling_params.output_size,
             response_format="b64_json",
-            extra_body={"url": image_urls},
+            output_format=req_output_format,
+            extra_body={"url": image_urls, "num_frames": sampling_params.num_frames},
         )
 
         result = response.parse()
@@ -1022,6 +1047,11 @@ def get_generate_fn(
         if not sampling_params.prompt:
             pytest.skip(f"{id}: no text prompt configured")
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         return _create_and_download_video(
             client,
             case_id,
@@ -1029,6 +1059,7 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=output_size,
             seconds=video_seconds,
+            extra_body=extra_body if extra_body else None,
         )
 
     def generate_image_to_video(case_id, client) -> str:
@@ -1043,6 +1074,11 @@ def get_generate_fn(
             if not image_path.exists():
                 pytest.skip(f"{id}: file missing: {image_path}")
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         with image_path.open("rb") as fh:
             return _create_and_download_video(
                 client,
@@ -1052,11 +1088,18 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body=extra_body if extra_body else None,
             )
 
     def generate_text_url_image_to_video(case_id, client) -> str:
         if not sampling_params.prompt or not sampling_params.image_path:
             pytest.skip(f"{id}: no edit config")
+
+        # Build extra_body for optional features
+        extra_body = {"reference_url": sampling_params.image_path}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         return _create_and_download_video(
             client,
             case_id,
@@ -1064,7 +1107,11 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             size=sampling_params.output_size,
             seconds=video_seconds,
-            extra_body={"reference_url": sampling_params.image_path},
+            extra_body={
+                "reference_url": sampling_params.image_path,
+                "fps": sampling_params.fps,
+                "num_frames": sampling_params.num_frames,
+            },
         )
 
     def generate_text_image_to_video(case_id, client) -> str:
@@ -1079,6 +1126,11 @@ def get_generate_fn(
             if not image_path.exists():
                 pytest.skip(f"{id}: file missing: {image_path}")
 
+        # Build extra_body for optional features
+        extra_body = {}
+        if sampling_params.enable_teacache:
+            extra_body["enable_teacache"] = True
+
         with image_path.open("rb") as fh:
             return _create_and_download_video(
                 client,
@@ -1088,6 +1140,10 @@ def get_generate_fn(
                 size=output_size,
                 seconds=video_seconds,
                 input_reference=fh,
+                extra_body={
+                    "fps": sampling_params.fps,
+                    "num_frames": sampling_params.num_frames,
+                },
             )
 
     if modality == "video":

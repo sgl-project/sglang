@@ -7,95 +7,67 @@
 
 #include <concepts>
 #include <cstddef>
-#include <type_traits>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+#ifndef USE_ROCM
+using fp32_t = float;
+using fp16_t = __half;
+using bf16_t = __nv_bfloat16;
+using fp8_e4m3_t = __nv_fp8_e4m3;
+using fp8_e5m2_t = __nv_fp8_e5m2;
+
+using fp32x2_t = float2;
+using fp16x2_t = __half2;
+using bf16x2_t = __nv_bfloat162;
+using fp8x2_e4m3_t = __nv_fp8x2_e4m3;
+using fp8x2_e5m2_t = __nv_fp8x2_e5m2;
+
+using fp32x4_t = float4;
+#endif
 
 namespace device {
+
+#define SGL_DEVICE __forceinline__ __device__
 
 inline constexpr auto kWarpThreads = 32u;
 inline constexpr auto kFullMask = 0xffffffffu;
 
-__device__ __forceinline__ float atomicMaxFloat(float* addr, float value) {
+template <bool kUsePDL>
+SGL_DEVICE void PDLWaitPrimary() {
 #ifndef USE_ROCM
-  float old;
-  old = (value >= 0) ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
-                     : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
-  return old;
-#else
-  int* addr_as_i = (int*)addr;
-  int old = *addr_as_i, assumed;
-  do {
-    assumed = old;
-    old = atomicCAS(addr_as_i, assumed, __float_as_int(fmaxf(value, __int_as_float(assumed))));
-  } while (assumed != old);
-  return __int_as_float(old);
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
 #endif
 }
 
-__device__ __forceinline__ float warpReduceMax(float value) {
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 16));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 8));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 4));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 2));
-  value = fmaxf(value, __shfl_xor_sync(kFullMask, value, 1));
-  return value;
-}
-
-__device__ __forceinline__ float blockReduceMax(float value) {
-  static __shared__ float warpLevelMaxs[kWarpThreads];
-  const int laneId = threadIdx.x % kWarpThreads;
-  const int warpId = threadIdx.x / kWarpThreads;
-
-  value = warpReduceMax(value);
-
-  if (laneId == 0) warpLevelMaxs[warpId] = value;
-  __syncthreads();
-
-  value = (threadIdx.x < blockDim.x / kWarpThreads) ? warpLevelMaxs[laneId] : 0;
-  if (warpId == 0) value = warpReduceMax(value);
-
-  return value;
+template <bool kUsePDL>
+SGL_DEVICE void PDLTriggerSecondary() {
+#ifndef USE_ROCM
+  if constexpr (kUsePDL) {
+    asm volatile("griddepcontrol.launch_dependents;" :::);
+  }
+#endif
 }
 
 namespace pointer {
 
 // we only allow void * pointer arithmetic for safety
 
-template <typename T, std::integral... U>
-__always_inline __device__ auto offset(T* ptr, U... offset) -> void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+SGL_DEVICE auto offset(void* ptr, U... offset) -> void* {
+  return static_cast<T*>(ptr) + (... + offset);
 }
 
-template <typename T, std::integral... U>
-__always_inline __device__ auto offset(const T* ptr, U... offset) -> const void* {
-  static_assert(std::is_same_v<T, void>, "Pointer arithmetic is only allowed for void* pointers");
-  return static_cast<const char*>(ptr) + (... + offset);
+template <typename T = char, std::integral... U>
+SGL_DEVICE auto offset(const void* ptr, U... offset) -> const void* {
+  return static_cast<const T*>(ptr) + (... + offset);
 }
 
 }  // namespace pointer
-
-template <typename T, std::size_t N>
-struct device_vec {
-  T data[N];
-};
-
-template <bool kUsePDL>
-__forceinline__ __device__ void PDLWaitPrimary() {
-#ifndef USE_ROCM
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.wait;");
-  }
-#endif
-}
-
-template <bool kUsePDL>
-__forceinline__ __device__ void PDLTriggerSecondary() {
-#ifndef USE_ROCM
-  if constexpr (kUsePDL) {
-    asm volatile("griddepcontrol.launch_dependents;");
-  }
-#endif
-}
 
 }  // namespace device
 

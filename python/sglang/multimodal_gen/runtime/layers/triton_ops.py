@@ -25,6 +25,7 @@ def _fused_scale_shift_4d_kernel(
     normalized_ptr,
     scale_ptr,
     shift_ptr,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.
     rows,
     inner_dim,
     seq_len,
@@ -56,8 +57,8 @@ def _fused_scale_shift_4d_kernel(
     scale = tl.load(scale_ptrs, mask=mask, other=0.0)
     shift = tl.load(shift_ptrs, mask=mask, other=0.0)
 
-    one = tl.full([BLOCK_N], 1.0, dtype=scale.dtype)
-    output = normalized * (one + scale) + shift
+    scale_const_tensor = tl.full([BLOCK_N], scale_constant, dtype=scale.dtype)
+    output = normalized * (scale_const_tensor + scale) + shift
 
     tl.store(out_ptrs, output, mask=mask)
 
@@ -67,6 +68,7 @@ def fuse_scale_shift_kernel_blc_opt(
     x_ptr,
     shift_ptr,
     scale_ptr,
+    scale_constant: tl.constexpr,  # scale_constant is either 0 or 1.,
     y_ptr,
     B,
     L,
@@ -125,7 +127,7 @@ def fuse_scale_shift_kernel_blc_opt(
         )
         scale = tl.load(scale_ptr + sc_off, mask=mask, other=0)
 
-    y = x * (1 + scale) + shift
+    y = x * (scale_constant + scale) + shift
     tl.store(y_ptr + x_off, y, mask=mask)
 
 
@@ -221,6 +223,7 @@ def fuse_scale_shift_kernel(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
+    scale_constant: float = 1.0,
     block_l: int = 128,
     block_c: int = 128,
 ):
@@ -251,6 +254,7 @@ def fuse_scale_shift_kernel(
             x_2d,
             scale_reshaped,
             shift_reshaped,
+            scale_constant,
             rows,
             C,
             L,
@@ -306,6 +310,7 @@ def fuse_scale_shift_kernel(
             x,
             shift_blc if need_shift_scalar else shift_exp,
             scale_blc if need_scale_scalar else scale_exp,
+            scale_constant,
             output,
             B,
             L,
@@ -1106,3 +1111,58 @@ def rms_norm_fn(
         out,
         residual_out,
     )
+
+
+# Adapted from https://github.com/ModelTC/LightX2V/blob/main/lightx2v/common/ops/norm/triton_ops.py#L905-L956
+@triton.jit
+def _rms_norm_tiled_onepass(
+    y_ptr,
+    x_ptr,
+    w_ptr,
+    SEQ: tl.constexpr,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_SIZE_SEQ: tl.constexpr,
+    BLOCK_SIZE_DIM: tl.constexpr,
+):
+    seq_blk_id = tl.program_id(0)
+    seq_id = seq_blk_id * BLOCK_SIZE_SEQ
+
+    seq_offset = seq_id + tl.arange(0, BLOCK_SIZE_SEQ)[:, None]
+    s_mask = seq_offset < SEQ
+    d_offset = tl.arange(0, BLOCK_SIZE_DIM)[None, :]
+    d_mask = d_offset < DIM
+    y_blk = y_ptr + seq_offset * DIM + d_offset
+    x_blk = x_ptr + seq_offset * DIM + d_offset
+    mask = s_mask & d_mask
+
+    x = tl.load(x_blk, mask=mask, other=0.0).to(tl.float32)
+    mean_square = tl.sum(x * x, axis=1, keep_dims=True) / DIM
+    rstd = tl.math.rsqrt(mean_square + EPS)
+    w = tl.load(w_ptr + d_offset, mask=d_mask)
+    tl.store(y_blk, x * rstd * w, mask=mask)
+
+
+def triton_one_pass_rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6):
+    shape = x.shape
+    x = x.contiguous()
+    y = torch.empty_like(x)
+    x_view = x.reshape(-1, shape[-1])
+    y_view = y.reshape(-1, shape[-1])
+    S, D = x_view.shape
+
+    BLOCK_SIZE_SEQ = min(16, triton.next_power_of_2(max(1, S // 512)))
+    grid = (triton.cdiv(S, BLOCK_SIZE_SEQ),)
+
+    with torch.cuda.device(x.device):
+        torch.library.wrap_triton(_rms_norm_tiled_onepass)[grid](
+            y_view,
+            x_view,
+            w,
+            S,
+            D,
+            eps,
+            BLOCK_SIZE_DIM=triton.next_power_of_2(D),
+            BLOCK_SIZE_SEQ=BLOCK_SIZE_SEQ,
+        )
+    return y

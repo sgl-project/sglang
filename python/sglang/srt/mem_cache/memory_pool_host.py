@@ -76,8 +76,8 @@ def get_allocator_from_storage(allocator_type):
             return MooncakeHostTensorAllocator()
         except ImportError:
             logger.warning(
-                "Mooncake's tensor allocator requires mooncake >= 0.3.8. "
-                "Please upgrade Mooncake by 'pip install mooncake --upgrade'. "
+                "Mooncake's tensor allocator requires mooncake >= 0.3.8.post1. "
+                "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'. "
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()

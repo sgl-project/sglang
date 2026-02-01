@@ -19,11 +19,12 @@ from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.utils import get_device
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.test_utils import CustomTestCase, is_in_amd_ci
 
 # Triton attention kernel unit tests (decode, extend, prefill)
-register_cuda_ci(est_time=30, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=30, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=30, suite="stage-b-test-small-1-gpu-amd")
 
 
 def extend_attention_fwd_torch(
@@ -622,7 +623,10 @@ class TestTritonAttention(CustomTestCase):
         )
         print(cos_sim.item())
         self.assertTrue(cos_sim.item() > 0.99)
-        self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
+        if is_in_amd_ci():
+            self.assertTrue(torch.allclose(o, o_grouped, atol=5e-2))
+        else:
+            self.assertTrue(torch.allclose(o, o_grouped, atol=3e-2))
 
     def test_grouped_decode_attention(self):
         seq_lens = [5, 100, 128, 500]
@@ -759,11 +763,18 @@ class TestTritonAttention(CustomTestCase):
         )
 
         # Compare results
-        self.assertTrue(
-            torch.allclose(o_regular, o_unified, rtol=0.15, atol=0.15),
-            f"Unified kernel output differs from 2-stage kernel. "
-            f"Max diff: {(o_regular - o_unified).abs().max()}",
-        )
+        if is_in_amd_ci():
+            self.assertTrue(
+                torch.allclose(o_regular, o_unified, rtol=0.15, atol=0.17),
+                f"Unified kernel output differs from 2-stage kernel. "
+                f"Max diff: {(o_regular - o_unified).abs().max()}",
+            )
+        else:
+            self.assertTrue(
+                torch.allclose(o_regular, o_unified, rtol=0.15, atol=0.15),
+                f"Unified kernel output differs from 2-stage kernel. "
+                f"Max diff: {(o_regular - o_unified).abs().max()}",
+            )
 
     def test_extend_attention_unified_vs_regular(self):
         """Test unified kernel matches 2-stage kernel across different configs."""

@@ -9,6 +9,7 @@ from fastchat.model import get_conversation_template
 from tqdm import tqdm
 
 from sglang.test.test_utils import add_common_other_args_and_parse, get_call_generate
+from sglang.utils import download_and_cache_file
 
 
 def load_questions(filename):
@@ -37,7 +38,13 @@ def write_answers(filename, model_id, questions, answers):
 
 
 def main(args):
-    questions = load_questions(args.question_file)
+    # Download question file if not exist
+    question_file = args.question_file
+    url = "https://raw.githubusercontent.com/lm-sys/FastChat/main/fastchat/llm_judge/data/mt_bench/question.jsonl"
+    if not os.path.isfile(question_file):
+        question_file = download_and_cache_file(url)
+
+    questions = load_questions(question_file)
     questions = (questions * 10)[: args.num_questions]
     max_tokens = 256
     model_id = "llama-2-chat"

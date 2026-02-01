@@ -24,7 +24,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
           pip install -r docs/requirements.txt
           apt-get update && apt-get install -y pandoc parallel retry
           ln -sf "$(which python3)" /usr/bin/python

@@ -80,7 +80,7 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
     def test_a_gsm8k(self):
         metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
         self.assertGreater(metrics["accuracy"], 0.64)
-        self.assertGreater(avg_spec_accept_length, 1.4)
+        self.assertGreater(avg_spec_accept_length, 2.7)
 
 
 if __name__ == "__main__":
