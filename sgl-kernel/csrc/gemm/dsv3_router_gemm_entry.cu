@@ -121,7 +121,11 @@ void dsv3_router_gemm(
       output.dtype() == torch::kFloat32 || output.dtype() == torch::kBFloat16, "output must be float32 or bf16");
 
   auto const sm = getSMVersion();
+#ifndef USE_MUSA
   TORCH_CHECK(sm >= 90, "required CUDA ARCH >= SM_90");
+#else
+  TORCH_CHECK(sm >= 22, "required MUSA ARCH >= MP_22");
+#endif
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
