@@ -108,6 +108,7 @@ class UsageInfo(BaseModel):
     completion_tokens: Optional[int] = 0
     # only used to return cached tokens when --enable-cache-report is set
     prompt_tokens_details: Optional[Dict[str, int]] = None
+    completion_tokens_details: Optional[Dict[str, int]] = None
     reasoning_tokens: Optional[int] = 0
 
 

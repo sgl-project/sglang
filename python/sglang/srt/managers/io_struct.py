@@ -964,6 +964,7 @@ class BatchTokenIDOutput(
 
     # Token counts
     prompt_tokens: List[int]
+    reasoning_tokens: List[int]
     completion_tokens: List[int]
     cached_tokens: List[int]
 
@@ -1053,6 +1054,7 @@ class BatchStrOutput(
     # Token counts
     prompt_tokens: List[int]
     completion_tokens: List[int]
+    reasoning_tokens: List[int]
     cached_tokens: List[int]
 
     # Logprobs
