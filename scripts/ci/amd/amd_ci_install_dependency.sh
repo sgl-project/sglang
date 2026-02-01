@@ -124,7 +124,31 @@ docker cp human-eval ci_sglang:/
 install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
 docker exec -w / ci_sglang mkdir -p /dummy-grok
-mkdir -p dummy-grok && wget https://sharkpublic.blob.core.windows.net/sharkpublic/sglang/dummy_grok.json -O dummy-grok/config.json
+# Create dummy grok config inline (bypasses Azure blob storage which may have auth issues)
+mkdir -p dummy-grok
+cat > dummy-grok/config.json << 'EOF'
+{
+  "architectures": [
+    "Grok1ModelForCausalLM"
+  ],
+  "embedding_multiplier_scale": 78.38367176906169,
+  "output_multiplier_scale": 0.5773502691896257,
+  "vocab_size": 131072,
+  "hidden_size": 6144,
+  "intermediate_size": 32768,
+  "max_position_embeddings": 8192,
+  "num_experts_per_tok": 2,
+  "num_local_experts": 8,
+  "num_attention_heads": 48,
+  "num_hidden_layers": 64,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "model_type": "mixtral",
+  "torch_dtype": "bfloat16"
+}
+EOF
 docker cp ./dummy-grok ci_sglang:/
 
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
