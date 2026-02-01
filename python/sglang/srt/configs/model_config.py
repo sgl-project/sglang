@@ -26,7 +26,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_sm100_supported, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -241,6 +241,11 @@ class ModelConfig:
             if is_draft_model
             else server_args.quantization
         )
+        override_config_file = (
+            server_args.decrypted_draft_config_file
+            if is_draft_model
+            else server_args.decrypted_config_file
+        )
         return ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
@@ -254,7 +259,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
-            override_config_file=server_args.decrypted_config_file,
+            override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
             encoder_only=server_args.encoder_only,
@@ -310,6 +315,10 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
+            self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
@@ -381,6 +390,17 @@ class ModelConfig:
             self.hf_text_config,
             "v_head_dim",
             self.head_dim,
+        )
+
+        self.swa_head_dim = getattr(
+            self.hf_text_config,
+            "swa_head_dim",
+            self.head_dim,
+        )
+        self.swa_v_head_dim = getattr(
+            self.hf_text_config,
+            "swa_v_head_dim",
+            self.v_head_dim,
         )
 
         # FIXME: temporary special judge for MLA architecture
@@ -583,12 +603,11 @@ class ModelConfig:
 
     def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
-        if not self.is_hybrid_swa_compress:
-            return 0
-
-        # For MiMoV2FlashForCausalLM models
-        total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
+            total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
+            return max(1, total_num_kv_heads // tensor_parallel_size)
+        else:
+            return self.get_num_kv_heads(tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
@@ -898,12 +917,14 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                logger.warning(
-                    "%s quantization is not fully "
-                    "optimized yet. The speed can be slower than "
-                    "non-quantized models.",
-                    self.quantization,
-                )
+                # Don't warn for MXFP4 on SM100 since it has optimized kernels
+                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                    logger.warning(
+                        "%s quantization is not fully "
+                        "optimized yet. The speed can be slower than "
+                        "non-quantized models.",
+                        self.quantization,
+                    )
 
     def _verify_dual_chunk_attention_config(self) -> None:
         if hasattr(self.hf_config, "dual_chunk_attention_config"):
