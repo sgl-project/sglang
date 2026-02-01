@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
+from typing import Literal
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
@@ -84,3 +85,7 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
+    # Use the SP Group of the transformer as the TP Group of T5.
+    parallel_folding: bool = False
+    # "sp" or "ulysses" or "ring"
+    parallel_folding_mode: Literal["sp", "ulysses", "ring"] = "sp"
