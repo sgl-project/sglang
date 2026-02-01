@@ -1,0 +1,103 @@
+# Kimi-K2.5 Usage
+
+[Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) is Moonshot AI's open-source, native multimodal, agentic MoE. It is a 1T-parameter model (32B active) with 256K context, MLA attention, and a MoonViT vision encoder, supporting both thinking and instant modes.
+
+In SGLang, Kimi-K2.5 uses the `kimi_k2` reasoning and tool-call parsers for correct thinking and tool handling.
+
+```{note}
+Kimi-K2.5 support is in SGLang main and will land in the next release. Use the latest main or a nightly image until then.
+```
+
+Official deployment guide: [Kimi-K2.5 deployment guide](https://huggingface.co/moonshotai/Kimi-K2.5/blob/main/docs/deploy_guidance.md)
+
+## Install (Latest Main)
+
+```bash
+uv pip install "sglang @ git+https://github.com/sgl-project/sglang.git#subdirectory=python"
+# For CUDA 12:
+uv pip install "nvidia-cudnn-cu12==9.16.0.29"
+# For CUDA 13:
+uv pip install "nvidia-cudnn-cu13==9.16.0.29"
+```
+
+## Launch Kimi-K2.5 with SGLang
+
+Example: single node, TP8 on H200.
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path moonshotai/Kimi-K2.5 \
+  --tp 8 \
+  --trust-remote-code \
+  --tool-call-parser kimi_k2 \
+  --reasoning-parser kimi_k2
+```
+
+### Parser Requirements
+
+- `--tool-call-parser kimi_k2`: Required for tool calling.
+- `--reasoning-parser kimi_k2`: Required to parse thinking content; thinking mode is enabled by default.
+
+## Test the Deployment
+
+Thinking mode is enabled by default. To disable thinking (instant mode), pass `extra_body.chat_template_kwargs.thinking=false`.
+
+```bash
+# Thinking mode (default)
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "moonshotai/Kimi-K2.5",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "Explain mixture-of-experts in one sentence."}
+    ],
+    "max_tokens": 256
+  }'
+```
+
+```bash
+# Instant mode (thinking disabled)
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "moonshotai/Kimi-K2.5",
+    "messages": [
+      {"role": "user", "content": "Give one sentence on MoE models."}
+    ],
+    "max_tokens": 128,
+    "extra_body": {"chat_template_kwargs": {"thinking": false}}
+  }'
+```
+
+## Multimodal Inputs (Image/Video)
+
+Kimi-K2.5 is multimodal. Image inputs are supported via the OpenAI-compatible vision API. For more details, see `openai_api_vision.ipynb`.
+
+```bash
+# Image input (SGLang)
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "moonshotai/Kimi-K2.5",
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {"type": "text", "text": "Describe this image."},
+          {
+            "type": "image_url",
+            "image_url": {
+              "url": "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+            }
+          }
+        ]
+      }
+    ],
+    "max_tokens": 256
+  }'
+```
+
+```{note}
+Video chat is experimental and is only supported in the official Moonshot API for now.
+```
