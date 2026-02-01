@@ -1,0 +1,55 @@
+name: PR Test LFM2
+
+on:
+  pull_request:
+    branches: [internal-release]
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model to test"
+        required: false
+        type: string
+        default: "LiquidAI/LFM2.5-1.2B-Instruct"
+
+concurrency:
+  group: pr-test-lfm2-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lfm2-test:
+    name: LFM2 Integration & Numerical Tests
+    runs-on: edge-ci-linux1
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: |
+          pip install uv
+          uv venv .venv
+          source .venv/bin/activate
+          uv pip install -e "python[dev]"
+          uv pip install pytest
+
+      - name: Run LFM2 generation model tests
+        timeout-minutes: 30
+        run: |
+          source .venv/bin/activate
+          cd test/registered/models
+          ONLY_RUN=${{ inputs.model || 'LiquidAI/LFM2.5-1.2B-Instruct' }} pytest test_generation_models.py -v -s
+
+      - name: Run LFM2 function calling tests
+        timeout-minutes: 15
+        run: |
+          source .venv/bin/activate
+          pytest test/registered/openai_server/function_call/test_tool_choice.py::TestToolChoiceLfm2 -v -s
+
+      - name: Show test summary
+        if: always()
+        run: |
+          echo "## LFM2 Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Model: ${{ inputs.model || 'LiquidAI/LFM2.5-1.2B-Instruct' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Runner: edge-ci-linux1" >> $GITHUB_STEP_SUMMARY

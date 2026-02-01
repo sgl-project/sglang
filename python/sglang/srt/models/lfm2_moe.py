@@ -1,40 +1,39 @@
 """
-LFM2 (Liquid Foundation Model 2) implementation for SGLang.
+LFM2-MoE (Liquid Foundation Model 2 - Mixture of Experts) implementation for SGLang.
 
-This is a hybrid architecture with both attention and short conv layers.
+This is a hybrid architecture with attention, ShortConv, and MoE layers:
 - Attention layers use standard KV cache (RadixAttention)
 - Conv layers use MambaPool for state caching (via HybridReqToTokenPool)
+- First `num_dense_layers` use dense MLP, rest use MoE with sigmoid routing
 
-The model uses a gated 1D causal convolution (kernel=3) instead of attention
-in some layers, providing linear memory complexity for those layers.
-
-Uses optimized causal_conv1d kernels from the mamba package for fast inference.
+Key MoE characteristics:
+- Sigmoid routing (not softmax) - auxiliary-loss-free style
+- Expert bias (fp32) affects selection but not weighting
+- Post-hoc normalization of top-k weights
 """
 
-import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from sglang.srt.configs.lfm2 import Lfm2Config
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.mamba.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -49,85 +48,132 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
-logger = logging.getLogger(__name__)
 
-
-# We don't use it, we keep it for reference. If we run sglang.srt.layers.layernorm.RMSNorm
-# kernel the difference in logprobs slightly increases, but to an acceptable degree
-# class Lfm2RMSNorm(nn.Module):
-#     """LFM2-specific RMSNorm: weight * x (not (1 + weight) * x like Gemma)."""
-
-#     def __init__(self, hidden_size: int, eps: float = 1e-6):
-#         super().__init__()
-#         self.weight = nn.Parameter(torch.ones(hidden_size))
-#         self.variance_epsilon = eps
-
-#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-#         input_dtype = hidden_states.dtype
-#         hidden_states = hidden_states.to(torch.float32)
-#         variance = hidden_states.pow(2).mean(-1, keepdim=True)
-#         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-#         return (self.weight * hidden_states).to(input_dtype)
-
-
-class Lfm2MLP(nn.Module):
-    """MLP with SwiGLU activation."""
+class Lfm2MoeMLP(nn.Module):
+    """Dense MLP for first N layers (before MoE kicks in)."""
 
     def __init__(
         self,
-        config: Lfm2Config,
+        config: Lfm2MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
         super().__init__()
-        intermediate_size = config.intermediate_size
-
-        if config.block_auto_adjust_ff_dim:
-            intermediate_size = int(2 * intermediate_size / 3)
-            if config.block_ffn_dim_multiplier is not None:
-                intermediate_size = int(
-                    config.block_ffn_dim_multiplier * intermediate_size
-                )
-                intermediate_size = config.block_multiple_of * (
-                    (intermediate_size + config.block_multiple_of - 1)
-                    // config.block_multiple_of
-                )
-
-        self.w1 = ColumnParallelLinear(
+        # Use MergedColumnParallelLinear for w1/w3 (gate/up projections)
+        self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
-            intermediate_size,
+            [config.intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w1", prefix),
+            prefix=add_prefix("gate_up_proj", prefix),
         )
-        self.w3 = ColumnParallelLinear(
-            config.hidden_size,
-            intermediate_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("w3", prefix),
-        )
-        self.w2 = RowParallelLinear(
-            intermediate_size,
+        self.down_proj = RowParallelLinear(
+            config.intermediate_size,
             config.hidden_size,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("w2", prefix),
+            prefix=add_prefix("down_proj", prefix),
         )
+        self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, _ = self.w1(x)
-        up, _ = self.w3(x)
-        out, _ = self.w2(F.silu(gate) * up)
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        out, _ = self.down_proj(x)
         return out
 
 
-class Lfm2Attention(nn.Module):
+class Lfm2MoeSparseMoeBlock(nn.Module):
+    """
+    Sparse MoE block with sigmoid routing using optimized FusedMoE.
+
+    Key features:
+    - Sigmoid scoring (not softmax) - auxiliary-loss-free style
+    - Expert bias (fp32) for load balancing
+    - Bias affects selection only, not weighting
+    - Uses FusedMoE for efficient batched expert computation
+    """
+
+    def __init__(
+        self,
+        config: Lfm2MoeConfig,
+        layer_idx: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+        if self.tp_size > config.num_experts:
+            raise ValueError(
+                f"Tensor parallel size {self.tp_size} is greater than "
+                f"the number of experts {config.num_experts}."
+            )
+
+        # Gate (router) - outputs logits for each expert
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
+        )
+
+        # Expert bias (fp32) - affects selection but not weighting
+        if config.use_expert_bias:
+            self.expert_bias = nn.Parameter(
+                torch.zeros(config.num_experts, dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("expert_bias", None)
+
+        # TopK selector with sigmoid scoring
+        self.topk = TopK(
+            top_k=config.num_experts_per_tok,
+            layer_id=layer_idx,
+            renormalize=config.norm_topk_prob,
+            scoring_func="sigmoid",
+            correction_bias=self.expert_bias if config.use_expert_bias else None,
+        )
+
+        # FusedMoE for efficient batched expert computation
+        # Note: We intentionally do NOT pass routed_scaling_factor to FusedMoE.
+        # While FusedMoE supports it, passing it there increases numerical
+        # differences vs HuggingFace (likely due to different code paths in the
+        # Triton runner when scaling_factor != None). We apply it manually below.
+        self.experts = FusedMoE(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            layer_id=layer_idx,
+            reduce_results=True,
+            quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Optimized expert forward pass using FusedMoE."""
+        # Get router logits
+        router_logits, _ = self.gate(hidden_states)
+
+        # Select top-k experts with sigmoid scoring
+        topk_output = self.topk(hidden_states, router_logits)
+
+        # Run fused expert computation
+        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        # Apply routed scaling factor (see __init__ comment for why not in FusedMoE)
+        return final_hidden_states * self.routed_scaling_factor
+
+
+class Lfm2MoeAttention(nn.Module):
     """Grouped-query attention with RoPE and Q/K layernorm."""
 
     def __init__(
         self,
-        config: Lfm2Config,
+        config: Lfm2MoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -136,21 +182,19 @@ class Lfm2Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", None) or (
-            self.hidden_size // self.total_num_heads
-        )
+        self.head_dim = self.hidden_size // self.total_num_heads
         self.scaling = self.head_dim**-0.5
 
         rope_parameters = getattr(config, "rope_parameters", None)
         if rope_parameters is not None and "rope_theta" in rope_parameters:
             rope_theta = rope_parameters["rope_theta"]
         else:
-            rope_theta = getattr(config, "rope_theta", 10000)
+            rope_theta = getattr(config, "rope_theta", 1000000.0)
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
-            max_position=getattr(config, "max_position_embeddings", 8192),
+            max_position=getattr(config, "max_position_embeddings", 128000),
             rope_scaling=getattr(config, "rope_scaling", None),
             base=rope_theta,
             is_neox_style=True,
@@ -219,20 +263,17 @@ class Lfm2Attention(nn.Module):
         return out
 
 
-class Lfm2ShortConv(nn.Module):
+class Lfm2MoeShortConv(nn.Module):
     """
     Gated short convolution layer using optimized causal_conv1d kernels.
 
     Architecture: in_proj -> split(B, C, x) -> Bx -> conv1d -> C*conv_out -> out_proj
-    - Uses double gating: B (before conv) and C (after conv)
-    - Fixed-size cache: stores last (kernel_size - 1) tokens
-    - Uses causal_conv1d_fn for prefill and causal_conv1d_update for decode
     - Supports tensor parallelism: hidden dimension is sharded across TP ranks
     """
 
     def __init__(
         self,
-        config: Lfm2Config,
+        config: Lfm2MoeConfig,
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -289,13 +330,11 @@ class Lfm2ShortConv(nn.Module):
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
 
-        # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)
         Bx = B_gate * x
 
         if forward_batch.forward_mode.is_decode():
-            # Decode: single token per request, use optimized update kernel
             conv_out = causal_conv1d_update(
                 Bx,
                 conv_state,
@@ -305,26 +344,22 @@ class Lfm2ShortConv(nn.Module):
                 conv_state_indices=req_pool_indices.to(torch.int32),
             )
         else:
-            # Prefill: multiple tokens, use varlen kernel
             T = hidden_states.shape[0]
             Bx_t = Bx.transpose(0, 1).contiguous()
 
-            # Build query_start_loc: [0, cumsum(seq_lens)...]
+            # Build query_start_loc for variable-length sequences
+            # causal_conv1d_fn expects [start0, start1, ..., startN, T]
             extend_start_loc = forward_batch.extend_start_loc
             if extend_start_loc is not None and len(extend_start_loc) > 1:
-                query_start_loc = torch.cat(
-                    [
-                        extend_start_loc,
-                        torch.tensor(
-                            [T], dtype=torch.int32, device=hidden_states.device
-                        ),
-                    ]
-                )
+                # Multiple sequences: append T to extend_start_loc
+                # Allocate and fill to avoid torch.cat overhead
+                query_start_loc = extend_start_loc.new_empty(len(extend_start_loc) + 1)
+                query_start_loc[:-1] = extend_start_loc
+                query_start_loc[-1] = T
                 cache_indices = req_pool_indices.to(torch.int32)
             else:
-                query_start_loc = torch.tensor(
-                    [0, T], dtype=torch.int32, device=hidden_states.device
-                )
+                # Single sequence: [0, T]
+                query_start_loc = hidden_states.new_tensor([0, T], dtype=torch.int32)
                 cache_indices = req_pool_indices[:1].to(torch.int32)
 
             conv_out = causal_conv1d_fn(
@@ -342,12 +377,17 @@ class Lfm2ShortConv(nn.Module):
         return output
 
 
-class Lfm2DecoderLayer(nn.Module):
-    """Decoder layer - either attention or conv based on config."""
+class Lfm2MoeDecoderLayer(nn.Module):
+    """
+    Decoder layer with attention/conv and dense MLP or MoE.
+
+    - Layers 0 to num_dense_layers-1: use Lfm2MoeMLP (dense)
+    - Layers num_dense_layers+: use Lfm2MoeSparseMoeBlock (MoE)
+    """
 
     def __init__(
         self,
-        config: Lfm2Config,
+        config: Lfm2MoeConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -359,26 +399,36 @@ class Lfm2DecoderLayer(nn.Module):
         self.operator_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.norm_eps)
 
+        # Attention or Conv
         if self.is_attention_layer:
-            self.self_attn = Lfm2Attention(
+            self.self_attn = Lfm2MoeAttention(
                 config=config,
                 layer_id=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
-            self.conv = Lfm2ShortConv(
+            self.conv = Lfm2MoeShortConv(
                 config=config,
                 layer_idx=layer_id,
                 quant_config=quant_config,
                 prefix=add_prefix("conv", prefix),
             )
 
-        self.feed_forward = Lfm2MLP(
-            config=config,
-            quant_config=quant_config,
-            prefix=add_prefix("feed_forward", prefix),
-        )
+        # Dense MLP or MoE
+        if layer_id < config.num_dense_layers:
+            self.feed_forward = Lfm2MoeMLP(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("feed_forward", prefix),
+            )
+        else:
+            self.feed_forward = Lfm2MoeSparseMoeBlock(
+                config=config,
+                layer_idx=layer_id,
+                quant_config=quant_config,
+                prefix=add_prefix("feed_forward", prefix),
+            )
 
     def forward(
         self,
@@ -406,10 +456,10 @@ class Lfm2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Lfm2Model(nn.Module):
+class Lfm2MoeModel(nn.Module):
     def __init__(
         self,
-        config: Lfm2Config,
+        config: Lfm2MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -429,7 +479,7 @@ class Lfm2Model(nn.Module):
         )
 
         def get_layer(idx: int, prefix: str, **kwargs):
-            return Lfm2DecoderLayer(
+            return Lfm2MoeDecoderLayer(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -465,14 +515,14 @@ class Lfm2Model(nn.Module):
         return self.embedding_norm(hidden_states)
 
 
-class Lfm2ForCausalLM(nn.Module):
-    """LFM2 for causal language modeling with hybrid attention/conv architecture."""
+class Lfm2MoeForCausalLM(nn.Module):
+    """LFM2-MoE for causal language modeling."""
 
     fall_back_to_pt_during_load = False
 
     def __init__(
         self,
-        config: Lfm2Config,
+        config: Lfm2MoeConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -482,7 +532,9 @@ class Lfm2ForCausalLM(nn.Module):
         assert self.pp_group.is_first_rank and self.pp_group.is_last_rank
 
         self.quant_config = quant_config
-        self.model = Lfm2Model(config, quant_config, prefix=add_prefix("model", prefix))
+        self.model = Lfm2MoeModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
@@ -513,11 +565,26 @@ class Lfm2ForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
+        """Load weights with FusedMoE expert format."""
         stacked_params_mapping = [
+            # (param_name, weight_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            # Dense MLP w1/w3 -> gate_up_proj
+            ("gate_up_proj", "w1", 0),
+            ("gate_up_proj", "w3", 1),
         ]
+
+        # FusedMoE expert params mapping
+        # HF format: experts.{expert_id}.w{1,2,3}.weight
+        # FusedMoE format: experts.w13_weight, experts.w2_weight
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.num_experts,
+        )
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
@@ -537,9 +604,16 @@ class Lfm2ForCausalLM(nn.Module):
             if ".conv.conv.bias" in name:
                 name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
-            # Handle QKV stacking
+            # Handle dense MLP w2 -> down_proj
+            if "feed_forward.w2" in name and "experts" not in name:
+                name = name.replace("feed_forward.w2", "feed_forward.down_proj")
+
+            # Handle stacked params (QKV, dense MLP gate_up)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
+                    continue
+                # Skip expert weights (handled below)
+                if "experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
@@ -552,15 +626,44 @@ class Lfm2ForCausalLM(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                # Handle MoE expert weights using FusedMoE format
+                # HF format: model.layers.X.feed_forward.experts.Y.wZ.weight
+                # FusedMoE format: model.layers.X.feed_forward.experts.w13_weight/w2_weight
+                for (
+                    param_name,
+                    weight_name,
+                    expert_id,
+                    shard_id,
+                ) in expert_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    # Build our parameter name
+                    name = name.replace(weight_name, param_name)
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    loaded_params.add(name)
+                    break
+                else:
+                    # Handle regular weights
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(name)
 
         # Handle tied lm_head weight
         if "lm_head.weight" not in loaded_params and "lm_head.weight" in params_dict:
@@ -573,4 +676,4 @@ class Lfm2ForCausalLM(nn.Module):
         return loaded_params
 
 
-EntryClass = [Lfm2ForCausalLM]
+EntryClass = [Lfm2MoeForCausalLM]

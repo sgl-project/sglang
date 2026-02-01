@@ -1,0 +1,24 @@
+name: Internal Release Lint
+
+on:
+  pull_request:
+    branches: [internal-release]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit hook
+        run: |
+          python -m pip install pre-commit
+          pre-commit install
+
+      - name: Run pre-commit checks
+        run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
