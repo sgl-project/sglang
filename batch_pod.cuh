@@ -34,16 +34,6 @@ enum Operation {
   DECODE = 1,
 };
 
-// Block factor constants (moved outside kernel for better compilation)
-constexpr int kBlkFactorP = 1;
-constexpr int kBlkFactorD = 1;
-
-// Scheduler result structure for better memory layout
-struct SchedulerResult {
-  int linear_bid;
-  int op;
-};
-
 template <typename KTraits_P, typename KTraits_D, typename PrefillParams, typename DecodeParams>
 __global__ __launch_bounds__(std::max(
     KTraits_P::NUM_THREADS,
@@ -51,8 +41,7 @@ __global__ __launch_bounds__(std::max(
                                                                       PrefillParams prefill_params,
                                                                   const __grid_constant__
                                                                       DecodeParams decode_params,
-                                                                  int* sm_aware_sched,
-                                                                  int num_sm) {
+                                                                  int* sm_aware_sched) {
   extern __shared__ uint8_t smem[];
   // PREFILL VARS
   const uint32_t padded_bsize_p = prefill_params.padded_batch_size;
@@ -66,95 +55,86 @@ __global__ __launch_bounds__(std::max(
   const uint32_t prefill_blocks = padded_bsize_p * num_kv_heads_p;
   const uint32_t decode_blocks = padded_bsize_d * num_kv_heads_d;
 
-  int op = 0;
-  int linear_bid = 0;
-
+  int op;
+  int linear_bid;
   // SM-aware CTA scheduler
   if (threadIdx.x == 0) {
     // TODO_AK: If num_threads dont match, use virtual sub-CTAs.
     // Requires changing block-level sync in main prefill/decode kernels.
+    constexpr int blk_factor_p = 1;
+    constexpr int blk_factor_d = 1;
 
-    // Get SM ID for this threadblock
-    int smid = 0;
-    asm volatile("mov.u32 %0, %smid;" : "=r"(smid));
+    // SM-aware threadblock scheduler code
+    // Find out which SM this threadblock is scheduled on
+    int num_SMs;
+    // WARNING: nsmid has only been tested on A100/H100, and matches SM count
+    // No guarantee this will work on other GPUs
+    asm volatile("mov.u32 %0, %nsmid;" : "=r"(num_SMs));
+    asm volatile("mov.u32 %0, %smid;" : "=r"(linear_bid));
+    const int prefill_slots = (prefill_blocks + blk_factor_p - 1) / blk_factor_p;
+    const int decode_slots = (decode_blocks + blk_factor_d - 1) / blk_factor_d;
 
-    // Clamp smid to num_sm to avoid out-of-bounds access
-    smid = (smid < num_sm) ? smid : num_sm - 1;
-
-    // No need for division when blk_factor = 1
-    const int prefill_slots = prefill_blocks;
-    const int decode_slots = decode_blocks;
-
-    // Handle empty batch cases to avoid div-by-zero
-    if (prefill_slots == 0 && decode_slots == 0) {
-      // Nothing to do - mark as invalid
-      op = -1;
-      linear_bid = 0;
-    } else if (prefill_slots == 0) {
-      // Pure decode mode: all SMs work on decode
-      op = DECODE;
-      linear_bid = atomicAdd(&sm_aware_sched[num_sm + DECODE], 1);
+    // Handle cases where one or both slot counts are zero to avoid divide-by-zero.
+    if (prefill_slots == 0) {
+      // No prefill blocks, always run DECODE
+      op = 1;
     } else if (decode_slots == 0) {
-      // Pure prefill mode: all SMs work on prefill
-      op = PREFILL;
-      linear_bid = atomicAdd(&sm_aware_sched[num_sm + PREFILL], 1);
-    } else {
-      // Mixed mode: use SM-aware scheduler with both prefill and decode
-      // Allocate work based on ratio of slots to minimize fallback
-      if (prefill_slots <= decode_slots) {
-        const int total_tags = decode_slots / prefill_slots + 1;
-        const int tag = atomicAdd(&sm_aware_sched[smid], 1);
-        op = (tag % total_tags == 0) ? PREFILL : DECODE;
-      } else {
-        const int pref_tags = prefill_slots / decode_slots;
-        const int tag = atomicAdd(&sm_aware_sched[smid], 1);
-        op = (tag % (pref_tags + 1) < pref_tags) ? PREFILL : DECODE;
+      // No decode blocks, always run PREFILL
+      op = 0;
+    } else if (prefill_slots <= decode_slots) {
+      // Total tags = (decode + prefill) / min(decode, prefill)
+      // = 1 + decode / prefill; when prefill < decode
+      const int total_tags = decode_slots / prefill_slots + 1;
+      // For this SM, what's the next operation we want to run?
+      op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % total_tags);
+      if (op > 0) {
+        op = 1 ;
       }
+    } else {
+      // Total tags = (decode + prefill) / min(decode, prefill)
+      // = 1 + prefill / decode; when decode < prefill
+      const int pref_tags = prefill_slots / decode_slots;
 
-      // Get the next blockId for that operation
-      linear_bid = atomicAdd(&sm_aware_sched[num_sm + op], 1);
-
-      // If out of range, try to switch to the other operation
-      if ((op == PREFILL && linear_bid >= prefill_slots) ||
-          (op == DECODE && linear_bid >= decode_slots)) {
-        // Try the other operation
-        int other_op = 1 - op;
-        int other_bid = atomicAdd(&sm_aware_sched[num_sm + other_op], 1);
-
-        // Only switch if the other operation has work available
-        if ((other_op == PREFILL && other_bid < prefill_slots) ||
-            (other_op == DECODE && other_bid < decode_slots)) {
-          op = other_op;
-          linear_bid = other_bid;
-        } else {
-          // No work available - mark as invalid
-          op = -1;
-          linear_bid = 0;
-        }
+      // For this SM, what's the next operation we want to run?
+      op = (atomicAdd(&sm_aware_sched[linear_bid], 1) % (pref_tags + 1));
+      if (op < pref_tags) {
+        op = 0;
+      } else {
+        op = 1;
       }
     }
 
-    // Write the blockId and operation to shared memory using structure
-    auto& result = *reinterpret_cast<SchedulerResult*>(smem);
-    result.linear_bid = linear_bid;
-    result.op = op;
+    // Get the next blockId for that operation
+    linear_bid = atomicAdd(&sm_aware_sched[num_SMs + op], 1);
+    // If the blockId obtained exceeds the max blockIds for that op, switch to the other op
+    if (op == 0 && linear_bid >= prefill_slots) {
+      linear_bid = atomicAdd(&sm_aware_sched[num_SMs + 1], 1);
+      op = !op;
+    } else if (op == 1 && linear_bid >= decode_slots) {
+      op = !op;
+      linear_bid = atomicAdd(&sm_aware_sched[num_SMs + 0], 1);
+    }
+    // Write the blockId and operation to shared memory
+    ((int*)smem)[0] = linear_bid;
+    ((int*)smem)[1] = op;
   }
-
-  // Sync to wait for scheduler to finish and broadcast results
+  // Sync to wait for dynamic scheduler to finish
   __syncthreads();
-  auto& result = *reinterpret_cast<SchedulerResult*>(smem);
-  linear_bid = result.linear_bid;
-  op = result.op;
-
-  // Early exit for invalid operations (no work available)
-  if (op < 0) return;
+  // Fetch from shared memory the assigned blockId and operation.
+  linear_bid = ((int*)smem)[0];
+  op = ((int*)smem)[1];
+  // Sync to force all threads to wait
+  __syncthreads();
 
   if (op == PREFILL) {
     auto& smem_storage = reinterpret_cast<typename KTraits_P::SharedStorage&>(smem);
+    // dim3 nblks_d(padded_batch_size_d, 1, num_kv_heads);
+    if (linear_bid >= prefill_blocks) return;
 
     const uint32_t bx = linear_bid % padded_bsize_p;
     const uint32_t kv_head_idx = linear_bid / padded_bsize_p;
 
+    // dim3 nthrs_d(32, NUM_WARPS_Q_D, NUM_WARPS_KV_D);
     const uint32_t linear_tid = threadIdx.x;
     // Return if threadId exceeds number of threads for this op
     if (linear_tid >= 32 * KTraits_P::NUM_WARPS_Q * KTraits_P::NUM_WARPS_KV) return;
@@ -166,10 +146,13 @@ __global__ __launch_bounds__(std::max(
                                                   kv_head_idx, num_kv_heads_p);
   } else /* OP == DECODE */ {
     auto& smem_storage = reinterpret_cast<typename KTraits_D::SharedStorage&>(smem);
+    // dim3 nblks_d(padded_batch_size_d, 1, num_kv_heads);
+    if (linear_bid >= decode_blocks) return;
 
     const uint32_t bx = linear_bid % padded_bsize_d;
     const uint32_t kv_head_idx = linear_bid / padded_bsize_d;
 
+    // dim3 nthrs_d(32, NUM_WARPS_Q_D, NUM_WARPS_KV_D);
     const uint32_t linear_tid = threadIdx.x;
     // Return if threadId exceeds number of threads for this op
     if (linear_tid >= 32 * KTraits_D::NUM_WARPS_Q * KTraits_D::NUM_WARPS_KV) return;
@@ -199,24 +182,15 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   // Ensure heads match
   assert(prefill_params.paged_kv.num_heads == decode_params.paged_kv.num_heads);
   assert(prefill_params.num_qo_heads == decode_params.num_qo_heads);
-
   // Common variables for both prefill and decode
   const uint32_t num_qo_heads = prefill_params.num_qo_heads;
   const uint32_t num_kv_heads = prefill_params.paged_kv.num_heads;
 
-  // Get device properties once
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
-
   int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
                                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
-
-  int num_sm = 0;
-  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-
-  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
-  constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
 
   // Prefill variable setup
   using DTypeQ_P = typename PrefillParams::DTypeQ;
@@ -230,6 +204,11 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
   using DTypeQKAccum_P =
       typename std::conditional<USE_FP16_QK_REDUCTION && std::is_same_v<DTypeQ_P, half>, half,
                                 float>::type;
+
+  const uint32_t group_size = num_qo_heads / num_kv_heads;
+  const uint_fastdiv group_size_fastdiv(group_size);
+  constexpr uint32_t NUM_MMA_D_QK = HEAD_DIM_QK / 16;
+  constexpr uint32_t NUM_MMA_D_VO = HEAD_DIM_VO / 16;
 
   // Decode vars setup
   using DTypeQ_D = typename DecodeParams::DTypeQ;
@@ -268,6 +247,7 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
        !USE_FP16_QK_REDUCTION)
           ? 2
           : (8 / NUM_MMA_Q_D);
+  // TODO(Zihao): fix the following computation
   const uint32_t max_num_mma_kv_smem_d =
       (max_smem_per_threadblock / (16 * HEAD_DIM_QK * sizeof(DTypeQ_D)) -
        NUM_MMA_Q_D * NUM_WARPS_Q_D) /
@@ -353,12 +333,14 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
           int nthrs = max(nthrs_p, nthrs_d);
           //  ************************************************ /
 
-          // Initialize scheduler array: [0..num_sm-1] per-sm counters, [num_sm+0] prefill global, [num_sm+1] decode global
+          int num_sm = 0;
+          FLASHINFER_CUDA_CALL(
+              cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
           FLASHINFER_CUDA_CALL(
               cudaMemsetAsync(sm_aware_sched, 0, sizeof(int) * (num_sm + 2), stream));
 
           // Setup kernel arguments
-          void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&sm_aware_sched, (void*)&num_sm};
+          void* args[] = {(void*)&prefill_params, (void*)&decode_params, (void*)&sm_aware_sched};
           FLASHINFER_CUDA_CALL(
               cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -375,7 +357,7 @@ cudaError_t BatchPODWithKVCacheTensorDispatched(PrefillParams prefill_params,
             config.dynamicSmemBytes = smem_size;
             config.stream = stream;
             FLASHINFER_CUDA_CALL(
-                cudaLaunchKernelEx(&config, kernel, prefill_params, decode_params, sm_aware_sched, num_sm));
+                cudaLaunchKernelEx(&config, kernel, prefill_params, decode_params, sm_aware_sched));
           } else {
             FLASHINFER_CUDA_CALL(
                 cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));

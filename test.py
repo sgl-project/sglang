@@ -12,7 +12,7 @@ os.environ['SGLANG_ENABLE_TORCH_COMPILE'] = '0'
 os.environ['FLASHINFER_DISABLE_VERSION_CHECK'] = '1'
 os.environ['SGLANG_DISABLE_CUDNN_CHECK'] = '1'
 os.environ['HF_HUB_OFFLINE'] = '1'
-os.environ['PYTHONPATH'] = '/workspace/pod/sglang/python:$PYTHONPATH'
+os.environ['PYTHONPATH'] = '/workspac/sglang/python:$PYTHONPATH'
 os.environ['SGLANG_USE_MODELSCOPE'] = 'true'
 
 
