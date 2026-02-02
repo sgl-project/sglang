@@ -404,7 +404,7 @@ class MMReceiverBase(ABC):
         for recv_req in recv_reqs:
             if (
                 isinstance(recv_req, TokenizedGenerateReqInput)
-                and recv_req.need_wait_for_image is True
+                and recv_req.need_wait_for_encoder is True
             ):
                 waiting_req = waiting_cls(
                     rid=recv_req.rid,
@@ -467,7 +467,7 @@ class MMReceiverBase(ABC):
             obj.rid = uuid.uuid4().hex
         if image_urls and len(image_urls) > 0:
             logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
-            obj.need_wait_for_image = True
+            obj.need_wait_for_encoder = True
 
             encode_idx = list(range(len(self.encode_urls)))
             random.shuffle(encode_idx)

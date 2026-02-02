@@ -264,7 +264,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     external_trace_header: Optional[Dict] = None
 
     # For EPD-disaggregated inference
-    need_wait_for_image: Optional[bool] = None
+    need_wait_for_encoder: Optional[bool] = None
     num_items_assigned: Optional[List] = None
 
     # Multimodal tiling controls (extensions)
@@ -762,7 +762,7 @@ class TokenizedGenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
-    need_wait_for_image: bool = False
+    need_wait_for_encoder: bool = False
     num_items_assigned: Optional[List] = None
 
 

@@ -945,7 +945,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,
-                need_wait_for_image=obj.need_wait_for_image,
+                need_wait_for_encoder=obj.need_wait_for_encoder,
                 num_items_assigned=obj.num_items_assigned,
             )
         elif isinstance(obj, EmbeddingReqInput):

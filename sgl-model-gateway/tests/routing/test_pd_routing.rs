@@ -1397,7 +1397,7 @@ mod pd_routing_unit_tests {
         // 1. Extract multimodal items
         // 2. Call encode worker via gRPC
         // 3. Clear multimodal from prefill request
-        // 4. Set need_wait_for_image flag
+        // 4. Set need_wait_for_encoder flag
         // 5. Send to prefill/decode via gRPC
 
         // Step 1: Extract multimodal items
@@ -1418,7 +1418,7 @@ mod pd_routing_unit_tests {
 
         // Step 3 & 4: After encode gRPC call, request should be modified
         // - mm_inputs cleared
-        // - need_wait_for_image = true
+        // - need_wait_for_encoder = true
         // These are verified in the actual implementation
 
         // Step 5: ExecutionResult is Dual (prefill + decode streams)

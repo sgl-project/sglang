@@ -329,12 +329,12 @@ impl RequestExecutionStage {
         helpers::clear_multimodal_inputs(&mut proto_request);
 
         // Mark request as waiting for image embeddings from encode worker via ZMQ
-        Self::set_wait_for_image(&mut proto_request, true);
+        Self::set_wait_for_encoder(&mut proto_request, true);
 
         // Start all three requests in parallel to avoid deadlock:
         // - Prefill/decode gRPC calls start the workers listening on ZMQ
         // - Encode processes images and sends embeddings to prefill via ZMQ
-        // - Prefill blocks on need_wait_for_image until it receives ZMQ data
+        // - Prefill blocks on need_wait_for_encoder until it receives ZMQ data
         let prefill_request = proto_request.clone_inner();
         let decode_request = proto_request;
 
@@ -482,13 +482,13 @@ impl RequestExecutionStage {
         })
     }
 
-    /// Set the need_wait_for_image flag on a proto request
+    /// Set the need_wait_for_encoder flag on a proto request
     ///
-    /// This tells the prefill scheduler to wait for image embeddings
+    /// This tells the prefill scheduler to wait for embeddings
     /// from the encode worker via ZMQ before processing.
-    fn set_wait_for_image(proto_request: &mut ProtoGenerateRequest, wait: bool) {
+    fn set_wait_for_encoder(proto_request: &mut ProtoGenerateRequest, wait: bool) {
         if let ProtoGenerateRequest::Sglang(req) = proto_request {
-            req.need_wait_for_image = Some(wait);
+            req.need_wait_for_encoder = Some(wait);
         }
     }
 }

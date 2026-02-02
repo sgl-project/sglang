@@ -559,7 +559,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             image_urls=image_urls,
             rid=grpc_req.request_id,
         )
-        tokenized_req.need_wait_for_image = bool(encode_req.need_wait_for_image)
+        tokenized_req.need_wait_for_encoder = bool(encode_req.need_wait_for_encoder)
         tokenized_req.num_items_assigned = encode_req.num_items_assigned
 
     # Helper methods for request/response conversion
@@ -624,16 +624,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_room=bootstrap_room,
         )
 
-        if getattr(grpc_req, "need_wait_for_image", False):
+        if getattr(grpc_req, "need_wait_for_encoder", False):
             if self.mm_receiver:
-                tokenized_req.need_wait_for_image = True
+                tokenized_req.need_wait_for_encoder = True
                 if not tokenized_req.num_items_assigned:
                     tokenized_req.num_items_assigned = [
                         1 for _ in self.mm_receiver.encode_urls
                     ]
             else:
                 logger.warning(
-                    "need_wait_for_image set but MM receiver is not initialized"
+                    "need_wait_for_encoder set but MM receiver is not initialized"
                 )
 
         return tokenized_req
