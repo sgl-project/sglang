@@ -798,7 +798,7 @@ class MMReceiverHTTP(MMReceiverBase):
         return mm_inputs
 
 
-class MMReceiverGrpc(MMReceiverHTTP):
+class MMReceiverGrpc(MMReceiverBase):
     def __init__(
         self,
         server_args: ServerArgs,
