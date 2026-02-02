@@ -652,7 +652,11 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch:
   TORCH_CHECK(output.scalar_type() == torch::kBFloat16, "Only BFloat16 output dtype is supported")
 
   auto const sm = getSMVersion();
+#ifndef USE_MUSA
   TORCH_CHECK(sm >= 90, "required CUDA ARCH >= SM_90");
+#else
+  TORCH_CHECK(sm >= 22, "required MUSA ARCH >= MP_22");
+#endif
 
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
   if (num_tokens <= 8) {
