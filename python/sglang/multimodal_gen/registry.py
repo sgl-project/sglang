@@ -30,7 +30,6 @@ if TYPE_CHECKING:
 from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
-    Hunyuan3D2PipelineConfig,
     HunyuanConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
@@ -47,6 +46,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
     GlmImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.mova import (
+    MOVA360PConfig,
+    MOVA720PConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -73,6 +76,10 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX2SamplingParams
+from sglang.multimodal_gen.configs.sample.mova import (
+    MOVA_360P_SamplingParams,
+    MOVA_720P_SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -91,7 +98,10 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
+from sglang.multimodal_gen.configs.sample.zimage import (
+    ZImageSamplingParams,
+    ZImageTurboSamplingParams,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -184,7 +194,6 @@ class ConfigInfo:
 
     sampling_param_cls: Any
     pipeline_config_cls: Type[PipelineConfig]
-    pipeline_cls: Type[ComposedPipelineBase] | None = None
 
 
 # The central registry mapping a model name to its configuration information
@@ -200,7 +209,6 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 def register_configs(
     sampling_param_cls: Any,
     pipeline_config_cls: Type[PipelineConfig],
-    pipeline_cls: Type[ComposedPipelineBase] | None = None,
     hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
 ):
@@ -212,7 +220,6 @@ def register_configs(
     _CONFIG_REGISTRY[model_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
-        pipeline_cls=pipeline_cls,
     )
     if hf_model_paths:
         for path in hf_model_paths:
@@ -360,62 +367,42 @@ def get_model_info(
     # 1. Discover all available pipeline classes and cache them
     _discover_and_register_pipelines()
 
-    # 2. Get configuration classes (sampling, pipeline config)
+    # 2. Get pipeline class from model's model_index.json
     try:
-        config_info = _get_config_info(model_path)
+        if os.path.exists(model_path):
+            config = verify_model_config_and_directory(model_path)
+        else:
+            config = maybe_download_model_index(model_path)
     except Exception as e:
-        logger.error(f"Could not resolve configuration for '{model_path}': {e}")
+        logger.error(f"Could not read model config for '{model_path}': {e}")
+        if backend == Backend.AUTO:
+            logger.info("Falling back to diffusers backend")
+            return _get_diffusers_model_info(model_path)
         return None
 
-    if not config_info:
-        logger.error(
-            f"Could not resolve configuration for model '{model_path}'. "
-            "It is not a registered model path or detected by any registered model family detectors. "
-            f"Known model paths: {list(_MODEL_HF_PATH_TO_NAME.keys())}"
-        )
+    pipeline_class_name = config.get("_class_name")
+    if not pipeline_class_name:
+        logger.error(f"'_class_name' not found in model_index.json for '{model_path}'")
+        if backend == Backend.AUTO:
+            logger.info("Falling back to diffusers backend")
+            return _get_diffusers_model_info(model_path)
         return None
 
-    if config_info.pipeline_cls is not None:
-        pipeline_cls = config_info.pipeline_cls
-    else:
-        # 3. Get pipeline class from model's model_index.json
-        try:
-            if os.path.exists(model_path):
-                config = verify_model_config_and_directory(model_path)
-            else:
-                config = maybe_download_model_index(model_path)
-        except Exception as e:
-            logger.error(f"Could not read model config for '{model_path}': {e}")
-            if backend == Backend.AUTO:
-                logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info(model_path)
-            return None
-
-        pipeline_class_name = config.get("_class_name")
-        if not pipeline_class_name:
-            logger.error(
-                f"'_class_name' not found in model_index.json for '{model_path}'"
+    pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
+    if not pipeline_cls:
+        if backend == Backend.AUTO:
+            logger.warning(
+                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
+                f"Falling back to diffusers backend."
             )
-            if backend == Backend.AUTO:
-                logger.info("Falling back to diffusers backend")
-                return _get_diffusers_model_info(model_path)
+            return _get_diffusers_model_info(model_path)
+        else:
+            logger.error(
+                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
+                f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}. "
+                f"Consider using --backend diffusers to use vanilla diffusers pipeline."
+            )
             return None
-
-        pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
-        if not pipeline_cls:
-            if backend == Backend.AUTO:
-                logger.warning(
-                    f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
-                    f"Falling back to diffusers backend."
-                )
-                return _get_diffusers_model_info(model_path)
-            else:
-                logger.error(
-                    f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
-                    f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}. "
-                    f"Consider using --backend diffusers to use vanilla diffusers pipeline."
-                )
-                return None
 
     # 3. Get configuration classes (sampling, pipeline config)
     config_info = _get_config_info(model_path)
@@ -466,7 +453,7 @@ def _register_configs():
         hf_model_paths=[
             "hunyuanvideo-community/HunyuanVideo",
         ],
-        model_detectors=[lambda hf_id: "hunyuanvideo" in hf_id.lower()],
+        model_detectors=[lambda hf_id: "hunyuan" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=FastHunyuanSamplingParam,
@@ -475,20 +462,6 @@ def _register_configs():
             "FastVideo/FastHunyuan-diffusers",
         ],
     )
-
-    from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-    from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
-        Hunyuan3D2Pipeline,
-    )
-
-    # Hunyuan3D-2.0
-    register_configs(
-        sampling_param_cls=Hunyuan3DSamplingParams,
-        pipeline_config_cls=Hunyuan3D2PipelineConfig,
-        pipeline_cls=Hunyuan3D2Pipeline,
-        hf_model_paths=["tencent/Hunyuan3D-2"],
-    )
-
     # Wan
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
@@ -581,6 +554,21 @@ def _register_configs():
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
+    # MOVA
+    register_configs(
+        sampling_param_cls=MOVA_360P_SamplingParams,
+        pipeline_config_cls=MOVA360PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "360p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MOVA_720P_SamplingParams,
+        pipeline_config_cls=MOVA720PConfig,
+        model_detectors=[
+            lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )
     # FLUX
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -613,12 +601,22 @@ def _register_configs():
         ],
     )
     register_configs(
-        sampling_param_cls=ZImageSamplingParams,
+        sampling_param_cls=ZImageTurboSamplingParams,
         pipeline_config_cls=ZImagePipelineConfig,
         hf_model_paths=[
             "Tongyi-MAI/Z-Image-Turbo",
         ],
-        model_detectors=[lambda hf_id: "z-image" in hf_id.lower()],
+        model_detectors=[lambda hf_id: "z-image-turbo" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        hf_model_paths=[
+            "Tongyi-MAI/Z-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
+        ],
     )
     # Qwen-Image
     register_configs(
@@ -660,18 +658,6 @@ def _register_configs():
         pipeline_config_cls=GlmImagePipelineConfig,
         model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
     )
-
-
-_NON_DIFFUSERS_MODEL_DETECTORS: List[Callable[[str], bool]] = [
-    lambda path: "hunyuan3d" in path.lower(),
-]
-
-
-def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    for detector in _NON_DIFFUSERS_MODEL_DETECTORS:
-        if detector(model_path):
-            return True
-    return False
 
 
 _register_configs()

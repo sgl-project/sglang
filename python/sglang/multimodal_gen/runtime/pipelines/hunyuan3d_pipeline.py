@@ -18,10 +18,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     Hunyuan3DInputStage,
+    Hunyuan3DPaintDelightStage,
     Hunyuan3DPaintDiffusionStage,
     Hunyuan3DPaintPostprocessStage,
-    Hunyuan3DPaintPreprocessStage,
     Hunyuan3DPaintRenderStage,
+    Hunyuan3DPaintUVUnwrapStage,
     Hunyuan3DShapeConditioningStage,
     Hunyuan3DShapeDenoisingStage,
     Hunyuan3DShapeExportStage,
@@ -83,14 +84,15 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
     def _initialize_paint_pipeline(self, config: Hunyuan3D2PipelineConfig):
         """Initialize the paint pipeline for texture generation.
 
-        This sets up the new 4-stage texture generation pipeline:
-        1. PaintPreprocessStage: UV unwrap and image delight
-        2. PaintRenderStage: Multi-view normal/position rendering
-        3. PaintDiffusionStage: Texture diffusion generation
-        4. PaintPostprocessStage: Texture baking and export
+        This sets up the new 5-stage texture generation pipeline:
+        1. PaintUVUnwrapStage: UV unwrap mesh
+        2. PaintDelightStage: Remove lighting from reference image
+        3. PaintRenderStage: Multi-view normal/position rendering
+        4. PaintDiffusionStage: Texture diffusion generation
+        5. PaintPostprocessStage: Texture baking and export
         """
         logger.info(
-            "Paint pipeline (texture generation) initialized with 4-stage architecture."
+            "Paint pipeline (texture generation) initialized with 5-stage architecture."
         )
 
     def create_pipeline_stages(self, server_args: ServerArgs):
@@ -147,10 +149,14 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
 
         # Paint stages (optional)
         if config.paint_enable:
-            # New 4-stage texture generation pipeline
+            # New 5-stage texture generation pipeline
             self.add_stage(
-                stage_name="paint_preprocess_stage",
-                stage=Hunyuan3DPaintPreprocessStage(config=config),
+                stage_name="paint_uv_unwrap_stage",
+                stage=Hunyuan3DPaintUVUnwrapStage(config=config),
+            )
+            self.add_stage(
+                stage_name="paint_delight_stage",
+                stage=Hunyuan3DPaintDelightStage(config=config),
             )
             self.add_stage(
                 stage_name="paint_render_stage",

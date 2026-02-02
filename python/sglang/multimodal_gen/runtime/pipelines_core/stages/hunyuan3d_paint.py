@@ -198,28 +198,117 @@ class DDIMSolver:
         return x_prev
 
 
-class Hunyuan3DPaintPreprocessStage(PipelineStage):
-    """Stage 1: UV unwrap and image delight preprocessing.
+def _recorrect_rgb(
+    src_image: torch.Tensor,
+    target_image: torch.Tensor,
+    alpha_channel: torch.Tensor,
+    scale: float = 0.95,
+) -> torch.Tensor:
+    """Correct RGB values to match target color distribution.
 
-    This stage prepares the mesh and reference image for texture generation:
-    - Applies UV unwrapping to the mesh using xatlas
-    - Removes lighting/shadows from the reference image using the delight model
+    Source: Hunyuan3D-2/hy3dgen/texgen/utils/dehighlight_utils.py
+    """
+
+    def flat_and_mask(bgr, a):
+        mask = torch.where(a > 0.5, True, False)
+        bgr_flat = bgr.reshape(-1, bgr.shape[-1])
+        mask_flat = mask.reshape(-1)
+        bgr_flat_masked = bgr_flat[mask_flat, :]
+        return bgr_flat_masked
+
+    src_flat = flat_and_mask(src_image, alpha_channel)
+    target_flat = flat_and_mask(target_image, alpha_channel)
+    corrected_bgr = torch.zeros_like(src_image)
+
+    for i in range(3):
+        src_mean, src_stddev = torch.mean(src_flat[:, i]), torch.std(src_flat[:, i])
+        target_mean, target_stddev = torch.mean(target_flat[:, i]), torch.std(
+            target_flat[:, i]
+        )
+        corrected_bgr[:, :, i] = torch.clamp(
+            (src_image[:, :, i] - scale * src_mean) * (target_stddev / src_stddev)
+            + scale * target_mean,
+            0,
+            1,
+        )
+
+    src_mse = torch.mean((src_image - target_image) ** 2)
+    modify_mse = torch.mean((corrected_bgr - target_image) ** 2)
+    if src_mse < modify_mse:
+        corrected_bgr = torch.cat([src_image, alpha_channel], dim=-1)
+    else:
+        corrected_bgr = torch.cat([corrected_bgr, alpha_channel], dim=-1)
+
+    return corrected_bgr
+
+
+class Hunyuan3DPaintUVUnwrapStage(PipelineStage):
+    """Stage 1a: UV unwrap preprocessing.
+
+    This stage applies UV unwrapping to the mesh using xatlas.
     """
 
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
         self.config = config
-        self.delight_model = None
-        self._delight_loaded = False
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        import time
+
+        from sglang.multimodal_gen.runtime.models.mesh3d_utils import mesh_uv_wrap
+
+        # Get mesh from shape generation
+        mesh = batch.extra["shape_meshes"]
+        if isinstance(mesh, list):
+            mesh = mesh[0]
+
+        print(
+            f"[DEBUG UV] Input mesh - vertices: {len(mesh.vertices)}, faces: {len(mesh.faces)}"
+        )
+
+        # UV unwrap
+        try:
+            print("[DEBUG UV] Starting xatlas UV unwrap...")
+            start_time = time.time()
+            mesh = mesh_uv_wrap(mesh)
+            elapsed = time.time() - start_time
+            print(f"[DEBUG UV] UV unwrapping completed in {elapsed:.2f} seconds")
+            logger.info("UV unwrapping completed")
+        except Exception as e:
+            print(f"[DEBUG UV] UV unwrapping failed: {e}")
+            logger.warning(f"UV unwrapping failed: {e}")
+
+        batch.extra["paint_mesh"] = mesh
+        return batch
+
+
+class Hunyuan3DPaintDelightStage(PipelineStage):
+    """Stage 1b: Image delight preprocessing.
+
+    This stage removes lighting/shadows from the reference image
+    using the StableDiffusionInstructPix2PixPipeline (delight model).
+    """
+
+    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.pipeline = None
+        self._loaded = False
+
+        # Delight parameters
+        self.cfg_image = 1.5
+        self.cfg_text = 1.0
 
     def _load_delight_model(self, server_args: ServerArgs):
         """Lazy load the delight model."""
-        if self._delight_loaded:
+        if self._loaded:
             return
 
-        from sglang.multimodal_gen.runtime.models.preprocessors.delight import (
-            LightShadowRemover,
+        from diffusers import (
+            EulerAncestralDiscreteScheduler,
+            StableDiffusionInstructPix2PixPipeline,
         )
+        from huggingface_hub import snapshot_download
 
         # Get model path from config
         model_path = server_args.model_path
@@ -228,8 +317,6 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
         )
 
         # Try to load from HuggingFace or local path
-        from huggingface_hub import snapshot_download
-
         base_dir = os.environ.get("HY3DGEN_MODELS", "~/.cache/hy3dgen")
         local_path = os.path.expanduser(
             os.path.join(base_dir, model_path, delight_subfolder)
@@ -248,41 +335,86 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
                 local_path = None
 
         if local_path and os.path.exists(local_path):
-            self.delight_model = LightShadowRemover(local_path)
-            self._delight_loaded = True
+            pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                local_path,
+                torch_dtype=torch.float16,
+                safety_checker=None,
+            )
+            pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
+                pipeline.scheduler.config
+            )
+            pipeline.set_progress_bar_config(disable=True)
+            self.pipeline = pipeline.to("cuda", torch.float16)
+            self._loaded = True
             logger.info("Delight model loaded successfully")
         else:
             logger.warning(
                 "Delight model not available, skipping delight preprocessing"
             )
+            self._loaded = True
+
+    @torch.no_grad()
+    def _run_delight(self, image):
+        """Run the delight pipeline on an image."""
+        import cv2
+        from PIL import Image as PILImage
+
+        image = image.resize((512, 512))
+
+        if image.mode == "RGBA":
+            image_array = np.array(image)
+            alpha_channel = image_array[:, :, 3]
+            erosion_size = 3
+            kernel = np.ones((erosion_size, erosion_size), np.uint8)
+            alpha_channel = cv2.erode(alpha_channel, kernel, iterations=1)
+            image_array[alpha_channel == 0, :3] = 255
+            image_array[:, :, 3] = alpha_channel
+            image = PILImage.fromarray(image_array)
+
+            image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
+            alpha = image_tensor[:, :, 3:]
+            rgb_target = image_tensor[:, :, :3]
+        else:
+            image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
+            alpha = torch.ones_like(image_tensor)[:, :, :1]
+            rgb_target = image_tensor[:, :, :3]
+
+        image = image.convert("RGB")
+
+        image = self.pipeline(
+            prompt="",
+            image=image,
+            generator=torch.manual_seed(42),
+            height=512,
+            width=512,
+            num_inference_steps=50,
+            image_guidance_scale=self.cfg_image,
+            guidance_scale=self.cfg_text,
+        ).images[0]
+
+        image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
+        rgb_src = image_tensor[:, :, :3]
+        image = _recorrect_rgb(rgb_src, rgb_target, alpha)
+        image = image[:, :, :3] * image[:, :, 3:] + torch.ones_like(image[:, :, :3]) * (
+            1.0 - image[:, :, 3:]
+        )
+        from PIL import Image as PILImage
+
+        image = PILImage.fromarray((image.cpu().numpy() * 255).astype(np.uint8))
+
+        return image
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from PIL import Image
 
-        from sglang.multimodal_gen.runtime.models.mesh_utils import mesh_uv_wrap
-
-        # Get mesh from shape generation
-        mesh = batch.extra["shape_meshes"]
-        if isinstance(mesh, list):
-            mesh = mesh[0]
-
-        # UV unwrap
-        try:
-            mesh = mesh_uv_wrap(mesh)
-            logger.info("UV unwrapping completed")
-        except Exception as e:
-            logger.warning(f"UV unwrapping failed: {e}")
-
-        batch.extra["paint_mesh"] = mesh
-
-        # Load and process reference image
+        # Load reference image
         image = Image.open(batch.image_path)
 
         # Apply delight if model is available
         self._load_delight_model(server_args)
-        if self.delight_model is not None:
+        if self.pipeline is not None:
             try:
-                image = self.delight_model(image)
+                image = self._run_delight(image)
                 logger.info("Image delight completed")
             except Exception as e:
                 logger.warning(f"Image delight failed: {e}")
@@ -313,9 +445,7 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
         if self.renderer is not None:
             return
 
-        from sglang.multimodal_gen.runtime.models.renderers.mesh_render import (
-            MeshRender,
-        )
+        from sglang.multimodal_gen.runtime.models.mesh3d_utils import MeshRender
 
         render_size = getattr(self.config, "paint_resolution", 512)
         texture_size = getattr(self.config, "paint_texture_size", 2048)
@@ -422,7 +552,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
             from diffusers.image_processor import VaeImageProcessor
             from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
-            from sglang.multimodal_gen.runtime.models.unets.hunyuan3d_paint import (
+            from sglang.multimodal_gen.runtime.models.dits.hunyuan3d import (
                 UNet2p5DConditionModel,
             )
 
@@ -601,7 +731,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         )
 
         if self.paint_is_turbo and "paint_position_maps" in batch.extra:
-            from sglang.multimodal_gen.runtime.models.unets.hunyuan3d_paint import (
+            from sglang.multimodal_gen.runtime.models.dits.hunyuan3d import (
                 compute_multi_resolution_discrete_voxel_indice,
                 compute_multi_resolution_mask,
             )
@@ -922,11 +1052,15 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         self.config = config
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        import time
+
         renderer = batch.extra["renderer"]
         multiview_textures = batch.extra["multiview_textures"]
         camera_elevs = batch.extra["camera_elevs"]
         camera_azims = batch.extra["camera_azims"]
         view_weights = batch.extra["view_weights"]
+
+        print(f"[DEBUG Postprocess] Starting with {len(multiview_textures)} textures")
 
         # Resize textures if needed
         render_size = getattr(self.config, "paint_resolution", 512)
@@ -936,9 +1070,14 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
                 resized_textures.append(tex.resize((render_size, render_size)))
             else:
                 resized_textures.append(tex)
+        print(
+            f"[DEBUG Postprocess] Resized {len(resized_textures)} textures to {render_size}x{render_size}"
+        )
 
         # Bake textures from multiple views
         try:
+            print("[DEBUG Postprocess] Starting bake_from_multiview()...")
+            start_time = time.time()
             texture, mask = renderer.bake_from_multiview(
                 resized_textures,
                 camera_elevs,
@@ -946,16 +1085,41 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
                 view_weights,
                 method="fast",
             )
+            elapsed = time.time() - start_time
+            print(
+                f"[DEBUG Postprocess] bake_from_multiview() completed in {elapsed:.2f} seconds"
+            )
+            print(
+                f"[DEBUG Postprocess] texture shape: {texture.shape if hasattr(texture, 'shape') else 'N/A'}"
+            )
 
             # Inpaint missing regions
+            print("[DEBUG Postprocess] Starting texture_inpaint()...")
+            start_time = time.time()
             mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype("uint8")
             texture = renderer.texture_inpaint(texture, mask_np)
+            elapsed = time.time() - start_time
+            print(
+                f"[DEBUG Postprocess] texture_inpaint() completed in {elapsed:.2f} seconds"
+            )
 
             # Apply texture to mesh
+            print("[DEBUG Postprocess] Setting texture...")
+            start_time = time.time()
             renderer.set_texture(texture)
+            elapsed = time.time() - start_time
+            print(
+                f"[DEBUG Postprocess] set_texture() completed in {elapsed:.2f} seconds"
+            )
+
+            print("[DEBUG Postprocess] Saving mesh...")
+            start_time = time.time()
             textured_mesh = renderer.save_mesh()
+            elapsed = time.time() - start_time
+            print(f"[DEBUG Postprocess] save_mesh() completed in {elapsed:.2f} seconds")
             logger.info("Texture baking completed")
         except Exception as e:
+            print(f"[DEBUG Postprocess] Texture baking failed: {e}")
             logger.error(f"Texture baking failed: {e}")
             # Fallback to untextured mesh
             textured_mesh = batch.extra["paint_mesh"]
@@ -963,16 +1127,26 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         # Export mesh
         obj_path = batch.extra["shape_obj_path"]
         return_path = batch.extra["shape_return_path"]
+        print(f"[DEBUG Postprocess] Exporting mesh to {obj_path}")
 
         # Save textured mesh
         try:
+            print("[DEBUG Postprocess] Starting mesh export...")
+            start_time = time.time()
             textured_mesh.export(obj_path)
+            elapsed = time.time() - start_time
+            print(f"[DEBUG Postprocess] Mesh exported in {elapsed:.2f} seconds")
 
             if return_path.endswith(".glb") and self.config.paint_save_glb:
+                print("[DEBUG Postprocess] Exporting GLB...")
+                start_time = time.time()
                 glb_path = obj_path[:-4] + ".glb"
                 textured_mesh.export(glb_path)
+                elapsed = time.time() - start_time
+                print(f"[DEBUG Postprocess] GLB exported in {elapsed:.2f} seconds")
                 return_path = glb_path
         except Exception as e:
+            print(f"[DEBUG Postprocess] Mesh export failed: {e}")
             logger.error(f"Mesh export failed: {e}")
 
         return OutputBatch(output=[return_path], timings=batch.timings)
@@ -1014,7 +1188,8 @@ class Hunyuan3DPaintStage(PipelineStage):
 
 
 __all__ = [
-    "Hunyuan3DPaintPreprocessStage",
+    "Hunyuan3DPaintUVUnwrapStage",
+    "Hunyuan3DPaintDelightStage",
     "Hunyuan3DPaintRenderStage",
     "Hunyuan3DPaintDiffusionStage",
     "Hunyuan3DPaintPostprocessStage",

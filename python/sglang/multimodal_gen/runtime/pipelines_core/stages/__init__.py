@@ -31,11 +31,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising_dmd import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encoding import EncodingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_paint import (
+    Hunyuan3DPaintDelightStage,
     Hunyuan3DPaintDiffusionStage,
     Hunyuan3DPaintPostprocessStage,
-    Hunyuan3DPaintPreprocessStage,
     Hunyuan3DPaintRenderStage,
     Hunyuan3DPaintStage,
+    Hunyuan3DPaintUVUnwrapStage,
 )
 
 # Hunyuan3D stages
@@ -100,7 +101,8 @@ __all__ = [
     "Hunyuan3DShapeExportStage",
     "Hunyuan3DShapeSaveStage",
     "Hunyuan3DShapeOnlyOutputStage",
-    "Hunyuan3DPaintPreprocessStage",
+    "Hunyuan3DPaintUVUnwrapStage",
+    "Hunyuan3DPaintDelightStage",
     "Hunyuan3DPaintRenderStage",
     "Hunyuan3DPaintDiffusionStage",
     "Hunyuan3DPaintPostprocessStage",

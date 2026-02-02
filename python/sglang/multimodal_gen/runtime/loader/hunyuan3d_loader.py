@@ -39,7 +39,7 @@ class Hunyuan3DShapeLoader(ComponentLoader):
             pass
 
         # Try to resolve via hunyuan3d_utils (for ImageProcessorV2, MVImageProcessorV2, etc.)
-        from sglang.multimodal_gen.runtime.models.hunyuan3d_utils import (
+        from sglang.multimodal_gen.runtime.models.mesh3d_utils import (
             resolve_hunyuan3d_tool,
         )
 
