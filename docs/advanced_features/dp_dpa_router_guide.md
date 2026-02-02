@@ -1,49 +1,6 @@
-# Comprehensive Guide: Navigating DP, DPA, and Router Best Practices
+# Comprehensive Guide: DP, DPA, and Router
 
-This guide serves as the definitive "Source of Truth" for understanding and optimizing parallelism strategies in SGLang. As SGLang expands its support for advanced model architectures (such as DeepSeek), choosing the right parallelism strategy becomes crucial for achieving high-throughput, large-scale inference.
-
-## Table of Contents
-
-1. [Overview: Parallelism Strategies in SGLang](#overview-parallelism-strategies-in-sglang)
-2. [Understanding Data Parallelism (DP)](#understanding-data-parallelism-dp)
-3. [Understanding DPA (Data Parallelism Attention)](#understanding-dpa-data-parallelism-attention)
-   - [What is DPA?](#what-is-dpa)
-   - [DPA with Expert Parallelism for MoE](#dpa-with-expert-parallelism-for-moe)
-   - [Target Models](#target-models)
-   - [Activation Logic](#activation-logic)
-4. [Native DP vs. Router-Based DP](#native-dp-vs-router-based-dp)
-   - [Native DP Mode](#native-dp-mode)
-   - [Router-Based DP (Recommended)](#router-based-dp-recommended)
-   - [Comparison Summary](#comparison-summary)
-5. [Practical Implementation: DP Routing via Router](#practical-implementation-dp-routing-via-router)
-   - [Quick Start](#quick-start)
-   - [Load Balancing Policies](#load-balancing-policies)
-   - [Best Practices](#best-practices)
-   - [Verifying Traffic Distribution](#verifying-traffic-distribution)
-6. [Quick Reference](#quick-reference)
-
----
-
-## Overview: Parallelism Strategies in SGLang
-
-SGLang supports multiple parallelism strategies that can be combined for optimal performance:
-
-| Strategy | Component | Description |
-|----------|-----------|-------------|
-| **TP (Tensor Parallelism)** | All layers | Splits model weights across GPUs |
-| **DP (Data Parallelism)** | Full model | Replicates model, processes different batches |
-| **DPA (DP Attention)** | Attention layers | DP for attention, avoids KV cache duplication |
-| **EP (Expert Parallelism)** | MoE layers | Distributes expert weights across GPUs |
-| **PP (Pipeline Parallelism)** | Across layers | Distributes layers across pipeline stages |
-
-For **DeepSeek models** (V2/V3/R1), the recommended strategy combines:
-- **DPA** for attention layers (eliminates KV cache duplication)
-- **EP** for MoE layers (enables large-scale expert distribution)
-- **DP** for dense FFN and LM head layers
-
-This achieves up to **5x throughput improvement** compared to vanilla tensor parallelism.
-
----
+This guide explains Data Parallelism Attention (DPA), a parallelism strategy optimized for MLA-based models like DeepSeek, and how to deploy it with Router-based DP for production.
 
 ## Understanding Data Parallelism (DP)
 
