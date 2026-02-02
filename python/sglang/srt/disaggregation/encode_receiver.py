@@ -1041,14 +1041,8 @@ def create_mm_receiver(
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
 ):
-    has_grpc = any(
-        url.startswith("grpc://") or url.startswith("grpcs://")
-        for url in server_args.encoder_urls
-    )
-    has_http = any(
-        url.startswith("http://") or url.startswith("https://")
-        for url in server_args.encoder_urls
-    )
+    has_grpc = any(url.startswith("grpc://") for url in server_args.encoder_urls)
+    has_http = any(url.startswith("http://") for url in server_args.encoder_urls)
     if has_grpc and has_http:
         raise ValueError(
             "Mixed encoder URL schemes are not supported; use either grpc:// or http(s):// only."
