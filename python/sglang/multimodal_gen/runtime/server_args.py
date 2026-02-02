@@ -244,7 +244,6 @@ class ServerArgs:
 
     # LiteAttention backend params (only used when attention_backend == "lite_attn")
     lite_attn_threshold: float = -6.0
-    lite_attn_enable_skipping: bool = True
     lite_attn_max_batch_size: int = 2
     lite_attn_reverse_skip_list: bool = True
     lite_attn_use_int8: bool = False
@@ -517,13 +516,6 @@ class ServerArgs:
             dest="lite_attn_threshold",
             default=ServerArgs.lite_attn_threshold,
             help="LiteAttention threshold (log-space), default -6.0.",
-        )
-        parser.add_argument(
-            "--lite-attn-enable-skipping",
-            action=StoreBoolean,
-            dest="lite_attn_enable_skipping",
-            default=ServerArgs.lite_attn_enable_skipping,
-            help="Enable LiteAttention skipping (falls back to FA when disabled).",
         )
         parser.add_argument(
             "--lite-attn-max-batch-size",
