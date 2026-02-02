@@ -177,7 +177,8 @@ class BatchScheduler:
         3. Tie-break by oldest request
         """
         best_config = None
-        best_score = -1
+        best_batch = -1
+        best_oldest_wait = -1.0
 
         for config, queue in self._buckets.items():
             if not queue:
@@ -185,17 +186,20 @@ class BatchScheduler:
 
             oldest_wait = queue[0].wait_time
 
-            # Starvation check - force this bucket if waited too long
+            # Starvation check
             if oldest_wait > self.max_wait_time_s:
                 logger.info(
                     f"Starvation prevention: forcing bucket {config} after {oldest_wait:.1f}s wait"
                 )
                 return config
 
-            # Score = potential batch size with bonus for older requests
-            score = min(oldest_wait / self.max_wait_time_s, 1.0)
-            if score > best_score:
-                best_score = score
+            # Biggest queue => biggest potential batch (or clamp to max batch if you have one)
+            potential_batch = len(queue)
+            if (potential_batch > best_batch) or (
+                potential_batch == best_batch and oldest_wait > best_oldest_wait
+            ):
+                best_batch = potential_batch
+                best_oldest_wait = oldest_wait
                 best_config = config
 
         return best_config
@@ -287,12 +291,13 @@ class BatchScheduler:
 
         return merged, per_req_num_outputs
 
-    def get_next_batch(self) -> Optional[Tuple[List[bytes], "Req", RequestConfig]]:
+    def get_next_batch(
+        self,
+    ) -> Optional[Tuple[List[bytes], List[int], "Req", RequestConfig]]:
         """
         Get the next batch to process.
-
         Returns:
-            Tuple of (identities, merged_req, config) or None if queue is empty
+            Tuple of (identities, per_req_num_outputs, merged_req, config) or None if queue is empty
         """
         if self.is_empty():
             return None
