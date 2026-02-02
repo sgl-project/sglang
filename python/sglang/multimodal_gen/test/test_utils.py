@@ -19,6 +19,28 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 logger = init_logger(__name__)
 
 
+def print_value_formatted(description: str, value: int | float | str):
+    """Helper function to print a metric value formatted."""
+    if isinstance(value, int):
+        if value >= 1e6:
+            value_str = f"{value / 1e6:<30.2f}M"
+        elif value >= 1e3:
+            value_str = f"{value / 1e3:<30.2f}K"
+        else:
+            value_str = f"{value:<30}"
+    elif isinstance(value, float):
+        value_str = f"{value:<30.2f}"
+    else:
+        value_str = f"{value:<30}"
+
+    print(f"{description:<45} {value_str}")
+
+
+def print_divider(length: int, char: str = "-"):
+    """Helper function to print a divider line."""
+    print(char * length)
+
+
 def is_image_url(image_path: str | Path | None) -> bool:
     """Check if image_path is a URL."""
     if image_path is None:
