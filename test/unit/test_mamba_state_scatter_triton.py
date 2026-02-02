@@ -34,7 +34,7 @@ def _ref_scatter(dst, src, dst_indices, src_indices, step_indices):
     dst[:, dst_indices] = src[:, src_indices, step_indices].to(dst.dtype, copy=False)
 
 
-def _old_update_like(
+def _ref_update_like(
     ssm_states,
     intermediate_ssm,
     conv_states,
@@ -45,7 +45,7 @@ def _old_update_like(
     mamba_track_indices=None,
     mamba_steps_to_track=None,
 ):
-    """Matches the pre-optimization logic in update_mamba_state_after_mtp_verify."""
+    """Reference implementation using PyTorch advanced indexing for correctness verification."""
     request_number = accepted_steps.shape[0]
     intermediate_state_indices = torch.arange(
         request_number, dtype=torch.int32, device=accepted_steps.device
@@ -189,7 +189,7 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
         ssm_fused = ssm_states0.clone()
         conv_fused = conv_states0.clone()
 
-        _old_update_like(
+        _ref_update_like(
             ssm_ref,
             intermediate_ssm,
             conv_ref,
@@ -267,8 +267,8 @@ class TestMambaStateScatterPerf(unittest.TestCase):
             track_invalid = torch.rand((B,), device=device) >= track_ratio
             mamba_steps_to_track[track_invalid] = -1
 
-        def old_fn():
-            _old_update_like(
+        def ref_fn():
+            _ref_update_like(
                 ssm_states,
                 intermediate_ssm,
                 conv_states,
@@ -292,16 +292,16 @@ class TestMambaStateScatterPerf(unittest.TestCase):
             )
 
         # Warm up JIT compilation for triton kernels (and caches for torch indexing)
-        old_fn()
+        ref_fn()
         fused_fn()
         torch.cuda.synchronize()
 
-        old_ms = _time_cuda_ms(old_fn)
+        ref_ms = _time_cuda_ms(ref_fn)
         fused_ms = _time_cuda_ms(fused_fn)
 
         num_valid = int((accepted_steps >= 0).sum().item())
-        ratio = fused_ms / old_ms if old_ms > 0 else float("inf")
-        speedup = old_ms / fused_ms if fused_ms > 0 else float("inf")
+        ratio = fused_ms / ref_ms if ref_ms > 0 else float("inf")
+        speedup = ref_ms / fused_ms if fused_ms > 0 else float("inf")
 
         # Print a concise report
         print(
@@ -309,7 +309,7 @@ class TestMambaStateScatterPerf(unittest.TestCase):
             f"  shapes: L={L} B={B} C={C} D={D} ssm_elems={ssm_elems} conv_elems={conv_elems}\n"
             f"  dtypes: ssm={ssm_dtype} conv={conv_dtype}\n"
             f"  valid: {num_valid}/{B}  invalid_ratio={invalid_ratio}  track_ratio={track_ratio}\n"
-            f"  old_total_ms (baseline):  {old_ms:.4f}\n"
+            f"  ref_total_ms (baseline):  {ref_ms:.4f}\n"
             f"  fused_total_ms:           {fused_ms:.4f}  (ratio={ratio:.3f}x, speedup={speedup:.2f}x)\n"
         )
 
