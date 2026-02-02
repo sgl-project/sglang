@@ -791,9 +791,9 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
             self.config.num_hidden_layers,
             self.config.__class__.model_type,
         ):
-            if not isinstance(self.model.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.model.layers[layer_idx].self_attn
-
+            if isinstance(self.model.layers[layer_idx], nn.Identity):
+                continue
+            layer_self_attn = self.model.layers[layer_idx].self_attn
             if is_hip():
                 # The scaling factor convention we are assuming is
                 # quantized_value * scaling_factor ~= true_value

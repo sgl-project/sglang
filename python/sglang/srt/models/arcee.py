@@ -357,9 +357,9 @@ class ArceeModel(nn.Module):
             self.config.num_hidden_layers,
             self.config.__class__.model_type,
         ):
-            if not isinstance(self.layers[layer_idx], nn.Identity):
-                layer_self_attn = self.layers[layer_idx].self_attn
-
+            if isinstance(self.layers[layer_idx], nn.Identity):
+                continue
+            layer_self_attn = self.layers[layer_idx].self_attn
             if hasattr(layer_self_attn.attn, "k_scale"):
                 layer_self_attn.attn.k_scale = scaling_factor
                 layer_self_attn.attn.v_scale = scaling_factor
