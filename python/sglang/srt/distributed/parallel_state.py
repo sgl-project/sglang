@@ -1710,7 +1710,7 @@ def initialize_model_parallel(
     global _MOE_CP
     assert _MOE_CP is None, "moe context model parallel group is already initialized"
     # gpus_per_pp_stage = tensor_model_parallel_size * attention_context_model_parallel_size
-    if moe_ep_size == tensor_model_parallel_size:
+    if moe_cp_size == tensor_model_parallel_size:
         _MOE_CP = _TP
     else:
         group_ranks = []
