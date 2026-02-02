@@ -749,8 +749,39 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         w13_qweight_tmp = unpack_from_int32(
             w13_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
+
+        if self.quant_config.weight_bits == 4:
+            group_size = self.quant_config.group_size
+            scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
+
+            neg_mask = scale_expanded < 0
+
+            if neg_mask.any():
+                neg_mask = neg_mask.transpose(-1, -2)
+                neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
+                w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
+
+                if w13_qweight_tmp.max() > 7:
+                    w13_qweight_tmp.clamp_(max=7)
+
+                layer.w13_scales.data.abs_()
+
+            layer.w13_qweight = torch.nn.Parameter(
+                torch_npu.npu_convert_weight_to_int4pack(
+                    w13_qweight_tmp.reshape(
+                        layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
+                    )
+                    .transpose(-1, -2)
+                    .contiguous()
+                    .reshape(-1, layer.w13_qweight.shape[2])
+                    .to(torch.int32)
+                )
+                .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
+                .contiguous(),
+                requires_grad=False,
+            )
         # use int8 to store weight by default
-        if self.quant_config.weight_bits != 4:
+        else:
             layer.w13_qweight = torch.nn.Parameter(
                 w13_qweight_tmp.reshape(
                     layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
@@ -759,37 +790,6 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
                 .contiguous(),
                 requires_grad=False,
             )
-            return
-
-        group_size = self.quant_config.group_size
-        scale_expanded = layer.w13_scales.data.repeat_interleave(group_size, dim=1)
-
-        neg_mask = scale_expanded < 0
-
-        if neg_mask.any():
-            neg_mask = neg_mask.transpose(-1, -2)
-            neg_mask = neg_mask.contiguous().reshape(w13_qweight_tmp.shape)
-            w13_qweight_tmp[neg_mask] = -w13_qweight_tmp[neg_mask]
-
-            if w13_qweight_tmp.max() > 7:
-                w13_qweight_tmp.clamp_(max=7)
-
-            layer.w13_scales.data.abs_()
-
-        layer.w13_qweight = torch.nn.Parameter(
-            torch_npu.npu_convert_weight_to_int4pack(
-                w13_qweight_tmp.reshape(
-                    layer.w13_qweight.shape[0], layer.w13_qweight.shape[2], -1
-                )
-                .transpose(-1, -2)
-                .contiguous()
-                .reshape(-1, layer.w13_qweight.shape[2])
-                .to(torch.int32)
-            )
-            .reshape(layer.w13_qweight.shape[0], layer.w13_qweight.shape[1] * 8, -1)
-            .contiguous(),
-            requires_grad=False,
-        )
 
         w2_qweight_2d = (
             layer.w2_qweight.data.transpose(-1, -2)
@@ -799,8 +799,39 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
         w2_qweight_tmp = unpack_from_int32(
             w2_qweight_2d, self.quant_config.weight_bits, packed_dim=1
         )
+
+        if self.quant_config.weight_bits == 4:
+            group_size = self.quant_config.group_size
+            scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
+
+            neg_mask = scale_expanded < 0
+
+            if neg_mask.any():
+                neg_mask = neg_mask.transpose(-1, -2)
+                neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
+                w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
+
+                if w2_qweight_tmp.max() > 7:
+                    w2_qweight_tmp.clamp_(max=7)
+
+                layer.w2_scales.data.abs_()
+
+            layer.w2_qweight = torch.nn.Parameter(
+                torch_npu.npu_convert_weight_to_int4pack(
+                    w2_qweight_tmp.reshape(
+                        layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
+                    )
+                    .transpose(-1, -2)
+                    .contiguous()
+                    .reshape(-1, layer.w2_qweight.shape[2])
+                    .to(torch.int32)
+                )
+                .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
+                .contiguous(),
+                requires_grad=False,
+            )
         # use int8 to store weight by default
-        if self.quant_config.weight_bits != 4:
+        else:
             layer.w2_qweight = torch.nn.Parameter(
                 w2_qweight_tmp.reshape(
                     layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
@@ -809,37 +840,6 @@ class GPTQMoEAscendMethod(FusedMoEMethodBase):
                 .contiguous(),
                 requires_grad=False,
             )
-            return
-
-        group_size = self.quant_config.group_size
-        scale_expanded = layer.w2_scales.data.repeat_interleave(group_size, dim=1)
-
-        neg_mask = scale_expanded < 0
-
-        if neg_mask.any():
-            neg_mask = neg_mask.transpose(-1, -2)
-            neg_mask = neg_mask.contiguous().reshape(w2_qweight_tmp.shape)
-            w2_qweight_tmp[neg_mask] = -w2_qweight_tmp[neg_mask]
-
-            if w2_qweight_tmp.max() > 7:
-                w2_qweight_tmp.clamp_(max=7)
-
-            layer.w2_scales.data.abs_()
-
-        layer.w2_qweight = torch.nn.Parameter(
-            torch_npu.npu_convert_weight_to_int4pack(
-                w2_qweight_tmp.reshape(
-                    layer.w2_qweight.shape[0], layer.w2_qweight.shape[2], -1
-                )
-                .transpose(-1, -2)
-                .contiguous()
-                .reshape(-1, layer.w2_qweight.shape[2])
-                .to(torch.int32)
-            )
-            .reshape(layer.w2_qweight.shape[0], layer.w2_qweight.shape[1] * 8, -1)
-            .contiguous(),
-            requires_grad=False,
-        )
 
     def apply(
         self,

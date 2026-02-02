@@ -339,6 +339,7 @@ class AutoRoundConfig(QuantizationConfig):
                 desc_act=False,
                 dynamic={},
             )
+            quant_args.sym = sym
 
             if isinstance(layer, FusedMoE):
                 return GPTQMoEAscendMethod(quant_args)
