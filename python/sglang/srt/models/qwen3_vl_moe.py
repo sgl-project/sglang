@@ -61,7 +61,10 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         return self.embed_tokens
 
     def get_deepstack_embeds(
-        self, layer_idx: int, input_deepstack_embeds: Optional[torch.Tensor]
+        self,
+        layer_idx: int,
+        input_deepstack_embeds: Optional[torch.Tensor],
+        target_batch_size: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         """Get deepstack embeddings for a given layer index, or None if not applicable."""
         if (
@@ -70,7 +73,19 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
         ):
             return None
         sep = self.hidden_size * layer_idx
-        return input_deepstack_embeds[:, sep : sep + self.hidden_size]
+        deepstack_embeds = input_deepstack_embeds[:, sep : sep + self.hidden_size]
+
+        # Handle PP sharding: when using pipeline parallelism, the deepstack_embeds may have
+        # the full batch size while the residual only has the local shard for this PP rank.
+        if (
+            target_batch_size is not None
+            and deepstack_embeds.shape[0] > target_batch_size
+        ):
+            start_idx = self.pp_group.rank * target_batch_size
+            end_idx = (self.pp_group.rank + 1) * target_batch_size
+            deepstack_embeds = deepstack_embeds[start_idx:end_idx]
+
+        return deepstack_embeds
 
     def forward(
         self,
@@ -108,8 +123,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
             # The order matters because addition with different tensors is not associative in practice.
             # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
             deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
+                layer_idx - 1,
+                input_deepstack_embeds,
+                target_batch_size=residual.shape[0] if residual is not None else None,
             )
+
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -120,7 +138,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
 
         # Handle deepstack for the last processed layer if it exists.
         last_deepstack = self.get_deepstack_embeds(
-            self.end_layer - 1, input_deepstack_embeds
+            self.end_layer - 1,
+            input_deepstack_embeds,
+            target_batch_size=residual.shape[0] if residual is not None else None,
         )
 
         if not self.pp_group.is_last_rank:
