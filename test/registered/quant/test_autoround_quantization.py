@@ -68,7 +68,6 @@ class TestAutoRoundQuantization(CustomTestCase):
             quantization="auto-round-int8",
             trust_remote_code=True,
         )
-
         load_config = LoadConfig(
             inc_save_path=self.output_dir,
         )
