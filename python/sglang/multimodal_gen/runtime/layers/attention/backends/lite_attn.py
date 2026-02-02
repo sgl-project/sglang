@@ -154,9 +154,6 @@ class LiteAttentionImpl(AttentionImpl):
         )
         self._lite_handle = id(self._lite)
         _LITE_ATTN_REGISTRY[self._lite_handle] = self._lite
-        if prefix:
-            logger.debug("Initialized LiteAttentionImpl for %s", prefix)
-
     def forward(
         self,
         query: torch.Tensor,
