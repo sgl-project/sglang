@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
+    NunchakuConfig,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
@@ -43,6 +46,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
+
+try:
+    # Optional dependency: only required when SVDQuant is enabled.
+    from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
+
+    _NUNCHAKU_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    NunchakuFeedForward = None  # type: ignore[assignment]
+    _NUNCHAKU_AVAILABLE = False
 
 
 def _get_qkv_projections(
@@ -503,11 +515,6 @@ class QwenImageCrossAttention(nn.Module):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.prefix = prefix
 
-        # Check if using nunchaku quantization for main QKV
-        from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
-            NunchakuConfig,
-        )
-
         self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
 
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
@@ -551,11 +558,6 @@ class QwenImageCrossAttention(nn.Module):
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
-            # Check if using nunchaku quantization
-            from sglang.multimodal_gen.runtime.layers.quantization.nunchaku_config import (
-                NunchakuConfig,
-            )
-
             self.use_fused_added_qkv = isinstance(quant_config, NunchakuConfig)
 
             if self.use_fused_added_qkv:
@@ -796,16 +798,13 @@ class QwenImageTransformerBlock(nn.Module):
             and hasattr(quant_config, "get_name")
             and quant_config.get_name() == "svdquant"
         ):
-            try:
-                from nunchaku.models.attention import (  # type: ignore[import]
-                    NunchakuFeedForward,
-                )
-            except ImportError:
+            if not _NUNCHAKU_AVAILABLE:
                 logger.warning(
                     "NunchakuConfig provided but `nunchaku` package is not available; "
                     "keeping standard FeedForward layers."
                 )
             else:
+                assert NunchakuFeedForward is not None
                 nunchaku_kwargs = {
                     "precision": quant_config.precision,
                     "rank": quant_config.rank,

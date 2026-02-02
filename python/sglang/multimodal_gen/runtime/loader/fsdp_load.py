@@ -40,7 +40,14 @@ def _make_param_like(
     actual_param: torch.nn.Parameter, tensor: torch.Tensor
 ) -> torch.nn.Parameter:
     cls = actual_param.__class__
-    new_param = cls.__new__(cls, tensor)
+    # IMPORTANT: nn.Parameter defaults to requires_grad=True, which is illegal
+    # for non-floating/complex dtypes (e.g., int8/FP8 quantized weights).
+    # Always create with requires_grad=False here, and let callers opt-in
+    # only when the dtype supports it.
+    try:
+        new_param = cls.__new__(cls, tensor, requires_grad=False)
+    except TypeError:
+        new_param = cls.__new__(cls, tensor)
     new_param.__dict__.update(actual_param.__dict__)
     new_param.requires_grad = False
     return new_param
@@ -268,6 +275,8 @@ def load_model_from_full_model_state_dict(
                 # Preserve requires_grad flag to avoid errors with non-floating dtypes
                 requires_grad = getattr(meta_sharded_param, "requires_grad", False)
                 temp_param = _make_param_like(actual_param, sharded_tensor)
+                if not (sharded_tensor.is_floating_point() or sharded_tensor.is_complex()):
+                    requires_grad = False
                 temp_param.requires_grad = requires_grad
                 weight_loader(temp_param, full_tensor)
                 sharded_tensor = temp_param.data

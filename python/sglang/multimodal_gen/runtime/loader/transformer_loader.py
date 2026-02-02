@@ -43,7 +43,7 @@ class TransformerLoader(ComponentLoader):
             return safetensors_load_file(weights_path)
         except Exception as exc:
             logger.warning(
-                "Failed to load weights from %s for wtscale patch: %s",
+                "Failed to load weights from %s for Nunchaku scale patch: %s",
                 weights_path,
                 exc,
             )
@@ -73,15 +73,40 @@ class TransformerLoader(ComponentLoader):
                 existing.data.copy_(tensor.to(existing.data.dtype))
         else:
             module.wtscale = tensor
+
+        # Keep alpha in sync (kernel reads `layer._nunchaku_alpha`)
+        try:
+            module._nunchaku_alpha = float(tensor.detach().cpu().item())
+        except Exception:
+            module._nunchaku_alpha = None
         return True
 
-    def _patch_nunchaku_wtscale(
+    def _patch_sglang_svdq_wcscales(
+        self, module: nn.Module, tensor: Any, svdq_method_cls: type
+    ) -> bool:
+        quant_method = getattr(module, "quant_method", None)
+        if not isinstance(quant_method, svdq_method_cls):
+            return False
+
+        existing = getattr(module, "wcscales", None)
+        if isinstance(existing, nn.Parameter):
+            with torch.no_grad():
+                existing.data.copy_(tensor.to(existing.data.dtype))
+        else:
+            module.wcscales = tensor
+        return True
+
+    def _patch_nunchaku_scales(
         self,
         model: nn.Module,
         safetensors_list: list[str],
         quant_config: Any,
     ) -> None:
-        """Patch wtscale from Nunchaku safetensors weights."""
+        """Patch Nunchaku scale tensors from safetensors weights.
+
+        For NVFP4 checkpoints, correctness depends on `wtscale` and attention
+        `wcscales`. The FSDP loader may skip some of these metadata tensors.
+        """
         if not self._is_svdquant_config(quant_config):
             return
 
@@ -90,7 +115,7 @@ class TransformerLoader(ComponentLoader):
 
         if len(safetensors_list) != 1:
             logger.warning(
-                "Nunchaku wtscale patch expects a single safetensors file, "
+                "Nunchaku scale patch expects a single safetensors file, "
                 "but got %d files. Skipping.",
                 len(safetensors_list),
             )
@@ -103,28 +128,43 @@ class TransformerLoader(ComponentLoader):
                 NunchakuSVDQLinearMethod,
             )
         except ImportError:
-            logger.warning("Nunchaku is not available; skipping wtscale patch.")
+            logger.warning("Nunchaku is not available; skipping scale patch.")
             return
 
         state_dict = self._load_state_dict_safe(safetensors_list[0])
         if state_dict is None:
             return
 
-        num_patched = 0
+        num_wtscale = 0
+        num_wcscales = 0
         for name, module in model.named_modules():
-            tensor = state_dict.get(f"{name}.wtscale")
-            if tensor is None:
-                continue
+            wt = state_dict.get(f"{name}.wtscale")
+            if wt is not None:
+                if self._patch_native_svdq_linear(module, wt, SVDQW4A4Linear):
+                    num_wtscale += 1
+                elif self._patch_sglang_svdq_linear(module, wt, NunchakuSVDQLinearMethod):
+                    num_wtscale += 1
 
-            if self._patch_native_svdq_linear(module, tensor, SVDQW4A4Linear):
-                num_patched += 1
-            elif self._patch_sglang_svdq_linear(
-                module, tensor, NunchakuSVDQLinearMethod
-            ):
-                num_patched += 1
+            wc = state_dict.get(f"{name}.wcscales")
+            if wc is not None:
+                # Some modules may have wcscales as a direct attribute/Parameter.
+                existing = getattr(module, "wcscales", None)
+                if isinstance(existing, nn.Parameter):
+                    with torch.no_grad():
+                        existing.data.copy_(wc.to(existing.data.dtype))
+                    num_wcscales += 1
+                elif existing is not None:
+                    setattr(module, "wcscales", wc)
+                    num_wcscales += 1
+                elif self._patch_sglang_svdq_wcscales(
+                    module, wc, NunchakuSVDQLinearMethod
+                ):
+                    num_wcscales += 1
 
-        if num_patched > 0:
-            logger.info("Patched wtscale for %d layers", num_patched)
+        if num_wtscale > 0:
+            logger.info("Patched wtscale for %d layers", num_wtscale)
+        if num_wcscales > 0:
+            logger.info("Patched wcscales for %d layers", num_wcscales)
 
     def _get_quant_config(self, server_args: ServerArgs) -> Any:
         ncfg = getattr(server_args, "nunchaku_config", None)
@@ -240,7 +280,7 @@ class TransformerLoader(ComponentLoader):
         )
 
         if quant_config is not None:
-            self._patch_nunchaku_wtscale(model, safetensors_list, quant_config)
+            self._patch_nunchaku_scales(model, safetensors_list, quant_config)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
