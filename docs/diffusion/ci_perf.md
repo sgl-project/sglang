@@ -1,11 +1,4 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/ci_perf.md](../../../../docs/diffusion/ci_perf.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
-
-## Perf baseline generation script
+## Perf Baseline Generation Script
 
 `python/sglang/multimodal_gen/test/scripts/gen_perf_baselines.py` starts a local diffusion server, issues requests for selected test cases, aggregates stage/denoise-step/E2E timings from the perf log, and writes the results back to the `scenarios` section of `perf_baselines.json`.
 

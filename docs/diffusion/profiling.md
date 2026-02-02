@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/profiling.md](../../../../docs/diffusion/profiling.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # Profiling Multimodal Generation
 
 This guide covers profiling techniques for multimodal generation pipelines in SGLang.

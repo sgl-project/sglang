@@ -1,13 +1,7 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/environment_variables.md](../../../../docs/diffusion/environment_variables.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 ## Caching Acceleration
 
 These variables configure caching acceleration for Diffusion Transformer (DiT) models.
-SGLang supports multiple caching strategies - see [caching documentation](cache/caching.md) for an overview.
+SGLang supports multiple caching strategies - see [caching documentation](cache/) for an overview.
 
 ### Cache-DiT Configuration
 

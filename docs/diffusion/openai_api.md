@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/openai_api.md](../../../../docs/diffusion/openai_api.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # SGLang Diffusion OpenAI API
 
 The SGLang diffusion HTTP server implements an OpenAI-compatible API for image and video generation, as well as LoRA adapter management.

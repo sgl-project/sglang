@@ -72,8 +72,6 @@ Its core features include:
 
    supported_models/generative_models.md
    supported_models/multimodal_language_models.md
-   supported_models/diffusion_language_models.md
-   supported_models/diffusion_models.md
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
@@ -82,6 +80,27 @@ Its core features include:
    supported_models/transformers_fallback.md
    supported_models/modelscope.md
    supported_models/mindspore_models.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: SGLang Diffusion
+
+   diffusion/index
+   diffusion/installation
+   diffusion/installation_rocm
+   diffusion/compatibility_matrix
+   diffusion/cli
+   diffusion/openai_api
+   diffusion/attention_backends
+   diffusion/cache/index
+   diffusion/cache/cache_dit
+   diffusion/cache/teacache
+   diffusion/profiling
+   diffusion/ci_perf
+   diffusion/environment_variables
+   diffusion/contributing
+   diffusion/support_new_models
+   diffusion/language_models/index
 
 .. toctree::
    :maxdepth: 1

@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/attention_backends.md](../../../../docs/diffusion/attention_backends.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # Attention Backends
 
 This document describes the attention backends available in sglang diffusion (`sglang.multimodal_gen`) and how to select them.

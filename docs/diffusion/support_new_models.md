@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/support_new_models.md](../../../../docs/diffusion/support_new_models.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # How to Support New Diffusion Models
 
 This document explains how to add support for new diffusion models in SGLang diffusion.

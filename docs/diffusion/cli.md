@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/cli.md](../../../../docs/diffusion/cli.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # SGLang diffusion CLI Inference
 
 The SGLang-diffusion CLI provides a quick way to access the inference pipeline for image and video generation.

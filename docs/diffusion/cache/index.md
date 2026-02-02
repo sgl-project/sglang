@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/cache/index.md](../../../../../docs/diffusion/cache/index.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # Caching Acceleration for Diffusion Models
 
 SGLang provides multiple caching acceleration strategies for Diffusion Transformer (DiT) models. These strategies can significantly reduce inference time by skipping redundant computation.

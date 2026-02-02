@@ -1,14 +1,8 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/cache/cache_dit.md](../../../../../docs/diffusion/cache/cache_dit.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # Cache-DiT Acceleration
 
 > **Note**: This is one of two caching strategies available in SGLang.
-> For an overview of all caching options, see [caching.md](caching.md).
-> For TeaCache documentation, see [teacache.md](teacache.md).
+> For an overview of all caching options, see [caching](index.md).
+> For TeaCache documentation, see [teacache](teacache.md).
 
 SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to **1.69x inference speedup** with minimal quality loss.
 
@@ -246,4 +240,4 @@ acceleration still works.
 ## References
 
 - [Cache-Dit](https://github.com/vipshop/cache-dit)
-- [SGLang Diffusion](../README.md)
+- [SGLang Diffusion](../../)

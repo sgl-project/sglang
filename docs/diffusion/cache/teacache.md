@@ -1,13 +1,7 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/cache/teacache.md](../../../../../docs/diffusion/cache/teacache.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # TeaCache Acceleration
 
 > **Note**: This is one of two caching strategies available in SGLang.
-> For an overview of all caching options, see [caching.md](caching.md).
+> For an overview of all caching options, see [caching](index.md).
 
 TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
 

@@ -1,9 +1,3 @@
-> **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/contributing.md](../../../../docs/diffusion/contributing.md)
->
-> This file is kept for backward compatibility and will be deprecated in a future release.
-
----
 # Contributing to SGLang Diffusion
 
 This guide outlines the requirements for contributing to the SGLang Diffusion module (`sglang.multimodal_gen`).
