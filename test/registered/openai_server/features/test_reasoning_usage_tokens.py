@@ -1,7 +1,7 @@
 """Usage:
-python3 -m unittest openai_server.features.test_usage_tokens.TestNormalReasoningTokenUsage
-python3 -m unittest openai_server.features.test_usage_tokens.TestSpecReasoningTokenUsage
-python3 -m unittest openai_server.features.test_usage_tokens.TestSpecV2ReasoningTokenUsage
+python3 -m unittest openai_server.features.test_reasoning_usage_tokens.TestNormalReasoningTokenUsage
+python3 -m unittest openai_server.features.test_reasoning_usage_tokens.TestSpecReasoningTokenUsage
+python3 -m unittest openai_server.features.test_reasoning_usage_tokens.TestSpecV2ReasoningTokenUsage
 """
 
 import json
