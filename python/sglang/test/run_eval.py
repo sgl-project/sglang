@@ -251,7 +251,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--top-k", type=int, default=None, help="Top-k sampling parameter")
+    parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k sampling parameter"
+    )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(
         "--thinking-mode",
