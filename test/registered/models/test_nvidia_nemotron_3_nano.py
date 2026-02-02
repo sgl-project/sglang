@@ -4,9 +4,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-# NVIDIA Nemotron-3 Nano 30B model tests (CUDA only)
-# GSM8K evaluation for BF16 and FP8 variants
-
 register_cuda_ci(est_time=180, suite="stage-b-test-large-2-gpu")
 
 
