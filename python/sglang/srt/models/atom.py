@@ -42,7 +42,7 @@ class ATOMForCausalLM(nn.Module):
         self.unpadded_vocab_size = config.vocab_size
 
         import atom
-        self.model = atom.prepare_model(config=config, framework="sglang")
+        self.model = atom.prepare_model(config=config, engine="sglang")
         if self.model is None:
             model_arch = config.model_config.architectures[0]
             raise ValueError(f'This model{model_arch} is not supported by atom')
