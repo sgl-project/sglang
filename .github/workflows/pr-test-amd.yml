@@ -734,101 +734,9 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
 
-  check-pdd-env:
-    runs-on: linux-mi35x-gpu-8.fabric
-    steps:
-      - name: Find RDMA in CI Runner
-        run: |
-          set +e
-
-          echo ""
-          echo "=== 0. Checking standard path for Ionic driver ==="
-          ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
-
-          echo ""
-          echo "=== 0a. Resolve symlink and check actual library file ==="
-          IONIC_SYMLINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
-          if [[ -L "$IONIC_SYMLINK" ]]; then
-            IONIC_REAL=$(readlink -f "$IONIC_SYMLINK" 2>/dev/null)
-            echo "Symlink: $IONIC_SYMLINK"
-            echo "Points to: $IONIC_REAL"
-            if [[ -f "$IONIC_REAL" ]]; then
-              echo "Actual library EXISTS:"
-              ls -la "$IONIC_REAL"
-            else
-              echo "ERROR: Actual library file does NOT exist (broken symlink)!"
-            fi
-          else
-            echo "Symlink $IONIC_SYMLINK does not exist"
-          fi
-
-          echo ""
-          echo "=== 0b. Check libionic.so.* directly ==="
-          ls -la /usr/lib/x86_64-linux-gnu/libionic* 2>/dev/null || echo "No libionic.so.* files in /usr/lib/x86_64-linux-gnu/"
-
-          echo ""
-          echo "=== 0c. Deep search for libionic-rdmav34.so ==="
-          find /usr /lib /opt -name "libionic-rdmav34.so" 2>/dev/null || echo "libionic-rdmav34.so not found anywhere"
-
-          echo ""
-          echo "=== 0d. Search for any ionic related libraries ==="
-          find /usr /lib /opt -name "*libionic*" 2>/dev/null || echo "No ionic related files found"
-
-          echo ""
-          echo "=== 1. libibverbs provider configs ==="
-          find /etc -name "*.driver" 2>/dev/null || true
-          ls -la /etc/libibverbs.d/ 2>/dev/null || echo "/etc/libibverbs.d not found"
-
-          echo ""
-          echo "=== 2. Provider libraries ==="
-          find /usr/lib -name "*verbs*.so*" 2>/dev/null || true
-          find /usr/lib64 -name "*verbs*.so*" 2>/dev/null || true
-          ls -la /usr/lib/x86_64-linux-gnu/libibverbs/ 2>/dev/null || echo "Standard libibverbs path not found"
-
-          echo ""
-          echo "=== 3. ionic related ==="
-          find /usr -name "*ionic*" 2>/dev/null || echo "No ionic files found"
-
-          echo ""
-          echo "=== 4. libibverbs.d directory search ==="
-          find / -name "libibverbs.d" -type d 2>/dev/null || echo "Not found anywhere"
-
-          echo ""
-          echo "=== 5. ldconfig cache ==="
-          ldconfig -p 2>/dev/null | grep -i verbs || echo "No verbs in ldconfig"
-
-          echo ""
-          echo "=== 6. Installed packages ==="
-          dpkg -l 2>/dev/null | grep -E "rdma|verbs|infiniband" || rpm -qa 2>/dev/null | grep -E "rdma|verbs" || echo "Package manager check failed"
-
-          echo ""
-          echo "=== 7. /dev/infiniband ==="
-          ls -la /dev/infiniband/ 2>/dev/null || echo "/dev/infiniband not found"
-
-          echo ""
-          echo "=== 8. /sys/class/infiniband ==="
-          ls -la /sys/class/infiniband/ 2>/dev/null || echo "Not found"
-
-          echo ""
-          echo "=== 9. /sys/class/infiniband_verbs ==="
-          ls -la /sys/class/infiniband_verbs/ 2>/dev/null || echo "Not found"
-
-          echo ""
-          echo "=== 10. ibv_devinfo ==="
-          which ibv_devinfo 2>/dev/null || echo "ibv_devinfo not in PATH"
-          ibv_devinfo 2>&1 || echo "ibv_devinfo failed or not found"
-
-          echo ""
-          echo "=== 11. Kernel modules ==="
-          lsmod 2>/dev/null | grep -E "ib_|rdma|ionic" || echo "lsmod failed or no modules"
-
-          echo ""
-          echo "=== Check Complete ==="
-
-
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-2-gpu-35x-disaggregation-amd:
-    needs: [check-changes]
+    needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
@@ -842,8 +750,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8.fabric]
-        part: [0]
+        runner: [linux-mi35x-gpu-2.fabric]
 
     runs-on: ${{matrix.runner}}
 
@@ -856,9 +763,31 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
 
-      - name: Detect RDMA Devices
+      - name: Check Host RDMA Environment
         id: rdma_detect
         run: |
+          set +e
+          echo "=== Checking Host RDMA Environment ==="
+
+          echo ""
+          echo "=== 1. Ionic driver library check ==="
+          ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
+
+          echo ""
+          echo "=== 2. Infiniband devices ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "/dev/infiniband not found"
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "/sys/class/infiniband not found"
+
+          echo ""
+          echo "=== 3. ibv_devinfo ==="
+          which ibv_devinfo 2>/dev/null && ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
+
+          echo ""
+          echo "=== 4. Kernel modules ==="
+          lsmod 2>/dev/null | grep -E "ib_|rdma|ionic" || echo "No RDMA kernel modules loaded"
+
+          echo ""
+          echo "=== 5. Detect RDMA Devices for test environment ==="
           if [ -d "/sys/class/infiniband" ]; then
             RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
             echo "Detected RDMA Devices: $RDMA_DEVS"
@@ -868,6 +797,9 @@ jobs:
             echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
           fi
 
+          echo ""
+          echo "=== Host RDMA Check Complete ==="
+
       - name: Start Special Container
         run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
         env:
@@ -876,32 +808,19 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      # - name: Debug RDMA Driver Dependencies
-      #   run: |
-      #     echo "=== Debugging Ionic Driver Dependencies ==="
-      #     echo "Checking what libraries libionic-rdmav34.so is missing..."
-      #     docker exec ci_sglang ldd /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so
-
-      - name: Setup RDMA in Container
+      - name: Verify RDMA in Container
         run: |
-          echo "=== Verify RDMA in container ==="
           docker exec -u root ci_sglang bash -c '
-            echo "=== Verification ==="
-            ibv_devinfo -list
+            echo "=== Container RDMA Verification ==="
             echo "Device nodes:"
             ls -la /dev/infiniband/
-            echo ""
-            echo "Driver config:"
-            cat /etc/libibverbs.d/ionic.driver 2>/dev/null || echo "No ionic.driver config"
             echo ""
             echo "Provider libraries:"
             ls /usr/lib/x86_64-linux-gnu/libibverbs/ | grep -E "ionic|mlx" || echo "No Ionic/Mellanox providers"
             echo ""
-            echo "ibv_devinfo:"
-            ibv_devinfo -list
-
-            # Verify HCAs are detected
+            echo "HCA devices:"
             HCA_COUNT=$(ibv_devinfo -list 2>&1 | grep -oE "^[0-9]+ HCAs? found" | grep -oE "^[0-9]+" || echo "0")
+            ibv_devinfo -list
             if [ "$HCA_COUNT" -gt 0 ]; then
               echo ""
               echo "=== SUCCESS: RDMA setup complete. Found $HCA_COUNT HCA(s) ==="
@@ -925,10 +844,10 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-35x-disaggregation-amd --timeout-per-file 3600
 
   stage-b-test-large-8-gpu-35x-disaggregation-amd:
-    needs: [check-changes]
+    needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
@@ -943,7 +862,6 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8.fabric]
-        part: [0]
 
     runs-on: ${{matrix.runner}}
 
@@ -956,9 +874,31 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
 
-      - name: Detect RDMA Devices
+      - name: Check Host RDMA Environment
         id: rdma_detect
         run: |
+          set +e
+          echo "=== Checking Host RDMA Environment ==="
+
+          echo ""
+          echo "=== 1. Ionic driver library check ==="
+          ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
+
+          echo ""
+          echo "=== 2. Infiniband devices ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "/dev/infiniband not found"
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "/sys/class/infiniband not found"
+
+          echo ""
+          echo "=== 3. ibv_devinfo ==="
+          which ibv_devinfo 2>/dev/null && ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
+
+          echo ""
+          echo "=== 4. Kernel modules ==="
+          lsmod 2>/dev/null | grep -E "ib_|rdma|ionic" || echo "No RDMA kernel modules loaded"
+
+          echo ""
+          echo "=== 5. Detect RDMA Devices for test environment ==="
           if [ -d "/sys/class/infiniband" ]; then
             RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
             echo "Detected RDMA Devices: $RDMA_DEVS"
@@ -968,6 +908,9 @@ jobs:
             echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
           fi
 
+          echo ""
+          echo "=== Host RDMA Check Complete ==="
+
       - name: Start Special Container
         run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
         env:
@@ -976,25 +919,19 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Setup RDMA in Container
+      - name: Verify RDMA in Container
         run: |
-          echo "=== Verify RDMA in container ==="
           docker exec -u root ci_sglang bash -c '
-            echo "=== Verification ==="
+            echo "=== Container RDMA Verification ==="
             echo "Device nodes:"
             ls -la /dev/infiniband/
-            echo ""
-            echo "Driver config:"
-            cat /etc/libibverbs.d/ionic.driver 2>/dev/null || echo "No ionic.driver config"
             echo ""
             echo "Provider libraries:"
             ls /usr/lib/x86_64-linux-gnu/libibverbs/ | grep -E "ionic|mlx" || echo "No Ionic/Mellanox providers"
             echo ""
-            echo "ibv_devinfo:"
-            ibv_devinfo -list
-
-            # Verify HCAs are detected
+            echo "HCA devices:"
             HCA_COUNT=$(ibv_devinfo -list 2>&1 | grep -oE "^[0-9]+ HCAs? found" | grep -oE "^[0-9]+" || echo "0")
+            ibv_devinfo -list
             if [ "$HCA_COUNT" -gt 0 ]; then
               echo ""
               echo "=== SUCCESS: RDMA setup complete. Found $HCA_COUNT HCA(s) ==="
@@ -1018,14 +955,7 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
-
-      # - name: Run test_disaggregation_pp
-      #   timeout-minutes: 15
-      #   run: |
-      #     bash scripts/ci/amd_ci_exec.sh \
-      #       -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-      #       python3 -m unittest test/registered/amd/disaggregation/test_disaggregation_pp.py
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 3600
 
   pr-test-amd-finish:
     needs:
@@ -1043,6 +973,8 @@ jobs:
         stage-b-test-small-1-gpu-amd-mi35x,
         stage-b-test-large-1-gpu-amd,
         stage-b-test-large-2-gpu-amd,
+        stage-b-test-large-2-gpu-35x-disaggregation-amd,
+        stage-b-test-large-8-gpu-35x-disaggregation-amd,
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
       ]
