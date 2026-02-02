@@ -348,13 +348,14 @@ class AscendAttnBackend(AttentionBackend):
                 (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
-            ),
-            "block_tables_swa": torch.empty(
+            )
+        }
+        if self.is_hybrid_swa:
+            self.graph_metadata["block_tables_swa"] = torch.empty(
                 (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
             )
-        }
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -369,7 +370,8 @@ class AscendAttnBackend(AttentionBackend):
         metadata = ForwardMetadata()
 
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if (
@@ -421,7 +423,7 @@ class AscendAttnBackend(AttentionBackend):
                 // self.page_size
             )
             metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs, :].fill_(0)
+            metadata.block_tables_swa[bs:, :].fill_(0)
         metadata.block_tables[:bs, :max_seq_pages].copy_(
             self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
             // self.page_size
