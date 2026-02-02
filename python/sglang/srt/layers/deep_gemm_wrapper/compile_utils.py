@@ -63,8 +63,8 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         # Totally 1024 + 1024 / 2 + 2048 / 4 + 4096 / 8 + 8192 / 16 = 3072 kernels
         next_m, sample_step = 1024, 2
         max_prefill_bs = (
-            server_args.chunked_prefill_size
-            if server_args.chunked_prefill_size
+            min(server_args.chunked_prefill_size, 32 * 1024)
+            if server_args.chunked_prefill_size >= 1
             else 16 * 1024
         )
         while next_m < max_prefill_bs:
