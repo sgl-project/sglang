@@ -6,6 +6,14 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=180, suite="stage-b-test-large-2-gpu")
 
+NEMOTRON_3_NANO_THINKING_ARGS = [
+    "--trust-remote-code",
+    "--tool-call-parser",
+    "qwen3_coder",
+    "--reasoning-parser",
+    "deepseek-r1",
+]
+
 
 class TestNvidiaNemotron3Nano30BBF16(GSM8KMixin, DefaultServerBase):
     """Test Nemotron-3-Nano-30B BF16 model with GSM8K accuracy evaluation."""
@@ -13,14 +21,9 @@ class TestNvidiaNemotron3Nano30BBF16(GSM8KMixin, DefaultServerBase):
     model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     gsm8k_accuracy_thres = 0.45
     other_args = [
-        "--trust-remote-code",
         "--tp-size",
         "2",
-        "--tool-call-parser",
-        "qwen3_coder",
-        "--reasoning-parser",
-        "deepseek-r1",
-    ]
+    ] + NEMOTRON_3_NANO_THINKING_ARGS
 
 
 class TestNvidiaNemotron3Nano30BFP8(GSM8KMixin, DefaultServerBase):
@@ -29,14 +32,9 @@ class TestNvidiaNemotron3Nano30BFP8(GSM8KMixin, DefaultServerBase):
     model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
     gsm8k_accuracy_thres = 0.30
     other_args = [
-        "--trust-remote-code",
         "--tp-size",
         "2",
-        "--tool-call-parser",
-        "qwen3_coder",
-        "--reasoning-parser",
-        "deepseek-r1",
-    ]
+    ] + NEMOTRON_3_NANO_THINKING_ARGS
 
 
 if __name__ == "__main__":
