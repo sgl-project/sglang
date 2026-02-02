@@ -323,7 +323,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             model_path="Qwen/Qwen-Image",
             modality="image",
             warmup=True,
-            # model_path="Qwen/Qwen-Image", modality="image"
         ),
         T2I_sampling_params,
     ),

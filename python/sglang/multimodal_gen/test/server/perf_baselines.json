@@ -49,7 +49,7 @@
                 "DecodingStage": 751.1
             },
             "denoise_step_ms": {
-                "0": 1077.77,
+                "0": 400.06,
                 "1": 345.13,
                 "2": 413.8,
                 "3": 405.49,
@@ -178,8 +178,8 @@
                 "DecodingStage": 653.03
             },
             "denoise_step_ms": {
-                "0": 165.27,
-                "1": 58.88,
+                "0": 58.88,
+                "1": 165.27,
                 "2": 166.85,
                 "3": 166.51,
                 "4": 166.77,
@@ -245,8 +245,8 @@
                 "DecodingStage": 489.8
             },
             "denoise_step_ms": {
-                "0": 511.3,
-                "1": 132.57,
+                "0": 68.7,
+                "1": 511.3,
                 "2": 541.19,
                 "3": 518.93,
                 "4": 541.2,
@@ -466,8 +466,8 @@
                 "DecodingStage": 381.56
             },
             "denoise_step_ms": {
-                "0": 166.27,
-                "1": 59.6,
+                "0": 73.27,
+                "1": 166.6,
                 "2": 167.31,
                 "3": 168.7,
                 "4": 168.83,
@@ -766,7 +766,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 879.71,
+                "0": 240.71,
                 "1": 248.13,
                 "2": 246.48,
                 "3": 247.87,
@@ -833,7 +833,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 879.71,
+                "0": 224.71,
                 "1": 248.13,
                 "2": 246.48,
                 "3": 247.87,
@@ -967,7 +967,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 1069.91,
+                "0": 266.91,
                 "1": 211.32,
                 "2": 206.59,
                 "3": 208.12,
@@ -1233,22 +1233,22 @@
         "fastwan2_2_ti2v_5b": {
             "stages_ms": {
                 "InputValidationStage": 300.00,
-                "TextEncodingStage": 2327.87,
+                "TextEncodingStage": 843.86,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 58.66,
                 "LatentPreparationStage": 28.55,
-                "DmdDenoisingStage": 4438.3,
-                "DecodingStage": 14177.77,
+                "DmdDenoisingStage": 499.34,
+                "DecodingStage": 1924.01,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 2022.21,
-                "1": 1263.17,
-                "2": 1149.59
+                "0": 164.76,
+                "1": 165.6,
+                "2": 165.84
             },
-            "expected_e2e_ms": 21133.36,
-            "expected_avg_denoise_ms": 1478.32,
-            "expected_median_denoise_ms": 1263.17
+            "expected_e2e_ms": 7722.91,
+            "expected_avg_denoise_ms": 165.42,
+            "expected_median_denoise_ms": 165.66
         },
         "fast_hunyuan_video": {
             "stages_ms": {
@@ -1286,7 +1286,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 15659.6,
+                "0": 1525.6,
                 "1": 1582.6,
                 "2": 1597.84,
                 "3": 1601.34,
@@ -1683,7 +1683,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 1964.07,
+                "0": 233.29,
                 "1": 265.02,
                 "2": 257.83,
                 "3": 260.27,
@@ -1752,7 +1752,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 7828.3,
+                "0": 6680.62,
                 "1": 3765.8,
                 "2": 3774.63,
                 "3": 3772.93,
