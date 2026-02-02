@@ -26,6 +26,26 @@ Its core features include:
 
 .. toctree::
    :maxdepth: 1
+   :caption: Diffusion
+
+   diffusion/README.md
+   diffusion/install.md
+   diffusion/install_rocm.md
+   diffusion/cli.md
+   diffusion/openai_api.md
+   diffusion/support_matrix.md
+   diffusion/support_new_models.md
+   diffusion/contributing.md
+   diffusion/attention_backends.md
+   diffusion/environment_variables.md
+   diffusion/profiling.md
+   diffusion/ci_perf.md
+   diffusion/cache/caching.md
+   diffusion/cache/cache_dit.md
+   diffusion/cache/teacache.md
+
+.. toctree::
+   :maxdepth: 1
    :caption: Basic Usage
 
    basic_usage/send_request.ipynb
