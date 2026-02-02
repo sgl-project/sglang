@@ -431,7 +431,9 @@ class ModelPool:
         )
 
         # Detect IB device once for PD workers
-        has_pd = any(r.is_prefill or r.is_decode or r.is_encode for r in valid_requirements)
+        has_pd = any(
+            r.is_prefill or r.is_decode or r.is_encode for r in valid_requirements
+        )
         ib_device = detect_ib_device() if has_pd else None
         if ib_device:
             logger.info("Detected InfiniBand device: %s", ib_device)

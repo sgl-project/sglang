@@ -61,6 +61,6 @@ class TestEPDMMLU:
         )
         metrics = run_eval(args)
 
-        assert metrics["score"] >= 0.50, (
-            f"EPD MMLU score {metrics['score']:.2f} below threshold 0.50"
-        )
+        assert (
+            metrics["score"] >= 0.50
+        ), f"EPD MMLU score {metrics['score']:.2f} below threshold 0.50"

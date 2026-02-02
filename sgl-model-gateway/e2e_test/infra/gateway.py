@@ -169,7 +169,9 @@ class Gateway:
 
         # Determine mode based on arguments
         is_epd_mode = encode_workers is not None
-        is_pd_mode = (prefill_workers is not None or decode_workers is not None) and not is_epd_mode
+        is_pd_mode = (
+            prefill_workers is not None or decode_workers is not None
+        ) and not is_epd_mode
         is_regular_mode = worker_urls is not None
         is_igw_mode = igw_mode
         is_cloud_mode = cloud_backend is not None

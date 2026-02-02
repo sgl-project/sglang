@@ -269,7 +269,11 @@ def get_pool_requirements() -> list["WorkerIdentity"]:
     for model_id, mode, worker_type in _first_seen_order:
         if model_id not in first_worker_type_per_model:
             first_worker_type_per_model[model_id] = worker_type
-            if worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
+            if worker_type in (
+                WorkerType.ENCODE,
+                WorkerType.PREFILL,
+                WorkerType.DECODE,
+            ):
                 models_with_pd_first.add(model_id)
                 logger.info(
                     "Model %s has disaggregation test first - skipping regular worker pre-launch",

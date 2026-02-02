@@ -387,7 +387,11 @@ def _setup_epd_backend(
                 [w for w in new_instances if w.worker_type == WorkerType.DECODE]
             )
 
-        if len(encodes) < num_encode or len(prefills) < num_prefill or len(decodes) < num_decode:
+        if (
+            len(encodes) < num_encode
+            or len(prefills) < num_prefill
+            or len(decodes) < num_decode
+        ):
             for w in encodes + prefills + decodes:
                 w.release()
             pytest.fail(
