@@ -182,6 +182,14 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs
         with torch.device(self.device):
             self.input_ids = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            self.out_cache_loc = torch.zeros(
+                (self.max_num_tokens,), dtype=self._cache_loc_dtype()
+            )
+            self.out_cache_loc_swa = (
+                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                if model_runner.is_hybrid_swa
+                else None
+            )
             self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -259,6 +267,12 @@ class PiecewiseCudaGraphRunner:
         mrope_positions = (
             self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
+        out_cache_loc = self.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = (
+            self.out_cache_loc_swa[:num_tokens]
+            if self.out_cache_loc_swa is not None
+            else None
+        )
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -273,12 +287,8 @@ class PiecewiseCudaGraphRunner:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=torch.zeros(num_tokens, dtype=self._cache_loc_dtype()),
-                out_cache_loc_swa=(
-                    torch.zeros(num_tokens, dtype=torch.int64)
-                    if self.model_runner.is_hybrid_swa
-                    else None
-                ),
+                out_cache_loc=out_cache_loc,
+                out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
@@ -373,6 +383,12 @@ class PiecewiseCudaGraphRunner:
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
         input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
+        out_cache_loc = self.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = (
+            self.out_cache_loc_swa[:num_tokens]
+            if self.out_cache_loc_swa is not None
+            else None
+        )
         positions = self.positions[:num_tokens]
         mrope_positions = (
             self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -401,12 +417,8 @@ class PiecewiseCudaGraphRunner:
                 req_to_token_pool=self.model_runner.req_to_token_pool,
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
-                out_cache_loc=torch.zeros(num_tokens, dtype=self._cache_loc_dtype()),
-                out_cache_loc_swa=(
-                    torch.zeros(num_tokens, dtype=torch.int64)
-                    if self.model_runner.is_hybrid_swa
-                    else None
-                ),
+                out_cache_loc=out_cache_loc,
+                out_cache_loc_swa=out_cache_loc_swa,
                 seq_lens_sum=num_tokens,
                 encoder_lens=None,
                 return_logprob=False,
@@ -480,13 +492,30 @@ class PiecewiseCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         self.raw_num_tokens = num_tokens
+        if static_num_tokens != num_tokens:
+            self.out_cache_loc.zero_()
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
         bs = forward_batch.batch_size
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         self.positions[:num_tokens].copy_(forward_batch.positions)
+        if self.out_cache_loc_swa is not None:
+            self.out_cache_loc_swa[: self.raw_num_tokens].copy_(
+                self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+            )
 
         input_ids = self.input_ids[:static_num_tokens]
         positions = self.positions[:static_num_tokens]
+        out_cache_loc = self.out_cache_loc[:static_num_tokens]
+
+        out_cache_loc_swa = (
+            self.out_cache_loc_swa[:static_num_tokens]
+            if forward_batch.out_cache_loc_swa is not None
+            else None
+        )
 
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
@@ -517,8 +546,8 @@ class PiecewiseCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
-            out_cache_loc=forward_batch.out_cache_loc,
-            out_cache_loc_swa=forward_batch.out_cache_loc_swa,
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=forward_batch.mamba_track_indices,
             mamba_track_mask=forward_batch.mamba_track_mask,
