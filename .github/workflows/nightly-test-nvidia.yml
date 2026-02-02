@@ -95,7 +95,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2]
+        partition: [0, 1, 2, 3]
     env:
       RUNNER_LABELS: 8-gpu-h200
     steps:
@@ -179,7 +179,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1, 2]
+        partition: [0, 1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
