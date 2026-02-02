@@ -19,6 +19,7 @@ class EncoderArchConfig(ArchConfig):
         default_factory=lambda: {
             AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.SAGE_ATTN_3,
         }
     )
     output_hidden_states: bool = False

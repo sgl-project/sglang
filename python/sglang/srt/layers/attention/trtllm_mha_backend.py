@@ -11,11 +11,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.trtllm_fp8_kv_kernel import fused_fp8_set_kv_buffer
+from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+    fused_fp8_set_kv_buffer,
+)
+from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 
@@ -30,9 +34,9 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
-DEFAULT_WORKSPACE_SIZE_MB = (
-    512  # Memory workspace size in MB, todo(Yingyi): read from config
-)
+# Default workspace size in MB for TRTLLM MHA
+# Can be configured via SGLANG_FLASHINFER_WORKSPACE_SIZE environment variable
+DEFAULT_WORKSPACE_SIZE_MB = 512
 
 # Reuse this workspace buffer across all TRTLLM MHA wrappers
 global_zero_init_workspace_buffer = None
@@ -65,6 +69,15 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
+        # Capture workspace size before super().__init__() to preserve user's
+        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
+        workspace_size_bytes = (
+            env_var.get()
+            if env_var.is_set()
+            else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        )
+
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )
@@ -83,7 +96,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.device = model_runner.device
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        self.workspace_size = workspace_size_bytes
         # Allocate buffers
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
@@ -527,7 +540,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.extend_prefix_lens_cpu
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                max_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = (
+                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                )
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
@@ -591,6 +609,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v_cache = v_cache.view(
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
+
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+
         kv_cache = (k_cache, v_cache)
 
         # TODO: add support for quantization
@@ -667,6 +691,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         v_cache = v_cache.view(
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
+
+        if layer.tp_k_head_num == 1:
+            k_cache = canonicalize_stride(k_cache)
+        if layer.tp_v_head_num == 1:
+            v_cache = canonicalize_stride(v_cache)
+
         kv_cache = (k_cache, v_cache)
 
         # sink: additional value per head in the denominator of the softmax.

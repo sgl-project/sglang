@@ -12,6 +12,23 @@ use crate::grpc_client::{
     vllm_proto as vllm,
 };
 
+/// Unified ProtoRequest
+#[derive(Clone)]
+pub enum ProtoRequest {
+    Generate(ProtoGenerateRequest),
+    Embed(ProtoEmbedRequest),
+}
+
+impl ProtoRequest {
+    /// Get request ID from either variant
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Generate(req) => req.request_id(),
+            Self::Embed(req) => req.request_id(),
+        }
+    }
+}
+
 /// Unified GenerateRequest that works with both backends
 #[derive(Clone)]
 pub enum ProtoGenerateRequest {
@@ -78,7 +95,7 @@ impl ProtoGenerateRequest {
 
 /// Unified GenerateResponse from stream
 pub enum ProtoGenerateResponse {
-    Sglang(sglang::GenerateResponse),
+    Sglang(Box<sglang::GenerateResponse>),
     Vllm(vllm::GenerateResponse),
 }
 
@@ -107,9 +124,7 @@ impl ProtoGenerateResponse {
                 Some(vllm::generate_response::Response::Complete(complete)) => {
                     ProtoResponseVariant::Complete(ProtoGenerateComplete::Vllm(complete))
                 }
-                Some(vllm::generate_response::Response::Error(error)) => {
-                    ProtoResponseVariant::Error(ProtoGenerateError::Vllm(error))
-                }
+                // Note: vLLM proto no longer has Error variant in GenerateResponse
                 None => ProtoResponseVariant::None,
             },
         }
@@ -187,7 +202,7 @@ impl ProtoGenerateStreamChunk {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
+            Self::Vllm(c) => c.prompt_tokens as i32,
         }
     }
 
@@ -195,7 +210,7 @@ impl ProtoGenerateStreamChunk {
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
+            Self::Vllm(c) => c.completion_tokens as i32,
         }
     }
 
@@ -203,7 +218,7 @@ impl ProtoGenerateStreamChunk {
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(c) => c.cached_tokens,
+            Self::Vllm(c) => c.cached_tokens as i32,
         }
     }
 }
@@ -262,7 +277,7 @@ impl ProtoGenerateComplete {
     pub fn prompt_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.prompt_tokens,
-            Self::Vllm(c) => c.prompt_tokens,
+            Self::Vllm(c) => c.prompt_tokens as i32,
         }
     }
 
@@ -270,7 +285,7 @@ impl ProtoGenerateComplete {
     pub fn completion_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.completion_tokens,
-            Self::Vllm(c) => c.completion_tokens,
+            Self::Vllm(c) => c.completion_tokens as i32,
         }
     }
 
@@ -312,7 +327,7 @@ impl ProtoGenerateComplete {
     pub fn cached_tokens(&self) -> i32 {
         match self {
             Self::Sglang(c) => c.cached_tokens,
-            Self::Vllm(_) => 0, // vLLM doesn't have cached_tokens field
+            Self::Vllm(c) => c.cached_tokens as i32,
         }
     }
 
@@ -334,10 +349,10 @@ impl ProtoGenerateComplete {
 }
 
 /// Unified GenerateError
+/// Note: vLLM proto no longer has GenerateError - errors are returned via gRPC status
 #[derive(Clone)]
 pub enum ProtoGenerateError {
     Sglang(sglang::GenerateError),
-    Vllm(vllm::GenerateError),
 }
 
 impl ProtoGenerateError {
@@ -345,7 +360,6 @@ impl ProtoGenerateError {
     pub fn message(&self) -> &str {
         match self {
             Self::Sglang(e) => &e.message,
-            Self::Vllm(e) => &e.message,
         }
     }
 }
@@ -363,7 +377,7 @@ impl ProtoStream {
             Self::Sglang(stream) => stream
                 .next()
                 .await
-                .map(|result| result.map(ProtoGenerateResponse::Sglang)),
+                .map(|result| result.map(|r| ProtoGenerateResponse::Sglang(Box::new(r)))),
             Self::Vllm(stream) => stream
                 .next()
                 .await
@@ -376,6 +390,132 @@ impl ProtoStream {
         match self {
             Self::Sglang(stream) => stream.mark_completed(),
             Self::Vllm(stream) => stream.mark_completed(),
+        }
+    }
+}
+
+/// Unified EmbedRequest that works with both backends
+#[derive(Clone)]
+pub enum ProtoEmbedRequest {
+    Sglang(Box<sglang::EmbedRequest>),
+}
+
+impl ProtoEmbedRequest {
+    /// Get SGLang variant
+    pub fn as_sglang(&self) -> &sglang::EmbedRequest {
+        match self {
+            Self::Sglang(req) => req,
+        }
+    }
+
+    /// Get mutable SGLang variant
+    pub fn as_sglang_mut(&mut self) -> &mut sglang::EmbedRequest {
+        match self {
+            Self::Sglang(req) => req,
+        }
+    }
+
+    /// Check if this is SGLang
+    pub fn is_sglang(&self) -> bool {
+        matches!(self, Self::Sglang(_))
+    }
+
+    /// Clone the inner request (for passing to embed())
+    pub fn clone_inner(&self) -> Self {
+        self.clone()
+    }
+
+    /// Get request ID
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Sglang(req) => &req.request_id,
+        }
+    }
+}
+
+/// Unified EmbedResponse
+pub enum ProtoEmbedResponse {
+    Sglang(sglang::EmbedResponse),
+}
+
+impl ProtoEmbedResponse {
+    /// Get the response variant (complete or error)
+    pub fn into_response(self) -> ProtoEmbedResponseVariant {
+        match self {
+            Self::Sglang(resp) => match resp.response {
+                Some(sglang::embed_response::Response::Complete(complete)) => {
+                    ProtoEmbedResponseVariant::Complete(ProtoEmbedComplete::Sglang(complete))
+                }
+                Some(sglang::embed_response::Response::Error(error)) => {
+                    ProtoEmbedResponseVariant::Error(ProtoEmbedError::Sglang(error))
+                }
+                None => ProtoEmbedResponseVariant::None,
+            },
+        }
+    }
+}
+
+/// Response variant extracted from EmbedResponse
+pub enum ProtoEmbedResponseVariant {
+    Complete(ProtoEmbedComplete),
+    Error(ProtoEmbedError),
+    None,
+}
+
+/// Unified EmbedComplete response
+#[derive(Clone)]
+pub enum ProtoEmbedComplete {
+    Sglang(sglang::EmbedComplete),
+}
+
+impl ProtoEmbedComplete {
+    /// Get embeddings
+    pub fn embedding(&self) -> &[f32] {
+        match self {
+            Self::Sglang(c) => &c.embedding,
+        }
+    }
+
+    /// Get prompt tokens
+    pub fn prompt_tokens(&self) -> i32 {
+        match self {
+            Self::Sglang(c) => c.prompt_tokens,
+        }
+    }
+
+    /// Get cached tokens
+    pub fn cached_tokens(&self) -> i32 {
+        match self {
+            Self::Sglang(c) => c.cached_tokens,
+        }
+    }
+
+    /// Get embedding dimension
+    pub fn embedding_dim(&self) -> i32 {
+        match self {
+            Self::Sglang(c) => c.embedding_dim,
+        }
+    }
+}
+
+/// Unified EmbedError
+#[derive(Clone)]
+pub enum ProtoEmbedError {
+    Sglang(sglang::EmbedError),
+}
+
+impl ProtoEmbedError {
+    /// Get error message
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Sglang(e) => &e.message,
+        }
+    }
+
+    /// Get error code
+    pub fn code(&self) -> &str {
+        match self {
+            Self::Sglang(e) => &e.code,
         }
     }
 }

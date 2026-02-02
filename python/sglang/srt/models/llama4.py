@@ -242,6 +242,7 @@ class Llama4Attention(nn.Module):
             RMSNorm(
                 hidden_size=self.head_dim,
                 eps=config.rms_norm_eps,
+                has_weight=False,
             )
             if self.use_qk_norm
             else None
@@ -384,6 +385,7 @@ class Llama4DecoderLayer(nn.Module):
         self.config = config
         is_moe_layer = self._is_moe_layer(layer_id)
         is_previous_moe_layer = self._is_moe_layer(layer_id - 1)
+        is_next_moe_layer = self._is_moe_layer(layer_id + 1)
 
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
@@ -410,6 +412,7 @@ class Llama4DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_moe_layer,
             is_previous_layer_sparse=is_previous_moe_layer,
+            is_next_layer_sparse=is_next_moe_layer,
         )
 
         self.layer_communicator = LayerCommunicator(
@@ -484,7 +487,7 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
         )
         self.layers = make_layers(
             config.num_hidden_layers,

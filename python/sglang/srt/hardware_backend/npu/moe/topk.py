@@ -5,6 +5,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
+from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ def fused_topk_npu(
     topk_config: "TopKConfig",
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
+    layer_id: Optional[int] = None,
 ) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
@@ -39,8 +41,7 @@ def fused_topk_npu(
         topk_weights = topk_weights.to(torch.float32)
 
     elif use_grouped_topk and correction_bias is not None:
-        routed_scaling_factor = topk_config.routed_scaling_factor or 1
-
+        # Force set routed_scaling_factor = 1 to optimize renormalize
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
             k=topk_config.top_k,
@@ -50,22 +51,17 @@ def fused_topk_npu(
             group_select_mode=1,
             renorm=0,
             norm_type=1,
-            routed_scaling_factor=routed_scaling_factor,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
             eps=float(1e-20),
         )
-
-        if renormalize:
-            topk_weights_sum = (
-                topk_weights.sum(dim=-1, keepdim=True)
-                if topk_config.num_fused_shared_experts == 0
-                else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-            )
-            topk_weights = topk_weights / topk_weights_sum
 
     else:
         topk_config.torch_native = True
         return select_experts(
             hidden_states=hidden_states,
+            layer_id=layer_id,
             router_logits=router_logits,
             topk_config=topk_config,
             num_token_non_padded=num_token_non_padded,
@@ -75,5 +71,9 @@ def fused_topk_npu(
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    get_global_experts_capturer().capture(
+        layer_id=layer_id,
+        topk_ids=topk_ids,
+    )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

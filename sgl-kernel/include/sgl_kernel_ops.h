@@ -401,7 +401,8 @@ void fused_qk_norm_rope(
     double factor,
     double low,
     double high,
-    double attention_factor);
+    double attention_factor,
+    int64_t rotary_dim);
 
 void cutlass_fp4_group_mm(
     torch::Tensor& output,

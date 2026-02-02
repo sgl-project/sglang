@@ -24,8 +24,8 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
         self.im_end_id = _processor.tokenizer.encode("<|endofimg|>")[0]
         self.image_token_id = _processor.tokenizer.encode("<|imgpad|>")[0]
         self.IM_TOKEN_ID = self.image_token_id
-        self.IM_START_ID = self.im_start_id
-        self.IM_END_ID = self.im_end_id
+        self.IM_START_TOKEN_ID = self.im_start_id
+        self.IM_END_TOKEN_ID = self.im_end_id
 
         vision_config = hf_config.vision_config
         patch_size = vision_config.patch_size
