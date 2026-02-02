@@ -425,6 +425,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                transport_mode="http",
             )
 
     def init_metric_collector_watchdog(self):

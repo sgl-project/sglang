@@ -956,6 +956,7 @@ class Scheduler(
                 tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
                 scheduler=self,
+                transport_mode="http",
             )
 
     def init_overlap(self):
