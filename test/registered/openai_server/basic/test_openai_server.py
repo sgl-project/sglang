@@ -113,7 +113,7 @@ class TestOpenAIServer(CustomTestCase):
         self, echo, logprobs, use_list_input, parallel_sample_num, token_input
     ):
         print(
-            f"run_completion_stream: echo={echo}, logprobs={logprobs}, use_list_input={use_list_input}, parallel_sample_num={parallel_sample_num}, token_input={token_input}"
+            f"run_completion_stream: {echo=}, {logprobs=}, {use_list_input=}, {parallel_sample_num=}, {token_input=}"
         )
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         prompt = "The capital of France is"
@@ -146,7 +146,7 @@ class TestOpenAIServer(CustomTestCase):
 
         is_firsts = {}
         for response in generator:
-            print(f"response: {response}")
+            print(f"{response=}")
             usage = response.usage
             if usage is not None:
                 assert usage.prompt_tokens > 0, f"usage.prompt_tokens was zero"
