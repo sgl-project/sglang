@@ -4,23 +4,38 @@
 
 import logging
 import os
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
     LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from sglang.srt.layers.quantization.marlin_utils import (
+    apply_rtn_marlin_linear,
+    marlin_make_workspace,
 )
 from sglang.srt.layers.quantization.rtn_utils import (
     fix_weights,
     rtn_dequantize,
     rtn_quantize,
 )
+from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
 from sglang.srt.utils import set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -32,6 +47,10 @@ NUM_BITS = os.getenv("RTN_NUM_BITS", "8")
 
 # By default, use group size of 128 parameters, but it can be overridden by setting the RTN_GROUP_SIZE envvar
 GROUP_SIZE = os.getenv("RTN_GROUP_SIZE", "128")
+
+ScalarType, scalar_types = get_scalar_types()
+
+_rtn_marlin_workspace = None
 
 
 class RTNConfig(QuantizationConfig):
@@ -50,6 +69,10 @@ class RTNConfig(QuantizationConfig):
                 "Currently, only 4-bit or 8-bit weight quantization is "
                 f"supported for RTN, but got {self.weight_bits} bits."
             )
+
+        self.quant_type = (
+            scalar_types.uint8b128 if self.weight_bits == 8 else scalar_types.uint4b8
+        )
 
     def __repr__(self) -> str:
         return (
@@ -187,6 +210,7 @@ class RTNParameter(Parameter):
     ) -> None:
         self.scale = scale
         self.quant_config = quant_config
+        super().__init__()
 
     @property
     def data(self):
@@ -249,6 +273,7 @@ class RTNLinearMethod(LinearMethodBase):
         )
 
         layer.register_parameter("scale", scale)
+        layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -272,26 +297,8 @@ class RTNLinearMethod(LinearMethodBase):
         return out
 
 
-class RTNMoEMethod:
+class RTNMoEMethod(FusedMoEMethodBase):
     """MoE method for RTN."""
-
-    def __new__(cls, *args, **kwargs):
-        from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-
-        if not hasattr(cls, "_initialized"):
-            original_init = cls.__init__
-            new_cls = type(
-                cls.__name__,
-                (FusedMoEMethodBase,),
-                {
-                    "__init__": original_init,
-                    **{k: v for k, v in cls.__dict__.items() if k != "__dict__"},
-                },
-            )
-            obj = super(new_cls, new_cls).__new__(new_cls)
-            obj.__init__(*args, **kwargs)
-            return obj
-        return super().__new__(cls)
 
     def __init__(self, quant_config: RTNConfig):
         self.quant_config = quant_config
@@ -370,67 +377,173 @@ class RTNMoEMethod:
         fix_weights(layer, "w13_weight", weight_bits == 4)
         fix_weights(layer, "w2_weight", weight_bits == 4)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if layer.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+        elif backend.is_triton_kernels() and not layer.use_triton_kernels:
+            logger.warning(
+                "RTN MoE requested triton_kernels backend but layer.use_triton_kernels "
+                "is False. Falling back to TRITON."
+            )
+            backend = MoeRunnerBackend.TRITON
+        self.runner = MoeRunner(backend, moe_runner_config)
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-        inplace: bool = True,
-        enable_eplb: bool = False,
-        apply_router_weight_on_input: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.fused_moe_triton import fused_experts
-        from sglang.srt.layers.moe.topk import select_experts
-
-        if enable_eplb:
-            raise NotImplementedError("EPLB not supported for `RTNMoEMethod` yet.")
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-
+        dispatch_output,
+    ):
         weight_bits = self.quant_config.weight_bits
         group_size = self.quant_config.group_size
+        block_shape = None if group_size == -1 else [0, group_size]
 
-        return fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace,
-            activation=activation,
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
             use_int4_w4a16=weight_bits == 4,
             use_int8_w8a16=weight_bits == 8,
-            w1_scale=layer.w13_scale,
+            w13_scale=layer.w13_scale,
             w2_scale=layer.w2_scale,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            block_shape=[0, group_size],
-            routed_scaling_factor=routed_scaling_factor,
+            block_shape=block_shape,
         )
+
+        return self.runner.run(dispatch_output, quant_info)
+
+
+def _get_perms():
+    perm = []
+    for i in range(32):
+        perm1 = []
+        col = i // 4
+        for block in [0, 1]:
+            for row in [
+                2 * (i % 4),
+                2 * (i % 4) + 1,
+                2 * (i % 4 + 4),
+                2 * (i % 4 + 4) + 1,
+            ]:
+                perm1.append(16 * row + col + 8 * block)
+        for j in range(4):
+            perm.extend([p + 256 * j for p in perm1])
+
+    perm_arr = np.array(perm)
+    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
+    perm_arr = perm_arr.reshape((-1, 8))[:, interleave].ravel()
+    perm_tensor = torch.from_numpy(perm_arr)
+    scale_perm = []
+    for i in range(8):
+        scale_perm.extend([i + 8 * j for j in range(8)])
+    scale_perm_single = []
+    for i in range(4):
+        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
+    return perm_tensor, scale_perm, scale_perm_single
+
+
+_perm, _scale_perm, _scale_perm_single = _get_perms()
+
+
+def pack_for_marlin(weight, scale, qbits):
+    batch = weight.shape[0]
+
+    n = weight.size(1)
+    k = weight.size(2)
+    groupsize = k // scale.size(2)
+
+    tile = 16
+    s = scale.permute(0, 2, 1)
+    w = weight.permute(0, 2, 1)
+    if groupsize != k:
+        w = w.reshape((batch, -1, groupsize, n))
+        w = w.permute(0, 2, 1, 3)
+        w = w.reshape((batch, groupsize, -1))
+        s = s.reshape((batch, 1, -1))
+
+    if groupsize != k:
+        w = w.reshape((batch, groupsize, -1, n))
+        w = w.permute(0, 2, 1, 3)
+        w = w.reshape((batch, k, n)).contiguous()
+        s = s.reshape((batch, -1, len(_scale_perm)))[:, :, _scale_perm]
+    else:
+        s = s.reshape((batch, -1, len(_scale_perm_single)))[:, :, _scale_perm_single]
+    s = s.reshape((batch, -1, n)).contiguous()
+    w = w.reshape((batch, k // tile, tile, n // tile, tile))
+    w = w.permute((0, 1, 3, 2, 4))
+    w = w.reshape((batch, k // tile, n * tile))
+    res = w
+    res = res.reshape((batch, -1, _perm.numel()))[:, :, _perm].reshape(res.shape)
+    if qbits == 4:
+        q = torch.zeros(
+            (batch, res.shape[1], res.shape[2] // 2), dtype=torch.int8, device=w.device
+        )
+        for i in range(2):
+            q |= res[:, :, i::2] << 4 * i
+        q = q.reshape(batch, -1, n).contiguous()
+    else:
+        q = res.clone()
+        q[:, :, 2::8] = res[:, :, 4::8]
+        q[:, :, 3::8] = res[:, :, 5::8]
+        q[:, :, 4::8] = res[:, :, 2::8]
+        q[:, :, 5::8] = res[:, :, 3::8]
+        q = q.reshape(batch, -1, n).to(torch.int8).contiguous()
+
+    return q, s
+
+
+def repack_8bit_into_32bit(input):
+    output = torch.zeros(
+        (input.shape[0], input.shape[1], input.shape[2] // 4),
+        dtype=torch.int32,
+        device=input.device,
+    )
+    for i in range(4):
+        output |= (input[:, :, i::4] & 0xFF).to(torch.int32) << 8 * i
+
+    return output
+
+
+def repack_weights(qweight, scale, weight_bits):
+    batch_present = len(qweight.shape) == 3
+    if not batch_present:
+        qweight = qweight.unsqueeze(0)
+        scale = scale.unsqueeze(0)
+
+    if weight_bits == 4:
+        qweight_unpacked = torch.empty(
+            (qweight.shape[0], qweight.shape[1] * 2, qweight.shape[2]),
+            dtype=torch.uint8,
+            device=qweight.device,
+        )
+        for i in range(2):
+            qweight_unpacked[:, :, i::2] = ((qweight << 4 * (1 - i)) >> 4).reshape(
+                qweight.shape[0], qweight.shape[1] * 2, qweight.shape[2] // 2
+            )
+    else:
+        qweight_unpacked = qweight
+
+    qweight_packed, scale_packed = pack_for_marlin(qweight_unpacked, scale, weight_bits)
+    qweight_repacked = repack_8bit_into_32bit(qweight_packed.to(torch.uint8))
+    qweight_reshaped = qweight_repacked.reshape(
+        qweight.shape[0], qweight.shape[2] // 16, -1
+    )
+    if not batch_present:
+        qweight_reshaped = qweight_reshaped.squeeze(0)
+        scale_packed = scale_packed.squeeze(0)
+
+    return qweight_reshaped, scale_packed
+
+
+def init_workspace(device):
+    global _rtn_marlin_workspace
+    if _rtn_marlin_workspace is None or _rtn_marlin_workspace.device != device:
+        _rtn_marlin_workspace = marlin_make_workspace(device, max_blocks_per_sm=4)
 
 
 # Copied from sglang/srt/layers/quantization/gptq.py to avoid circular import
@@ -500,113 +613,13 @@ class RTNMarlinLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sgl_kernel import gptq_marlin_repack
+        weight_bits = self.quant_config.weight_bits
 
-        from sglang.srt.layers.quantization.gptq import GPTQMarlinConfig
-        from sglang.srt.layers.quantization.marlin_utils import (
-            marlin_make_empty_g_idx,
-            marlin_make_workspace,
-            marlin_permute_scales,
-        )
+        weight, scale = repack_weights(layer.weight, layer.scale, weight_bits)
+        replace_parameter(layer, "weight", weight)
+        replace_parameter(layer, "scale", scale)
 
-        device = layer.weight.device
-
-        # 1. Get unpacked weights from RTNParameter
-        # RTNParameter (layer.weight) stores quantized data.
-        # We get the raw data tensor.
-        qweight = layer.weight.data.data
-        if self.quant_config.weight_bits == 4:
-            # Unpack 4-bit weights
-            # Shape: (out/2, in) -> (out, in/2) -> (out, in)
-            from sglang.srt.layers.quantization.rtn_utils import rtn_unpack
-
-            qweight = qweight.view(qweight.shape[0] * 2, -1)
-            qweight = rtn_unpack(qweight, 4)
-
-        # Transpose to (in, out) for Marlin/GPTQ packing
-        qweight = qweight.t().contiguous()
-
-        # 2. Pack to GPTQ format (int32)
-
-        input_size = qweight.shape[0]
-        output_size = qweight.shape[1]
-
-        def pack_rows_torch(q_w, num_bits):
-            pack_factor = 32 // num_bits
-            q_res = torch.zeros(
-                (q_w.shape[0] // pack_factor, q_w.shape[1]),
-                dtype=torch.int32,
-                device=q_w.device,
-            )
-            for i in range(pack_factor):
-                q_res |= q_w[i::pack_factor, :].to(torch.int32) << (num_bits * i)
-            return q_res
-
-        qweight_gptq = pack_rows_torch(qweight, self.quant_config.weight_bits)
-
-        # 3. Call gptq_marlin_repack
-        # It expects `b_q_weight` (gptq format), perm (empty for rtn).
-
-        part_shape = (input_size, output_size)
-
-        # Create empty sort indices (identity)
-        g_idx_sort_indices = marlin_make_empty_g_idx(device)
-
-        marlin_qweight = gptq_marlin_repack(
-            qweight_gptq.contiguous(),
-            g_idx_sort_indices,
-            input_size,
-            output_size,
-            self.quant_config.weight_bits,
-        )
-
-        # 4. Scales
-        scales = layer.scale.data
-        # RTN Scales: (out, in // group).
-        # Marlin Scales expects: (in // group, out) permuted.
-
-        scales = scales.t().contiguous()
-        marlin_scales = marlin_permute_scales(
-            scales, input_size, output_size, self.quant_config.group_size
-        )
-
-        # 5. Replace params
-        # Use register_parameter to match apply() expecting qweight/scales and avoid AttributeError
-        layer.register_parameter(
-            "qweight", torch.nn.Parameter(marlin_qweight, requires_grad=False)
-        )
-        layer.register_parameter(
-            "scales", torch.nn.Parameter(marlin_scales, requires_grad=False)
-        )
-        layer.register_parameter(
-            "g_idx",
-            torch.nn.Parameter(marlin_make_empty_g_idx(device), requires_grad=False),
-        )
-        layer.register_parameter(
-            "g_idx_sort_indices",
-            torch.nn.Parameter(g_idx_sort_indices, requires_grad=False),
-        )
-        layer.register_parameter(
-            "qzeros",
-            torch.nn.Parameter(marlin_make_empty_g_idx(device), requires_grad=False),
-        )  # No zeros for RTN
-
-        # Clear old params
-        if hasattr(layer, "weight"):
-            del layer.weight
-        if hasattr(layer, "scale"):
-            del layer.scale
-
-        # Workspace
-        self.workspace = marlin_make_workspace(device)
-
-        # Metadata
-        self.is_k_full = True  # RTN usually no act order
-
-        # Type
-        self.quant_type = GPTQMarlinConfig.TYPE_MAP[
-            (self.quant_config.weight_bits, True)
-        ]
+        init_workspace(layer.weight.device)
 
     def apply(
         self,
@@ -614,29 +627,24 @@ class RTNMarlinLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.quantization.marlin_utils import apply_gptq_marlin_linear
-
-        return apply_gptq_marlin_linear(
+        return apply_rtn_marlin_linear(
             input=x,
-            weight=layer.qweight,
-            weight_scale=layer.scales,
-            weight_zp=layer.qzeros,
-            g_idx=layer.g_idx,
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=self.workspace,
-            wtype=self.quant_type,
-            input_size_per_partition=layer.qweight.shape[0] * 16,
+            weight=layer.weight,
+            weight_scale=layer.scale,
+            workspace=_rtn_marlin_workspace,
+            quant_type=self.quant_config.quant_type,
             output_size_per_partition=layer.output_size_per_partition,
-            is_k_full=self.is_k_full,
+            input_size_per_partition=layer.input_size_per_partition,
             bias=bias,
         )
 
 
-class RTNMarlinMoEMethod:
+class RTNMarlinMoEMethod(FusedMoEMethodBase):
     """MoE method for RTN with Marlin kernels."""
 
     def __init__(self, quant_config: RTNConfig):
         self.quant_config = quant_config
+        self.is_k_full = True
 
     def create_weights(
         self,
@@ -658,157 +666,25 @@ class RTNMarlinMoEMethod:
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.layers.quantization.marlin_utils import (
-            marlin_moe_permute_scales,
+        weight_bits = self.quant_config.weight_bits
+
+        w13_weight, w13_scale = repack_weights(
+            layer.w13_weight, layer.w13_scale, weight_bits
         )
-        from sglang.srt.layers.quantization.rtn_utils import rtn_unpack
+        replace_parameter(layer, "w13_weight", w13_weight)
+        replace_parameter(layer, "w13_scale", w13_scale)
 
-        def pack_rows_batch(q_w, num_bits):
-            # q_w: (batch, rows, cols)
-            pack_factor = 32 // num_bits
-            q_res = torch.zeros(
-                (q_w.shape[0], q_w.shape[1] // pack_factor, q_w.shape[2]),
-                dtype=torch.int32,
-                device=q_w.device,
-            )
-            for i in range(pack_factor):
-                q_res |= q_w[:, i::pack_factor, :].to(torch.int32) << (num_bits * i)
-            return q_res
-
-        # Processing w13
-        w13_packed = layer.w13_weight.data.data
-        if self.quant_config.weight_bits == 4:
-            # (E, out/2, in) -> (E, out, in/2)
-            w13_packed = w13_packed.view(
-                w13_packed.shape[0], w13_packed.shape[1] * 2, -1
-            )
-            w13_unpacked = rtn_unpack(w13_packed, 4)
-        else:
-            w13_unpacked = w13_packed
-
-        # (E, in, out)
-        w13_t = w13_unpacked.transpose(1, 2).contiguous()
-        w13_gptq = pack_rows_batch(w13_t, self.quant_config.weight_bits)
-
-        # Sort indices (empty/identity)
-        device = w13_packed.device
-        num_experts = w13_packed.shape[0]
-        w13_size_k = w13_t.shape[1]
-        w13_size_n = w13_t.shape[2]
-        w13_sort_indices = torch.empty(
-            (num_experts, w13_size_k), dtype=torch.int32, device=device
+        w2_weight, w2_scale = repack_weights(
+            layer.w2_weight, layer.w2_scale, weight_bits
         )
-        for e in range(num_experts):
-            w13_sort_indices[e] = torch.arange(
-                w13_size_k, dtype=torch.int32, device=device
-            )
+        replace_parameter(layer, "w2_weight", w2_weight)
+        replace_parameter(layer, "w2_scale", w2_scale)
 
-        marlin_w13_qweight = gptq_marlin_moe_repack(
-            w13_gptq,
-            w13_sort_indices,
-            w13_size_k,
-            w13_size_n,
-            self.quant_config.weight_bits,
-        )
+        init_workspace(layer.w13_weight.device)
 
-        # Processing w2
-        w2_packed = layer.w2_weight.data.data
-        if self.quant_config.weight_bits == 4:
-            # (E, out/2, in) -> (E, out, in/2)
-            w2_packed = w2_packed.view(w2_packed.shape[0], w2_packed.shape[1] * 2, -1)
-            w2_unpacked = rtn_unpack(w2_packed, 4)
-        else:
-            w2_unpacked = w2_packed
-
-        w2_t = w2_unpacked.transpose(1, 2).contiguous()
-        w2_gptq = pack_rows_batch(w2_t, self.quant_config.weight_bits)
-        w2_size_k = w2_t.shape[1]
-        w2_size_n = w2_t.shape[2]
-        w2_sort_indices = torch.empty(
-            (num_experts, w2_size_k), dtype=torch.int32, device=device
-        )
-        for e in range(num_experts):
-            w2_sort_indices[e] = torch.arange(
-                w2_size_k, dtype=torch.int32, device=device
-            )
-
-        marlin_w2_qweight = gptq_marlin_moe_repack(
-            w2_gptq,
-            w2_sort_indices,
-            w2_size_k,
-            w2_size_n,
-            self.quant_config.weight_bits,
-        )
-
-        # Scales
-        # RTN scales: (experts, out, in//group)
-        # Marlin scales: (experts, in//group, out) permuted
-        w13_scales = layer.w13_scale.transpose(1, 2).contiguous()
-        marlin_w13_scales = marlin_moe_permute_scales(
-            w13_scales, w13_size_k, w13_size_n, self.quant_config.group_size
-        )
-
-        w2_scales = layer.w2_scale.transpose(1, 2).contiguous()
-        marlin_w2_scales = marlin_moe_permute_scales(
-            w2_scales, w2_size_k, w2_size_n, self.quant_config.group_size
-        )
-
-        # Replace
-        # Use register_parameter for new parameters to avoid AttributeError in replace_parameter
-        layer.register_parameter(
-            "w13_qweight",
-            torch.nn.Parameter(marlin_w13_qweight, requires_grad=False),
-        )
-        layer.register_parameter(
-            "w2_qweight", torch.nn.Parameter(marlin_w2_qweight, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w13_scales", torch.nn.Parameter(marlin_w13_scales, requires_grad=False)
-        )
-        layer.register_parameter(
-            "w2_scales", torch.nn.Parameter(marlin_w2_scales, requires_grad=False)
-        )
-
-        layer.register_parameter(
-            "w13_g_idx_sort_indices",
-            torch.nn.Parameter(w13_sort_indices, requires_grad=False),
-        )
-        layer.register_parameter(
-            "w2_g_idx_sort_indices",
-            torch.nn.Parameter(w2_sort_indices, requires_grad=False),
-        )
-
-        # Set g_idx, zeros to None/Empty
-        layer.register_parameter(
-            "w13_g_idx",
-            torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            ),
-        )
-        layer.register_parameter(
-            "w2_g_idx",
-            torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            ),
-        )
-
-        # Remove old
-        del layer.w13_weight
-        del layer.w13_scale
-        del layer.w2_weight
-        del layer.w2_scale
-
-        self.is_k_full = True
-
-    def create_moe_runner(self, layer, moe_runner_config):
-        from sglang.srt.layers.moe import (
-            MoeRunner,
-            MoeRunnerBackend,
-            get_moe_runner_backend,
-        )
-
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
         assert get_moe_runner_backend().is_auto()
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
@@ -816,103 +692,19 @@ class RTNMarlinMoEMethod:
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        correction_bias: Optional[torch.Tensor] = None,
-        activation: str = "silu",
-        inplace: bool = True,
-        enable_eplb: bool = False,
-        apply_router_weight_on_input: bool = False,
-        routed_scaling_factor: Optional[float] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-        from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-        from sglang.srt.layers.moe.topk import select_experts
-
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-
-        # Helper stub to simulate DispatchOutput since we don't have dispatch yet?
-        # MoeRunner.run expects DispatchOutput.
-        # But wait, MarlinRunner (fused_experts_none_to_marlin) takes dispatch_output.
-        # usually run_moe calls dispatcher.
-        # But `apply` here replaces `fused_experts`.
-        # `fused_experts` bundles everything.
-
-        # But `MoeRunner` interface runs dispatch + combine?
-        # Check `sglang/srt/layers/moe/moe_runner/runner.py`.
-        # `run(self, dispatch_output, quant_info)`.
-        # So we needed to dispatch first.
-        # But `RTNMoEMethod.apply` calls `fused_experts` which usually assumes `x` is token states.
-
-        # `fused_experts` in `fused_moe_triton.py` DOES NOT dispatch?
-        # No, `fused_experts` takes `topk_weights`, `topk_ids` etc.
-        # It is the kernel wrapper.
-
-        # `runner.run` calls the implementation.
-        # `fused_experts_none_to_marlin` takes `StandardDispatchOutput`.
-        # We can construct `StandardDispatchOutput` wrapping `x`, `topk`, etc.
-
-        dispatch_output = StandardDispatchOutput(
-            hidden_states=x,
-            topk_output=type(
-                "TopKOutput",
-                (),
-                {
-                    "topk_weights": topk_weights,
-                    "topk_ids": topk_ids,
-                    "router_logits": router_logits,
-                },
-            )(),
-            router_logits=router_logits,
-        )
-        # Hacky topk_output.
-        # Actually `StandardDispatchOutput` expects `TopKOutput`.
-        from sglang.srt.layers.moe.topk import TopKOutput
-
-        topk_out = TopKOutput(topk_weights, topk_ids, router_logits)
-        dispatch_output = StandardDispatchOutput(
-            x, topk_out, router_logits
-        )  # router_logits argument?
-
-        # `MoeRunner` calls `self.backend_func(dispatch_output, quant_info, self.config)`.
-
+        dispatch_output,
+    ):
         quant_info = MarlinMoeQuantInfo(
-            w13_qweight=layer.w13_qweight,
-            w2_qweight=layer.w2_qweight,
-            w13_scales=layer.w13_scales,
-            w2_scales=layer.w2_scales,
-            w13_g_idx=layer.w13_g_idx,
-            w2_g_idx=layer.w2_g_idx,
-            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
-            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
+            w13_qweight=layer.w13_weight,
+            w2_qweight=layer.w2_weight,
+            w13_scales=layer.w13_scale,
+            w2_scales=layer.w2_scale,
+            w13_g_idx_sort_indices=None,
+            w2_g_idx_sort_indices=None,
             weight_bits=self.quant_config.weight_bits,
+            w13_g_idx=None,
+            w2_g_idx=None,
             is_k_full=self.is_k_full,
         )
 
-        # We need to manually invoke the runner or fused function?
-        # `RTNMoEMethod` creates a runner? No, `RTNMoEMethod.apply` is the implementation.
-        # `FusedMoE` layer calls `method.apply`.
-
-        return self.runner.run(dispatch_output, quant_info).hidden_states
+        return self.runner.run(dispatch_output, quant_info)
