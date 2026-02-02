@@ -553,11 +553,14 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
             cls.prefill_port,
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
+        prefill_env = os.environ.copy()
+        prefill_env["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.process_prefill = popen_launch_server(
             cls.model,
             base_url=cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
+            env=prefill_env,
         )
 
     @classmethod
