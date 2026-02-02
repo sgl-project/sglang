@@ -2489,7 +2489,7 @@ class IncModelLoader(DefaultModelLoader):
                     "act_dynamic": True,
                     "act_sym": True,
                 },
-                "llm_compressor"
+                "llm_compressor",
             ),
         }
         quant_cfg = AR_QUANT_CFG_CHOICES.get(quantization)
@@ -2528,8 +2528,7 @@ class IncModelLoader(DefaultModelLoader):
                 low_cpu_mem_usage=False,
             )
             model, _ = autoround.quantize_and_save(
-                output_dir=self.load_config.inc_save_path,
-                format=format
+                output_dir=self.load_config.inc_save_path, format=format
             )
             return model
         except Exception as e:

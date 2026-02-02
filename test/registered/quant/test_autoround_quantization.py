@@ -82,4 +82,3 @@ class TestAutoRoundQuantization(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
