@@ -56,11 +56,11 @@ def _ref_update_like(
     src_state_indices = intermediate_state_indices[valid_mask].to(torch.int64)
     last_steps = accepted_steps[valid_mask].to(torch.int64)
 
-    if dst_state_indices.numel() == 0:
-        return
-
-    _ref_scatter(ssm_states, intermediate_ssm, dst_state_indices, src_state_indices, last_steps)
-    _ref_scatter(conv_states, intermediate_conv, dst_state_indices, src_state_indices, last_steps)
+    # Only scatter if there are valid indices (but don't early return -
+    # mamba_track_indices processing is independent)
+    if dst_state_indices.numel() > 0:
+        _ref_scatter(ssm_states, intermediate_ssm, dst_state_indices, src_state_indices, last_steps)
+        _ref_scatter(conv_states, intermediate_conv, dst_state_indices, src_state_indices, last_steps)
 
     if mamba_track_indices is not None:
         assert mamba_steps_to_track is not None
