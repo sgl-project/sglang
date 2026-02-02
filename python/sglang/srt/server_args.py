@@ -1406,6 +1406,26 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
                 )
+        elif "Step3p5ForCausalLM" in model_arch:
+            if self.speculative_algorithm == "EAGLE":
+                self.enable_multi_layer_eagle = True
+                logger.info(
+                    "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
+                )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                    )
+            if self.enable_hierarchical_cache:
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Reset swa_full_tokens_ratio to 1.0 for Step3p5ForCausalLM model with hierarchical cache"
+                )
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
+                )
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
