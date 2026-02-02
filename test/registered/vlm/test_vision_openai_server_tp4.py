@@ -23,7 +23,7 @@ class TestInternVL25TP4Server(ImageOpenAITestMixin):
 
 
 # Delete the mixin classes so that they are not collected by pytest
-del (ImageOpenAITestMixin,)
+del ImageOpenAITestMixin
 
 
 if __name__ == "__main__":
