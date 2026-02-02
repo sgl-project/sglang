@@ -87,6 +87,7 @@ def launch_server(
         "--trust-remote-code",
         "--mem-fraction-static", "0.80",
         "--disable-radix-cache",
+        "--watchdog-timeout", "600",  # Increase timeout for JIT compilation
     ]
     if not disable_speculative:
         cmd += [
@@ -186,10 +187,50 @@ def start_profiling(output_dir: str, num_steps: int = 5, activities: list = None
     try:
         response = requests.post(url=url, json=json_data, timeout=300)
         response.raise_for_status()
-        print(f"Profiler completed. Traces saved to: {output_dir}")
+        print(f"Profiler started. Output dir: {output_dir}")
         return True
     except Exception as e:
-        print(f"Warning: Profiling failed: {e}")
+        print(f"Warning: Profiling start failed: {e}")
+        return False
+
+
+def run_profile_requests(model_path: str, num_requests: int = 8, input_len: int = 128, output_len: int = 256, seed: int = 42):
+    """Run requests to trigger profiling steps."""
+    print(f"Running {num_requests} requests to trigger profiling...")
+    
+    cmd = [
+        "python", f"{SGLANG_GDN_PATH}/python/sglang/bench_serving.py",
+        "--backend", "sglang",
+        "--host", SERVER_HOST,
+        "--port", str(SERVER_PORT),
+        "--model", model_path,
+        "--dataset-name", "random",
+        "--random-input", str(input_len),
+        "--random-output", str(output_len),
+        "--num-prompts", str(num_requests),
+        "--seed", str(seed + 1000),  # Different seed for profiling run
+    ]
+    
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{SGLANG_GDN_PATH}/python:{env.get('PYTHONPATH', '')}"
+    
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
+    print("Profiling requests completed.")
+    return result.returncode == 0
+
+
+def stop_profiling():
+    """Stop torch profiling via HTTP API."""
+    url = f"http://{SERVER_HOST}:{SERVER_PORT}/stop_profile"
+    
+    print("Stopping profiler...")
+    try:
+        response = requests.post(url=url, timeout=300)
+        response.raise_for_status()
+        print("Profiler stopped and traces saved.")
+        return True
+    except Exception as e:
+        print(f"Warning: Profiling stop failed: {e}")
         return False
 
 
@@ -216,12 +257,19 @@ def run_benchmark(model_path: str, num_prompts: int, input_len: int, output_len:
     
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1200)
     
-    # Run profiling if enabled
+    # Run profiling if enabled: start profiler, run requests to trigger steps, then stop
     if enable_profile and profile_output_dir:
         print("\n" + "="*60)
         print("Running profiling...")
         print("="*60)
-        start_profiling(profile_output_dir, profile_num_steps, profile_activities or ["CPU", "GPU"])
+        os.makedirs(profile_output_dir, exist_ok=True)
+        if start_profiling(profile_output_dir, profile_num_steps, profile_activities or ["CPU", "GPU"]):
+            # Run additional requests to trigger profiling steps
+            run_profile_requests(model_path, num_requests=num_prompts, input_len=input_len, output_len=output_len, seed=seed)
+            # Give some time for profiler to flush
+            import time
+            time.sleep(2)
+            stop_profiling()
     
     # Save benchmark output
     output_file = result_file.replace(".jsonl", "_output.txt")

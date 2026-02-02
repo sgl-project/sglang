@@ -40,6 +40,35 @@ def _get_cutedsl_gdn_verify():
     return _cutedsl_gdn_verify_available, _cutedsl_gdn_verify_k_last
 
 
+def _precompile_cutedsl_kernels(
+    max_batch_size: int = 64,
+    T: int = 4,
+    H: int = 8,
+    HV: int = 16,
+    K: int = 128,
+    V: int = 128,
+    pool_size: int = 49,
+    cache_steps: int = 4,
+):
+    """Pre-compile CuTe DSL GDN Verify kernels for common batch sizes."""
+    try:
+        from sglang.jit_kernel.cutedsl_gdn_verify import precompile_cutedsl_gdn_verify_kernels
+        # Pre-compile for batch sizes 1 to max_batch_size
+        batch_sizes = list(range(1, max_batch_size + 1))
+        precompile_cutedsl_gdn_verify_kernels(
+            batch_sizes=batch_sizes,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            pool_size=pool_size,
+            cache_steps=cache_steps,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to pre-compile CuTe DSL kernels: {e}")
+
+
 # Lazy import for FlashInfer GDN prefill kernel
 _flashinfer_gdn_prefill_available = None
 _flashinfer_chunk_gated_delta_rule = None
@@ -924,6 +953,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
             self._flashinfer_chunk_gated_delta_rule = flashinfer_chunk_gdr
             self._cutedsl_gdn_verify_k_last = cutedsl_gdn_verify_k_last
+            
+            # Pre-compile CuTe DSL kernels for common batch sizes during initialization
+            # This avoids JIT compilation overhead during inference
+            server_args = get_global_server_args()
+            if server_args.speculative_algorithm is not None:
+                # Get model config for kernel parameters
+                hf_config = getattr(model_runner, "model_config", None)
+                if hf_config is not None:
+                    hf_config = getattr(hf_config, "hf_config", hf_config)
+                    H = getattr(hf_config, "linear_num_key_heads", 8) // model_runner.tp_size
+                    HV = getattr(hf_config, "linear_num_value_heads", 16) // model_runner.tp_size
+                    K = getattr(hf_config, "linear_key_head_dim", 128)
+                    V = getattr(hf_config, "linear_value_head_dim", 128)
+                else:
+                    H, HV, K, V = 8, 16, 128, 128
+                
+                # Pre-compile for batch sizes 1-64
+                max_bs = min(64, server_args.max_running_requests or 64)
+                draft_token_num = server_args.speculative_num_steps + 1  # T parameter
+                # pool_size = max_running_requests + 1 (for verify kernel)
+                pool_size = (server_args.max_running_requests or 48) + 1
+                
+                logger.info(f"Pre-compiling CuTe DSL GDN Verify kernels (B=1..{max_bs}, T={draft_token_num}, pool_size={pool_size})")
+                _precompile_cutedsl_kernels(
+                    max_batch_size=max_bs,
+                    T=draft_token_num,
+                    H=H,
+                    HV=HV,
+                    K=K,
+                    V=V,
+                    pool_size=pool_size,
+                    cache_steps=draft_token_num,
+                )
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:

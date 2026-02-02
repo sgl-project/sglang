@@ -823,3 +823,63 @@ def cutedsl_gdn_verify_k_last(
     )
     
     return o
+
+
+def precompile_cutedsl_gdn_verify_kernels(
+    batch_sizes: list,
+    T: int = 4,
+    H: int = 8,
+    HV: int = 16,
+    K: int = 128,
+    V: int = 128,
+    pool_size: int = 49,
+    cache_steps: int = 4,
+    use_qk_l2norm: bool = True,
+    act_dtype: torch.dtype = torch.bfloat16,
+):
+    """
+    Pre-compile CuTe DSL GDN Verify kernels for common batch sizes.
+    
+    This should be called during server warmup to avoid JIT compilation
+    overhead during inference.
+    
+    Args:
+        batch_sizes: List of batch sizes to pre-compile (e.g., [1, 2, 4, 8, 16, 32])
+        T: Number of tokens per sequence (default: 4 for spec decoding)
+        H: Number of attention heads
+        HV: Number of value heads  
+        K: Key dimension
+        V: Value dimension
+        pool_size: Pool size for state caching
+        cache_steps: Number of cache steps
+        use_qk_l2norm: Whether to use L2 normalization
+        act_dtype: Activation dtype (default: bfloat16)
+    """
+    if not _check_cutlass_available():
+        logger.warning("CuTe DSL not available, skipping kernel pre-compilation")
+        return
+    
+    logger.info(f"Pre-compiling CuTe DSL GDN Verify kernels for batch sizes: {batch_sizes}")
+    
+    for B in batch_sizes:
+        try:
+            _get_compiled_kernel(
+                B=B,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                pool_size=pool_size,
+                cache_steps=cache_steps,
+                disable_state_update=True,
+                cache_intermediate_states=True,
+                use_qk_l2norm=use_qk_l2norm,
+                act_dtype=act_dtype,
+                use_precomputed_g_beta=False,
+                use_precomputed_g_decay=False,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to pre-compile kernel for B={B}: {e}")
+    
+    logger.info(f"Pre-compilation complete. {len(_compiled_kernels)} kernels cached.")
