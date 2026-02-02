@@ -192,26 +192,30 @@ def pad_nvfp4_weight(
     weight_current_rows = weight.shape[0]  # N dimension
     weight_current_col_bytes = weight.shape[1]  # K//2 (packed)
 
-    # Pad N dimension (rows) if not aligned
+    # Calculate padding for N dimension (rows)
+    pad_rows = 0
     if n_alignment > 0 and weight_current_rows % n_alignment != 0:
         total_rows = round_up_to_multiple(weight_current_rows, n_alignment)
         pad_rows = total_rows - weight_current_rows
-        weight = torch.nn.functional.pad(weight, (0, 0, 0, pad_rows)).contiguous()
 
-    # Check K dimension alignment
+    # Calculate padding for K dimension (columns)
     # 2 FP4 items are packed per byte in the input dimension
     weight_current_col_elements = weight_current_col_bytes * 2
-    weights_padding_cols = 0
-
+    pad_cols_bytes = 0
     if k_alignment > 0 and weight_current_col_elements % k_alignment != 0:
         total_cols = round_up_to_multiple(weight_current_col_elements, k_alignment)
         pad_cols = total_cols - weight_current_col_elements
         # pad_cols is in elements, but padding is in bytes (2 elements per byte)
         pad_cols_bytes = pad_cols // 2
-        weight = torch.nn.functional.pad(weight, (0, pad_cols_bytes, 0, 0)).contiguous()
-        weights_padding_cols = pad_cols_bytes
 
-    return weight, weights_padding_cols
+    # Apply padding in a single operation if needed
+    # For 2D tensor, pad argument is (pad_left, pad_right, pad_top, pad_bottom)
+    if pad_rows > 0 or pad_cols_bytes > 0:
+        weight = torch.nn.functional.pad(
+            weight, (0, pad_cols_bytes, 0, pad_rows)
+        ).contiguous()
+
+    return weight, pad_cols_bytes
 
 
 def pad_nvfp4_activation_for_cutlass(
