@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
@@ -487,16 +488,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         ), f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
-        if backend.is_triton():
-
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-            )
-            return self.runner.run(dispatch_output, quant_info)
-        else:
+        if use_intel_xpu_backend():
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
@@ -511,6 +503,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b2=getattr(layer, "w2_weight_bias", None),
             )
             return StandardCombineInput(hidden_states=output)
+        else:
+            assert backend.is_triton()
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
     def forward_npu(
         self,

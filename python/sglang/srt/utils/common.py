@@ -299,6 +299,10 @@ def xpu_has_xmx_support():
     return False
 
 
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
+
+
 @lru_cache(maxsize=1)
 def is_flashinfer_available():
     """

@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_xpu,
+    use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -42,7 +43,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
-_use_sgl_xpu = get_bool_env_var("SGLANG_USE_SGL_XPU") and _is_xpu
+_use_sgl_xpu = use_intel_xpu_backend()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
