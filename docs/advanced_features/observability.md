@@ -7,7 +7,7 @@ You can query them by:
 curl http://localhost:30000/metrics
 ```
 
-See [Production Metrics](../references/production_metrics.md) for more details.
+See [Production Metrics](../references/production_metrics.md) and [Production Request Tracing](../references/production_request_trace.md) for more details.
 
 ## Logging
 

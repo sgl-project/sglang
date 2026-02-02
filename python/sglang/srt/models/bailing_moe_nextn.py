@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" SGLang BailingMoENextN model."""
+"""SGLang BailingMoENextN model."""
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -28,16 +28,16 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.bailing_moe import BailingMoEBlock, BailingMoEForCausalLM
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 LoraConfig = None
@@ -63,14 +63,20 @@ class BailingMoEModelNextN(nn.Module):
         self.word_embeddings = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("word_embeddings", prefix),
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        self.eh_proj = ReplicatedLinear(
+            2 * config.hidden_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("eh_proj", prefix),
+        )
 
         self.decoder = BailingMoEBlock(
             config,
@@ -97,7 +103,7 @@ class BailingMoEModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            hidden_states = self.eh_proj(
+            hidden_states, _ = self.eh_proj(
                 torch.cat(
                     (
                         self.enorm(hidden_states),
@@ -145,7 +151,7 @@ class BailingMoeForCausalLMNextN(BailingMoEForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 

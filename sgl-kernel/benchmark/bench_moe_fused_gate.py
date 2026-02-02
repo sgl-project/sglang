@@ -1,5 +1,6 @@
 import itertools
 import math
+import os
 
 import torch
 import triton
@@ -7,6 +8,12 @@ import triton.language as tl
 from sgl_kernel import moe_fused_gate
 
 from sglang.srt.layers.moe.topk import biased_grouped_topk
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def biased_grouped_topk_org(scores, bias, num_expert_group, topk_group, topk):
@@ -28,7 +35,12 @@ def biased_grouped_topk_org_fuse_kernel(
     return moe_fused_gate(scores, bias, num_expert_group, topk_group, topk)
 
 
-seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+# CI environment uses simplified parameters
+if IS_CI:
+    seq_length_range = [5000]  # Only test one sequence length in CI
+else:
+    seq_length_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+
 configs = [(sq,) for sq in seq_length_range]
 
 
