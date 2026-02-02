@@ -1245,7 +1245,7 @@ class Hunyuan3D2DiT(nn.Module):
 
         latent = self.latent_in(x)
 
-        t_emb = _flux_timestep_embedding(t, 256, time_factor=self.time_factor).to(
+        t_emb = _flux_timestep_embedding(t, 256, self.time_factor).to(
             dtype=latent.dtype
         )
 
@@ -1258,7 +1258,7 @@ class Hunyuan3D2DiT(nn.Module):
                     "Didn't get guidance strength for guidance distilled model."
                 )
             vec = vec + self.guidance_in(
-                _flux_timestep_embedding(guidance, 256, time_factor=self.time_factor)
+                _flux_timestep_embedding(guidance, 256, self.time_factor)
             )
 
         cond = self.cond_in(cond)
