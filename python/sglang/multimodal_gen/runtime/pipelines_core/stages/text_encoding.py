@@ -124,10 +124,6 @@ class TextEncodingStage(PipelineStage):
                     pe.repeat_interleave(expansion_factors, dim=0)
                     for pe in neg_embeds_list
                 ]
-                batch.negative_prompt_embeds = [
-                    pe.repeat_interleave(expansion_factors, dim=0)
-                    for pe in neg_embeds_list
-                ]
                 if neg_masks_list:
                     batch.negative_attention_mask = [
                         pe.repeat_interleave(expansion_factors, dim=0)

@@ -283,7 +283,7 @@ class DiffGenerator:
                             "size": (
                                 batch_req.sampling_params.height,
                                 batch_req.sampling_params.width,
-                                batch_req.sampling_params.num_frames
+                                batch_req.sampling_params.num_frames,
                             ),
                             "generation_time": timer.duration / num_outputs,
                             "peak_memory_mb": output_batch.peak_memory_mb,
@@ -301,9 +301,6 @@ class DiffGenerator:
 
         except Exception as e:
             logger.error(f"Error processing batch: {e}")
-            import traceback
-
-            traceback.print_exc()
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)

@@ -224,7 +224,7 @@ class Scheduler:
                                 [identity, b"", pickle.dumps(OutputBatch(error=str(e)))]
                             )
                 else:
-                    self.waiting_queue.append((identity, req.batch_size, req))
+                    self.waiting_queue.append(([identity], [req.batch_size], req))
 
     def prepare_server_warmup_reqs(self):
         if (
