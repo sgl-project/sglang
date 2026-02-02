@@ -267,6 +267,7 @@ class PiecewiseCudaGraphRunner:
         mrope_positions = (
             self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
+
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:num_tokens]
@@ -500,6 +501,7 @@ class PiecewiseCudaGraphRunner:
 
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         self.positions[:num_tokens].copy_(forward_batch.positions)
+        self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         if self.out_cache_loc_swa is not None:
             self.out_cache_loc_swa[: self.raw_num_tokens].copy_(
                 self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
