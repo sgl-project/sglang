@@ -66,6 +66,7 @@ runtime_common = [
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "arctic-inference==0.1.1",
 ]
 
 tracing = [
