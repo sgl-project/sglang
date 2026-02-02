@@ -43,6 +43,13 @@ class TestGptOss120B(unittest.TestCase):
             "--cuda-graph-max-bs=200",
             "--mem-fraction-static=0.93",
         ]
+        # Lower batch size for EAGLE3 variants to avoid OOM
+        base_args_eagle3 = [
+            "--tp=8",
+            "--trust-remote-code",
+            "--cuda-graph-max-bs=100",
+            "--mem-fraction-static=0.85",
+        ]
         parser_args = [
             "--reasoning-parser=gpt-oss",
             "--tool-call-parser=gpt-oss",
@@ -88,19 +95,19 @@ class TestGptOss120B(unittest.TestCase):
                 extra_args=base_args + parser_args,
                 variant="MXFP4+Parsers",
             ),
-            # Variant 5: BF16 + Parsers + EAGLE3 (full featured)
+            # Variant 5: BF16 + Parsers + EAGLE3 (full featured, lower batch size)
             ModelLaunchSettings(
                 GPT_OSS_120B_BF16_MODEL_PATH,
                 tp_size=8,
-                extra_args=base_args + parser_args + eagle3_args,
+                extra_args=base_args_eagle3 + parser_args + eagle3_args,
                 env=eagle3_env,
                 variant="BF16+Parsers+EAGLE3",
             ),
-            # Variant 6: MXFP4 + Parsers + EAGLE3 (full featured quantized)
+            # Variant 6: MXFP4 + Parsers + EAGLE3 (full featured quantized, lower batch size)
             ModelLaunchSettings(
                 GPT_OSS_120B_MXFP4_MODEL_PATH,
                 tp_size=8,
-                extra_args=base_args + parser_args + eagle3_args,
+                extra_args=base_args_eagle3 + parser_args + eagle3_args,
                 env=eagle3_env,
                 variant="MXFP4+Parsers+EAGLE3",
             ),
