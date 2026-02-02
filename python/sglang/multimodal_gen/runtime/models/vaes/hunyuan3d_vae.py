@@ -29,15 +29,6 @@ logger = init_logger(__name__)
 
 # Attention backend selection
 scaled_dot_product_attention = F.scaled_dot_product_attention
-if os.environ.get("USE_SAGEATTN", "0") == "1":
-    try:
-        from sageattention import sageattn
-
-        scaled_dot_product_attention = sageattn
-        logger.info("Using SageAttention for Hunyuan3D VAE")
-    except ImportError:
-        logger.warning("SageAttention not available, using default SDPA")
-
 
 # =============================================================================
 # Attention Processors
@@ -601,17 +592,92 @@ class CrossAttentionDecoder(nn.Module):
         self.cross_attn_decoder.attn.attention.attn_processor = CrossAttentionProcessor
 
     def forward(self, queries=None, query_embeddings=None, latents=None):
-        if query_embeddings is None:
-            query_embeddings = self.query_proj(
-                self.fourier_embedder(queries).to(latents.dtype)
+        if self.count == 0:
+            print(
+                f"[output_proj] weight stats: min={self.output_proj.weight.min():.6f}, "
+                f"max={self.output_proj.weight.max():.6f}, mean={self.output_proj.weight.mean():.6f}"
             )
+            print(f"[output_proj] bias: {self.output_proj.bias}")
+            print(f"[output_proj] bias value: {self.output_proj.bias.data}")
+            # print(f"[ln_post] output shape after ln: {x.shape}")
+            print(f"[output_proj] weight shape: {self.output_proj.weight.shape}")
+            print(f"[output_proj] weight std: {self.output_proj.weight.std():.6f}")
+            print(f"[output_proj] bias value: {self.output_proj.bias.data.item():.6f}")
+
+            # sample_x = x[0, 0, :]  # 取一个样本
+            # manual_dot = (sample_x * self.output_proj.weight.data[0]).sum()
+            # print(f"[manual calc] sample x mean: {sample_x.mean():.4f}, dot product: {manual_dot:.4f}")
+        if query_embeddings is None:
+            fourier_out = self.fourier_embedder(queries)
+            query_embeddings = self.query_proj(fourier_out.to(latents.dtype))
+
+        # 只在第一个 chunk 打印调试信息
+        debug_this_chunk = self.count == 0
         self.count += query_embeddings.shape[1]
+
+        if debug_this_chunk:
+            print(
+                f"[geo_decoder] query_embeddings: shape={query_embeddings.shape}, min={query_embeddings.min():.4f}, max={query_embeddings.max():.4f}, mean={query_embeddings.mean():.4f}"
+            )
+            print(
+                f"[geo_decoder] input latents: shape={latents.shape}, min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
+            )
+
         if self.downsample_ratio != 1:
             latents = self.latents_proj(latents)
+            if debug_this_chunk:
+                print(
+                    f"[geo_decoder] after latents_proj: min={latents.min():.4f}, max={latents.max():.4f}"
+                )
+
         x = self.cross_attn_decoder(query_embeddings, latents)
+        if debug_this_chunk:
+            print(
+                f"[geo_decoder] after cross_attn: shape={x.shape}, min={x.min():.4f}, max={x.max():.4f}, mean={x.mean():.4f}"
+            )
+
         if self.enable_ln_post:
             x = self.ln_post(x)
+            if debug_this_chunk:
+                print(
+                    f"[geo_decoder] after ln_post: min={x.min():.4f}, max={x.max():.4f}, mean={x.mean():.4f}",
+                    flush=True,
+                )
+
+        if debug_this_chunk:
+            # 手动计算并立即比较
+            import sys
+
+            sample_x = x[0, 0, :].float()  # 第一个点
+            w = self.output_proj.weight.data[0].float()
+            b = self.output_proj.bias.data[0].float()
+            manual_dot = (sample_x * w).sum()
+            manual_result = manual_dot + b
+            print(
+                f"[CRITICAL] Manual calc: dot={manual_dot:.4f}, +bias={manual_result:.4f}",
+                flush=True,
+            )
+            print(
+                f"[CRITICAL] x[0,0] stats: min={sample_x.min():.4f}, max={sample_x.max():.4f}, mean={sample_x.mean():.4f}",
+                flush=True,
+            )
+            sys.stdout.flush()
+
         occ = self.output_proj(x)
+
+        if debug_this_chunk:
+            import sys
+
+            print(f"[CRITICAL] occ from layer: {occ[0,0,0].item():.6f}", flush=True)
+            print(
+                f"[CRITICAL] occ stats: min={occ.min():.4f}, max={occ.max():.4f}, mean={occ.mean():.4f}",
+                flush=True,
+            )
+            print(
+                f"[CRITICAL] occ positive: {(occ > 0).sum().item()}, negative: {(occ < 0).sum().item()}",
+                flush=True,
+            )
+            sys.stdout.flush()
         return occ
 
 
@@ -1247,6 +1313,19 @@ class FlashVDMVolumeDecoding:
             .view((batch_size, grid_size[0], grid_size[1], grid_size[2]))
         )
 
+        print(
+            f"[DEBUG] First level grid_logits stats: "
+            f"min={grid_logits.min().item():.4f}, "
+            f"max={grid_logits.max().item():.4f}, "
+            f"mean={grid_logits.mean().item():.4f}, "
+            f"nan_count={torch.isnan(grid_logits).sum().item()}"
+        )
+
+        # 检查是否有零交叉
+        pos_count = (grid_logits > 0).sum().item()
+        neg_count = (grid_logits < 0).sum().item()
+        print(f"[DEBUG] Positive voxels: {pos_count}, Negative voxels: {neg_count}")
+
         for octree_depth_now in resolutions[1:]:
             grid_size = np.array([octree_depth_now + 1] * 3)
             resolution = bbox_size / octree_depth_now
@@ -1607,8 +1686,51 @@ class VectsetVAE(nn.Module):
 
     def latents2mesh(self, latents: torch.FloatTensor, **kwargs):
         """Convert latents to mesh."""
+        """Convert latents to mesh."""
+        print(f"[SGLANG VAE] latents2mesh input - shape: {latents.shape}")
+        print(
+            f"[SGLANG VAE] latents2mesh input - min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
+        )
+        print(
+            f"[SGLANG VAE] kwargs: octree_resolution={kwargs.get('octree_resolution')}, mc_level={kwargs.get('mc_level')}, bounds={kwargs.get('bounds')}"
+        )
+
         grid_logits = self.volume_decoder(latents, self.geo_decoder, **kwargs)
+
+        # 关键调试：grid_logits的分布决定了mesh的大小
+        print(f"[SGLANG VAE] grid_logits shape: {grid_logits.shape}")
+        print(
+            f"[SGLANG VAE] grid_logits stats: min={grid_logits.min():.4f}, max={grid_logits.max():.4f}, mean={grid_logits.mean():.4f}"
+        )
+        print(
+            f"[SGLANG VAE] grid_logits positive count: {(grid_logits > 0).sum().item()}"
+        )
+        print(
+            f"[SGLANG VAE] grid_logits negative count: {(grid_logits < 0).sum().item()}"
+        )
+        print(
+            f"[SGLANG VAE] grid_logits nan count: {torch.isnan(grid_logits).sum().item()}"
+        )
+
+        # 检查零交叉（这决定了mesh surface的位置）
+        mc_level = kwargs.get("mc_level", 0.0)
+        above_level = (grid_logits > mc_level).sum().item()
+        below_level = (grid_logits < mc_level).sum().item()
+        print(
+            f"[SGLANG VAE] Above mc_level({mc_level}): {above_level}, Below: {below_level}"
+        )
+
         outputs = self.surface_extractor(grid_logits, **kwargs)
+
+        # 检查输出mesh
+        if outputs and len(outputs) > 0 and outputs[0] is not None:
+            mesh = outputs[0]
+            print(
+                f"[SGLANG VAE] Output mesh - vertices: {len(mesh.mesh_v)}, faces: {len(mesh.mesh_f)}"
+            )
+        else:
+            print(f"[SGLANG VAE] Output mesh is None or empty!")
+
         return outputs
 
     def enable_flashvdm_decoder(
@@ -1635,13 +1757,9 @@ class VectsetVAE(nn.Module):
 
 
 class ShapeVAE(VectsetVAE):
-    """Shape VAE for 3D mesh generation from latent codes.
+    """Shape VAE for 3D mesh generation from latent codes."""
 
-    This VAE decodes latent representations to 3D meshes through:
-    1. Transformer processing of latents
-    2. Cross-attention decoding to 3D grid
-    3. Volume decoding and surface extraction
-    """
+    _aliases = ["hy3dgen.shapegen.models.ShapeVAE"]
 
     def __init__(
         self,
@@ -1728,8 +1846,59 @@ class ShapeVAE(VectsetVAE):
 
     def forward(self, latents):
         """Decode latents through transformer."""
+        print(
+            f"[SGLANG VAE.forward] Input latents: shape={latents.shape}, min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
+        )
+
+        # Debug: check post_kl weights
+        print(
+            f"[VAE DEBUG] post_kl.weight: sum={self.post_kl.weight.float().sum():.4f}, mean={self.post_kl.weight.float().mean():.6f}"
+        )
+        print(f"[VAE DEBUG] post_kl.bias: sum={self.post_kl.bias.float().sum():.4f}")
+
         latents = self.post_kl(latents)
+        print(
+            f"[SGLANG VAE.forward] After post_kl: shape={latents.shape}, min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
+        )
+
+        # Debug: check transformer first layer
+        print(
+            f"[VAE DEBUG] transformer.resblocks[0].attn.c_qkv.weight sum: {self.transformer.resblocks[0].attn.c_qkv.weight.float().sum():.4f}"
+        )
+
+        # Debug: trace through first transformer block
+        x = latents
+        block = self.transformer.resblocks[0]
+
+        # Self-attention part
+        y = block.ln_1(x)
+        print(
+            f"[VAE DEBUG] block0 after ln_1: min={y.min():.4f}, max={y.max():.4f}, mean={y.mean():.6f}"
+        )
+
+        y = block.attn(y)
+        print(
+            f"[VAE DEBUG] block0 after attn: min={y.min():.4f}, max={y.max():.4f}, mean={y.mean():.6f}"
+        )
+
+        x = x + y
+        print(
+            f"[VAE DEBUG] block0 after residual1: min={x.min():.4f}, max={x.max():.4f}"
+        )
+
+        # MLP part
+        y = block.ln_2(x)
+        y = block.mlp(y)
+        print(f"[VAE DEBUG] block0 after mlp: min={y.min():.4f}, max={y.max():.4f}")
+
+        x = x + y
+        print(f"[VAE DEBUG] block0 final: min={x.min():.4f}, max={x.max():.4f}")
+
+        # Now run full transformer
         latents = self.transformer(latents)
+        print(
+            f"[SGLANG VAE.forward] After transformer: shape={latents.shape}, min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
+        )
         return latents
 
     def encode(self, surface, sample_posterior=True):

@@ -142,6 +142,10 @@ class DinoImageEncoder(ImageEncoder):
 
 
 class DinoImageEncoderMV(DinoImageEncoder):
+    _aliases = [
+        "hy3dshape.models.conditioner.DinoImageEncoderMV",
+    ]
+
     def __init__(
         self,
         version=None,
@@ -281,4 +285,9 @@ class SingleImageEncoder(nn.Module):
 
 
 # Entry class for model registry
-EntryClass = SingleImageEncoder
+EntryClass = [
+    SingleImageEncoder,
+    DualImageEncoder,
+    DinoImageEncoder,
+    DinoImageEncoderMV,
+]
