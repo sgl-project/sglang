@@ -12,7 +12,11 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import _delay_gather_for_dsa, get_attn_tp_context
+from sglang.srt.layers.communicator import (
+    ScatterMode,
+    _delay_gather_for_dsa,
+    get_attn_tp_context,
+)
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 
 if TYPE_CHECKING:
@@ -352,7 +356,11 @@ def forward_dsa_prepare_npu(
 
         # overlap qk norm
         q = m.q_a_layernorm(q)
-        if _delay_gather_for_dsa():
+        if (
+            _delay_gather_for_dsa()
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
             q = scattered_to_tp_attn_full(q, forward_batch)
             latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
         q_lora = q.clone()  # required for topk_indices
