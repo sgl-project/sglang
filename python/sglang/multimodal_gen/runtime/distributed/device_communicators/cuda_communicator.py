@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/cuda_communicator.py
 
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -26,24 +27,53 @@ class CudaCommunicator(DeviceCommunicatorBase):
             PyNcclCommunicator,
         )
 
+        self.custom_allreduce = None
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
+            # use lazy import here
+            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                dispatch_custom_allreduce,
+            )
+
+            CustomAllreduce = dispatch_custom_allreduce()
+            self.custom_allreduce = CustomAllreduce(
+                group=self.cpu_group,
+                device=self.device,
+            )
+
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
 
     def all_reduce(self, input_, op: torch.distributed.ReduceOp | None = None):
+        torch_op = op if op is not None else torch.distributed.ReduceOp.SUM
+
+        pynccl_op = torch_op
+        if not isinstance(torch_op, torch.distributed.ReduceOp):
+            op_name = getattr(torch_op, "name", None)
+            if op_name is None:
+                op_name = str(torch_op).split(".")[-1]
+            pynccl_op = getattr(torch.distributed.ReduceOp, op_name, None)
+
+        custom_allreduce = self.custom_allreduce
+        if custom_allreduce is not None and pynccl_op == torch.distributed.ReduceOp.SUM:
+            out = custom_allreduce.custom_all_reduce(input_)
+            if out is not None:
+                return out
+
         pynccl_comm = self.pynccl_comm
         assert pynccl_comm is not None
-        out = pynccl_comm.all_reduce(input_, op=op)
+        out = None
+        if pynccl_op is not None:
+            out = pynccl_comm.all_reduce(input_, op=pynccl_op)
         if out is None:
             # fall back to the default all-reduce using PyTorch.
             # this usually happens during testing.
             # when we run the model, allreduce only happens for the TP
             # group, where we always have either custom allreduce or pynccl.
             out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group, op=op)
+            torch.distributed.all_reduce(out, group=self.device_group, op=torch_op)
         return out
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
@@ -75,5 +105,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return tensor
 
     def destroy(self) -> None:
+        if self.custom_allreduce is not None:
+            self.custom_allreduce = None
         if self.pynccl_comm is not None:
             self.pynccl_comm = None

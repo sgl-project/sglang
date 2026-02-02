@@ -333,10 +333,22 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        else:
-            torch.distributed.all_reduce(
-                input_, op=op, group=self.device_group, async_op=async_op
-            )
+
+        if (
+            not async_op
+            and self.use_device_communicator
+            and self.device_communicator is not None
+            and current_platform.is_cuda_alike()
+        ):
+            out = self.device_communicator.all_reduce(input_, op=op)
+            if out is not None:
+                if out is not input_:
+                    input_.copy_(out)
+                return input_
+
+        torch.distributed.all_reduce(
+            input_, op=op, group=self.device_group, async_op=async_op
+        )
         return input_
 
     def all_gather(
