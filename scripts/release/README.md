@@ -21,6 +21,7 @@ python scripts/release/bump_sglang_version.py 0.5.3rc0
 - `docs/platforms/ascend_npu.md`
 - `python/pyproject.toml`
 - `python/pyproject_other.toml`
+- `python/pyproject_npu.toml`
 - `python/sglang/version.py`
 
 ### `bump_kernel_version.py`

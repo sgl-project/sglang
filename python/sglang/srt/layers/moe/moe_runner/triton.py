@@ -117,10 +117,11 @@ class TritonRunnerCore(MoeRunnerCore):
 
         # TODO: move these functions to the triton runner
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            _swiglu_gpt_oss_sigmoid_alpha,
+            _swiglu_silu_clamp_mul,
             invoke_fused_moe_kernel,
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
-            swiglu_with_alpha_and_limit,
         )
 
         hidden_states = runner_input.hidden_states
@@ -203,10 +204,12 @@ class TritonRunnerCore(MoeRunnerCore):
         if activation == "silu":
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
-                intermediate_cache2 = swiglu_with_alpha_and_limit(
-                    intermediate_cache1.view(-1, N),
-                    gemm1_alpha,
-                    gemm1_limit,
+                intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+                    intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
+                )
+            elif gemm1_limit is not None:
+                intermediate_cache2 = _swiglu_silu_clamp_mul(
+                    intermediate_cache1.view(-1, N), gemm1_limit
                 )
             elif _is_cuda or _is_hip:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
