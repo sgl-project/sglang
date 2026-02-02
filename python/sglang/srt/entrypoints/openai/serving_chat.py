@@ -843,7 +843,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens,
                     reasoning_tokens,
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
