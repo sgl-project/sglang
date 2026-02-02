@@ -424,13 +424,14 @@ class SchedulerOutputProcessorMixin:
             # for normal spec decoding: unify next_token_ids format
             next_token_ids = []
             cum_num_token_ids = 0
+            next_token_ids_list = result.next_token_ids.tolist()
 
             for i, req in enumerate(batch.reqs):
                 accept_length = result.accept_length_per_req_cpu[i]
                 next_token_ids.append(
-                    result.next_token_ids[
+                    next_token_ids_list[
                         cum_num_token_ids : cum_num_token_ids + accept_length + 1
-                    ].tolist()
+                    ]
                 )
                 cum_num_token_ids += accept_length + 1
 

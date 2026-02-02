@@ -14,6 +14,7 @@ from openai import OpenAI
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_REASONING_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -22,13 +23,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+register_cuda_ci(est_time=90, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=90, suite="stage-b-test-small-1-gpu-amd")
+
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
 class ReasoningTokenUsageMixin:
-    model_name = ""
+    model = ""
     reasoning_parser_name = ""
     extra_server_args = []
     extra_env_vars = {}
@@ -39,7 +43,7 @@ class ReasoningTokenUsageMixin:
         for k, v in cls.extra_env_vars.items():
             os.environ[k] = v
 
-        cls.model = cls.model_name
+        assert cls.model
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
 
@@ -147,17 +151,14 @@ class ReasoningTokenUsageMixin:
 
 
 class TestNormalReasoningTokenUsage(ReasoningTokenUsageMixin, CustomTestCase):
-    model_name = DEFAULT_REASONING_MODEL_NAME_FOR_TEST
+    model = DEFAULT_REASONING_MODEL_NAME_FOR_TEST
     reasoning_parser_name = "deepseek-r1"
     extra_server_args = ["--cuda-graph-max-bs", "2"]
 
 
 class TestSpecReasoningTokenUsage(ReasoningTokenUsageMixin, CustomTestCase):
-    model_name = (
-        "Qwen/Qwen3-30B-A3B"  # select this model due to its suitable eagle model
-    )
+    model = "Qwen/Qwen3-30B-A3B"  # select this model due to its suitable eagle model
     reasoning_parser_name = "qwen3"
-    max_new_tokens = 2048
     extra_env_vars = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
     extra_server_args = [
         "--speculative-algorithm",
