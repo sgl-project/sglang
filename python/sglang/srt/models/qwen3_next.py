@@ -46,6 +46,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
     is_cuda,
     is_npu,
     make_layers,
@@ -56,6 +58,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
 
 
 import triton
@@ -209,8 +213,16 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.hidden_size = config.hidden_size
-        self.num_v_heads = config.linear_num_value_heads
-        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = (
+            config.linear_num_value_heads
+            if not _is_cpu
+            else config.linear_num_value_heads_cpu
+        )
+        self.num_k_heads = (
+            config.linear_num_key_heads
+            if not _is_cpu
+            else config.linear_num_key_heads_cpu
+        )
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
@@ -366,7 +378,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if _is_cpu or _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -416,7 +428,11 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and is_cuda_graph
+            and not _is_cpu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -424,6 +440,17 @@ class Qwen3GatedDeltaNet(nn.Module):
                 triton.cdiv(self.num_v_heads, self.attn_tp_size),
                 self.head_k_dim,
                 self.head_v_dim,
+            )
+        elif _is_cpu and _is_amx_available:
+            mixed_qkv, z, b, a = (
+                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                    projected_states_qkvz,
+                    projected_states_ba,
+                    self.num_k_heads // self.attn_tp_size,
+                    self.num_v_heads // self.attn_tp_size,
+                    self.head_k_dim,
+                    self.head_v_dim,
+                )
             )
         else:
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
@@ -433,7 +460,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
-
         core_attn_out = self.linear_attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -521,12 +547,18 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -743,10 +775,16 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs: Any,
     ):
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = (
+            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                hidden_states,
+                residual,
+                forward_batch,
+                captured_last_layer_outputs=captured_last_layer_outputs,
+            )
         )
 
         if not forward_batch.forward_mode.is_idle():
@@ -818,6 +856,14 @@ class Qwen3NextModel(nn.Module):
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
 
+        # For EAGLE3 support
+        self.layers_to_capture = []
+
+    def set_eagle3_layers_to_capture(self, layers_to_capture: list[int]):
+        self.layers_to_capture = layers_to_capture
+        for layer_id in self.layers_to_capture:
+            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -836,6 +882,7 @@ class Qwen3NextModel(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
 
         residual = None
+        aux_hidden_states = []
         for i in range(len(self.layers)):
             layer = self.layers[i]
             with get_global_expert_distribution_recorder().with_current_layer(i):
@@ -845,6 +892,11 @@ class Qwen3NextModel(nn.Module):
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
+                    captured_last_layer_outputs=(
+                        aux_hidden_states
+                        if getattr(layer, "_is_layer_to_capture", False)
+                        else None
+                    ),
                 )
 
         if not forward_batch.forward_mode.is_idle():
@@ -853,7 +905,10 @@ class Qwen3NextModel(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class HybridLayerType(enum.Enum):
@@ -889,6 +944,8 @@ class Qwen3NextForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        # For EAGLE3 support
+        self.capture_aux_hidden_states = False
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
@@ -913,8 +970,12 @@ class Qwen3NextForCausalLM(nn.Module):
     ):
         hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def get_embed_and_head(self):
@@ -925,6 +986,21 @@ class Qwen3NextForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def get_embed(self):
+        return self.model.embed_tokens.weight
+
+    def set_embed(self, embed):
+        # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
+        if (
+            hasattr(self.config, "target_hidden_size")
+            and self.config.target_hidden_size != self.config.hidden_size
+        ):
+            return
+        del self.model.embed_tokens.weight
+        self.model.embed_tokens.weight = embed
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -1044,6 +1120,23 @@ class Qwen3NextForCausalLM(nn.Module):
             num_logical_experts=config.num_experts,
             num_groups=None,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[list[int]] = None):
+        if not self.pp_group.is_last_rank:
+            return
+
+        self.capture_aux_hidden_states = True
+        if layer_ids is None:
+            num_layers = self.config.num_hidden_layers
+            self.model.set_eagle3_layers_to_capture(
+                [
+                    2,
+                    num_layers // 2,
+                    num_layers - 3,
+                ]
+            )  # Specific layers for EAGLE3 support
+        else:
+            self.model.set_eagle3_layers_to_capture([val + 1 for val in layer_ids])
 
 
 EntryClass = Qwen3NextForCausalLM
