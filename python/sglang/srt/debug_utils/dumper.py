@@ -1028,6 +1028,19 @@ class _RpcBroadcastBase:
         self._handles = handles
 
 
+class _LocalOnlyBroadcast(_RpcBroadcastBase):
+    """Calls methods directly on the local dumper, wrapping the result in a list."""
+
+    def __init__(self, dumper: "_Dumper"):
+        self._dumper = dumper
+
+    def __getattr__(self, method_name: str):
+        def call(*args, **kwargs):
+            return [getattr(self._dumper, method_name)(*args, **kwargs)]
+
+        return call
+
+
 class _ZmqRpcBroadcast(_RpcBroadcastBase):
     """Broadcasts method calls to all ZMQ RPC handles.
 
