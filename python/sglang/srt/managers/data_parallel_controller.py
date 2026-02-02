@@ -479,6 +479,8 @@ class DataParallelController:
         if req.data_parallel_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
             self.workers[req.data_parallel_rank].send_pyobj(req)
+            return True
+        return False
 
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
