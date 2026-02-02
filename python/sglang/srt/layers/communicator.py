@@ -146,9 +146,11 @@ class AttnTpContext:
     def __init__(self):
         self.allow_input_scattered = False
         self.input_scattered_ = False
+        self.is_nsa = False
         self.attn_inputs_: Optional[AttentionInputs] = None
 
     def init_context(self, q_lora_rank, is_nsa):
+        self.is_nsa = is_nsa
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
@@ -209,6 +211,13 @@ ATTN_TP_CONTEXT = AttnTpContext()
 
 def get_attn_tp_context():
     return ATTN_TP_CONTEXT
+
+
+def _delay_gather_for_dsa():
+    return (
+        get_global_server_args().enable_attn_tp_input_scattered
+        and get_attn_tp_context().is_nsa
+    )
 
 
 @dataclass
@@ -634,6 +643,8 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
+            if _delay_gather_for_dsa():
+                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
