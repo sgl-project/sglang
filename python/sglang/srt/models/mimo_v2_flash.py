@@ -13,7 +13,7 @@
 # ==============================================================================
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -557,16 +557,10 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = (
-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
-                hidden_states,
-                residual,
-                forward_batch,
-                captured_last_layer_outputs=captured_last_layer_outputs,
-            )
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
         )
 
         if hidden_states.shape[0] != 0:
@@ -669,11 +663,6 @@ class MiMoV2Model(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
-    def set_eagle3_layers_to_capture(self, layers_to_capture: List[int]):
-        self.layers_to_capture = layers_to_capture
-        for layer_id in self.layers_to_capture:
-            setattr(self.layers[layer_id], "_is_layer_to_capture", True)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -693,7 +682,6 @@ class MiMoV2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -701,11 +689,6 @@ class MiMoV2Model(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
-                captured_last_layer_outputs=(
-                    aux_hidden_states
-                    if getattr(layer, "_is_layer_to_capture", False)
-                    else None
-                ),
             )
 
         hidden_states_before_norm = None
