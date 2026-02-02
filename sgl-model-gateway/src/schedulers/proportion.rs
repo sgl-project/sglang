@@ -23,18 +23,18 @@ pub struct ProportionSchedulerConfig {
     pub regular_worker_weight: f32,
 }
 
-impl Default for ProportionSchedulerConfig {
-    fn default() -> Self {
-        info!("默认方法");
-        Self {
-            adjust_interval: Duration::from_secs(1),
-            adjust_window: Duration::from_secs(2),
-            balance_abs_threshold: 1,
-            balance_rel_threshold: 1.001,
-            regular_worker_weight: 0.4,
-        }
-    }
-}
+// impl Default for ProportionSchedulerConfig {
+//     fn default() -> Self {
+//         info!("默认方法");
+//         Self {
+//             adjust_interval: Duration::from_secs(1),
+//             adjust_window: Duration::from_secs(2),
+//             balance_abs_threshold: 1,
+//             balance_rel_threshold: 1.001,
+//             regular_worker_weight: 0.4,
+//         }
+//     }
+// }
 
 /// Represents a choice between the two primary resource routers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

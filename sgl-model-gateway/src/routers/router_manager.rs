@@ -440,6 +440,7 @@ impl RouterManager {
                     Err(e) => warn!("Failed to encode prompt for model '{}': {}", mid, e),
                 }
             } else {
+                info!("没找到合适的tokenizer");
                 warn!(
                     "Tokenizer for model '{}' not found in registry. Scheduling will be based on 0 tokens.",
                     mid

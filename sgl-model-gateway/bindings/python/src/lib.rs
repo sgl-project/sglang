@@ -3,6 +3,13 @@ use smg::*;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 
+
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum SchedulerPolicyType {
+    Proportion,
+}
+
 // Define the enums with PyO3 bindings
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
@@ -339,6 +346,12 @@ struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
+    scheduler_strategy: SchedulerPolicyType,
+    scheduler_balance_abs_threshold: usize,
+    scheduler_balance_rel_threshold: f32,
+    scheduler_regular_worker_weight: f32,
+    scheduler_adjust_interval_secs: usize,
+    scheduler_adjust_window_secs: usize,
     policy: PolicyType,
     worker_startup_timeout_secs: u64,
     worker_startup_check_interval: u64,
@@ -434,7 +447,18 @@ impl Router {
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode, SchedulerConfig
+        };
+        let convert_scheduler_policy = |scheduler: &SchedulerPolicyType| -> SchedulerConfig {
+            match scheduler{
+                SchedulerPolicyType::Proportion => SchedulerConfig::Proportion {
+                    balance_abs_threshold: self.scheduler_balance_abs_threshold,
+                    balance_rel_threshold: self.scheduler_balance_rel_threshold,
+                    regular_worker_weight: self.scheduler_regular_worker_weight,
+                    adjust_interval: self.scheduler_adjust_interval_secs,
+                    adjust_window: self.scheduler_adjust_window_secs,
+                },
+            }
         };
 
         let convert_policy = |policy: &PolicyType| -> ConfigPolicyConfig {
@@ -496,6 +520,8 @@ impl Router {
         };
 
         let policy = convert_policy(&self.policy);
+
+        let scheduler_policy = convert_scheduler_policy(&self.scheduler_strategy);
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -561,6 +587,7 @@ impl Router {
 
         config::RouterConfig::builder()
             .mode(mode)
+            .scheduler(scheduler_policy)
             .policy(policy)
             .host(&self.host)
             .port(self.port)
@@ -640,6 +667,12 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
+        scheduler_strategy = SchedulerPolicyType::Proportion,
+        scheduler_balance_abs_threshold = 100,
+        scheduler_balance_rel_threshold = 1.1,
+        scheduler_regular_worker_weight = 0.4,
+        scheduler_adjust_interval_secs = 5,
+        scheduler_adjust_window_secs= 10,
         policy = PolicyType::RoundRobin,
         host = String::from("0.0.0.0"),
         port = 3001,
@@ -726,6 +759,12 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     fn new(
         worker_urls: Vec<String>,
+        scheduler_strategy: SchedulerPolicyType,
+        scheduler_balance_abs_threshold: usize,
+        scheduler_balance_rel_threshold: f32,
+        scheduler_regular_worker_weight: f32,
+        scheduler_adjust_interval_secs: usize,
+        scheduler_adjust_window_secs: usize,
         policy: PolicyType,
         host: String,
         port: u16,
@@ -827,6 +866,12 @@ impl Router {
             host,
             port,
             worker_urls,
+            scheduler_strategy,
+            scheduler_balance_abs_threshold,
+            scheduler_balance_rel_threshold,
+            scheduler_regular_worker_weight,
+            scheduler_adjust_interval_secs,
+            scheduler_adjust_window_secs,
             policy,
             worker_startup_timeout_secs,
             worker_startup_check_interval,
@@ -1006,6 +1051,7 @@ fn get_available_tool_call_parsers() -> Vec<String> {
 
 #[pymodule]
 fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<SchedulerPolicyType>()?;
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
     m.add_class::<HistoryBackendType>()?;

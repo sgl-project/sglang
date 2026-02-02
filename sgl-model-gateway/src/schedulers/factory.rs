@@ -19,14 +19,7 @@ impl SchedulerFactory {
                 balance_rel_threshold,
                 regular_worker_weight,
             } => {
-                // 将从配置文件解析的参数转换为调度器内部使用的配置结构体
                 let scheduler_config = ProportionSchedulerConfig {
-                    // 注意：这里假设你的 SchedulerConfig 字段是 Duration
-                    // 如果它们是 usize (秒数)，你需要这样转换：
-                    // adjust_interval: std::time::Duration::from_secs(*adjust_interval as u64),
-                    // adjust_window: std::time::Duration::from_secs(*adjust_window as u64),
-
-                    // 假设它们已经是 Duration 了
                     adjust_interval: std::time::Duration::from_secs(*adjust_interval as u64),
                     adjust_window: std::time::Duration::from_secs(*adjust_window as u64),
                     balance_abs_threshold: *balance_abs_threshold,

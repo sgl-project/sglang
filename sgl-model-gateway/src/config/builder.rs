@@ -1,7 +1,7 @@
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
+    RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig, SchedulerConfig
 };
 use crate::{core::ConnectionMode, mcp::McpConfig};
 
@@ -39,6 +39,13 @@ impl RouterConfigBuilder {
 
     pub fn from_config_ref(config: &RouterConfig) -> Self {
         Self::from_config(config.clone())
+    }
+
+    // ==================== Scheduler ====================
+
+    pub fn scheduler(mut self, scheduler: SchedulerConfig) -> Self {
+        self.config.scheduler = scheduler;
+        self
     }
 
     // ==================== Routing Mode ====================

@@ -24,6 +24,13 @@ class RouterArgs:
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
 
+    # scheduler strategy
+    scheduler_strategy: str = "proportion"
+    scheduler_balance_abs_threshold: int = 100
+    scheduler_balance_rel_threshold: float = 1.1
+    scheduler_regular_worker_weight: float = 0.4
+    scheduler_adjust_interval_secs: int = 5
+    scheduler_adjust_window_secs: int = 10
     # Routing policy
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
@@ -162,6 +169,9 @@ class RouterArgs:
         worker_group = parser.add_argument_group(
             "Worker Configuration", "Settings for worker connections and URLs"
         )
+        scheduling_group = parser.add_argument_group(
+            "Scheduling Strategy", "Load balancing and scheduling configuration"
+        )
         routing_group = parser.add_argument_group(
             "Routing Policy", "Load balancing and routing configuration"
         )
@@ -239,6 +249,53 @@ class RouterArgs:
             nargs="*",
             default=[],
             help="List of worker URLs. Supports IPv4 and IPv6 addresses (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)",
+        )
+        
+        # TODO
+        # Scheduler policy configuation
+        # scheduler_balance_abs_threshold: int = 100
+        # scheduler_balance_rel_threshold: float = 1.1
+        # scheduler_regular_worker_weight: float = 0.4
+        # scheduler_adjust_interval_secs: int = 5
+        # scheduler_adjust_window_secs: int = 10
+        scheduling_group.add_argument(
+            f"--{prefix}scheduler-strategy",
+            type=str,
+            default=RouterArgs.scheduler_strategy,
+            choices=["proportion"],
+            help="Load balancing scheduler strategy to use. In enable IGW (Inference-Gateway) mode, this is used for both regular and pd router unless overridden",
+        )
+        scheduling_group.add_argument(
+            f"--{prefix}scheduler-balance-abs-threshold",
+            type=int,
+            default=RouterArgs.scheduler_balance_abs_threshold,
+            help="Absolute threshold for load difference. Balancing is triggered if `(max_load - min_load) > abs_threshold` and the relative threshold is also met.",
+        )
+        scheduling_group.add_argument(
+            f"--{prefix}scheduler-balance-rel-threshold",
+            type=float,
+            default=RouterArgs.scheduler_balance_rel_threshold,
+            help="Relative threshold for load difference. Balancing is triggered if `max_load > min_load * rel_threshold` and the absolute threshold is also met.",
+        )
+
+        scheduling_group.add_argument(
+            f"--{prefix}scheduler-regular-worker-weight",
+            type=float,
+            default=RouterArgs.scheduler_regular_worker_weight,
+            help="The processing capacity of a regular worker relative to a pair of pd workers",
+        )
+
+        scheduling_group.add_argument(
+            f"--{prefix}scheduler-adjust-interval-secs",
+            type=int,
+            default=RouterArgs.scheduler_adjust_interval_secs,
+            help="Interval in seconds between crossover point adjustment operations",
+        )
+        scheduling_group.add_argument(
+            f"--{prefix}scheduler-adjust-window-secs",
+            type=int,
+            default=RouterArgs.scheduler_adjust_window_secs,
+            help="Scheduler decision reference time window",
         )
 
         # Routing policy configuration
