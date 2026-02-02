@@ -26,12 +26,11 @@ import shutil
 import time
 from functools import reduce
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Optional, Union, cast
 
 from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
-from huggingface_hub import snapshot_download
 from huggingface_hub.errors import (
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
@@ -468,7 +467,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     """
     import tempfile
 
-    from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError
 
     # If it's a local path, verify it directly
@@ -488,20 +486,11 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             # Download just the model_index.json file
-            if envs.SGLANG_USE_MODELSCOPE.get():
-                from modelscope import model_file_download
-
-                model_index_path = model_file_download(
-                    model_id=model_name_or_path,
-                    file_path="model_index.json",
-                    local_dir=tmp_dir,
-                )
-            else:
-                model_index_path = hf_hub_download(
-                    repo_id=model_name_or_path,
-                    filename="model_index.json",
-                    local_dir=tmp_dir,
-                )
+            model_index_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="model_index.json",
+                local_dir=tmp_dir,
+            )
 
             # Load the model_index.json
             with open(model_index_path) as f:
@@ -643,26 +632,13 @@ def maybe_download_model(
         logger.info(
             "Checking for cached model in HF Hub cache for %s...", model_name_or_path
         )
-        if envs.SGLANG_USE_MODELSCOPE.get():
-            from modelscope import snapshot_download as ms_snapshot_download
-
-            local_path = ms_snapshot_download(
-                model_id=model_name_or_path,
-                ignore_patterns=["*.onnx", "*.msgpack"],
-                local_dir=local_dir,
-                local_files_only=True,
-                max_workers=8,
-            )
-        else:
-            local_path = snapshot_download(
-                repo_id=model_name_or_path,
-                ignore_patterns=["*.onnx", "*.msgpack"],
-                local_dir=local_dir,
-                local_files_only=True,
-                resume_download=True,
-                max_workers=8,
-                etag_timeout=60,
-            )
+        local_path = snapshot_download(
+            repo_id=model_name_or_path,
+            ignore_patterns=["*.onnx", "*.msgpack"],
+            local_dir=local_dir,
+            local_files_only=True,
+            max_workers=8,
+        )
         if is_lora or _verify_model_complete(local_path):
             # CI validation: check all subdirectories for missing shards
             if not is_lora:
@@ -725,25 +701,13 @@ def maybe_download_model(
                 MAX_RETRIES,
             )
             with get_lock(model_name_or_path).acquire(poll_interval=2):
-                if envs.SGLANG_USE_MODELSCOPE.get():
-                    from modelscope import snapshot_download as ms_snapshot_download
-
-                    local_path = ms_snapshot_download(
-                        model_id=model_name_or_path,
-                        ignore_patterns=["*.onnx", "*.msgpack"],
-                        allow_patterns=allow_patterns,
-                        local_dir=local_dir,
-                        max_workers=8,
-                    )
-                else:
-                    local_path = snapshot_download(
-                        repo_id=model_name_or_path,
-                        ignore_patterns=["*.onnx", "*.msgpack"],
-                        allow_patterns=allow_patterns,
-                        local_dir=local_dir,
-                        max_workers=8,
-                        etag_timeout=120,
-                    )
+                local_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=allow_patterns,
+                    local_dir=local_dir,
+                    max_workers=8,
+                )
 
             # Verify downloaded model is complete (skip for LoRA)
             if not is_lora and not _verify_model_complete(local_path):
@@ -752,26 +716,13 @@ def maybe_download_model(
                     local_path,
                 )
                 with get_lock(model_name_or_path).acquire(poll_interval=2):
-                    if envs.SGLANG_USE_MODELSCOPE.get():
-                        from modelscope import snapshot_download as ms_snapshot_download
-
-                        local_path = ms_snapshot_download(
-                            model_id=model_name_or_path,
-                            ignore_patterns=["*.onnx", "*.msgpack"],
-                            allow_patterns=allow_patterns,
-                            local_dir=local_dir,
-                            max_workers=8,
-                        )
-                    else:
-                        local_path = snapshot_download(
-                            repo_id=model_name_or_path,
-                            ignore_patterns=["*.onnx", "*.msgpack"],
-                            local_dir=local_dir,
-                            resume_download=True,
-                            max_workers=8,
-                            etag_timeout=60,
-                            force_download=True,
-                        )
+                    local_path = snapshot_download(
+                        repo_id=model_name_or_path,
+                        ignore_patterns=["*.onnx", "*.msgpack"],
+                        local_dir=local_dir,
+                        max_workers=8,
+                        force_download=True,
+                    )
                 if not _verify_model_complete(local_path):
                     raise ValueError(
                         f"Downloaded model at {local_path} is still incomplete after forced re-download. "
@@ -817,3 +768,71 @@ def maybe_download_model(
             raise ValueError(
                 f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
             ) from e
+
+
+# Unified download functions with Hugging Face-compatible names
+def hf_hub_download(
+    repo_id: str,
+    filename: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    **kwargs,
+) -> str:
+    """Unified hf_hub_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import model_file_download
+
+        return model_file_download(
+            model_id=repo_id,
+            file_path=filename,
+            cache_dir=local_dir,
+            **kwargs,
+        )
+    else:
+        from huggingface_hub import hf_hub_download as _hf_hub_download
+
+        return _hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            local_dir=local_dir,
+            **kwargs,
+        )
+
+
+def snapshot_download(
+    repo_id: str,
+    local_dir: Optional[Union[str, Path]] = None,
+    ignore_patterns: Optional[Union[list[str], str]] = None,
+    allow_patterns: Optional[Union[list[str], str]] = None,
+    local_files_only: bool = False,
+    max_workers: int = 8,
+    **kwargs,
+) -> str:
+    """Unified snapshot_download that supports both Hugging Face Hub and ModelScope."""
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        from modelscope import snapshot_download as _ms_snapshot_download
+
+        ms_kwargs = {
+            "model_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+        }
+        ms_kwargs.update(kwargs)
+        return _ms_snapshot_download(**ms_kwargs)
+    else:
+        from huggingface_hub import snapshot_download as _hf_snapshot_download
+
+        hf_kwargs = {
+            "repo_id": repo_id,
+            "local_dir": local_dir,
+            "ignore_patterns": ignore_patterns,
+            "allow_patterns": allow_patterns,
+            "local_files_only": local_files_only,
+            "max_workers": max_workers,
+            "resume_download": True,
+            "etag_timeout": 60,
+        }
+        hf_kwargs.update(kwargs)
+        return _hf_snapshot_download(**hf_kwargs)

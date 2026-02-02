@@ -8,8 +8,8 @@ from functools import lru_cache
 from typing import Optional
 
 import filelock
-from huggingface_hub import hf_hub_download
 
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import hf_hub_download
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -61,20 +61,11 @@ def _maybe_download_model(
                 source_hub,
                 model_name_or_path,
             )
-            if envs.SGLANG_USE_MODELSCOPE.get():
-                from modelscope import model_file_download
-
-                file_path = model_file_download(
-                    model_id=model_name_or_path,
-                    file_path="model_index.json",
-                    cache_dir=local_dir,
-                )
-            else:
-                file_path = hf_hub_download(
-                    repo_id=model_name_or_path,
-                    filename="model_index.json",
-                    local_dir=local_dir,
-                )
+            file_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="model_index.json",
+                local_dir=local_dir,
+            )
             logger.info("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_index:
@@ -87,20 +78,11 @@ def _maybe_download_model(
                 source_hub,
                 model_name_or_path,
             )
-            if envs.SGLANG_USE_MODELSCOPE.get():
-                from modelscope import model_file_download
-
-                file_path = model_file_download(
-                    model_id=model_name_or_path,
-                    file_path="config.json",
-                    cache_dir=local_dir,
-                )
-            else:
-                file_path = hf_hub_download(
-                    repo_id=model_name_or_path,
-                    filename="config.json",
-                    local_dir=local_dir,
-                )
+            file_path = hf_hub_download(
+                repo_id=model_name_or_path,
+                filename="config.json",
+                local_dir=local_dir,
+            )
             logger.info("Downloaded to %s", file_path)
             return os.path.dirname(file_path)
         except Exception as e_config:
