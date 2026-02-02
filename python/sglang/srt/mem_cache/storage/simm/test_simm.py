@@ -13,10 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 def generate_batch_query_keys(kv_num: int, config: HiCacheStorageConfig):
-    keys = []
-    for _ in range(kv_num):
-        key = "test_" + str(uuid.uuid4())
-        keys.append(key)
+    keys = ["test_" + str(uuid.uuid4()) for _ in range(kv_num)]
     set_keys = []
     for key in keys:
         if config.is_mla_model:

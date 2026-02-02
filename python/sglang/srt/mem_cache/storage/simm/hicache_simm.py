@@ -7,7 +7,10 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -23,9 +26,10 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 try:
     from simm.kv import BlockView, Store, register_mr, set_flag
 except ImportError as e:
+    # TODO: add install guide after SiMM opensource
     raise ImportError(
         "Please install simm by following the instructions at "
-        "to run vLLM with SimmConnector."
+        "to run SGLang with SimmConnector."
     ) from e
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -285,7 +289,9 @@ class HiCacheSiMM(HiCacheStorage):
         try:
             self.mr_ext = register_mr(buffer)
             if self.mr_ext is None:
-                logger.error(f"Failed to register buffer")
+                logger.error(
+                    f"Failed to register buffer, {buffer=}, please check buffer and RDMA network"
+                )
                 raise RuntimeError(f"Failed to register buffer to SiMM")
         except TypeError as err:
             logger.error("Failed to register buffer to SiMM: %s", err)
@@ -297,6 +303,10 @@ class HiCacheSiMM(HiCacheStorage):
         for key_ in keys:
             key_list.append(f"{key_}_{self.mha_suffix}_k")
             key_list.append(f"{key_}_{self.mha_suffix}_v")
+        if len(key_list) != len(ptr_list):
+            logger.error(
+                f"key size {len(key_list)} not equal with incides ptr size {len(ptr_list)}"
+            )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -305,6 +315,10 @@ class HiCacheSiMM(HiCacheStorage):
         key_list = []
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
+        if len(key_list) != len(ptr_list):
+            logger.error(
+                f"key size {len(key_list)} not equal with incides ptr size {len(ptr_list)}"
+            )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
