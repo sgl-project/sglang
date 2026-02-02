@@ -87,6 +87,13 @@ class TextEncodingStage(PipelineStage):
 
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
+            assert (
+                negative_prompts is not None
+            ), "Negative prompts cannot be None for CFG "
+            assert len(prompts) == len(
+                negative_prompts
+            ), "Negative prompts number must match number of prompts"
+
             neg_embeds_list, neg_masks_list, neg_pooler_list = self.encode_text(
                 negative_prompts,
                 server_args,
