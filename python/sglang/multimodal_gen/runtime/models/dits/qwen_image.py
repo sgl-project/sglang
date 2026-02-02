@@ -701,6 +701,7 @@ class QwenImageTransformerBlock(nn.Module):
         # Apply attention gates and add residual (like in Megatron)
         #   - residual_out = gate_x * x + residual_x
         # - x = norm(residual_out) * (1 + scale) + shift
+        # TODO: clean code here
         is_scale_residual = gate_x is not None
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
@@ -715,11 +716,10 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-            if is_scale_residual:
-                x = gate_x * x + residual_x
-                residual_out = x
-
             if _is_cuda:
+                if is_scale_residual:
+                    x = gate_x * x + residual_x
+                    residual_out = x
                 if not x.is_contiguous():
                     x = x.contiguous()
                 if not index.is_contiguous():
@@ -750,16 +750,19 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
                 if is_scale_residual:
-                    return (
-                        norm_module(x, shift=shift_result, scale=scale_result),
-                        residual_out,
-                        gate_result,
+                    modulated, residual_out = (
+                        norm_module(
+                            residual=residual_x,
+                            x=x,
+                            gate=gate_x,
+                            shift=shift_result,
+                            scale=scale_result,
+                        ),
                     )
+                    return modulated, residual_out, gate_result
                 else:
-                    return (
-                        norm_module(x, shift=shift_result, scale=scale_result),
-                        gate_result,
-                    )
+                    modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+                    return modulated, gate_result
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
@@ -774,10 +777,8 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 return modulated, residual_out, gate_result
             else:
-                return (
-                    norm_module(x=x, shift=shift_result, scale=scale_result),
-                    gate_result,
-                )
+                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+                return modulated, gate_result
 
     def forward(
         self,
