@@ -49,6 +49,7 @@ jobs:
           cd docs
           make clean
           make compile
+          make markdown
 
       - name: Push HTML to sgl-project.github.io
         timeout-minutes: 30
