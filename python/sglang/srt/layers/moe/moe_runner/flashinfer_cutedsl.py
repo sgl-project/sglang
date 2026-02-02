@@ -470,7 +470,14 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         not runner_config.apply_router_weight_on_input
     ), "apply_router_weight_on_input is not supported for Flashinfer"
 
-    hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    masked_m = dispatch_output.masked_m
+    recv_topk_weights = dispatch_output.recv_topk_weights
+    recv_rank_info = dispatch_output.recv_rank_info
+    recv_idx_info = dispatch_output.recv_idx_info
+    combine_out = dispatch_output.combine_out
+    combine_out_ptrs = dispatch_output.combine_out_ptrs
 
     # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
     # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
@@ -501,6 +508,11 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         w2_blockscale=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
         masked_m=masked_m,
+        topk_weights=recv_topk_weights,
+        recv_rank_info=recv_rank_info,
+        recv_idx_info=recv_idx_info,
+        combine_out=combine_out,
+        combine_out_ptrs=combine_out_ptrs,
         **(
             dict(
                 down_sm_count=overlap.num_sms,

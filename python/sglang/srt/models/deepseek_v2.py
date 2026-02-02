@@ -107,6 +107,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    is_fused_grouped_gemm_combine_enabled,
     is_sbo_enabled,
     is_tbo_enabled,
 )
@@ -1108,7 +1109,12 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
-        sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        fused_down_gemm_combine = is_fused_grouped_gemm_combine_enabled()
+        sbo_enabled_flag = (
+            self._fuse_shared_experts_inside_sbo
+            and not self.is_nextn
+            and not fused_down_gemm_combine
+        )
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
         )

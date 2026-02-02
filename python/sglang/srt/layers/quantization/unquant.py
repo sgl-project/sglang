@@ -791,8 +791,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             combine_cls = DeepEPNormalCombineInput
         else:
-            hidden_states, _, _, _, group_list, _ = dispatch_output
-            group_list = group_list.to(torch.int64)
+            hidden_states = dispatch_output.hidden_states
+            group_list = dispatch_output.masked_m.to(torch.int64)
             combine_cls = DeepEPLLCombineInput
 
         hidden_states = npu_fused_moe_without_routing_weights_bf16(

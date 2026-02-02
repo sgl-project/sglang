@@ -760,6 +760,7 @@ class ServerArgs:
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
+    enable_fused_grouped_gemm_combine: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     disable_piecewise_cuda_graph: bool = False
@@ -3604,6 +3605,20 @@ class ServerArgs:
                 assert (
                     self.chunked_prefill_size
                 ) <= envs.SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get(), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+
+        if self.enable_fused_grouped_gemm_combine:
+            assert (
+                not self.enable_single_batch_overlap
+            ), "Fused grouped GEMM + combine is incompatible with single batch overlap."
+            assert (
+                self.moe_runner_backend == "flashinfer_cutedsl"
+            ), "Fused grouped GEMM + combine is only supported with 'flashinfer_cutedsl' MoE backend."
+            assert (
+                self.moe_a2a_backend == "deepep"
+            ), "Fused grouped GEMM + combine is only supported with 'deepep' MoE A2A backend."
+            assert (
+                self.deepep_mode == "low_latency"
+            ), "Fused grouped GEMM + combine is only supported with DeepEP 'low_latency' mode."
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -6639,6 +6654,11 @@ class ServerArgs:
             "--enable-single-batch-overlap",
             action="store_true",
             help="Let computation and communication overlap within one micro batch.",
+        )
+        parser.add_argument(
+            "--enable-fused-grouped-gemm-combine",
+            action="store_true",
+            help="Enable fusion of grouped gemm and combine for NVLINK communication. This is only supported with cuteDSL MoE backend and DeepEP low_latency mode.",
         )
         parser.add_argument(
             "--tbo-token-distribution-threshold",
