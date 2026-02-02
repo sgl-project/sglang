@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -11,6 +12,7 @@ from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_IMAGE_URL,
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
@@ -127,6 +129,51 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
             f"{avg_spec_accept_length=:.3f}\n"
         )
         self.assertGreater(avg_spec_accept_length, 2.5)
+
+
+class TestDPAttentionDP2TP4VLM(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.image_url = DEFAULT_IMAGE_URL
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_vlm_generate(self):
+        chat_template = get_chat_template_by_model_path(self.model)
+        prompt = f"{chat_template.image_token}What is in this image?"
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": prompt,
+                "image_data": [self.image_url],
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 16,
+                },
+            },
+        )
+        response.raise_for_status()
+        response_json = response.json()
+        print(response_json)
+        self.assertIn("output_ids", response_json)
+        self.assertGreater(len(response_json["output_ids"]), 0)
 
 
 if __name__ == "__main__":
