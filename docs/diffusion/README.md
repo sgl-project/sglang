@@ -11,4 +11,4 @@ SGLang Diffusion is an inference framework for accelerated image and video gener
 - [Support New Models](support_new_models.md) – Developer guide for adding models
 - [Caching](cache/caching.md) – Cache-DiT and TeaCache acceleration
 
-For the main diffusion overview and compatibility matrix, see [Diffusion Models](../supported_models/diffusion_models.md) in Supported Models.
+The previous long overview in [Supported Models > Diffusion Models](../supported_models/diffusion_models.md) is now a short redirect to this section; detailed content lives here.
