@@ -1419,15 +1419,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
-            if not torch.allclose(
-                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
-            ):
-                logger.warning_once(
-                    "w1_weight_scale_2 must match w3_weight_scale_2. "
-                    "Accuracy may be affected."
-                )
+            if layer.w13_weight_scale_2.dim() == 1:
+                # Some checkpoints store a shared scale for w1/w3.
+                w13_weight_scale_2 = layer.w13_weight_scale_2
+            else:
+                if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                    layer.w13_weight_scale_2[:, 0],
+                    layer.w13_weight_scale_2[:, 1],
+                ):
+                    logger.warning_once(
+                        "w1_weight_scale_2 must match w3_weight_scale_2. "
+                        "Accuracy may be affected."
+                    )
 
-            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+                w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
