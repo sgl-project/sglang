@@ -759,11 +759,16 @@ def run_benchmark_internal(
         max_running_requests_per_dp = internal_state[0].get(
             "effective_max_running_requests_per_dp", -1
         )
-        dp_size = server_info.get("dp_size", None) or 1
+
+        dp_size = internal_state[0].get("dp_size", None) or 1
         assert (
             max_running_requests_per_dp > 0
         ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
         skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+
+    print(f"{max_running_requests_per_dp=}")
+    print(f"{dp_size=}")
+    print(f"{skip_max_running_requests_threshold=}")
 
     # Warmup
     if not bench_args.skip_warmup:
