@@ -2327,10 +2327,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     ):
         """Handle EPD-disaggregation mode encoding request."""
         if isinstance(obj, GenerateReqInput) and obj.contains_mm_input():
-            should_dispatch = (
-                self.server_args.enable_adaptive_dispatch_to_encoder
-                and self._should_dispatch_to_encoder(obj)
-            )
+            # dispatch to encoder by default
+            should_dispatch = True
+            if self.server_args.enable_adaptive_dispatch_to_encoder:
+                should_dispatch = self._should_dispatch_to_encoder(obj)
 
             # Set need_wait_for_image flag based on whether we dispatch to encoder
             # This flag will be used in _tokenize_one_request to determine processing path
