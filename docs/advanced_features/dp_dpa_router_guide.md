@@ -364,7 +364,7 @@ python -m sglang_router.launch_router \
 ### Best Practices
 
 1. **Start with `cache_aware` policy** - It provides the best balance between cache locality and load distribution for most workloads
-2. **Use Router-Based DP for production** - Prefer `sglang_router.launch_server` over `--dp-size` for better reliability and observability
+2. **Use Router-Based DP for production** - Prefer `sglang_router.launch_server` over `sglang.launch_server` for better reliability and observability when using data parallelism
 3. **Enable health checks** - Configure `--health-check-interval-secs` to detect and remove unhealthy workers automatically
 
 **Recommended command with best practices applied:**
