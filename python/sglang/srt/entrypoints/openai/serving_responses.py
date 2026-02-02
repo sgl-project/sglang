@@ -530,7 +530,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=False
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:

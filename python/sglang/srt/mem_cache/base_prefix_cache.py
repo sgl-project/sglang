@@ -43,6 +43,51 @@ class MatchPrefixParams:
     req: Optional[Req] = None
 
 
+@dataclasses.dataclass
+class InsertParams:
+    """Unified parameters for insert across different cache types"""
+
+    key: RadixKey
+    value: Optional[torch.Tensor] = None
+
+    # Mamba specific
+    mamba_value: Optional[torch.Tensor] = None
+
+    # SWA specific
+    prev_prefix_len: int = 0
+    swa_evicted_seqlen: int = 0
+
+    # General
+    chunked: bool = False
+    priority: int = 0
+
+
+@dataclasses.dataclass
+class InsertResult:
+    """Result of an insert operation"""
+
+    prefix_len: int
+    mamba_exist: bool = False
+
+
+@dataclasses.dataclass
+class EvictParams:
+    """Unified parameters for evict across different cache types"""
+
+    num_tokens: int
+    swa_num_tokens: int = 0
+    mamba_num: int = 0
+
+
+@dataclasses.dataclass
+class EvictResult:
+    """Result of an evict operation"""
+
+    num_tokens_evicted: int = 0
+    swa_num_tokens_evicted: int = 0
+    mamba_num_evicted: int = 0
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -74,9 +119,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     )
 
     def init_metrics_collector(self):
-        self.metrics_collector = RadixCacheMetricsCollector(
-            labels={"cache_type": self.__class__.__name__}
-        )
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        labels = {"cache_type": self.__class__.__name__}
+        if server_args.extra_metric_labels:
+            labels.update(server_args.extra_metric_labels)
+        self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
@@ -102,7 +151,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         pass
 
     @abstractmethod
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         pass
 
     @abstractmethod

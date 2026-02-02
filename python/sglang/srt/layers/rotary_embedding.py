@@ -17,9 +17,11 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
+    get_device,
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -31,6 +33,7 @@ _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
@@ -115,9 +118,11 @@ class RotaryEmbedding(MultiPlatformOp):
             cache = cache.to(dtype)
 
         if (
-            (not (_is_cuda or _is_npu) or self.head_size not in [64, 128, 256, 512])
+            (not (_is_cuda) or self.head_size not in [64, 128, 256, 512])
             and not (_is_cpu)
             and not (_is_xpu)
+            and not (_is_npu)
+            and not (_is_musa)
         ):
             if _is_cuda or _is_hip:
                 from sgl_kernel import rotary_embedding
@@ -755,8 +760,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        query = query.view(*query.shape[:-1], -1, self.head_size)
-        key = key.view(*key.shape[:-1], -1, self.head_size)
+        query = query.unflatten(1, (-1, self.head_size))
+        key = key.unflatten(1, (-1, self.head_size))
 
         k = self.original_max_position_embeddings
         long_prompt_offset = (
@@ -818,7 +823,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         beta_slow: int = 1,
         mscale: float = 1,
         mscale_all_dim: float = 0,
-        device: Optional[str] = "cuda" if not _is_npu else "npu",
+        device: Optional[str] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -835,7 +840,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self.sin_cached_total = None
         self.cos_cached = None
         self.sin_cached = None
-        self.device = device
+        self.device = device if device is not None else get_device()
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -1695,11 +1700,12 @@ class MRotaryEmbedding(RotaryEmbedding):
                         video_index += 1
                         remain_videos -= 1
                         ed = ed_video
-                    llm_grid_t, llm_grid_h, llm_grid_w = (
-                        t.item(),
-                        h.item() // spatial_merge_size,
-                        w.item() // spatial_merge_size,
-                    )
+                    # Avoid .item() lookups in repeated context
+                    t_int, h_int, w_int = int(t), int(h), int(w)
+
+                    llm_grid_t = t_int
+                    llm_grid_h = h_int // spatial_merge_size
+                    llm_grid_w = w_int // spatial_merge_size
                     text_len = ed - st
 
                     st_idx = (
@@ -1732,24 +1738,24 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen3_vl_moe",
                     ):
                         t_index = (
-                            torch.arange(llm_grid_t)
+                            torch.arange(llm_grid_t, device=position_ids.device)
                             .view(-1, 1)
-                            .expand(-1, llm_grid_h * llm_grid_w)
-                            .flatten()
+                            .expand(llm_grid_t, llm_grid_h * llm_grid_w)
+                            .reshape(-1)
                         )
                     else:
                         raise RuntimeError(f"Unimplemented model type: {model_type}")
                     h_index = (
-                        torch.arange(llm_grid_h)
+                        torch.arange(llm_grid_h, device=position_ids.device)
                         .view(1, -1, 1)
-                        .expand(llm_grid_t, -1, llm_grid_w)
-                        .flatten()
+                        .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                        .reshape(-1)
                     )
                     w_index = (
-                        torch.arange(llm_grid_w)
+                        torch.arange(llm_grid_w, device=position_ids.device)
                         .view(1, 1, -1)
-                        .expand(llm_grid_t, llm_grid_h, -1)
-                        .flatten()
+                        .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                        .reshape(-1)
                     )
                     llm_pos_ids_list.append(
                         torch.stack([t_index, h_index, w_index]) + text_len + st_idx
@@ -1782,10 +1788,9 @@ class MRotaryEmbedding(RotaryEmbedding):
             position_ids = (
                 position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
             )
-            max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                -1, keepdim=True
-            )[0]
-            mrope_position_deltas = max_position_ids + 1 - s
+            max_position_ids = position_ids.amax(dim=0, keepdim=False)
+            mrope_position_deltas = max_position_ids.amax(-1, keepdim=True) + 1 - s
+
             return position_ids, mrope_position_deltas
 
     @staticmethod
@@ -2102,13 +2107,224 @@ class MRotaryEmbedding(RotaryEmbedding):
         video_end_token_id = hf_config.video_end_token_id
         spatial_merge_size = hf_config.vision_config.spatial_merge_size
 
+        # Preallocate lists for efficiency
+        mrope_position_deltas = []
+
+        if input_ids is not None and (
+            image_grid_thw is not None or video_grid_thw is not None
+        ):
+            total_input_ids = input_ids
+
+            if attention_mask is None:
+                attention_mask = torch.ones_like(total_input_ids)
+
+            position_ids = torch.ones(
+                3,
+                input_ids.shape[0],
+                input_ids.shape[1],
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+
+            image_index, video_index = 0, 0
+            video_group_index = 0
+            # Move attention mask to device once to avoid repeated transfers
+            attention_mask = attention_mask.to(total_input_ids.device)
+
+            for i, ids in enumerate(total_input_ids):
+                curr_mask = attention_mask[i]
+                ids_masked = ids[curr_mask == 1]
+
+                # Preallocate input_token_type for maximum speed
+                input_tokens = ids_masked.tolist()
+                input_token_type = [""] * len(input_tokens)
+
+                # Single pass through tokens for type assignment, using explicit indices for performance
+                video_check_flg = False
+                for j, token in enumerate(input_tokens):
+                    if token == video_start_token_id:
+                        video_check_flg = True
+                    elif token == video_end_token_id:
+                        video_check_flg = False
+
+                    if token == image_token_id and not video_check_flg:
+                        input_token_type[j] = "image"
+                    elif token == image_token_id and video_check_flg:
+                        input_token_type[j] = "video"
+                    else:
+                        input_token_type[j] = "text"
+
+                # Use itertools.groupby for consecutive token type groups (unchanged logic)
+                input_type_group = []
+                for key, group in itertools.groupby(
+                    enumerate(input_token_type), lambda x: x[1]
+                ):
+                    group = list(group)
+                    start_index = group[0][0]
+                    end_index = group[-1][0] + 1
+                    input_type_group.append((key, start_index, end_index))
+
+                llm_pos_ids_list = []
+                video_frame_num = 1
+
+                for modality_type, start_idx, end_idx in input_type_group:
+                    # st_idx can be computed by torch directly for speed
+                    if llm_pos_ids_list:
+                        st_idx = llm_pos_ids_list[-1].max().item() + 1
+                    else:
+                        st_idx = 0
+
+                    if modality_type == "image":
+                        t, h, w = (
+                            image_grid_thw[image_index][0],
+                            image_grid_thw[image_index][1],
+                            image_grid_thw[image_index][2],
+                        )
+                        # Avoid .item() lookups in repeated context
+                        t_int, h_int, w_int = int(t), int(h), int(w)
+
+                        llm_grid_t = t_int
+                        llm_grid_h = h_int // spatial_merge_size
+                        llm_grid_w = w_int // spatial_merge_size
+
+                        # Avoid unnecessary views/expands for speed, always flatten at the end
+                        t_index = (
+                            torch.arange(llm_grid_t, device=position_ids.device)
+                            .view(-1, 1)
+                            .expand(llm_grid_t, llm_grid_h * llm_grid_w)
+                            .reshape(-1)
+                        )
+                        h_index = (
+                            torch.arange(llm_grid_h, device=position_ids.device)
+                            .view(1, -1, 1)
+                            .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                            .reshape(-1)
+                        )
+                        w_index = (
+                            torch.arange(llm_grid_w, device=position_ids.device)
+                            .view(1, 1, -1)
+                            .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                            .reshape(-1)
+                        )
+                        llm_pos_ids_list.append(
+                            torch.stack([t_index, h_index, w_index]) + st_idx
+                        )
+                        image_index += 1
+                        video_frame_num = 1
+
+                    elif modality_type == "video":
+                        t = video_frame_num
+                        h = video_grid_thw[video_index][1]
+                        w = video_grid_thw[video_index][2]
+
+                        h_int, w_int = int(h), int(w)
+                        llm_grid_h = h_int // spatial_merge_size
+                        llm_grid_w = w_int // spatial_merge_size
+
+                        # Only one video frame at a time
+                        for t_idx in range(t):
+                            t_index = (
+                                torch.tensor(t_idx, device=position_ids.device)
+                                .view(-1, 1)
+                                .expand(1, llm_grid_h * llm_grid_w)
+                                .reshape(-1)
+                            )
+                            h_index = (
+                                torch.arange(llm_grid_h, device=position_ids.device)
+                                .view(1, -1, 1)
+                                .expand(1, llm_grid_h, llm_grid_w)
+                                .reshape(-1)
+                            )
+                            w_index = (
+                                torch.arange(llm_grid_w, device=position_ids.device)
+                                .view(1, 1, -1)
+                                .expand(1, llm_grid_h, llm_grid_w)
+                                .reshape(-1)
+                            )
+                            llm_pos_ids_list.append(
+                                torch.stack([t_index, h_index, w_index]) + st_idx
+                            )
+
+                        video_group_index += 1
+                        if video_group_index >= video_grid_thw[video_index][0]:
+                            video_index += 1
+                            video_group_index = 0
+
+                        video_frame_num += 1
+
+                    else:  # text
+                        text_len = end_idx - start_idx
+                        # Use in-place expand for improved performance
+                        text_range = torch.arange(text_len, device=position_ids.device)
+                        text_pos = text_range.view(1, -1).expand(3, text_len) + st_idx
+                        llm_pos_ids_list.append(text_pos)
+                        video_frame_num = 1
+
+                # Concatenate once outside for speed
+                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+                # Use advanced indexing for assignment
+                idx_mask = curr_mask == 1
+                position_ids[..., i, idx_mask] = llm_positions.to(position_ids.device)
+                mrope_position_deltas.append(
+                    llm_positions.max() + 1 - len(total_input_ids[i])
+                )
+            # Build tensor in one call at the end
+            mrope_position_deltas = torch.tensor(
+                mrope_position_deltas, device=input_ids.device
+            ).unsqueeze(1)
+            return position_ids, mrope_position_deltas
+        else:
+            if attention_mask is not None:
+                # Use in-place operations whenever possible
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
+                position_ids = (
+                    position_ids.unsqueeze(0)
+                    .expand(3, -1, -1)
+                    .to(attention_mask.device)
+                )
+                max_position_ids = position_ids.amax(dim=0, keepdim=False)
+                mrope_position_deltas = (
+                    max_position_ids.amax(-1, keepdim=True)
+                    + 1
+                    - attention_mask.shape[-1]
+                )
+            else:
+                length = input_ids.shape[1]
+                batch_size = input_ids.shape[0]
+                # Use torch.arange with in-place expansion
+                arange_ids = torch.arange(length, device=input_ids.device).view(
+                    1, 1, -1
+                )
+                position_ids = arange_ids.expand(3, batch_size, length)
+                mrope_position_deltas = torch.zeros(
+                    [batch_size, 1],
+                    device=input_ids.device,
+                    dtype=input_ids.dtype,
+                )
+            return position_ids, mrope_position_deltas
+
+    @staticmethod
+    def get_rope_index_ernie45(
+        input_ids: torch.Tensor,
+        hf_config: Any,
+        image_grid_thw: Union[list[list[int]], torch.Tensor],
+        video_grid_thw: Union[list[list[int]], torch.Tensor],
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get mrope input positions and delta value for Ernie VL."""
+
+        image_token_id = hf_config.im_patch_id
+        video_start_token_id = hf_config.video_start_token_id
+        video_end_token_id = hf_config.video_end_token_id
+        spatial_conv_size = hf_config.spatial_conv_size
+        temporal_conv_size = hf_config.temporal_conv_size
+
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
         ):
             total_input_ids = input_ids
-            if attention_mask is None:
-                attention_mask = torch.ones_like(total_input_ids)
             position_ids = torch.ones(
                 3,
                 input_ids.shape[0],
@@ -2117,10 +2333,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 device=input_ids.device,
             )
             image_index, video_index = 0, 0
-            video_group_index = 0
-            attention_mask = attention_mask.to(total_input_ids.device)
             for i, input_ids in enumerate(total_input_ids):
-                input_ids = input_ids[attention_mask[i] == 1]
                 input_tokens = input_ids.tolist()
 
                 input_token_type = []
@@ -2164,8 +2377,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                         )
                         llm_grid_t, llm_grid_h, llm_grid_w = (
                             t.item(),
-                            h.item() // spatial_merge_size,
-                            w.item() // spatial_merge_size,
+                            h.item() // spatial_conv_size,
+                            w.item() // spatial_conv_size,
                         )
 
                         t_index = (
@@ -2195,15 +2408,15 @@ class MRotaryEmbedding(RotaryEmbedding):
 
                     elif modality_type == "video":
                         t, h, w = (
-                            video_frame_num,
+                            video_grid_thw[video_index][0],
                             video_grid_thw[video_index][1],
                             video_grid_thw[video_index][2],
                         )
 
                         llm_grid_t, llm_grid_h, llm_grid_w = (
-                            t,
-                            h.item() // spatial_merge_size,
-                            w.item() // spatial_merge_size,
+                            t.item() // temporal_conv_size,
+                            h.item() // spatial_conv_size,
+                            w.item() // spatial_conv_size,
                         )
 
                         for t_idx in range(llm_grid_t):
@@ -2230,12 +2443,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                                 torch.stack([t_index, h_index, w_index]) + st_idx
                             )
 
-                        video_group_index += 1
-
-                        if video_group_index >= video_grid_thw[video_index][0]:
-                            video_index += 1
-                            video_group_index = 0
-
+                        video_index += 1
                         video_frame_num += 1
 
                     else:
@@ -2247,9 +2455,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                         video_frame_num = 1
 
                 llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
-                    position_ids.device
-                )
+                position_ids[..., i, :] = llm_positions.to(position_ids.device)
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
@@ -2258,30 +2464,15 @@ class MRotaryEmbedding(RotaryEmbedding):
             ).unsqueeze(1)
             return position_ids, mrope_position_deltas
         else:
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = (
-                    position_ids.unsqueeze(0)
-                    .expand(3, -1, -1)
-                    .to(attention_mask.device)
-                )
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(
-                    -1, keepdim=True
-                )[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1],
-                    device=input_ids.device,
-                    dtype=input_ids.dtype,
-                )
-
+            s = input_ids.shape[1]
+            position_ids = torch.arange(s)
+            position_ids = (
+                position_ids.unsqueeze(0).expand(3, -1, -1).to(input_ids.device)
+            )
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(
+                -1, keepdim=True
+            )[0]
+            mrope_position_deltas = max_position_ids + 1 - s
             return position_ids, mrope_position_deltas
 
     # For qwen3-omni
@@ -2321,6 +2512,91 @@ class MRotaryEmbedding(RotaryEmbedding):
 
         llm_pos_ids = torch.stack([t_index, h_index, w_index], dim=0) + st_idx
         return llm_pos_ids
+
+
+class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
+    """3D rotary positional embedding. [h w h w h w h w... t t t...]"""
+
+    def forward_native(  # type: ignore[override]
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        assert positions.ndim == 1 or positions.ndim == 2
+        assert key is not None
+
+        num_tokens = positions.shape[-1]
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            assert self.mrope_section
+
+            section_h = self.mrope_section[0]  # 22
+            section_w = self.mrope_section[1]  # 22
+            section_t = self.mrope_section[2]  # 20
+            assert section_h == section_w
+            # Split according to [h w h w h w h w... t t t...]
+            section_cos_t = cos[..., -section_t:]
+            section_cos_h = cos[..., : section_h + section_w : 2]
+            section_cos_w = cos[..., 1 : section_h + section_w : 2]
+
+            cos_t, cos_h, cos_w = section_cos_t[0], section_cos_h[1], section_cos_w[2]
+            cos_hw = torch.stack([cos_h, cos_w], dim=-1).reshape(
+                cos_h.shape[:-1] + (cos_h.shape[-1] * 2,)
+            )
+            cos = torch.cat([cos_hw, cos_t], dim=-1)
+
+            section_sin_t = sin[..., -section_t:]
+            section_sin_h = sin[..., : section_h + section_w : 2]
+            section_sin_w = sin[..., 1 : section_h + section_w : 2]
+
+            sin_t, sin_h, sin_w = section_sin_t[0], section_sin_h[1], section_sin_w[2]
+            sin_hw = torch.stack([sin_h, sin_w], dim=-1).reshape(
+                sin_h.shape[:-1] + (sin_h.shape[-1] * 2,)
+            )
+            sin = torch.cat([sin_hw, sin_t], dim=-1)
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+    def forward_cuda(  # type: ignore[override]
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.forward_native(positions, query, key)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+        return self.forward_native(positions, query, key)
 
 
 class DualChunkRotaryEmbedding(MultiPlatformOp):
