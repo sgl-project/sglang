@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_autoround.TestAutoRound.test_mmlu
+python3 -m unittest test_autoround_quantization
 """
 
 import os
@@ -17,21 +17,21 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=77, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=120, suite="stage-b-test-large-1-gpu")
 
 
 class TestAutoRound(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.output_dir = tempfile.mkdtemp()
 
     @classmethod
@@ -54,13 +54,13 @@ class TestAutoRound(CustomTestCase):
                 eval_name="mmlu",
                 num_examples=32,
                 num_threads=32,
-                device=device,
+                device="auto",
             )
             metrics = run_eval(args)
-            self.assertGreaterEqual(metrics["score"], 0.6)
+            self.assertGreaterEqual(metrics["score"], 0.7)
         finally:
             kill_process_tree(process.pid)
-            print(f"[INFO] Server for {cls.model} stopped.")
+            print(f"[INFO] Server for {self.model} stopped.")
 
     def test_offline_quant(self):
 
