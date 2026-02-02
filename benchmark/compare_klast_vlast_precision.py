@@ -85,7 +85,7 @@ def launch_server(
         "--host", SERVER_HOST,
         "--port", str(SERVER_PORT),
         "--trust-remote-code",
-        "--mem-fraction-static", "0.80",
+        "--mem-fraction-static", "0.70",
         "--disable-radix-cache",
         "--watchdog-timeout", "600",  # Increase timeout for JIT compilation
     ]
@@ -169,7 +169,7 @@ def wait_for_server(timeout: int = 1800):
     return False
 
 
-def start_profiling(output_dir: str, num_steps: int = 5, activities: list = None):
+def start_profiling(output_dir: str, num_steps: int = 5, activities: list = None, profile_by_stage: bool = True):
     """Start torch profiling via HTTP API."""
     if activities is None:
         activities = ["CPU", "GPU"]
@@ -179,11 +179,11 @@ def start_profiling(output_dir: str, num_steps: int = 5, activities: list = None
         "output_dir": output_dir,
         "num_steps": str(num_steps),
         "activities": activities,
-        "profile_by_stage": False,
-        "merge_profiles": False,
+        "profile_by_stage": profile_by_stage,  # True: profile num_steps prefills AND num_steps decodes separately
+        "merge_profiles": True,
     }
     
-    print(f"Starting profiler: {num_steps} steps, activities={activities}, output_dir={output_dir}")
+    print(f"Starting profiler: {num_steps} steps, activities={activities}, profile_by_stage={profile_by_stage}, output_dir={output_dir}")
     try:
         response = requests.post(url=url, json=json_data, timeout=300)
         response.raise_for_status()
