@@ -90,6 +90,34 @@ auto-round \
     --output_dir ./tmp_autoround
 ```
 
+- SGlang API Usage (CPU/CUDA)
+
+```python
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.model_loader.loader import get_model_loader
+from sglang.srt.configs.device_config import DeviceConfig
+
+# Configure model with inc quantization and saving
+model_config = ModelConfig(
+    model_path="meta-llama/Llama-3.2-3B-Instruct",
+    quantization="auto-round-int8",
+    trust_remote_code=True,
+)
+
+load_config = LoadConfig(
+    inc_save_path="./quantized_model",
+)
+device_config = DeviceConfig(device="cpu")
+
+# Load and quantize the model
+model_loader = get_model_loader(load_config, model_config)
+quantized_model = model_loader.load_model(
+    model_config=model_config,
+    device_config=device_config,
+)
+```
+
 - known issues
 
 Several limitations currently affect offline quantized model loading in sglang, These issues might be resolved in future updates of sglang. If you experience any problems, consider using Hugging Face Transformers as an alternative.
@@ -118,6 +146,10 @@ Several limitations currently affect offline quantized model loading in sglang, 
     ```
     auto_round:auto_awq and AWQ format:  These work as expected.
     </details>
+
+4. Limited Support for SGlang API Usage
+
+    SGlang API Usage only supports `auto-round-int8` quantization method now, more quantization methods are on the way.
 
 #### Using [GPTQModel](https://github.com/ModelCloud/GPTQModel)
 
@@ -381,6 +413,16 @@ python3 -m sglang.launch_server \
 SGLang running on AMD GPUs (CDNA3 or CDNA4 architecture) supports the quantization method `--quantization quark_int4fp8_moe`, that will replace [MoE layers](https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/layers/moe/fused_moe_triton/layer.py#L271) originally in high precision (bfloat16, float16 or float32) to use weights dynamically quantized to int4, that are upcasted to float8 during inference to run compute in float8 precision with activations dynamically quantized on the fly to float8.
 
 Other layers (e.g. projections in the attention layers) have their weights quantized online to float8 directly.
+
+
+### Intel® Neural Compressor online quantization method
+
+SGLang supports quantization methods based on the advanced algorithm [auto-round](https://github.com/intel/auto-round) in [Intel® Neural Compressor](https://github.com/intel/neural-compressor). You can simply specify `--quantization auto-round-int8` to use this feature. It will quantize the model on the fly to target format. More online quantization methods are on the way.
+
+##### Available Quantization Methods
+
+- `auto-round-int8`: INT8 per-channel quantized weight with INT8 per-token dynamic quantized activation
+
 
 ## Reference
 
