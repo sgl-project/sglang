@@ -1597,7 +1597,11 @@ def initialize_model_parallel(
     Arguments:
         tensor_model_parallel_size: number of GPUs used for tensor model
             parallelism.
+        expert_model_parallel_size: number of GPUs used for expert model
+            parallelism.
         pipeline_model_parallel_size: number of GPUs used for pipeline model
+            parallelism.
+        attention_data_parallel_size: number of GPUs used for attention data
             parallelism.
         attention_context_model_parallel_size: number of GPUs used for attention context
             parallelism.
@@ -1615,7 +1619,7 @@ def initialize_model_parallel(
 
     Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
     attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe context
-    parallelism (moe_ep_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
+    parallelism (moe_cp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
     function will create the following groups:
         2 tensor model-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]

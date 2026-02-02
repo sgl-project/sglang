@@ -2048,8 +2048,8 @@ class ServerArgs:
                 self.tp_size % self.attn_cp_size == 0
             ), "tp_size must be divisible by attn_cp_size"
             assert (
-                self.dp_size * self.attn_cp_size <= self.tp_size
-            ), "dp_size * attn_cp_size must be less than or equal to tp_size"
+                self.tp_size % (self.dp_size * self.attn_cp_size) == 0
+            ), "tp_size must be divisible by dp_size * attn_cp_size"
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
         if self.moe_cp_size > 1:
