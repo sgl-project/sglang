@@ -135,6 +135,7 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
             lora_backend=LORA_BACKEND,
             port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
             trust_remote_code=True,
+            mem_fraction_static=0.88,
         ) as runner:
             # Call engine.encode directly with lora_path
             response = runner.engine.encode(prompt=texts, lora_path=lora_path)
@@ -160,18 +161,19 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
         print(f"\nModel: {MODEL_PATH}")
         print(f"LoRA: {LORA_PATH}")
 
-        # Get HF embeddings
-        print("\nGetting HF embeddings...")
-        hf_embeddings = self.get_hf_embedding_with_lora(
+        # Get SGLang embeddings first (before HF loads model into GPU)
+        # This order matches test_lora_hf_sgl_logprob_diff.py and avoids OOM
+        print("\nGetting SGLang embeddings...")
+        sglang_embeddings = self.get_sglang_embedding_with_lora(
             MODEL_PATH, LORA_PATH, test_texts, torch.float16
         )
 
         # Clear GPU memory
         torch.cuda.empty_cache()
 
-        # Get SGLang embeddings
-        print("Getting SGLang embeddings...")
-        sglang_embeddings = self.get_sglang_embedding_with_lora(
+        # Get HF embeddings
+        print("Getting HF embeddings...")
+        hf_embeddings = self.get_hf_embedding_with_lora(
             MODEL_PATH, LORA_PATH, test_texts, torch.float16
         )
 
