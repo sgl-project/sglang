@@ -68,7 +68,6 @@ _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
-_use_ag_after_qlora = get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA")
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -635,8 +634,6 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
-            if _use_ag_after_qlora:
-                return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
