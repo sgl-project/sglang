@@ -1048,6 +1048,7 @@ def create_mm_receiver(
 ):
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
+        logger.debug(f"MMReceiver transport_mode from env: {transport_mode}")
     if transport_mode == "grpc":
         return MMReceiverGrpc(
             server_args,
