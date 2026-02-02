@@ -312,10 +312,10 @@ impl RequestExecutionStage {
         debug!(
             request_id = %request_id,
             mm_items_count = mm_items.len(),
-            "EPD dispatch: calling encode worker gRPC endpoint"
+            "EPD dispatch: starting encode/prefill/decode in parallel"
         );
 
-        // Step 1: Call encode worker gRPC Encode() RPC
+        // Build encode request
         let encode_request = encoder_proto::EncodeRequest {
             mm_items,
             req_id: request_id.clone(),
@@ -325,39 +325,22 @@ impl RequestExecutionStage {
             embedding_port: vec![], // Let runtime allocate ZMQ ports dynamically
         };
 
-        if let Err(e) = encode_client.encode(encode_request).await {
-            error!(
-                request_id = %request_id,
-                error = %e,
-                "Encode worker gRPC call failed"
-            );
-            if let Some(w) = workers {
-                w.record_triple_outcomes(false, true, true);
-            }
-            return Err(error::internal_error(
-                "encode_worker_grpc_failed",
-                format!("Encode worker gRPC call failed: {}", e),
-            ));
-        }
-
-        debug!(
-            request_id = %request_id,
-            "Encode gRPC call completed - embeddings being sent via ZMQ"
-        );
-
-        // Step 2: Clear multimodal inputs from prefill request
+        // Clear multimodal inputs from prefill request (encode worker handles them)
         helpers::clear_multimodal_inputs(&mut proto_request);
 
-        // Step 3: Mark request as waiting for image embeddings
+        // Mark request as waiting for image embeddings from encode worker via ZMQ
         Self::set_wait_for_image(&mut proto_request, true);
 
-        // Step 4: Start prefill/decode requests before awaiting encode to avoid deadlock.
+        // Start all three requests in parallel to avoid deadlock:
+        // - Prefill/decode gRPC calls start the workers listening on ZMQ
+        // - Encode processes images and sends embeddings to prefill via ZMQ
+        // - Prefill blocks on need_wait_for_image until it receives ZMQ data
         let prefill_request = proto_request.clone_inner();
         let decode_request = proto_request;
 
-        let mut prefill_future = prefill_client.generate(prefill_request);
-        let mut decode_future = decode_client.generate(decode_request);
-        let mut encode_future = encode_client.encode(encode_request);
+        let prefill_future = prefill_client.generate(prefill_request);
+        let decode_future = decode_client.generate(decode_request);
+        let encode_future = encode_client.encode(encode_request);
 
         tokio::pin!(prefill_future);
         tokio::pin!(decode_future);
@@ -401,7 +384,7 @@ impl RequestExecutionStage {
 
         debug!(
             request_id = %request_id,
-            "Encode gRPC call completed - embeddings being sent via ZMQ"
+            "EPD parallel dispatch completed: encode/prefill/decode all responded"
         );
 
         let prefill_stream = match prefill_result.unwrap() {
