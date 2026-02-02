@@ -332,15 +332,12 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -352,6 +349,14 @@ class CompletionResponse(BaseModel):
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -361,15 +366,12 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -380,6 +382,14 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -784,15 +794,12 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -804,6 +811,14 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class DeltaMessage(BaseModel):
@@ -812,15 +827,12 @@ class DeltaMessage(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
-    sgl_ext: Optional[SglExt] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
-        if self.sgl_ext is None:
-            data.pop("sgl_ext", None)
         return data
 
 
@@ -843,6 +855,14 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class MultimodalEmbeddingInput(BaseModel):
