@@ -121,7 +121,7 @@ DPA addresses these limitations by applying **data parallelism specifically to t
 
 ### DPA with Expert Parallelism for MoE
 
-For MoE models like DeepSeek, **DPA must be combined with Expert Parallelism (EP)** for optimal performance. While DPA handles the attention layers efficiently, the MoE layers require EP to:
+For MoE models like DeepSeek, DPA is **often** paired with Expert Parallelism (EP) for best throughput at scale. However, **DPA does not require EP**: you can enable DPA without EP if your deployment does not need expert sharding.
 
 - Distribute 256+ expert weights across GPUs (cannot fit on single GPU)
 - Enable efficient all-to-all token routing via DeepEP
@@ -143,35 +143,19 @@ For detailed EP configuration (DeepEP, Two-Batch Overlap, EPLB), see [Expert Par
 
 ### Target Models
 
-DPA is specifically designed for and **automatically enabled** for the following model architectures:
+DPA is designed for MLA-based architectures (e.g., DeepSeek family) and is enabled **explicitly** via the `--enable-dp-attention` server flag.
 
-| Model Family | Architecture Feature | Auto-Enable Condition |
-|--------------|---------------------|----------------------|
-| **DeepSeek-V2** | MLA with single KV head | `tp_size > 1` and `dp_size > 1` |
-| **DeepSeek-V3** | MLA with single KV head | `tp_size > 1` and `dp_size > 1` |
-| **DeepSeek-R1** | MLA with single KV head | `tp_size > 1` and `dp_size > 1` |
-| **DeepSeek-Coder-V2** | MLA with single KV head | `tp_size > 1` and `dp_size > 1` |
+| Model Family | Architecture Feature | How to enable |
+|--------------|---------------------|---------------|
+| **DeepSeek-V2** | MLA with single KV head | Add `--enable-dp-attention` |
+| **DeepSeek-V3 / V3.1 / R1** | MLA with single KV head | Add `--enable-dp-attention` |
+| **DeepSeek-Coder-V2** | MLA with single KV head | Add `--enable-dp-attention` |
 
 **Note**: DPA is optimized for MLA-based architectures. For standard multi-head attention models (like Llama, Qwen, etc.), standard DP or TP is recommended.
 
 ### Activation Logic
 
-DPA can be enabled in two ways:
-
-#### 1. Automatic Activation (Recommended for DeepSeek models)
-
-SGLang automatically enables DPA for supported models when the following conditions are met:
-
-```python
-# Automatic activation logic (simplified)
-if model_architecture in ["DeepSeekV2", "DeepSeekV3"]:
-    if tp_size > 1 and dp_size > 1:
-        enable_dp_attention = True  # Auto-enabled
-```
-
-#### 2. Manual Activation
-
-You can explicitly enable DPA using the `--enable-dp-attention` flag:
+DPA is enabled explicitly via server arguments (CLI or config). You can enable DPA using the `--enable-dp-attention` flag:
 
 ```bash
 python -m sglang.launch_server \
@@ -338,7 +322,6 @@ The router supports multiple load balancing policies:
 | `round_robin` | Cycles through workers in order | Simple, predictable distribution |
 | `random` | Random worker selection | Baseline, testing |
 | `power_of_two` | Samples two workers, picks lighter one | Low latency requirements |
-| `bucket` | Divides workers into load buckets | Variable workload sizes |
 
 #### Cache-Aware Policy (Default, Recommended)
 
@@ -364,8 +347,8 @@ python -m sglang_router.launch_router \
 ### Best Practices
 
 1. **Start with `cache_aware` policy** - It provides the best balance between cache locality and load distribution for most workloads
-2. **Use Router-Based DP for production** - Prefer `sglang_router.launch_server` over `sglang.launch_server` for better reliability and observability when using data parallelism
-3. **Enable health checks** - Configure `--health-check-interval-secs` to detect and remove unhealthy workers automatically
+2. **Use Router-Based DP for production** - Prefer `sglang_router.launch_server` over `sglang.launch_server` for better reliability and observability
+3. **Enable health checks** - Configure `--router-health-check-interval-secs` to detect and remove unhealthy workers automatically
 
 **Recommended command with best practices applied:**
 
@@ -374,7 +357,7 @@ python -m sglang_router.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --dp-size 4 \
     --router-policy cache_aware \
-    --health-check-interval-secs 30 \
+    --router-health-check-interval-secs 30 \
     --router-prometheus-port 10001 \
     --host 0.0.0.0 \
     --port 30000
