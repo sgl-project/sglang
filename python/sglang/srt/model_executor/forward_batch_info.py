@@ -989,6 +989,10 @@ class ForwardBatch:
                     :num_tokens
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            elif self.forward_mode.is_simple_draft():  # simple draft
+                self.spec_info.accept_length = self.spec_info.accept_length[:bs * 2]
+                logits_output.next_token_logits = logits_output.next_token_logits[:bs * 2]
+                logits_output.hidden_states = logits_output.hidden_states[:bs * 2]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
                 logits_output.next_token_logits = logits_output.next_token_logits[

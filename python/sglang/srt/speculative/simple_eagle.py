@@ -336,11 +336,11 @@ class SimpleEagleWorker(TpModelWorker):
         # Run
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         #
-        # last = accept_index[:, 1]
-        # first = accept_index[:, 0]
-        # save_index = torch.where(last != -1, last, first)
-        # logits_output.hidden_states = logits_output.hidden_states[save_index]
-        # logits_output.next_token_logits = logits_output.next_token_logits[save_index]
+        last = accept_index[:, 1]
+        first = accept_index[:, 0]
+        save_index = torch.where(last != -1, last, first)
+        logits_output.hidden_states = logits_output.hidden_states[save_index]
+        logits_output.next_token_logits = logits_output.next_token_logits[save_index]
 
         return logits_output
 
@@ -504,17 +504,11 @@ class SimpleEagleWorker(TpModelWorker):
             accept_length_cpu_for_draft_extend = accept_length_for_draft_extend.tolist()
 
             # here, we extend draft tokens anyway cause we want to adopt to cuda graph.
-            last = accept_index[:, 1]
-            first = accept_index[:, 0]
-            save_index = torch.where(last != -1, last, first)
-            selected_hidden_states = logits_output.hidden_states[save_index]
-
             draft_input = EagleDraftInput()
-            # draft_input.hidden_states = logits_output.hidden_states
-            draft_input.hidden_states = selected_hidden_states
+            draft_input.hidden_states = logits_output.hidden_states
             draft_input.accept_length = accept_length_for_draft_extend
             draft_input.accept_length_cpu = accept_length_cpu_for_draft_extend
-            draft_input.verified_id = next_token_ids[save_index]
+            draft_input.verified_id = next_token_ids
             draft_input.seq_lens_for_draft_extend = forward_batch.seq_lens + (
                 accept_length_for_draft_extend + 1
             )
