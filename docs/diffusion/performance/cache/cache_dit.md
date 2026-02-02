@@ -222,4 +222,4 @@ acceleration still works.
 ## References
 
 - [Cache-Dit](https://github.com/vipshop/cache-dit)
-- [SGLang Diffusion](../../)
+- [SGLang Diffusion](../index.md)
