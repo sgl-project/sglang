@@ -63,9 +63,8 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Requires SM100 (Blackwell) for optimal nvFP4 support
-        # Falls back to SM90 (Hopper) with emulation
-        return 90
+        # Requires SM100 (Blackwell) for nvFP4 hardware support
+        return 100
 
     def create_weights(
         self,
