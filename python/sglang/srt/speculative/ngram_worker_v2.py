@@ -285,13 +285,16 @@ class NGRAMWorkerV2(NGRAMWorker):
                 logits_output, predict, accept_index
             )
             # pad predict to [bs, num_draft_token], can be rewritten as a kernel
-            verify_next_token_ids = torch.zeros(
+            draft_input_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32
             ).to(device=self.device, non_blocking=True)
+            start, end = 0, 0
             for i in range(len(model_worker_batch.reqs)):
                 acc_len = accept_length[i]
-                start = i * self.draft_token_num
-                verify_next_token_ids[i, :acc_len] = predict[start : start + acc_len]
+                start = end
+                end = start + acc_len
+                draft_input_tokens[i, :acc_len] = predict[start:end]
+            draft_input_tokens = draft_input_tokens.flatten()
             # copy kvcache will not use the new_seq_lens
             move_accepted_tokens_to_target_kvcache(
                 model_worker_batch,
@@ -300,7 +303,7 @@ class NGRAMWorkerV2(NGRAMWorker):
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
-
+            predict = draft_input_tokens
             model_worker_batch.forward_mode = ForwardMode.DECODE
 
         else:
@@ -319,11 +322,12 @@ class NGRAMWorkerV2(NGRAMWorker):
             accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
                 device=self.device, non_blocking=True
             )
-            verify_next_token_ids = torch.zeros(
+            draft_input_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32
             ).to(device=self.device, non_blocking=True)
-            verify_next_token_ids[:, 0] = predict
-            verify_next_token_ids = verify_next_token_ids.flatten()
+            draft_input_tokens[:, 0] = predict
+            draft_input_tokens = draft_input_tokens.flatten()
+            predict = draft_input_tokens
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
@@ -331,7 +335,7 @@ class NGRAMWorkerV2(NGRAMWorker):
             draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
-            next_token_ids=verify_next_token_ids,
+            next_token_ids=draft_input_tokens,
             accept_lens=accept_length,
             is_spec_v2=True,
         )
