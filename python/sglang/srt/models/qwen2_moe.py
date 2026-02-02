@@ -532,6 +532,22 @@ class Qwen2MoeDecoderLayer(nn.Module):
             )
         )
 
+        if self.layer_id in [0] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "CP" if is_cp else "non-CP"
+            print(
+                f"[ATTN I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE ATTN: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            torch.save(
+                hidden_states,
+                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_attn_hidden_states_{mode_str}_rank{torch.distributed.get_rank()}.pt",
+            )
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -539,9 +555,43 @@ class Qwen2MoeDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
+        # DEBUG: Print hidden states before MLP for first two layers
+        if self.layer_id in [0] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "CP" if is_cp else "non-CP"
+            print(
+                f"[MLP I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE MLP: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            torch.save(
+                hidden_states,
+                f"l/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/ayer{self.layer_id}_mlp_hidden_states_{mode_str}_rank{torch.distributed.get_rank()}.pt",
+            )
+
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        # DEBUG: Print hidden states before MLP for first two layers
+        if self.layer_id in [0] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "CP" if is_cp else "non-CP"
+            print(
+                f"[MLP I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE MLP: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            print(
+                f"[MLP I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE MLP: hidden_states (first 3 tokens, first 5 dims): {hidden_states[:3, :5]}",
+                flush=True,
+            )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
@@ -658,6 +708,23 @@ class Qwen2MoeModel(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
+                # DEBUG: Print layer input/output for first two layers
+                if i in [0, 1] and forward_batch.forward_mode.is_extend():
+                    is_cp = (
+                        is_prefill_context_parallel_enabled()
+                        and forward_batch.forward_mode.is_context_parallel_extend()
+                        and forward_batch.attn_cp_metadata is not None
+                    )
+                    mode_str = "CP" if is_cp else "non-CP"
+                    print(
+                        f"[LAYER I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {i} INPUT: hidden_states shape: {hidden_states.shape}",
+                        flush=True,
+                    )
+                    print(
+                        f"[LAYER I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {i} INPUT: hidden_states (first 3 tokens, first 5 dims): {hidden_states[:3, :5]}",
+                        flush=True,
+                    )
+
                 ctx = (
                     nullcontext()
                     if get_global_server_args().enable_piecewise_cuda_graph
@@ -675,6 +742,23 @@ class Qwen2MoeModel(nn.Module):
                             if getattr(layer, "_is_layer_to_capture", False)
                             else None
                         ),
+                    )
+
+                # DEBUG: Print layer output for first two layers
+                if i in [0, 1] and forward_batch.forward_mode.is_extend():
+                    is_cp = (
+                        is_prefill_context_parallel_enabled()
+                        and forward_batch.forward_mode.is_context_parallel_extend()
+                        and forward_batch.attn_cp_metadata is not None
+                    )
+                    mode_str = "CP" if is_cp else "non-CP"
+                    print(
+                        f"[LAYER I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {i} OUTPUT: hidden_states shape: {hidden_states.shape}",
+                        flush=True,
+                    )
+                    print(
+                        f"[LAYER I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {i} OUTPUT: hidden_states (first 3 tokens, first 5 dims): {hidden_states[:3, :5]}",
+                        flush=True,
                     )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -696,11 +780,19 @@ class Qwen2MoeModel(nn.Module):
             and forward_batch.forward_mode.is_context_parallel_extend()
             and forward_batch.attn_cp_metadata is not None
         ):
+            print(
+                f"[CP DEBUG] Rank {torch.distributed.get_rank()} before hidden_states allgather, shape: {hidden_states.shape}, values (first token, first 5 dims): {hidden_states[0, :5]}",
+                flush=True,
+            )
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.moe_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
+            )
+            print(
+                f"[CP DEBUG] Rank {torch.distributed.get_rank()} after hidden_states allgather, shape: {hidden_states.shape}, values (first token, first 5 dims): {hidden_states[0, :5]}",
+                flush=True,
             )
 
         if len(aux_hidden_states) == 0:

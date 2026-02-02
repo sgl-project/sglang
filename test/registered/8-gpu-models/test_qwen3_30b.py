@@ -18,8 +18,9 @@ BASE_ARGS = [
 ]
 
 DP_ARGS = [
-    "--tp=2",
+    "--tp=4",
     "--moe-cp-size=2",
+    "--ep-size=2",
     "--attn-cp-size=2",
     "--enable-prefill-context-parallel",
 ]
@@ -55,7 +56,7 @@ class TestQwen330B(unittest.TestCase):
             # ),
             ModelLaunchSettings(
                 QWEN3_30B_MODEL_PATH,
-                tp_size=2,
+                tp_size=4,
                 extra_args=BASE_ARGS + DP_ARGS + MTP_ARGS,
                 variant="CP-in-seq-split",
             ),

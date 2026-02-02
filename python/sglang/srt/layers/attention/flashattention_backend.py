@@ -735,7 +735,20 @@ class FlashAttentionBackend(AttentionBackend):
     ):
         if k is not None:
             assert v is not None
-            if save_kv_cache:
+
+            # DEBUG: Print KV cache info for both CP and non-CP cases
+            is_cp_mode = (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+                and self.attn_cp_size > 1
+            )
+
+            # if forward_batch.forward_mode.is_extend() and layer.layer_id in [0, 1]:  # Print for first two layers
+            #     mode_str = "CP" if is_cp_mode else "non-CP"
+            #     print(f"[KV CACHE] {mode_str} Rank {torch.distributed.get_rank()} layer {layer.layer_id}: k shape: {k.shape}, v shape: {v.shape}", flush=True)
+            #     print(f"[KV CACHE] {mode_str} Rank {torch.distributed.get_rank()} layer {layer.layer_id} k values (first 3 tokens, first head, first 5 dims): {k[:3, 0, :5]}", flush=True)
+
+            if save_kv_cache and not is_cp_mode:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -754,11 +767,7 @@ class FlashAttentionBackend(AttentionBackend):
                     )
             # When enable context parallelism, we need to all gather the kv cache from other ranks
             # and save the kv cache to the memory pool.
-            if (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            ):
+            if is_cp_mode:
 
                 # Get the cache_loc that will be used for writing
                 cache_loc = (
@@ -770,16 +779,6 @@ class FlashAttentionBackend(AttentionBackend):
                 # Allgather and reorganize key and value caches
                 k = k.contiguous()
                 v = v.contiguous()
-                torch.save(k, "key_cache_{}.pt".format(torch.distributed.get_rank()))
-                print(
-                    f"DEBUG: Rank {torch.distributed.get_rank()} before allgather k shape: {k.shape}, v shape: {v.shape}, cache_loc shape: {cache_loc.shape}"
-                )
-                print(
-                    f"DEBUG: Rank {torch.distributed.get_rank()} cache_loc values (first 10): {cache_loc[:10] if len(cache_loc) > 0 else cache_loc}"
-                )
-                print(
-                    f"DEBUG: Rank {torch.distributed.get_rank()} k values (first 5 of first head): {k[:5, 0, :3] if k.shape[0] >= 5 else k[:, 0, :3]}"
-                )
 
                 key_cache_full = cp_all_gather_rerange_kv_cache(
                     k, self.attn_cp_size, forward_batch, torch.cuda.current_stream()
@@ -788,17 +787,13 @@ class FlashAttentionBackend(AttentionBackend):
                     v, self.attn_cp_size, forward_batch, torch.cuda.current_stream()
                 )
 
-                torch.save(
-                    key_cache_full,
-                    "key_cache_full_{}.pt".format(torch.distributed.get_rank()),
-                )
-
-                print(
-                    f"DEBUG: Rank {torch.distributed.get_rank()} after allgather key_cache_full shape: {key_cache_full.shape}, value_cache_full shape: {value_cache_full.shape}"
-                )
-                print(
-                    f"DEBUG: Rank {torch.distributed.get_rank()} key_cache_full values (first 5 of first head): {key_cache_full[:5, 0, :3] if key_cache_full.shape[0] >= 5 else key_cache_full[:, 0, :3]}"
-                )
+                # if layer.layer_id in [0, 1]:  # Print for first two layers
+                #     print(
+                #         f"[KV CACHE] CP Rank {torch.distributed.get_rank()} layer {layer.layer_id} after allgather key_cache_full shape: {key_cache_full.shape}, value_cache_full shape: {value_cache_full.shape}", flush=True
+                #     )
+                #     print(
+                #         f"[KV CACHE] CP Rank {torch.distributed.get_rank()} layer {layer.layer_id} key_cache_full values (first 3 tokens, first head, first 5 dims): {key_cache_full[:3, 0, :5]}", flush=True
+                #     )
 
                 # Each rank writes the full KV cache to its own local memory pool.
                 # All ranks need the full sequence KV for subsequent decode steps.
@@ -810,10 +805,9 @@ class FlashAttentionBackend(AttentionBackend):
                     layer.k_scale,
                     layer.v_scale,
                 )
-                exit()
-                print(
-                    f"DEBUG: Rank {torch.distributed.get_rank()} wrote full KV cache to local memory pool"
-                )
+                # print(
+                #     f"DEBUG: Rank {torch.distributed.get_rank()} wrote full KV cache to local memory pool"
+                # )
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -950,11 +944,64 @@ class FlashAttentionBackend(AttentionBackend):
                 # print(f"[Rank {cp_rank}]   prev_window_size: {window_size}")
 
                 cu_seqlens_q_prev = torch.tensor(
-                    [0, forward_batch.attn_cp_metadata.actual_seq_q_prev - 1],
+                    [0, forward_batch.attn_cp_metadata.actual_seq_q_prev],
                     device=self.device,
                     dtype=torch.int32,
                 )
                 # print(f"[Rank {cp_rank}] DEBUG: cu_seqlens_q_prev: {cu_seqlens_q_prev}")
+
+                # VERIFICATION: Read back KV cache using page_table to verify it matches what we saved
+                # print(f"[Rank {cp_rank}] VERIFICATION: Checking KV cache retrieval")
+
+                # # Get the full sequence length from cache_seqlens (total tokens in this batch item)
+                # full_seq_len = cache_seqlens[0].item()
+                # print(f"[Rank {cp_rank}]   full_seq_len (from cache_seqlens): {full_seq_len}")
+                # print(f"[Rank {cp_rank}]   kv_len_prev (for attention): {forward_batch.attn_cp_metadata.kv_len_prev_tensor[0].item()}")
+                # print(f"[Rank {cp_rank}]   page_table shape: {page_table.shape}, page_table[0, :10]: {page_table[0, :10]}")
+                # print(f"[Rank {cp_rank}]   key_cache shape: {key_cache.shape}")
+
+                # Extract FULL KV from cache using page_table indices (simulating what flash_attn does)
+                # if self.page_size == 1:
+                #     # Direct indexing: page_table contains the actual cache locations for the full sequence
+                #     cache_indices = page_table[0, :full_seq_len]
+                #     retrieved_k = key_cache[cache_indices, 0, :, :]  # [full_seq_len, num_heads, head_dim]
+                #     print(f"[Rank {cp_rank}]   cache_indices (full sequence): {cache_indices}")
+                #     print(f"[Rank {cp_rank}]   Retrieved K shape: {retrieved_k.shape}")
+                #     print(f"[Rank {cp_rank}]   Retrieved K values (all tokens, first head, first 3 dims):")
+                #     for i in range(retrieved_k.shape[0]):
+                #         print(f"[Rank {cp_rank}]     Token {i}: {retrieved_k[i, 0, :3]}")
+
+                #     # Load what we saved earlier and compare
+                #     try:
+                #         saved_k_full = torch.load(f"key_cache_full_{torch.distributed.get_rank()}.pt")
+                #         print(f"[Rank {cp_rank}]   Saved K shape: {saved_k_full.shape}")
+                #         print(f"[Rank {cp_rank}]   Saved K values (all tokens, first head, first 3 dims):")
+                #         for i in range(saved_k_full.shape[0]):
+                #             print(f"[Rank {cp_rank}]     Token {i}: {saved_k_full[i, 0, :3]}")
+
+                #         # Compare the full sequences
+                #         compare_len = min(full_seq_len, saved_k_full.shape[0], retrieved_k.shape[0])
+                #         retrieved_to_compare = retrieved_k[:compare_len]
+                #         saved_to_compare = saved_k_full[:compare_len]
+
+                #         matches = torch.allclose(retrieved_to_compare, saved_to_compare, rtol=1e-2, atol=1e-2)
+                #         print(f"[Rank {cp_rank}]   ✓ FULL SEQUENCE KV cache matches saved data ({compare_len} tokens): {matches}")
+                #         if not matches:
+                #             print(f"[Rank {cp_rank}]   ✗ WARNING: Retrieved KV does NOT match saved data!")
+                #             diff = (retrieved_to_compare - saved_to_compare).abs()
+                #             print(f"[Rank {cp_rank}]   Max diff: {diff.max()}, Mean diff: {diff.mean()}")
+                #             # Print per-token max difference
+                #             for i in range(compare_len):
+                #                 token_diff = diff[i].max()
+                #                 print(f"[Rank {cp_rank}]     Token {i} max diff: {token_diff}")
+                #     except Exception as e:
+                #         print(f"[Rank {cp_rank}]   Could not load saved KV for comparison: {e}")
+                #         import traceback
+                #         traceback.print_exc()
+                # else:
+                #     print(f"[Rank {cp_rank}]   Skipping verification for paged attention (page_size={self.page_size})")
+
+                # exit()
                 result_prev = flash_attn_with_kvcache(
                     q=q_prev,
                     k_cache=key_cache,
@@ -990,7 +1037,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # print(f"[Rank {cp_rank}]   next_window_size: {window_size}")
 
                 cu_seqlens_q_next = torch.tensor(
-                    [0, forward_batch.attn_cp_metadata.actual_seq_q_next - 1],
+                    [0, forward_batch.attn_cp_metadata.actual_seq_q_next],
                     device=self.device,
                     dtype=torch.int32,
                 )

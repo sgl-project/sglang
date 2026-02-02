@@ -273,22 +273,38 @@ class RMSNorm(MultiPlatformOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
+        use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward method with allreduce fusion, prioritizing flashinfer fused operations
+
+        Args:
+            x: Input tensor
+            residual: Residual tensor
+            post_residual_addition: Optional post-residual addition tensor
+            use_attn_tp_group: If True, use attention TP group; otherwise use MoE TP group
         """
         if residual is not None:
-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
+            from sglang.srt.distributed import (
+                get_attn_tensor_model_parallel_world_size,
+                get_moe_tensor_parallel_world_size,
+            )
             from sglang.srt.layers.flashinfer_comm_fusion import (
                 flashinfer_allreduce_residual_rmsnorm,
             )
 
-            if get_tensor_model_parallel_world_size() > 1:
+            world_size = (
+                get_attn_tensor_model_parallel_world_size()
+                if use_attn_tp_group
+                else get_moe_tensor_parallel_world_size()
+            )
+            if world_size > 1:
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
                     weight=self.weight,
                     eps=self.variance_epsilon,
+                    use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:
                     return fused_result

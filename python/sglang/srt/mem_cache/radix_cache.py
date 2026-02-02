@@ -450,6 +450,17 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # Debug logging for CP mode
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            print(
+                f"[RADIX CACHE_FINISHED] Rank {dist.get_rank()} req_pool_idx={req.req_pool_idx}, "
+                f"kv_committed_len={kv_committed_len}, token_ids_len={len(token_ids)}, "
+                f"kv_indices shape={kv_indices.shape}, kv_indices[:10]={kv_indices[:10]}",
+                flush=True,
+            )
+
         # Maybe convert to bigram keys for EAGLE
         keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
         keys = self._page_align_keys(keys)

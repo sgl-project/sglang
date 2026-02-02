@@ -251,12 +251,12 @@ class LayerScatterModes:
     @classmethod
     def init_new(cls, **kwargs):
         context = _LayerModeComputationContext(**kwargs)
-        print("Layer ID: ", context.layer_id)
-        print("Layer Input Mode: ", cls._compute_layer_input_mode(context))
-        print("Attn Mode: ", ScatterMode.TP_ATTN_FULL)
-        print("MLP Mode: ", cls._compute_mlp_mode(context))
-        print("Middle Residual Mode: ", cls._compute_middle_residual_mode(context))
-        print("Layer Output Mode: ", cls._compute_layer_output_mode(context))
+        # print("Layer ID: ", context.layer_id)
+        # print("Layer Input Mode: ", cls._compute_layer_input_mode(context))
+        # print("Attn Mode: ", ScatterMode.TP_ATTN_FULL)
+        # print("MLP Mode: ", cls._compute_mlp_mode(context))
+        # print("Middle Residual Mode: ", cls._compute_middle_residual_mode(context))
+        # print("Layer Output Mode: ", cls._compute_layer_output_mode(context))
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
             attn_mode=ScatterMode.TP_ATTN_FULL,
@@ -426,9 +426,10 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
+                # Use attention TP group for allreduce fusion in prepare_attn
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
-                        hidden_states, residual
+                        hidden_states, residual, use_attn_tp_group=True
                     )
                 )
             else:
@@ -825,8 +826,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and get_global_server_args().enable_flashinfer_allreduce_fusion
                 and hidden_states.shape[0] <= 2048
             ):
+                # Use standard TP group (MLP/MoE) for allreduce fusion in postprocess_layer
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual
+                    hidden_states, residual, use_attn_tp_group=False
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)

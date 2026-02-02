@@ -784,11 +784,44 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
+        if self.layer_id in [1] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "CP" if is_cp else "non-CP"
+            print(
+                f"[ATTN I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE ATTN: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            torch.save(
+                hidden_states,
+                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_attn_hidden_states_{mode_str}_rank{torch.distributed.get_rank()}.pt",
+            )
+
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+            )
+
+        # DEBUG: Print hidden states before MLP for first two layers
+        if self.layer_id in [1] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "CP" if is_cp else "non-CP"
+            print(
+                f"[MLP I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE MLP: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            torch.save(
+                hidden_states,
+                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_mlp_hidden_states_{mode_str}_rank{torch.distributed.get_rank()}.pt",
             )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -809,6 +842,23 @@ class Qwen3MoeDecoderLayer(nn.Module):
         hidden_states = self.mlp(
             hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
         )
+
+        # DEBUG: Print hidden states after MLP for layer 0
+        if self.layer_id in [0] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "CP" if is_cp else "non-CP"
+            print(
+                f"[MLP I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} AFTER MLP: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            torch.save(
+                hidden_states,
+                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_mlp_output_{mode_str}_rank{torch.distributed.get_rank()}.pt",
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -964,9 +1014,51 @@ class Qwen3MoeForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            logits_output = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+
+            # DEBUG: Check logits and predicted tokens for both CP and non-CP cases
+            # Extract the actual logits tensor from the output
+            if hasattr(logits_output, "next_token_logits"):
+                logits = logits_output.next_token_logits
+            elif hasattr(logits_output, "logits"):
+                logits = logits_output.logits
+            else:
+                logits = logits_output  # fallback if it's already a tensor
+
+            # Print for both CP and non-CP to compare
+            if forward_batch.forward_mode.is_extend():
+                is_cp_enabled = (
+                    self.attn_cp_size > 1
+                    and forward_batch.forward_mode.is_context_parallel_extend()
+                    and forward_batch.attn_cp_metadata is not None
+                )
+                mode_str = (
+                    f"CP (rank {self.attn_cp_rank})" if is_cp_enabled else "TP-only"
+                )
+
+                print(
+                    f"[LOGITS DEBUG] {mode_str} Rank {torch.distributed.get_rank()} logits shape: {logits.shape}",
+                    flush=True,
+                )
+                if logits.shape[0] > 0:
+                    print(
+                        f"[LOGITS DEBUG] {mode_str} Rank {torch.distributed.get_rank()} last token logits (first 10): {logits[-1, :10]}",
+                        flush=True,
+                    )
+                    print(
+                        f"[LOGITS DEBUG] {mode_str} Rank {torch.distributed.get_rank()} last token logits (argmax indices 0-9): {torch.topk(logits[-1], 10).indices}",
+                        flush=True,
+                    )
+                    # Get the predicted token
+                    predicted_token = torch.argmax(logits[-1], dim=-1)
+                    print(
+                        f"[LOGITS DEBUG] {mode_str} Rank {torch.distributed.get_rank()} predicted next token: {predicted_token.item()}",
+                        flush=True,
+                    )
+
+            return logits_output
         else:
             return hidden_states
 

@@ -151,10 +151,10 @@ def cp_all_gather_reorganazied_into_tensor_kv_cache(
         device=input_tensor.device,
         dtype=input_tensor.dtype,
     )
-    print(
-        f"DEBUG: Rank {torch.distributed.get_rank()} cp_all_gather_reorganazied_into_tensor_kv_cache input: {input_tensor.shape}, output: {input_tensor_full.shape}, pad: {pad_size}",
-        flush=True,
-    )
+    # print(
+    #     f"DEBUG: Rank {torch.distributed.get_rank()} cp_all_gather_reorganazied_into_tensor_kv_cache input: {input_tensor.shape}, output: {input_tensor_full.shape}, pad: {pad_size}",
+    #     flush=True,
+    # )
 
     get_attention_cp_group().cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
@@ -305,9 +305,26 @@ def prepare_context_parallel_metadata(
     - To mitigate uneven load, the input hissenstate needs to be sliced by cp_size*2 and rearranged.
     """
     # just support batch = 1
+    # kv_len: the number of tokens *computed in this extend pass* (i.e. the
+    # "new" tokens). When radix/prefix cache hits, the effective KV length
+    # visible to attention is: prefix_len + kv_len. CP attention must use the
+    # full visible KV length, otherwise queries won't attend to cached prefix.
     kv_len = torch.tensor(kv_len)
     bs_per_cp_group = 1
     kv_len_origin = kv_len
+
+    # Derive prefix offset from the full sequence length on CPU.
+    # NOTE: forward_batch.seq_lens_cpu includes cached prefix + extend tokens.
+    # In CP we only split the extend tokens, but cache_seqlens passed to FA must
+    # include the cached prefix.
+    prefix_len = 0
+    try:
+        if seqs_len is not None and len(seqs_len) == 1:
+            prefix_len = int(seqs_len[0]) - int(kv_len_origin.item())
+            if prefix_len < 0:
+                prefix_len = 0
+    except Exception:
+        prefix_len = 0
     # get zigzag index
     cp_segment_num = cp_size * 2
     seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment
@@ -357,8 +374,11 @@ def prepare_context_parallel_metadata(
     prefix_sum_list = list(accumulate(split_list))
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
-    kv_len_prev = prefix_sum_list[cp_rank]
-    kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
+    # Prefix offset is critical when radix cache hits (prefix_len > 0).
+    # These "cache_seqlens" values represent how many KV tokens are visible to
+    # each query segment during CP attention.
+    kv_len_prev = prefix_len + prefix_sum_list[cp_rank]
+    kv_len_next = prefix_len + prefix_sum_list[cp_size * 2 - cp_rank - 1]
     actual_seq_q_prev = split_list[cp_rank]
     actual_seq_q_next = split_list[cp_size * 2 - cp_rank - 1]
     # Flash Attention expects cache_seqlens to have shape (batch_size,), not scalar
