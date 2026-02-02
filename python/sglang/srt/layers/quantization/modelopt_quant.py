@@ -168,23 +168,22 @@ def round_up_to_multiple(x: int, m: int) -> int:
     return (x + m - 1) // m * m
 
 
-def pad_nvfp4_weight_for_cutlass(
+def pad_nvfp4_weight(
     weight: torch.Tensor,
     n_alignment: int = FP4_GEMM_ALIGNMENT,
     k_alignment: int = FP4_GEMM_ALIGNMENT,
 ) -> tuple[torch.Tensor, int]:
     """
-    Pad packed NVFP4 weights so that both N (rows) and K (columns) satisfy
-    the alignment constraints required by CUTLASS / FlashInfer FP4 kernels.
+    Pad packed NVFP4 weights to satisfy alignment constraints for FP4 GEMM kernels.
 
-    CUTLASS FP4 kernel requires both K and N matrix dimensions to be divisible
-    by 32 for aligned memory access and efficient tensor core operations.
-    TRTLLM backend requires N % 128 == 0 for shuffle_matrix_sf_a.
+    Different backends have different alignment requirements:
+    - CUTLASS/cuDNN: N % 32 == 0, K % 32 == 0
+    - TRTLLM: N % 128 == 0 (for shuffle_matrix_sf_a), K padding handled separately
 
     Args:
         weight: Packed FP4 weight tensor of shape [N, K//2] (2 FP4 values per byte)
         n_alignment: Required alignment for N dimension (default 32, use 128 for TRTLLM)
-        k_alignment: Required alignment for K dimension (default 32, use 0 to skip K padding)
+        k_alignment: Required alignment for K dimension (default 32, use 0 to skip)
 
     Returns:
         Tuple of (padded_weight, weights_padding_cols) where weights_padding_cols
@@ -1269,11 +1268,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             # Alignment requirements:
             #   - shuffle_matrix_a: weight.shape[0] (N) % 32 == 0
             #   - shuffle_matrix_sf_a: scale.shape[0] (N) % 128 == 0, scale.shape[1] (K/16) % 4 == 0
-            # We pad N to multiple of 128 which satisfies both requirements.
+            # We pad N to multiple of 128 and K/16 to multiple of 4.
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
 
-            # Pad weight N dimension to 128 (no K padding needed for TRTLLM)
-            weight, _ = pad_nvfp4_weight_for_cutlass(
+            # Pad weight N dimension to 128
+            weight, _ = pad_nvfp4_weight(
                 layer.weight.data, n_alignment=128, k_alignment=0
             )
             # Pad scale N dimension to match weight
@@ -1281,6 +1280,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if scale.shape[0] != weight.shape[0]:
                 pad_n = weight.shape[0] - scale.shape[0]
                 scale = torch.nn.functional.pad(scale, (0, 0, 0, pad_n))
+
+            # Pad K dimension: scale K/16 must be multiple of 4
+            scale_k = scale.shape[1]  # K/16
+            weights_padding_cols = 0
+            if scale_k % 4 != 0:
+                padded_scale_k = round_up_to_multiple(scale_k, 4)
+                pad_scale_k = padded_scale_k - scale_k
+                # Pad scale K/16 dimension
+                scale = torch.nn.functional.pad(scale, (0, pad_scale_k, 0, 0))
+                # Pad weight K/2 dimension correspondingly (K/2 = K/16 * 8)
+                pad_weight_k = pad_scale_k * 8
+                weight = torch.nn.functional.pad(weight, (0, pad_weight_k, 0, 0))
+                # Store K padding for activation padding in apply()
+                weights_padding_cols = pad_weight_k
 
             # Shuffle for TRTLLM layout
             epilogue_tile_m = 128
@@ -1294,11 +1307,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
             layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
             layer.weight = Parameter(weight, requires_grad=False)
-            layer.weights_padding_cols = 0  # No K padding needed for TRTLLM
+            layer.weights_padding_cols = weights_padding_cols
             return
 
         # Pad weights for CUTLASS/FlashInfer kernel alignment (K and N divisible by 32)
-        weight, weights_padding_cols = pad_nvfp4_weight_for_cutlass(layer.weight.data)
+        weight, weights_padding_cols = pad_nvfp4_weight(layer.weight.data)
         layer.weights_padding_cols = weights_padding_cols
         layer.weight = Parameter(weight, requires_grad=False)
 
@@ -1309,9 +1322,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             scales = scales.unsqueeze(0)
         assert scales.ndim == 3
         B, M, K = scales.shape
-        round_up_multiple = lambda x, m: (x + m - 1) // m * m
-        M_padded = round_up_multiple(M, 128)
-        K_padded = round_up_multiple(K, 4)
+        M_padded = round_up_to_multiple(M, 128)
+        K_padded = round_up_to_multiple(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
         batches, rows, cols = padded_scales.shape
