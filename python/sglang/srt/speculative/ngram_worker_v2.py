@@ -99,6 +99,7 @@ class NGRAMWorkerV2(NGRAMWorker):
                 prev_accept_lens = prev_accept_lens.cpu()
             self.prev_token_ids = prev_token_ids.tolist()
             self.prev_accept_lens = prev_accept_lens.tolist()
+
         stride = self.draft_token_num
         for i, req in enumerate(batch.reqs):
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -205,8 +206,10 @@ class NGRAMWorkerV2(NGRAMWorker):
         bs = len(model_worker_batch.seq_lens)
         self._prepare_for_speculative_decoding_v2(model_worker_batch)
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
-        accept_length = None
-        new_seq_lens, verify_done = None, None
+        accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
+            device=self.device, non_blocking=True
+        )
+        accept_index = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
@@ -277,24 +280,10 @@ class NGRAMWorkerV2(NGRAMWorker):
                 accept_index,
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
+            draft_input_tokens = predict
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
-            # use accept_index to get valid predict
-            predict = verify_input.filter_invalid_predict(
-                logits_output, predict, accept_index
-            )
-            # pad predict to [bs, num_draft_token], can be rewritten as a kernel
-            draft_input_tokens = torch.zeros(
-                bs, self.draft_token_num, dtype=torch.int32
-            ).to(device=self.device, non_blocking=True)
-            start, end = 0, 0
-            for i in range(len(model_worker_batch.reqs)):
-                acc_len = accept_length[i]
-                start = end
-                end = start + acc_len
-                draft_input_tokens[i, :acc_len] = predict[start:end]
-            draft_input_tokens = draft_input_tokens.flatten()
             # copy kvcache will not use the new_seq_lens
             move_accepted_tokens_to_target_kvcache(
                 model_worker_batch,
@@ -303,7 +292,6 @@ class NGRAMWorkerV2(NGRAMWorker):
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
-            predict = draft_input_tokens
             model_worker_batch.forward_mode = ForwardMode.DECODE
 
         else:
@@ -316,18 +304,21 @@ class NGRAMWorkerV2(NGRAMWorker):
                 batch_result.can_run_cuda_graph,
             )
             new_seq_lens = model_worker_batch.seq_lens
-            verify_done = torch.get_device_module(self.device).Event()
-            verify_done.record()
 
-            accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
-                device=self.device, non_blocking=True
-            )
             draft_input_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32
             ).to(device=self.device, non_blocking=True)
             draft_input_tokens[:, 0] = predict
             draft_input_tokens = draft_input_tokens.flatten()
-            predict = draft_input_tokens
+            accept_index = torch.full(
+                (bs, self.draft_token_num), -1, dtype=torch.int32
+            ).to(device=self.device, non_blocking=True)
+            accept_index[:, 0] = torch.arange(
+                0, bs * self.draft_token_num, self.draft_token_num, dtype=torch.int32
+            ).to(device=self.device, non_blocking=True)
+
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
 
         # Construct the next draft input
         next_draft_input = NgramVerifyInput(
@@ -337,17 +328,13 @@ class NGRAMWorkerV2(NGRAMWorker):
             verify_done=verify_done,
             next_token_ids=draft_input_tokens,
             accept_lens=accept_length,
+            accept_indices=accept_index,
             is_spec_v2=True,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
-            accept_lens=(
-                accept_length
-                if model_worker_batch.forward_mode
-                in [ForwardMode.TARGET_VERIFY, ForwardMode.DECODE]
-                else None
-            ),
+            accept_lens=accept_length,
             next_draft_input=next_draft_input,
         )

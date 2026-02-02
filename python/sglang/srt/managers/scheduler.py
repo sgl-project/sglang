@@ -165,6 +165,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTen
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -2099,6 +2100,18 @@ class Scheduler(
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
+
+        if batch.spec_algorithm.is_ngram() and batch.is_spec_v2:
+            # in ngram spec v2, select the correct output tokens using accept_indices and transform next_token_ids to shape of [bs*num_draft_token] which is then being used to prepare draft tokens. This operation should be done before continuous batching. Otherwise filtering accept_indices will be much more complicated.
+            batch.maybe_wait_verify_done()
+            batch.forward_mode = ForwardMode.DECODE
+            ngram_verify_input: NgramVerifyInput = (
+                batch.spec_info.copy()
+            )  # pop_and_process share the spec_info. Here copy it so it'll have no impact on pop_and_process
+            next_token_ids = ngram_verify_input.process_predict_spec_v2(batch)
+            assert next_token_ids is not None
+            ngram_verify_input.next_token_ids = next_token_ids
+            batch.spec_info = ngram_verify_input
 
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
