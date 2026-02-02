@@ -476,7 +476,7 @@ class EAGLEWorker(TpModelWorker):
         # Use the MAB manager to select the best strategy for this batch size
         selected_strategy = self.mab_manager.select_strategy(batch_size)
 
-        print(f"[MAB] Selected strategy: {selected_strategy} for batch_size={batch_size}")
+        #print(f"[MAB] Selected strategy: {selected_strategy} for batch_size={batch_size}")
 
         # Apply the selected strategy
         self.set_mab_strategy(selected_strategy)
