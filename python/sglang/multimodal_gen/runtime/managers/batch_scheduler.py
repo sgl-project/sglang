@@ -37,20 +37,10 @@ class RequestConfig(NamedTuple):
     num_frames: int
     num_inference_steps: int
     has_cfg: bool  # guidance_scale > 1.0 and negative_prompt exists
-    effective_batch_size: int  # num_prompts × num_outputs_per_prompt
 
     @classmethod
     def from_req(cls, req: "Req") -> "RequestConfig":
         """Create RequestConfig from a Req object."""
-        # Calculate effective batch size
-        if isinstance(req.prompt, list):
-            num_prompts = len(req.prompt)
-        elif req.prompt is not None:
-            num_prompts = 1
-        else:
-            num_prompts = 1
-
-        effective_batch = num_prompts * req.num_outputs_per_prompt
 
         # Handle potential list types for dimensions
         height = req.height[0] if isinstance(req.height, list) else (req.height or 480)
@@ -65,11 +55,10 @@ class RequestConfig(NamedTuple):
             num_frames=num_frames,
             num_inference_steps=req.num_inference_steps,
             has_cfg=req.do_classifier_free_guidance,
-            effective_batch_size=effective_batch,
         )
 
     def __str__(self) -> str:
-        return f"({self.height}×{self.width}×{self.num_frames}f, {self.num_inference_steps}steps, cfg={self.has_cfg}, batch={self.effective_batch_size})"
+        return f"({self.height}×{self.width}×{self.num_frames}f, {self.num_inference_steps}steps, cfg={self.has_cfg})"
 
 
 @dataclass
@@ -96,10 +85,6 @@ class BatchScheduler:
     - Estimates memory to determine safe batch sizes
     - Prevents starvation with max wait time
     - Adapts to actual memory usage over time
-
-    Requests with different `effective_batch_size` (num_outputs_per_prompt) are
-    bucketed separately to simplify output distribution. This trades some batching
-    efficiency for implementation simplicity.
     """
 
     def __init__(
@@ -236,9 +221,6 @@ class BatchScheduler:
         """
         Merge multiple Req objects into a single batched Req.
         All requests must have compatible configurations.
-
-        For atomic batching (same effective_batch_size), we concatenate prompts
-        but keep num_outputs_per_prompt the same.
         """
         if len(queued_items) == 1:
             return queued_items[0].req, [queued_items[0].req.batch_size]

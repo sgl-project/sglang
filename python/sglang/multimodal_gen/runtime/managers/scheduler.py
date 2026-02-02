@@ -197,7 +197,6 @@ class Scheduler:
         if self.enable_batching and self.batch_scheduler is not None:
             result = self.batch_scheduler.get_next_batch()
             if result is None:
-
                 return None
 
             identities, per_req_num_outputs, merged_req, config = result
@@ -439,7 +438,6 @@ class Scheduler:
                         else:
                             logger.info(f"Warmup req processing failed")
 
-                # TODO: Support sending back to multiple identities if batched
                 self.return_result(
                     output_batch, identities, per_req_num_outputs, is_warmup=is_warmup
                 )
