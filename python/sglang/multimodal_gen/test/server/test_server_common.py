@@ -8,7 +8,6 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any, Callable
 
 import openai
@@ -25,8 +24,6 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     PerformanceValidator,
     ServerContext,
     ServerManager,
-    WarmupRunner,
-    download_image_from_url,
     get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -37,7 +34,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
-    is_image_url,
     wait_for_req_perf_record,
 )
 
@@ -91,8 +87,8 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    if server_args.enable_warmup:
-        extra_args += f" --enable-warmup"
+    if server_args.warmup:
+        extra_args += f" --warmup"
 
     # Build custom environment variables
     env_vars = {}
@@ -115,41 +111,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         output_size = os.environ.get(
             "SGLANG_TEST_OUTPUT_SIZE", sampling_params.output_size
         )
-        warmup = WarmupRunner(
-            port=ctx.port,
-            model=server_args.model_path,
-            prompt=sampling_params.prompt or "A colorful raccoon icon",
-            output_size=output_size,
-            output_format=sampling_params.output_format,
-        )
-        if server_args.warmup > 0:
-            if sampling_params.image_path and case.sampling_params.prompt:
-                # Handle URL or local path
-                image_path_list = sampling_params.image_path
-                if not isinstance(image_path_list, list):
-                    image_path_list = [image_path_list]
-
-                new_image_path_list = []
-                for image_path in image_path_list:
-                    if is_image_url(image_path):
-                        new_image_path_list.append(
-                            download_image_from_url(str(image_path))
-                        )
-                    else:
-                        path_obj = Path(image_path)
-                        if not path_obj.exists():
-                            pytest.skip(f"{case.id}: file missing: {image_path}")
-                        new_image_path_list.append(path_obj)
-
-                image_path_list = new_image_path_list
-
-                warmup.run_edit_warmups(
-                    count=server_args.warmup,
-                    edit_prompt=sampling_params.prompt,
-                    image_path=image_path_list,
-                )
-            else:
-                warmup.run_text_warmups(server_args.warmup)
     except Exception as exc:
         logger.error("Warm-up failed for %s: %s", case.id, exc)
         ctx.cleanup()
