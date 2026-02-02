@@ -1184,6 +1184,19 @@ def create_mm_receiver(
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
         logger.debug(f"MMReceiver transport_mode from env: {transport_mode}")
     if transport_mode == "grpc":
+        if any(url.startswith("http://") for url in server_args.encoder_urls):
+            raise ValueError(
+                "EPD MMReceiver: grpc mode requires grpc:// encoder URLs. "
+                "Set SGLANG_ENCODER_MM_RECEIVER_MODE=grpc for the prefill process."
+            )
+    if transport_mode == "http":
+        if any(url.startswith("grpc://") for url in server_args.encoder_urls):
+            raise ValueError(
+                "EPD MMReceiver: http mode requires http:// encoder URLs. "
+                "Set SGLANG_ENCODER_MM_RECEIVER_MODE=http for the prefill process."
+            )
+    logger.info(f"EPD MMReceiver: using transport_mode={transport_mode}")
+    if transport_mode == "grpc":
         return MMReceiverGrpc(
             server_args,
             dtype=dtype,
