@@ -638,7 +638,6 @@ class ModelRunnerKVCacheMixin:
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
                         need_sort=need_sort,
-                        is_npu=True,
                     )
                 else:
                     from sglang.srt.hardware_backend.npu.allocator_npu import (
