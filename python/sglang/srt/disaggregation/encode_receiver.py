@@ -16,15 +16,11 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-import grpc
-
 from sglang.srt.environ import envs
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
     get_mooncake_transfer_engine,
 )
-from sglang.srt.environ import envs
-from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
@@ -33,7 +29,6 @@ from sglang.srt.utils import ImageData, get_local_ip_auto, get_zmq_socket_on_hos
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
-SGLangEncoderStub = sglang_encoder_pb2_grpc.SglangEncoderStub
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -56,9 +51,12 @@ def _normalize_embedding_ports(embedding_port):
 
 
 def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
+    import grpc
+    from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
-    stub = SGLangEncoderStub(channel)
+    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         stub.SchedulerReceiveUrl(
             sglang_encoder_pb2.SchedulerReceiveUrlRequest(
@@ -73,9 +71,12 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 
 
 def _grpc_encode_request(target, encode_request):
+    import grpc
+    from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
-    stub = SGLangEncoderStub(channel)
+    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         response = stub.Encode(
             sglang_encoder_pb2.EncodeRequest(
@@ -96,9 +97,12 @@ def _grpc_encode_request(target, encode_request):
 
 
 def _grpc_send_request(target, request_json):
+    import grpc
+    from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
-    stub = SGLangEncoderStub(channel)
+    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         stub.Send(
             sglang_encoder_pb2.SendRequest(
