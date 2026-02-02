@@ -839,15 +839,8 @@ jobs:
             ci_sglang \
             python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
-      - name: Run test_disaggregation_basic
-        timeout-minutes: 30
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh \
-            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
-            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 1800
-
-      - name: Run test_disaggregation_pp
-        timeout-minutes: 30
+      - name: Run test_disaggregation
+        timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
