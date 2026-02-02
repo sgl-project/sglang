@@ -1059,14 +1059,9 @@ def create_mm_receiver(
     tp_rank: Optional[int] = None,
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
+    transport_mode: str = "http",
 ):
-    has_grpc = any(url.startswith("grpc://") for url in server_args.encoder_urls)
-    has_http = any(url.startswith("http://") for url in server_args.encoder_urls)
-    if has_grpc and has_http:
-        raise ValueError(
-            "Mixed encoder URL schemes are not supported; use either grpc:// or http(s):// only."
-        )
-    if has_grpc:
+    if transport_mode == "grpc":
         return MMReceiverGrpc(
             server_args,
             dtype=dtype,
@@ -1076,12 +1071,14 @@ def create_mm_receiver(
             tp_group=tp_group,
             scheduler=scheduler,
         )
-    return MMReceiverHTTP(
-        server_args,
-        dtype=dtype,
-        hf_config=hf_config,
-        pp_rank=pp_rank,
-        tp_rank=tp_rank,
-        tp_group=tp_group,
-        scheduler=scheduler,
-    )
+    if transport_mode == "http":
+        return MMReceiverHTTP(
+            server_args,
+            dtype=dtype,
+            hf_config=hf_config,
+            pp_rank=pp_rank,
+            tp_rank=tp_rank,
+            tp_group=tp_group,
+            scheduler=scheduler,
+        )
+    raise ValueError(f"Unsupported transport_mode: {transport_mode}")
