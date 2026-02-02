@@ -743,24 +743,37 @@ inline void transfer_kv_page_first_direct_impl(
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
   const int64_t num_pages = src_indices_cpu.size(0) / page_size;
+  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   if constexpr (IsLf2Pf) {
     const bool is_mla = dst_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
 
+    const int64_t dst_stride0 = dst_ptrs[0].stride(0);
+    const int64_t dst_stride1 = dst_ptrs[0].stride(1);
+    const int64_t src_stride0 = src_ptrs[0].stride(0);
+    const int64_t elem_size = dst_ptrs[0].element_size();
+    const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
+
     for (const auto i : c10::irange(num_pages)) {
-      auto s_index = src_indices_cpu[i * page_size].item<int64_t>();
-      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>() / page_size;
+      auto s_index = src_indices_ptr[i * page_size];
+      auto d_index = dst_indices_ptr[i * page_size] / page_size;
+
       for (int64_t j = 0; j < num_layers; ++j) {
-        transfer_page_direct(
-            src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+        const char* src_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
+        char* dst_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
+            (start_layer_id + j) * dst_stride1 * elem_size;
+        C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
+
         if (!is_mla) {
-          transfer_page_direct(
-              src_ptrs[j + num_layers],
-              dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
-              s_index,
-              0,
-              page_size);
+          const char* src_ptr = static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) +
+            s_index * src_stride0 * elem_size;
+          char* dst_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
+            (start_layer_id + j) * dst_stride1 * elem_size;
+          C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
         }
       }
     }
@@ -768,19 +781,27 @@ inline void transfer_kv_page_first_direct_impl(
     const bool is_mla = src_ptrs.size() == 1;
     const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
 
+    const int64_t src_stride0 = src_ptrs[0].stride(0);
+    const int64_t src_stride1 = src_ptrs[0].stride(1);
+    const int64_t dst_stride0 = dst_ptrs[0].stride(0);
+    const int64_t elem_size = src_ptrs[0].element_size();
+    const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
+
     for (const auto i : c10::irange(num_pages)) {
-      auto s_index = src_indices_cpu[i * page_size].item<int64_t>() / page_size;
-      auto d_index = dst_indices_cpu[i * page_size].item<int64_t>();
+      auto s_index = src_indices_ptr[i * page_size] / page_size;
+      auto d_index = dst_indices_ptr[i * page_size];
+
       for (int64_t j = 0; j < num_layers; ++j) {
-        transfer_page_direct(
-            src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+        const char* src_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
+            (start_layer_id + j) * src_stride1 * elem_size;
+        char* dst_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
+        C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
+
         if (!is_mla) {
-          transfer_page_direct(
-              src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
-              dst_ptrs[j + num_layers],
-              0,
-              d_index,
-              page_size);
+          const char* src_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
+            (start_layer_id + j) * src_stride1 * elem_size;
+          char* dst_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
+          C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
         }
       }
     }
