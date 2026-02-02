@@ -1545,8 +1545,9 @@ class Scheduler(
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
-            if recv_req.return_logprob:
-                # If return_logprob is True, return the logprobs for output tokens by default
+            if recv_req.return_logprob and recv_req.token_ids_logprob is None:
+                # If logprob is required but neither token_ids_logprob nor logprob_start_len is
+                # set, return the logprobs for output tokens by default
                 req.logprob_start_len = len(req.origin_input_ids) - 1
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
