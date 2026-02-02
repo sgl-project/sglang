@@ -1154,14 +1154,27 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
-        layer.input_scale = Parameter(input_scale_2, requires_grad=False)
-        layer.weight_scale_2 = Parameter(weight_scale_2, requires_grad=False)
-        layer.alpha = Parameter(
-            layer.input_scale * layer.weight_scale_2, requires_grad=False
-        )
-        layer.input_scale_inv = Parameter(
-            (1 / input_scale_2).to(torch.float32), requires_grad=False
-        )
+
+        # Keep parameter objects stable for CUDA graph reuse and hot reload.
+        # Prefer in-place copy; rebind only when shape/dtype changes.
+        def _copy_or_rebind_param(name: str, new_value: torch.Tensor) -> None:
+            param = getattr(layer, name, None)
+            if isinstance(param, Parameter):
+                if (
+                    param.data.shape == new_value.shape
+                    and param.data.dtype == new_value.dtype
+                ):
+                    param.data.copy_(new_value)
+                else:
+                    param.data = new_value
+                param.requires_grad_(False)
+            else:
+                setattr(layer, name, Parameter(new_value, requires_grad=False))
+
+        _copy_or_rebind_param("input_scale", input_scale_2)
+        _copy_or_rebind_param("weight_scale_2", weight_scale_2)
+        _copy_or_rebind_param("alpha", layer.input_scale * layer.weight_scale_2)
+        _copy_or_rebind_param("input_scale_inv", (1 / input_scale_2).to(torch.float32))
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
@@ -1179,8 +1192,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 .view(torch.float8_e4m3fn)
             )
 
-            layer.weight_scale_interleaved = Parameter(scale, requires_grad=False)
-            layer.weight = Parameter(weight, requires_grad=False)
+            _copy_or_rebind_param("weight_scale_interleaved", scale)
+            _copy_or_rebind_param("weight", weight)
             return
         # Pad and blockwise interleave weight_scale
         scales = layer.weight_scale
@@ -1205,7 +1218,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             if scale_ndim == 2
             else padded_scales.reshape(B, M_padded, K_padded)
         )
-        layer.weight_scale_interleaved = Parameter(padded_scales, requires_grad=False)
+        _copy_or_rebind_param("weight_scale_interleaved", padded_scales)
 
     def apply(
         self,
