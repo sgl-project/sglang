@@ -78,7 +78,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         residual = hidden_states
@@ -97,6 +96,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
+        hidden_states = hidden_states + residual
 
         return hidden_states, residual
 
@@ -140,6 +140,18 @@ class LlamaModel(nn.Module):
 
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
+        self.midlayers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"midlayers.{i}", prefix),
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -166,14 +178,13 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
-        residual = None
-        hidden_states, residual = self.midlayer(
-            positions,
-            embeds,
-            hidden_states,
-            forward_batch,
-            residual,
-        )
+        for layer in self.midlayers:
+            hidden_states, residual = layer(
+              positions,
+              embeds,
+              hidden_states,
+              forward_batch,
+            )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
@@ -194,9 +205,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-
-        if self.config.num_hidden_layers != 1:
-            raise ValueError("EAGLE3 currently only supports 1 layer")
 
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
