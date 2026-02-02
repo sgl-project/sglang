@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
 
+import nvtx
 import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
@@ -29,7 +30,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_cp_round_robin_split_q_seqs,
     pad_nsa_cache_seqlens,
 )
-import nvtx
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import enable_nsa_hybrid_indexer_pool
@@ -308,7 +308,9 @@ class NativeSparseAttnBackend(
 
         self.sparse_kvcache_manager = None
         if is_hierarchical_sparse_attention_enabled():
-            self.sparse_kvcache_manager = get_sparse_coordinator().sparse_kv_cache_manager
+            self.sparse_kvcache_manager = (
+                get_sparse_coordinator().sparse_kv_cache_manager
+            )
 
         self.use_mha: bool = False
         self.nsa_prefill_impl: _NSA_IMPL_T = (

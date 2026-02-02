@@ -100,7 +100,7 @@ def test_sparse_lru_end_to_end(
     warmup: int = 4,
     block_size: int = 512,
 ) -> None:
-    device = "cuda" 
+    device = "cuda"
     torch.manual_seed(0)
     diff_target = int(num_top_k * diff_ratio)
     assert diff_target > 0, "diff_ratio too small for current top_k"

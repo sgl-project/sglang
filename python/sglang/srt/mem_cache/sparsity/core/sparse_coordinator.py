@@ -4,8 +4,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
-import torch
 import nvtx
+import torch
+
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
