@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 class VAELoader(ComponentLoader):
     """Shared loader for (video/audio) VAE modules."""
 
-    component_names = ["vae", "audio_vae"]
+    component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
     def should_offload(
