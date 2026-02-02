@@ -272,6 +272,8 @@ class HFRunner:
                 trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
             ).cuda()
+            # Track PeftModel wrapper for LoRA adapter management across batches
+            self.peft_model = None
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
                 self.model = AutoModelForVision2Seq.from_pretrained(
@@ -315,11 +317,9 @@ class HFRunner:
             if prompts is not None:
                 if self.model_type == "generation":
                     out_queue.put(
-                        self.forward_generation_raw(
-                            base_model=self.base_model,
+                        self.forward_generation_with_lora(
                             prompts=prompts,
                             max_new_tokens=max_new_tokens,
-                            tokenizer=self.tokenizer,
                             lora_paths=lora_paths,
                             torch_dtype=torch_dtype,
                             output_str_only=self.output_str_only,
@@ -403,18 +403,17 @@ class HFRunner:
         self.model_proc.terminate()
         self.in_queue = self.out_queue = None
 
-    @staticmethod
-    def forward_generation_raw(
-        base_model,
+    def forward_generation_with_lora(
+        self,
         prompts: Union[List[str], List[torch.Tensor]],
         max_new_tokens: int,
-        tokenizer,
         torch_dtype: torch.dtype,
         lora_paths: Optional[List[str]] = None,
         output_str_only: bool = False,
         token_ids_logprob: Optional[int] = None,
         patch_model_do_sample_false: Optional[bool] = False,
     ) -> ModelOutput:
+        """Forward generation with proper LoRA adapter management across batches."""
         output_strs = []
         top_input_logprobs = []
         top_output_logprobs = []
@@ -426,21 +425,45 @@ class HFRunner:
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
+                input_ids = self.tokenizer.encode(p, return_tensors="pt").cuda()
             else:
                 input_ids = torch.tensor([p], device="cuda")
 
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftModel
 
-                model = PeftModel.from_pretrained(
-                    base_model,
-                    lora_paths[i],
-                    torch_dtype=torch_dtype,
-                    is_trainable=False,
-                )
+                # If we already have a PeftModel wrapper, load the new adapter into it
+                # Otherwise, create a new PeftModel wrapper
+                if self.peft_model is not None:
+                    # Check if this adapter is already loaded
+                    adapter_name = lora_paths[i].replace("/", "_")
+                    if adapter_name not in self.peft_model.peft_config:
+                        self.peft_model.load_adapter(
+                            lora_paths[i],
+                            adapter_name=adapter_name,
+                            is_trainable=False,
+                        )
+                    self.peft_model.set_adapter(adapter_name)
+                    model = self.peft_model
+                else:
+                    adapter_name = lora_paths[i].replace("/", "_")
+                    self.peft_model = PeftModel.from_pretrained(
+                        self.base_model,
+                        lora_paths[i],
+                        adapter_name=adapter_name,
+                        torch_dtype=torch_dtype,
+                        is_trainable=False,
+                    )
+                    model = self.peft_model
             else:
-                model = base_model
+                # For base model (no LoRA), disable all adapters if PeftModel exists.
+                # We must use peft_model with disabled adapters because base_model
+                # gets modified in-place when PeftModel is created.
+                if self.peft_model is not None:
+                    self.peft_model.disable_adapter_layers()
+                    model = self.peft_model
+                else:
+                    model = self.base_model
 
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
@@ -458,7 +481,7 @@ class HFRunner:
                 ),
             )
 
-            text = tokenizer.decode(
+            text = self.tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
 
@@ -498,9 +521,11 @@ class HFRunner:
                     )
                 del input_logits
 
-            if lora_paths is not None and lora_paths[i] is not None:
-                # Unload the LoRA adapter if it is used
-                model.unload()
+            # Re-enable adapter layers if they were disabled for base model inference
+            if self.peft_model is not None and (
+                lora_paths is None or lora_paths[i] is None
+            ):
+                self.peft_model.enable_adapter_layers()
 
         return ModelOutput(
             output_strs=output_strs,
