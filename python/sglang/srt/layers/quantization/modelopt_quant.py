@@ -1644,15 +1644,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
-            # Set up CUTLASS MoE parameters
+            # Set up CUTLASS MoE parameters (reuse to keep CUDA graph stable)
             device = layer.w13_weight.device
-            layer.cutlass_moe_params = CutlassMoEParams(
-                CutlassMoEType.BlockscaledFP4,
-                device,
-                num_experts=layer.num_experts,  # global num experts
-                intermediate_size_per_partition=layer.w2_weight.shape[2] * 2,  # n
-                hidden_size=layer.w13_weight.shape[2] * 2,
-            )  # k
+            inter_size = layer.w2_weight.shape[2] * 2
+            hidden_size = layer.w13_weight.shape[2] * 2
+            existing_params = getattr(layer, "cutlass_moe_params", None)
+            if (
+                existing_params is None
+                or existing_params.cutlass_moe_type != CutlassMoEType.BlockscaledFP4
+                or existing_params.num_experts != layer.num_experts
+                or existing_params.intermediate_size_per_partition != inter_size
+                or existing_params.hidden_size != hidden_size
+                or existing_params.device != device
+            ):
+                layer.cutlass_moe_params = CutlassMoEParams(
+                    CutlassMoEType.BlockscaledFP4,
+                    device,
+                    num_experts=layer.num_experts,  # global num experts
+                    intermediate_size_per_partition=inter_size,  # n
+                    hidden_size=hidden_size,
+                )  # k
 
     @property
     def load_up_proj_weight_first(self) -> bool:
