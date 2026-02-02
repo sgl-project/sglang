@@ -444,6 +444,7 @@ class Envs:
 
     # Encoder gRPC
     SGLANG_ENCODER_GRPC_TIMEOUT_SECS = EnvInt(60)
+    SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
