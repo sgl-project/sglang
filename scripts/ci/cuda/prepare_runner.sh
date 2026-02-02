@@ -11,9 +11,19 @@ echo ""
 python3 "${SCRIPT_DIR}/../utils/cleanup_hf_cache.py"
 echo ""
 
+# Pre-download critical models to avoid race conditions in multi-GPU tests
+# This downloads models before tests run, so TP workers don't race to download
+python3 "${SCRIPT_DIR}/../utils/predownload_critical_models.py"
+echo ""
+
 # Pre-validate cached models and write markers for offline mode
 # This allows tests to run with HF_HUB_OFFLINE=1 for models that are fully cached
 python3 "${SCRIPT_DIR}/../utils/prevalidate_cached_models.py"
+echo ""
+
+# Validate weight checksums for critical models to detect bit-flip corruption
+# This catches corruption that safetensors header validation might miss
+python3 "${SCRIPT_DIR}/../utils/validate_weight_checksums.py"
 echo ""
 
 echo "CI runner preparation complete!"
