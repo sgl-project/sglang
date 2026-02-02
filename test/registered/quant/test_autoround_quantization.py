@@ -63,8 +63,6 @@ class TestAutoRoundQuantization(CustomTestCase):
             print(f"[INFO] Server for {self.model} stopped.")
 
     def test_offline_quant(self):
-
-        # Configure model with inc quantization and saving
         model_config = ModelConfig(
             model_path=self.model,
             quantization="auto-round-int8",
@@ -75,7 +73,6 @@ class TestAutoRoundQuantization(CustomTestCase):
             inc_save_path=self.output_dir,
         )
         device_config = DeviceConfig(device="cuda")
-        # Load and quantize the model
         model_loader = get_model_loader(load_config, model_config)
         quantized_model = model_loader.load_model(
             model_config=model_config,
