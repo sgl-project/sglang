@@ -1573,20 +1573,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
 
-            # Clean up weights that won't be used by TRT-LLM
-            del (
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                layer.w13_weight,
-                layer.w13_weight_scale,
-            )
+            # Keep original weights/scales to support update_weights_from_disk.
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            del layer.w13_weight_scale
             layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
 
             w13_weight = layer.w13_weight
@@ -1625,7 +1618,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
-            del layer.w2_weight_scale
             layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
