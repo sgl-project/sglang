@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from queue import Empty
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
@@ -88,6 +88,7 @@ class HiRadixCache(RadixCache):
         self.pp_size = params.pp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+        self.extra_metric_labels = server_args.extra_metric_labels
 
         (
             extra_config,
@@ -126,6 +127,7 @@ class HiRadixCache(RadixCache):
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
             enable_storage=self.enable_storage,
             enable_storage_metrics=self.enable_storage_metrics,
+            extra_metric_labels=self.extra_metric_labels,
         )
 
         # record the nodes with ongoing write through
@@ -168,6 +170,7 @@ class HiRadixCache(RadixCache):
         hicache_storage_pass_prefix_keys: bool,
         enable_storage: bool,
         enable_storage_metrics: bool,
+        extra_metric_labels: Optional[Dict[str, str]],
     ) -> None:
         prefetch_timeout_per_page = (
             self.page_size / 1024 * prefetch_timeout_per_ki_token
@@ -182,6 +185,9 @@ class HiRadixCache(RadixCache):
                 "pp_rank": self.cache_controller.pp_rank,
                 "pp_size": self.cache_controller.pp_size,
             }
+            if extra_metric_labels:
+                labels.update(extra_metric_labels)
+            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
             storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
         self.enable_storage = enable_storage
@@ -310,6 +316,7 @@ class HiRadixCache(RadixCache):
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
             enable_storage=True,
             enable_storage_metrics=self._enable_metrics_flag,
+            extra_metric_labels=self.extra_metric_labels,
         )
         return True, "Attached HiCache storage backend successfully."
 

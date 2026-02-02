@@ -62,6 +62,7 @@ class FunctionCallParser:
         "qwen25": Qwen25Detector,
         "qwen3_coder": Qwen3CoderDetector,
         "step3": Step3Detector,
+        "step3p5": Qwen3CoderDetector,
         "minimax-m2": MinimaxM2Detector,
         "trinity": TrinityDetector,
         "interns1": InternlmDetector,
