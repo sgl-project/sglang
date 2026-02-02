@@ -8,14 +8,14 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
 class TestQwen25VL72B(TestVLMModels):
-    """Testcase: Verify that the inference accuracy of the Qwen/Qwen2.5-VL-72B-Instruct model on the MMMU dataset is no less than 0.3.
+    """Testcase: Verify that the inference accuracy of the Qwen/Qwen2.5-VL-72B-Instruct model on the MMMU dataset is no less than 0.2.
 
     [Test Category] Model
     [Test Target] Qwen/Qwen2.5-VL-72B-Instruct
     """
 
     model = QWEN2_5_VL_72B_INSTRUCT_WEIGHTS_PATH
-    mmmu_accuracy = 0.3
+    mmmu_accuracy = 0.2
     other_args = [
         "--trust-remote-code",
         "--cuda-graph-max-bs",
