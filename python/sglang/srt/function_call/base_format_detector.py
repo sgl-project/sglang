@@ -171,9 +171,17 @@ class BaseFormatDetector(ABC):
                 # parallel tool calls because the bot_token (e.g., '[') can also
                 # appear inside array parameters of the current tool, and we must not
                 # mistakenly identify that as the start of a new tool.
-                if self.current_tool_id > 0 and current_text.startswith(
-                    self.tool_call_separator
-                ):
+                # We also skip the separator match when it is actually the start of
+                # an eot_token (e.g. separator="\n" and eot_token="\n</tool_call>").
+                eot_suffix = self.eot_token[len(self.tool_call_separator) :]
+                is_separator = (
+                    self.current_tool_id > 0
+                    and current_text.startswith(self.tool_call_separator)
+                    and not current_text[len(self.tool_call_separator) :].startswith(
+                        eot_suffix
+                    )
+                )
+                if is_separator:
                     start_idx = len(self.tool_call_separator)
                 else:
                     # Only search for bot_token if not processing subsequent tool
@@ -186,7 +194,7 @@ class BaseFormatDetector(ABC):
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
 
-                (obj, end_idx) = _partial_json_loads(current_text[start_idx:], flags)
+                obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
 
                 is_current_complete = _is_complete_json(
                     current_text[start_idx : start_idx + end_idx]
