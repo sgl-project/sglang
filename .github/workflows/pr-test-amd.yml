@@ -99,6 +99,19 @@ jobs:
             sgl_kernel:
               - "sgl-kernel/**"
               - ".github/workflows/pr-test-amd.yml"
+              # Exclude non-ROCm platform configs and code
+              - "!sgl-kernel/pyproject_cpu.toml"
+              - "!sgl-kernel/pyproject.toml"
+              - "!sgl-kernel/pyproject_musa.toml"
+              - "!sgl-kernel/setup_musa.py"
+              - "!sgl-kernel/csrc/cpu/**"
+              # Exclude documentation and non-functional files
+              - "!sgl-kernel/README.md"
+              - "!sgl-kernel/LICENSE"
+              - "!sgl-kernel/THIRDPARTYNOTICES.txt"
+              - "!sgl-kernel/.clang-format"
+              - "!sgl-kernel/analyze_whl_kernel_sizes.py"
+              - "!sgl-kernel/rename_wheels.sh"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
