@@ -667,7 +667,6 @@ class AiterAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        is_lora: bool = False,
     ):
 
         num_kv_splits = None
@@ -922,7 +921,6 @@ class AiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        is_lora: bool = False,
     ):
 
         if forward_mode.is_decode_or_idle():

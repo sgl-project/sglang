@@ -771,7 +771,6 @@ class NativeSparseAttnBackend(
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        is_lora: bool = False,
     ):
         self.set_nsa_prefill_impl(forward_batch=None)
 
@@ -928,7 +927,6 @@ class NativeSparseAttnBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        is_lora: bool = False,
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""

@@ -73,7 +73,6 @@ class HybridAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        is_lora: bool = False,
     ):
         backend = self._select_backend(forward_mode)
         backend.init_forward_metadata_capture_cuda_graph(
@@ -84,7 +83,6 @@ class HybridAttnBackend(AttentionBackend):
             encoder_lens,
             forward_mode,
             spec_info,
-            is_lora=is_lora,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -97,7 +95,6 @@ class HybridAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        is_lora: bool = False,
     ):
         backend = self._select_backend(forward_mode)
         backend.init_forward_metadata_replay_cuda_graph(
@@ -109,7 +106,6 @@ class HybridAttnBackend(AttentionBackend):
             forward_mode,
             spec_info,
             seq_lens_cpu,
-            is_lora=is_lora,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):

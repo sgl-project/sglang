@@ -412,7 +412,6 @@ class MambaAttnBackendBase(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        is_lora: bool = False,
     ):
         self.forward_metadata = self._capture_metadata(
             bs, req_pool_indices, forward_mode, spec_info
@@ -428,7 +427,6 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
-        is_lora: bool = False,
     ):
         self.forward_metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
@@ -1064,7 +1062,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        is_lora: bool = False,
     ):
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
@@ -1085,7 +1082,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
-        is_lora: bool = False,
     ):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
@@ -1160,7 +1156,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        is_lora: bool = False,
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -1171,7 +1166,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 encoder_lens,
                 forward_mode,
                 spec_info,
-                is_lora=is_lora,
             )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -1184,7 +1178,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        is_lora: bool = False,
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -1196,7 +1189,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
                 seq_lens_cpu,
-                is_lora=is_lora,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
