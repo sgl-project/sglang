@@ -29,8 +29,8 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-    from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
     from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
+    from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
 logger = logging.getLogger(__name__)
 
 
