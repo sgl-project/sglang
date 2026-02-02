@@ -48,10 +48,8 @@ class LatentPreparationStage(PipelineStage):
             The batch with prepared latent variables.
         """
 
-        latent_num_frames = None
         # Adjust video length based on VAE version if needed
-        if hasattr(self, "adjust_video_length"):
-            latent_num_frames = self.adjust_video_length(batch, server_args)
+        latent_num_frames = self.adjust_video_length(batch, server_args)
 
         batch_size = batch.batch_size
 
