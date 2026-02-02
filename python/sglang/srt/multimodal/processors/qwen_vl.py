@@ -363,14 +363,18 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         audio_seq_lens = None
         if audio_feature_lens is not None:
-            # apply _get_feat_extract_lengths to get seq_lens
-            input_lengths_leave = audio_feature_lens % 100
-            feat_lengths = (input_lengths_leave - 1) // 2 + 1
-            audio_seq_lens = (
-                ((feat_lengths - 1) // 2 + 1 - 1) // 2
-                + 1
-                + (audio_feature_lens // 100) * 13
-            )
+            if self.model_type == "qwen3_omni_moe":
+                # apply _get_feat_extract_lengths to get seq_lens
+                input_lengths_leave = audio_feature_lens % 100
+                feat_lengths = (input_lengths_leave - 1) // 2 + 1
+                audio_seq_lens = (
+                    ((feat_lengths - 1) // 2 + 1 - 1) // 2
+                    + 1
+                    + (audio_feature_lens // 100) * 13
+                )
+            elif self.model_type == "qwen2_5_omni":
+                audio_seq_lens = (audio_feature_lens - 1) // 2 + 1
+                audio_seq_lens = (audio_seq_lens - 2) // 2 + 1
 
         if (
             self.model_type in ["qwen3_vl", "qwen3_vl_moe"]

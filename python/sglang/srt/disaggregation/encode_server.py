@@ -118,7 +118,7 @@ def _convert(data):
 _vision_grid_attrs = {
     Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
     Modality.VIDEO: ["video_grid_thw"],
-    Modality.AUDIO: ["audio_feature_lens"],
+    Modality.AUDIO: ["audio_feature_lens_raw"],
 }
 
 
@@ -369,6 +369,30 @@ class MMEncoder:
                 task_info.append((modality, data))
         return futures, task_info
 
+    def _get_feat_extract_output_lengths(self, feature_lens):
+        """
+        Computes the output length of the convolutional layers and the output length of the audio encoder
+        """
+        # qwen2_audio/qwen2.5_omni
+        if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
+            input_length = (feature_lens - 1) // 2 + 1
+            return (input_length - 2) // 2 + 1
+        # qwen3_omni_moe
+        elif self.model_type == "qwen3_omni_moe":
+            input_lengths_leave = feature_lens % 100
+            feat_lengths = (input_lengths_leave - 1) // 2 + 1
+            output_lengths = (
+                ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
+            )
+            return output_lengths
+        else:
+            # fallback to original HF audio sample logic for other models
+            logger.warning(
+                f"Fallback to original HF audio sample logic for {self.model_type}"
+            )
+            input_length = (feature_lens - 1) // 2 + 1
+            return (input_length - 2) // 2 + 1
+
     async def _convert_frames(self, vr):
         # TODO: support sample_frames to reduce memory usage
         total_frames, video_fps = len(vr), vr.get_avg_fps()
@@ -570,10 +594,12 @@ class MMEncoder:
                 "attention_mask"
             )
             # convert to same format as image/video
-            audio_feature_lens = torch.tensor(
+            input_lengths = torch.tensor(
                 processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
             )
-            processor_input["audio_feature_lens"] = audio_feature_lens
+            processor_input["audio_feature_lens_raw"] = input_lengths
+            output_lengths = self._get_feat_extract_output_lengths(input_lengths)
+            processor_input["audio_feature_lens"] = output_lengths
             feature = processor_input["input_features"]
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_audio_feature
@@ -591,7 +617,7 @@ class MMEncoder:
             }
         )
         for k, v in processor_input.items():
-            if k in ["pixel_values", "pixel_values_videos"]:
+            if k in ["pixel_values", "pixel_values_videos", "input_features"]:
                 continue
             mm_item.set(k, _convert(v))
         return processor_input, mm_item, get_feature_method
