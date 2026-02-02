@@ -42,8 +42,11 @@ def initialize_mamba_selective_state_update_backend(server_args: ServerArgs) -> 
     if requested == "flashinfer":
         try:
             from flashinfer.mamba import selective_state_update  # noqa: F401
+
             _mamba_selective_state_fn = selective_state_update
-            _mamba_selective_state_update_backend = MambaSelectiveStateUpdateBackend.FLASHINFER
+            _mamba_selective_state_update_backend = (
+                MambaSelectiveStateUpdateBackend.FLASHINFER
+            )
             logger.info("Mamba selective_state_update backend initialized: flashinfer")
         except ImportError:
             raise ValueError(
@@ -52,7 +55,10 @@ def initialize_mamba_selective_state_update_backend(server_args: ServerArgs) -> 
                 "--mamba-backend triton"
             )
     else:
-        from sglang.srt.layers.attention.mamba.ops.mamba_ssm import selective_state_update
+        from sglang.srt.layers.attention.mamba.ops.mamba_ssm import (
+            selective_state_update,
+        )
+
         _mamba_selective_state_fn = selective_state_update
         _mamba_selective_state_update_backend = MambaSelectiveStateUpdateBackend.TRITON
         logger.info("Mamba selective_state_update backend initialized: triton")
@@ -75,7 +81,7 @@ def selective_state_update(
     intermediate_states_buffer=None,
     cache_steps=None,
     retrieve_parent_token=None,
-    intermediate_state_indices= None,
+    intermediate_state_indices=None,
 ) -> None:
     """Dispatch selective-state-update to the configured backend.
 
@@ -107,15 +113,25 @@ def selective_state_update(
             If provided, uses these indices instead of state_batch_indices for the buffer.
 
     """
-    assert _mamba_selective_state_fn is not None, (
-        "Mamba selective_state_update function not initialized. Call initialize_mamba_selective_state_update_backend() first."
-    )
-    
-    if _mamba_selective_state_update_backend == MambaSelectiveStateUpdateBackend.FLASHINFER:
-        assert _is_specdec_call(disable_state_update, intermediate_states_buffer, cache_steps, retrieve_parent_token, intermediate_state_indices) is False, (
-            "Speculative decoding is not supported by FlashInfer selective_state_update. Use the mamba triton backend instead."
-        )
-        
+    assert (
+        _mamba_selective_state_fn is not None
+    ), "Mamba selective_state_update function not initialized. Call initialize_mamba_selective_state_update_backend() first."
+
+    if (
+        _mamba_selective_state_update_backend
+        == MambaSelectiveStateUpdateBackend.FLASHINFER
+    ):
+        assert (
+            _is_specdec_call(
+                disable_state_update,
+                intermediate_states_buffer,
+                cache_steps,
+                retrieve_parent_token,
+                intermediate_state_indices,
+            )
+            is False
+        ), "Speculative decoding is not supported by FlashInfer selective_state_update. Use the mamba triton backend instead."
+
         _mamba_selective_state_fn(
             state=state,
             x=x,
@@ -151,13 +167,18 @@ def selective_state_update(
             intermediate_state_indices=intermediate_state_indices,
         )
 
-def _is_specdec_call(disable_state_update=False,
-                     intermediate_states_buffer=None,
-                     cache_steps=None,
-                     retrieve_parent_token=None,
-                     intermediate_state_indices=None) -> bool:
-    return (disable_state_update) \
-        or (intermediate_states_buffer is not None) \
-        or (cache_steps is not None) \
-        or (retrieve_parent_token is not None) \
+
+def _is_specdec_call(
+    disable_state_update=False,
+    intermediate_states_buffer=None,
+    cache_steps=None,
+    retrieve_parent_token=None,
+    intermediate_state_indices=None,
+) -> bool:
+    return (
+        (disable_state_update)
+        or (intermediate_states_buffer is not None)
+        or (cache_steps is not None)
+        or (retrieve_parent_token is not None)
         or (intermediate_state_indices is not None)
+    )
