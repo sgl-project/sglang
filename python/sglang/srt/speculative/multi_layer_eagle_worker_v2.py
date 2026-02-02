@@ -466,8 +466,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                draft_logits_output, _ = self.draft_runner_list[step].forward(
-                    forward_batch, skip_attn_backend_init=True
+                draft_logits_output = (
+                    self.draft_runner_list[step]
+                    .forward(forward_batch, skip_attn_backend_init=True)
+                    .logits_output
                 )
                 probs = torch.softmax(
                     draft_logits_output.next_token_logits[select_index], dim=-1
