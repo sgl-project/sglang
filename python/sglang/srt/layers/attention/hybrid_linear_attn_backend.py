@@ -942,6 +942,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Cache for FlashInfer prefill output tensors to avoid cudaMalloc/cudaFree overhead
         # Key: (total_seq_len, num_o_heads, head_size)
         self._flashinfer_output_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
+        # Cache for FlashInfer prefill state tensors (initial_state in float32)
+        # Key: (batch_size, num_value_heads, head_v_dim, head_k_dim)
+        self._flashinfer_state_cache: Dict[Tuple[int, int, int, int], torch.Tensor] = {}
         if self.ssm_k_last:
             flashinfer_available, flashinfer_chunk_gdr = _get_flashinfer_gdn_prefill()
             cutedsl_available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
@@ -1325,9 +1328,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 
                 # Format conversion: SGLang -> FlashInfer
                 # q/k/v: [1, total_seq_len, H, K] -> [total_seq_len, H, K]
-                q_fi = query[0].contiguous()  # [total_seq_len, num_heads, head_k_dim]
-                k_fi = key[0].contiguous()  # [total_seq_len, num_heads, head_k_dim]
-                v_fi = value[0].contiguous()  # [total_seq_len, num_value_heads, head_v_dim]
+                # OPTIMIZATION: Use view instead of [0] indexing to avoid potential copy,
+                # then only call contiguous() if actually needed
+                q_squeezed = query.squeeze(0)
+                k_squeezed = key.squeeze(0)
+                v_squeezed = value.squeeze(0)
+                
+                # Only call contiguous if not already contiguous (avoids direct_copy_kernel)
+                q_fi = q_squeezed if q_squeezed.is_contiguous() else q_squeezed.contiguous()
+                k_fi = k_squeezed if k_squeezed.is_contiguous() else k_squeezed.contiguous()
+                v_fi = v_squeezed if v_squeezed.is_contiguous() else v_squeezed.contiguous()
 
                 # FlashInfer's `gdn_prefill.chunk_gated_delta_rule` does not currently
                 # honor the `use_qk_l2norm_in_kernel` flag in its Python wrapper.
@@ -1341,29 +1351,53 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # g (alpha): g_log is in log space, convert to alpha = exp(g_log)
                 # g_log: [1, total_seq_len, num_value_heads] -> alpha: [total_seq_len, num_sab_heads]
                 # FlashInfer expects [total_seq_len, num_sab_heads] where num_sab_heads = max(num_q_heads, num_v_heads)
-                # At this point, num_sab_heads == num_value_heads (checked above), so format matches
-                alpha_fi = torch.exp(g[0]).contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
-                beta_fi = beta[0].contiguous()  # [total_seq_len, num_value_heads] == [total_seq_len, num_sab_heads]
+                # OPTIMIZATION: Avoid intermediate tensor creation where possible
+                g_squeezed = g.squeeze(0)
+                beta_squeezed = beta.squeeze(0)
+                alpha_fi = torch.exp(g_squeezed)
+                # Only call contiguous if needed
+                if not alpha_fi.is_contiguous():
+                    alpha_fi = alpha_fi.contiguous()
+                beta_fi = beta_squeezed if beta_squeezed.is_contiguous() else beta_squeezed.contiguous()
                 
                 # cu_seqlens: query_start_loc [batch+1] int32 -> int64
                 cu_seqlens_fi = query_start_loc.to(torch.int64)
 
                 # Prepare initial_state/output_state (FlashInfer requires float32 state).
                 # In K-last mode, ssm_states is already laid out as [V, K] for FlashInfer.
-                # Always use gather/scatter to avoid GPU-CPU sync from torch.equal() check.
-                initial_state_fi = ssm_states[cache_indices].to(torch.float32)
+                # OPTIMIZATION: Use cached tensor for state to avoid cudaMalloc/cudaFree
+                batch_size = cache_indices.shape[0]
+                state_cache_key = (batch_size, num_value_heads, head_v_dim, head_k_dim)
+                if state_cache_key not in self._flashinfer_state_cache:
+                    self._flashinfer_state_cache[state_cache_key] = torch.empty(
+                        (batch_size, num_value_heads, head_v_dim, head_k_dim),
+                        dtype=torch.float32,
+                        device=ssm_states.device,
+                    )
+                initial_state_fi = self._flashinfer_state_cache[state_cache_key]
+                # Copy indexed data into cached buffer
+                # Note: ssm_states[cache_indices] creates a temporary tensor, but we reuse the
+                # destination buffer to avoid allocation on the output side.
+                # The .to(torch.float32) conversion happens during copy.
+                if ssm_states.dtype == torch.float32:
+                    # No dtype conversion needed - use index_select with out parameter
+                    torch.index_select(ssm_states, 0, cache_indices, out=initial_state_fi)
+                else:
+                    # Need dtype conversion - copy with conversion
+                    # This still creates a temporary from fancy indexing, but destination is cached
+                    initial_state_fi.copy_(ssm_states[cache_indices])
                 output_state_fi = initial_state_fi  # in-place update is supported
                 
                 # Pre-allocate output tensor using cache to avoid cudaMalloc/cudaFree overhead
                 # Cache key: (total_seq_len, num_o_heads, head_size)
-                cache_key = (total_seq_len, num_value_heads, head_v_dim)
-                if cache_key not in self._flashinfer_output_cache:
-                    self._flashinfer_output_cache[cache_key] = torch.empty(
+                output_cache_key = (total_seq_len, num_value_heads, head_v_dim)
+                if output_cache_key not in self._flashinfer_output_cache:
+                    self._flashinfer_output_cache[output_cache_key] = torch.empty(
                         (total_seq_len, num_value_heads, head_v_dim),
                         dtype=q_fi.dtype,
                         device=q_fi.device,
                     )
-                output_fi_buffer = self._flashinfer_output_cache[cache_key]
+                output_fi_buffer = self._flashinfer_output_cache[output_cache_key]
                 
                 # Call FlashInfer prefill kernel
                 output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
@@ -1388,9 +1422,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 # Write back state to pool (K-last layout)
-                ssm_states[cache_indices] = output_state_fi_result.to(
-                    ssm_states.dtype, copy=False
-                )
+                # OPTIMIZATION: Use scatter or index_copy_ to avoid creating intermediate tensor
+                # The output_state_fi_result is already in the correct shape [batch_size, HV, V, K]
+                # We need to write it back to ssm_states at cache_indices positions
+                # Note: index_copy_ requires long tensor for index
+                cache_indices_long = cache_indices.to(torch.int64)
+                if output_state_fi_result.dtype == ssm_states.dtype:
+                    # No dtype conversion needed - direct scatter
+                    ssm_states.index_copy_(0, cache_indices_long, output_state_fi_result)
+                else:
+                    # Need dtype conversion - use pre-allocated buffer if possible
+                    # Since output_state_fi_result is the same buffer as initial_state_fi,
+                    # we can convert in-place or use a cached conversion buffer
+                    ssm_states.index_copy_(0, cache_indices_long, output_state_fi_result.to(ssm_states.dtype))
 
                 # Return early: FlashInfer prefill path is complete
                 return core_attn_out
