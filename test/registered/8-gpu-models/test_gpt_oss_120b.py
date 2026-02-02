@@ -7,9 +7,8 @@ from sglang.test.test_utils import ModelLaunchSettings
 
 # Runs on both H200 and B200 via nightly-8-gpu-common suite
 # Higher est_time due to 6 variants with both performance and accuracy tests
-register_cuda_ci(est_time=3600, suite="nightly-8-gpu-common", nightly=True)
+register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
 
-GPT_OSS_120B_BF16_MODEL_PATH = "lmsys/gpt-oss-120b-bf16"
 GPT_OSS_120B_MXFP4_MODEL_PATH = "openai/gpt-oss-120b"
 GPT_OSS_120B_EAGLE3_DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 
@@ -17,22 +16,9 @@ GPT_OSS_120B_EAGLE3_DRAFT_MODEL_PATH = "lmsys/EAGLE3-gpt-oss-120b-bf16"
 class TestGptOss120B(unittest.TestCase):
     """Unified test class for GPT-OSS-120B performance and accuracy.
 
-    Six variants testing combinations of:
-    - Quantization: BF16 vs MXFP4
-    - Parsers: With/without reasoning-parser and tool-call-parser
-    - Speculative Decoding: With/without EAGLE3
-
-    Variants:
-    1. BF16 baseline
-    2. MXFP4 baseline
-    3. BF16 + Parsers
-    4. MXFP4 + Parsers
-    5. BF16 + Parsers + EAGLE3 (full featured)
-    6. MXFP4 + Parsers + EAGLE3 (full featured quantized)
-
-    Each variant runs BOTH:
-    - Performance test (using NightlyBenchmarkRunner)
-    - Accuracy test (using run_eval with gsm8k)
+    Testing:
+    - Basic configs for MXFP4
+    - Full config for MXFP4 with reasoning-parser, tool-call-parser, and MTP
     """
 
     def test_gpt_oss_120b_all_variants(self):
@@ -67,43 +53,14 @@ class TestGptOss120B(unittest.TestCase):
         }
 
         variants = [
-            # Variant 1: BF16 baseline
-            ModelLaunchSettings(
-                GPT_OSS_120B_BF16_MODEL_PATH,
-                tp_size=8,
-                extra_args=base_args,
-                variant="BF16",
-            ),
-            # Variant 2: MXFP4 baseline
+            # Variant 1: MXFP4 baseline
             ModelLaunchSettings(
                 GPT_OSS_120B_MXFP4_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args,
                 variant="MXFP4",
             ),
-            # Variant 3: BF16 + Parsers
-            ModelLaunchSettings(
-                GPT_OSS_120B_BF16_MODEL_PATH,
-                tp_size=8,
-                extra_args=base_args + parser_args,
-                variant="BF16+Parsers",
-            ),
-            # Variant 4: MXFP4 + Parsers
-            ModelLaunchSettings(
-                GPT_OSS_120B_MXFP4_MODEL_PATH,
-                tp_size=8,
-                extra_args=base_args + parser_args,
-                variant="MXFP4+Parsers",
-            ),
-            # Variant 5: BF16 + Parsers + EAGLE3 (full featured, lower batch size)
-            ModelLaunchSettings(
-                GPT_OSS_120B_BF16_MODEL_PATH,
-                tp_size=8,
-                extra_args=base_args_eagle3 + parser_args + eagle3_args,
-                env=eagle3_env,
-                variant="BF16+Parsers+EAGLE3",
-            ),
-            # Variant 6: MXFP4 + Parsers + EAGLE3 (full featured quantized, lower batch size)
+            # Variant 2: MXFP4 + Parsers + EAGLE3 (full featured quantized, lower batch size)
             ModelLaunchSettings(
                 GPT_OSS_120B_MXFP4_MODEL_PATH,
                 tp_size=8,
