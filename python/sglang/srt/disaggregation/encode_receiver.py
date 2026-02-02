@@ -1039,8 +1039,10 @@ def create_mm_receiver(
     tp_rank: Optional[int] = None,
     tp_group: Optional[GroupCoordinator] = None,
     scheduler: Optional["Scheduler"] = None,
-    transport_mode: str = "http",
+    transport_mode: Optional[str] = None,
 ):
+    if transport_mode is None:
+        transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
     if transport_mode == "grpc":
         return MMReceiverGrpc(
             server_args,
