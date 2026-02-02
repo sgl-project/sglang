@@ -594,19 +594,16 @@ std::tuple<at::Tensor, at::Tensor> autoawq_to_int4pack(
     at::Tensor qweight,  // (*, K, N / 8), int32
     at::Tensor qzeros)   // (*, K / group_size, N / 8), int32
 {
+  qweight = qweight.contiguous();
+  qzeros = qzeros.contiguous();
   // bitshifts: [0, 4, 1, 5, 2, 6, 3, 7] * 4
   auto bitshifts = at::tensor({0, 4, 1, 5, 2, 6, 3, 7}, at::kInt) * 4;
-  // qweight: assumed shape [..., K, N/8] (int32)
   auto qweight_unsq = qweight.unsqueeze(-1);  // [..., K, N/8, 1]
-  auto shape = qweight_unsq.sizes().vec();    // shape: [A, B, C, 1]
-  shape[3] = 8;
-  auto unpacked = at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF;
-  auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte);
-
+  auto unpacked = (at::bitwise_right_shift(qweight_unsq, bitshifts) & 0xF).contiguous();
+  auto qweight_final = unpacked.flatten(-2).transpose(-1, -2).to(at::kByte).clone();
   auto qzeros_unsq = qzeros.unsqueeze(-1);
-  auto qzeros_unpacked = at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF;
-  auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte);
-
+  auto qzeros_unpacked = (at::bitwise_right_shift(qzeros_unsq, bitshifts) & 0xF).contiguous();
+  auto qzeros_final = qzeros_unpacked.flatten(-2).to(at::kByte).clone();
   return std::make_tuple(qweight_final, qzeros_final);
 }
 
