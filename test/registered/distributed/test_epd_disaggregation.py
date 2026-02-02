@@ -74,6 +74,7 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        os.environ["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.encode_port = f"{int(cls.lb_port) + 300}"
         cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
@@ -610,6 +611,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
+        os.environ.pop("SGLANG_ENCODER_MM_RECEIVER_MODE", None)
         os.environ.pop("OPENAI_API_KEY", None)
         os.environ.pop("OPENAI_API_BASE", None)
         for process in [
@@ -689,6 +691,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        os.environ["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.encode_port = f"{int(cls.lb_port) + 302}"
 
@@ -752,6 +755,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
 
     @classmethod
     def tearDownClass(cls):
+        os.environ.pop("SGLANG_ENCODER_MM_RECEIVER_MODE", None)
         if cls.process_encode:
             try:
                 kill_process_tree(cls.process_encode.pid)
