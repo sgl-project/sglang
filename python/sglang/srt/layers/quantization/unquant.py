@@ -482,10 +482,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
-
-        assert (
-            moe_runner_config.activation == "silu"
-        ), f"activation = {moe_runner_config.activation} is not supported."
+        assert moe_runner_config.activation in [
+            "silu",
+            "gelu",
+        ], f"activation = {moe_runner_config.activation} is not supported."
 
         backend = self.runner.runner_backend
         if use_intel_xpu_backend():
@@ -501,10 +501,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 topk_ids,
                 b1=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
+                activation=moe_runner_config.activation,
             )
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
+            assert (
+                moe_runner_config.activation == "silu"
+            ), f"activation = {moe_runner_config.activation} is not supported \
+            for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
