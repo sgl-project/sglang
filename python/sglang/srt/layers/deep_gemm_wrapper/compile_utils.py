@@ -72,7 +72,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
             next_m = next_m * 2
             sample_step = sample_step * 2
         _BUILTIN_M_LIST.append(max_prefill_bs)
-        _BUILTIN_M_LIST = list(set(_BUILTIN_M_LIST))
+        _BUILTIN_M_LIST = sorted(list(set(_BUILTIN_M_LIST)))
     else:
         # When fast warmup isn't enabled, generate m_max and compile all the covered Ms.
         m_max = 1024 * 16
