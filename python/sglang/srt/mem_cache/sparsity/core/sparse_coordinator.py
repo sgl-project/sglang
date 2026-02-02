@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
-
+import nvtx
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
@@ -101,6 +101,7 @@ class RequestTrackers:
             .contiguous()
         )
 
+    @nvtx.annotate(message="RequestTrackers._reset_state", color="red")
     def _reset_state(self, idx: int) -> None:
         """Reset all tensor states for a request slot."""
         self.req_to_tokens_host[idx].fill_(-1)
@@ -122,6 +123,7 @@ class RequestTrackers:
         self._reset_state(idx)
         return host_indices
 
+    @nvtx.annotate(message="RequestTrackers.init_topk_indices", color="green")
     def init_topk_indices(self, req_pool_idx: int, req_to_token_pool) -> None:
         # Store device indices
         if self.page_size > 1:
@@ -306,6 +308,7 @@ class SparseCoordinator:
                 len(host_indices) == req_seqlen
             ), f"Host indices mismatch: {len(host_indices)} != {req_seqlen}"
 
+    @nvtx.annotate(message="SparseCoordinator.forward_begin", color="yellow")
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """
         Handle forward pass begin event. Called before each forward pass starts.
@@ -316,6 +319,7 @@ class SparseCoordinator:
         if self._should_check_offload(forward_batch):
             self.sparse_kv_cache_manager.poll_decode_offload_completion()
 
+    @nvtx.annotate(message="SparseCoordinator.forward_end", color="yellow")
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """
         Handle forward pass end event. Called after each forward pass completes.
@@ -346,6 +350,7 @@ class SparseCoordinator:
         """Check if attention hooks should be enabled for sparse attention."""
         return not isinstance(self.algorithm, DeepSeekNSAAlgorithm)
 
+    @nvtx.annotate(message="SparseCoordinator.attention_begin", color="blue")
     def attention_begin(
         self,
         query: torch.Tensor,
@@ -606,6 +611,12 @@ class SparseCoordinator:
                 ),
                 out_cache_loc[non_truncated_indices],
             )
+
+        # Allocate index_k tokens if using NSA hybrid pool
+        from sglang.srt.disaggregation.decode import NSADecodeReqToTokenPool
+
+        if isinstance(batch.req_to_token_pool, NSADecodeReqToTokenPool):
+            self._alloc_for_nsa_index_k(batch, token_per_req, seq_lens_next, locs)
 
         return out_cache_loc
 
