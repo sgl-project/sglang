@@ -217,6 +217,7 @@ MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 
+
 # Allow external code to add more choices
 def add_load_format_choices(choices):
     LOAD_FORMAT_CHOICES.extend(choices)
@@ -2036,9 +2037,13 @@ class ServerArgs:
 
                     logger.info("Successfully imported FlashInfer mamba module")
                 except (ImportError, AttributeError):
-                    raise ValueError("FlashInfer mamba module not available, please check flashinfer installation.")
+                    raise ValueError(
+                        "FlashInfer mamba module not available, please check flashinfer installation."
+                    )
             else:
-                raise ValueError("FlashInfer mamba module not available, please check flashinfer installation.")
+                raise ValueError(
+                    "FlashInfer mamba module not available, please check flashinfer installation."
+                )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -2433,7 +2438,10 @@ class ServerArgs:
 
         # Reset mamba_backend to triton when speculative decoding is enabled
         # FlashInfer mamba kernels don't support speculative decoding parameters
-        if self.speculative_algorithm is not None and self.mamba_backend == "flashinfer":
+        if (
+            self.speculative_algorithm is not None
+            and self.mamba_backend == "flashinfer"
+        ):
             self.mamba_backend = "triton"
             logger.info(
                 "Mamba backend reset to 'triton' because speculative decoding is enabled. "
