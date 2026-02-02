@@ -10,8 +10,6 @@ from openai import OpenAI
 
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
-    WarmupRunner,
-    download_image_from_url,
     get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
@@ -20,7 +18,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
-    is_image_url,
     wait_for_req_perf_record,
 )
 
@@ -53,20 +50,23 @@ def _openai_client(port: int) -> OpenAI:
 
 
 def _build_server_extra_args(case: DiffusionTestCase) -> str:
+    server_args = case.server_args
     a = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    a += f" --num-gpus {case.server_args.num_gpus}"
-    if case.server_args.tp_size is not None:
-        a += f" --tp-size {case.server_args.tp_size}"
-    if case.server_args.ulysses_degree is not None:
-        a += f" --ulysses-degree {case.server_args.ulysses_degree}"
-    if case.server_args.dit_layerwise_offload:
+    a += f" --num-gpus {server_args.num_gpus}"
+    if server_args.tp_size is not None:
+        a += f" --tp-size {server_args.tp_size}"
+    if server_args.ulysses_degree is not None:
+        a += f" --ulysses-degree {server_args.ulysses_degree}"
+    if server_args.dit_layerwise_offload:
         a += " --dit-layerwise-offload true"
-    if case.server_args.ring_degree is not None:
-        a += f" --ring-degree {case.server_args.ring_degree}"
-    if case.server_args.lora_path:
-        a += f" --lora-path {case.server_args.lora_path}"
-    if case.server_args.enable_warmup:
-        a += " --enable-warmup"
+    if server_args.dit_offload_prefetch_size:
+        a += f" --dit-offload-prefetch-size {server_args.dit_offload_prefetch_size}"
+    if server_args.ring_degree is not None:
+        a += f" --ring-degree {server_args.ring_degree}"
+    if server_args.lora_path:
+        a += f" --lora-path {server_args.lora_path}"
+    if server_args.warmup:
+        a += " --warmup"
     return a
 
 
@@ -107,35 +107,6 @@ def _run_case(case: DiffusionTestCase) -> dict:
     try:
         sp = case.sampling_params
         output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sp.output_size)
-        w = WarmupRunner(
-            port=ctx.port,
-            model=case.server_args.model_path,
-            prompt=sp.prompt or "A colorful raccoon icon",
-            output_size=output_size,
-            output_format=sp.output_format,
-        )
-        if case.server_args.warmup > 0:
-            if sp.image_path and sp.prompt:
-                image_path_list = sp.image_path
-                if not isinstance(image_path_list, list):
-                    image_path_list = [image_path_list]
-                new_image_path_list = []
-                for p in image_path_list:
-                    if is_image_url(p):
-                        new_image_path_list.append(download_image_from_url(str(p)))
-                    else:
-                        pp = Path(p)
-                        if not pp.exists():
-                            raise FileNotFoundError(str(pp))
-                        new_image_path_list.append(pp)
-                w.run_edit_warmups(
-                    count=case.server_args.warmup,
-                    edit_prompt=sp.prompt,
-                    image_path=new_image_path_list,
-                )
-            else:
-                w.run_text_warmups(case.server_args.warmup)
-
         client = _openai_client(ctx.port)
         gen = get_generate_fn(
             model_path=case.server_args.model_path,
