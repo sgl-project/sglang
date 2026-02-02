@@ -37,7 +37,7 @@ To add support for a new diffusion model, you will primarily need to define or c
 
 ## Available Pipeline Stages
 
-You can build your custom `ComposedPipeline` by combining the following available stages as your will. Each stage is responsible for a specific part of the generation process.
+You can build your custom `ComposedPipeline` by combining the following available stages as needed. Each stage is responsible for a specific part of the generation process.
 
 | Stage Class                      | Description                                                                                             |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------- |
