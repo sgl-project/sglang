@@ -284,7 +284,7 @@ class MMReceiverHTTP(MMReceiverBase):
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.encode_idx = list(range(len(self.encode_urls)))
-        self.host = server_args.host
+        self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = MooncakeTransferEngine(
