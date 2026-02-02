@@ -586,111 +586,6 @@ def _get_precomputed_embedding_with_mixed(
     return None, input_ids
 
 
-def _extract_precomputed_embeddings(
-    items: List[MultimodalDataItem],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-    items_size: Optional[List[int]] = None,
-) -> Optional[torch.Tensor]:
-    """Extract precomputed embeddings from items."""
-    precomputed_embeddings = []
-
-    if items_size is None:
-        # Fallback: assume one item per request (old behavior)
-        for idx, item in enumerate(items):
-            if item.precomputed_embeddings is None:
-                continue
-            seq_start_idx = prefix_length[idx] if idx < len(prefix_length) else 0
-            seq_end_idx = (
-                seq_start_idx
-                + (extend_length[idx] if idx < len(extend_length) else 0)
-                - 1
-            )
-            prefix_embedding_length = []
-            extend_embedding_length = []
-            items_offset = (
-                items_offset_list[idx] if idx < len(items_offset_list) else []
-            )
-            for mm_start_idx, mm_end_idx in items_offset:
-                if mm_start_idx > seq_end_idx:
-                    break
-                if seq_start_idx > mm_start_idx:
-                    prefix_embedding_length.append(
-                        min(seq_start_idx - mm_start_idx, mm_end_idx - mm_start_idx + 1)
-                    )
-                if mm_end_idx >= seq_start_idx:
-                    extend_embedding_length.append(
-                        min(
-                            mm_end_idx - seq_start_idx + 1,
-                            seq_end_idx - mm_start_idx + 1,
-                            mm_end_idx - mm_start_idx + 1,
-                            seq_end_idx - seq_start_idx + 1,
-                        )
-                    )
-            prefix_embedding_length = int(np.sum(prefix_embedding_length))
-            extend_embedding_length = int(np.sum(extend_embedding_length))
-            precomputed_embeddings.append(
-                item.precomputed_embeddings[
-                    prefix_embedding_length : prefix_embedding_length
-                    + extend_embedding_length
-                ]
-            )
-    else:
-        # Process by request using items_size
-        max_iterations = min(len(items_size) - 1, len(prefix_length))
-        for i in range(max_iterations):
-            if items_size[i] == items_size[i + 1]:
-                continue
-            items_per_req = items[items_size[i] : items_size[i + 1]]
-            items_offset = items_offset_list[i]
-            seq_start_idx = prefix_length[i]
-            seq_end_idx = seq_start_idx + extend_length[i] - 1
-
-            # Check if all items in this request have been prefixed
-            if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
-                continue
-
-            for item in items_per_req:
-                if item.precomputed_embeddings is None:
-                    continue
-                prefix_embedding_length = []
-                extend_embedding_length = []
-                for mm_start_idx, mm_end_idx in items_offset:
-                    if mm_start_idx > seq_end_idx:
-                        break
-                    if seq_start_idx > mm_start_idx:
-                        prefix_embedding_length.append(
-                            min(
-                                seq_start_idx - mm_start_idx,
-                                mm_end_idx - mm_start_idx + 1,
-                            )
-                        )
-                    if mm_end_idx >= seq_start_idx:
-                        extend_embedding_length.append(
-                            min(
-                                mm_end_idx - seq_start_idx + 1,
-                                seq_end_idx - mm_start_idx + 1,
-                                mm_end_idx - mm_start_idx + 1,
-                                seq_end_idx - seq_start_idx + 1,
-                            )
-                        )
-                prefix_embedding_length = int(np.sum(prefix_embedding_length))
-                extend_embedding_length = int(np.sum(extend_embedding_length))
-                precomputed_embeddings.append(
-                    item.precomputed_embeddings[
-                        prefix_embedding_length : prefix_embedding_length
-                        + extend_embedding_length
-                    ]
-                )
-
-    if precomputed_embeddings:
-        result = torch.concat(precomputed_embeddings)
-        result = result.reshape(-1, result.shape[-1])
-        return result
-    return None
-
-
 def _filter_non_precomputed_items(
     items: List[MultimodalDataItem],
     items_size: List[int],
@@ -722,8 +617,9 @@ def _filter_non_precomputed_items(
         request_skipped.append(skipped)
 
         # NOTE: within a request all items are either all precomputed or all not
-        all_precomputed = all(has_precomputed[items_size[i] : items_size[i + 1]])
-        all_computed = all(not has_precomputed[items_size[i] : items_size[i + 1]])
+        has_precomputed_per_req = has_precomputed[items_size[i] : items_size[i + 1]]
+        all_precomputed = all(has_precomputed_per_req)
+        all_computed = not any(has_precomputed_per_req)
         if not all_precomputed and not all_computed:
             raise NotImplementedError(
                 "Not implemented: Items in a request are neither all precomputed nor all computed!"

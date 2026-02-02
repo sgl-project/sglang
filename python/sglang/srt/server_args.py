@@ -4792,7 +4792,7 @@ class ServerArgs:
             "--enable-adaptive-dispatch-to-encoder",
             default=ServerArgs.enable_adaptive_dispatch_to_encoder,
             action="store_true",
-            help="When enabled (default), adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally; when disabled, all mm requests are processed locally.",
+            help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
         )
 
         # Custom weight loader

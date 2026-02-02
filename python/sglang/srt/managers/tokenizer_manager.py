@@ -2339,7 +2339,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 if self.server_args.encoder_transfer_backend == "zmq_to_scheduler":
                     self.mm_receiver.send_encode_request(obj)
             else:
-                # Only one image or no images - don't dispatch to encoder, use local processing
                 obj.need_wait_for_image = False
 
     def convert_to_span_attrs(
