@@ -1,41 +1,46 @@
 [
   {
-    "timestamp": "2026-01-31T15:46:14.084965",
-    "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4",
+    "timestamp": "2026-02-02T03:52:54.252989",
+    "model": "deepseek-ai/deepseek-vl2-small",
     "metrics": {
-      "en": 0.84,
-      "en:std": 0.36660605559646725,
-      "group_latin": 0.84,
-      "group_latin:std": 0.36660605559646725,
-      "score:std": 0.36660605559646725,
-      "score": 0.84
+      "Overall-Art and Design": {
+        "num": 10,
+        "acc": 0.3
+      },
+      "Art": {
+        "num": 10,
+        "acc": 0.3
+      },
+      "Overall-Business": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Accounting": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall-Tech and Engineering": {
+        "num": 60,
+        "acc": 0.35
+      },
+      "Agriculture": {
+        "num": 30,
+        "acc": 0.367
+      },
+      "Architecture_and_Engineering": {
+        "num": 30,
+        "acc": 0.333
+      },
+      "Overall": {
+        "num": 100,
+        "acc": 0.34
+      },
+      "score": 0.3399,
+      "latency": 9.936
     },
-    "score": 0.84
-  },
-  {
-    "timestamp": "2026-01-31T15:47:10.146021",
-    "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
-    "metrics": {
-      "en": 0.856,
-      "en:std": 0.35108973211986705,
-      "group_latin": 0.856,
-      "group_latin:std": 0.35108973211986705,
-      "score:std": 0.35108973211986705,
-      "score": 0.856
-    },
-    "score": 0.856
-  },
-  {
-    "timestamp": "2026-01-31T15:48:15.259417",
-    "model": "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4",
-    "metrics": {
-      "en": 0.64,
-      "en:std": 0.48,
-      "group_latin": 0.64,
-      "group_latin:std": 0.48,
-      "score:std": 0.48,
-      "score": 0.64
-    },
-    "score": 0.64
+    "score": 0.3399,
+    "latency": [
+      9.936
+    ]
   }
 ]
