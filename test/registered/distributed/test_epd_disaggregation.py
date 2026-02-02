@@ -45,7 +45,8 @@ def _ensure_grpc_proto_generated():
         grpc_dir / "sglang_scheduler_pb2_grpc.py",
         grpc_dir / "sglang_scheduler_pb2.pyi",
     ]
-    if all(path.exists() for path in expected):
+    missing = [path for path in expected if not path.exists()]
+    if not missing:
         return
 
     compile_script = grpc_dir / "compile_proto.py"
@@ -65,6 +66,24 @@ def _ensure_grpc_proto_generated():
             raise unittest.SkipTest(
                 f"Failed to generate gRPC stubs: {e.stderr.strip()}"
             )
+    _register_grpc_generated_files(missing)
+
+
+_GRPC_GENERATED_FILES = set()
+
+
+def _register_grpc_generated_files(paths):
+    for path in paths:
+        _GRPC_GENERATED_FILES.add(path)
+
+
+def _cleanup_grpc_generated_files():
+    for path in list(_GRPC_GENERATED_FILES):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
@@ -627,6 +646,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process: {e}")
+        _cleanup_grpc_generated_files()
 
     def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
         model = "openai_compatible"
@@ -763,6 +783,7 @@ class TestEPDDisaggregationGrpcEncoderOnly(PDDisaggregationServerBase):
                 kill_process_tree(cls.process_encode.pid)
             except Exception as e:
                 print(f"Error killing process: {e}")
+        _cleanup_grpc_generated_files()
         super().tearDownClass()
 
     def test_grpc_encoder_zmq_to_scheduler(self):
