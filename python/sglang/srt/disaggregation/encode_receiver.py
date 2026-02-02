@@ -50,6 +50,7 @@ def _normalize_embedding_ports(embedding_port):
 
 def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     import grpc
+
     from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
@@ -70,6 +71,7 @@ def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
 
 def _grpc_encode_request(target, encode_request):
     import grpc
+
     from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
@@ -96,6 +98,7 @@ def _grpc_encode_request(target, encode_request):
 
 def _grpc_send_request(target, request_json):
     import grpc
+
     from sglang.srt.grpc import sglang_encoder_pb2, sglang_encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
