@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -18,6 +20,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -139,14 +142,28 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                _ = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                    return_indices=False,
-                )
+
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and get_forward_context() is not None
+                ):
+                    _ = nas_indexer_forward_cus(
+                        layer_id=self.layer_id,
+                        hidden_states=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        return_indices=False,
+                    )
+                else:
+                    _ = self.indexer(
+                        x=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                        return_indices=False,
+                    )
+
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
                 q, _, _, _ = fused_rms_mxfp4_quant(
@@ -211,20 +228,48 @@ class DeepseekMHAForwardMixin:
         q[..., self.qk_nope_head_dim :] = q_pe
 
         self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
-        if (
-            forward_batch.mha_one_shot
-            and sum(forward_batch.extend_prefix_lens_cpu) != 0
-        ):
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
-            else:
-                # BF16/FP16 path: directly fetch from cache
-                kv_a, k_pe = self._get_mla_kv_buffer(
-                    forward_batch.fetch_mha_one_shot_kv_indices(),
-                    q.dtype,
-                    forward_batch,
+        # if (
+        #     forward_batch.mha_one_shot
+        #     and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        # ):
+        #     if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+        #         # FP8 path: dequantize NSA-specific FP8 format to BF16
+        #         kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+        #     else:
+        #         # BF16/FP16 path: directly fetch from cache
+        #         kv_a, k_pe = self._get_mla_kv_buffer(
+        #             forward_batch.fetch_mha_one_shot_kv_indices(),
+        #             q.dtype,
+        #             forward_batch,
+        #         )
+
+        if forward_batch.mha_one_shot:
+            if (
+                forward_batch.forward_mode.is_extend()
+                and get_forward_context() is not None
+            ):
+                kv_a, k_pe = torch.cond(
+                    forward_batch.extend_prefix_lens.sum() != 0,
+                    self.get_kv_buffer_true_branch,
+                    self.get_kv_buffer_false_branch,
+                    (
+                        kv_a,
+                        k_pe,
+                        q,
+                    ),
                 )
+            elif sum(forward_batch.extend_prefix_lens_cpu) != 0:
+                if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+                    # FP8 path: dequantize NSA-specific FP8 format to BF16
+                    kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+                else:
+                    # BF16/FP16 path: directly fetch from cache
+                    kv_a, k_pe = self._get_mla_kv_buffer(
+                        forward_batch.fetch_mha_one_shot_kv_indices(),
+                        q.dtype,
+                        forward_batch,
+                    )
+
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
             kv = self.kv_b_proj(
                 kv_a_quanted,
@@ -237,6 +282,28 @@ class DeepseekMHAForwardMixin:
 
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
         return q, k, v, forward_batch
+
+    def get_kv_buffer_true_branch(
+        self, kv_a: torch.Tensor, k_pe: torch.Tensor, q: torch.Tensor
+    ):
+        context = get_forward_context()
+        forward_batch = context.forward_batch
+        if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+            # FP8 path: dequantize NSA-specific FP8 format to BF16
+            kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+        else:
+            # BF16/FP16 path: directly fetch from cache
+            kv_a, k_pe = self._get_mla_kv_buffer(
+                forward_batch.fetch_mha_one_shot_kv_indices(),
+                q.dtype,
+                forward_batch,
+            )
+        return kv_a.clone(), k_pe.clone()
+
+    def get_kv_buffer_false_branch(
+        self, kv_a: torch.Tensor, k_pe: torch.Tensor, q: torch.Tensor
+    ):
+        return kv_a.clone(), k_pe.clone()
 
     def forward_normal_core(
         self: DeepseekV2AttentionMLA,
@@ -323,16 +390,46 @@ class DeepseekMHAForwardMixin:
         v: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        # has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
         # Only initialize the info once
-        if has_extend_prefix and forward_batch.num_prefix_chunks is None:
-            forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+        # if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+        #     forward_batch.num_prefix_chunks = 0
+        #     if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+        #         forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+            if forward_batch.num_prefix_chunks is None:
+                forward_batch.num_prefix_chunks = 0
+
+            _ = torch.cond(
+                forward_batch.extend_prefix_lens.sum() != 0,
+                self.forward_normal_one_shot_core_true_branch,
+                self.forward_normal_one_shot_core_false_branch,
+                (),
+            )
+        else:
+            has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+            if has_extend_prefix and forward_batch.num_prefix_chunks is None:
+                forward_batch.num_prefix_chunks = 0
+                if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+                    forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
         return self.forward_normal_core(q, k, v, forward_batch)
+
+    def forward_normal_one_shot_core_true_branch(self) -> None:
+        # if self.forward_batch.num_prefix_chunks is None:
+        #     self.forward_batch.num_prefix_chunks = 0
+        context = get_forward_context()
+        forward_batch = context.forward_batch
+        if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
+            forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+        return 0
+
+    def forward_normal_one_shot_core_false_branch(self) -> None:
+        return 0
 
     def _chunked_prefix_attn_mha(
         self: DeepseekV2AttentionMLA,
@@ -491,3 +588,37 @@ class DeepseekMHAForwardMixin:
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
         return k
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def nas_indexer_forward_cus(
+    layer_id: int,
+    hidden_states: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    return_indices: bool,
+    output: Optional[torch.Tensor] = None,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    indexer_layers = context.indexer_layers
+    indexer_layer = indexer_layers[layer_id]
+
+    ret = indexer_layer(
+        x=hidden_states,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=layer_id,
+        return_indices=return_indices,
+    )
+
+    if output is not None:
+        assert (
+            output.numel() == ret.numel()
+        ), f"Indexer Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+
+        output.view(ret.shape).copy_(ret)
+
+    return

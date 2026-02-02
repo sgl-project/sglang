@@ -32,7 +32,11 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
 )
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     get_nsa_index_n_heads,
@@ -65,6 +69,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import (
+    AttentionInputs,
     LayerCommunicator,
     LayerScatterModes,
     enable_moe_dense_fully_dp,
@@ -97,7 +102,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -123,6 +128,9 @@ from sglang.srt.models.deepseek_common.attention_backend_handler import (
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
     DeepseekMHAForwardMixin,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
+    nas_indexer_forward_cus,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
@@ -151,6 +159,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if _use_aiter_gfx95:
 
@@ -1198,7 +1207,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         )
 
         self.alt_stream = alt_stream
-        self.attn_mha.kv_b_proj = None
 
         self.w_kc = None
         self.w_vc = None
@@ -1318,6 +1326,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
+        if self.prepare_qkv_latent is not None:
+            attn_inputs = AttentionInputs(
+                hidden_states, forward_batch, self.prepare_qkv_latent
+            )
+            get_attn_tp_context().set_attn_inputs(attn_inputs)
+
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
@@ -1335,8 +1349,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
-        if self.attn_mha.kv_b_proj is None:
-            self.attn_mha.kv_b_proj = self.kv_b_proj
+        # if self.attn_mha.kv_b_proj is None:
+        #     self.attn_mha.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
@@ -1569,18 +1583,25 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
+
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and get_forward_context() is not None
+                ):
+                    topk_indices = torch.empty(
+                        (hidden_states.shape[0], 2048),
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                    nas_indexer_forward_cus(
+                        layer_id=self.layer_id,
+                        hidden_states=hidden_states,
+                        q_lora=q_lora,
+                        positions=positions,
+                        return_indices=True,
+                        output=topk_indices,
+                    )
+                else:
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -1588,6 +1609,38 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None:
+                    if (
+                        forward_batch.forward_mode.is_extend()
+                        and get_forward_context() is not None
+                    ):
+                        topk_indices = torch.empty(
+                            (hidden_states.shape[0], 2048),
+                            dtype=torch.int32,
+                            device=hidden_states.device,
+                        )
+                        nas_indexer_forward_cus(
+                            layer_id=self.layer_id,
+                            hidden_states=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            return_indices=True,
+                            output=topk_indices,
+                        )
+                    else:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -2916,3 +2969,94 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def mla_gdn_with_output(
+    layer_id: int,
+    output: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    attention_layers = context.attention_layers
+    attention_layer = attention_layers[layer_id]
+
+    if attention_layer.prepare_qkv_latent is not None:
+        attn_inputs = AttentionInputs(
+            hidden_states, forward_batch, attention_layer.prepare_qkv_latent
+        )
+        get_attn_tp_context().set_attn_inputs(attn_inputs)
+
+    s = attention_layer.forward_prepare(
+        positions=positions,
+        hidden_states=hidden_states,
+        forward_batch=forward_batch,
+        llama_4_scaling=llama_4_scaling,
+    )
+
+    ret = attention_layer.forward_core(s)
+
+    assert (
+        output.numel() == ret.numel()
+    ), f"DeepSeekV3.2 mla Output tensor shape is not matching. {output.shape} != {ret.shape}"
+
+    output.view(ret.shape).copy_(ret)
+
+    return
+
+
+def mla_gdn_with_output_fake(
+    layer_id: int,
+    output: torch.Tensor,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    llama_4_scaling: Optional[torch.Tensor] = None,
+) -> None:
+    return
+
+
+def mlp_gdn_with_output_fake(
+    layer_id: int,
+    hidden_states: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    router_logits: Optional[torch.Tensor] = None,
+) -> None:
+    final_hidden_states.view(hidden_states.shape).copy_(
+        torch.zeros_like(final_hidden_states)
+    )
+    return
+
+
+@register_custom_op(
+    mutates_args=["final_hidden_states"], fake_impl=mlp_gdn_with_output_fake
+)
+@register_split_op()
+def mlp_gdn_with_output(
+    layer_id: int,
+    hidden_states: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: Optional[torch.Tensor] = None,
+    router_logits: Optional[torch.Tensor] = None,
+) -> None:
+    context = get_forward_context()
+    moe_layers = context.moe_layers
+    moe_layer = moe_layers[layer_id]
+
+    topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
+    ret = moe_layer(hidden_states=hidden_states, topk_output=topk_output)
+
+    assert (
+        final_hidden_states.numel() == ret.numel()
+    ), f"DeepSeekV3.2 MOE-deepep Output tensor shape is not matching. {final_hidden_states.shape} != {ret.shape}"
+
+    final_hidden_states.view(ret.shape).copy_(ret)
+
+    return

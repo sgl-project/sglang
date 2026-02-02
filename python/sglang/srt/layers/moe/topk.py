@@ -743,7 +743,7 @@ def biased_grouped_topk_gpu(
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
-
+    fused_topk_deepseek = None
     if (
         _is_cuda
         and fused_topk_deepseek is not None

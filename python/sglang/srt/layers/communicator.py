@@ -489,11 +489,13 @@ class LayerCommunicator:
             forward_batch=forward_batch,
             context=self._context,
         )
-        if self.qkv_latent_func is not None:
-            attn_inputs = AttentionInputs(
-                hidden_states, forward_batch, self.qkv_latent_func
-            )
-            get_attn_tp_context().set_attn_inputs(attn_inputs)
+
+        # due to piecewise-cudagraph，so move
+        # if self.qkv_latent_func is not None:
+        #     attn_inputs = AttentionInputs(
+        #         hidden_states, forward_batch, self.qkv_latent_func
+        #     )
+        #     get_attn_tp_context().set_attn_inputs(attn_inputs)
         return hidden_states, residual
 
     def _tp_reduce_scatter(

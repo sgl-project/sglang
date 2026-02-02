@@ -95,7 +95,6 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -1533,13 +1532,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "Disable piecewise CUDA graph because piecewise_cuda_graph does not support PP",
             )
             return False
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            # TODO(yuwei): fix the compilation errors for MOE A2A backend
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph due to existing compilation errors",
-            )
-            return False
+        # if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+        #     # TODO(yuwei): fix the compilation errors for MOE A2A backend
+        #     log_info_on_rank0(
+        #         logger,
+        #         "Disable piecewise CUDA graph due to existing compilation errors",
+        #     )
+        #     return False
         return True
 
     def configure_kv_cache_dtype(self):
@@ -2029,6 +2028,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         self.attention_layers = []
         self.moe_layers = []
+        self.indexer_layers = []
         for layer in self.model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
@@ -2036,6 +2036,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     self.attention_layers.append(layer.self_attn.attn_mqa)
+                elif hasattr(layer.self_attn, "indexer "):
+                    self.indexer_layers.append(layer.self_attn.indexer)
             # For hybrid model
             elif hasattr(layer, "attn"):
                 self.attention_layers.append(layer.attn)
