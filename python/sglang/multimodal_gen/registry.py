@@ -386,34 +386,36 @@ def get_model_info(
                 config = maybe_download_model_index(model_path)
         except Exception as e:
             logger.error(f"Could not read model config for '{model_path}': {e}")
-        if backend == Backend.AUTO:
-            logger.info("Falling back to diffusers backend")
-            return _get_diffusers_model_info(model_path)
-        return None
-
-    pipeline_class_name = config.get("_class_name")
-    if not pipeline_class_name:
-        logger.error(f"'_class_name' not found in model_index.json for '{model_path}'")
-        if backend == Backend.AUTO:
-            logger.info("Falling back to diffusers backend")
-            return _get_diffusers_model_info(model_path)
-        return None
-
-    pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
-    if not pipeline_cls:
-        if backend == Backend.AUTO:
-            logger.warning(
-                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
-                f"Falling back to diffusers backend."
-            )
-            return _get_diffusers_model_info(model_path)
-        else:
-            logger.error(
-                f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
-                f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}. "
-                f"Consider using --backend diffusers to use vanilla diffusers pipeline."
-            )
+            if backend == Backend.AUTO:
+                logger.info("Falling back to diffusers backend")
+                return _get_diffusers_model_info(model_path)
             return None
+
+        pipeline_class_name = config.get("_class_name")
+        if not pipeline_class_name:
+            logger.error(
+                f"'_class_name' not found in model_index.json for '{model_path}'"
+            )
+            if backend == Backend.AUTO:
+                logger.info("Falling back to diffusers backend")
+                return _get_diffusers_model_info(model_path)
+            return None
+
+        pipeline_cls = _PIPELINE_REGISTRY.get(pipeline_class_name)
+        if not pipeline_cls:
+            if backend == Backend.AUTO:
+                logger.warning(
+                    f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' has no native sglang support. "
+                    f"Falling back to diffusers backend."
+                )
+                return _get_diffusers_model_info(model_path)
+            else:
+                logger.error(
+                    f"Pipeline class '{pipeline_class_name}' specified in '{model_path}' is not a registered EntryClass in the framework. "
+                    f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}. "
+                    f"Consider using --backend diffusers to use vanilla diffusers pipeline."
+                )
+                return None
 
     # 3. Get configuration classes (sampling, pipeline config)
     config_info = _get_config_info(model_path)
