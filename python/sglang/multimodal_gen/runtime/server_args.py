@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
 """The arguments of sglang-diffusion Inference."""
-
 import argparse
 import dataclasses
 import inspect
@@ -17,8 +16,11 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
+import addict
+import yaml
+
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -235,6 +237,7 @@ class ServerArgs:
 
     # Attention
     attention_backend: str = None
+    attention_backend_config: addict.Dict | None = None
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -276,6 +279,7 @@ class ServerArgs:
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+    lora_scale: float = 1.0  # LoRA scale for merging (e.g., 0.125 for Hyper-SD)
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
@@ -296,11 +300,6 @@ class ServerArgs:
     # ComfyUI integration
     comfyui_mode: bool = False
 
-    # STA (Sliding Tile Attention) parameters
-    mask_strategy_file_path: str | None = None
-    STA_mode: STA_Mode = STA_Mode.STA_INFERENCE
-    skip_time_steps: int = 15
-
     # Compilation
     enable_torch_compile: bool = False
 
@@ -309,13 +308,6 @@ class ServerArgs:
     warmup_resolutions: list[str] = None
 
     disable_autocast: bool | None = None
-
-    # VSA parameters
-    VSA_sparsity: float = 0.0  # inference/validation sparsity
-
-    # V-MoBA parameters
-    moba_config_path: str | None = None
-    moba_config: dict[str, Any] = field(default_factory=dict)
 
     # Master port for distributed inference
     # TODO: do not hard code
@@ -393,6 +385,45 @@ class ServerArgs:
             if self.vae_cpu_offload is None:
                 self.vae_cpu_offload = True
 
+    def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
+        """parse attention backend config from string."""
+        if not config_str:
+            return {}
+
+        # 1. treat as file path
+        if os.path.exists(config_str):
+            if config_str.endswith((".yaml", ".yml")):
+                with open(config_str, "r") as f:
+                    return yaml.safe_load(f)
+            elif config_str.endswith(".json"):
+                with open(config_str, "r") as f:
+                    return json.load(f)
+
+        # 2. treat as JSON string
+        try:
+            return json.loads(config_str)
+        except json.JSONDecodeError:
+            pass
+
+        # 3. treat as k=v pairs (simple implementation). e.g., "sparsity=0.5,enable_x=true"
+        try:
+            config = {}
+            pairs = config_str.split(",")
+            for pair in pairs:
+                k, v = pair.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if v.lower() == "true":
+                    v = True
+                elif v.lower() == "false":
+                    v = False
+                elif v.replace(".", "", 1).isdigit():
+                    v = float(v) if "." in v else int(v)
+                config[k] = v
+            return config
+        except Exception:
+            raise ValueError(f"Could not parse attention backend config: {config_str}")
+
     def __post_init__(self):
         # configure logger before use
         configure_logger(server_args=self)
@@ -401,6 +432,14 @@ class ServerArgs:
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+
+        # normalize attention_backend_config
+        if self.attention_backend_config is None:
+            self.attention_backend_config = addict.Dict()
+        elif isinstance(self.attention_backend_config, str):
+            self.attention_backend_config = addict.Dict(
+                self._parse_attention_backend_config(self.attention_backend_config)
+            )
 
         # handle warmup
         if self.warmup_resolutions is not None:
@@ -419,16 +458,6 @@ class ServerArgs:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
-        if self.moba_config_path:
-            try:
-                with open(self.moba_config_path) as f:
-                    self.moba_config = json.load(f)
-                logger.info("Loaded V-MoBA config from %s", self.moba_config_path)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                logger.error(
-                    "Failed to load V-MoBA config from %s: %s", self.moba_config_path, e
-                )
-                raise
 
         self.check_server_args()
 
@@ -466,6 +495,12 @@ class ServerArgs:
                 "use diffusers attention backend names such as flash, _flash_3_hub, "
                 "sage, or xformers."
             ),
+        )
+        parser.add_argument(
+            "--attention-backend-config",
+            type=str,
+            default=None,
+            help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
         )
         parser.add_argument(
             "--diffusers-attention-backend",
@@ -568,20 +603,6 @@ class ServerArgs:
             help="Path to a text file containing prompts (one per line) for batch processing",
         )
 
-        # STA (Sliding Tile Attention) parameters
-        parser.add_argument(
-            "--STA-mode",
-            type=str,
-            default=ServerArgs.STA_mode.value,
-            choices=[mode.value for mode in STA_Mode],
-            help="STA mode contains STA_inference, STA_searching, STA_tuning, STA_tuning_cfg, None",
-        )
-        parser.add_argument(
-            "--skip-time-steps",
-            type=int,
-            default=ServerArgs.skip_time_steps,
-            help="Number of time steps to warmup (full attention) for STA",
-        )
         parser.add_argument(
             "--mask-strategy-file-path",
             type=str,
@@ -662,14 +683,6 @@ class ServerArgs:
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
-        # VSA parameters
-        parser.add_argument(
-            "--VSA-sparsity",
-            type=float,
-            default=ServerArgs.VSA_sparsity,
-            help="Validation sparsity for VSA",
-        )
-
         # Master port for distributed inference
         parser.add_argument(
             "--master-port",
@@ -727,6 +740,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.lora_nickname,
             help="The nickname for the LoRA adapter to launch with",
+        )
+        parser.add_argument(
+            "--lora-scale",
+            type=float,
+            default=ServerArgs.lora_scale,
+            help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
@@ -1150,9 +1169,3 @@ def get_global_server_args() -> ServerArgs:
         # TODO(will): may need to handle this for CI.
         raise ValueError("Global sgl_diffusion args is not set.")
     return _global_server_args
-
-
-def parse_int_list(value: str) -> list[int]:
-    if not value:
-        return []
-    return [int(x.strip()) for x in value.split(",")]
