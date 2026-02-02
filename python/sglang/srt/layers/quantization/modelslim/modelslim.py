@@ -12,11 +12,9 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.modelslim.schemes import (
-    ModelSlimScheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A8Int8MoE,
     ModelSlimW8A8Int8,
@@ -31,7 +29,8 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
-
+    from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
+    from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 logger = logging.getLogger(__name__)
 
 
@@ -203,8 +202,7 @@ class ModelSlimConfig(QuantizationConfig):
         layer: torch.nn.Module,
         prefix: str,
     ) -> Optional[ModelSlimScheme]:
-        # TODO: @dsikka: refactor this to use schemes as other kernels
-        # are supported + check if the layer is being ignored.
+        # TODO: @dsikka: check if the layer is being ignored.
 
         prefix_in_quant_config = prefix + ".0.down_proj.weight"
         is_moe_w4a8_dynamic = (
@@ -223,9 +221,9 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW8A8Int8MoE(self)
         else:
             logger.warning(
-                f"Unsupported FusedMoe modelslim scheme: \
-                    {self.quant_description.get(prefix_in_quant_config.strip())} \
-                    in layer: {prefix}"
+                f"Unsupported FusedMoe modelslim scheme: "
+                f"{self.quant_description.get(prefix_in_quant_config.strip())} "
+                f"in layer: {prefix}"
             )
             return None
 
@@ -336,7 +334,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
     ):
         """
         Use the ModelSlimScheme associated with each layer to create
-        the necessary parameters for the layer. See LinearMethodBase for param
+        the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
         layer.scheme.create_weights(
