@@ -98,7 +98,6 @@ def _topk_ids_logical_to_physical_dynamic(
     topk_ids_original_shape = topk_ids.shape
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
-
     chosen_dispatch_index = (
         torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]

@@ -567,6 +567,7 @@ class DeepseekV2MoE(nn.Module):
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
+                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -574,6 +575,7 @@ class DeepseekV2MoE(nn.Module):
             else:
                 return self.forward_normal(
                     hidden_states,
+                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -584,11 +586,12 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-
+    
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(
@@ -598,7 +601,14 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
                 final_hidden_states *= self.routed_scaling_factor
@@ -617,6 +627,7 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
@@ -635,7 +646,14 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=forward_batch.num_token_non_padded,
+                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                    layer_id=self.layer_id,
+                ),
+            )
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
