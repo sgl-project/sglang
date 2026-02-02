@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
 from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
     SparseKVCacheManager,
 )
+from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,7 @@ def create_sparse_coordinator(
     server_args,
     **kwargs,
 ) -> SparseCoordinator:
+    bind_to_closest_numa_node_cuda()
     config = _parse_sparse_config(server_args)
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     sparse_kv_cache_manager = SparseKVCacheManager(

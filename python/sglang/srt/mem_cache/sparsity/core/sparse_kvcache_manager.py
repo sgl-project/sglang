@@ -211,18 +211,20 @@ class SparseKVCacheManager:
                 queue_sizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
         completed_count = queue_sizes.tolist()[0]
-        assert completed_count == 1, f"Expected 1 completion, got {completed_count}"
 
-        _, finish_event, offload_ids = self.ack_sparse_decode_write_queue.pop(0)
-        finish_event.synchronize()
+        # Process all completed offload operations
+        while completed_count > 0:
+            _, finish_event, offload_ids = self.ack_sparse_decode_write_queue.pop(0)
+            finish_event.synchronize()
 
-        # Update host indices mapping
-        host_indices, req_pool_indices, seq_lens = (
-            self.pending_sparse_decode_offloads.pop(offload_ids[0])
-        )
-        self.req_states.req_to_tokens_host[req_pool_indices, seq_lens] = (
-            host_indices.to(self.req_states.device)
-        )
+            # Update host indices mapping
+            host_indices, req_pool_indices, seq_lens = (
+                self.pending_sparse_decode_offloads.pop(offload_ids[0])
+            )
+            self.req_states.req_to_tokens_host[req_pool_indices, seq_lens] = (
+                host_indices.to(self.req_states.device)
+            )
+            completed_count -= 1
 
     def offload_prompt_kvcache(self, req):
         """
