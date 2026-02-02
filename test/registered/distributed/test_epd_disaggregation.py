@@ -27,8 +27,16 @@ register_cuda_ci(est_time=150, suite="stage-c-test-4-gpu-h100")
 
 
 def _ensure_grpc_proto_generated():
-    root = Path(__file__).resolve().parents[2]
-    grpc_dir = root / "python" / "sglang" / "srt" / "grpc"
+    grpc_dir = None
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "python" / "sglang" / "srt" / "grpc"
+        if candidate.exists():
+            grpc_dir = candidate
+            break
+    if grpc_dir is None:
+        raise unittest.SkipTest(
+            "python/sglang/srt/grpc not found; cannot generate gRPC stubs"
+        )
     expected = [
         grpc_dir / "sglang_encoder_pb2.py",
         grpc_dir / "sglang_encoder_pb2_grpc.py",
