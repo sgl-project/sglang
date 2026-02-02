@@ -4,7 +4,6 @@ from .ssu_dispatch import (
     initialize_mamba_selective_state_update_backend,
     selective_state_update,
 )
-    
 
 __all__ = [
     "PAD_SLOT_ID",
