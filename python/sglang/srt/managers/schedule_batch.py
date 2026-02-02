@@ -1115,6 +1115,9 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2283,6 +2286,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            server_args = get_global_server_args()
+
+            if (
+                self.forward_mode.is_decode()
+                and server_args.enable_piecewise_cuda_graph
+                and not self.tree_cache.is_chunk_cache()
+            ):
+                return
+
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -2297,7 +2309,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            server_args = get_global_server_args()
                             pre_len = (
                                 pre_len - server_args.chunked_prefill_size
                                 if server_args.chunked_prefill_size > 0
