@@ -1099,9 +1099,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 forward_batch.mamba_track_mask is None
                 or not forward_batch.mamba_track_mask.any()
             )
-            use_flashinfer = (
-                False  # todo(yingyi): flashinfer prefill kernel hangs on h100, fix it
-            )
             if use_flashinfer:
                 q_for_kernel = query.squeeze(0).contiguous()
                 k_for_kernel = key.squeeze(0).contiguous()
