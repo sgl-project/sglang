@@ -1417,6 +1417,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         Only supports pre-quantized checkpoints with FP8 weights and scales.
         """
 
+        # Keep parameter objects stable for CUDA graph reuse and hot reload.
+        # Prefer in-place copy; rebind only when shape/dtype changes.
+        def _copy_or_rebind_param(name: str, new_value: torch.Tensor) -> None:
+            param = getattr(layer, name, None)
+            if isinstance(param, Parameter):
+                if (
+                    param.data.shape == new_value.shape
+                    and param.data.dtype == new_value.dtype
+                ):
+                    param.data.copy_(new_value)
+                else:
+                    param.data = new_value
+                param.requires_grad_(False)
+            else:
+                setattr(layer, name, Parameter(new_value, requires_grad=False))
+
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
             if layer.w13_weight_scale_2.dim() == 1:
@@ -1435,8 +1451,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
-        layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
-
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
             w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
@@ -1477,19 +1491,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_input_scale = layer.w2_input_scale
 
         # Create shared parameters
-        layer.g1_alphas = Parameter(
-            (w13_input_scale * w13_weight_scale_2).to(torch.float32),
-            requires_grad=False,
+        _copy_or_rebind_param(
+            "g1_alphas", (w13_input_scale * w13_weight_scale_2).to(torch.float32)
         )
-        layer.g2_alphas = Parameter(
+        _copy_or_rebind_param(
+            "g2_alphas",
             (w2_input_scale * layer.w2_weight_scale_2).to(torch.float32),
-            requires_grad=False,
         )
-        layer.w13_input_scale_quant = Parameter(
-            (1 / w13_input_scale).to(torch.float32), requires_grad=False
+        _copy_or_rebind_param(
+            "w13_input_scale_quant", (1 / w13_input_scale).to(torch.float32)
         )
-        layer.w2_input_scale_quant = Parameter(
-            (1 / w2_input_scale).to(torch.float32), requires_grad=False
+        _copy_or_rebind_param(
+            "w2_input_scale_quant", (1 / w2_input_scale).to(torch.float32)
         )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
@@ -1554,23 +1567,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             # Set flashinfer parameters
-            layer.gemm1_weights_fp4_shuffled = Parameter(
-                gemm1_weights_fp4_shuffled, requires_grad=False
+            _copy_or_rebind_param(
+                "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
             )
-            layer.gemm2_weights_fp4_shuffled = Parameter(
-                gemm2_weights_fp4_shuffled, requires_grad=False
+            _copy_or_rebind_param(
+                "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
             )
-            layer.gemm1_scales_fp4_shuffled = Parameter(
-                gemm1_scales_fp4_shuffled, requires_grad=False
+            _copy_or_rebind_param(
+                "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled
             )
-            layer.gemm2_scales_fp4_shuffled = Parameter(
-                gemm2_scales_fp4_shuffled, requires_grad=False
+            _copy_or_rebind_param(
+                "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled
             )
 
             # Additional parameter needed for TRT-LLM
-            layer.g1_scale_c = Parameter(
+            _copy_or_rebind_param(
+                "g1_scale_c",
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
-                requires_grad=False,
             )
 
             # Keep original weights/scales to support update_weights_from_disk.
@@ -1580,7 +1593,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # Process w13 weights
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            layer.w13_blockscale_swizzled.data.copy_(w13_blockscale_swizzled)
+            _copy_or_rebind_param("w13_blockscale_swizzled", w13_blockscale_swizzled)
 
             w13_weight = layer.w13_weight
             intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
@@ -1592,33 +1605,28 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     "but padding is also implemented for gated activations"
                 )
 
-                layer.w13_weight = Parameter(
+                _copy_or_rebind_param(
+                    "w13_weight",
                     torch.nn.functional.pad(
                         w13_weight, (0, 0, 0, intermediate_size_pad)
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_weight = Parameter(
+                _copy_or_rebind_param(
+                    "w2_weight",
                     torch.nn.functional.pad(
                         layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_weight_scale = Parameter(
+                _copy_or_rebind_param(
+                    "w2_weight_scale",
                     torch.nn.functional.pad(
                         layer.w2_weight_scale, (0, intermediate_size_pad // 16)
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_blockscale_swizzled = Parameter(
-                    swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
-                )
-
-            layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
 
             # Process w2 weights
             w2_blockscale_swizzled = swizzle_blockscale(layer.w2_weight_scale)
-            layer.w2_blockscale_swizzled.data.copy_(w2_blockscale_swizzled)
+            _copy_or_rebind_param("w2_blockscale_swizzled", w2_blockscale_swizzled)
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
