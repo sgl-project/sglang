@@ -166,7 +166,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         ):
             from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 
-            os.environ["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
+            os.environ.setdefault("SGLANG_ENCODER_MM_RECEIVER_MODE", "grpc")
             self.mm_receiver = create_mm_receiver(self.server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
