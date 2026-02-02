@@ -9,7 +9,6 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.utils import seqlens_expand_triton
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
@@ -31,6 +30,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     pad_nsa_cache_seqlens,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
+from sglang.srt.layers.attention.utils import seqlens_expand_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
@@ -409,7 +409,7 @@ class NativeSparseAttnBackend(
                 torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=device),
                 cache_seqlens_int32,
                 self.speculative_num_draft_tokens * batch_size,
-                self.speculative_num_draft_tokens
+                self.speculative_num_draft_tokens,
             )
             page_table = torch.repeat_interleave(
                 page_table, repeats=self.speculative_num_draft_tokens, dim=0
@@ -437,7 +437,7 @@ class NativeSparseAttnBackend(
                 forward_batch.extend_seq_lens,
                 cache_seqlens_int32,
                 sum(extend_seq_lens_cpu),
-                self.speculative_num_draft_tokens
+                self.speculative_num_draft_tokens,
             )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
@@ -957,10 +957,12 @@ class NativeSparseAttnBackend(
             extend_seq_lens_cpu = [self.speculative_num_draft_tokens] * bs
 
             seqlens_expanded = seqlens_expand_triton(
-                torch.tensor(extend_seq_lens_cpu, dtype=torch.int32, device=self.device),
+                torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32, device=self.device
+                ),
                 cache_seqlens,
                 self.speculative_num_draft_tokens * bs,
-                self.speculative_num_draft_tokens
+                self.speculative_num_draft_tokens,
             )
 
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
@@ -991,7 +993,7 @@ class NativeSparseAttnBackend(
                 extend_seq_lens,
                 cache_seqlens,
                 sum(extend_seq_lens_cpu),
-                self.speculative_num_draft_tokens
+                self.speculative_num_draft_tokens,
             )
 
             metadata.nsa_seqlens_expanded[: seqlens_expanded.shape[0]].copy_(

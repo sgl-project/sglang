@@ -278,12 +278,13 @@ def pad_sequence_with_mask(
 
     return B, output, attn_mask
 
+
 @triton.jit
 def seqlens_expand_kernel(
-    extend_seq_lens_ptr,   # [N]
-    seq_lens_ptr,          # [N]
-    offsets_ptr,           # [N+1]
-    output_ptr,            # [sum(extend_seq_lens)]
+    extend_seq_lens_ptr,  # [N]
+    seq_lens_ptr,  # [N]
+    offsets_ptr,  # [N+1]
+    output_ptr,  # [sum(extend_seq_lens)]
     N,
     BLOCK: tl.constexpr,
 ):
@@ -304,11 +305,12 @@ def seqlens_expand_kernel(
     values = start + offs
     tl.store(output_ptr + out_offset + offs, values, mask=mask)
 
+
 def seqlens_expand_triton(
     extend_seq_lens: torch.Tensor,
     seq_lens: torch.Tensor,
     total_len: int,
-    max_q_len: int
+    max_q_len: int,
 ):
     """
     extend_seq_lens: [N], int32, CUDA
@@ -319,13 +321,9 @@ def seqlens_expand_triton(
 
     N = extend_seq_lens.numel()
 
-    offsets = torch.zeros(
-        N + 1, device=extend_seq_lens.device, dtype=torch.int32
-    )
+    offsets = torch.zeros(N + 1, device=extend_seq_lens.device, dtype=torch.int32)
     offsets[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    output = torch.empty(
-        total_len, device=extend_seq_lens.device, dtype=torch.int32
-    )
+    output = torch.empty(total_len, device=extend_seq_lens.device, dtype=torch.int32)
 
     BLOCK = triton.next_power_of_2(max_q_len)
     grid = (N,)
@@ -340,6 +338,7 @@ def seqlens_expand_triton(
     )
 
     return output
+
 
 # When num_kv_heads=1, we have tensors with degenerate strides,
 # For example, as below, where we have stride[-3] == stride[-2]:
