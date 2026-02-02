@@ -91,43 +91,23 @@ LOAD_FORMAT_CHOICES = [
     "private",
 ]
 
-QUANTIZATION_CHOICES = [
-    "awq",
-    "fp8",
-    "mxfp8",
-    "gptq",
-    "marlin",
-    "gptq_marlin",
-    "awq_marlin",
-    "bitsandbytes",
-    "gguf",
-    "modelopt",
+# NOTE: this list should contain only methods that support online quantization,
+# i.e. loading a higher precision checkpoint and quantizing it at load time.
+# Other quantization methods that load a pre-serialized checkpoint should NOT be added to this list.
+ONLINE_QUANTIZATION_CHOICES = [
+    # Modelopt has some online quantization support through ModelOptModelLoader.
     "modelopt_fp8",
     "modelopt_fp4",
-    "petit_nvfp4",
-    "w8a8_int8",
-    "w8a8_fp8",
-    "moe_wna16",
-    "qoq",
-    "w4afp8",
-    "mxfp4",
-    "quark_mxfp4",
-    "auto-round",
-    "compressed-tensors",  # for Ktransformers
-    "modelslim",  # for NPU
+    "modelopt" "fp8",  # MOE + linear.
+    "mxfp8",  # MOE + linear.
+    "w8a8_fp8",  # linear + MOE (only half support => should likely be deprecated in favor of fp8, see https://github.com/sgl-project/sglang/issues/4524)
+    "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
+    "mxfp4",  # MOE-only.
+    "quark_mxfp4",  # MOE + linear.
     "quark_int4fp8_moe",
 ]
 
-# TODO: prune the one above
-ONLINE_QUANTIZATION = [
-    "fp8",
-    "mxfp8",
-    "mxfp4",  # supports only MOE
-    "quark_mxfp4",
-    "quark_int4fp8_moe",
-]
-
-SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*QUANTIZATION_CHOICES, "unquant"]
+SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = [*ONLINE_QUANTIZATION_CHOICES, "unquant"]
 
 ATTENTION_BACKEND_CHOICES = [
     # Common
@@ -231,7 +211,7 @@ def add_load_format_choices(choices):
 
 
 def add_quantization_method_choices(choices):
-    QUANTIZATION_CHOICES.extend(choices)
+    ONLINE_QUANTIZATION_CHOICES.extend(choices)
 
 
 def add_attention_backend_choices(choices):
@@ -2888,7 +2868,7 @@ class ServerArgs:
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
-            choices=QUANTIZATION_CHOICES,
+            choices=ONLINE_QUANTIZATION_CHOICES,
             help="The quantization method.",
         )
         parser.add_argument(

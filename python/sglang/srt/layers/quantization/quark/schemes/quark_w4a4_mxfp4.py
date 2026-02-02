@@ -46,17 +46,9 @@ class QuarkW4A4MXFP4(QuarkScheme):
         return 70
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        """
-        Process weights after loading. If checkpoint is not serialized in MXFP4,
-        perform online quantization.
-        """
         if not self.is_checkpoint_mxfp4_serialized:
             assert layer.weight.dtype == torch.uint8
             assert layer.weight_scale.dtype == torch.uint8
-
-        # Checkpoint already serialized in MXFP4, just freeze parameters
-        layer.weight.requires_grad_(False)
-        layer.weight_scale.requires_grad_(False)
 
     def create_weights(
         self,
