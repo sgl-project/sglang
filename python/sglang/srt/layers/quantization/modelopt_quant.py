@@ -1171,9 +1171,10 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             else:
                 setattr(layer, name, Parameter(new_value, requires_grad=False))
 
-        _copy_or_rebind_param("input_scale", input_scale_2)
-        _copy_or_rebind_param("weight_scale_2", weight_scale_2)
-        _copy_or_rebind_param("alpha", layer.input_scale * layer.weight_scale_2)
+        # Keep per-shard scales intact for hot reload; derive scalar params below.
+        _copy_or_rebind_param(
+            "alpha", (input_scale_2 * weight_scale_2).to(torch.float32)
+        )
         _copy_or_rebind_param("input_scale_inv", (1 / input_scale_2).to(torch.float32))
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
