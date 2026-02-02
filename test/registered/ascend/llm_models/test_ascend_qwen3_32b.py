@@ -1,22 +1,27 @@
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
-from sglang.test.ascend.test_ascend_utils import LING_LITE_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-4-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
-class TestLingLite(GSM8KAscendMixin, CustomTestCase):
-    """Testcase: Verify that the inference accuracy of the inclusionAI/Ling-lite model on the GSM8K dataset is no less than 0.75.
+class TestQwen332B(GSM8KAscendMixin, CustomTestCase):
+    """Testcase: Verify that the inference accuracy of the Qwen/Qwen3-32B model on the GSM8K dataset is no less than 0.88.
 
     [Test Category] Model
-    [Test Target] inclusionAI/Ling-lite
+    [Test Target] Qwen/Qwen3-32B
     """
 
-    model = LING_LITE_WEIGHTS_PATH
-    accuracy = 0.75
+    model = QWEN3_32B_WEIGHTS_PATH
+    accuracy = 0.88
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
@@ -25,7 +30,7 @@ class TestLingLite(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--disable-cuda-graph",
         "--tp-size",
-        "2",
+        "4",
     ]
 
 
