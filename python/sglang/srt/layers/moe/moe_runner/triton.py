@@ -37,7 +37,7 @@ _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 
 
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum, silu_and_mul
 
     if _is_hip:
         if _use_aiter:
@@ -48,7 +48,16 @@ if _is_cuda or _is_hip:
                     "aiter is required when SGLANG_USE_AITER is set to True"
                 )
         else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
+            try:
+                from vllm import _custom_ops as vllm_ops  # moe_sum
+            except ImportError:
+                # Fallback to sgl_kernel ops when vllm is unavailable.
+                class _FallbackOps:
+                    moe_sum = staticmethod(moe_sum)
+                    silu_and_mul = staticmethod(silu_and_mul)
+                    gelu_and_mul = staticmethod(gelu_and_mul)
+
+                vllm_ops = _FallbackOps()
 elif _is_cpu and _is_cpu_amx_available:
     pass
 
