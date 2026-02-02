@@ -16,7 +16,11 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 INT8 quantization tests (channel and block INT8)
-register_cuda_ci(est_time=341, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(
+    est_time=341,
+    suite="stage-b-test-large-1-gpu",
+    disabled="HF token doesn't have private repository access",
+)
 
 
 class TestMLADeepseekV3ChannelInt8(CustomTestCase):

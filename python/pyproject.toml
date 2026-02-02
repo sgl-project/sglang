@@ -82,6 +82,22 @@ dependencies = [
   "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
 ]
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+]
+
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
@@ -96,7 +112,8 @@ diffusion = [
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "runai_model_streamer>=0.15.5",
-  "cache-dit==1.2.0"
+  "cache-dit==1.2.0",
+  "addict"
 ]
 
 tracing = [
