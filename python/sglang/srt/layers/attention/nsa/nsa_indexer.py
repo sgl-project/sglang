@@ -1244,7 +1244,7 @@ class Indexer(MultiPlatformOp):
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
-                actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0)
+                actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
