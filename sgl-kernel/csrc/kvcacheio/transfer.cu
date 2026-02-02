@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/util/irange.h>
+#include <cuda_runtime.h>
 
 #include <cstdint>
 
@@ -763,17 +764,17 @@ inline void transfer_kv_page_first_direct_impl(
       auto d_index = dst_indices_ptr[i * page_size] / page_size;
 
       for (int64_t j = 0; j < num_layers; ++j) {
-        const char* src_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
-        char* dst_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
-            (start_layer_id + j) * dst_stride1 * elem_size;
-        C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
+        const char* src_k_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
+                          (start_layer_id + j) * dst_stride1 * elem_size;
+        C10_CUDA_CHECK(cudaMemcpyAsync(dst_k_ptr, src_k_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
 
         if (!is_mla) {
-          const char* src_ptr = static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) +
-            s_index * src_stride0 * elem_size;
-          char* dst_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
-            (start_layer_id + j) * dst_stride1 * elem_size;
-          C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
+          const char* src_v_ptr =
+              static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) + s_index * src_stride0 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
+                            (start_layer_id + j) * dst_stride1 * elem_size;
+          C10_CUDA_CHECK(cudaMemcpyAsync(dst_v_ptr, src_v_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
         }
       }
     }
@@ -792,16 +793,16 @@ inline void transfer_kv_page_first_direct_impl(
       auto d_index = dst_indices_ptr[i * page_size];
 
       for (int64_t j = 0; j < num_layers; ++j) {
-        const char* src_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
-            (start_layer_id + j) * src_stride1 * elem_size;
-        char* dst_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
-        C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
+        const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
+                                (start_layer_id + j) * src_stride1 * elem_size;
+        char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
+        C10_CUDA_CHECK(cudaMemcpyAsync(dst_k_ptr, src_k_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
 
         if (!is_mla) {
-          const char* src_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
-            (start_layer_id + j) * src_stride1 * elem_size;
-          char* dst_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
-          C10_CUDA_CHECK(cudaMemcpyAsync(dst_ptr, src_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
+          const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
+                                  (start_layer_id + j) * src_stride1 * elem_size;
+          char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
+          C10_CUDA_CHECK(cudaMemcpyAsync(dst_v_ptr, src_v_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
         }
       }
     }
