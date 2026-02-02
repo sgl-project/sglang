@@ -20,27 +20,31 @@ fi
 
 
 # Default base tags (can be overridden by command line arguments)
-ROCM_VERSION="rocm700"
-DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
-DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+DEFAULT_ROCM_VERSION="rocm700"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${DEFAULT_ROCM_VERSION}-mi30x"
+DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${DEFAULT_ROCM_VERSION}-mi35x"
+CUSTOM_IMAGE=""
+GPU_ARCH_BUILD=""
 
 # Parse command line arguments
-MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
-MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
+    --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG]"
+      echo "Usage: $0 [OPTIONS]"
+      echo "Options:"
+      echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
+      echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --gpu-arch ARCH            GPU architecture & ROCm version tuple (e.g., gfx950-rocm720)"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
   esac
 done
-
-
 
 # Detect GPU architecture from the Kubernetes runner hostname
 HOSTNAME_VALUE=$(hostname)
@@ -69,6 +73,17 @@ case "${GPU_ARCH}" in
     ;;
 esac
 
+case "${GPU_ARCH_BUILD}" in
+  rocm720)
+    echo "Specifying ROCm 7.2.0."
+    MI30X_BASE_TAG="${SGLANG_VERSION}-rocm720-mi30x"
+    MI35X_BASE_TAG="${SGLANG_VERSION}-rocm720-mi35x"
+    ;;
+  *)
+    MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
+    MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+    ;;
+esac
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
 if [[ -f /etc/podinfo/gha-render-devices ]]; then
@@ -76,7 +91,6 @@ if [[ -f /etc/podinfo/gha-render-devices ]]; then
 else
   DEVICE_FLAG="--device /dev/dri"
 fi
-
 
 # Find the latest image
 find_latest_image() {
@@ -142,10 +156,18 @@ find_latest_image() {
   fi
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-echo "Pulling Docker image: ${IMAGE}"
-docker pull "${IMAGE}"
+# Determine which image to use
+if [[ -n "${CUSTOM_IMAGE}" ]]; then
+  # Use explicitly provided custom image
+  IMAGE="${CUSTOM_IMAGE}"
+  echo "Using custom image: ${IMAGE}"
+  docker pull "${IMAGE}"
+else
+  # Find the latest pre-built image
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  echo "Pulling Docker image: ${IMAGE}"
+  docker pull "${IMAGE}"
+fi
 
 CACHE_HOST=/home/runner/sgl-data
 if [[ -d "$CACHE_HOST" ]]; then

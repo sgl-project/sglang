@@ -108,7 +108,7 @@ DISABLE_HF_XET_MODELS = {
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
 }
 TRITON_MOE_MODELS = {
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+    # "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mistral-7B-Instruct-v0.3",
