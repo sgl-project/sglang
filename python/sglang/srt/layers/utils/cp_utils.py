@@ -128,6 +128,56 @@ def cp_all_gather_reorganazied_into_tensor(
     return outputs
 
 
+def cp_all_gather_reorganazied_into_tensor_kv_cache(
+    input_tensor, total_len, cp_size, forward_batch, stream
+):
+    """
+    Allgather communication for context_parallel KV cache.
+    Handles multi-dimensional tensors (e.g., [seq_len, num_heads, head_dim]).
+    """
+    max_len = (total_len + cp_size - 1) // cp_size
+    pad_size = max_len - input_tensor.shape[0]
+    if pad_size > 0:
+        # Pad the first dimension (seq_len). F.pad expects padding in reverse dimension order.
+        # For n dimensional tensor, we need 2*n values: (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+        # To pad only the first dimension: [0, 0] * (ndim - 1) + [0, pad_size]
+        padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
+        input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
+
+    # Create output tensor with proper shape for all dimensions
+    input_tensor_full = torch.empty(
+        max_len * cp_size,
+        *input_tensor.shape[1:],
+        device=input_tensor.device,
+        dtype=input_tensor.dtype,
+    )
+    print(
+        f"DEBUG: Rank {torch.distributed.get_rank()} cp_all_gather_reorganazied_into_tensor_kv_cache input: {input_tensor.shape}, output: {input_tensor_full.shape}, pad: {pad_size}",
+        flush=True,
+    )
+
+    get_attention_cp_group().cp_all_gather_into_tensor_async(
+        input_tensor_full, input_tensor, stream
+    )
+
+    outputs_list_max = list(
+        torch.split(
+            input_tensor_full, forward_batch.attn_cp_metadata.max_rank_len, dim=0
+        )
+    )
+    outputs = torch.cat(
+        [
+            outputs_list_max[index][:per_rank_len]
+            for index, per_rank_len in enumerate(
+                forward_batch.attn_cp_metadata.per_rank_actual_token
+            )
+        ],
+        dim=0,
+    )
+
+    return outputs
+
+
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     """
     # for in-seq-split
@@ -170,6 +220,44 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
         dim=0,
     )
     output_tensor = output_tensor.view(-1, hidden_size)
+    return output_tensor
+
+
+def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream):
+    """
+    Allgather and reorganize KV cache from all ranks in context parallel group.
+
+    # for in-seq-split
+    |   +-----------before allgather------------+|
+    |   | dp_atten_tp0: block0, block7 |
+    |   | dp_atten_tp1: block1, block6 |
+    |   | dp_atten_tp2: block2, block5 |
+    |   | dp_atten_tp3: block3, block4 |
+    |
+    |   +----------before rerange---------------+|
+    | block0 | block7 | block1 | block6 | block2 | block5 | block3 | block4 |
+    |
+    |   +--------------result-------------------+
+    | block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7 |
+    |   +-------------------------+
+    """
+    output_tensor = cp_all_gather_reorganazied_into_tensor_kv_cache(
+        input_tensor,
+        forward_batch.attn_cp_metadata.total_seq_lens,
+        cp_size,
+        forward_batch,
+        stream,
+    )
+    outputs_list = list(
+        torch.split(
+            output_tensor, forward_batch.attn_cp_metadata.reverse_split_len, dim=0
+        )
+    )
+    output_tensor = torch.cat(
+        [outputs_list[i] for i in forward_batch.attn_cp_metadata.cp_reverse_index],
+        dim=0,
+    )
+    # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
 
 

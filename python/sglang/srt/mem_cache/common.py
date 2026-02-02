@@ -375,6 +375,23 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
         )
 
+    print(
+        "DEBUG: Rank {} out_cache_loc: {} shape: {}".format(
+            torch.distributed.get_rank(), out_cache_loc, out_cache_loc.shape
+        )
+    )
+    print(
+        "DEBUG: Rank {} req_pool_indices_device: {} shape: {}".format(
+            torch.distributed.get_rank(),
+            req_pool_indices_cpu,
+            req_pool_indices_device.shape,
+        )
+    )
+    print(
+        "DEBUG: Rank {} extend_lens: {} (total extend_num_tokens: {})".format(
+            torch.distributed.get_rank(), extend_lens_cpu, batch.extend_num_tokens
+        )
+    )
     # Write to req_to_token_pool
     write_cache_indices(
         out_cache_loc,
