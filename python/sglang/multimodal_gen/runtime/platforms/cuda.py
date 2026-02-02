@@ -167,6 +167,29 @@ class CudaPlatformBase(Platform):
                 raise ImportError(
                     "Sliding Tile Attention backend is not installed. "
                 ) from e
+        elif selected_backend == AttentionBackendEnum.LITE_ATTN:
+            # LiteAttention is a Hopper-only optional dependency. If not available,
+            # fall back to FlashAttention.
+            if not cls.is_hopper():
+                raise ValueError(
+                    "LiteAttention backend requires Hopper (SM90). "
+                    "Please use 'fa' or 'torch_sdpa' on non-Hopper GPUs."
+                )
+            try:
+                import lite_attention  # noqa: F401
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.lite_attn import (  # noqa: F401
+                    LiteAttentionBackend,
+                )
+
+                logger.info("Using LiteAttention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.lite_attn.LiteAttentionBackend"
+            except ImportError as e:
+                logger.info(e)
+                logger.info(
+                    "LiteAttention backend is not installed. Falling back to FlashAttention."
+                )
+                target_backend = AttentionBackendEnum.FA
         elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
             try:
                 from sageattention import sageattn  # noqa: F401
