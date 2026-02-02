@@ -268,6 +268,8 @@ class ServerArgs:
     hsdp_shard_dim: int = -1
     dist_timeout: int | None = None  # timeout for torch.distributed
 
+    enable_custom_all_reduce: bool = False
+
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
     # Pipeline override
@@ -459,6 +461,12 @@ class ServerArgs:
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
 
+        os.environ["SGLANG_DIFFUSION_ENABLE_CUSTOM_ALL_REDUCE"] = (
+            "1" if self.enable_custom_all_reduce else "0"
+        )
+        if self.enable_custom_all_reduce:
+            os.environ["SGLANG_SKIP_P2P_CHECK"] = "1"
+
         self.check_server_args()
 
         # log clean server_args
@@ -593,6 +601,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.dist_timeout,
             help="Set timeout for torch.distributed initialization.",
+        )
+
+        parser.add_argument(
+            "--enable-custom-all-reduce",
+            action=StoreBoolean,
+            default=ServerArgs.enable_custom_all_reduce,
+            help="Enable custom all-reduce.",
         )
 
         # Prompt text file for batch processing

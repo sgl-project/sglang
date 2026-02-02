@@ -4,6 +4,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/cuda_communicator.py
 
 
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -30,16 +32,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.custom_allreduce = None
         self.pynccl_comm: PyNcclCommunicator | None = None
         if self.world_size > 1:
-            # use lazy import here
-            from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-                dispatch_custom_allreduce,
+            enable_custom_all_reduce = (
+                os.environ.get("SGLANG_DIFFUSION_ENABLE_CUSTOM_ALL_REDUCE", "0") == "1"
             )
+            if enable_custom_all_reduce:
+                # use lazy import here
+                from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+                    dispatch_custom_allreduce,
+                )
 
-            CustomAllreduce = dispatch_custom_allreduce()
-            self.custom_allreduce = CustomAllreduce(
-                group=self.cpu_group,
-                device=self.device,
-            )
+                CustomAllreduce = dispatch_custom_allreduce()
+                self.custom_allreduce = CustomAllreduce(
+                    group=self.cpu_group,
+                    device=self.device,
+                )
 
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
