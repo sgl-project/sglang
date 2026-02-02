@@ -6,10 +6,7 @@ python3 -m unittest test_vision_openai_server_tp2.TestQwen25VLTP2Server.test_sin
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.vlm_utils import (
-    ImageOpenAITestMixin,
-    VideoOpenAITestMixin,
-)
+from sglang.test.vlm_utils import ImageOpenAITestMixin, VideoOpenAITestMixin
 
 # Register for 2-GPU per-commit CI
 register_cuda_ci(est_time=300, suite="stage-b-test-large-2-gpu")
