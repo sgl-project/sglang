@@ -256,20 +256,6 @@ class DiffGenerator:
                                 isinstance(sample, (tuple, list)) and len(sample) == 2
                             ):
                                 sample = (sample, audio)
-                        if req.data_type == DataType.MESH:
-                            result_item = {
-                                "mesh_path": sample,
-                                "prompts": req.prompt,
-                                "generation_time": timer.duration,
-                                "peak_memory_mb": output_batch.peak_memory_mb,
-                                "timings": (
-                                    output_batch.timings.to_dict()
-                                    if output_batch.timings
-                                    else {}
-                                ),
-                                "prompt_index": output_idx,
-                            }
-                        else:
                             frames = post_process_sample(
                                 sample,
                                 fps=req.fps,
@@ -298,6 +284,19 @@ class DiffGenerator:
                                 "trajectory": output_batch.trajectory_latents,
                                 "trajectory_timesteps": output_batch.trajectory_timesteps,
                                 "trajectory_decoded": output_batch.trajectory_decoded,
+                                "prompt_index": output_idx,
+                            }
+                        elif req.data_type == DataType.MESH:
+                            result_item = {
+                                "mesh_path": sample,
+                                "prompts": req.prompt,
+                                "generation_time": timer.duration,
+                                "peak_memory_mb": output_batch.peak_memory_mb,
+                                "timings": (
+                                    output_batch.timings.to_dict()
+                                    if output_batch.timings
+                                    else {}
+                                ),
                                 "prompt_index": output_idx,
                             }
                         results.append(result_item)
