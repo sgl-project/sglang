@@ -13,7 +13,6 @@ help:
 	@echo "  serve       to build and serve documentation with auto-build and live reload"
 
 # Compile Notebook files and record execution time
-# Compile Notebook files and record execution time
 compile:
 	@set -e; \
 	echo "Starting Notebook compilation..."; \
