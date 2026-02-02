@@ -984,18 +984,6 @@ def zigzag_attn_varlen_func(
     nnz_kv, num_heads_kv, head_dim_vo = v.shape
     assert num_heads_q == num_heads_kv
 
-    # streaming_info = torch.tensor(
-    #     [[1, 7]] * q.shape[1],
-    #     device=q.device,
-    #     dtype=torch.int32,
-    # )
-    # head_mask_type = torch.full(
-    #     (q.shape[1],),
-    #     -1,
-    #     device=q.device,
-    #     dtype=torch.int32,
-    # )
-
     if streaming_info is not None:
         block_M = 128
         block_N = 128
@@ -1032,23 +1020,11 @@ def zigzag_attn_with_kvcache(
     assert num_heads_kv == 1
     assert head_dim_qk == head_dim_vo
 
-    # streaming_info = torch.tensor(
-    #     [[1, 7]] * q.shape[2],
-    #     device=q.device,
-    #     dtype=torch.int32,
-    # )
-    # head_mask_type = torch.full(
-    #     (q.shape[2],),
-    #     -1,
-    #     device=q.device,
-    #     dtype=torch.int32,
-    # )
-
     if streaming_info is not None:
         block_H = 64
         block_N = 128
         # num_splits = get_splits(batch_size, num_heads_q, seqlen_q, torch.mean(cache_seqlens.float()).int().item(), block_H, block_N, streaming_info[0].cpu().tolist())
-        num_splits = 2
+        num_splits = 1
         num_stages = 1
         threads = 256
 
@@ -1063,7 +1039,7 @@ def zigzag_attn_with_kvcache(
         block_H = 64
         block_N = 64
         # num_splits = get_splits(batch_size, num_heads_q, seqlen_q, torch.mean(cache_seqlens.float()).int().item(), block_H, block_N, None)
-        num_splits = 2
+        num_splits = 1
 
         glse = torch.empty(batch_size, seqlen_q, num_heads_q, num_splits, dtype=q.dtype, device=q.device)
         out_partial = torch.empty(batch_size, seqlen_q, num_heads_q, num_splits, dim_nope, dtype=q.dtype, device=q.device)

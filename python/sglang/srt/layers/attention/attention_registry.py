@@ -84,7 +84,7 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 @register_attention_backend("zigzag_attn")
-def create_nsa_backend(runner):
+def create_zigzag_attn_backend(runner):
     from sglang.srt.layers.attention.zigzag_attn_backend import ZigZagAttnBackend
 
     return ZigZagAttnBackend(runner)

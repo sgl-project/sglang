@@ -508,7 +508,6 @@ class LongcatFlashModel(nn.Module):
         )
 
         self.alt_stream = torch.cuda.Stream()
-        # config.num_hidden_layers = 3; self.start_layer=0; self.end_layer=3
         self.layers = nn.ModuleList(
             [
                 LongcatFlashDecoderLayer(
