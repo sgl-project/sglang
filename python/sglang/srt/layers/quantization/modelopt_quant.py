@@ -2043,6 +2043,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
+        topk_weights: Optional[torch.Tensor] = None,
+        recv_rank_info: Optional[torch.Tensor] = None,
+        recv_idx_info: Optional[torch.Tensor] = None,
+        combine_out: Optional[torch.Tensor] = None,
+        combine_out_ptrs: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -2074,6 +2079,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_blockscale=layer.w2_blockscale_swizzled,
             w2_alpha=layer.g2_alphas,
             masked_m=masked_m,
+            topk_weights=topk_weights,
+            recv_rank_info=recv_rank_info,
+            recv_idx_info=recv_idx_info,
+            combine_out=combine_out,
+            combine_out_ptrs=combine_out_ptrs,
             **(
                 dict(
                     down_sm_count=down_gemm_overlap_args.num_sms,

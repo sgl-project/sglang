@@ -71,6 +71,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each GPU for --moe-a2a-backend=flashinfer | `"1024"` |
 | `SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS` | Number of SMs used for DeepEP combine when single batch overlap is enabled | `"32"` |
 | `SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO` | Run shared experts on an alternate stream when single batch overlap is enabled on GB200. When not setting this flag, shared experts and down gemm will be overlapped with DeepEP combine together. | `"false"` |
+| `SGLANG_FUSED_GROUPED_GEMM_COMBINE_FP32` | Enable the use of FP32 accumulation in fused grouped GEMM + combine kernel for higher numerical accuracy. | `false` |
 
 ## MORI Configuration
 

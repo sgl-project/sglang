@@ -313,7 +313,19 @@ class DeepEPMoE(FusedMoE):
         self,
         dispatch_output: DeepEPLLDispatchOutput,
     ):
-        hidden_states, hidden_states_scale, _, _, masked_m, _ = dispatch_output
+        (
+            hidden_states,
+            hidden_states_scale,
+            _,
+            _,
+            masked_m,
+            _,
+            recv_topk_weights,
+            recv_rank_info,
+            recv_idx_info,
+            combine_out,
+            combine_out_ptrs,
+        ) = dispatch_output
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
@@ -322,6 +334,11 @@ class DeepEPMoE(FusedMoE):
             x=(hidden_states, hidden_states_scale),
             masked_m=masked_m,
             moe_runner_config=self.moe_runner_config,
+            topk_weights=recv_topk_weights,
+            recv_rank_info=recv_rank_info,
+            recv_idx_info=recv_idx_info,
+            combine_out=combine_out,
+            combine_out_ptrs=combine_out_ptrs,
         )
         return output
 

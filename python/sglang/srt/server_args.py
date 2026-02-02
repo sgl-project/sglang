@@ -631,6 +631,7 @@ class ServerArgs:
     enable_dp_lm_head: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
+    enable_fused_grouped_gemm_combine: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
     disable_piecewise_cuda_graph: bool = False
@@ -2806,6 +2807,11 @@ class ServerArgs:
                 assert (self.chunked_prefill_size) <= get_int_env_var(
                     "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
                 ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+
+        if self.enable_fused_grouped_gemm_combine:
+            assert (
+                not self.enable_single_batch_overlap
+            ), "Fused grouped GEMM + combine is incompatible with single batch overlap."
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -5442,6 +5448,11 @@ class ServerArgs:
             "--enable-single-batch-overlap",
             action="store_true",
             help="Let computation and communication overlap within one micro batch.",
+        )
+        parser.add_argument(
+            "--enable-fused-grouped-gemm-combine",
+            action="store_true",
+            help="Enable fusion of grouped gemm and combine.",
         )
         parser.add_argument(
             "--tbo-token-distribution-threshold",
