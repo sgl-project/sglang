@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 from typing import Any, Callable, Optional
 
 import torch
-from torch.nn import Parameter
 
-from sglang.srt.layers.parameter import (
-    GroupQuantScaleParameter,
-    PackedvLLMParameter,
-)
+from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.utils import is_hip
-import logging
+
 _is_hip = is_hip()
 if _is_hip:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
@@ -40,7 +37,9 @@ class QuarkW4A4MXFP4(QuarkScheme):
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
 
         if not self.is_checkpoint_mxfp4_serialized:
-            logger.info_once("Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization.")
+            logger.info_once(
+                "Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+            )
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -58,7 +57,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
         # Checkpoint already serialized in MXFP4, just freeze parameters
         layer.weight.requires_grad_(False)
         layer.weight_scale.requires_grad_(False)
-    
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -115,8 +114,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
     ) -> Callable:
         """
         Wrap the original weight loader to perform online MXFP4 quantization.
-
-        Since MXFP4 uses per-group quantization, there is no need to load all shards (q_proj, k_proj, v_proj) before doing quantization.
         """
 
         def online_mxfp4_weight_loader(
@@ -127,25 +124,19 @@ class QuarkW4A4MXFP4(QuarkScheme):
             # Materialize on device the loaded weight.
             loaded_weight = loaded_weight.to(param.device)
 
-            # Quantize the loaded weight shard immediately
+            # Quantize the loaded weight shard immediately. Since MXFP4 uses per-group quantization, there is no need to load all shards (e.g. q_proj, k_proj, v_proj) before doing online quantization.
             qweight, weight_scale = dynamic_mxfp4_quant(loaded_weight)
 
-            # Required for q_proj, k_proj, v_proj.
+            # Required e.g. for q_proj, k_proj, v_proj.
             kwargs = {}
             if shard_id is not None:
                 kwargs["loaded_shard_id"] = shard_id
 
             # Use the original weight loader to handle the loading logic
-            # (e.g., partitioning, tensor parallel slicing, etc.)
+            # (e.g. qkv sharding, etc.)
             original_weight_loader(param, qweight, **kwargs)
 
             layer.weight_scale.weight_loader(layer.weight_scale, weight_scale, **kwargs)
-
-            # # Store the scale to be registered in process_weights_after_loading
-            # # We accumulate scales per shard
-            # if not hasattr(param, "_mxfp4_scales"):
-            #     param._mxfp4_scales = []
-            # param._mxfp4_scales.append(weight_scale)
 
         return online_mxfp4_weight_loader
 
@@ -199,7 +190,6 @@ class QuarkW4A4MXFP4(QuarkScheme):
         else:
             gemm_afp4wfp4(x_q, layer.weight, x_s, layer.weight_scale, self.out_dtype, y)
 
-        # Add bias if provided
         if bias is not None:
             y = y + bias
 

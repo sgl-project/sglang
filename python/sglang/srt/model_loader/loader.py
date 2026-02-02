@@ -80,6 +80,7 @@ from sglang.srt.model_loader.utils import (
     post_load_weights,
     set_default_torch_dtype,
 )
+from sglang.srt.utils.common import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -679,6 +680,14 @@ class DefaultModelLoader(BaseModelLoader):
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
         model.load_weights(weights)
+
+        # Used in test_online_quantization.py to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            peak_memory = torch.cuda.max_memory_allocated()
+            logger.debug(
+                "Peak GPU memory after loading weights: %s GiB",
+                f"{peak_memory / 1073741824:.3f}",
+            )
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)

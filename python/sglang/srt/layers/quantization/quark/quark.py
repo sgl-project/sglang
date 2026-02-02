@@ -44,11 +44,10 @@ class QuarkConfig(QuantizationConfig):
         if kv_cache_group is None:
             kv_cache_group = []
 
-        # If online_scheme is specified, create synthetic config for online quantization
         if online_scheme is not None:
+            assert not is_prequantized
             if online_scheme == "quark_mxfp4":
                 quant_config = self._create_online_mxfp4_config()
-                is_prequantized = False
             else:
                 raise ValueError(f"Unsupported online_scheme: {online_scheme}")
 

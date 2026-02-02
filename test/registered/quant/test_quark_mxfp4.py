@@ -1,5 +1,4 @@
 import io
-import os
 import re
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -12,8 +11,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
-    DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -24,11 +21,6 @@ from sglang.test.test_utils import (
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.SGLANG_USE_AITER = os.environ.get("SGLANG_USE_AITER", None)
-
-        # DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE has a shape not compatible with aiter.
-        os.environ["SGLANG_USE_AITER"] = "0"
-
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
@@ -39,23 +31,25 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             other_args=[
                 "--quantization",
                 "quark_mxfp4",
+                "--context-length",
+                "3000",  # Required for Qwen MOE model.
                 "--tensor-parallel-size",
                 "1",
                 "--log-level",
                 "debug",
-                "--disable-cuda-graph",  # See https://github.com/sgl-project/sglang/issues/18002
+                "--disable-cuda-graph",  # See https://github.com/sgl-project/sglang/issues/18002, just for safety here.
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
 
         # # Extract and display peak GPU memory from logs
-        # combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
-        # peak_memory = cls._extract_peak_memory(combined_output)
+        combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
+        peak_memory = cls._extract_peak_memory(combined_output)
 
-        # if is_cuda_alike() and not peak_memory:
-        #     raise ValueError("Should have found peak memory")
+        if is_cuda_alike() and not peak_memory:
+            raise ValueError("Should have found peak memory")
 
-        # cls.peak_memory = float(peak_memory)
+        cls.peak_memory = float(peak_memory)
 
     @classmethod
     def _extract_peak_memory(cls, log_output):
@@ -73,20 +67,18 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         cls.stdout.close()
         cls.stderr.close()
 
-        if cls.SGLANG_USE_AITER:
-            os.environ["SGLANG_USE_AITER"] = cls.SGLANG_USE_AITER
-
 
 class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
     # model = "/mnt/fxmarty/Qwen_Qwen3-8B"
-    model = "/mnt/fxmarty/Qwen_Qwen3-32B"
+    # model = "/mnt/fxmarty/Qwen_Qwen3-32B"
+    model = "/mnt/fxmarty/Qwen_Qwen3-8B"
 
-    # def test_peak_memory(self):
-    #     if not is_cuda_alike():
-    #         self.skipTest("not is_cuda_alike")
+    def test_peak_memory(self):
+        if not is_cuda_alike():
+            self.skipTest("not is_cuda_alike")
 
-    #     # Original BF16 model: 2.887 GiB
-    #     assert self.peak_memory < 2
+        # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
+        assert self.peak_memory < 6
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -101,6 +93,37 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        # Qwen/Qwen3-8B hits >0.9 as well.
-        # Original model reference accuracy: ~0.608
-        self.assertGreater(metrics["accuracy"], 0.58)
+        # Original Qwen/Qwen3-8B reference accuracy: ~0.92
+        self.assertGreater(metrics["accuracy"], 0.85)
+
+
+class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
+    # Unfortunately, smaller models as Qwen/Qwen1.5-MoE-A2.7B or ibm-granite/granite-3.0-3b-a800m-base currently crash in AITER:
+    # - Qwen/Qwen1.5-MoE-A2.7B => K // 2 = 704 as intermediate size, not multiple of 128.
+    # - ibm-granite/granite-3.0-3b-a800m-base: dtype issue with fp16 in AITER MOE MLP activation
+    # so using a large model here.
+    model = "/mnt/fxmarty/Qwen_Qwen3-30B-A3B-Instruct-2507"
+    # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N in fused_dynamic_mxfp4_quant_moe_sort.
+
+    def test_peak_memory(self):
+        if not is_cuda_alike():
+            self.skipTest("not is_cuda_alike")
+
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
+        assert self.peak_memory < 21.5
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=8,
+            data_path=None,
+            num_questions=500,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
+        self.assertGreater(metrics["accuracy"], 0.9)
