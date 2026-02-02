@@ -877,6 +877,54 @@ class MMReceiverGrpc(MMReceiverBase):
         return encode_req
 
     # For zmq_to_scheduler
+    def _run_encode_in_thread(
+        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
+    ):
+        try:
+            asyncio.run(
+                self.encode(
+                    req_id=req_id,
+                    img_data=img_data,
+                    embedding_port=embedding_port,
+                    endpoint_encode=endpoint_encode,
+                    endpoint_send=None,
+                    num_items_assigned=num_items_assigned,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
+
+    # For zmq_to_scheduler
+    def send_encode_request(self, obj):
+        if type(obj.image_data) != list:
+            image_urls = [obj.image_data.url]
+        else:
+            image_urls = [img.url for img in obj.image_data]
+        if obj.rid is None:
+            obj.rid = uuid.uuid4().hex
+        if image_urls and len(image_urls) > 0:
+            logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
+            obj.need_wait_for_image = True
+
+            encode_idx = list(range(len(self.encode_urls)))
+            random.shuffle(encode_idx)
+            obj.num_items_assigned = [
+                (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
+            ]
+            encode_thread = threading.Thread(
+                target=self._run_encode_in_thread,
+                args=(
+                    obj.rid,
+                    image_urls,
+                    "encode",
+                    obj.num_items_assigned,
+                    None,
+                ),
+                daemon=True,
+            )
+            encode_thread.start()
+
+    # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
         new_recv_reqs = []
         for recv_req in recv_reqs:
@@ -935,6 +983,70 @@ class MMReceiverGrpc(MMReceiverBase):
 
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
+
+    # For zmq_to_tokenizer and mooncake
+    async def recv_mm_data(self, img_data, mm_processor, prompt):
+        try:
+            if len(self.encode_urls) == 0:
+                return None
+            req_id = uuid.uuid4().hex
+            embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
+            if type(img_data) != list:
+                img_data = [img_data.url]
+            else:
+                img_data = [img.url for img in img_data]
+            asyncio.create_task(
+                self.encode(req_id, img_data, embedding_port, "encode", "send")
+            )
+            return await asyncio.wait_for(
+                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
+                timeout=20,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Embedding recv timeout for request {req_id}")
+            if hasattr(self, "embeddings_buffer") and req_id in self.embeddings_buffer:
+                del self.embeddings_buffer[req_id]
+            return None
+
+    # For zmq_to_tokenizer and mooncake
+    async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
+        # Bypass MMReceiverHTTP
+        if req_id is None:
+            return None
+
+        recv_embedding = None
+
+        recv_embedding_data: EmbeddingData = None
+
+        while recv_embedding_data is None or not recv_embedding_data.ready:
+            parts = await recv_socket.recv_multipart(copy=False)
+
+            recv_obj: EmbeddingData = pickle.loads(parts[0])
+            logger.info(f"{recv_obj = }")
+            if self.encoder_transfer_backend == "zmq_to_tokenizer":
+                buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+                recv_obj.embedding = torch.frombuffer(
+                    buffer, dtype=recv_obj.dtype
+                ).reshape(recv_obj.shape)
+            if recv_embedding_data is None:
+                recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
+                recv_embedding_data = recv_obj
+            else:
+                recv_embedding_data.add(recv_obj)
+
+        if self.encoder_transfer_backend == "mooncake":
+            recv_embedding = self.embeddings_buffer[req_id]
+            del self.embeddings_buffer[req_id]
+            self.embeddings_engine.deregister(recv_embedding.data_ptr())
+        elif self.encoder_transfer_backend == "zmq_to_tokenizer":
+            recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+
+        recv_socket.close()
+
+        img_grid_thw = recv_embedding_data.get_img_grid()
+
+        mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
+        return mm_inputs
 
     async def encode(
         self,
