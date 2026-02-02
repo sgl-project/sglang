@@ -633,34 +633,49 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        model_detectors=[
+            lambda hf_id: "qwen-image" in hf_id.lower()
+            and "edit" not in hf_id.lower()
+            and "layered" not in hf_id.lower()
+            and "2512" not in hf_id.lower()
+        ],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-2512"],
+        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
+        model_detectors=[
+            lambda hf_id: "qwen-image-edit" in hf_id.lower()
+            and "2509" not in hf_id.lower()
+            and "2511" not in hf_id.lower()
+        ],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
     )
 
     register_configs(
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
+        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
     )
 
     register_configs(
