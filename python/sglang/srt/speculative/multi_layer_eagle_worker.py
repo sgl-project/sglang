@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -55,6 +55,9 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_npu = is_npu()
 
@@ -226,7 +229,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
 
-    def mtp_model_runner(self, layer_id: int):
+    def mtp_model_runner(self, layer_id: int) -> ModelRunner:
         return self.model_runner_list[layer_id]
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
