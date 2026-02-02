@@ -163,6 +163,7 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
 
@@ -234,6 +235,7 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
+    SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -248,6 +250,7 @@ class Envs:
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    SGLANG_FORWARD_TIMEOUT_MS = EnvInt(-1)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")

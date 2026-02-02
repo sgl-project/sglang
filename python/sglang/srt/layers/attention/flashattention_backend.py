@@ -34,7 +34,6 @@ from sglang.jit_kernel.flash_attention_v4 import (
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
 )
-
 from sglang.srt.layers.attention.kernels.flatten_kv_cache import flatten_kv_cache_sglang
 
 

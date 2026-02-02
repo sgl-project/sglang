@@ -47,7 +47,16 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         if self.kv_cache_dtype not in ("int4", "int8"):
             kv_size = torch._utils._element_size(self.kv_cache_dtype)
+        elif self.kv_cache_dtype == "int4":
+            kv_size = 0.5
+        elif self.kv_cache_dtype == "int8":
+            kv_size = 1
+
         if self.use_mla_backend:
+            assert self.kv_cache_dtype not in (
+                "int4",
+                "int8",
+            ), "MLA backend does not support int4 and int8"
             cell_size = (
                 (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
                 * num_layers
@@ -80,65 +89,78 @@ class ModelRunnerKVCacheMixin:
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            if self.kv_cache_dtype in ("int4", "int8"):
+            if self.model_config.is_hybrid_swa:
+                assert self.kv_cache_dtype not in (
+                    "int4",
+                    "int8",
+                ), "Hybrid SWA model does not support int4 and int8"
+                full_layers_num = len(self.model_config.full_attention_layer_ids)
+                swa_layers_num = len(self.model_config.swa_attention_layer_ids)
+
+                full_per_token = self.model_config.get_num_kv_heads(
+                    get_attention_tp_size()
+                ) * (self.model_config.head_dim + self.model_config.v_head_dim)
+
+                swa_per_token = self.model_config.get_swa_num_kv_heads(
+                    get_attention_tp_size()
+                ) * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+
+                cell_size = (
+                    full_per_token * full_layers_num + swa_per_token * swa_layers_num
+                ) * kv_size
+            else:
                 if self.kv_cache_dtype == "int4":
                     cell_size = (
                         self.model_config.get_num_kv_heads(get_attention_tp_size())
-                        * (self.model_config.head_dim + 1)
-                        // 2  # two neighbour dims are packed into one byte, equal to ceil(head_dim/2)
+                        # two neighbour dims are packed into one byte, equal to ceil(head_dim/2) + ceil(v_head_dim/2)
+                        * (
+                            (self.model_config.head_dim + 1) // 2
+                            + (self.model_config.v_head_dim + 1) // 2
+                        )
                         * num_layers
-                        * 2  # key and value
-                        * 1  # two int4 pack to one byte
+                    )
+                    cell_size = cell_size + (
+                        (
+                            self.model_config.get_num_kv_heads(get_attention_tp_size())
+                            * num_layers
+                            * 2  # key and value
+                            * 2  # scale and zero
+                        )
+                        * torch._utils._element_size(torch.float32)
+                    )
+                elif self.kv_cache_dtype == "int8":
+                    cell_size = (
+                        self.model_config.get_num_kv_heads(get_attention_tp_size())
+                        * (self.model_config.head_dim + self.model_config.v_head_dim)
+                        * num_layers
+                        * 1
+                    )
+                    cell_size = cell_size + (
+                        (
+                            self.model_config.get_num_kv_heads(get_attention_tp_size())
+                            * num_layers
+                            * 2  # key and value
+                            * 2  # scale and zero
+                        )
+                        * torch._utils._element_size(torch.float32)
                     )
                 else:
                     cell_size = (
                         self.model_config.get_num_kv_heads(get_attention_tp_size())
-                        * self.model_config.head_dim
+                        * (self.model_config.head_dim + self.model_config.v_head_dim)
                         * num_layers
-                        * 2  # key and value
-                        * 1  # int8 is one byte
-                    )
-                # quantize on head dimension, so need add scale buffer
-                cell_size = cell_size + (
-                    (
-                        self.model_config.get_num_kv_heads(get_attention_tp_size())
-                        * num_layers
-                        * 2  # key and value
-                        * 2  # scale and zero
-                    )
-                    * torch._utils._element_size(torch.float32)
-                )
-            else:
-                cell_size = (
-                    self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    * (self.model_config.head_dim + self.model_config.v_head_dim)
-                    * num_layers
-                    * kv_size
-                )
-
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    # kv_scale_buffer
-                    scale_block_size = 16
-
-                    n = self.model_config.get_num_kv_heads(get_attention_tp_size())
-                    k = self.model_config.head_dim
-                    cell_size = (cell_size // 2) + (
-                        (n * k * num_layers * 2 * kv_size) // scale_block_size
-                    )
-
-                if (
-                    "MiMoV2FlashForCausalLM"
-                    in self.model_config.hf_config.architectures
-                ):
-                    cell_size += (
-                        self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-                        * (
-                            self.model_config.hf_text_config.swa_head_dim
-                            + self.model_config.hf_text_config.swa_v_head_dim
-                        )
-                        * len(self.model_config.swa_attention_layer_ids)
                         * kv_size
                     )
+
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # kv_scale_buffer
+                scale_block_size = 16
+
+                n = self.model_config.get_num_kv_heads(get_attention_tp_size())
+                k = self.model_config.head_dim
+                cell_size = (cell_size // 2) + (
+                    (n * k * num_layers * 2 * kv_size) // scale_block_size
+                )
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
@@ -258,21 +280,59 @@ class ModelRunnerKVCacheMixin:
             )
             return
 
-        # Algorithm:
-        # Existing max_total_num_tokens is per layer and assume all layers have the same number of tokens.
-        # - Find total # of tokens available across layers.
-        # - Calculate full_max_total_num_tokens and swa_max_total_num_tokens based on the given swa_full_tokens_ratio.
-        total_tokens = self.max_total_num_tokens * self.model_config.num_hidden_layers
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
-        # Solve the equations:
-        # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
-        # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-        denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+        # Use unified memory-based allocation for all hybrid SWA models.
+        #
+        # Let:
+        #   F = Full layer per-token memory
+        #   S = SWA layer per-token memory (may differ from F)
+        #   r = swa_full_tokens_ratio = swa_tokens / full_tokens
+        #
+        # The profile phase computed:
+        #   cell_size = F * n_full + S * n_swa
+        #   max_total_num_tokens = rest_memory / cell_size
+        #   => total_memory = max_total_num_tokens * (F * n_full + S * n_swa)
+        #
+        # We need to solve:
+        #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
+        #   swa_tokens = full_tokens * r
+        #
+        # Solution:
+        #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
+        #               = max_total_num_tokens * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
+
+        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+
+        # Full layer per-token memory
+        full_per_token = (
+            self.model_config.get_num_kv_heads(get_attention_tp_size())
+            * (self.model_config.head_dim + self.model_config.v_head_dim)
+            * kv_size
+        )
+
+        # SWA layer per-token memory
+        swa_per_token = (
+            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+            * kv_size
+        )
+
+        # Total memory available from profile
+        total_memory = self.max_total_num_tokens * (
+            full_per_token * full_layers_num + swa_per_token * swa_layers_num
+        )
+
+        # Solve the equations
+        denominator = (
+            full_per_token * full_layers_num
+            + swa_full_tokens_ratio * swa_per_token * swa_layers_num
+        )
         assert (
             denominator > 0
-        ), f"Invalid denominator={denominator} for swa_full_tokens_ratio={swa_full_tokens_ratio} and swa_layers_num={swa_layers_num} and full_layers_num={full_layers_num}"
-        self.full_max_total_num_tokens = int(total_tokens / denominator)
+        ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
+
+        self.full_max_total_num_tokens = int(total_memory / denominator)
         self.swa_max_total_num_tokens = int(
             self.full_max_total_num_tokens * swa_full_tokens_ratio
         )
