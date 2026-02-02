@@ -19,9 +19,31 @@ inline auto get_blocks_per_sm(T&& kernel, int32_t block_dim, std::size_t dynamic
 
 // Return the number of SMs for the given device
 inline auto get_sm_count(int device_id) -> uint32_t {
-  cudaDeviceProp device_prop;
-  RuntimeDeviceCheck(cudaGetDeviceProperties(&device_prop, device_id));
-  return static_cast<uint32_t>(device_prop.multiProcessorCount);
+  int sm_count;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id));
+  return static_cast<uint32_t>(sm_count);
+}
+
+// Return the Major compute capability for the given device
+inline auto get_cc_major(int device_id) -> int {
+  int cc_major;
+  RuntimeDeviceCheck(cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, device_id));
+  return cc_major;
+}
+
+// Return the runtime version
+inline auto get_runtime_version() -> int {
+  int runtime_version;
+  RuntimeDeviceCheck(cudaRuntimeGetVersion(&runtime_version));
+  return runtime_version;
+}
+
+// Return the maximum dynamic shared memory per block for the given kernel
+template <typename T>
+inline auto get_available_dynamic_smem_per_block(T&& kernel, int num_blocks, int block_size) -> std::size_t {
+  std::size_t smem_size;
+  RuntimeDeviceCheck(cudaOccupancyAvailableDynamicSMemPerBlock(&smem_size, kernel, num_blocks, block_size));
+  return smem_size;
 }
 
 }  // namespace host::runtime

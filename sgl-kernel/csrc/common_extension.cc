@@ -609,19 +609,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("fast_hadamard_transform_40N(Tensor x, float scale) -> Tensor");
   m.impl("fast_hadamard_transform_40N", torch::kCUDA, &fast_hadamard_transform_40N);
-
-  /*
-   * From csrc/sgl_diffusion/elementwise
-   */
-  m.def(
-      "timestep_embedding(Tensor input,"
-      "Tensor output,"
-      "int dim,"
-      "bool flip_sin_to_cos,"
-      "float downscale_freq_shift,"
-      "float scale,"
-      "int max_period) -> Tensor");
-  m.impl("timestep_embedding", torch::kCUDA, &timestep_embedding);
 }
 
 REGISTER_EXTENSION(common_ops)

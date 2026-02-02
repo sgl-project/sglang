@@ -16,9 +16,15 @@ from sglang.multimodal_gen.runtime.platforms import (
 try:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    # flash_attn 3 no longer have a different API, see following commit:
-    # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
-    flash_attn_func = flash_attn_varlen_func
+    from sglang.jit_kernel.flash_attention_v4 import (
+        flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+    )
+
+    def flash_attn_func(*args, ver: int = 3, **kwargs):
+        if ver == 4:
+            return flash_attn_varlen_func_fa4(*args, **kwargs)
+        return flash_attn_varlen_func(*args, ver=ver, **kwargs)
+
 except ImportError as e:
     raise e
 

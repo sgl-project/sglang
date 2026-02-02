@@ -131,8 +131,14 @@ def shard_rotary_emb_for_sp(emb):
 
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
-    width, height = batch.raw_latent_shape[-1], batch.raw_latent_shape[-2]
-    target_tokens = width * height
+    raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 3:
+        # Sequence format [B, S, D]: use seq_len directly
+        target_tokens = raw_shape[1]
+    else:
+        # Spatial format [B, C, H, W] or [B, C, T, H, W]: use width * height
+        width, height = raw_shape[-1], raw_shape[-2]
+        target_tokens = width * height
     if latents.shape[1] > target_tokens:
         latents = latents[:, :target_tokens, :]
     return latents
@@ -547,7 +553,7 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path)
+                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -563,7 +569,7 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path)
+            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "
