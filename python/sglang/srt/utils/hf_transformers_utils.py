@@ -488,6 +488,12 @@ def get_tokenizer(
         if kwargs.get("use_fast", False):
             raise ValueError("Cannot use the fast tokenizer in slow tokenizer mode.")
         kwargs["use_fast"] = False
+    elif tokenizer_mode == "auto":
+        # In Transformers v5, the default for use_fast changed from True to False.
+        # Explicitly set use_fast=True for "auto" mode to maintain previous behavior
+        # and avoid issues with models that have incorrect tokenizer_class values.
+        if "use_fast" not in kwargs:
+            kwargs["use_fast"] = True
 
     # TODO(Xinyuan): Remove this once we have a proper tokenizer for Devstral
     if tokenizer_name == "mistralai/Devstral-Small-2505":

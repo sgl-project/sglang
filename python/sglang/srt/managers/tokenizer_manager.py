@@ -1797,7 +1797,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             ]
         else:
             assert self.tokenizer is not None
-            token_texts = self.tokenizer.batch_decode(token_logprobs_idx)
+            # Wrap each token ID in its own list for batch_decode to decode them separately
+            # batch_decode([1, 2, 3]) concatenates tokens, batch_decode([[1], [2], [3]]) decodes separately
+            token_texts = self.tokenizer.batch_decode([[idx] for idx in token_logprobs_idx])
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
