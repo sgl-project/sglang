@@ -43,7 +43,7 @@ def _grpc_target(url: str) -> str:
     if url.startswith("grpc://"):
         return url[len("grpc://") :]
     if url.startswith("grpcs://"):
-        return url[len("grpcs://") :]
+        raise ValueError("grpcs:// is not supported; use grpc://")
     return url
 
 
