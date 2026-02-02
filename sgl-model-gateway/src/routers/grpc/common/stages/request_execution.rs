@@ -351,17 +351,104 @@ impl RequestExecutionStage {
         // Step 3: Mark request as waiting for image embeddings
         Self::set_wait_for_image(&mut proto_request, true);
 
-        // Step 4: Execute prefill and decode in parallel via gRPC
-        let result =
-            Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client).await;
+        // Step 4: Start prefill/decode requests before awaiting encode to avoid deadlock.
+        let prefill_request = proto_request.clone_inner();
+        let decode_request = proto_request;
+
+        let mut prefill_future = prefill_client.generate(prefill_request);
+        let mut decode_future = decode_client.generate(decode_request);
+        let mut encode_future = encode_client.encode(encode_request);
+
+        tokio::pin!(prefill_future);
+        tokio::pin!(decode_future);
+        tokio::pin!(encode_future);
+
+        let mut prefill_result: Option<StreamResult> = None;
+        let mut decode_result: Option<StreamResult> = None;
+        let mut encode_result = None;
+
+        loop {
+            tokio::select! {
+                res = &mut encode_future, if encode_result.is_none() => {
+                    encode_result = Some(res);
+                    if let Some(Err(e)) = encode_result.as_ref() {
+                        error!(
+                            request_id = %request_id,
+                            error = %e,
+                            "Encode worker gRPC call failed"
+                        );
+                        if let Some(w) = workers {
+                            w.record_triple_outcomes(false, true, true);
+                        }
+                        return Err(error::internal_error(
+                            "encode_worker_grpc_failed",
+                            format!("Encode worker gRPC call failed: {}", e),
+                        ));
+                    }
+                }
+                res = &mut prefill_future, if prefill_result.is_none() => {
+                    prefill_result = Some(res);
+                }
+                res = &mut decode_future, if decode_result.is_none() => {
+                    decode_result = Some(res);
+                }
+            }
+
+            if encode_result.is_some() && prefill_result.is_some() && decode_result.is_some() {
+                break;
+            }
+        }
+
+        debug!(
+            request_id = %request_id,
+            "Encode gRPC call completed - embeddings being sent via ZMQ"
+        );
+
+        let prefill_stream = match prefill_result.unwrap() {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!(
+                    function = "execute_triple_dispatch",
+                    error = %e,
+                    "Prefill worker failed to start"
+                );
+                if let Some(w) = workers {
+                    w.record_triple_outcomes(true, false, true);
+                }
+                return Err(error::internal_error(
+                    "prefill_worker_failed_to_start",
+                    format!("Prefill worker failed to start: {}", e),
+                ));
+            }
+        };
+
+        let decode_stream = match decode_result.unwrap() {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!(
+                    function = "execute_triple_dispatch",
+                    error = %e,
+                    "Decode worker failed to start"
+                );
+                if let Some(w) = workers {
+                    w.record_triple_outcomes(true, true, false);
+                }
+                return Err(error::internal_error(
+                    "decode_worker_failed_to_start",
+                    format!("Decode worker failed to start: {}", e),
+                ));
+            }
+        };
 
         // Record circuit breaker outcomes for all workers
         if let Some(w) = workers {
-            // Encode succeeded (we got here), prefill/decode success based on result
-            w.record_triple_outcomes(true, result.is_ok(), result.is_ok());
+            w.record_triple_outcomes(true, true, true);
         }
 
-        result
+        Ok(ExecutionResult::Dual {
+            prefill: prefill_stream,
+            decode: Box::new(decode_stream),
+        })
     }
 
     /// Execute gRPC requests to prefill and decode workers in parallel
