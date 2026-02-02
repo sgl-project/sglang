@@ -21,7 +21,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
         if is_npu() or is_xpu():
             self.skipTest("NSA host transfer tests only support CUDA/ROCm.")
         if not (is_cuda() or is_hip()):
-            self.skipTest("CUDA/ROCm backend not available.")
+            self.skipTest("CUDA/ROCm not available.")
 
     @staticmethod
     def _token_indices_for_pages(pages: torch.Tensor, page_size: int, device: str):
