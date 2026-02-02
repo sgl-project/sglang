@@ -1,6 +1,7 @@
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
+@CustomOp.register("mul_add")
 class MulAdd(CustomOp):
     """
     Fuse elementwise mul and add
@@ -9,5 +10,4 @@ class MulAdd(CustomOp):
     """
 
     def __init__(self, prefix: str = ""):
-        self.function_name = "mul_add"
         super().__init__()

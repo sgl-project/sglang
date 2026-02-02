@@ -25,8 +25,6 @@ class CustomOp(nn.Module):
     Dispatches the forward method to the appropriate backend.
     """
 
-    function_name = ""
-
     def __init__(self) -> None:
         super().__init__()
         self._forward_method = MethodType(self.dispatch_forward(), self)
@@ -37,7 +35,7 @@ class CustomOp(nn.Module):
     def get_function(self, backend) -> Callable:
         filename = inspect.getmodulename(inspect.getmodule(self).__file__)
         module = importlib.import_module(f"{hardware_path}.{backend}.{filename}")
-        return getattr(module, self.function_name)
+        return getattr(module, self.name)
 
     def raise_error(self):
         import traceback

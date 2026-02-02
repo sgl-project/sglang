@@ -21,7 +21,6 @@ class SiluAndMul(CustomOp):
     """
 
     def __init__(self) -> None:
-        self.function_name = "silu_and_mul"
         super().__init__()
 
 
@@ -37,7 +36,6 @@ class GeluAndMul(CustomOp):
     """
 
     def __init__(self, approximate: str = "none"):
-        self.function_name = "gelu_and_mul"
         super().__init__()
         self.approximate = approximate
         if approximate not in ("none", "tanh"):
@@ -54,7 +52,6 @@ class GeluAndMul(CustomOp):
 class NewGELU(CustomOp):
 
     def __init__(self):
-        self.function_name = "gelu_new"
         super().__init__()
 
     def use_forward_cuda(self):
@@ -65,7 +62,6 @@ class NewGELU(CustomOp):
 class QuickGELU(CustomOp):
     # https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py#L90
     def __init__(self):
-        self.function_name = "quick_gelu"
         super().__init__()
 
     def use_forward_cuda(self):

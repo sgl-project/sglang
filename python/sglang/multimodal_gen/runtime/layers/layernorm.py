@@ -39,7 +39,6 @@ class RMSNorm(CustomOp):
         dtype: torch.dtype = torch.float32,
         var_hidden_size: Optional[int] = None,
     ) -> None:
-        self.function_name = "rms_norm"
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
@@ -81,7 +80,6 @@ class LayerNorm(CustomOp):
         device=None,
         dtype=None,
     ) -> None:
-        self.function_name = "layer_norm"
         super().__init__()
         self.eps = eps
         factory_kwargs = {"device": device, "dtype": dtype}
