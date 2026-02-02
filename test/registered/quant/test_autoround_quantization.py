@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=120, suite="stage-b-test-large-1-gpu")
 
 
-class TestAutoRound(CustomTestCase):
+class TestAutoRoundQuantization(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
