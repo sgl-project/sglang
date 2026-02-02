@@ -348,7 +348,7 @@ class AscendAttnBackend(AttentionBackend):
                 (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
-            )
+            ),
         }
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
