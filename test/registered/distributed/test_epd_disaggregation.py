@@ -74,7 +74,6 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        os.environ["SGLANG_ENCODER_MM_RECEIVER_MODE"] = "grpc"
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
         cls.encode_port = f"{int(cls.lb_port) + 300}"
         cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
