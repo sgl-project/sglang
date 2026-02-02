@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 
@@ -47,10 +47,12 @@ def _precompile_cutedsl_kernels(
     HV: int = 16,
     K: int = 128,
     V: int = 128,
-    pool_size: int = 49,
     cache_steps: int = 4,
 ):
-    """Pre-compile CuTe DSL GDN Verify kernels for common batch sizes."""
+    """Pre-compile CuTe DSL GDN Verify kernels for common batch sizes.
+    
+    Note: pool_size is not needed - kernels are pool_size-agnostic.
+    """
     try:
         from sglang.jit_kernel.cutedsl_gdn_verify import precompile_cutedsl_gdn_verify_kernels
         # Pre-compile for batch sizes 1 to max_batch_size
@@ -62,7 +64,6 @@ def _precompile_cutedsl_kernels(
             HV=HV,
             K=K,
             V=V,
-            pool_size=pool_size,
             cache_steps=cache_steps,
         )
     except Exception as e:
@@ -938,6 +939,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Cache kernel handles in K-last mode to avoid per-layer checks.
         self._flashinfer_chunk_gated_delta_rule = None
         self._cutedsl_gdn_verify_k_last = None
+        # Cache for FlashInfer prefill output tensors to avoid cudaMalloc/cudaFree overhead
+        # Key: (total_seq_len, num_o_heads, head_size)
+        self._flashinfer_output_cache: Dict[Tuple[int, int, int], torch.Tensor] = {}
         if self.ssm_k_last:
             flashinfer_available, flashinfer_chunk_gdr = _get_flashinfer_gdn_prefill()
             cutedsl_available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
@@ -972,10 +976,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Pre-compile for batch sizes 1-64
                 max_bs = min(64, server_args.max_running_requests or 64)
                 draft_token_num = server_args.speculative_num_steps + 1  # T parameter
-                # pool_size = max_running_requests + 1 (for verify kernel)
-                pool_size = (server_args.max_running_requests or 48) + 1
                 
-                logger.info(f"Pre-compiling CuTe DSL GDN Verify kernels (B=1..{max_bs}, T={draft_token_num}, pool_size={pool_size})")
+                logger.info(f"Pre-compiling CuTe DSL GDN Verify kernels (B=1..{max_bs}, T={draft_token_num})")
                 _precompile_cutedsl_kernels(
                     max_batch_size=max_bs,
                     T=draft_token_num,
@@ -983,7 +985,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     HV=HV,
                     K=K,
                     V=V,
-                    pool_size=pool_size,
                     cache_steps=draft_token_num,
                 )
         
@@ -1353,6 +1354,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 initial_state_fi = ssm_states[cache_indices].to(torch.float32)
                 output_state_fi = initial_state_fi  # in-place update is supported
                 
+                # Pre-allocate output tensor using cache to avoid cudaMalloc/cudaFree overhead
+                # Cache key: (total_seq_len, num_o_heads, head_size)
+                cache_key = (total_seq_len, num_value_heads, head_v_dim)
+                if cache_key not in self._flashinfer_output_cache:
+                    self._flashinfer_output_cache[cache_key] = torch.empty(
+                        (total_seq_len, num_value_heads, head_v_dim),
+                        dtype=q_fi.dtype,
+                        device=q_fi.device,
+                    )
+                output_fi_buffer = self._flashinfer_output_cache[cache_key]
+                
                 # Call FlashInfer prefill kernel
                 output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
                     q=q_fi,
@@ -1365,7 +1377,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     output_final_state=True,
                     cu_seqlens=cu_seqlens_fi,
                     use_qk_l2norm_in_kernel=True,
-                    output=None,  # Let FlashInfer allocate
+                    output=output_fi_buffer,  # Use cached buffer to avoid cudaMalloc/cudaFree
                     output_state=output_state_fi,
                 )
 

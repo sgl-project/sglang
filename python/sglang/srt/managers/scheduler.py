@@ -185,6 +185,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
+    enable_device_properties_caching,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -2890,6 +2891,9 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Enable device properties caching to reduce overhead
+    enable_device_properties_caching()
+
     # Generate the logger prefix
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:

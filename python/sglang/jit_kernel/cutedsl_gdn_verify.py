@@ -58,13 +58,33 @@ def _check_cutlass_available():
         from cutlass.cute.nvgpu import cpasync
         from cutlass.cute.runtime import from_dlpack
 
+        # Optimization: Cache from_dlpack results to avoid overhead (e.g. cudaGetDeviceProperties)
+        # This is particularly important for stable tensors like weights and memory pools
+        global _tensor_cache
+        _tensor_cache = {}
+
+        def _cached_from_dlpack(tensor, assumed_align=16):
+            # Key includes data_ptr, so it's safe for reused memory with same layout
+            # tensor.device is hashable
+            key = (tensor.data_ptr(), tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
+            if key in _tensor_cache:
+                return _tensor_cache[key]
+            
+            # Simple eviction
+            if len(_tensor_cache) > 1024:
+                _tensor_cache.clear()
+                
+            res = from_dlpack(tensor, assumed_align=assumed_align)
+            _tensor_cache[key] = res
+            return res
+
         _cutlass = cutlass
         _cute = cute
         _cpasync = cpasync
-        _from_dlpack = from_dlpack
+        _from_dlpack = _cached_from_dlpack
         _cuda = cuda
         _cutlass_available = True
-        logger.info("CuTe DSL GDN Verify kernel: cutlass/cute available")
+        logger.info("CuTe DSL GDN Verify kernel: cutlass/cute available (with cached from_dlpack)")
     except ImportError as e:
         _cutlass_available = False
         logger.warning(f"CuTe DSL GDN Verify kernel: cutlass/cute not available: {e}")
@@ -547,7 +567,6 @@ def _get_compiled_kernel(
     HV,
     K,
     V,
-    pool_size,
     cache_steps,
     disable_state_update,
     cache_intermediate_states,
@@ -557,6 +576,10 @@ def _get_compiled_kernel(
     use_precomputed_g_decay,
 ):
     """Get or compile the kernel for given dimensions.
+    
+    Note: pool_size is NOT a parameter because the kernel doesn't depend on it.
+    The kernel uses h0_indices to access state slots, so any pool_size works
+    with the same compiled kernel.
     
     Fixed precision settings (per ablation study):
     - Beta is always quantized to activation dtype
@@ -568,6 +591,7 @@ def _get_compiled_kernel(
 
     global _compiled_kernels
 
+    # pool_size is NOT part of the key - kernel doesn't depend on it
     key = (
         B,
         T,
@@ -575,7 +599,6 @@ def _get_compiled_kernel(
         HV,
         K,
         V,
-        pool_size,
         cache_steps,
         disable_state_update,
         cache_intermediate_states,
@@ -591,6 +614,11 @@ def _get_compiled_kernel(
     cuda = _cuda
     from_dlpack = _from_dlpack
 
+    # Use a fixed dummy pool_size for compilation.
+    # The kernel doesn't depend on pool_size - it uses h0_indices to access the correct slot.
+    # This allows kernels with different runtime pool_sizes to share the same compiled binary.
+    dummy_pool_size = 2  # Minimal size for compilation
+
     # Create dummy tensors for compilation with actual sizes
     cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device="cuda")
     q = torch.zeros(B, T, H, K, dtype=act_dtype, device="cuda")
@@ -603,16 +631,16 @@ def _get_compiled_kernel(
     g_log_in = torch.zeros(B, T, HV, dtype=torch.float32, device="cuda")
     g_decay_in = torch.zeros(B, T, HV, dtype=torch.float32, device="cuda")
     beta_in = torch.zeros(B, T, HV, dtype=torch.float32, device="cuda")
-    # h0_source is already K-last: [pool_size * HV, V, K]
-    h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
+    # h0_source is already K-last: [pool_size * HV, V, K] - use dummy_pool_size for compilation
+    h0_source = torch.zeros(dummy_pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(B, dtype=torch.int32, device="cuda")
     # Output is always bf16 (critical for accuracy per ablation study)
     o = torch.zeros(B, T, HV, V, dtype=torch.bfloat16, device="cuda")
 
     if cache_intermediate_states:
-        # intermediate_states is K-last: [pool_size * cache_steps * HV, V, K]
+        # intermediate_states is K-last: [pool_size * cache_steps * HV, V, K] - use dummy_pool_size
         intermediate_states = torch.zeros(
-            pool_size * cache_steps * HV, V, K,
+            dummy_pool_size * cache_steps * HV, V, K,
             dtype=torch.float32, device="cuda"
         )
     else:
@@ -800,7 +828,7 @@ def cutedsl_gdn_verify_k_last(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = _get_compiled_kernel(
-        B, T, H, HV, K_dim, V_dim, pool_size, cache_steps,
+        B, T, H, HV, K_dim, V_dim, cache_steps,
         disable_state_update,
         cache_intermediate_states,
         use_qk_l2norm_in_kernel,
@@ -832,7 +860,6 @@ def precompile_cutedsl_gdn_verify_kernels(
     HV: int = 16,
     K: int = 128,
     V: int = 128,
-    pool_size: int = 49,
     cache_steps: int = 4,
     use_qk_l2norm: bool = True,
     act_dtype: torch.dtype = torch.bfloat16,
@@ -843,6 +870,9 @@ def precompile_cutedsl_gdn_verify_kernels(
     This should be called during server warmup to avoid JIT compilation
     overhead during inference.
     
+    Note: pool_size is NOT a parameter because the kernel doesn't depend on it.
+    Any pool_size can use the same compiled kernel.
+    
     Args:
         batch_sizes: List of batch sizes to pre-compile (e.g., [1, 2, 4, 8, 16, 32])
         T: Number of tokens per sequence (default: 4 for spec decoding)
@@ -850,7 +880,6 @@ def precompile_cutedsl_gdn_verify_kernels(
         HV: Number of value heads  
         K: Key dimension
         V: Value dimension
-        pool_size: Pool size for state caching
         cache_steps: Number of cache steps
         use_qk_l2norm: Whether to use L2 normalization
         act_dtype: Activation dtype (default: bfloat16)
@@ -870,7 +899,6 @@ def precompile_cutedsl_gdn_verify_kernels(
                 HV=HV,
                 K=K,
                 V=V,
-                pool_size=pool_size,
                 cache_steps=cache_steps,
                 disable_state_update=True,
                 cache_intermediate_states=True,

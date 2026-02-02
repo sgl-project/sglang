@@ -60,6 +60,7 @@ def launch_server(
     disable_cuda_graph: bool = False,
     disable_speculative: bool = False,
     skip_server_warmup: bool = False,
+    chunked_prefill_size: int = None,
 ):
     """Launch server with specified layout."""
     mode = "klast" if k_last else "vlast"
@@ -104,6 +105,9 @@ def launch_server(
 
     if skip_server_warmup:
         cmd.append("--skip-server-warmup")
+    
+    if chunked_prefill_size is not None:
+        cmd += ["--chunked-prefill-size", str(chunked_prefill_size)]
     
     if k_last:
         cmd.append("--mamba-ssm-k-last")
@@ -219,6 +223,56 @@ def run_profile_requests(model_path: str, num_requests: int = 8, input_len: int 
     return result.returncode == 0
 
 
+def run_one_batch_profile(
+    batch_size: int = 1,
+    input_len: int = 1024,
+    output_len: int = 8,
+    profile_steps: int = 5,
+    profile_output_dir: str = None,
+    profile_prefix: str = None,
+):
+    """Run bench_one_batch_server.py with --profile to get trace.
+    
+    This uses the already-running server via --base-url.
+    """
+    print(f"\n{'='*60}")
+    print(f"Running one-batch profiling: batch_size={batch_size}, input_len={input_len}, output_len={output_len}")
+    print(f"profile_steps={profile_steps}, output_dir={profile_output_dir}")
+    print(f"{'='*60}")
+    
+    os.makedirs(profile_output_dir, exist_ok=True)
+    
+    cmd = [
+        "python", "-m", "sglang.bench_one_batch_server",
+        "--model", "None",  # Use existing server
+        "--base-url", f"http://{SERVER_HOST}:{SERVER_PORT}",
+        "--batch-size", str(batch_size),
+        "--input-len", str(input_len),
+        "--output-len", str(output_len),
+        "--profile",
+        "--profile-steps", str(profile_steps),
+        "--profile-by-stage",
+        "--profile-output-dir", profile_output_dir,
+    ]
+    if profile_prefix:
+        cmd += ["--profile-prefix", profile_prefix]
+    
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{SGLANG_GDN_PATH}/python:{env.get('PYTHONPATH', '')}"
+    
+    print(f"Command: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1200)
+    
+    print("=== STDOUT ===")
+    print(result.stdout)
+    if result.stderr:
+        print("=== STDERR ===")
+        print(result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr)
+    
+    print(f"One-batch profiling completed. Return code: {result.returncode}")
+    return result.returncode == 0
+
+
 def stop_profiling():
     """Stop torch profiling via HTTP API."""
     url = f"http://{SERVER_HOST}:{SERVER_PORT}/stop_profile"
@@ -235,7 +289,8 @@ def stop_profiling():
 
 
 def run_benchmark(model_path: str, num_prompts: int, input_len: int, output_len: int, result_file: str, seed: int = 42, 
-                  enable_profile: bool = False, profile_num_steps: int = 5, profile_activities: list = None, profile_output_dir: str = None):
+                  enable_profile: bool = False, profile_num_steps: int = 5, profile_activities: list = None, profile_output_dir: str = None,
+                  profile_batch_size: int = 1, profile_input_len: int = None, profile_prefix: str = None):
     """Run benchmark."""
     print(f"\nRunning benchmark: {num_prompts} prompts (seed={seed})...")
     
@@ -257,19 +312,18 @@ def run_benchmark(model_path: str, num_prompts: int, input_len: int, output_len:
     
     result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1200)
     
-    # Run profiling if enabled: start profiler, run requests to trigger steps, then stop
+    # Run profiling if enabled: use bench_one_batch_server --profile for better traces
     if enable_profile and profile_output_dir:
-        print("\n" + "="*60)
-        print("Running profiling...")
-        print("="*60)
-        os.makedirs(profile_output_dir, exist_ok=True)
-        if start_profiling(profile_output_dir, profile_num_steps, profile_activities or ["CPU", "GPU"]):
-            # Run additional requests to trigger profiling steps
-            run_profile_requests(model_path, num_requests=num_prompts, input_len=input_len, output_len=output_len, seed=seed)
-            # Give some time for profiler to flush
-            import time
-            time.sleep(2)
-            stop_profiling()
+        # Use profile_input_len if specified, otherwise use input_len
+        actual_profile_input_len = profile_input_len if profile_input_len is not None else input_len
+        run_one_batch_profile(
+            batch_size=profile_batch_size,
+            input_len=actual_profile_input_len,
+            output_len=output_len,
+            profile_steps=profile_num_steps,
+            profile_output_dir=profile_output_dir,
+            profile_prefix=profile_prefix,
+        )
     
     # Save benchmark output
     output_file = result_file.replace(".jsonl", "_output.txt")
@@ -487,6 +541,12 @@ def main():
         action="store_true",
         help="Pass --skip-server-warmup when launching server (useful for profiling).",
     )
+    parser.add_argument(
+        "--chunked-prefill-size",
+        type=int,
+        default=None,
+        help="Chunked prefill size for the server (e.g., 32768 for 8192*4)",
+    )
     # Dataset accuracy eval (GSM8K)
     parser.add_argument(
         "--gsm8k-eval",
@@ -523,6 +583,18 @@ def main():
         nargs="+",
         default=["CPU", "GPU"],
         help="Profiling activities: CPU, GPU, MEM (default: CPU GPU)",
+    )
+    parser.add_argument(
+        "--profile-batch-size",
+        type=int,
+        default=1,
+        help="Batch size for profiling (default: 1)",
+    )
+    parser.add_argument(
+        "--profile-input-len",
+        type=int,
+        default=None,
+        help="Input length for profiling. If not set, uses --input-len. Set to larger value (e.g. 4096) for meaningful prefill traces.",
     )
     args = parser.parse_args()
 
@@ -566,6 +638,7 @@ def main():
                 disable_cuda_graph=(args.disable_cuda_graph or args.gsm8k_eval or args.mmlu_eval),
                 disable_speculative=args.disable_speculative,
                 skip_server_warmup=args.skip_server_warmup,
+                chunked_prefill_size=args.chunked_prefill_size,
             )
             wait_for_server._process = process
             if wait_for_server():
@@ -594,7 +667,10 @@ def main():
                         enable_profile=args.enable_profile,
                         profile_num_steps=args.profile_num_steps,
                         profile_activities=args.profile_activities,
-                        profile_output_dir=os.path.join(log_dir, "profile_klast") if args.enable_profile else None
+                        profile_output_dir=os.path.join(log_dir, "profile_klast") if args.enable_profile else None,
+                        profile_batch_size=args.profile_batch_size,
+                        profile_input_len=args.profile_input_len,
+                        profile_prefix="klast",
                     )
             cleanup_server(process)
             time.sleep(5)
@@ -611,6 +687,7 @@ def main():
                 disable_cuda_graph=(args.disable_cuda_graph or args.gsm8k_eval or args.mmlu_eval),
                 disable_speculative=args.disable_speculative,
                 skip_server_warmup=args.skip_server_warmup,
+                chunked_prefill_size=args.chunked_prefill_size,
             )
             wait_for_server._process = process
             if wait_for_server():
@@ -639,7 +716,10 @@ def main():
                         enable_profile=args.enable_profile,
                         profile_num_steps=args.profile_num_steps,
                         profile_activities=args.profile_activities,
-                        profile_output_dir=os.path.join(log_dir, "profile_vlast") if args.enable_profile else None
+                        profile_output_dir=os.path.join(log_dir, "profile_vlast") if args.enable_profile else None,
+                        profile_batch_size=args.profile_batch_size,
+                        profile_input_len=args.profile_input_len,
+                        profile_prefix="vlast",
                     )
             cleanup_server(process)
         

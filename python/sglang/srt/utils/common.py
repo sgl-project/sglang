@@ -1963,6 +1963,71 @@ def get_device_core_count(device_id: int = 0) -> int:
     return 0
 
 
+_device_properties_cache = {}
+_device_capability_cache = {}
+
+
+def enable_device_properties_caching():
+    """Monkey patch torch.cuda.get_device_properties/capability to use caching.
+    
+    This is critical for performance because some libraries (e.g. cutlass/flashinfer)
+    may call these APIs on the hot path, causing significant overhead (5-15us per call).
+    """
+    if not hasattr(torch, "cuda") or not torch.cuda.is_available():
+        return
+
+    # Store original functions if not already patched
+    if getattr(torch.cuda, "_sglang_patched", False):
+        return
+
+    _orig_get_device_properties = torch.cuda.get_device_properties
+    _orig_get_device_capability = torch.cuda.get_device_capability
+    
+    # Define cached wrappers
+    def cached_get_device_properties(device):
+        # Handle device objects or indices similar to PyTorch implementation
+        if isinstance(device, torch.device):
+            index = device.index if device.index is not None else torch.cuda.current_device()
+        elif isinstance(device, str):
+            if ":" in device:
+                index = int(device.split(":")[-1])
+            else:
+                index = torch.cuda.current_device()
+        elif device is None:
+             index = torch.cuda.current_device()
+        else:
+            index = int(device)
+            
+        if index not in _device_properties_cache:
+            _device_properties_cache[index] = _orig_get_device_properties(index)
+        return _device_properties_cache[index]
+
+    def cached_get_device_capability(device=None):
+        # Handle device objects or indices
+        if isinstance(device, torch.device):
+            index = device.index if device.index is not None else torch.cuda.current_device()
+        elif isinstance(device, str):
+            if ":" in device:
+                index = int(device.split(":")[-1])
+            else:
+                index = torch.cuda.current_device()
+        elif device is None:
+             index = torch.cuda.current_device()
+        else:
+            index = int(device)
+
+        if index not in _device_capability_cache:
+            _device_capability_cache[index] = _orig_get_device_capability(index)
+        return _device_capability_cache[index]
+
+    # Apply patch
+    torch.cuda.get_device_properties = cached_get_device_properties
+    torch.cuda.get_device_capability = cached_get_device_capability
+    torch.cuda._sglang_patched = True
+    logger.info("Monkey patched torch.cuda.get_device_properties/capability with caching.")
+
+
+
 def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
     major, minor = None, None
     if hasattr(torch, "cuda") and torch.cuda.is_available():
