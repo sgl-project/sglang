@@ -147,8 +147,18 @@ class SchedulerOutputProcessorMixin:
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
-                    req.check_finished()
 
+                    # update reasoning tokens
+                    if (
+                        req.require_reasoning
+                        and self.tokenizer
+                        and hasattr(self.tokenizer, "think_end_id")
+                    ):
+                        req.update_reasoning_tokens(
+                            next_token_id, self.tokenizer.think_end_id
+                        )
+
+                    req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
@@ -208,16 +218,6 @@ class SchedulerOutputProcessorMixin:
                             )
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
-
-                    # update reasoning tokens
-                    if (
-                        req.require_reasoning
-                        and self.tokenizer
-                        and hasattr(self.tokenizer, "think_end_id")
-                    ):
-                        req.update_reasoning_tokens(
-                            next_token_id, self.tokenizer.think_end_id
-                        )
 
                     trace_slice(
                         RequestStage.PREFILL_FORWARD,
