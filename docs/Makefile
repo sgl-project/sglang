@@ -56,6 +56,26 @@ compile:
 	echo "Total execution time: $${TOTAL_ELAPSED}s" >> logs/timing.log; \
 	echo "All Notebook execution timings:" && cat logs/timing.log
 
+# Convert Notebook files to Markdown artifacts (no execution)
+markdown:
+	@set -e; \
+	echo "Exporting notebooks to Markdown..."; \
+	mkdir -p "$(BUILDDIR)/md"; \
+	find $(SOURCEDIR) -path "*/_build/*" -prune -o -name "*.ipynb" -print0 | \
+		parallel -0 -j3 --halt soon,fail=1 ' \
+		NB_SRC="{}"; \
+		REL_DIR=$$(dirname "$$NB_SRC"); \
+		NB_NAME=$$(basename "$$NB_SRC"); \
+		NB_BASE=$${NB_NAME%.ipynb}; \
+		OUT_DIR="$(BUILDDIR)/md/$$REL_DIR"; \
+		mkdir -p "$$OUT_DIR"; \
+		jupyter nbconvert --to markdown "$$NB_SRC" \
+			--output "$$NB_BASE.md" \
+			--output-dir "$$OUT_DIR" \
+			>/dev/null; \
+		' || exit 1; \
+	echo "Markdown artifacts written to: $(BUILDDIR)/md"
+
 # Serve documentation with auto-build and live reload
 serve:
 	@echo "Starting auto-build server at http://0.0.0.0:$(PORT)"
