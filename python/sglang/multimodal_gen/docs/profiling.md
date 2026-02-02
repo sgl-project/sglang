@@ -1,5 +1,5 @@
 > **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/profiling.md](../../../../docs/diffusion/profiling.md)
+> Please see: [docs/diffusion/performance/profiling.md](../../../../docs/diffusion/performance/profiling.md)
 >
 > This file is kept for backward compatibility and will be deprecated in a future release.
 

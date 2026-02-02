@@ -2,6 +2,10 @@
 
 The SGLang diffusion HTTP server implements an OpenAI-compatible API for image and video generation, as well as LoRA adapter management.
 
+## Prerequisites
+
+- Python 3.11+ if you plan to use the OpenAI Python SDK.
+
 ## Serve
 
 Launch the server using the `sglang serve` command.

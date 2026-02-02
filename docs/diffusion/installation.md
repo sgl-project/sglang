@@ -1,10 +1,10 @@
-# Install SGLang-diffusion
+# Install SGLang-Diffusion
 
-You can install sglang-diffusion using one of the methods below.
+You can install SGLang-Diffusion using one of the methods below.
 
-This page primarily applies to common NVIDIA GPU platforms. For AMD Instinct/ROCm environments see the dedicated [ROCm quickstart](installation_rocm.md), which lists the exact steps (including kernel builds) we used to validate sgl-diffusion on MI300X.
+## Standard Installation (NVIDIA GPUs)
 
-## Method 1: With pip or uv
+### Method 1: With pip or uv
 
 It is recommended to use uv for a faster installation:
 
@@ -14,7 +14,7 @@ pip install uv
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
-## Method 2: From source
+### Method 2: From source
 
 ```bash
 # Use the latest release branch
@@ -29,7 +29,7 @@ pip install -e "python[diffusion]"
 uv pip install -e "python[diffusion]" --prerelease=allow
 ```
 
-## Method 3: Using Docker
+### Method 3: Using Docker
 
 The Docker images are available on Docker Hub at [lmsysorg/sglang](https://hub.docker.com/r/lmsysorg/sglang), built from the [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/Dockerfile).
 Replace `<secret>` below with your HuggingFace Hub [token](https://huggingface.co/docs/hub/en/security-tokens).
@@ -52,3 +52,17 @@ docker run --gpus all \
             --save-output \
     '
 ```
+
+## Platform-Specific: ROCm (AMD GPUs)
+
+For AMD Instinct GPUs (e.g., MI300X), you can use the ROCm-enabled Docker image:
+
+```bash
+docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  --env HF_TOKEN=<secret> \
+  lmsysorg/sglang:v0.5.5.post2-rocm700-mi30x \
+  sglang generate --model-path black-forest-labs/FLUX.1-dev --prompt "A logo With Bold Large text: SGL Diffusion" --save-output
+```
+
+For detailed ROCm system configuration and installation from source, see [AMD GPUs](../../platforms/amd_gpu.md).

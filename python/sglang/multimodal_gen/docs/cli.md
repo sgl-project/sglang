@@ -1,5 +1,5 @@
 > **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/cli.md](../../../../docs/diffusion/cli.md)
+> Please see: [docs/diffusion/api/cli.md](../../../../docs/diffusion/api/cli.md)
 >
 > This file is kept for backward compatibility and will be deprecated in a future release.
 

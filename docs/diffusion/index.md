@@ -44,26 +44,26 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 ### Getting Started
 
 - **[Installation](installation.md)** - Install SGLang Diffusion via pip, uv, Docker, or from source
-- **[ROCm Installation](installation_rocm.md)** - ROCm-specific setup for AMD GPUs
 - **[Compatibility Matrix](compatibility_matrix.md)** - Supported models and optimization compatibility
 
 ### Usage
 
-- **[CLI Documentation](cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
-- **[OpenAI API](openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
-- **[Attention Backends](attention_backends.md)** - Available attention backends (FlashAttention, SageAttention, etc.)
+- **[CLI Documentation](api/cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
+- **[OpenAI API](api/openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
 
-### Performance
+### Performance Optimization
 
-- **[Caching Overview](cache/)** - Overview of caching acceleration strategies
-- **[Cache-DiT](cache/cache_dit.md)** - Block-level caching for DiT models (up to 1.69x speedup)
-- **[Profiling](profiling.md)** - Profiling techniques with PyTorch Profiler and Nsight Systems
+- **[Performance Overview](performance/index.md)** - Overview of all performance optimization strategies
+- **[Attention Backends](performance/attention_backends.md)** - Available attention backends (FlashAttention, SageAttention, etc.)
+- **[Caching Strategies](performance/cache/)** - Cache-DiT and TeaCache acceleration
+- **[Profiling](performance/profiling.md)** - Profiling techniques with PyTorch Profiler and Nsight Systems
 
 ### Reference
 
 - **[Environment Variables](environment_variables.md)** - Configuration via environment variables
 - **[Contributing](contributing.md)** - Contribution guidelines and commit message conventions
 - **[Support New Models](support_new_models.md)** - Guide for adding new diffusion models
+- **[CI Performance](ci_perf.md)** - Performance baseline generation script
 
 ### Diffusion Language Models
 

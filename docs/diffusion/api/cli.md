@@ -5,7 +5,6 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ## Prerequisites
 
 - A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
-- Python 3.11+ if you plan to use the OpenAI Python SDK.
 
 
 ## Supported Arguments
@@ -183,7 +182,7 @@ export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
 export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables Documentation](environment_variables.md) for more details.
+See [Environment Variables Documentation](../environment_variables.md) for more details.
 
 ## Generate
 

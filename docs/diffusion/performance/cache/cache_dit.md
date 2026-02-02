@@ -1,9 +1,5 @@
 # Cache-DiT Acceleration
 
-> **Note**: This is one of two caching strategies available in SGLang.
-> For an overview of all caching options, see [caching](index.md).
-> For TeaCache documentation, see [teacache](teacache.md).
-
 SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to **1.69x inference speedup** with minimal quality loss.
 
 ## Overview
@@ -178,22 +174,8 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 ## Environment Variables
 
-All Cache-DiT parameters can be set via the following environment variables:
-
-| Environment Variable                | Default | Description                              |
-|-------------------------------------|---------|------------------------------------------|
-| `SGLANG_CACHE_DIT_ENABLED`          | false   | Enable Cache-DiT acceleration            |
-| `SGLANG_CACHE_DIT_FN`               | 1       | First N blocks to always compute         |
-| `SGLANG_CACHE_DIT_BN`               | 0       | Last N blocks to always compute          |
-| `SGLANG_CACHE_DIT_WARMUP`           | 4       | Warmup steps before caching              |
-| `SGLANG_CACHE_DIT_RDT`              | 0.24    | Residual difference threshold            |
-| `SGLANG_CACHE_DIT_MC`               | 3       | Max continuous cached steps              |
-| `SGLANG_CACHE_DIT_TAYLORSEER`       | false   | Enable TaylorSeer calibrator             |
-| `SGLANG_CACHE_DIT_TS_ORDER`         | 1       | TaylorSeer order (1 or 2)                |
-| `SGLANG_CACHE_DIT_SCM_PRESET`       | none    | SCM preset (none/slow/medium/fast/ultra) |
-| `SGLANG_CACHE_DIT_SCM_POLICY`       | dynamic | SCM caching policy                       |
-| `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set | Custom SCM compute bins                  |
-| `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set | Custom SCM cache bins                    |
+All Cache-DiT parameters can be configured via environment variables.
+See [Environment Variables](../../environment_variables.md) for the complete list.
 
 ## Supported Models
 

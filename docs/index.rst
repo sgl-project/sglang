@@ -87,19 +87,19 @@ Its core features include:
 
    diffusion/index
    diffusion/installation
-   diffusion/installation_rocm
    diffusion/compatibility_matrix
-   diffusion/cli
-   diffusion/openai_api
-   diffusion/attention_backends
-   diffusion/cache/index
-   diffusion/cache/cache_dit
-   diffusion/cache/teacache
-   diffusion/profiling
+   diffusion/api/cli
+   diffusion/api/openai_api
+   diffusion/performance/index
+   diffusion/performance/attention_backends
+   diffusion/performance/profiling
+   diffusion/performance/cache/index
+   diffusion/performance/cache/cache_dit
+   diffusion/performance/cache/teacache
+   diffusion/support_new_models
+   diffusion/contributing
    diffusion/ci_perf
    diffusion/environment_variables
-   diffusion/contributing
-   diffusion/support_new_models
    diffusion/language_models/index
 
 .. toctree::

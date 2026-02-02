@@ -1,5 +1,5 @@
 > **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/attention_backends.md](../../../../docs/diffusion/attention_backends.md)
+> Please see: [docs/diffusion/performance/attention_backends.md](../../../../docs/diffusion/performance/attention_backends.md)
 >
 > This file is kept for backward compatibility and will be deprecated in a future release.
 

@@ -1,5 +1,5 @@
 > **NOTE:** This documentation has been moved to the main SGLang documentation site.
-> Please see: [docs/diffusion/openai_api.md](../../../../docs/diffusion/openai_api.md)
+> Please see: [docs/diffusion/api/openai_api.md](../../../../docs/diffusion/api/openai_api.md)
 >
 > This file is kept for backward compatibility and will be deprecated in a future release.
 
