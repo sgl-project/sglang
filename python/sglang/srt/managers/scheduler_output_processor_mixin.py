@@ -423,17 +423,17 @@ class SchedulerOutputProcessorMixin:
         else:
             # for normal spec decoding: unify next_token_ids format
             next_token_ids = []
-            cum_num_token_ids = 0
+            cum_num_tokens = 0
             next_token_ids_list = result.next_token_ids.tolist()
 
             for i, req in enumerate(batch.reqs):
                 accept_length = result.accept_length_per_req_cpu[i]
                 next_token_ids.append(
                     next_token_ids_list[
-                        cum_num_token_ids : cum_num_token_ids + accept_length + 1
+                        cum_num_tokens : cum_num_tokens + accept_length + 1
                     ]
                 )
-                cum_num_token_ids += accept_length + 1
+                cum_num_tokens += accept_length + 1
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
