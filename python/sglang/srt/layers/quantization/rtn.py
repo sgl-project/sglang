@@ -142,57 +142,80 @@ class RTNConfig(QuantizationConfig):
         return []
 
 
-class RTNTensor:
-    """A wrapper over Tensor that enables quantization on-the-fly by
-    overloading the copy_ method.
-    """
+class RTNTensor(torch.Tensor):
+    """A Tensor subclass that quantizes on-the-fly via copy_."""
+
+    @staticmethod
+    def _base_tensor(data: torch.Tensor) -> torch.Tensor:
+        if hasattr(data, "as_subclass"):
+            return data.as_subclass(torch.Tensor)
+        return data
+
+    @staticmethod
+    def __new__(
+        cls, data: torch.Tensor, scale: torch.Tensor, quant_config: RTNConfig
+    ) -> "RTNTensor":
+        base = RTNTensor._base_tensor(data)
+        return torch.Tensor._make_subclass(cls, base, False)
 
     def __init__(
         self, data: torch.Tensor, scale: torch.Tensor, quant_config: RTNConfig
     ) -> None:
-        self.data = data
         self.scale = scale
         self.quant_config = quant_config
+        self._packed_shape = self._base_tensor(data).shape
 
-    def dim(self):
-        """Return number of dimensions, matching torch.Tensor.dim() behavior"""
-        return len(self.shape)
+    def _logical_shape(self) -> torch.Size:
+        factor = 1 if self.quant_config.weight_bits == 8 else 2
+        batch_present = len(self._packed_shape) == 3
+        if batch_present:
+            return torch.Size(
+                (
+                    self._packed_shape[0],
+                    self._packed_shape[1] * factor,
+                    self._packed_shape[2],
+                )
+            )
+        return torch.Size((self._packed_shape[0] * factor, self._packed_shape[1]))
 
     @property
-    def __class__(self):
-        """Make isinstance(rtn_tensor, torch.Tensor) return True"""
-        return torch.Tensor
+    def shape(self):
+        return self._logical_shape()
+
+    def size(self, dim: Optional[int] = None):
+        shape = self._logical_shape()
+        if dim is None:
+            return shape
+        return shape[dim]
+
+    def dim(self):
+        return len(self._logical_shape())
 
     def narrow(self, dim, start, length):
         factor = 1 if self.quant_config.weight_bits == 8 else 2
         return RTNTensor(
-            self.data.narrow(dim, start // factor, length // factor),
+            self._base_tensor(super().narrow(dim, start // factor, length // factor)),
             self.scale.narrow(dim, start, length),
             self.quant_config,
         )
 
     def __getitem__(self, key):
-        return RTNTensor(self.data[key], self.scale[key], self.quant_config)
+        return RTNTensor(
+            self._base_tensor(super().__getitem__(key)),
+            self.scale[key],
+            self.quant_config,
+        )
 
-    @property
-    def shape(self):
-        shape = self.data.shape
-        factor = 1 if self.quant_config.weight_bits == 8 else 2
-        batch_present = len(shape) == 3
-        if batch_present:
-            return torch.Size((shape[0], shape[1] * factor, shape[2]))
-        else:
-            return torch.Size((shape[0] * factor, shape[1]))
-
-    def copy_(self, loaded_weight: torch.Tensor) -> None:
+    def copy_(self, loaded_weight: torch.Tensor) -> "RTNTensor":
         qweight, weight_scale = rtn_quantize(
-            loaded_weight.cuda(),
+            loaded_weight.to(self.device, non_blocking=True),
             self.quant_config.weight_bits,
             self.quant_config.group_size,
         )
 
-        self.data.copy_(qweight)
+        super().copy_(qweight)
         self.scale.data.copy_(weight_scale)
+        return self
 
 
 class RTNParameter(Parameter):
@@ -544,43 +567,6 @@ def init_workspace(device):
     global _rtn_marlin_workspace
     if _rtn_marlin_workspace is None or _rtn_marlin_workspace.device != device:
         _rtn_marlin_workspace = marlin_make_workspace(device, max_blocks_per_sm=4)
-
-
-# Copied from sglang/srt/layers/quantization/gptq.py to avoid circular import
-def gptq_marlin_moe_repack(
-    b_q_weight: torch.Tensor,
-    perm: torch.Tensor,
-    size_k: int,
-    size_n: int,
-    num_bits: int,
-) -> torch.Tensor:
-    from sgl_kernel import gptq_marlin_repack
-
-    num_experts = b_q_weight.shape[0]
-    assert size_k % 16 == 0
-    output = torch.empty(
-        (num_experts, size_k // 16, size_n * (num_bits // 2)),
-        device=b_q_weight.device,
-        dtype=b_q_weight.dtype,
-    )
-    for e in range(num_experts):
-        output[e] = gptq_marlin_repack(b_q_weight[e], perm[e], size_k, size_n, num_bits)
-    return output
-
-
-def pack_columns(
-    q_w: torch.Tensor,
-    num_bits: int,
-    size_k: int,
-    size_n: int,
-) -> torch.Tensor:
-    pack_factor = 32 // num_bits
-    q_res = torch.zeros(
-        (size_k, size_n // pack_factor), dtype=torch.int32, device=q_w.device
-    )
-    for i in range(pack_factor):
-        q_res |= q_w[:, i::pack_factor].to(torch.int32) << (num_bits * i)
-    return q_res
 
 
 class RTNMarlinLinearMethod(LinearMethodBase):
