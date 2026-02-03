@@ -264,9 +264,10 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
                 ],
                 dim=-1,
             )
-            .reshape(f, 1, -1)
+            .reshape(f, -1)
             .to(x.device)
         )
+        freqs = torch.cat([freqs.real, freqs.imag], dim=-1)
 
         def create_custom_forward(module):
             def custom_forward(*inputs):

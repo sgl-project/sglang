@@ -28,11 +28,17 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 
 # @torch.compile(fullgraph=True)
@@ -72,25 +78,6 @@ def precompute_freqs_cis(
     freqs = torch.outer(pos, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
-
-
-def rope_apply(x, freqs, num_heads):
-    x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
-
-
-def rope_apply_head_dim(x, freqs, head_dim):
-    x = rearrange(x, "b s (n d) -> b s n d", d=head_dim)
-    x_out = torch.view_as_complex(
-        x.to(torch.float64).reshape(x.shape[0], x.shape[1], x.shape[2], -1, 2)
-    )
-    # print(f"{x_out.shape = }, {freqs.shape = }")
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
 
 
 class SelfAttention(nn.Module):
@@ -159,8 +146,13 @@ class SelfAttention(nn.Module):
             k = self.norm_k(k)
 
         # Apply RoPE
-        q = rope_apply_head_dim(q, freqs, self.head_dim)
-        k = rope_apply_head_dim(k, freqs, self.head_dim)
+        if _is_cuda and q.shape == k.shape:
+            q, k = apply_flashinfer_rope_qk_inplace(q, k, freqs, is_neox=False)
+        else:
+            cos, sin = freqs.unbind(-1)
+            q, k = _apply_rotary_emb(
+                q, cos, sin, is_neox_style=False
+            ), _apply_rotary_emb(k, cos, sin, is_neox_style=False)
 
         # USPAttention expects [B, S_local, H, D] format
         q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
@@ -528,9 +520,10 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
                 ],
                 dim=-1,
             )
-            .reshape(f * h * w, 1, -1)
+            .reshape(f * h * w, -1)
             .to(x.device)
         )
+        freqs = torch.cat([freqs.real, freqs.imag], dim=-1)
 
         def create_custom_forward(module):
             def custom_forward(*inputs):
