@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -132,6 +133,7 @@ class RadixAttention(nn.Module):
 
 
 @register_custom_op(mutates_args=["output"])
+@register_split_op()
 def unified_attention_with_output(
     query: torch.Tensor,
     key: torch.Tensor,

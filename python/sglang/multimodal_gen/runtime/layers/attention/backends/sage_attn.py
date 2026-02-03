@@ -68,4 +68,7 @@ class SageAttentionImpl(AttentionImpl):
             sm_scale=self.softmax_scale,
             return_lse=return_softmax_lse,
         )
+        if return_softmax_lse:
+            output, softmax_lse = output
+            return output, softmax_lse
         return output

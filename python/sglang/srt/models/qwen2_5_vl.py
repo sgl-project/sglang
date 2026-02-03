@@ -76,7 +76,9 @@ from sglang.srt.models.utils import RotaryPosMixin, WeightsMapper, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
+
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +330,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             1 if use_data_parallel else get_tensor_model_parallel_world_size()
         )
         self.max_context_len = max_context_len
-        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
+        self.enable_cg = _is_cuda and envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = None
+        if self.enable_cg:
+            self.cuda_graph_runner = ViTCudaGraphRunner(self)
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
@@ -400,7 +406,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        if self.enable_cg:
             return self.forward_with_cuda_graph(x, grid_thw)
 
         # patchify

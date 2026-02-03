@@ -9,39 +9,18 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
     attn_tp_all_gather_into_tensor,
+    get_attention_dp_rank,
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import ceil_align, ceil_div
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-
-NSA_DUAL_STREAM = get_bool_env_var("SGLANG_NSA_DUAL_STREAM", "true")
-NSA_FUSE_TOPK = get_bool_env_var("SGLANG_NSA_FUSE_TOPK", "true")
-
-NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8 = get_bool_env_var(
-    "SGLANG_NSA_FLASHMLA_BACKEND_DECODE_COMPUTE_FP8", "true"
-)
-NSA_QUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_QUANT_K_CACHE_FAST", "true")
-NSA_DEQUANT_K_CACHE_FAST = get_bool_env_var("SGLANG_NSA_DEQUANT_K_CACHE_FAST", "true")
-
-# Environment variable to control mtp precomputing of metadata for multi-step speculative decoding
-NSA_ENABLE_MTP_PRECOMPUTE_METADATA = get_bool_env_var(
-    "SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA", "true"
-)
-
-
-def print_nsa_bool_env_vars():
-    msg = ""
-    for k, v in globals().items():
-        if k.startswith("NSA_") and isinstance(v, bool):
-            msg += f"{k}={v} "
-    print(msg, flush=True)
 
 
 def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
@@ -105,12 +84,33 @@ def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
 
-def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
+def cal_padded_tokens(forward_batch: "ForwardBatch"):
+    # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
+    # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
+    global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
+    sync_group_size = len(global_num_tokens)
     attn_tp_size = get_attention_tp_size()
-    if attn_tp_size == 1 or not can_nsa_prefill_cp_round_robin_split(forward_batch):
+    for i in range(sync_group_size):
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+    dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+        forward_batch.is_extend_in_batch, global_num_tokens
+    )
+    if dp_padding_mode.is_max_len():
+        tokens = max(global_num_tokens)
+    elif len(global_num_tokens) > 1:
+        tokens = global_num_tokens[get_attention_dp_rank()]
+    else:
+        tokens = global_num_tokens[0]
+    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+        tokens = ceil_div(tokens, attn_tp_size)
+    return tokens
+
+
+def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
+    if forward_batch.global_num_tokens_cpu is None:
         return nsa_cache_seqlens
-    tokens = sum(forward_batch.extend_seq_lens_cpu)
-    pad_len = (tokens - 1) // attn_tp_size + 1 - nsa_cache_seqlens.shape[0]
+    tokens = cal_padded_tokens(forward_batch)
+    pad_len = tokens - nsa_cache_seqlens.shape[0]
     if pad_len > 0:
         nsa_cache_seqlens = torch.cat(
             [
