@@ -1532,6 +1532,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if not isinstance(recv_obj, BatchEmbeddingOutput):
                 meta_info.update(
                     {
+                        "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
