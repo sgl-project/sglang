@@ -86,6 +86,11 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
+    def get_nsa_extend_len_cpu(self) -> List[int]:
+        """
+        Return: extend seq lens for each batch.
+        """
+
     def get_token_to_batch_idx(self) -> torch.Tensor:
         """
         Return: batch idx for each token.
@@ -390,6 +395,9 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
+        # When attn_tp_size > 1 or in the MAX_LEN padding mode, padding may exist in the hidden states,
+        # and it is necessary to extract the actual q length.
+        q_offset = sum(metadata.get_nsa_extend_len_cpu())
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -416,9 +424,9 @@ class Indexer(MultiPlatformOp):
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8,
+                q_fp8[:q_offset],
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset],
                 seqlens_32,
                 block_tables,
                 schedule_metadata,
@@ -428,6 +436,16 @@ class Indexer(MultiPlatformOp):
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
+        # Restore possible padding exist in the hidden states.
+        if not _is_hip and q_offset < q_fp8.shape[0]:
+            pad_len = q_fp8.shape[0] - q_offset
+            padding = torch.full(
+                (pad_len, topk_result.shape[1]),
+                -1,
+                dtype=topk_result.dtype,
+                device=topk_result.device,
+            )
+            topk_result = torch.cat([topk_result, padding], dim=0)
         return topk_result
 
     def _should_chunk_mqa_logits(
@@ -956,11 +974,11 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             weights = self._project_and_scale_head_gates(x)
+            query, key = self._get_q_k_bf16(
+                q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
+            )
+            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             with torch.cuda.stream(self.alt_stream):
-                query, key = self._get_q_k_bf16(
-                    q_lora, x, positions, False, forward_batch=forward_batch
-                )
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
             current_stream.wait_stream(self.alt_stream)
             weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
@@ -1226,7 +1244,7 @@ class Indexer(MultiPlatformOp):
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
-                actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0)
+                actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (

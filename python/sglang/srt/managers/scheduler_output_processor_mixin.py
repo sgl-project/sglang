@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -16,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     BaseFinishReason,
     Req,
     RequestStage,
@@ -122,7 +124,19 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions
             logprob_pt = 0
 
+            deadline = -1
+            if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+                deadline = time.perf_counter() - timeout_ms / 1000.0
+
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if (
+                    not req.finished()
+                    and 0 < req.time_stats.forward_entry_time < deadline
+                ):
+                    req.to_finish = FINISH_ABORT(
+                        "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
@@ -287,6 +301,16 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                adder=self.adder,
+                can_run_list=self.can_run_list,
+                running_bs=self.running_bs,
+                running_bs_offline_batch=0,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
@@ -356,6 +380,16 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                adder=self.adder,
+                can_run_list=self.can_run_list,
+                running_bs=self.running_bs,
+                running_bs_offline_batch=0,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -388,9 +422,19 @@ class SchedulerOutputProcessorMixin:
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
+        deadline = -1
+        if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+            deadline = time.perf_counter() - timeout_ms / 1000.0
+
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
+
+            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                # req.set_finish_with_abort()
+                req.to_finish = FINISH_ABORT(
+                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                )
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.

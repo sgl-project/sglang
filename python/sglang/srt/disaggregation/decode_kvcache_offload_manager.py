@@ -211,7 +211,7 @@ class DecodeKVCacheOffloadManager:
         # Free the incremental part of the request (NSA-aware)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
         self.token_to_kv_pool_allocator.free(kv_indices)
-        self.req_to_token_pool.free(req.req_pool_idx)
+        self.req_to_token_pool.free(req)
         self.tree_cache.protected_size_ -= len(req.prefix_indices)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
