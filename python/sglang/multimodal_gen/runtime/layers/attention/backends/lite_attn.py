@@ -53,10 +53,13 @@ def _fa3(
 ):
     bsz, qlen, nheads_q = q.shape[:3]
     dv = v.shape[-1]
+    q_ = q.contiguous()
+    k_ = k.contiguous()
+    v_ = v.contiguous()
     out = flash_attn_varlen_func_upstream(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
+        q_,
+        k_,
+        v_,
         None,
         None,
         qlen,
@@ -86,13 +89,19 @@ def lite_attn_func_op(
     lite = _LITE_ATTN.get(int(handle))
     if lite is None:
         raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
-    return lite(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
+    bsz, qlen, nheads_q = q.shape[:3]
+    dv = v.shape[-1]
+    q_ = q.contiguous()
+    k_ = k.contiguous()
+    v_ = v.contiguous()
+    out = lite(
+        q_,
+        k_,
+        v_,
         scale=softmax_scale,
         return_softmax_lse=False,
     )
+    return out.reshape(bsz, qlen, nheads_q, dv)
 
 
 @register_custom_op(fake_impl=lite_attn_fake_out_lse)
@@ -110,13 +119,19 @@ def lite_attn_func_op_lse(
     lite = _LITE_ATTN.get(int(handle))
     if lite is None:
         raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
-    return lite(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
+    bsz, qlen, nheads_q = q.shape[:3]
+    dv = v.shape[-1]
+    q_ = q.contiguous()
+    k_ = k.contiguous()
+    v_ = v.contiguous()
+    out_tensor, softmax_lse = lite(
+        q_,
+        k_,
+        v_,
         scale=softmax_scale,
         return_softmax_lse=True,
     )
+    return out_tensor.reshape(bsz, qlen, nheads_q, dv), softmax_lse
 
 
 def _get_lite_attn_params_from_server_args() -> dict[str, Any]:
