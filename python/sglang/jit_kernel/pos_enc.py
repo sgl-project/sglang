@@ -16,6 +16,14 @@ def _jit_rotary_embedding_module() -> Module:
         "rotary_embedding",
         cuda_files=["elementwise/pos_enc.cuh"],
         cuda_wrappers=[("rotary_embedding", "RotaryEmbeddingKernel::run")],
+        extra_ldflags=[
+            "-L/usr/local/lib/python3.12/dist-packages/torch/lib",
+            "-lc10",
+            "-ltorch",
+        ],
+        extra_include_paths=[
+            "/usr/local/lib/python3.12/dist-packages/torch/include",
+        ],
     )
 
 
