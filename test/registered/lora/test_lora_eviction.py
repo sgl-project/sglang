@@ -23,8 +23,8 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=224, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=224, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=224, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=224, suite="stage-b-test-large-1-gpu-amd")
 
 PROMPTS = [
     "AI is a field of computer science focused on",
@@ -102,6 +102,9 @@ class TestLoRAEviction(CustomTestCase):
             enable_lora=True,
             max_lora_rank=256,
             lora_target_modules=["all"],
+            attention_backend="fa3",
+            disable_cuda_graph=True,
+            enable_deterministic_inference=True,
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 
