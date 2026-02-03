@@ -595,6 +595,11 @@ class DenoisingStage(PipelineStage):
                 None,
             )
 
+        # Used for sequence shard
+        batch.sp_shard_mode = getattr(
+            server_args.pipeline_config, "sp_shard_mode", "frame"
+        )
+
         # Handle sequence parallelism after TI2V processing
         self._preprocess_sp_latents(batch, server_args)
         latents = batch.latents

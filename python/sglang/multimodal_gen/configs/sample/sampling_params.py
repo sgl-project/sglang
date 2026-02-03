@@ -367,6 +367,10 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        if getattr(pipeline_config, "sp_shard_mode", "frame") == "sequence":
+            self.adjust_frames = False
+            logger.info(f"Sequence parallelism is enabled, disabling frame adjustment")
+
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
