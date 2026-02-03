@@ -3,8 +3,8 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING, Optional
 from functools import lru_cache
+from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
@@ -282,14 +282,14 @@ def is_peo_enabled() -> bool:
         IS_PEO_ENABLED = False
     return IS_PEO_ENABLED
 
+
 def get_peo_overlap_method() -> int:
     global PEO_OVERLAP_METHOD
     if PEO_OVERLAP_METHOD is None:
-        logger.warning(
-            "PEO_OVERLAP_METHOD is not initialized, using 4"
-        )
+        logger.warning("PEO_OVERLAP_METHOD is not initialized, using 4")
         PEO_OVERLAP_METHOD = 4
     return PEO_OVERLAP_METHOD
+
 
 def get_peo_num_rounds() -> int:
     global PEO_NUM_ROUNDS
@@ -297,30 +297,27 @@ def get_peo_num_rounds() -> int:
         PEO_NUM_ROUNDS = 1
     return PEO_NUM_ROUNDS
 
+
 def get_peo_deepep_num_sms() -> int:
     global PEO_DEEPEP_NUM_SMS
     if PEO_DEEPEP_NUM_SMS is None or PEO_DEEPEP_NUM_SMS < 1:
-        logger.warning(
-            "PEO_DEEPEP_NUM_SMS is not initialized, using 16"
-        )
+        logger.warning("PEO_DEEPEP_NUM_SMS is not initialized, using 16")
         PEO_DEEPEP_NUM_SMS = 16
     return PEO_DEEPEP_NUM_SMS
+
 
 def get_peo_up_deepgemm_num_sms() -> int:
     global PEO_UP_DEEPGEMM_NUM_SMS
     if PEO_UP_DEEPGEMM_NUM_SMS is not None and PEO_UP_DEEPGEMM_NUM_SMS < 1:
-        logger.warning(
-            "PEO_UP_DEEPGEMM_NUM_SMS is not initialized, using None"
-        )
+        logger.warning("PEO_UP_DEEPGEMM_NUM_SMS is not initialized, using None")
         PEO_UP_DEEPGEMM_NUM_SMS = None
     return PEO_UP_DEEPGEMM_NUM_SMS
+
 
 def get_peo_down_deepgemm_num_sms() -> int:
     global PEO_DOWN_DEEPGEMM_NUM_SMS
     if PEO_DOWN_DEEPGEMM_NUM_SMS is not None and PEO_DOWN_DEEPGEMM_NUM_SMS < 1:
-        logger.warning(
-            "PEO_DOWN_DEEPGEMM_NUM_SMS is not initialized, using None"
-        )
+        logger.warning("PEO_DOWN_DEEPGEMM_NUM_SMS is not initialized, using None")
         PEO_DOWN_DEEPGEMM_NUM_SMS = None
     return PEO_DOWN_DEEPGEMM_NUM_SMS
 

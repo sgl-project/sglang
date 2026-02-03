@@ -17,13 +17,17 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, PeoMoeRunner
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend, get_moe_runner_backend, is_peo_enabled
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_runner_backend,
+    is_peo_enabled,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -1454,10 +1458,7 @@ class PeoFp8MoEMethod(Fp8MoEMethod):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
         if moe_runner_backend.is_deep_gemm() or moe_runner_backend.is_triton():
-            if is_peo_enabled():
-                self.runner = PeoMoeRunner(moe_runner_backend, moe_runner_config)
-            else:
-                self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
             # TODO(cwan): refactor other backends
             pass
@@ -1470,19 +1471,23 @@ class PeoFp8MoEMethod(Fp8MoEMethod):
         end_idx: int,
     ) -> CombineInput:
 
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
 
         if use_intel_amx_backend(layer):
-            raise NotImplementedError("Unsupported runner backend: %s for PEO" % self.runner.runner_backend)
+            raise NotImplementedError(
+                "Unsupported runner backend: %s for PEO" % self.runner.runner_backend
+            )
 
         if _is_hip:
-            raise NotImplementedError("Unsupported runner backend: %s for PEO" % self.runner.runner_backend)
+            raise NotImplementedError(
+                "Unsupported runner backend: %s for PEO" % self.runner.runner_backend
+            )
 
         if get_moe_runner_backend().is_cutlass():
-            raise NotImplementedError("Unsupported runner backend: %s for PEO" % self.runner.runner_backend)
+            raise NotImplementedError(
+                "Unsupported runner backend: %s for PEO" % self.runner.runner_backend
+            )
 
         if self.runner.runner_backend.is_deep_gemm():
 
@@ -1527,9 +1532,10 @@ class PeoFp8MoEMethod(Fp8MoEMethod):
             )
 
         from sglang.srt.layers.moe.token_dispatcher import DeepEPLLDispatchOutput
+
         new_dispatch_output = DeepEPLLDispatchOutput(
             hidden_states=x[start_idx:end_idx],
-            hidden_states_scale = dispatch_output.hidden_states_scale[start_idx:end_idx],
+            hidden_states_scale=dispatch_output.hidden_states_scale[start_idx:end_idx],
             topk_weights=dispatch_output.topk_weights,
             topk_ids=dispatch_output.topk_ids,
             masked_m=dispatch_output.masked_m[start_idx:end_idx],

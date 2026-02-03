@@ -1,4 +1,4 @@
-from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig, PeoMoeRunner
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     MoeA2ABackend,
@@ -7,16 +7,16 @@ from sglang.srt.layers.moe.utils import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_peo_deepep_num_sms,
+    get_peo_down_deepgemm_num_sms,
+    get_peo_num_rounds,
+    get_peo_overlap_method,
+    get_peo_up_deepgemm_num_sms,
     get_tbo_token_distribution_threshold,
     initialize_moe_config,
+    is_peo_enabled,
     is_tbo_enabled,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
-    is_peo_enabled,
-    get_peo_overlap_method,
-    get_peo_num_rounds,
-    get_peo_deepep_num_sms,
-    get_peo_up_deepgemm_num_sms,
-    get_peo_down_deepgemm_num_sms,
 )
 
 __all__ = [
@@ -24,7 +24,6 @@ __all__ = [
     "MoeA2ABackend",
     "MoeRunner",
     "MoeRunnerConfig",
-    "PeoMoeRunner",
     "MoeRunnerBackend",
     "initialize_moe_config",
     "get_moe_a2a_backend",

@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from sglang.srt.batch_overlap.per_expert_overlap import PeoOverlapArgs
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -23,6 +24,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
     get_moe_runner_backend,
+    is_peo_enabled,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -32,10 +34,6 @@ from sglang.srt.utils import (
     is_npu,
     load_json_config,
 )
-
-from sglang.srt.batch_overlap.per_expert_overlap import PeoOverlapArgs
-
-from sglang.srt.layers.moe.utils import is_peo_enabled
 
 _is_npu = is_npu()
 
@@ -746,6 +744,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_experts,
         )
 
+
 class _DeepEPDispatcherImplLowLatencyPEO(_DeepEPDispatcherImplLowLatency):
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(return_recv_hook, **kwargs)
@@ -859,7 +858,7 @@ class _DeepEPDispatcherImplLowLatencyPEO(_DeepEPDispatcherImplLowLatency):
                 round_id=peo_overlap_args.round_id,
                 send_num_sms=peo_overlap_args.send_num_sms,
                 recv_num_sms=peo_overlap_args.recv_num_sms,
-                hook_use_comm_stream=peo_overlap_args.hook_use_comm_stream
+                hook_use_comm_stream=peo_overlap_args.hook_use_comm_stream,
             )
         )
         if peo_overlap_args.round_id == 0:

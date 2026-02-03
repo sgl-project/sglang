@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+
 @dataclass
 class PeoOverlapArgs:
     use_expert_overlap: bool
