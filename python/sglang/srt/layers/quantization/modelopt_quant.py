@@ -65,6 +65,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 fp4_quantize = None
 try:
@@ -214,25 +215,28 @@ class ModelOptQuantConfig(QuantizationConfig):
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
         if self.exclude_modules:
-            # Wildcard patterns (e.g., "model.visual*") can break _map_name's
-            # prefix matching: "model.visual*" doesn't startswith "model.visual."
-            # so it falls through to the shorter "model." prefix and gets
-            # incorrectly remapped. Replace '*' with a dotted placeholder so
-            # prefix matching works, then restore the wildcard afterward.
-            _WILDCARD = ".__wildcard_placeholder__"
-            new_exclude = []
-            for module in self.exclude_modules:
-                temp = module.replace("*", _WILDCARD)
-                mapped = hf_to_sglang_mapper._map_name(temp)
-                if mapped is not None:
-                    new_exclude.append(mapped.replace(_WILDCARD, "*"))
-                else:
-                    new_exclude.append(module)
-            self.exclude_modules = new_exclude
+            self.exclude_modules = [
+                self._remap_wildcard_name(m, hf_to_sglang_mapper)
+                for m in self.exclude_modules
+            ]
         if self.packed_modules_mapping:
             self.packed_modules_mapping = hf_to_sglang_mapper.apply_dict(
                 self.packed_modules_mapping
             )
+
+    @staticmethod
+    def _remap_wildcard_name(name: str, mapper: "WeightsMapper") -> str:
+        """Remap a module name through a WeightsMapper, preserving wildcards.
+
+        Temporarily replaces ``*`` with a dotted sentinel so _map_name's
+        longest-prefix matching isn't short-circuited (e.g. "model.visual*"
+        won't fall through to the shorter "model." prefix).
+        """
+        _SENTINEL = ".__wildcard__"
+        mapped = mapper._map_name(name.replace("*", _SENTINEL))
+        if mapped is not None:
+            return mapped.replace(_SENTINEL, "*")
+        return name
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
