@@ -333,6 +333,9 @@ class DiffusersExecutionStage(PipelineStage):
         if not batch.image_path:
             return None
 
+        if isinstance(batch.image_path, list):
+            batch.image_path = batch.image_path[0]
+
         try:
             if batch.image_path.startswith(("http://", "https://")):
                 response = requests.get(batch.image_path, timeout=30)
