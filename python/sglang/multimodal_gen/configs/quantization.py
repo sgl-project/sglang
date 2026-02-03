@@ -83,13 +83,16 @@ class NunchakuSVDQuantArgs:
         # Map CLI/config keys to dataclass fields (keep backwards compatibility).
         return cls(
             enable_svdquant=bool(kwargs.get("enable_svdquant", cls.enable_svdquant)),
-            quantized_model_path=kwargs.get("quantized_model_path", cls.quantized_model_path),
+            quantized_model_path=kwargs.get(
+                "quantized_model_path", cls.quantized_model_path
+            ),
             quantization_precision=str(
                 kwargs.get("quantization_precision", cls.quantization_precision)
             ),
-            quantization_rank=int(kwargs.get("quantization_rank", cls.quantization_rank)),
+            quantization_rank=int(
+                kwargs.get("quantization_rank", cls.quantization_rank)
+            ),
             quantization_act_unsigned=bool(
                 kwargs.get("quantization_act_unsigned", cls.quantization_act_unsigned)
             ),
         )
-

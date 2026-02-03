@@ -275,7 +275,9 @@ def load_model_from_full_model_state_dict(
                 # Preserve requires_grad flag to avoid errors with non-floating dtypes
                 requires_grad = getattr(meta_sharded_param, "requires_grad", False)
                 temp_param = _make_param_like(actual_param, sharded_tensor)
-                if not (sharded_tensor.is_floating_point() or sharded_tensor.is_complex()):
+                if not (
+                    sharded_tensor.is_floating_point() or sharded_tensor.is_complex()
+                ):
                     requires_grad = False
                 temp_param.requires_grad = requires_grad
                 weight_loader(temp_param, full_tensor)

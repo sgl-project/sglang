@@ -1,6 +1,6 @@
+import inspect
 import os
 from copy import deepcopy
-import inspect
 from typing import Any
 
 import torch
@@ -142,7 +142,9 @@ class TransformerLoader(ComponentLoader):
             if wt is not None:
                 if self._patch_native_svdq_linear(module, wt, SVDQW4A4Linear):
                     num_wtscale += 1
-                elif self._patch_sglang_svdq_linear(module, wt, NunchakuSVDQLinearMethod):
+                elif self._patch_sglang_svdq_linear(
+                    module, wt, NunchakuSVDQLinearMethod
+                ):
                     num_wtscale += 1
 
             wc = state_dict.get(f"{name}.wcscales")
@@ -213,7 +215,9 @@ class TransformerLoader(ComponentLoader):
 
         quant_config = self._get_quant_config(server_args)
 
-        if quant_config is not None and getattr(quant_config, "quantized_model_path", None):
+        if quant_config is not None and getattr(
+            quant_config, "quantized_model_path", None
+        ):
             weights_path = quant_config.quantized_model_path
             logger.info("Using quantized model weights from: %s", weights_path)
             if os.path.isfile(weights_path) and weights_path.endswith(".safetensors"):
