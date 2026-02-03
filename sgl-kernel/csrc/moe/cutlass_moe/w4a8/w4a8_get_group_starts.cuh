@@ -30,8 +30,10 @@ __global__ void int4_fp8_get_group_gemm_starts(
   a_offsets[expert_id] = a_base_as_int + expert_offset * k;
   b_offsets[expert_id] = b_base_as_int + expert_id * k * n / 2;
   out_offsets[expert_id] = out_base_as_int + expert_offset * n;
-  a_scales_offsets[expert_id] = a_scales_base_as_int + (per_act_token ? expert_offset : 0);
-  b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * k / 128 : expert_id);
+  int64_t scale_k = k / 128;
+  b_scales_offsets[expert_id] = b_scales_base_as_int + (per_out_ch ? expert_id * n * scale_k : expert_id);
+  a_scales_offsets[expert_id] =
+      a_scales_base_as_int + (per_act_token ? expert_offset * (scale_k % 4 == 0 ? scale_k : scale_k * 4) : 0);
 }
 
 template <typename ElementA, typename ElementB, typename ElementC, typename ElementAccumulator>

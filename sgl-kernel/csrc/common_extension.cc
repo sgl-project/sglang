@@ -297,7 +297,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
       "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
       "               Tensor problem_sizes, Tensor a_strides, "
-      "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
+      "               Tensor b_strides, Tensor d_strides, Tensor sa_strides, Tensor sb_strides, "
       "               int chunk_size, int topk) -> ()");
   m.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &cutlass_w4a8_moe_mm);
 

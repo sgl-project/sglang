@@ -458,7 +458,8 @@ void cutlass_w4a8_moe_mm(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size,
     int64_t topk);
 /*

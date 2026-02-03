@@ -73,7 +73,8 @@ static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
 struct cutlass_3x_w4a8_group_gemm {
   static constexpr int GroupSize = 128;
-  static constexpr int PackedScalesNum = get<2>(TileShape{}) / GroupSize;
+  static constexpr int PackedScalesNum =
+      get<2>(TileShape{}) / GroupSize;  // get<2>(TileShape{}) :K only support 128/512
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -98,7 +99,7 @@ struct cutlass_3x_w4a8_group_gemm {
       cute::tuple<QuantType, ElementScalePacked>,
       LayoutB_Transpose*,
       AlignmentB,
-      MmaType,
+      cute::tuple<MmaType, float>,
       LayoutA_Transpose*,
       AlignmentA,
       ElementAccumulator,
@@ -118,7 +119,8 @@ struct cutlass_3x_w4a8_group_gemm {
   using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
   using StrideC = typename GemmKernelScaleOnly::InternalStrideC;
   using StrideD = typename GemmKernelScaleOnly::InternalStrideD;
-  using StrideS = typename CollectiveMainloopScaleOnly::StrideScale;
+  using StrideSA = typename CollectiveMainloopScaleOnly::StrideScaleA;
+  using StrideSB = typename CollectiveMainloopScaleOnly::StrideScaleB;
 };
 
 /**
@@ -148,7 +150,8 @@ struct cutlass_3x_w4a8_group_gemm {
  * @param a_strides Stride information for A tensors
  * @param b_strides Stride information for B tensors
  * @param d_strides Stride information for D tensors
- * @param s_strides Stride information for scale tensors
+ * @param sa_strides Stride information for A scale tensors
+ * @param sb_strides Stride information for B scale tensors
  * @param chunk_size Size of each chunk for scales (K / number of scale chunks)
  */
 // template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
@@ -164,7 +167,8 @@ void cutlass_w4a8_group_gemm_caller(
     torch::Tensor const& a_strides,
     torch::Tensor const& b_strides,
     torch::Tensor const& d_strides,
-    torch::Tensor const& s_strides,
+    torch::Tensor const& sa_strides,
+    torch::Tensor const& sb_strides,
     int64_t chunk_size) {
   //   using Gemm = cutlass_3x_w4a8_group_gemm<TileShape, ClusterShape, KernelSchedule, EpilogueSchedule>;
   using Args = typename Gemm::GemmScaleOnly::Arguments;
@@ -176,8 +180,8 @@ void cutlass_w4a8_group_gemm_caller(
   // Check inputs
   TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
   TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
+  TORCH_CHECK(a_scales.dim() == 2, "A Scale tensor must be 2D");
   TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
-  TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D [1]");
   TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
 
@@ -211,9 +215,9 @@ void cutlass_w4a8_group_gemm_caller(
 
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 0;
+  fusion_args.alpha = 1;  // not use scalar scale
   fusion_args.beta = 0;
-  fusion_args.alpha_ptr = a_scales.data_ptr<float>();
+  fusion_args.alpha_ptr = nullptr;
   ;
   fusion_args.beta_ptr = nullptr;
   fusion_args.alpha_ptr_array = nullptr;
@@ -245,7 +249,9 @@ void cutlass_w4a8_group_gemm_caller(
        static_cast<const MmaType**>(a_ptrs.data_ptr()),
        static_cast<typename Gemm::StrideA*>(a_strides.data_ptr()),
        static_cast<const typename Gemm::ElementScalePacked**>(b_scales_ptrs.data_ptr()),
-       static_cast<typename Gemm::StrideS*>(s_strides.data_ptr()),
+       static_cast<typename Gemm::StrideSA*>(sb_strides.data_ptr()),
+       static_cast<const float**>(a_scales_ptrs.data_ptr()),
+       static_cast<typename Gemm::StrideSB*>(sa_strides.data_ptr()),
        static_cast<int>(chunk_size)},
       {fusion_args,
        nullptr,

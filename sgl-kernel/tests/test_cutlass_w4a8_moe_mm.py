@@ -3,6 +3,8 @@ import torch
 from sgl_kernel import cutlass_w4a8_moe_mm, sgl_per_tensor_quant_fp8
 from utils import is_hopper
 
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
     if int4_values_interleaved.shape[-1] % 2 != 0:
@@ -88,10 +90,26 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     a_strides = torch.full((num_experts, 3), k, device=device, dtype=torch.int64)
     c_strides = torch.full((num_experts, 3), n, device=device, dtype=torch.int64)
     b_strides = a_strides
-    s_strides = c_strides
+    sb_strides = c_strides
 
     # Quantize input
-    a_q, a_scale = _per_tensor_quant_fp8(a)
+    a_q, a_scale = sglang_per_token_group_quant_fp8(a, 128)
+
+    if k % 512 != 0:  # K need padding to 4 for B scale
+        assert k % 128 == 0, "k must be multiple of 128 or 512"
+        a_scale_padded = torch.empty(
+            (a_scale.shape[0], a_scale.shape[1] * 4), device=device, dtype=a_scale.dtype
+        )
+        for i in range(a_scale.shape[0]):
+            a_scale_padded[i] = a_scale[i].repeat_interleave(4, dim=0)
+        sa_strides = torch.full(
+            (num_experts, 3), k // 128 * 4, device=device, dtype=torch.int64
+        )
+    else:
+        a_scale_padded = a_scale
+        sa_strides = torch.full(
+            (num_experts, 3), k // 128, device=device, dtype=torch.int64
+        )
 
     # Create output tensor
     c = torch.empty((m, n), dtype=torch.bfloat16, device=device)
@@ -99,14 +117,15 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
         c,
         a_q,
         w,
-        a_scale,
+        a_scale_padded,
         w_scale,
         expert_offsets[:-1],
         problem_sizes,
         a_strides,
         b_strides,
         c_strides,
-        s_strides,
+        sa_strides,
+        sb_strides,
         128,
         8,
     )
@@ -115,7 +134,13 @@ def test_int4_fp8_grouped_gemm_single_expert(batch_size):
     # Reference implementation
     experts_selection_result = torch.full((m,), 0)
     c_ref = ref_grouped_gemm(
-        c, a_q, a_scale, ref_w, ref_w_scale, num_experts, experts_selection_result
+        c,
+        a_q,
+        a_scale_padded,
+        ref_w,
+        ref_w_scale,
+        num_experts,
+        experts_selection_result,
     )
 
     # Compare results
@@ -157,8 +182,8 @@ def _per_tensor_quant_fp8(
     reason="cutlass_w4a8_moe_mm is only supported on sm90",
 )
 @pytest.mark.parametrize("batch_size", [2, 4, 8, 16, 32])
-@pytest.mark.parametrize("k", [256, 512, 1024, 2048, 4096, 7168])
-@pytest.mark.parametrize("n", [256, 512, 1024, 2048, 7168])
+@pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 4096, 7168])
+@pytest.mark.parametrize("n", [128, 256, 512, 1024, 2048, 7168])
 @pytest.mark.parametrize("num_experts", [2, 4, 6, 8])
 def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     torch.manual_seed(0)
@@ -210,28 +235,47 @@ def test_int4_fp8_grouped_gemm_multi_experts(batch_size, k, n, num_experts):
     expert_offsets = torch.tensor(expert_offsets, dtype=torch.int32, device=device)
 
     # Permute input and quantize
-    a_q, a_scale = _per_tensor_quant_fp8(a)
+    a_q, a_scale = sglang_per_token_group_quant_fp8(a, 128)
+
+    if k % 512 != 0:  # K need padding to 4 for B scale
+        assert k % 128 == 0, "k must be multiple of 128 or 512"
+        a_scale_padded = torch.empty(
+            (a_scale.shape[0], a_scale.shape[1] * 4), device=device, dtype=a_scale.dtype
+        )
+        for i in range(a_scale.shape[0]):
+            a_scale_padded[i] = a_scale[i].repeat_interleave(4, dim=0)
+        sa_strides = torch.full(
+            (num_experts, 3), k // 128 * 4, device=device, dtype=torch.int64
+        )
+    else:
+        a_scale_padded = a_scale
+        sa_strides = torch.full(
+            (num_experts, 3), k // 128, device=device, dtype=torch.int64
+        )
+
     a_q_perm = a_q[permutation]
+    a_scale_perm = a_scale_padded[permutation]
 
     # Create stride tensors
     a_strides = torch.full((num_experts, 3), k, device=device, dtype=torch.int64)
     c_strides = torch.full((num_experts, 3), n, device=device, dtype=torch.int64)
     b_strides = a_strides
-    s_strides = c_strides
+    sb_strides = c_strides
 
     c_perm = torch.empty((batch_size, n), dtype=torch.bfloat16, device=device)
     cutlass_w4a8_moe_mm(
         c_perm,
         a_q_perm,
         w,
-        a_scale,
+        a_scale_perm,
         w_scale,
         expert_offsets,
         problem_sizes,
         a_strides,
         b_strides,
         c_strides,
-        s_strides,
+        sa_strides,
+        sb_strides,
         128,
         8,
     )
@@ -265,6 +309,9 @@ def ref_grouped_gemm(
 ):
     dtype = torch.bfloat16
     c_ref = torch.zeros_like(c)
+    a_q = a_q.to(torch.float32) * a_scale.repeat_interleave(128, dim=1).to(
+        torch.float32
+    )
     for i in range(num_experts):
         token_idx = torch.where(experts_selection_result == i)[0]
         if len(token_idx) == 0:
@@ -273,7 +320,7 @@ def ref_grouped_gemm(
 
         ref_w_scale_repeat = w_scale[i].repeat_interleave(128, dim=1).to(torch.float32)
         ref_w = w[i].to(torch.float32) * ref_w_scale_repeat
-        c = torch.matmul(a.to(torch.float32), ref_w.t()) * a_scale
+        c = torch.matmul(a.to(torch.float32), ref_w.t())
         c_ref[token_idx] = c.to(dtype)
 
     return c_ref
