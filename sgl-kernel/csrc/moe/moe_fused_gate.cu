@@ -99,14 +99,11 @@ __device__ void moe_fused_gate_impl(
     bias_chunk[ii] = vec_bias_thread_read_ptr[0][ii];
   }
 
-  __syncthreads();
-
 ////////////////////// Sigmoid //////////////////////
 #pragma unroll
   for (int ii = 0; ii < params.VPT; ++ii) {
     row_chunk[ii] = static_cast<T>(1.0f / (1.0f + expf(-float(row_chunk[ii]))));
   }
-  __syncthreads();
 
 ////////////////////// Add Bias //////////////////////
 #pragma unroll
@@ -157,15 +154,11 @@ __device__ void moe_fused_gate_impl(
       int const thread_to_clear_in_group = expert / params.VPT;
 
       if (thread_group_idx == thread_to_clear_in_group) {
-#pragma unroll
-        for (int ii = 0; ii < params.VPT; ++ii) {
-          bias_chunk[ii] = static_cast<T>(FLT_MAX);
-        }
+        // only clear the first element will be used later
+          bias_chunk[0] = static_cast<T>(FLT_MAX);
       }
     }
   }
-
-  __syncthreads();
 
   ////////////////////// Topk //////////////////////
   float output_sum = 0.0f;
@@ -219,8 +212,6 @@ __device__ void moe_fused_gate_impl(
     if (thread_group_idx == 0) {
       output_sum += output_ptr[idx];
     }
-
-    __syncthreads();
   }
 
   if (thread_group_idx == 0 && num_fused_shared_experts > 0) {
