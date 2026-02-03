@@ -56,7 +56,7 @@ markdown:
 			--output-dir "$$OUT_DIR" \
 			>/dev/null; \
 		' || exit 1; \
-	echo "Markdown artifacts written to: $(BUILDDIR)/html/md"
+	echo "Markdown artifacts written to: $(BUILDDIR)/html/markdown"
 
 # Serve documentation with auto-build and live reload
 serve:
