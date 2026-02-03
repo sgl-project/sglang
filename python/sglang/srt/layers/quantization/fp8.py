@@ -734,27 +734,50 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         return False
 
-    def create_weights(
-        self,
+    @staticmethod
+    def create_fp8_moe_weight_(
         layer: Module,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
+        block_quant: bool,
+        quant_config,
+        use_mxfp8: bool,
+        is_checkpoint_fp8_serialized: bool,
         params_dtype: torch.dtype,
-        **extra_weight_attrs,
+        extra_weight_attrs: dict,
     ):
+        """
+        Create FP8 MoE weight parameters.
+
+        This static method creates w13_weight, w2_weight and their corresponding scales
+        for FP8 quantized MoE layers. It can be reused for both:
+        - Direct FP8 checkpoint loading
+        - FP8 checkpoint loading with requantization to other formats (e.g., MXFP4)
+
+        Args:
+            layer: The MoE layer module
+            num_experts: Number of experts in the MoE layer
+            hidden_size: Hidden dimension size
+            intermediate_size_per_partition: Intermediate size per TP partition
+            block_quant: Whether to use block-wise quantization
+            quant_config: Quantization configuration
+            use_mxfp8: Whether to use MXFP8 format
+            is_checkpoint_fp8_serialized: Whether checkpoint is FP8 serialized
+            params_dtype: Parameter dtype
+            extra_weight_attrs: Extra weight attributes for weight loading
+        """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        if self.quant_config.is_checkpoint_fp8_serialized:
+        if is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
+
         tp_size = get_tensor_model_parallel_world_size()
-        if self.block_quant:
-            block_n, block_k = (
-                self.quant_config.weight_block_size[0],
-                self.quant_config.weight_block_size[1],
-            )
-            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
+
+        if block_quant:
+            block_n, block_k = quant_config.weight_block_size[0], quant_config.weight_block_size[1]
+
+            # Validate block quantization shapes
             if intermediate_size_per_partition % block_n != 0:
                 raise ValueError(
                     f"The output_size of gate's and up's weight = "
@@ -762,15 +785,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     f"weight quantization block_n = {block_n}."
                 )
             if tp_size > 1:
-                # Required by row parallel
                 if intermediate_size_per_partition % block_k != 0:
                     raise ValueError(
                         f"The input_size of down's weight = "
                         f"{intermediate_size_per_partition} is not divisible by "
                         f"weight quantization block_k = {block_k}."
                     )
+        else:
+            block_n, block_k = None, None
 
-        # WEIGHTS
+        # Create WEIGHTS
         if _is_hip and _use_hip_int4:
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
@@ -817,9 +841,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        # WEIGHT_SCALES
-        if self.block_quant:
-            scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
+        # Create WEIGHT_SCALES
+        if block_quant:
+            scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
@@ -840,13 +864,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             # w13_weight and w2_weight are always requanted together
-            w13_weight_scale.format_ue8m0 = self.use_mxfp8
-            w2_weight_scale.format_ue8m0 = self.use_mxfp8
+            w13_weight_scale.format_ue8m0 = use_mxfp8
+            w2_weight_scale.format_ue8m0 = use_mxfp8
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
-            assert self.quant_config.activation_scheme == "dynamic"
+
+            assert quant_config.activation_scheme == "dynamic"
             if get_moe_runner_backend().is_cutlass():
-                self._ensure_cutlass_buffers_initialized(layer)
+                Fp8MoEMethod._ensure_cutlass_buffers_initialized(layer)
 
         else:
             # Allocate 2 scales for w1 and w3 respectively.
@@ -860,7 +885,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-            if _is_hip:  # _use_aiter: TODO: add check back after triton kernel
+            if _is_hip:
                 # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
                 w13_weight_scale1 = torch.nn.Parameter(
                     torch.ones(
@@ -881,13 +906,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-            if self.block_quant
+            if block_quant
             else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
+
         # If loading fp8 checkpoint, pass the weight loaders.
-        # If loading an fp16 checkpoint, do not (we will quantize in
-        #   process_weights_after_loading()
-        if self.quant_config.is_checkpoint_fp8_serialized:
+        if is_checkpoint_fp8_serialized:
             set_weight_attrs(w13_weight_scale, extra_weight_attrs)
             set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
@@ -899,8 +923,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 set_weight_attrs(w2_weight_scale1, extra_weight_attrs)
 
         # INPUT_SCALES
-        if self.quant_config.activation_scheme == "static":
-            if not self.quant_config.is_checkpoint_fp8_serialized:
+        if quant_config.activation_scheme == "static":
+            if not is_checkpoint_fp8_serialized:
                 raise ValueError(
                     "Found static activation scheme for checkpoint that "
                     "was not serialized fp8."
@@ -921,6 +945,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
+
+    def create_weights(
+        self,
+        layer: Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        Fp8MoEMethod.create_fp8_moe_weight_(
+            layer=layer,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size_per_partition=intermediate_size_per_partition,
+            block_quant=self.block_quant,
+            quant_config=self.quant_config,
+            use_mxfp8=self.use_mxfp8,
+            is_checkpoint_fp8_serialized=self.quant_config.is_checkpoint_fp8_serialized,
+            params_dtype=params_dtype,
+            extra_weight_attrs=extra_weight_attrs,
+        )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz

@@ -9,7 +9,11 @@ import torch
 
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
+from sglang.srt.layers.quantization.base_config import (
+    FusedMoEMethodBase,
+    QuantizationConfig,
+)
+from sglang.srt.layers.quantization.dequantization import dequantize_fp8
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
@@ -20,7 +24,7 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
-
+from sglang.srt.layers.quantization.dequantization import dequantize_fp8
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -57,6 +61,16 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuarkConfig
 
 
+def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
+    """Copies any attrs present in `old` but not in `new` to `new`"""
+    new_attrs = set(dir(new))
+    attrs_to_set = {}
+    for attr in dir(old):
+        if attr not in new_attrs:
+            attrs_to_set[attr] = getattr(old, attr)
+    set_weight_attrs(new, attrs_to_set)
+
+
 class QuarkMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: QuarkConfig):
@@ -84,6 +98,7 @@ class QuarkMoEMethod(FusedMoEMethodBase):
                 weight_config,
                 input_config,
                 is_checkpoint_mxfp4_serialized=quant_config.is_prequantized,
+                dequantization_config=quant_config.dequantization_config,
             )
         elif quant_config._is_fp8_w8a8(weight_config, input_config):
             return QuarkW8A8FP8MoEMethod(weight_config, input_config)
@@ -98,10 +113,12 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         weight_config: dict[str, Any],
         input_config: dict[str, Any],
         is_checkpoint_mxfp4_serialized: bool = True,
+        dequantization_config: QuantizationConfig | None = None,
     ):
         self.weight_quant = weight_config
         self.input_quant = input_config
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+        self.dequantization_config = dequantization_config
 
         weight_qscheme = self.weight_quant.get("qscheme")
         input_qscheme = self.input_quant.get("qscheme")
@@ -134,13 +151,61 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
+        original_weight_loader = extra_weight_attrs.get("weight_loader")
+
+        # Handle FP8 to MXFP4 requantization
+        if self.dequantization_config is not None:
+            from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+
+            if not isinstance(self.dequantization_config, Fp8Config):
+                raise NotImplementedError(
+                    f"Requantization in QuarkW4A4MXFp4MoEMethod from {self.dequantization_config.__class__.__name__} is not supported, only Fp8Config is supported."
+                )
+
+            # Extract necessary parameters from dequantization_config
+            self.weight_block_size = self.dequantization_config.weight_block_size
+
+            if self.dequantization_config.use_mxfp8:
+                raise NotImplementedError(
+                    "use_mxfp8=True is not supported in Quark MXFP4 requantization."
+                )
+
+            # Determine if block quantization is used
+            block_quant = self.weight_block_size is not None
+
+            # Initialize tracking attributes for FP8->MXFP4 conversion
+            layer._fp8_loaded_numel = 0
+            layer._load_device = torch.get_default_device()
+
+            # Wrap the weight loader to handle FP8->MXFP4 conversion
+            fp8_to_mxfp4_weight_loader = self.get_online_fp8_to_mxfp4_weight_loader(
+                layer, original_weight_loader
+            )
+
+            extra_weight_attrs["weight_loader"] = fp8_to_mxfp4_weight_loader
+
+            # Create FP8 MoE weight parameters on meta device to avoid memory overhead
+            # They will be materialized on first load in the weight loader
+            with torch.device("meta"):
+                Fp8MoEMethod.create_fp8_moe_weight_(
+                    layer=layer,
+                    num_experts=num_experts,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=intermediate_size_per_partition,
+                    block_quant=block_quant,
+                    quant_config=self.dequantization_config,
+                    use_mxfp8=False,
+                    is_checkpoint_fp8_serialized=True,
+                    params_dtype=params_dtype,
+                    extra_weight_attrs=extra_weight_attrs,
+                )
+            return
+
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
-
-        original_weight_loader = extra_weight_attrs.get("weight_loader")
 
         if self.is_checkpoint_mxfp4_serialized:
             weight_loader = original_weight_loader
@@ -297,6 +362,183 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         return online_mxfp4_moe_weight_loader
 
+    def get_online_fp8_to_mxfp4_weight_loader(self, layer, original_weight_loader):
+        """
+        Wrap the original weight loader to perform FP8 to MXFP4 requantization for MoE layers.
+
+        This loader handles:
+        1. Loading FP8 weights (w13_weight, w2_weight) and weight_scale_inv parameters
+        2. Waiting for all experts to be loaded
+        3. Dequantizing FP8 -> BF16 using weight_scale_inv
+        4. Requantizing BF16 -> MXFP4
+        """
+
+        def online_fp8_to_mxfp4_moe_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: int,
+        ):
+            print("weight_name", weight_name)
+            print("layer._fp8_loaded_numel", layer._fp8_loaded_numel)
+            # Determine which parameter we're loading
+            is_w13_weight = "w13_weight" in weight_name and "scale" not in weight_name
+            is_w2_weight = "w2_weight" in weight_name and "scale" not in weight_name
+            is_w13_scale = "w13_weight_scale_inv" in weight_name
+            is_w2_scale = "w2_weight_scale_inv" in weight_name
+
+            # Materialize FP8 parameters on first load from meta device. Adds a small but manageable overhead compared to materializing one by one - but weights are loaded in order layer by layer so it is fine.
+            # TODO: handle bias!!!!
+            if layer._fp8_loaded_numel == 0:
+                # w13_weight
+                assert layer.w13_weight.device.type == "meta"
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(layer.w13_weight.data, device=layer._load_device),
+                    requires_grad=False,
+                )
+                _copy_missing_attrs(layer.w13_weight, materialized)
+                layer.w13_weight = materialized
+
+                # w13_weight_scale_inv
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(layer.w13_weight_scale_inv.data, device=layer._load_device),
+                    requires_grad=False,
+                )
+                _copy_missing_attrs(layer.w13_weight_scale_inv, materialized)
+                layer.w13_weight_scale_inv = materialized
+
+                # w2_weight
+                assert layer.w2_weight.device.type == "meta"
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(layer.w2_weight.data, device=layer._load_device),
+                    requires_grad=False,
+                )
+                _copy_missing_attrs(layer.w2_weight, materialized)
+                layer.w2_weight = materialized
+
+                # w2_weight_scale_inv
+                assert layer.w2_weight_scale_inv.device.type == "meta"
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(layer.w2_weight_scale_inv.data, device=layer._load_device),
+                    requires_grad=False,
+                )
+                _copy_missing_attrs(layer.w2_weight_scale_inv, materialized)
+                layer.w2_weight_scale_inv = materialized
+
+            if is_w13_weight:
+                param = layer.w13_weight
+            elif is_w2_weight:
+                param = layer.w2_weight
+            elif is_w13_scale:
+                param = layer.w13_weight_scale_inv
+            elif is_w2_scale:
+                param = layer.w2_weight_scale_inv
+
+            # Move to device
+            loaded_weight = loaded_weight.to(layer._load_device)
+
+            # Track how much data we're loading
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                original_weight_loader(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+
+            layer._fp8_loaded_numel += copy_numel_counter.copied_numel
+
+            # Calculate total target numel (all weights and scales)
+            total_target_numel = (
+                layer.w13_weight.numel()
+                + layer.w2_weight.numel()
+                + layer.w13_weight_scale_inv.numel()
+                + layer.w2_weight_scale_inv.numel()
+            )
+            print("layer._fp8_loaded_numel", layer._fp8_loaded_numel)
+            print("total_target_numel", total_target_numel)
+
+            # Perform dequantization and requantization when all data is loaded
+            if layer._fp8_loaded_numel == total_target_numel:
+                if dynamic_mxfp4_quant is None:
+                    raise NotImplementedError(
+                        "MXFP4 quantization for MoE is only supported on AMD GPUs."
+                    )
+            
+                assert layer.w13_weight.device.type == "cuda"
+                assert layer.w13_weight_scale_inv.device.type == "cuda"
+
+                # Dequantize and requantize w13
+                w13_bf16 = dequantize_fp8(
+                    layer.w13_weight,
+                    layer.w13_weight_scale_inv,
+                    block_size=self.weight_block_size,
+                )
+
+                qw13_weight = torch.empty(
+                    w13_bf16.shape[0],
+                    w13_bf16.shape[1],
+                    w13_bf16.shape[2] // 2,
+                    dtype=torch.uint8,
+                    device=layer._load_device,
+                )
+                w13_weight_scale = torch.empty(
+                    w13_bf16.shape[0],
+                    w13_bf16.shape[1],
+                    w13_bf16.shape[2] // OCP_MX_BLOCK_SIZE,
+                    dtype=torch.uint8,
+                    device=layer._load_device,
+                )
+
+                for expert in range(w13_bf16.shape[0]):
+                    qweight, weight_scale = dynamic_mxfp4_quant(w13_bf16[expert])
+                    qw13_weight[expert] = qweight
+                    w13_weight_scale[expert] = weight_scale
+
+                # Dequantize and requantize w2
+                w2_bf16 = dequantize_fp8(
+                    layer.w2_weight,
+                    layer.w2_weight_scale_inv,
+                    block_size=self.weight_block_size,
+                )
+
+                qw2_weight = torch.empty(
+                    w2_bf16.shape[0],
+                    w2_bf16.shape[1],
+                    w2_bf16.shape[2] // 2,
+                    dtype=torch.uint8,
+                    device=layer._load_device,
+                )
+                w2_weight_scale = torch.empty(
+                    w2_bf16.shape[0],
+                    w2_bf16.shape[1],
+                    w2_bf16.shape[2] // OCP_MX_BLOCK_SIZE,
+                    dtype=torch.uint8,
+                    device=layer._load_device,
+                )
+
+                for expert in range(w2_bf16.shape[0]):
+                    qweight, weight_scale = dynamic_mxfp4_quant(w2_bf16[expert])
+                    qw2_weight[expert] = qweight
+                    w2_weight_scale[expert] = weight_scale
+
+                # Replace FP8 parameters with MXFP4 parameters
+                layer.w13_weight = torch.nn.Parameter(qw13_weight, requires_grad=False)
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
+                layer.w2_weight_scale = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+
+                # Clean up FP8 parameters and tracking attributes
+                del layer.w13_weight_scale_inv
+                del layer.w2_weight_scale_inv
+                del layer._fp8_loaded_numel
+                del layer._load_device
+
+        return online_fp8_to_mxfp4_moe_weight_loader
+
     def _quantize_w13_online(self, layer, dynamic_mxfp4_quant):
         qw13_weight = torch.empty(
             layer.w13_weight.shape[0],
@@ -335,8 +577,11 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not self.is_checkpoint_mxfp4_serialized:
-            # Quantization already happened during weight loading via get_online_weight_loader.
+        if not self.is_checkpoint_mxfp4_serialized or self.dequantization_config is not None:
+            # Quantization already happened during weight loading.
+            # This covers both:
+            # - Online quantization from BF16/FP16 -> MXFP4
+            # - Requantization from FP8 -> MXFP4
             assert layer.w13_weight.dtype == torch.uint8
             assert layer.w2_weight.dtype == torch.uint8
             assert layer.w13_weight_scale.dtype == torch.uint8
