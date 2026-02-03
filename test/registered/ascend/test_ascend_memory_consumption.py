@@ -31,7 +31,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
 
     def test_memory_consumption(self):
 
-        model = "vllm-ascend/Qwen3-30B-A3B-W8A8"
+        model = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B-W8A8"
         base_url = DEFAULT_URL_FOR_TEST
 
         ### Calculate initial used memory
