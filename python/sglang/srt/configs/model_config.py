@@ -965,7 +965,8 @@ class ModelConfig:
             # The vision config model type for GLM-4.5v is 'glm4v_moe',
             # while for GLM-4.6v, it is 'glm4v_moe_vision'.
         )
-        needs_tf_v5 = is_glm_46vmoe
+        is_lfm2_vl = getattr(self.hf_config, "model_type", None) == "lfm2_vl"
+        needs_tf_v5 = is_glm_46vmoe or is_lfm2_vl
 
         tf_version = version.parse(tf_version_str)
         required_version = version.parse("5.0.0dev0")
@@ -1186,6 +1187,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "Lfm2VlForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",

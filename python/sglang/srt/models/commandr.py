@@ -43,7 +43,6 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn.parameter import Parameter
-from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -66,6 +65,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
+from transformers import Cohere2Config, CohereConfig, PretrainedConfig
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -171,8 +171,8 @@ class CohereAttention(nn.Module):
         self.max_position_embeddings = getattr(
             config, "model_max_length", None
         ) or getattr(config, "max_position_embeddings", 8192)
-        self.rope_theta = config.rope_theta
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        self.rope_scaling = config.rope_parameters.get("rope_scaling")
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         self.qkv_proj = QKVParallelLinear(
             self.hidden_size,

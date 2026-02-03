@@ -36,6 +36,7 @@ from sglang.srt.configs import (
     JetVLMConfig,
     KimiLinearConfig,
     Lfm2Config,
+    Lfm2VlConfig,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -1516,6 +1517,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
+        if isinstance(config, Lfm2VlConfig):
+            return config.text_config
         return None
 
     @property

@@ -25,7 +25,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
@@ -154,6 +153,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+from transformers import PretrainedConfig
 
 if _use_aiter_gfx95:
 
@@ -2227,8 +2227,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm

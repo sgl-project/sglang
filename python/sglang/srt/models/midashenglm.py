@@ -7,7 +7,6 @@ from typing import Iterable, List, Optional, Tuple, TypeAlias, cast
 import torch
 import torch.nn as nn
 import torchaudio.functional as F
-from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -25,6 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
@@ -475,18 +475,14 @@ class MiDashengLMModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if (
-            hasattr(config.text_config, "rope_scaling")
-            and config.text_config.rope_scaling
-        ):
-            if "mrope_section" in config.text_config.rope_scaling:
+        rope_scaling = config.text_config.rope_parameters.get("rope_scaling")
+        if rope_scaling:
+            if "mrope_section" in rope_scaling:
 
                 new_rope_scaling = {
-                    k: v
-                    for k, v in config.text_config.rope_scaling.items()
-                    if k != "mrope_section"
+                    k: v for k, v in rope_scaling.items() if k != "mrope_section"
                 }
-                config.text_config.rope_scaling = (
+                config.text_config.rope_parameters["rope_scaling"] = (
                     new_rope_scaling if new_rope_scaling else None
                 )
         self.audio_encoder = DashengAudioTransformer(

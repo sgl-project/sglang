@@ -17,7 +17,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -52,6 +51,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import is_hip
+from transformers import PretrainedConfig
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -401,8 +401,8 @@ class HunYuanDecoderLayer(nn.Module):
             if isinstance(config.intermediate_size, int)
             else config.intermediate_size[layer_id]
         )
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):

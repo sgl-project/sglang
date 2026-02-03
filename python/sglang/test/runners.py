@@ -20,21 +20,21 @@ from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-import transformers
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoModelForCausalLM,
-    AutoModelForVision2Seq,
-    AutoProcessor,
-    GenerationConfig,
-)
 
+import transformers
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.model_loader.ci_weight_validation import ci_validate_and_clean_hf_cache
 from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    GenerationConfig,
+)
 
 if is_npu():
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -274,7 +274,7 @@ class HFRunner:
             ).cuda()
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
-                self.model = AutoModelForVision2Seq.from_pretrained(
+                self.model = AutoModelForImageTextToText.from_pretrained(
                     model_path,
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
@@ -339,7 +339,8 @@ class HFRunner:
                             )
                             logits = self.model.get_image_features(
                                 pixel_values=inputs.data["pixel_values"].cuda(),
-                            ).tolist()
+                                return_dict=True,
+                            ).pooler_output.tolist()
                         else:
                             inputs = self.tokenizer(
                                 prompts, padding=True, return_tensors="pt"
@@ -347,7 +348,8 @@ class HFRunner:
                             logits = self.model.get_text_features(
                                 input_ids=inputs.data["input_ids"].cuda(),
                                 attention_mask=inputs.data["attention_mask"].cuda(),
-                            ).tolist()
+                                return_dict=True,
+                            ).pooler_output.tolist()
                     else:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))

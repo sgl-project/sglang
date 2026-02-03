@@ -18,7 +18,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
@@ -39,6 +38,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaMLP as LoopCoderMLP
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -166,8 +166,8 @@ class LoopCoderAttention(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         max_position_embeddings = getattr(
             config, "max_position_embeddings", max_position
         )

@@ -3,7 +3,6 @@ from typing import Iterable, Optional
 
 import torch
 from torch import nn
-from transformers import PhiConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
@@ -23,6 +22,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import PhiConfig
 
 
 class PhiAttention(nn.Module):
@@ -63,7 +63,7 @@ class PhiAttention(nn.Module):
         )
         assert rotary_dim % 2 == 0
 
-        rope_theta = getattr(config, "rope_theta", 10000.0)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000.0)
         max_position_embeddings = getattr(config, "max_position_embeddings", 2048)
         self.rotary_emb = get_rope(
             self.head_size,

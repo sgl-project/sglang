@@ -205,7 +205,7 @@ class DbrxAttention(nn.Module):
         self.head_dim = self.d_model // self.total_num_heads
         self.total_num_kv_heads = config.attn_config.kv_n_heads
         self.clip_qkv = config.attn_config.clip_qkv
-        self.rope_theta = config.attn_config.rope_theta
+        self.rope_theta = config.attn_config.rope_parameters.get("rope_theta", 10000)
         self.max_position = config.max_seq_len
 
         # pylint: disable=invalid-name

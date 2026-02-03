@@ -19,7 +19,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -60,6 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -453,7 +453,7 @@ class Grok1DecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream or torch.cuda.Stream()
 
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,

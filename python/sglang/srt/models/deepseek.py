@@ -20,7 +20,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -49,6 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from transformers import PretrainedConfig
 
 
 class DeepseekMLP(nn.Module):
@@ -288,8 +288,8 @@ class DeepseekDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = DeepseekAttention(
             hidden_size=self.hidden_size,

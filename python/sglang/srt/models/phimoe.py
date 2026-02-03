@@ -2,7 +2,6 @@ from typing import Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -29,6 +28,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
+from transformers.configuration_utils import PretrainedConfig
 
 
 class PhiMoEConfig(PretrainedConfig):
@@ -336,7 +336,7 @@ class PhiMoEDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.self_attn = PhiMoEAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -349,7 +349,7 @@ class PhiMoEDecoderLayer(nn.Module):
             layer_id=layer_id,
             attention_bias=config.attention_bias,
             quant_config=quant_config,
-            rope_scaling=config.rope_scaling,
+            rope_scaling=config.rope_parameters.get("rope_scaling"),
             prefix=add_prefix("self_attn", prefix),
         )
         self.block_sparse_moe = PhiMoE(

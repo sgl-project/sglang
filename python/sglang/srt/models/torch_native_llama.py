@@ -46,7 +46,6 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
-from transformers import LlamaConfig
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -65,6 +64,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from transformers import LlamaConfig
 
 tp_size: Optional[int] = None
 tp_rank: Optional[int] = None
@@ -274,8 +274,8 @@ class LlamaDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = config.rope_parameters.get("rope_theta", 10000)
+        rope_scaling = config.rope_parameters.get("rope_scaling")
         if rope_scaling is not None and getattr(
             config, "original_max_position_embeddings", None
         ):

@@ -3,7 +3,6 @@ from typing import Iterable, Optional, Set, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
@@ -26,6 +25,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -396,8 +396,8 @@ class Gemma3nAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=config.max_position_embeddings,
-                base=config.rope_theta,
-                rope_scaling=config.rope_scaling,
+                base=config.rope_parameters.get("rope_theta", 10000),
+                rope_scaling=config.rope_parameters.get("rope_scaling"),
             )
 
         self.sliding_window = config.sliding_window if self.is_sliding else None

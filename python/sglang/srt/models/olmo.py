@@ -19,7 +19,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import OlmoConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
@@ -39,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+from transformers import OlmoConfig
 
 
 class OlmoAttention(nn.Module):
@@ -67,7 +67,7 @@ class OlmoAttention(nn.Module):
         self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
+        self.rope_theta = config.rope_parameters.get("rope_theta", 10000)
         self.clip_qkv = config.clip_qkv
 
         # Attention input projection. Projects x -> (q, k, v)
