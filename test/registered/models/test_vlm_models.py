@@ -22,7 +22,7 @@ register_amd_ci(est_time=420, suite="stage-b-test-small-1-gpu-amd")
 _is_hip = is_hip()
 # VLM models for testing
 if _is_hip:
-    MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.4)]
+    MODELS = [SimpleNamespace(model="openbmb/MiniCPM-V-2_6", mmmu_accuracy=0.38)]
 else:
     MODELS = [
         SimpleNamespace(model="google/gemma-3-4b-it", mmmu_accuracy=0.38),

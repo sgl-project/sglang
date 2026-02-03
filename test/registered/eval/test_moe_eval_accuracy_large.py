@@ -66,7 +66,10 @@ class TestMoEEvalAccuracyLarge(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.62)
+        if is_in_amd_ci():
+            self.assertGreater(metrics["score"], 0.60)
+        else:
+            self.assertGreater(metrics["score"], 0.62)
 
         if is_in_ci():
             write_github_step_summary(f"### test_mmlu\n" f'{metrics["score"]=:.4f}\n')

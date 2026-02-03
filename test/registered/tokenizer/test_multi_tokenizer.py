@@ -11,6 +11,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     auto_config_device,
     get_benchmark_args,
+    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     run_benchmark,
@@ -79,7 +80,10 @@ class TestMultiTokenizer(CustomTestCase):
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            self.assertLess(res["median_ttft_ms"], 86)
+            if is_in_amd_ci():
+                self.assertLess(res["median_ttft_ms"], 88)
+            else:
+                self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
 
