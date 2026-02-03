@@ -116,8 +116,9 @@ def transform_index_page_table_decode_ref(
         index=topk_indices.clamp(min=0),
         out=result,
     )
+    if dcp_size > 1:
+        result //= dcp_size
     result[topk_indices < 0] = -1
-    result[topk_indices >= 0] //= dcp_size
     return result
 
 
