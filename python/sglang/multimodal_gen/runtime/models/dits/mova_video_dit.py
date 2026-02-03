@@ -500,7 +500,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             .reshape(f * h * w, -1)
             .to(x.device)
         )
-        freqs = torch.cat([freqs.real, freqs.imag], dim=-1)
+        freqs = torch.cat([freqs.real, freqs.imag], dim=-1).float()
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)

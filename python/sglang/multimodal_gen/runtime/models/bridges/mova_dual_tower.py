@@ -64,14 +64,9 @@ def compute_rope_cos_sin(
         ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim)
     )
 
-    # Expand for batch computation: [B, L] -> [B, 1, L] @ [1, head_dim/2, 1] -> [B, head_dim/2, L]
-    inv_freq_expanded = inv_freq[None, :, None].expand(position_ids.shape[0], -1, 1)
-    position_ids_expanded = position_ids[:, None, :].float()
+    freqs = torch.outer(inv_freq.float(), position_ids.float()).transpose(0, 1)
 
-    # Compute frequencies: [B, head_dim/2, L] -> [B, L, head_dim/2]
-    freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-
-    # Double the frequencies for full head_dim: [B, L, head_dim]
+    # Double the frequencies for full head_dim: [L, head_dim]
     emb = torch.cat((freqs, freqs), dim=-1)
 
     cos = emb.cos().to(dtype=dtype)
@@ -529,7 +524,7 @@ class DualTowerConditionalBridge(
                 torch.arange(f_v, device=device, dtype=torch.float32) * scale
             )
 
-        video_pos = video_pos_per_frame.repeat_interleave(h * w).unsqueeze(0)
+        video_pos = video_pos_per_frame.repeat_interleave(h * w)
 
         # Use functional RoPE to compute cos/sin
         cos_v, sin_v = compute_rope_cos_sin(
