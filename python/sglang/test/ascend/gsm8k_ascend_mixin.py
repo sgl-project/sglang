@@ -14,6 +14,7 @@ from sglang.test.test_utils import (
 class GSM8KAscendMixin(ABC):
     model = ""
     accuracy = 0.00
+    timeout_for_server_launch = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
@@ -42,7 +43,7 @@ class GSM8KAscendMixin(ABC):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=cls.timeout_for_server_launch,
             other_args=cls.other_args,
             env=env,
         )
@@ -62,7 +63,7 @@ class GSM8KAscendMixin(ABC):
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval(args)
-        self.assertGreater(
+        self.assertGreaterEqual(
             metrics["accuracy"],
             self.accuracy,
             f'Accuracy of {self.model} is {str(metrics["accuracy"])}, is lower than {self.accuracy}',

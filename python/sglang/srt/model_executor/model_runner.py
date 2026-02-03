@@ -106,6 +106,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -390,6 +391,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
 
+        if self.is_multimodal:
+            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
+
         # Temporary cached values
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
@@ -488,6 +492,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         )
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
+            model_num_layers = 1
+        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
             model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
