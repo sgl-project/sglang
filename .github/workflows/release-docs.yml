@@ -47,6 +47,7 @@ jobs:
         run: |
           cd docs
           make html
+          make markdown
           python3 wrap_run_llm.py
 
           cd _build/html
