@@ -192,7 +192,6 @@ class DiffusionServerArgs:
             self.custom_validator = "video"
 
 
-
 @dataclass(frozen=True)
 class DiffusionSamplingParams:
     """Configuration for a single model/scenario test case."""
@@ -218,8 +217,6 @@ class DiffusionSamplingParams:
 
     # TeaCache acceleration
     enable_teacache: bool = False
-
-
 
 
 @dataclass(frozen=True)
@@ -665,7 +662,7 @@ TWO_GPU_CASES_A = [
             num_gpus=2,
             warmup=True,
         ),
-        T2I_sampling_params
+        T2I_sampling_params,
     ),
 ]
 
