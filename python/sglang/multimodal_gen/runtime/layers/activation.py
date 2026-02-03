@@ -3,13 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/activation.py
 """Custom activation functions."""
-import math
-from typing import Any
-
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from sgl_kernel import silu_and_mul
 
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
@@ -29,18 +23,6 @@ class SiluAndMul(CustomOp):
     def __init__(self) -> None:
         super().__init__()
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        output_shape = x.shape[:-1] + (d,)
-        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
-        return out
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        d = x.shape[-1] // 2
-        return F.silu(x[..., :d]) * x[..., d:]
-
 
 @CustomOp.register("gelu_and_mul")
 class GeluAndMul(CustomOp):
@@ -59,13 +41,8 @@ class GeluAndMul(CustomOp):
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unknown approximate mode: {approximate}")
 
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        d = x.shape[-1] // 2
-        return F.gelu(x[..., :d], approximate=self.approximate) * x[..., d:]
+    def use_forward_cuda(self):
+        return self.use_forward_native()
 
     def extra_repr(self) -> str:
         return f"approximate={repr(self.approximate)}"
@@ -77,13 +54,8 @@ class NewGELU(CustomOp):
     def __init__(self):
         super().__init__()
 
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        c = math.sqrt(2.0 / math.pi)
-        return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
+    def use_forward_cuda(self):
+        return self.use_forward_native()
 
 
 @CustomOp.register("quick_gelu")
@@ -92,12 +64,8 @@ class QuickGELU(CustomOp):
     def __init__(self):
         super().__init__()
 
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
-
-    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        """PyTorch-native implementation equivalent to forward()."""
-        return x * torch.sigmoid(1.702 * x)
+    def use_forward_cuda(self):
+        return self.use_forward_native()
 
 
 _ACTIVATION_REGISTRY = {
