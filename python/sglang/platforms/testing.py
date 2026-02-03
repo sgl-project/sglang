@@ -38,10 +38,20 @@ class MockPlatform(Platform):
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
-        if name in self._mock_ops:
-            return self._mock_ops[name]
-        # Return a no-op callable for any unregistered op
-        return lambda *args, **kwargs: None
+        # Use object.__getattribute__ to avoid infinite recursion
+        # when _mock_ops hasn't been initialized yet (e.g., during unpickling)
+        try:
+            mock_ops = object.__getattribute__(self, "_mock_ops")
+        except AttributeError:
+            raise AttributeError(name)
+        if name in mock_ops:
+            return mock_ops[name]
+        # Raise AttributeError for unregistered ops to avoid silent failures
+        raise AttributeError(
+            f"MockPlatform has no op '{name}' registered. "
+            f"Available ops: {list(mock_ops.keys())}. "
+            f"Register it with mock.register_op('{name}', implementation)"
+        )
 
 
 def set_current_platform(platform: Platform) -> None:
