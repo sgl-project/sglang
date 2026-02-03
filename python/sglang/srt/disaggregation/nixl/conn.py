@@ -514,24 +514,29 @@ class NixlKVManager(CommonKVManager):
                 + dst_head_slice_offset
             ).ravel()
 
-            src_addrs.extend(
-                zip(
-                    src_all.tolist(),
-                    repeat(heads_bytes_per_token_to_send),
-                    repeat(self.kv_args.gpu_id),
-                )
-            )
-            dst_addrs.extend(
-                zip(
-                    dst_all.tolist(),
-                    repeat(heads_bytes_per_token_to_send),
-                    repeat(dst_gpu_id),
+            src_addrs.append(src_all)
+            dst_addrs.append(dst_all)
+
+        def make_req_array(addr_chunks, size, gpu):
+            if not addr_chunks:
+                return np.empty((0, 3), dtype=np.int64)
+            flat_addrs = np.concatenate(addr_chunks)
+            return np.column_stack(
+                (
+                    flat_addrs,
+                    np.full_like(flat_addrs, size),
+                    np.full_like(flat_addrs, gpu),
                 )
             )
 
+        src_reqs = make_req_array(
+            src_addrs, heads_bytes_per_token_to_send, self.kv_args.gpu_id
+        )
+        dst_reqs = make_req_array(dst_addrs, heads_bytes_per_token_to_send, dst_gpu_id)
+
         # Use NIXL agent for transfer
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
 
         xfer_handle = self.agent.initialize_xfer(
             "WRITE", src_descs, dst_descs, peer_name, notif.encode("ascii")
