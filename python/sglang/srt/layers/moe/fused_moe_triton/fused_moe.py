@@ -278,7 +278,18 @@ def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
 
 
 @torch.compile
-def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
+def _swiglu_silu_clamp_mul(x, gemm1_limit):
+    gate, up = x.chunk(2, dim=-1)
+    gate = F.silu(gate)
+    gate = gate.clamp(min=None, max=gemm1_limit)
+    up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
+    return gate * up
+
+
+@torch.compile
+def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
+    # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
+    # At present, only GPT-OSS uses this variant.
     gate, up = x[..., ::2], x[..., 1::2]
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
@@ -471,12 +482,16 @@ def fused_experts_impl(
 
         # Activation function with multiplication
         if activation == "silu" and is_gated:
+            # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
+            # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
-                intermediate_cache2 = swiglu_with_alpha_and_limit(
-                    intermediate_cache1.view(-1, N),
-                    gemm1_alpha,
-                    gemm1_limit,
+                intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+                    intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
+                )
+            elif gemm1_limit is not None:
+                intermediate_cache2 = _swiglu_silu_clamp_mul(
+                    intermediate_cache1.view(-1, N), gemm1_limit
                 )
             elif _is_cuda or _is_hip:
                 if not filter_expert:
