@@ -142,14 +142,14 @@ class SelfAttention(nn.Module):
             q = self.norm_q(q)
             k = self.norm_k(k)
 
-        # Apply RoPE
-        cos, sin = freqs.chunk(2, dim=-1)
-        q, k = _apply_rotary_emb_qk(q, k, cos, sin, is_neox_style=False)
-
         # USPAttention expects [B, S_local, H, D] format
         q = rearrange(q, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
         k = rearrange(k, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
         v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
+
+        # Apply RoPE
+        cos, sin = freqs.chunk(2, dim=-1)
+        q, k = _apply_rotary_emb_qk(q, k, cos, sin, is_neox_style=False)
 
         # USPAttention handles SP communication internally
         out = self.attn(q, k, v)
