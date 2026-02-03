@@ -651,15 +651,6 @@ class PointCrossAttentionEncoder(nn.Module):
         self.point_feats = point_feats
         self.normal_pe = normal_pe
 
-        if pc_sharpedge_size == 0:
-            print(
-                f"PointCrossAttentionEncoder INFO: pc_sharpedge_size is not given, using pc_size as pc_sharpedge_size"
-            )
-        else:
-            print(
-                f"PointCrossAttentionEncoder INFO: pc_sharpedge_size is given, using pc_size={pc_size}, pc_sharpedge_size={pc_sharpedge_size}"
-            )
-
         self.pc_size = pc_size
         self.pc_sharpedge_size = pc_sharpedge_size
 
@@ -1238,19 +1229,6 @@ class FlashVDMVolumeDecoding:
             .contiguous()
             .view((batch_size, grid_size[0], grid_size[1], grid_size[2]))
         )
-
-        print(
-            f"[DEBUG] First level grid_logits stats: "
-            f"min={grid_logits.min().item():.4f}, "
-            f"max={grid_logits.max().item():.4f}, "
-            f"mean={grid_logits.mean().item():.4f}, "
-            f"nan_count={torch.isnan(grid_logits).sum().item()}"
-        )
-
-        # 检查是否有零交叉
-        pos_count = (grid_logits > 0).sum().item()
-        neg_count = (grid_logits < 0).sum().item()
-        print(f"[DEBUG] Positive voxels: {pos_count}, Negative voxels: {neg_count}")
 
         for octree_depth_now in resolutions[1:]:
             grid_size = np.array([octree_depth_now + 1] * 3)

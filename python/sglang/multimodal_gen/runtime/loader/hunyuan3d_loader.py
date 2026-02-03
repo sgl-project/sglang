@@ -227,13 +227,9 @@ class Hunyuan3DShapeLoader(ComponentLoader):
                 ckpt_name = f"model-{variant}.ckpt"
 
         ckpt_path = os.path.join(local_path, ckpt_name)
-        print(f"[DEBUG] Looking for checkpoint: {ckpt_path}")
-        print(f"[DEBUG] Checkpoint exists: {os.path.exists(ckpt_path)}")
         if not os.path.exists(ckpt_path):
             ckpt_pattern = "*.safetensors" if use_safetensors else "*.ckpt"
             files = glob.glob(os.path.join(local_path, ckpt_pattern))
-            print(f"[DEBUG] Fallback search pattern: {ckpt_pattern}")
-            print(f"[DEBUG] Found files: {files}")
             if files:
                 ckpt_path = files[0]
 
