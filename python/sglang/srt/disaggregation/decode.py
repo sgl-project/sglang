@@ -909,7 +909,7 @@ class DecodeTransferQueue:
         # Check if this request has paged scatter allocation
         # Returns: (scatter_page_indices, kv_page_indices, num_pages)
         info = paged_scatter_mgr.get_request_info(req.rid)
-        logger.info(
+        logger.debug(
             f"Paged scatter get_request_info: rid={req.rid}, info_exists={info is not None}"
         )
         if info is None:
@@ -924,7 +924,7 @@ class DecodeTransferQueue:
 
         prefill_tp_size = paged_scatter_mgr.prefill_tp_size
 
-        logger.info(
+        logger.debug(
             f"Paged scatter EXEC: rid={req.rid}, pages={num_pages}, tp_size={prefill_tp_size}"
         )
 
@@ -938,7 +938,7 @@ class DecodeTransferQueue:
             )
 
             if success:
-                logger.info(
+                logger.debug(
                     f"Paged scatter DONE: rid={req.rid}, pages={num_pages}, tp_ranks={prefill_tp_size}"
                 )
             else:

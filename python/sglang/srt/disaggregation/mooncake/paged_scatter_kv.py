@@ -244,7 +244,7 @@ class PagedScatterKVManager:
 
             allocated_count = self.max_pages - len(self._free_pages)
             usage_percent = (allocated_count / self.max_pages) * 100
-            logger.info(
+            logger.debug(
                 f"Paged scatter ALLOC OK: request_id={request_id}, "
                 f"pages={num_pages}, usage={usage_percent:.1f}% ({allocated_count}/{self.max_pages})"
             )
@@ -298,7 +298,7 @@ class PagedScatterKVManager:
             allocated_count = self.max_pages - len(self._free_pages)
             usage_percent = (allocated_count / self.max_pages) * 100
 
-            logger.info(
+            logger.debug(
                 f"Paged scatter RELEASE: request_id={request_id}, pages={num_pages}, "
                 f"usage={usage_percent:.1f}% ({allocated_count}/{self.max_pages})"
             )
@@ -479,7 +479,7 @@ class PagedScatterKVManager:
                 if layer_idx == 0 and prefill_tp_rank == 0:
                     # Check if scatter buffer has non-zero data
                     src_k_sum = src_k.float().abs().sum().item()
-                    logger.info(
+                    logger.debug(
                         f"Scatter debug: layer=0, tp_rank={prefill_tp_rank}, "
                         f"scatter_tokens={scatter_token_indices[:5].tolist()}, "
                         f"dst_tokens={dst_token_indices[:5].tolist()}, "

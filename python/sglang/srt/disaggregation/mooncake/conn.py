@@ -181,7 +181,7 @@ class KVArgsRegisterInfo:
             # If msg[9] is not digit, maybe a field was inserted. Try index 10.
             if len(msg) > 10 and msg[10].isdigit():
                 base_offset = 1
-                logger.info(
+                logger.debug(
                     f"KVArgsRegisterInfo: detected field shift, base_offset={base_offset}"
                 )
 
@@ -226,7 +226,7 @@ class KVArgsRegisterInfo:
             # Try next index
             if len(msg) > scatter_idx + 1 and msg[scatter_idx + 1] in (b"0", b"1"):
                 scatter_idx += 1
-                logger.info(
+                logger.debug(
                     f"KVArgsRegisterInfo: detected scatter field shift, scatter_idx={scatter_idx}"
                 )
 
@@ -251,7 +251,7 @@ class KVArgsRegisterInfo:
                             f"{len(msg[scatter_idx + 3])//4}i", msg[scatter_idx + 3]
                         )
                     )
-                logger.info(
+                logger.debug(
                     f"KVArgsRegisterInfo.from_zmq: scatter_enabled={base_info.scatter_mode_enabled}, "
                     f"num_ptrs={len(base_info.scatter_kv_ptrs)}, item_len={base_info.scatter_kv_item_len}, "
                     f"num_pages={len(base_info.scatter_page_indices)}"
@@ -1011,7 +1011,7 @@ class MooncakeKVManager(CommonKVManager):
         num_layers = len(scatter_kv_ptrs) // 2
         item_lens = [scatter_kv_item_len] * len(scatter_kv_ptrs)
 
-        logger.info(
+        logger.debug(
             f"Scatter transfer (paged): pages={num_pages}, layers={num_layers}, "
             f"chunk_start={chunk_start_page_idx}, item_len={scatter_kv_item_len}, "
             f"src_indices={prefill_kv_indices[:3].tolist() if len(prefill_kv_indices) >= 3 else prefill_kv_indices.tolist()}, "
@@ -1291,7 +1291,7 @@ class MooncakeKVManager(CommonKVManager):
                                 and target_rank_registration_info.scatter_mode_enabled
                             )
 
-                            logger.info(
+                            logger.debug(
                                 f"send_kvcache_slice: room={kv_chunk.room}, scatter_enabled={scatter_mode_enabled}, "
                                 f"scatter_pages={len(scatter_page_indices) if scatter_page_indices else 0}, "
                                 f"scatter_indices[:3]={scatter_page_indices[:3] if scatter_page_indices else []}, "
@@ -1480,7 +1480,7 @@ class MooncakeKVManager(CommonKVManager):
                                         bootstrap_room
                                     )
                         else:
-                            logger.info(
+                            logger.debug(
                                 f"Attempting to reconnect to {bootstrap_addr}..."
                             )
                             self.heartbeat_failures[bootstrap_addr] = (
@@ -1490,7 +1490,7 @@ class MooncakeKVManager(CommonKVManager):
                                 if bootstrap_addr in self.session_pool:
                                     del self.session_pool[bootstrap_addr]
                     except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        logger.debug(f"Attempting to reconnect to {bootstrap_addr}...")
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
@@ -1744,7 +1744,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         # Track if _register_kv_args was called during super().__init__
         self._register_kv_args_called = False
 
-        logger.info(
+        logger.debug(
             f"MooncakeKVReceiver BEFORE super().__init__: request_id={self._scatter_request_id}, "
             f"estimated_pages={self._estimated_num_pages}"
         )
@@ -1761,13 +1761,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         #
         # This is necessary because scatter buffer offset is PER-REQUEST, not per-connection.
         # Without this, subsequent requests would use the first request's scatter buffer info.
-        logger.info(
+        logger.debug(
             f"MooncakeKVReceiver init: request_id={self._scatter_request_id}, "
             f"pending_mgr={self._pending_mgr is not None}, scatter_allocated={self._scatter_allocated}, "
             f"register_kv_args_called={self._register_kv_args_called}"
         )
         if self._pending_mgr is not None and not self._scatter_allocated:
-            logger.info(
+            logger.debug(
                 f"MooncakeKVReceiver post-init: calling _try_allocate_scatter_buffer, "
                 f"register_kv_args_called={self._register_kv_args_called}"
             )
@@ -1781,7 +1781,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 and not self._register_kv_args_called
             ):
                 # Call _register_kv_args to send scatter buffer info for this request
-                logger.info(
+                logger.debug(
                     f"MooncakeKVReceiver post-init: calling _register_kv_args for connection reuse"
                 )
                 self._register_kv_args()
@@ -1860,7 +1860,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self._use_scatter_for_request = True
             self._scatter_allocated = True
             self._scatter_page_indices = scatter_page_indices  # List[int]
-            logger.info(
+            logger.debug(
                 f"Paged scatter ALLOC OK: request_id={self._scatter_request_id}, "
                 f"pages={self._estimated_num_pages}, "
                 f"scatter_indices={scatter_page_indices[:5]}..."
@@ -1969,7 +1969,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         scatter_indices, dtype=np.int32
                     ).tobytes()
 
-                    logger.info(
+                    logger.debug(
                         f"Scatter registration (paged): "
                         f"prefill_tp global={global_prefill_tp_rank}, local={local_prefill_tp_rank}, "
                         f"num_ptrs={len(scatter_kv_ptrs)}, item_len={scatter_item_len}, "
