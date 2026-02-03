@@ -73,7 +73,6 @@ from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
     configure_logger,
-    enable_device_properties_caching,
     get_bool_env_var,
     get_zmq_socket,
     is_cuda,
@@ -758,9 +757,6 @@ class Engine(EngineBase):
 
 
 def _set_envs_and_config(server_args: ServerArgs):
-    # Enable device properties caching to reduce overhead
-    enable_device_properties_caching()
-
     # Set global environments
     if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))

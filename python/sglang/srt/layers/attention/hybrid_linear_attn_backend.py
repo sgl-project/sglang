@@ -1330,6 +1330,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output_state_fi = initial_state_fi
                 
                 # Call FlashInfer prefill kernel
+                # Note: q and k are already L2-normalized above, so use_qk_l2norm_in_kernel=False
                 output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
                     q=q_fi,
                     k=k_fi,
@@ -1340,7 +1341,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     initial_state=initial_state_fi,
                     output_final_state=True,
                     cu_seqlens=cu_seqlens_fi,
-                    use_qk_l2norm_in_kernel=True,
+                    use_qk_l2norm_in_kernel=False,
                     output_state=output_state_fi,
                 )
 
