@@ -657,7 +657,6 @@ impl SglangSchedulerClient {
 
         Ok(sampling)
     }
-
 }
 
 #[cfg(test)]

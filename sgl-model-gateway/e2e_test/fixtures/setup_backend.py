@@ -319,6 +319,7 @@ def _setup_epd_backend(
     )
 
     if transfer_backend:
+
         def _filter_backend(workers):
             matched = []
             for w in workers:
