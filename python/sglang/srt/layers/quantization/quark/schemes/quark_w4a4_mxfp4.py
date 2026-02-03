@@ -7,7 +7,10 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import is_hip
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.utils import is_hip, set_weight_attrs
+from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 
 _is_hip = is_hip()
 if _is_hip:
@@ -22,6 +25,16 @@ logger = logging.getLogger(__name__)
 OCP_MX_BLOCK_SIZE = 32
 
 
+def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
+    """Copies any attrs present in `old` but not in `new` to `new`"""
+    new_attrs = set(dir(new))
+    attrs_to_set = {}
+    for attr in dir(old):
+        if attr not in new_attrs:
+            attrs_to_set[attr] = getattr(old, attr)
+    set_weight_attrs(new, attrs_to_set)
+
+
 class QuarkW4A4MXFP4(QuarkScheme):
 
     def __init__(
@@ -29,12 +42,14 @@ class QuarkW4A4MXFP4(QuarkScheme):
         weight_quant_spec: dict[str, Any],
         input_quant_spec: dict[str, Any],
         is_checkpoint_mxfp4_serialized: bool = True,
+        dequantization_config: QuantizationConfig | None = None,
     ):
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+        self.dequantization_config = dequantization_config
 
         if not self.is_checkpoint_mxfp4_serialized:
             logger.info_once(
@@ -66,38 +81,79 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         layer.logical_widths = output_partition_sizes
 
-        original_weight_loader = weight_loader
-        if not self.is_checkpoint_mxfp4_serialized:
-            weight_loader = self.get_online_mxfp4_weight_loader(layer, weight_loader)
+        # If dequantization_config is provided, we need to create FP8 weights first
+        # for dequantization from FP8 checkpoint to MXFP4
+        if self.dequantization_config is not None:
+            # Create FP8 weights for re-quantization from FP8 checkpoint
+            # Extract necessary parameters from dequantization_config
+            weight_block_size = self.dequantization_config.weight_block_size
 
-        # WEIGHT
-        # Both serialized and online quantization use packed uint8 format
-        weight = PackedvLLMParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // 2,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            packed_dim=1,
-            packed_factor=2,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight", weight)
+            if self.dequantization_config.use_mxfp8:
+                raise NotImplementedError("use_mxfp8=True is not supported in Quark MXFP4 requantization.")
 
-        # WEIGHT SCALE
-        weight_scale = GroupQuantScaleParameter(
-            data=torch.empty(
-                output_size_per_partition,
-                input_size_per_partition // OCP_MX_BLOCK_SIZE,
-                dtype=torch.uint8,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=original_weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
+            # Determine if block quantization is used
+            block_quant = weight_block_size is not None
+
+            layer._fp8_weight_loaded_numel = 0
+            layer._fp8_scale_loaded_numel = 0
+            layer._load_device = torch.get_default_device()
+
+            # Wrap the weight loader to handle FP8->MXFP4 conversion
+            fp8_to_mxfp4_weight_loader = self.get_online_fp8_to_mxfp4_weight_loader(
+                layer, weight_loader
+            )
+
+            # Create FP8 weight parameters on meta device to avoid memory overhead
+            # They will be materialized on first load in the weight loader
+            with torch.device("meta"):
+                Fp8LinearMethod.create_fp8_weight_(
+                    layer=layer,
+                    block_quant=block_quant,
+                    quant_config=self.dequantization_config,
+                    use_mxfp8=False,
+                    output_size_per_partition=output_size_per_partition,
+                    input_size_per_partition=input_size_per_partition,
+                    output_partition_sizes=output_partition_sizes,
+                    weight_loader=fp8_to_mxfp4_weight_loader,
+                    is_checkpoint_fp8_serialized=True,
+                    params_dtype=params_dtype,
+                    skip_block_quant_check=False,
+                    input_size=kwargs.get("input_size", input_size_per_partition),
+                    output_size=kwargs.get("output_size", output_size_per_partition),
+                )
+        else:
+            original_weight_loader = weight_loader
+            if not self.is_checkpoint_mxfp4_serialized:
+                weight_loader = self.get_online_mxfp4_weight_loader(layer, weight_loader)
+
+            # WEIGHT
+            # Both serialized and online quantization use packed uint8 format
+            weight = PackedvLLMParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // 2,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=2,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+
+            # WEIGHT SCALE
+            weight_scale = GroupQuantScaleParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition // OCP_MX_BLOCK_SIZE,
+                    dtype=torch.uint8,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=original_weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
 
     def get_online_mxfp4_weight_loader(
         self,
@@ -131,6 +187,125 @@ class QuarkW4A4MXFP4(QuarkScheme):
             layer.weight_scale.weight_loader(layer.weight_scale, weight_scale, **kwargs)
 
         return online_mxfp4_weight_loader
+
+    def get_online_fp8_to_mxfp4_weight_loader(
+        self,
+        layer,
+        original_weight_loader: Callable,
+    ) -> Callable:
+        """
+        Wrap the original weight loader to perform FP8 to MXFP4 requantization.
+
+        This loader handles:
+        1. Loading FP8 weights and weight_scale_inv parameters
+        2. Waiting for all shards (e.g., q_proj, k_proj, v_proj) to be loaded
+        3. Dequantizing FP8 -> BF16 using weight_scale_inv
+        4. Requantizing BF16 -> MXFP4
+        """
+        def online_fp8_to_mxfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            shard_id: int | str | None = None,
+        ):
+            # Determine if we're loading weight or weight_scale_inv
+            param_name = None
+            for name, p in layer.named_parameters():
+                if p is param:
+                    param_name = name
+                    break
+
+            is_weight = param_name == "weight"
+            is_weight_scale_inv = param_name == "weight_scale_inv"
+
+            if not is_weight and not is_weight_scale_inv:
+                # For other parameters (e.g., bias), use original loader
+                kwargs = {}
+                if shard_id is not None:
+                    kwargs["loaded_shard_id"] = shard_id
+                original_weight_loader(param, loaded_weight, **kwargs)
+                return
+
+            # Materialize FP8 parameters on first load from meta device
+            if is_weight and layer._fp8_weight_loaded_numel == 0:
+                assert param.device.type == "meta", f"Expected weight on meta device, got {param.device}"
+
+                # Materialize weight parameter on device
+                from sglang.srt.layers.parameter import ModelWeightParameter
+                layer.weight = ModelWeightParameter(
+                    data=torch.empty_like(param.data, device=layer._load_device),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=online_fp8_to_mxfp4_weight_loader,
+                )
+                _copy_missing_attrs(param, layer.weight)
+                param = layer.weight
+
+            if is_weight_scale_inv and layer._fp8_scale_loaded_numel == 0:
+                assert param.device.type == "meta", f"Expected weight_scale_inv on meta device, got {param.device}"
+
+                # Materialize scale parameter on device
+                from sglang.srt.layers.parameter import BlockQuantScaleParameter
+                layer.weight_scale_inv = BlockQuantScaleParameter(
+                    data=torch.empty_like(param.data, device=layer._load_device),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=online_fp8_to_mxfp4_weight_loader,
+                )
+                _copy_missing_attrs(param, layer.weight_scale_inv)
+                param = layer.weight_scale_inv
+
+            # Move loaded weight to device
+            loaded_weight = loaded_weight.to(layer._load_device)
+
+            kwargs = {}
+            if shard_id is not None:
+                kwargs["loaded_shard_id"] = shard_id
+
+            # Track how much data we are actually loading (`narrow` used in weight loader)
+            copy_numel_counter = CopyNumelCounter()
+            with copy_numel_counter:
+                original_weight_loader(param, loaded_weight, **kwargs)
+
+            # Update loading progress
+            if is_weight:
+                layer._fp8_weight_loaded_numel += copy_numel_counter.copied_numel
+            elif is_weight_scale_inv:
+                layer._fp8_scale_loaded_numel += copy_numel_counter.copied_numel
+
+            # Check if both weight and scale are fully loaded
+            weight_fully_loaded = layer._fp8_weight_loaded_numel == layer.weight.numel()
+            scale_fully_loaded = layer._fp8_scale_loaded_numel == layer.weight_scale_inv.numel()
+
+            # Perform dequantization and requantization only when both are fully loaded
+            if weight_fully_loaded and scale_fully_loaded:
+                # Abstract function placeholders - to be implemented
+                def fp8_to_bf16(weight, weight_scale):
+                    """Dequantize FP8 weight to BF16 using weight_scale_inv."""
+                    raise NotImplementedError("fp8_to_bf16 dequantization not yet implemented")
+
+                def quantize_mxfp4(weight_bf16):
+                    """Quantize BF16 weight to MXFP4, returning (weight_mxfp4, weight_mxfp4_scale)."""
+                    raise NotImplementedError("quantize_mxfp4 not yet implemented")
+
+                # FP8 -> BF16 dequantization
+                weight_bf16 = fp8_to_bf16(layer.weight, layer.weight_scale_inv)
+
+                # BF16 -> MXFP4 requantization
+                weight_mxfp4, weight_mxfp4_scale = quantize_mxfp4(weight_bf16)
+
+                # Replace FP8 weight parameter with MXFP4 weight
+                layer.weight = torch.nn.Parameter(weight_mxfp4, requires_grad=False)
+
+                # Create and set MXFP4 weight_scale parameter
+                layer.weight_scale = torch.nn.Parameter(weight_mxfp4_scale, requires_grad=False)
+
+                # Clean up FP8 parameters and tracking attributes
+                del layer.weight_scale_inv
+                del layer._fp8_weight_loaded_numel
+                del layer._fp8_scale_loaded_numel
+                del layer._load_device
+
+        return online_fp8_to_mxfp4_weight_loader
 
     def apply_weights(
         self,

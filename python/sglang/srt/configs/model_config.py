@@ -80,6 +80,9 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
 
+QUANT_METHOD_SUPPORTS_DEQUANTIZATION = [
+    "quark_mxfp4"
+]
 
 class ModelConfig:
     def __init__(
@@ -875,6 +878,9 @@ class ModelConfig:
                         f"Using draft model's detected quantization: {quant_method}"
                     )
                     self.quantization = quant_method
+                elif self.quantization in QUANT_METHOD_SUPPORTS_DEQUANTIZATION:
+                    print("DOING DEQUANTIZATION")
+                    print("quant_cfg", quant_cfg)
                 else:
                     raise ValueError(
                         "Quantization method specified in the model config "

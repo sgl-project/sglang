@@ -198,6 +198,10 @@ def get_quant_config(
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
+
+        # This is only used by quantization methods that support requantization (e.g. from fp8 to mxfp4).
+        hf_quant_config["requantization_method"] = model_config.quantization
+
         return quant_cls.from_config(hf_quant_config)
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.

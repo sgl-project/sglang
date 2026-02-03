@@ -104,6 +104,7 @@ class DeepseekV2WeightLoaderMixin:
             weights: Iterable of (weight_name, weight_tensor) pairs
             is_nextn: Whether loading NextN speculative decoding weights
         """
+        print("CALL do_load_weights ----------------------------------")
         nextn_conf = self._initialize_nextn_conf(is_nextn)
 
         weights = self._maybe_quant_weights_to_fp8_ue8m0(
@@ -147,6 +148,7 @@ class DeepseekV2WeightLoaderMixin:
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                print("----- loading:", name)
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (
@@ -343,7 +345,7 @@ class DeepseekV2WeightLoaderMixin:
                                 # modelopt ckpt contains not needed weights for MTP module:
                                 # model.decoder.self_attn.attn_mqa.v_scale and
                                 # model.decoder.self_attn.attn_mqa.k_scale
-                                logger.warning(f"{name} not found in params_dict.")
+                                logger.warning(f"{name} not found in params_dict (deepseek weight loader).")
                                 continue
                             param = params_dict[name]
                             weight_loader = getattr(

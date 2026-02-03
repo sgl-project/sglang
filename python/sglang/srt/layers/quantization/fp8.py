@@ -251,8 +251,112 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+    @staticmethod
+    def create_fp8_weight_(
+        layer: torch.nn.Module,
+        block_quant: bool,
+        quant_config,
+        use_mxfp8: bool,
+        output_size_per_partition: int,
+        input_size_per_partition: int,
+        output_partition_sizes: list,
+        weight_loader,
+        is_checkpoint_fp8_serialized: bool,
+        params_dtype,
+        skip_block_quant_check: bool,
+        input_size: int,
+        output_size: int,
+    ):
+        # Copy the layer attributes
+        output_size_per_partition = sum(output_partition_sizes)
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+
+        if block_quant:
+            block_n, block_k = quant_config.weight_block_size
+            Fp8LinearMethod.validate_block_quant_shapes(
+                quant_config,
+                input_size,
+                input_size_per_partition,
+                output_size,
+                output_size_per_partition,
+                output_partition_sizes,
+                skip_block_quant_check,
+            )
+        else:
+            block_n, block_k = None, None
+
+        # Create the weight
+        weight_dtype = (
+            torch.float8_e4m3fn if is_checkpoint_fp8_serialized else params_dtype
+        )
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
+
+        if is_checkpoint_fp8_serialized:
+            if block_quant:
+                if hasattr(quant_config, "activation_scheme"):
+                    assert quant_config.activation_scheme == "dynamic"
+                elif hasattr(quant_config, "linear_activation_scheme"):
+                    assert quant_config.linear_activation_scheme == "dynamic"
+
+                scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
+                scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
+
+                print("scale of shape", (output_size_per_partition + block_n - 1) // block_n,
+                        (input_size_per_partition + block_k - 1) // block_k)
+                scale = BlockQuantScaleParameter(
+                    data=scale_init(
+                        (output_size_per_partition + block_n - 1) // block_n,
+                        (input_size_per_partition + block_k - 1) // block_k,
+                        dtype=scale_dtype,
+                    ),
+                    input_dim=1,
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                scale.format_ue8m0 = use_mxfp8
+                if scale_dtype != torch.uint8:
+                    scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale_inv", scale)
+            else:
+                scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", scale)
+
+            # INPUT ACTIVATION SCALE
+            if (
+                hasattr(quant_config, "activation_scheme")
+                and quant_config.activation_scheme == "static"
+            ) or (
+                hasattr(quant_config, "linear_activation_scheme")
+                and quant_config.linear_activation_scheme == "static"
+            ):
+                scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("input_scale", scale)
+            else:
+                layer.register_parameter("input_scale", None)
+
+    @staticmethod
     def validate_block_quant_shapes(
-        self,
+        quant_config,
         input_size: int,
         input_size_per_partition: int,
         output_size: int,
@@ -262,8 +366,8 @@ class Fp8LinearMethod(LinearMethodBase):
     ):
         tp_size = get_tensor_model_parallel_world_size()
         block_n, block_k = (
-            self.quant_config.weight_block_size[0],
-            self.quant_config.weight_block_size[1],
+            quant_config.weight_block_size[0],
+            quant_config.weight_block_size[1],
         )
 
         if skip_block_quant_check:
@@ -310,85 +414,21 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.orig_dtype = params_dtype
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        if self.block_quant:
-            block_n, block_k = self.quant_config.weight_block_size
-            self.validate_block_quant_shapes(
-                input_size,
-                input_size_per_partition,
-                output_size,
-                output_size_per_partition,
-                output_partition_sizes,
-                skip_block_quant_check,
-            )
-
-        # Create the weight
-        weight_dtype = (
-            torch.float8_e4m3fn if self.is_checkpoint_fp8_serialized else params_dtype
-        )
-        weight = ModelWeightParameter(
-            data=torch.empty(
-                output_size_per_partition, input_size_per_partition, dtype=weight_dtype
-            ),
-            input_dim=1,
-            output_dim=0,
+        Fp8LinearMethod.create_fp8_weight_(
+            layer,
+            block_quant=self.block_quant,
+            quant_config=self.quant_config,
+            use_mxfp8=self.use_mxfp8,
+            output_size_per_partition=output_size_per_partition,
+            input_size_per_partition=input_size_per_partition,
+            output_partition_sizes=output_partition_sizes,
             weight_loader=weight_loader,
+            skip_block_quant_check=skip_block_quant_check,
+            input_size=input_size,
+            output_size=output_size,
+            is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
+            params_dtype=params_dtype,
         )
-        layer.register_parameter("weight", weight)
-
-        # If checkpoint is serialized fp8, load them.
-        # Otherwise, wait until process_weights_after_loading.
-        if self.is_checkpoint_fp8_serialized:
-            # WEIGHT SCALE
-            if self.block_quant:
-                if hasattr(self.quant_config, "activation_scheme"):
-                    assert self.quant_config.activation_scheme == "dynamic"
-                elif hasattr(self.quant_config, "linear_activation_scheme"):
-                    assert self.quant_config.linear_activation_scheme == "dynamic"
-                if self.use_mxfp8 and not self.is_checkpoint_fp8_serialized:
-                    raise ValueError(
-                        "MXFP8 requires fp8-serialized checkpoint for linear layers."
-                    )
-                scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
-                scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
-                scale = BlockQuantScaleParameter(
-                    data=scale_init(
-                        (output_size_per_partition + block_n - 1) // block_n,
-                        (input_size_per_partition + block_k - 1) // block_k,
-                        dtype=scale_dtype,
-                    ),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=weight_loader,
-                )
-                scale.format_ue8m0 = self.use_mxfp8
-                if scale_dtype != torch.uint8:
-                    scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale_inv", scale)
-            else:
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale", scale)
-
-            # INPUT ACTIVATION SCALE
-            if (
-                hasattr(self.quant_config, "activation_scheme")
-                and self.quant_config.activation_scheme == "static"
-            ) or (
-                hasattr(self.quant_config, "linear_activation_scheme")
-                and self.quant_config.linear_activation_scheme == "static"
-            ):
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("input_scale", scale)
-            else:
-                layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz
