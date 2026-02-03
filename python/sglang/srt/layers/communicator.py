@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import (
+    attention_tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -426,10 +427,9 @@ class LayerCommunicator:
                 and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
-                # Use attention TP group for allreduce fusion in prepare_attn
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
-                        hidden_states, residual, use_attn_tp_group=True
+                        hidden_states, residual, use_attn_tp_group=False
                     )
                 )
             else:
@@ -828,10 +828,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
             ):
                 # Use standard TP group (MLP/MoE) for allreduce fusion in postprocess_layer
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual, use_attn_tp_group=False
+                    hidden_states, residual, use_attn_tp_group=True
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states = attention_tensor_model_parallel_all_reduce(
+                    hidden_states
+                )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -953,8 +955,6 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
-        print("Hidden States Shape: ", hidden_states.shape)
-        print("Global Hidden States Shape: ", global_hidden_states.shape)
         if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)

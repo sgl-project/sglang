@@ -33,7 +33,7 @@ from sglang.srt.distributed import (
     get_moe_tensor_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_rank,
-    tensor_model_parallel_all_reduce,
+    moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -317,7 +317,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -784,22 +786,6 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
         )
 
-        if self.layer_id in [1] and forward_batch.forward_mode.is_extend():
-            is_cp = (
-                is_prefill_context_parallel_enabled()
-                and forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-            )
-            mode_str = "CP" if is_cp else "non-CP"
-            print(
-                f"[ATTN I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE ATTN: hidden_states shape: {hidden_states.shape}",
-                flush=True,
-            )
-            torch.save(
-                hidden_states,
-                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_attn_hidden_states_{mode_str}_rank{torch.distributed.get_rank()}.pt",
-            )
-
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
@@ -808,25 +794,42 @@ class Qwen3MoeDecoderLayer(nn.Module):
             )
 
         # DEBUG: Print hidden states before MLP for first two layers
-        if self.layer_id in [1] and forward_batch.forward_mode.is_extend():
+        if self.layer_id in [0] and forward_batch.forward_mode.is_extend():
             is_cp = (
                 is_prefill_context_parallel_enabled()
                 and forward_batch.forward_mode.is_context_parallel_extend()
                 and forward_batch.attn_cp_metadata is not None
             )
-            mode_str = "CP" if is_cp else "non-CP"
+            mode_str = "test"
             print(
                 f"[MLP I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE MLP: hidden_states shape: {hidden_states.shape}",
                 flush=True,
             )
             torch.save(
                 hidden_states,
-                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_mlp_hidden_states_{mode_str}_rank{torch.distributed.get_rank()}.pt",
+                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_attn_output_{mode_str}_rank{torch.distributed.get_rank()}.pt",
             )
 
+        # print(f"DEBUG: Layer {self.layer_id} prepare_mlp hidden_states.shape={hidden_states.shape}, residual.shape={residual.shape}", flush=True)
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+
+        if self.layer_id in [0] and forward_batch.forward_mode.is_extend():
+            is_cp = (
+                is_prefill_context_parallel_enabled()
+                and forward_batch.forward_mode.is_context_parallel_extend()
+                and forward_batch.attn_cp_metadata is not None
+            )
+            mode_str = "test"
+            print(
+                f"[ATTN I/O] {mode_str} Rank {torch.distributed.get_rank()} layer {self.layer_id} BEFORE ATTN: hidden_states shape: {hidden_states.shape}",
+                flush=True,
+            )
+            torch.save(
+                hidden_states,
+                f"/home/scratch.shunkangz_gpu_1/LLM-Inference/sglang/layer{self.layer_id}_mlp_input_{mode_str}_rank{torch.distributed.get_rank()}.pt",
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
