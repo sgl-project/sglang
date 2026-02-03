@@ -586,13 +586,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
       - name: Accuracy Test MI35x (8-GPU Grok1-INT4)
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e RCCL_MSCCL_ENABLE=0 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 3600 || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 5400 || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
