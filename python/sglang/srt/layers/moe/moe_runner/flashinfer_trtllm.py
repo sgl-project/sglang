@@ -45,7 +45,6 @@ elif is_cuda_alike():
 else:
     fp4_quantize = None
 
-
 def align_fp8_moe_weights_for_flashinfer_trtllm(
     layer: Module, swap_w13_halves: bool = False
 ) -> None:
