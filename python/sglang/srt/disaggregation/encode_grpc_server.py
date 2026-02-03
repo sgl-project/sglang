@@ -138,9 +138,25 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 if not embedding_ports:
                     # Dynamic endpoint discovery
                     # Don't block the Encode RPC on receiver registration.
-                    asyncio.create_task(
+                    task = asyncio.create_task(
                         self.encoder.send_with_url(req_id=request.req_id)
                     )
+
+                    def _log_task_result(t: asyncio.Task) -> None:
+                        try:
+                            t.result()
+                        except asyncio.CancelledError:
+                            logger.debug(
+                                "Encoder send_with_url task cancelled (req_id=%s)",
+                                request.req_id,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Encoder send_with_url task failed (req_id=%s)",
+                                request.req_id,
+                            )
+
+                    task.add_done_callback(_log_task_result)
                 else:
                     # Send to specified ports
                     tasks = []
