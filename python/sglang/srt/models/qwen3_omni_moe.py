@@ -70,8 +70,18 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim,
+            config.encoder_ffn_dim,
+            bias=True,
+            prefix=f"{prefix}.fc1",
+        )
+        self.fc2 = RowParallelLinear(
+            config.encoder_ffn_dim,
+            self.embed_dim,
+            bias=True,
+            prefix=f"{prefix}.fc2",
+        )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -187,12 +197,10 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             2,
             padding=1,
         )
-        self.conv_out = nn.Linear(
-            config.downsample_hidden_size
-            * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2),
-            config.d_model,
-            bias=False,
+        conv_out_dim = config.downsample_hidden_size * (
+            (((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2
         )
+        self.conv_out = nn.Linear(conv_out_dim, config.d_model, bias=False)
         self.proj1 = nn.Linear(config.d_model, config.d_model)
         self.act = ACT2FN[config.activation_function]
         self.proj2 = nn.Linear(config.d_model, config.output_dim)
@@ -238,23 +246,34 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         padded_feature = nn.utils.rnn.pad_sequence(
             chunk_list, batch_first=True
         ).transpose(1, 2)
+
+        # Introduce vectorized mask to avoid many small tensors
         feature_lens_after_cnn = _get_feat_extract_output_lengths(chunk_lengths)
-        padded_mask_after_cnn = nn.utils.rnn.pad_sequence(
-            [
-                torch.ones(length, dtype=torch.bool, device=padded_feature.device)
-                for length in feature_lens_after_cnn
-            ],
-            batch_first=True,
+        max_len_after_cnn = (
+            int(feature_lens_after_cnn.max().item())
+            if feature_lens_after_cnn.numel()
+            else 0
         )
+
+        idx = torch.arange(max_len_after_cnn, device=padded_feature.device)
+        padded_mask_after_cnn = idx.unsqueeze(0) < feature_lens_after_cnn.unsqueeze(1)
+
         padded_feature = padded_feature.unsqueeze(1)
-        # Split to chunk to avoid OOM during convolution
-        padded_embeds = []
-        for chunk in padded_feature.split(self.conv_chunksize, dim=0):
-            padded_embed = F.gelu(self.conv2d1(chunk))
+
+        # Add fast path + chunk normal path
+        if padded_feature.size(0) <= self.conv_chunksize:
+            padded_embed = F.gelu(self.conv2d1(padded_feature))
             padded_embed = F.gelu(self.conv2d2(padded_embed))
             padded_embed = F.gelu(self.conv2d3(padded_embed))
-            padded_embeds.append(padded_embed)
-        padded_embed = torch.cat(padded_embeds, dim=0)
+        else:
+            padded_embeds = []
+            for chunk in padded_feature.split(self.conv_chunksize, dim=0):
+                x = F.gelu(self.conv2d1(chunk))
+                x = F.gelu(self.conv2d2(x))
+                x = F.gelu(self.conv2d3(x))
+                padded_embeds.append(x)
+            padded_embed = torch.cat(padded_embeds, dim=0)
+
         b, c, f, t = padded_embed.size()
         padded_embed = self.conv_out(
             padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
@@ -271,11 +290,13 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         window_aftercnn = padded_mask_after_cnn.shape[-1] * (
             self.n_window_infer // (self.n_window * 2)
         )
-        for cnn_len in aftercnn_lens:
-            cu_chunk_lens += [window_aftercnn] * (cnn_len // window_aftercnn)
+        # Use tolist() for efficient batch conversion from tensor to Python
+        for cnn_len in aftercnn_lens.tolist():
+            num_full_chunks = cnn_len // window_aftercnn
             remainder = cnn_len % window_aftercnn
-            if remainder != 0:
-                cu_chunk_lens += [remainder]
+            cu_chunk_lens.extend([window_aftercnn] * num_full_chunks)
+            if remainder:
+                cu_chunk_lens.append(remainder)
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
             -1, dtype=torch.int32
         )
