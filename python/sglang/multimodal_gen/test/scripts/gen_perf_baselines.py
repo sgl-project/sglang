@@ -68,8 +68,8 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
     if server_args.warmup:
         a += " --warmup"
 
-    for extra_arg in server_args.extra:
-        a += extra_arg
+    for extra_arg in server_args.extras:
+        a += f" {extra_arg}"
     return a
 
 

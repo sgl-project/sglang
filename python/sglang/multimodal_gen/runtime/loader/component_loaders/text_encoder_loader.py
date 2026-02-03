@@ -246,7 +246,6 @@ class TextEncoderLoader(ComponentLoader):
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
 
-
             # Explicitly move model to target device after loading weights
             if not should_offload:
                 model = model.to(local_torch_device)

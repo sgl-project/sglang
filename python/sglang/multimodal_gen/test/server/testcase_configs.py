@@ -183,7 +183,7 @@ class DiffusionServerArgs:
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
 
-    extra: list[str] = field(default_factory=lambda: [])
+    extras: list[str] = field(default_factory=lambda: [])
 
     def __post_init__(self):
         if self.modality == "image":
@@ -661,6 +661,7 @@ TWO_GPU_CASES_A = [
             modality="image",
             num_gpus=2,
             warmup=True,
+            extras=["--use-fsdp-inference"]
         ),
         T2I_sampling_params,
     ),

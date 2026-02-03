@@ -90,7 +90,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.warmup:
         extra_args += f" --warmup"
 
-    for arg in server_args.extra:
+    for arg in server_args.extras:
         extra_args += f" {arg}"
 
     # Build custom environment variables
