@@ -847,43 +847,6 @@ class WanAttentionBlock(nn.Module):
         return attention_block_forward(self, x)
 
 
-class WanDistAttentionBlock(WanAttentionBlock):
-    r"""
-    Causal self-attention with a single head.
-
-    Args:
-        dim (int): The number of channels in the input tensor.
-    """
-    def forward(self, x):
-        rank = 0
-        world_size = 1
-        if dist.is_initialized():
-            world_size = get_sp_world_size()
-            rank = get_sp_parallel_rank()
-            x = get_sp_group().all_gather(x, dim=-2)
-
-        x = attention_block_forward(self, x)
-
-        if world_size > 1:
-            x = torch.chunk(x, world_size, dim=-2)[rank]
-
-        return x
-
-
-def mid_block_forward(self, x):
-    # First residual block
-    x = self.resnets[0](x)
-
-    # Process through attention and residual blocks
-    for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-        if attn is not None:
-            x = attn(x)
-
-        x = resnet(x)
-
-    return x
-
-
 class WanMidBlock(nn.Module):
     """
     Middle block for WanVAE encoder and decoder.
@@ -916,7 +879,17 @@ class WanMidBlock(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
-        return mid_block_forward(self, x)
+        # First residual block
+        x = self.resnets[0](x)
+
+        # Process through attention and residual blocks
+        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
+            if attn is not None:
+                x = attn(x)
+
+            x = resnet(x)
+
+        return x
 
 
 class WanDistMidBlock(nn.Module):
@@ -943,15 +916,39 @@ class WanDistMidBlock(nn.Module):
         resnets = [WanDistResidualBlock(dim, dim, dropout, non_linearity)]
         attentions = []
         for _ in range(num_layers):
-            attentions.append(WanDistAttentionBlock(dim))
+            attentions.append(WanAttentionBlock(dim))
             resnets.append(WanDistResidualBlock(dim, dim, dropout, non_linearity))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
         self.gradient_checkpointing = False
 
-    def forward(self, x):
-        return mid_block_forward(self, x)
+    def forward(self, x, origin_height: int = 1, local_padded_height: int = 0):
+        rank = get_sp_parallel_rank()
+        world_size = get_sp_world_size()
+
+        # First residual block
+        x = self.resnets[0](x)
+
+        # Process through attention and residual blocks
+        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
+            if attn is not None:
+                # We need to do global attention, so that we must all gather first
+                # Padding make sure all the tensors are the same shape in case all gather
+                # hang up.
+                padding_len = local_padded_height - x.shape[-2]
+                if padding_len > 0:
+                    x = F.pad(x, (0, 0, 0, padding_len, 0, 0))
+                x = get_sp_group().all_gather(x, dim=-2)
+                # Truncate the useless data make sure the compute result is correct as non-distributed version.
+                if x.shape[-2] != origin_height:
+                    x = x[..., :origin_height, :].contiguous()
+                x = attn(x)
+                x = torch.chunk(x, world_size, dim=-2)[rank]
+
+            x = resnet(x)
+
+        return x
 
 
 def residual_down_block_forward(self, x):
@@ -1606,14 +1603,22 @@ class WanDecoder3d(nn.Module):
         self.gradient_checkpointing = False
 
     def forward(self, x):
+        rank = 0
         world_size = 1
         if torch.distributed.is_initialized():
+            rank = get_sp_parallel_rank()
             world_size = get_sp_world_size()
 
         if self.use_parallel_decode and world_size > 1:
-            rank = get_sp_parallel_rank()
+            origin_height = x.shape[-2]
             expected_height = x.shape[-2] * (2 ** self.upsample_count)
-            x = sp_chunk(x, dim=-2, world_size=world_size, rank=rank)
+
+            _, padding_len = sp_should_padding(x, world_size=world_size, dim=-2)
+            local_padded_height = (x.shape[-2] + padding_len) // world_size
+
+            x = torch.chunk(x, world_size, dim=-2)[rank]
+
+            local_expected_height = local_padded_height * (2 ** self.upsample_count)
 
         ## conv1
         _feat_cache = feat_cache.get()
@@ -1641,7 +1646,10 @@ class WanDecoder3d(nn.Module):
             x = self.conv_in(x)
 
         ## middle
-        x = self.mid_block(x)
+        if self.use_parallel_decode and world_size > 1:
+            x = self.mid_block(x, origin_height, local_padded_height)
+        else:
+            x = self.mid_block(x)
 
         ## upsamples
         for up_block in self.up_blocks:
@@ -1675,9 +1683,11 @@ class WanDecoder3d(nn.Module):
             x = self.conv_out(x)
 
         if self.use_parallel_decode and world_size > 1:
-            tensor_list = [torch.empty_like(x) for _ in range(world_size)]
-            dist.all_gather(tensor_list, x)
-            x = torch.concat(tensor_list, dim=-2)
+            padding_len = local_expected_height - x.shape[-2]
+            if padding_len > 0:
+                x = F.pad(x, (0, 0, 0, padding_len, 0, 0))
+            
+            x = get_sp_group().all_gather(x, dim=-2)
 
             if x.shape[-2] != expected_height:
                 x = x[..., :expected_height, :].contiguous()
