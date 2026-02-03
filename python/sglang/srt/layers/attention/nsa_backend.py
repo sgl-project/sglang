@@ -1256,8 +1256,8 @@ class NativeSparseAttnBackend(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
             if self.dcp_size > 1:
-                q_nope = get_dcp_group().all_gather(q_nope, dim=1)
-                q_rope = get_dcp_group().all_gather(q_rope, dim=1)
+                q_nope = get_dcp_group().all_gather(q_nope.contiguous(), dim=1)
+                q_rope = get_dcp_group().all_gather(q_rope.contiguous(), dim=1)
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             if self.dcp_size > 1:
@@ -1356,6 +1356,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_softmax_lse=True,
             )
             if self.dcp_size > 1:
                 return cp_lse_ag_out_rs(o, s, get_dcp_group())
@@ -1374,6 +1375,7 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                return_softmax_lse=True,
             )
             if self.dcp_size > 1:
                 return cp_lse_ag_out_rs(o, s, get_dcp_group())
@@ -1426,8 +1428,8 @@ class NativeSparseAttnBackend(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
             if self.dcp_size > 1:
-                q_nope = get_dcp_group().all_gather(q_nope, dim=1)
-                q_rope = get_dcp_group().all_gather(q_rope, dim=1)
+                q_nope = get_dcp_group().all_gather(q_nope.contiguous(), dim=1)
+                q_rope = get_dcp_group().all_gather(q_rope.contiguous(), dim=1)
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
             if self.dcp_size > 1:
@@ -1446,6 +1448,7 @@ class NativeSparseAttnBackend(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,
                 page_size=1,
+                dcp_size=self.dcp_size,
             )
 
         if self.nsa_decode_impl == "flashmla_sparse":
@@ -1474,6 +1477,7 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                return_softmax_lse=True,
             )
             if self.dcp_size > 1:
                 return cp_lse_ag_out_rs(o, s, get_dcp_group())
@@ -1571,6 +1575,9 @@ class NativeSparseAttnBackend(
             return_softmax_lse=return_softmax_lse,
             num_splits=self.num_splits,
         )
+        if return_softmax_lse:
+            out, lse, *reset = out
+            return out, lse
         return out  # type: ignore
 
     def _forward_flashmla_sparse(
