@@ -73,6 +73,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+diffusion = [
+  "PyYAML==6.0.1",
+  "cloudpickle",
+  "diffusers==0.35.2",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python==4.10.0.84",
+  "remote-pdb",
+  "st_attn ==0.0.7",
+]
+
 tracing = [
   "opentelemetry-sdk",
   "opentelemetry-api",
@@ -93,9 +105,15 @@ test = [
 all = []
 dev = ["sglang[test]"]
 
+[tool.uv.extra-build-dependencies]
+st-attn = ["torch", "setuptools"]
+
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sglang"
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.scripts]
+sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
