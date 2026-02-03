@@ -437,9 +437,6 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
                     } else {
                         image_urls.push(url.clone());
                     }
-                    if !modalities.contains(&"image".to_string()) {
-                        modalities.push("image".to_string());
-                    }
                 }
                 ContentPart::VideoUrl { video_url } => {
                     let url = &video_url.url;
@@ -447,9 +444,6 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
                         video_data.push(base64_data);
                     } else {
                         video_urls.push(url.clone());
-                    }
-                    if !modalities.contains(&"video".to_string()) {
-                        modalities.push("video".to_string());
                     }
                 }
                 ContentPart::Text { .. } => {
@@ -466,6 +460,17 @@ fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<Multimod
         && video_data.is_empty()
     {
         return None;
+    }
+
+    let image_count = image_urls.len() + image_data.len();
+    let video_count = video_urls.len() + video_data.len();
+    if video_count > 0 {
+        // Prefer "video" when mixed to match Python multimodal modality selection.
+        modalities.push("video".to_string());
+    } else if image_count > 1 {
+        modalities.push("multi-images".to_string());
+    } else if image_count == 1 {
+        modalities.push("image".to_string());
     }
 
     Some(MultimodalInputs {
@@ -1456,7 +1461,7 @@ mod tests {
         assert_eq!(result.image_urls[0], "https://example.com/cat.jpg");
         assert!(result.video_urls.is_empty());
         assert!(result.image_data.is_empty());
-        assert!(result.modalities.contains(&"image".to_string()));
+        assert_eq!(result.modalities, vec!["image".to_string()]);
     }
 
     #[test]
@@ -1498,11 +1503,7 @@ mod tests {
         assert_eq!(result.image_urls[0], "https://example.com/image1.jpg");
         assert_eq!(result.image_urls[1], "https://example.com/image2.jpg");
         assert_eq!(result.image_urls[2], "https://example.com/image3.jpg");
-        // Modality should only appear once
-        assert_eq!(
-            result.modalities.iter().filter(|m| *m == "image").count(),
-            1
-        );
+        assert_eq!(result.modalities, vec!["multi-images".to_string()]);
     }
 
     #[test]
@@ -1527,7 +1528,7 @@ mod tests {
         assert!(result.image_urls.is_empty());
         assert_eq!(result.video_urls.len(), 1);
         assert_eq!(result.video_urls[0], "https://example.com/video.mp4");
-        assert!(result.modalities.contains(&"video".to_string()));
+        assert_eq!(result.modalities, vec!["video".to_string()]);
     }
 
     #[test]
@@ -1554,8 +1555,7 @@ mod tests {
         let result = extract_multimodal_from_messages(&messages).unwrap();
         assert_eq!(result.image_urls.len(), 1);
         assert_eq!(result.video_urls.len(), 1);
-        assert!(result.modalities.contains(&"image".to_string()));
-        assert!(result.modalities.contains(&"video".to_string()));
+        assert_eq!(result.modalities, vec!["video".to_string()]);
     }
 
     #[test]
@@ -1578,7 +1578,7 @@ mod tests {
         assert!(result.image_urls.is_empty());
         assert_eq!(result.image_data.len(), 1);
         assert!(!result.image_data[0].is_empty());
-        assert!(result.modalities.contains(&"image".to_string()));
+        assert_eq!(result.modalities, vec!["image".to_string()]);
     }
 
     #[test]
