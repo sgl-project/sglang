@@ -1,42 +1,191 @@
-About Glean:
-Glean is the Work AI platform that helps everyone work smarter with AI. What began as the industry’s most advanced enterprise search has evolved into a full-scale Work AI ecosystem, powering intelligent Search, an AI Assistant, and scalable AI agents on one secure, open platform. With over 100 enterprise SaaS connectors, flexible LLM choice, and robust APIs, Glean gives organizations the infrastructure to govern, scale, and customize AI across their entire business - without vendor lock-in or costly implementation cycles.
+Company logo for, Cherish.
+Cherish
 
-At its core, Glean is redefining how enterprises find, use, and act on knowledge. Its Enterprise Graph and Personal Knowledge Graph map the relationships between people, content, and activity, delivering deeply personalized, context-aware responses for every employee. This foundation powers Glean’s agentic capabilities - AI agents that automate real work across teams by accessing the industry’s broadest range of data: enterprise and world, structured and unstructured, historical and real-time. The result: measurable business impact through faster onboarding, hours of productivity gained each week, and smarter, safer decisions at every level.
-Recognized by Fast Company as one of the World’s Most Innovative Companies (Top 10, 2025), by CNBC’s Disruptor 50, Bloomberg’s AI Startups to Watch (2026), Forbes AI 50, and Gartner’s Tech Innovators in Agentic AI, Glean continues to accelerate its global impact. With customers across 50+ industries and 1,000+ employees in more than 25 countries, we’re helping the world’s largest organizations make every employee AI-fluent, and turning the superintelligent enterprise from concept into reality.
 
-If you’re excited to shape how the world works, you’ll help build systems used daily across Microsoft Teams, Zoom, ServiceNow, Zendesk, GitHub, and many more - deeply embedded where people get things done. You’ll ship agentic capabilities on an open, extensible stack, with the craft and care required for enterprise trust, as we bring Work AI to every employee, in every company.
-About the Role:
+Sr. Data Scientist (Sensor Data) 
 
-Glean is building a world-class Data Organization composed of product data science, applied science, data engineering and business intelligence groups. This is an applied science role based in our Palo Alto or San Francisco office. It covers a subset of:
+Boston, MA · 3 hours ago · 32 applicants
 
-A/B Experimentation:
+Promoted by hirer · Company review time is typically 1 week
 
-Collaborate with product data science and engineering teams to identify techniques, tooling and process improvements in online A/B experimentation to assist rigorous decision making across all relevant product domains. 
-Develop and maintain our A/B experimentation platform based on stakeholder feedback
-Write code or identify vendors to deploy these techniques to production in a scalable manner that’s easy to use by engineering, product data science, product management and design teams
-Generative AI evaluation:
 
-End to end evaluation of various hero use cases like document/URL uploads, including evaluation set generation, coming up with evaluation criteria and methods to interpret the results.
-Breaking down end to end evaluations into more granular evaluation of various tasks & skills including but not limited to content summarization/analysis/generation, multi-step reasoning & strategizing, tool selection & use, coding & system design.
-Design, development and ownership of best practices, tools and processes across various evaluation problems, e.g. query intent classification, standardizing the use of best statistical principles to handle LLM stochasticity, industry benchmarking.
-About you:
+On-site
 
-You have 5+ years of experience as a Masters degree holder, 3+ as a PhD degree holders (Masters/PhD degree in Statistics, Mathematics or Computer Science, or another quantitative field)
-You’re strong in statistics and/or machine learning. You have experience in applying these skills into tangible improvements in products, internal tools, and processes in a pragmatic way that puts business urgencies first.
-You are very proficient in Python, e.g. proficient enough to maintain an internal source-controlled library used by dozens of others.
-You are concise and precise in written and verbal communication. Technical documentation is your strong suit.
-You are proficient in SQL and the modern data stack (e.g. source-controlled dbt pipelines for ETL/ELT).
-You are strong at defining good product KPIs/guardrail metrics, dashboarding and analysis of raw data to derive strategic insights.
-You have experience in B2B SaaS.
-You have experience working on ranking, developing, and maintaining A/B experimentation platforms and/or ML measurement problems.
-You are passionate about using AI to improve the productivity of data teams as well as non-data professionals trying to derive more value of their company’s data.
-Location: 
+Full-time
+Easy Apply
 
-This role is hybrid (3-4 days a week in one of our SF Bay Area offices)
-Compensation & Benefits:
+Save
+You’d be a top applicant, we can help you stand out
 
-The standard base salary range for this position is $175,000 - $230,000 annually. Compensation offered will be determined by factors such as location, level, job-related knowledge, skills, and experience. Certain roles may be eligible for variable compensation, equity, and benefits.
+Your profile matches several of the required qualifications.
 
-We offer a comprehensive benefits package including competitive compensation, Medical, Vision, and Dental coverage, generous time-off policy, and the opportunity to contribute to your 401k plan to support your long-term goals. When you join, you'll receive a home office improvement stipend, as well as an annual education and wellness stipends to support your growth and wellbeing. We foster a vibrant company culture through regular events, and provide healthy lunches daily to keep you fueled and focused.
 
-We are a diverse bunch of people and we want to continue to attract and retain a diverse range of people into our organization. We're committed to an inclusive and diverse company. We do not discriminate based on gender, ethnicity, sexual orientation, religion, civil or family status, age, disability, or race.
+Show match details
+
+Tailor my resume
+
+Help me stand out
+
+Create cover letter
+
+
+BETA • Is this information helpful?
+
+
+
+About the job
+MUST HAVE SENSOR DATA EXPERIENCE 
+
+
+
+About Us
+
+Cherish develops intelligent radar-based sensor platforms for health and safety monitoring. Our patented spatial computing technology works ambiently without changing how people live while prioritizing privacy. We detect emergencies and health risks to help people live with greater independence and peace of mind.
+
+
+
+We're an experienced team of visionaries, technologists, and health professionals driven by urgency to create solutions that change lives at scale. We operate like a high-energy startup while partnering with Fortune 30 companies and leading consumer tech and healthcare organizations.
+
+Senior Data Scientist - DC/DA Lead
+
+We seek an experienced Senior Data Scientist to serve as single-threaded owner of Data Curation and Data Analysis—the foundation powering all radar-based insights. You'll independently drive scalable frameworks for radar insights while ensuring highest data quality standards.
+
+
+
+This role requires comfort in a multi-sensor environment with hardware familiarity essential. Camera experience (Zed360) highly desirable; RF/thermal imaging experience a bonus. You'll design robust radar data pipelines for processing, cleaning, and transforming signals into meaningful information for target detection, tracking, and classification.
+
+
+
+You'll collaborate with DSP/ML engineers on production algorithm integration, emphasizing scalable workflows, diagnostics tooling, and labeling infrastructure including third-party partnerships.
+
+Your Superpowers
+
+Self-starting data detective with proven ability to independently own end-to-end DC/DA processes. Expert at finding patterns in complex multi-dimensional datasets where others see none, with unwavering focus on data integrity and quality. You thrive on being the go-to expert for data curation and analysis, taking initiative to dive deep into data quality challenges without needing direction.
+
+
+
+The Job’s Responsibilities
+
+As a collaborative individual contributor and subject-matter expert (SME) who will be the single-threaded owner of DC/DA, you will use your superpowers to collaborate with others with their superpowers (you'll work with others who excel at business strategy, product management, user experience and industrial design, electronics design and engineering, software architecture and development, supply chain and logistics management, finance and business modeling, SCRUM and program management, business development and contracting, sales, and marketing) in a supportive and safe team setting to achieve company goals.
+
+
+
+PRIMARY RESPONSIBILITIES (70-80% of role):
+
+Own and drive our weekly Data Curation / Data Analysis (DC/DA) efforts as the single-threaded leader
+Independently establish DC/DA frameworks and processes from first principles
+Develop and refine auto-labeling techniques for faster annotation
+Build robust visualization and root-cause analysis (RCA) tooling to help debug and improve models
+Perform in-depth data exploration to identify gaps, biases, and edge cases
+Design and implement robust data pipelines tailored to radar data, including processing, cleaning, and transforming raw radar signals
+Conduct exploratory data analysis to extract valuable insights specific to radar data, such as target detection, tracking, and classification
+Explore and visualize data to identify patterns, trends, and relationships, providing actionable insights to stakeholders
+Craft publication-quality data visualizations highlighting results and improvements
+Collect, categorize, and analyze data from various sources (e.g., spreadsheets, company databases, public websites, sensors, devices)
+Clean and prepare raw, unstructured datasets to ensure they are accurate and usable for analysis
+
+
+SECONDARY RESPONSIBILITIES (when bandwidth allows):
+
+Develop predictive models to support key business initiatives, integrating radar data with other data sources to provide comprehensive solutions
+Collaborate closely with DSP and ML engineers to ensure seamless radar data processing algorithms integration into existing systems
+Create, validate, test, and update algorithms and models for tasks such as classification, regression, and clustering
+Develop statistical models and algorithms using machine learning to forecast trends and behaviors
+RF/ML pipeline testing (end-to-end, and per-module) and root cause analysis (RCA)
+
+
+ONGOING RESPONSIBILITIES:
+
+Stay current with industry trends and best practices in radar data analysis, continuously enhancing the organization’s capabilities in this domain
+Clearly communicate technical concepts and progress not only within your team but also to other teams across the company
+Ensure that all departments understand the work that you are doing and how it aligns with and supports the broader company goals
+Develop and maintain documentation for design specifications, test plans, and user manuals
+Stay up-to-date with the latest advancements in data science methodologies and technologies
+Use data visualization software to present findings as charts, maps, and other graphics
+Communicate complex data insights clearly and effectively to both technical and non-technical audiences, including stakeholders and senior management
+Collaborate with cross-functional teams (e.g., marketing, finance, operations, engineering) to integrate data insights into business strategies and implement recommended solutions
+Identify opportunities to apply data insights or models in other business areas
+
+
+Key Technical Requirements
+
+To hit the ground running, you are comfortable across the entire engineering life cycle, leading to a successful product launch and ongoing improvements. In particular:
+
+
+
+REQUIRED:
+
+Proven leadership experience with the ability to independently own data collection and data curation processes
+A track record of determining, implementing, and tracking key performance indicators (KPIs) for sophisticated processing pipelines
+Experience being the single-threaded owner for key pipelines
+Proficiency in programming languages such as Python, R, or Matlab
+Experience with radar data processing techniques and tools
+Strong understanding of statistical methods and machine learning algorithms
+Fluency in data science tools like NumPy/Scikit-learn, and cloud services (Google Cloud Platform)
+Implementing automation processes for repetitive tasks and high-compute time activities
+Solid understanding of software development methodologies and version control systems
+Strong analytical and problem-solving skills with a focus on system-level performance optimization
+Excellent written and verbal communication skills
+Ability to work effectively both independently and in a team environment
+Experience with debugging tools, emulators, and performance optimization techniques
+
+
+PREFERRED (definite plus):
+
+RF engineering principles and practices
+Experience with radar hardware and systems
+Radar data visualization techniques and tools, such as waterfall plots, range-Doppler maps, or ParaView
+Familiarity with radar-specific data formats and protocols
+Experience with radar data simulation and modeling
+Machine learning experience, particularly in applying ML techniques to radar signal processing tasks
+Experience with stereo cameras and thermal cameras considered a bonus
+
+
+Personal Qualities
+
+We’d love you to be self-aware, thoughtful, empathetic, diligent, hard-working, a lifelong learner, and a great team player. You’d show us that you have:
+
+
+
+Self-starting mentality with the drive to independently own and improve DC/DA processes
+Strong interpersonal skills and the ability, perhaps even a passion, to build camaraderie and work effectively on difficult goals with a broad range of business and technical collaborators across cultures and skills
+Self-awareness, to know your own superpower (nobody is great at all things), and the humility to permit others to exercise theirs on a team of accomplished specialists
+Respect and empathy to recognize and support the goals of the company, your team, and colleagues in ways that build trust for people to feel safe to “disagree and commit” (The Amazon Way)
+A work ethic that doesn’t quit, that recognizes that time-to-market is often the only thing that separates teams that win from those that don’t (“No matter how hard you work, someone else is working harder.” — Elon Musk)
+Tenacity and a dogged determination to never give up
+Innate hunger to constantly do better and evolve both your work product and yourself (You’re a lifelong learner)
+The courage to move fast, break things, and ship products that people use (“Real artists ship.” — Steve Jobs)
+Exceptional communication skills characterized by meticulous attention to detail and precision in verbal and written expression. 
+
+
+Education and Experience
+
+Bachelor’s or Master’s degree in Data Science, Electrical Engineering, Computer Science, Applied Physics, or a related field; PhD is a plus
+5+ years of relevant industry experience in data science with demonstrated experience independently owning data curation and analysis processes
+Proven track record of being the single-threaded owner for key data initiatives
+Proven track record applying advanced analytics and machine learning to real-world sensor data in production environments
+Experience collaborating cross-functionally with engineering teams, particularly in embedded systems, DSP, or machine learning
+
+
+Cherish is an Equal Opportunity Employer. We celebrate diversity and are committed to creating an inclusive environment for all employees.
+
+
+Requirements added by the job poster
+
+• Commute to this job’s location
+
+• 5+ years of work experience with Data Curation
+
+• Can start immediately
+
+• 5+ years of work experience with Digital Signal Processing
+
+• Accept a background check
+
+• Working in an onsite setting
+
+• Authorized to work in the United States
+
+• 5+ years of work experience with Applied Machine Learning
+
+• Master's Degree
