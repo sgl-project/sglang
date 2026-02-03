@@ -135,6 +135,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
@@ -1833,6 +1834,28 @@ class Scheduler(
             )
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
+
+            # For requests with max_new_tokens == 1, mark them to avoid decode phase
+            # In overlap mode, process_batch_result hasn't been called yet, so output_ids is empty
+            # We use static property max_new_tokens to identify requests that will finish after first token
+            # Mark them with to_finish and filter them out manually
+            max_tokens_1_req_indices = []
+            for i, req in enumerate(self.last_batch.reqs):
+                if not req.finished() and req.sampling_params.max_new_tokens == 1:
+                    # Set a marker that will be converted to finished_reason in process_batch_result
+                    req.to_finish = FINISH_LENGTH(length=1)
+                    max_tokens_1_req_indices.append(i)
+
+            # Filter out max_new_tokens==1 requests to prevent them from entering decode phase
+            # These requests will complete in process_batch_result via check_finished()
+            if max_tokens_1_req_indices:
+                max_tokens_1_req_indices_set = set(max_tokens_1_req_indices)
+                keep_indices = [
+                    i
+                    for i in range(len(self.last_batch.reqs))
+                    if i not in max_tokens_1_req_indices_set
+                ]
+                self.last_batch.filter_batch(keep_indices=keep_indices)
 
             # Merge the new batch into the running batch.
             # For prefill-only batch, we can avoid going through decoding step.
