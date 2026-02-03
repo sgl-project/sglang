@@ -11,6 +11,7 @@ use crate::{
     core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
+        StorageFactoryConfig,
     },
     mcp::McpManager,
     middleware::TokenBucket,
@@ -429,8 +430,14 @@ impl AppContextBuilder {
 
     /// Create all storage backends using the factory function
     fn with_storage(mut self, config: &RouterConfig) -> Result<Self, String> {
+        let storage_config = StorageFactoryConfig {
+            backend: &config.history_backend,
+            oracle: config.oracle.as_ref(),
+            postgres: config.postgres.as_ref(),
+            redis: config.redis.as_ref(),
+        };
         let (response_storage, conversation_storage, conversation_item_storage) =
-            create_storage(config)?;
+            create_storage(storage_config)?;
 
         self.response_storage = Some(response_storage);
         self.conversation_storage = Some(conversation_storage);
