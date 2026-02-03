@@ -922,6 +922,7 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
+        print("gpu_mem: ", gpu_mem, flush=True)
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
@@ -964,6 +965,7 @@ class ServerArgs:
                     else:
                         self.cuda_graph_max_bs = 512
             elif gpu_mem < 160 * 1024:
+                print("---------------gpu_mem < 160 * 1024----------------")
                 # H20, H200
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
@@ -974,6 +976,7 @@ class ServerArgs:
                     else:
                         self.cuda_graph_max_bs = 512
             else:
+                print("---------------else----------------")
                 # B200, MI300
                 # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                 if self.chunked_prefill_size is None:
@@ -981,6 +984,7 @@ class ServerArgs:
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 512
         else:
+            print("---------------fallback----------------")
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
                 self.chunked_prefill_size = 4096
@@ -994,14 +998,22 @@ class ServerArgs:
             else:
                 self.cuda_graph_max_bs = max(self.cuda_graph_bs)
         else:
-            # set torch_compile_max_bs for cpu device
+            # Reuse cuda_graph_bs for cpu graph and use torch_compile_max_bs for cpu graph batch size limit,
             # as cpu graph is based on torch.compile
-            assert self.cuda_graph_max_bs is not None
-            self.torch_compile_max_bs = self.cuda_graph_max_bs
-            if self.cuda_graph_bs is None:
-                self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
-            else:
+            if self.cuda_graph_bs is not None:
                 self.torch_compile_max_bs = max(self.cuda_graph_bs)
+            else:
+                # If cuda_graph_bs is not set, we will preferentially use torch_compile_max_bs
+                # to generate cuda_graph_bs
+                self.torch_compile_max_bs = (
+                    self.torch_compile_max_bs or self.cuda_graph_max_bs
+                )
+                self.cuda_graph_bs = self._generate_cpu_graph_batch_sizes()
+
+            assert (
+                self.torch_compile_max_bs > 0
+            ), "cuda_graph_bs should contain positive batch sizes"
+            self.cuda_graph_max_bs = self.torch_compile_max_bs
 
         if self.piecewise_cuda_graph_max_tokens is None:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
@@ -1117,7 +1129,10 @@ class ServerArgs:
             capture_bs = list(range(1, self.torch_compile_max_bs + 1))
         else:
             capture_bs = (
-                list(range(1, 17)) + list(range(18, 31, 2)) + list(range(32, 81, 4))
+                list(range(1, 17))
+                + list(range(18, 31, 2))
+                + list(range(32, 81, 4))
+                + list(range(84, self.torch_compile_max_bs + 1, 8))
             )
         capture_bs = [bs for bs in capture_bs if bs <= self.torch_compile_max_bs]
 

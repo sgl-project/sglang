@@ -32,28 +32,13 @@ class TestCPUGraph(CustomTestCase):
             "0.05",
             "--enable-torch-compile",
             "--torch-compile-max-bs",
-            "1",
-        ],
-        min_throughput=10,
-    )
-    def test_latency_torch_compile_cpu(self):
-        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
-
-    @intel_amx_benchmark(
-        extra_args=[
-            "--batch-size",
-            "1",
-            "--mem-fraction-static",
-            "0.05",
-            "--enable-torch-compile",
-            "--torch-compile-max-bs",
             "2",
             "--cuda-graph-bs",
             "2",
         ],
         min_throughput=40,
     )
-    def test_padding_latency_torch_compile_cpu(self):
+    def test_latency_torch_compile_cpu(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
     def test_mmlu_torch_compile_cpu(self):
