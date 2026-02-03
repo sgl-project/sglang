@@ -166,13 +166,9 @@ class BaseFormatDetector(ABC):
 
         try:
             try:
-                # Priority check: if we're processing a subsequent tool (current_tool_id > 0),
-                # first check if text starts with the tool separator. This is critical for
-                # parallel tool calls because the bot_token (e.g., '[') can also
-                # appear inside array parameters of the current tool, and we must not
-                # mistakenly identify that as the start of a new tool.
-                # We also skip the separator match when it is actually the start of
-                # an eot_token (e.g. separator="\n" and eot_token="\n</tool_call>").
+                # Check if text starts with tool_call_separator for subsequent tools.
+                # Skip separator match when it's actually the start of eot_token
+                # (e.g. separator="\n" and eot_token="\n</tool_call>").
                 is_separator = (
                     self.current_tool_id > 0
                     and current_text.startswith(self.tool_call_separator)
