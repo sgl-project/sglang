@@ -1792,11 +1792,6 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
-        # Chunked request keeps its rid but will get a new req_pool_idx
-        if self.tp_worker.model_runner.mambaish_config is not None:
-            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
-        else:
-            self.req_to_token_pool.free(req.req_pool_idx)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()
