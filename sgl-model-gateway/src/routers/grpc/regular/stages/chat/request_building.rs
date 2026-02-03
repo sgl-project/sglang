@@ -56,7 +56,6 @@ impl PipelineStage for ChatRequestBuildingStage {
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
-            ClientSelection::Triple { prefill, .. } => prefill,
         };
 
         // Build chat request
@@ -110,12 +109,11 @@ impl PipelineStage for ChatRequestBuildingStage {
                     .as_ref()
                     .and_then(|selection| match selection {
                         WorkerSelection::Dual { prefill, .. } => Some(prefill),
-                        WorkerSelection::Triple { prefill, .. } => Some(prefill),
                         _ => None,
                     })
             {
                 // Inject PD bootstrap metadata for prefill->decode KV cache transfer.
-                // For EPD mode, encode is a separate gRPC stage; bootstrap is prefill↔decode only.
+                // For EPD mode, encoder dispatch happens on prefill; bootstrap is prefill↔decode only.
                 helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }

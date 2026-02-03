@@ -79,7 +79,7 @@ impl GrpcEPDRouter {
         })
     }
 
-    /// Main route_generate implementation with EPD Triple dispatch
+    /// Main route_generate implementation with EPD prefill/decode dispatch
     async fn route_generate_impl(
         &self,
         headers: Option<&HeaderMap>,
@@ -102,7 +102,7 @@ impl GrpcEPDRouter {
             .await
     }
 
-    /// Main route_chat implementation with EPD Triple dispatch
+    /// Main route_chat implementation with EPD prefill/decode dispatch
     async fn route_chat_impl(
         &self,
         headers: Option<&HeaderMap>,

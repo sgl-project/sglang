@@ -284,12 +284,12 @@ impl RequestPipeline {
             Box::new(WorkerSelectionStage::new(
                 worker_registry,
                 policy_registry,
-                WorkerSelectionMode::EncodePrefillDecode,
+                WorkerSelectionMode::PrefillDecode,
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(RequestBuildingStage::new(true)), // Inject EPD metadata
             Box::new(DispatchMetadataStage),
-            Box::new(RequestExecutionStage::new(ExecutionMode::TripleDispatch)),
+            Box::new(RequestExecutionStage::new(ExecutionMode::DualDispatch)),
             Box::new(ResponseProcessingStage::new(processor, streaming_processor)),
         ];
 

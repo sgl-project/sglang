@@ -55,9 +55,6 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
-            // For EPD mode, use the prefill client as the upstream client for building the request
-            // (the current encode path uses HTTP, not gRPC, so we don't build the request against it)
-            ClientSelection::Triple { prefill, .. } => prefill,
         };
 
         // Harmony model support not yet implemented for vLLM
@@ -193,12 +190,11 @@ impl PipelineStage for HarmonyRequestBuildingStage {
                     .as_ref()
                     .and_then(|selection| match selection {
                         WorkerSelection::Dual { prefill, .. } => Some(prefill),
-                        WorkerSelection::Triple { prefill, .. } => Some(prefill),
                         _ => None,
                     })
             {
                 // Inject PD bootstrap metadata for prefill->decode KV cache transfer.
-                // For EPD mode, encode is a separate gRPC stage; bootstrap is prefill↔decode only.
+                // For EPD mode, encoder dispatch happens on prefill; bootstrap is prefill↔decode only.
                 helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }

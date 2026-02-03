@@ -16,10 +16,7 @@ use super::{
 };
 use crate::{
     core::Worker,
-    grpc_client::{
-        sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
-        SglangEncoderClient,
-    },
+    grpc_client::sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
     observability::metrics::metrics_labels,
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -116,39 +113,6 @@ pub(crate) async fn get_grpc_client_from_worker(
             error::internal_error(
                 "worker_not_configured_for_grpc",
                 "Selected worker is not configured for gRPC",
-            )
-        })?;
-
-    Ok((*client_arc).clone())
-}
-
-/// Get encoder gRPC client from worker, returning appropriate error response on failure
-pub async fn get_encoder_client_from_worker(
-    worker: &Arc<dyn Worker>,
-) -> Result<SglangEncoderClient, Response> {
-    // Get cached encoder client from worker (or create one if not cached yet)
-    let client_arc = worker
-        .get_encoder_client()
-        .await
-        .map_err(|e| {
-            error!(
-                function = "get_encoder_client_from_worker",
-                error = %e,
-                "Failed to get encoder client from worker"
-            );
-            error::internal_error(
-                "get_encoder_client_failed",
-                format!("Failed to get encoder client: {}", e),
-            )
-        })?
-        .ok_or_else(|| {
-            error!(
-                function = "get_encoder_client_from_worker",
-                "Selected worker is not an encode worker"
-            );
-            error::internal_error(
-                "worker_not_encode_type",
-                "Selected worker is not configured as an encode worker",
             )
         })?;
 
