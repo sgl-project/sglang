@@ -155,10 +155,8 @@ def _rocm_platform_plugin() -> str | None:
             e,
         )
 
-    # For now, ROCm falls back to multimodal_gen implementation
-    return (
-        "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform" if is_rocm else None
-    )
+    # Use unified RocmPlatform implementation
+    return "sglang.platforms.rocm.RocmPlatform" if is_rocm else None
 
 
 def _musa_platform_plugin() -> str | None:
@@ -195,6 +193,36 @@ def _musa_platform_plugin() -> str | None:
     return (
         "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform" if is_musa else None
     )
+
+
+def _xpu_platform_plugin() -> str | None:
+    """
+    Detect if Intel XPU is available.
+
+    Returns:
+        Platform class path if XPU available, None otherwise.
+    """
+    is_xpu = False
+
+    try:
+        import torch
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            is_xpu = torch.xpu.device_count() > 0
+            if is_xpu:
+                logger.info("Intel XPU platform detected")
+    except ImportError:
+        # torch not installed
+        pass
+    except Exception as e:
+        logger.warning(
+            "XPU detection failed with unexpected error: %s. "
+            "If you have Intel GPU hardware, check driver and oneAPI installation.",
+            e,
+        )
+
+    # Use unified XpuPlatform implementation
+    return "sglang.platforms.xpu.XpuPlatform" if is_xpu else None
 
 
 def _mps_platform_plugin() -> str | None:
@@ -246,7 +274,8 @@ def _detect_platform() -> Platform:
     2. ROCm - AMD (sets torch.cuda.is_available() = True)
     3. CUDA - NVIDIA (only after ruling out ROCm)
     4. MUSA - Moore Threads
-    5. CPU - Final fallback
+    5. XPU - Intel GPUs
+    6. CPU - Final fallback
 
     Returns:
         Platform instance for the detected platform.
@@ -285,6 +314,14 @@ def _detect_platform() -> Platform:
             return resolve_obj_by_qualname(platform_cls_qualname)()
         except (ImportError, AttributeError) as e:
             logger.error("Failed to load MUSA platform: %s", e)
+
+    # Fall back to XPU (Intel GPUs)
+    platform_cls_qualname = _xpu_platform_plugin()
+    if platform_cls_qualname is not None:
+        try:
+            return resolve_obj_by_qualname(platform_cls_qualname)()
+        except (ImportError, AttributeError) as e:
+            logger.error("Failed to load XPU platform: %s", e)
 
     # Fall back to CPU as last resort
     platform_cls_qualname = _cpu_platform_plugin()

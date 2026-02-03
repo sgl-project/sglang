@@ -149,22 +149,22 @@ class CudaPlatformBase(Platform):
     # =========================================================================
 
     @classmethod
-    @lru_cache(maxsize=1)
-    def is_hopper(cls) -> bool:
+    @lru_cache(maxsize=8)
+    def is_hopper(cls, device_id: int = 0) -> bool:
         """Check if running on NVIDIA Hopper (SM 9.0)."""
-        return torch.cuda.get_device_capability() == (9, 0)
+        return torch.cuda.get_device_capability(device_id) == (9, 0)
 
     @classmethod
-    @lru_cache(maxsize=1)
-    def is_blackwell(cls) -> bool:
+    @lru_cache(maxsize=8)
+    def is_blackwell(cls, device_id: int = 0) -> bool:
         """Check if running on NVIDIA Blackwell (SM 10.x)."""
-        return torch.cuda.get_device_capability()[0] == 10
+        return torch.cuda.get_device_capability(device_id)[0] == 10
 
     @classmethod
-    @lru_cache(maxsize=1)
-    def is_sm120(cls) -> bool:
+    @lru_cache(maxsize=8)
+    def is_sm120(cls, device_id: int = 0) -> bool:
         """Check if running on SM 12.x."""
-        return torch.cuda.get_device_capability()[0] == 12
+        return torch.cuda.get_device_capability(device_id)[0] == 12
 
     # =========================================================================
     # Memory Management
@@ -474,6 +474,38 @@ class CudaPlatformBase(Platform):
         from sgl_kernel import gelu_tanh_and_mul
 
         return gelu_tanh_and_mul
+
+    # =========================================================================
+    # LayerNorm Ops - Lazy loaded via @cached_property
+    # =========================================================================
+
+    @cached_property
+    def rmsnorm(self):
+        """RMS Normalization kernel."""
+        from sgl_kernel import rmsnorm
+
+        return rmsnorm
+
+    @cached_property
+    def fused_add_rmsnorm(self):
+        """Fused add + RMS Normalization kernel."""
+        from sgl_kernel import fused_add_rmsnorm
+
+        return fused_add_rmsnorm
+
+    @cached_property
+    def gemma_rmsnorm(self):
+        """Gemma-style RMS Normalization kernel."""
+        from sgl_kernel import gemma_rmsnorm
+
+        return gemma_rmsnorm
+
+    @cached_property
+    def gemma_fused_add_rmsnorm(self):
+        """Gemma-style fused add + RMS Normalization kernel."""
+        from sgl_kernel import gemma_fused_add_rmsnorm
+
+        return gemma_fused_add_rmsnorm
 
     @classmethod
     def log_warnings(cls) -> None:

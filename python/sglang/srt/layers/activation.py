@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.platforms import current_platform
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -31,33 +32,22 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    is_cpu,
-    is_cuda,
-    is_hip,
-    is_npu,
-    is_xpu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import cpu_has_amx_support, set_weight_attrs
 from sglang.utils import resolve_obj_by_qualname
 
-_is_cuda = is_cuda()
-_is_npu = is_npu()
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
-_is_hip = is_hip()
-_is_xpu = is_xpu()
-
-if _is_cuda or _is_xpu:
-    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-elif _is_hip:
-    from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
-
-if is_npu():
-    import torch_npu
-
 logger = logging.getLogger(__name__)
+
+# Platform detection via unified platform abstraction
+_is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
+_is_npu = current_platform.is_npu()
+_is_xpu = current_platform.is_xpu()
+_is_cpu = current_platform.is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+
+# Lazy import for NPU
+if _is_npu:
+    import torch_npu
 
 
 class SiluAndMul(MultiPlatformOp):
@@ -74,7 +64,7 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+        current_platform.silu_and_mul(x, out)
         return out
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -92,7 +82,7 @@ class SiluAndMul(MultiPlatformOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        silu_and_mul(x, out)
+        current_platform.silu_and_mul(x, out)
         return out
 
 
@@ -106,9 +96,9 @@ class GeluAndMul(MultiPlatformOp):
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         if self.approximate == "tanh":
-            gelu_tanh_and_mul(x, out)
+            current_platform.gelu_tanh_and_mul(x, out)
         elif self.approximate == "none":
-            gelu_and_mul(x, out)
+            current_platform.gelu_and_mul(x, out)
         else:
             raise RuntimeError("GeluAndMul only support tanh or none")
         return out
@@ -173,7 +163,7 @@ class QuickGELU(MultiPlatformOp):
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        gelu_quick(x, out)
+        current_platform.gelu_quick(x, out)
         return out
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
