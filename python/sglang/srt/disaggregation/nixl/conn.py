@@ -7,7 +7,6 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from itertools import repeat
 from typing import Dict, List, Optional, Set
 
 import numpy as np
@@ -377,7 +376,9 @@ class NixlKVManager(CommonKVManager):
             ]
 
         src_addrs = []
+        src_lens = []
         dst_addrs = []
+        dst_lens = []
 
         # Precompute block starts/lengths to reduce Python-level loops.
         prefill_starts = np.fromiter(
@@ -389,27 +390,33 @@ class NixlKVManager(CommonKVManager):
         )
 
         for src_ptr, dst_ptr, item_len in layers_params:
-            lengths = (item_len * block_lens).tolist()
-            src_addrs.extend(
-                zip(
-                    (src_ptr + prefill_starts * item_len).tolist(),
-                    lengths,
-                    repeat(self.kv_args.gpu_id),
+            lengths = item_len * block_lens
+            src_addrs.append(src_ptr + prefill_starts * item_len)
+            src_lens.append(lengths)
+            dst_addrs.append(dst_ptr + dst_starts * item_len)
+            dst_lens.append(lengths)
+
+        def make_req_array(addr_chunks, len_chunks, gpu):
+            if not addr_chunks:
+                return np.empty((0, 3), dtype=np.int64)
+            flat_addrs = np.concatenate(addr_chunks)
+            flat_lens = np.concatenate(len_chunks)
+            return np.column_stack(
+                (
+                    flat_addrs,
+                    flat_lens,
+                    np.full_like(flat_addrs, gpu),
                 )
             )
-            dst_addrs.extend(
-                zip(
-                    (dst_ptr + dst_starts * item_len).tolist(),
-                    lengths,
-                    repeat(dst_gpu_id),
-                )
-            )
+
+        src_reqs = make_req_array(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = make_req_array(dst_addrs, dst_lens, dst_gpu_id)
 
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
         )
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+        src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_reqs, "VRAM")
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
             "WRITE",
