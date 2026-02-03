@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -96,11 +96,13 @@ class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
 
     # KV chunks received per pp_rank: {pp_rank: set of chunk_ids}
-    received_kvs_per_pp: Dict[int, Set[int]] = dataclasses.field(
+    received_kvs_per_pp: Dict[Tuple[int, int], Set[int]] = dataclasses.field(
         default_factory=lambda: defaultdict(set)
     )
     # Expected chunk count per pp_rank (set when is_last=True): {pp_rank: expected_count}
-    expected_kvs_per_pp: Dict[int, int] = dataclasses.field(default_factory=dict)
+    expected_kvs_per_pp: Dict[Tuple[int, int], int] = dataclasses.field(
+        default_factory=dict
+    )
     # Number of PP ranks expected to send data.
     num_pp_ranks_expected: Optional[int] = None
     # Whether aux data has been received.
@@ -505,6 +507,8 @@ class NixlKVManager(CommonKVManager):
 
         src_addrs = []
         dst_addrs = []
+        src_lens = []
+        dst_lens = []
 
         for src_ptr, dst_ptr in src_dst_ptr_pairs:
             src_page_bases = src_ptr + prefill_indices * src_kv_item_len
@@ -521,25 +525,28 @@ class NixlKVManager(CommonKVManager):
                 + dst_head_slice_offset
             ).ravel()
 
-            src_addrs.append(src_all)
-            dst_addrs.append(dst_all)
+            lengths = np.full_like(src_all, heads_bytes_per_token_to_send)
 
-        def make_req_array(addr_chunks, size, gpu):
+            src_addrs.append(src_all)
+            src_lens.append(lengths)
+            dst_addrs.append(dst_all)
+            dst_lens.append(lengths)
+
+        def make_req_array(addr_chunks, len_chunks, gpu):
             if not addr_chunks:
                 return np.empty((0, 3), dtype=np.int64)
             flat_addrs = np.concatenate(addr_chunks)
+            flat_lens = np.concatenate(len_chunks)
             return np.column_stack(
                 (
                     flat_addrs,
-                    np.full_like(flat_addrs, size),
+                    flat_lens,
                     np.full_like(flat_addrs, gpu),
                 )
             )
 
-        src_reqs = make_req_array(
-            src_addrs, heads_bytes_per_token_to_send, self.kv_args.gpu_id
-        )
-        dst_reqs = make_req_array(dst_addrs, heads_bytes_per_token_to_send, dst_gpu_id)
+        src_reqs = make_req_array(src_addrs, src_lens, self.kv_args.gpu_id)
+        dst_reqs = make_req_array(dst_addrs, dst_lens, dst_gpu_id)
 
         # Use NIXL agent for transfer
         src_descs = self.agent.get_xfer_descs(src_reqs, "VRAM")
@@ -618,7 +625,7 @@ class NixlKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
+            notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}_{self.attn_tp_rank}"
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
             if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
@@ -672,19 +679,22 @@ class NixlKVManager(CommonKVManager):
             # the message sender. But the bootstrap room alone should be
             # sufficient to map the status.
             for msg in messages:
-                components = msg.decode("ascii").split("_", 4)
+                components = msg.decode("ascii").split("_")
                 room = int(components[0])
                 if components[1] == "kv":
                     chunk_id = int(components[2])
                     is_last = bool(int(components[3]))
                     pp_rank = int(components[4]) if len(components) > 4 else 0
-                    # Track received chunks per pp_rank
-                    self.transfer_statuses[room].received_kvs_per_pp[pp_rank].add(
+                    tp_rank = int(components[5]) if len(components) > 5 else 0
+                    sender_id = (pp_rank, tp_rank)
+
+                    # Track received chunks per sender
+                    self.transfer_statuses[room].received_kvs_per_pp[sender_id].add(
                         chunk_id
                     )
                     if is_last:
-                        # Record expected chunk count for this pp_rank
-                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = (
+                        # Record expected chunk count for this sender
+                        self.transfer_statuses[room].expected_kvs_per_pp[sender_id] = (
                             chunk_id + 1
                         )
                         # Set num_pp_ranks_expected from table (or default to 1)
