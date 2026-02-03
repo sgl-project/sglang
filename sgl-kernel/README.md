@@ -1,6 +1,6 @@
-# SGL Kernel
+# sgl-kernel
 
-[Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for SGLang
+[Kernel Library](https://github.com/sgl-project/sglang/tree/main/sgl-kernel) for LLM inference engines
 
 <div align="center">
 
@@ -9,7 +9,7 @@
 
 </div>
 
-SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernel operations.
+sgl-kernel provides optimized compute primitives for LLM inference engines, enabling efficient inference for large language models and vision-language models through custom kernel operations. It has been used by [LightLLM](https://github.com/ModelTC/LightLLM), [SGLang](https://github.com/sgl-project/sglang) and so on.
 
 ## Installation
 Requires torch == 2.9.1
@@ -30,6 +30,18 @@ Requires
 
 ```bash
 make build
+```
+
+### Limit build resource usage (CPU / parallelism)
+
+By default, `make build` uses all available CPU cores. You can override build parallelism and NVCC compile threads:
+
+```bash
+# Limit parallel jobs (controls both make and cmake parallelism)
+make build MAX_JOBS=2
+
+# Additionally limit NVCC internal threads (reduces CPU and peak memory)
+make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
 ## Contribution
@@ -101,6 +113,30 @@ m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));
    - More realistic performance data on PDL-supported architectures (SM >= 90)
 
 3. Run test suite
+
+## Kernel Size Analysis
+
+Analyze CUDA kernel sizes in compiled wheel files to identify oversized kernels and template-instantiation bloat:
+
+This tool requires `cubloaty` (install with `pip install cubloaty`) to work.
+
+```bash
+# Install cubloaty
+pip install cubloaty
+
+# Analyze a wheel file
+python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl
+
+# Custom output file
+python analyze_whl_kernel_sizes.py path/to/sgl_kernel-*.whl --output my_analysis.txt
+```
+
+The tool generates:
+- A text report with:
+  - Kernel groups (by name prefix)
+  - Individual kernel sizes (sorted by size)
+
+Use this to identify large kernels and potential template instantiation bloat.
 
 ## FAQ
 - Q: Segmentation fault with CUDA 12.6

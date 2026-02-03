@@ -7,12 +7,6 @@ import triton.language as tl
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -40,6 +34,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_INITIAL_STATE: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    IS_KDA: tl.constexpr,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -70,8 +65,12 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
-    p_a = a + bos * HV + i_hv
-    p_dt_bias = dt_bias + i_hv
+    if IS_KDA:
+        p_a = a + (bos * HV + i_hv) * K + o_k
+        p_dt_bias = dt_bias + i_hv * K + o_k
+    else:
+        p_a = a + bos * HV + i_hv
+        p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -125,7 +124,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_q = b_q * scale
 
         # Apply gating to hidden state: h *= exp(g)
-        b_h *= tl.exp(b_g)
+        if IS_KDA:
+            b_h *= tl.exp(b_g[:, None])
+        else:
+            b_h *= tl.exp(b_g)
 
         # Delta rule: v -= sum(h * k, dim=0)
         b_v -= tl.sum(b_h * b_k[:, None], 0)
@@ -178,6 +180,7 @@ def fused_sigmoid_gating_delta_rule_update(
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    is_kda: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -224,7 +227,10 @@ def fused_sigmoid_gating_delta_rule_update(
         V=V,
         BK=BK,
         BV=BV,
+        USE_INITIAL_STATE=initial_state_source is not None,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
+        IS_KDA=is_kda,
         num_warps=num_warps,
         num_stages=num_stages,
     )

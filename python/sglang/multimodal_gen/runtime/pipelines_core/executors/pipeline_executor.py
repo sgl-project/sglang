@@ -5,14 +5,20 @@
 Base class for all pipeline executors.
 """
 
+import contextlib
 from abc import ABC, abstractmethod
-from typing import List
+from typing import TYPE_CHECKING, List
 
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
+from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+
+if TYPE_CHECKING:
+    # Only for type checkers; avoids runtime circular import
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
 
@@ -24,7 +30,9 @@ class Timer(StageProfiler):
     """
 
     def __init__(self, name="Stage"):
-        super().__init__(stage_name=name, timings=None, simple_log=True, logger=logger)
+        super().__init__(
+            stage_name=name, timings=None, log_stage_start_end=True, logger=logger
+        )
 
 
 class PipelineExecutor(ABC):
@@ -38,13 +46,25 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
 
+    def execute_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+
+        with self.profile_execution(batch, dump_rank=0):
+            batch = self.execute(stages, batch, server_args)
+
+        return batch
+
     @abstractmethod
     def execute(
         self,
-        stages: List[PipelineStage],
+        stages: List["PipelineStage"],
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Execute the pipeline stages.
 
@@ -57,3 +77,29 @@ class PipelineExecutor(ABC):
             The processed batch.
         """
         raise NotImplementedError
+
+    @contextlib.contextmanager
+    def profile_execution(self, batch: Req, dump_rank: int = 0):
+        """
+        Context manager for profiling execution.
+        """
+        do_profile = batch.profile and not batch.is_warmup
+        if not do_profile:
+            # fast forward
+            yield
+            return
+
+        request_id = batch.request_id
+        rank = get_world_rank()
+
+        profiler = SGLDiffusionProfiler(
+            request_id=request_id,
+            rank=rank,
+            full_profile=batch.profile_all_stages,
+            num_steps=batch.num_profiled_timesteps,
+            num_inference_steps=batch.num_inference_steps,
+        )
+        try:
+            yield
+        finally:
+            profiler.stop(dump_rank=dump_rank)

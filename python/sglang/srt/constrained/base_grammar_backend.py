@@ -46,6 +46,9 @@ class BaseGrammarObject:
         self.grammar_stats = None
         self.current_token = None
 
+    def maybe_init_reasoning(self, reasoning: bool):
+        pass
+
     def accept_token(self, token: int) -> None:
         """
         Accept a token in the grammar.
@@ -151,7 +154,9 @@ class BaseGrammarBackend:
     def dispatch_structural_tag(self, key_string: str) -> Optional[BaseGrammarObject]:
         return self._not_supported("structural_tag", key_string)
 
-    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
+    def _init_value_dispatch(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Optional[BaseGrammarObject]:
         s = time.perf_counter()
         key_type, key_string = key
         if key_type == "json":
@@ -174,12 +179,14 @@ class BaseGrammarBackend:
         return grammar
 
     def get_cached_or_future_value(
-        self, key: Tuple[str, str]
+        self, key: Tuple[str, str], require_reasoning: bool
     ) -> Optional[BaseGrammarObject]:
         value = self.cache.get(key)
         if value:
-            return value.copy(), True
-        value = self.executor.submit(self._init_value_dispatch, key)
+            copied_value = value.copy()
+            copied_value.maybe_init_reasoning(require_reasoning)
+            return copied_value, True
+        value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
@@ -219,17 +226,29 @@ def create_grammar_backend(
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "xgrammar":
-        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+        from sglang.srt.constrained.xgrammar_backend import (
+            TokenizerNotSupportedError,
+            XGrammarGrammarBackend,
+        )
 
         # Convert Set[int] to List[int] if needed
         eos_list = list(eos_token_ids) if eos_token_ids else None
 
-        grammar_backend = XGrammarGrammarBackend(
-            tokenizer,
-            vocab_size=vocab_size,
-            model_eos_token_ids=eos_list,
-            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
-        )
+        try:
+            grammar_backend = XGrammarGrammarBackend(
+                tokenizer,
+                vocab_size=vocab_size,
+                model_eos_token_ids=eos_list,
+                any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+            )
+        except TokenizerNotSupportedError as e:
+            logger.warning(
+                f"Grammar backend disabled because tokenizer is not supported by XGrammar: {e}. "
+                "Falling back to grammar_backend='none'. "
+                "Structured outputs (JSON schema, regex, EBNF) will not be available."
+            )
+            server_args.grammar_backend = "none"
+            return None
     elif name == "llguidance":
         from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 

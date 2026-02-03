@@ -9,6 +9,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -23,8 +24,8 @@ class SDPABackend(AttentionBackend):
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_name() -> str:
-        return "SDPA"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.TORCH_SDPA
 
     @staticmethod
     def get_impl_cls() -> type["SDPAImpl"]:

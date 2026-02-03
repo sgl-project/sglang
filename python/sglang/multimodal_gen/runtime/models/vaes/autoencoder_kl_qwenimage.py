@@ -14,6 +14,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -445,6 +446,7 @@ class QwenImageEncoder3d(nn.Module):
         temperal_downsample=[True, True, False],
         dropout=0.0,
         non_linearity: str = "silu",
+        input_channels: int = 3,
     ):
         super().__init__()
         # dim = config.arch_config.dim
@@ -468,7 +470,7 @@ class QwenImageEncoder3d(nn.Module):
         scale = 1.0
 
         # init block
-        self.conv_in = QwenImageCausalConv3d(3, dims[0], 3, padding=1)
+        self.conv_in = QwenImageCausalConv3d(input_channels, dims[0], 3, padding=1)
 
         # downsample blocks
         self.down_blocks = nn.ModuleList([])
@@ -649,6 +651,7 @@ class QwenImageDecoder3d(nn.Module):
         temperal_upsample=[False, True, True],
         dropout=0.0,
         non_linearity: str = "silu",
+        input_channels=3,
     ):
         super().__init__()
         self.dim = dim
@@ -701,7 +704,7 @@ class QwenImageDecoder3d(nn.Module):
 
         # output blocks
         self.norm_out = QwenImageRMS_norm(out_dim, images=False)
-        self.conv_out = QwenImageCausalConv3d(out_dim, 3, 3, padding=1)
+        self.conv_out = QwenImageCausalConv3d(out_dim, input_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -755,7 +758,7 @@ class QwenImageDecoder3d(nn.Module):
         return x
 
 
-class AutoencoderKLQwenImage(nn.Module):
+class AutoencoderKLQwenImage(ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding videos into latents and decoding latent representations into videos.
 
@@ -769,20 +772,9 @@ class AutoencoderKLQwenImage(nn.Module):
     def __init__(
         self,
         config: QwenImageVAEConfig,
-        # base_dim: int = 96,
-        # z_dim: int = 16,
-        # dim_mult: Tuple[int] = [1, 2, 4, 4],
-        # num_res_blocks: int = 2,
-        # attn_scales: List[float] = [],
-        # temperal_downsample: List[bool] = [False, True, True],
-        # dropout: float = 0.0,
-        # latents_mean: List[float] = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134,
-        #                              -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921],
-        # latents_std: List[float] = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526,
-        #                             2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160],
     ) -> None:
         # fmt: on
-        super().__init__()
+        super().__init__(config=config)
         base_dim = config.arch_config.base_dim
         z_dim = config.arch_config.z_dim
         dim_mult = config.arch_config.dim_mult
@@ -794,18 +786,21 @@ class AutoencoderKLQwenImage(nn.Module):
         self.z_dim = z_dim
         self.temperal_downsample = temperal_downsample
         self.temperal_upsample = temperal_downsample[::-1]
+        self.input_channels = config.arch_config.input_channels
+        self.latents_mean = config.arch_config.latents_mean
+        self.config = config.arch_config
 
         self.encoder = QwenImageEncoder3d(
-            base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout
+            base_dim, z_dim * 2, dim_mult, num_res_blocks, attn_scales, self.temperal_downsample, dropout,
+            input_channels=self.input_channels
         )
         self.quant_conv = QwenImageCausalConv3d(z_dim * 2, z_dim * 2, 1)
         self.post_quant_conv = QwenImageCausalConv3d(z_dim, z_dim, 1)
 
         self.decoder = QwenImageDecoder3d(
-            base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout
+            base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout,
+            input_channels=self.input_channels
         )
-
-        self.spatial_compression_ratio = 2 ** len(self.temperal_downsample)
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
         # to perform decoding of a single video latent at a time.
@@ -845,8 +840,6 @@ class AutoencoderKLQwenImage(nn.Module):
             .view(1, latent_channels, 1, 1, 1)
             .to(cuda_device, dtype)
         )
-        latents_std_tensor = torch.tensor(config.arch_config.latents_std, dtype=dtype, device=cuda_device)
-        self.scaling_factor = (1.0 / latents_std_tensor).view(1, latent_channels, 1, 1, 1)
 
     def enable_tiling(
         self,
@@ -961,8 +954,6 @@ class AutoencoderKLQwenImage(nn.Module):
             h = self._encode(x)
         posterior = DiagonalGaussianDistribution(h)
 
-        if not return_dict:
-            return (posterior,)
         return posterior
 
     def _decode(self, z: torch.Tensor, return_dict: bool = True):
