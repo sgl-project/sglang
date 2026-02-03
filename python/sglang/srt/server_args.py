@@ -922,7 +922,6 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
-        print("gpu_mem: ", gpu_mem, flush=True)
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
@@ -965,7 +964,6 @@ class ServerArgs:
                     else:
                         self.cuda_graph_max_bs = 512
             elif gpu_mem < 160 * 1024:
-                print("---------------gpu_mem < 160 * 1024----------------")
                 # H20, H200
                 # (chunked_prefill_size 8k, cuda_graph_max_bs 256 if tp < 4 else 512)
                 if self.chunked_prefill_size is None:
@@ -976,7 +974,6 @@ class ServerArgs:
                     else:
                         self.cuda_graph_max_bs = 512
             else:
-                print("---------------else----------------")
                 # B200, MI300
                 # (chunked_prefill_size 16k, cuda_graph_max_bs 512)
                 if self.chunked_prefill_size is None:
@@ -984,7 +981,6 @@ class ServerArgs:
                 if self.cuda_graph_max_bs is None:
                     self.cuda_graph_max_bs = 512
         else:
-            print("---------------fallback----------------")
             # Fallback defaults when gpu_mem is None
             if self.chunked_prefill_size is None:
                 self.chunked_prefill_size = 4096
