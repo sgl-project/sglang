@@ -1,6 +1,7 @@
 """Common utilities for testing and benchmarking on NPU"""
 
 import os
+import subprocess
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -196,3 +197,61 @@ QWEN2_5_1_5B_APEACH_WEIGHTS_PATH = os.path.join(
 QWEN2_5_MATH_RM_72B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen2.5-Math-RM-72B"
 )
+
+def run_command(cmd, shell=True):
+    """Execute system command and return stdout
+
+    parameter:
+        cmd: command to execute
+        shell: Execute command in shell
+    return:
+        The result of executing the command
+    """
+    try:
+        result = subprocess.run(
+            cmd, shell=shell, capture_output=True, text=True, check=True
+        )
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"execute command error: {e}")
+        return None
+
+
+def get_device_ids(index=None):
+    """Get list of NPU device IDs or a single device ID by specified index
+
+    Parameters:
+        index: Optional, integer type, the index value of the device ID list;
+               returns the complete list if not passed in
+    Returns:
+        If index is passed in: returns the integer-type device ID corresponding to the index
+                               (returns None if the index is invalid)
+        If index is not passed in: returns the list of device IDs (integer type),
+                                   returns an empty list if acquisition fails
+    """
+    cmd = "npu-smi info | awk 'BEGIN {OFS=\"\"} /Process id/ {exit} /Phy-ID/ {next} {print $3}' | grep -E '^[0-9]+$'"
+    output = run_command(cmd)
+
+    device_ids = []
+    if output and output.strip():
+        lines = output.strip().split('\n')
+        for line in lines:
+            line = line.strip()
+            if line and line.isdigit():
+                try:
+                    device_id = int(line)
+                    device_ids.append(device_id)
+                except ValueError:
+                    print(f"Device ID '{line}' cannot be converted to an integer and has been skipped")
+
+    if index is not None:
+        if not isinstance(index, int):
+            print(f"Index {index} must be an integer type")
+            return None
+        if 0 <= index < len(device_ids):
+            return device_ids[index]
+        else:
+            print(f"Index {index} is invalid, the length of device ID list is {len(device_ids)}")
+            return None
+
+    return device_ids
