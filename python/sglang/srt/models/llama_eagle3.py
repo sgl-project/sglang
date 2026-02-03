@@ -78,6 +78,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         residual = hidden_states
@@ -96,8 +97,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-        hidden_states = hidden_states + residual
-
         return hidden_states, residual
 
 
@@ -176,12 +175,14 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
+        residual = None
         for layer in self.midlayers:
             hidden_states, residual = layer(
               positions,
               embeds,
               hidden_states,
               forward_batch,
+              residual,
             )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
