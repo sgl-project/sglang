@@ -366,6 +366,9 @@ class PipelineConfig:
         latents = maybe_unpad_latents(latents, batch)
         return latents
 
+    def post_decoding(self, frames, server_args):
+        return frames
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 

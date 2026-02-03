@@ -10,7 +10,6 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -80,9 +79,7 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        if isinstance(batch.tree_cache, SWAChunkCache):
-            for req in batch.reqs:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+        batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -102,6 +99,7 @@ class EagleDraftInputV2Mixin:
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
             r.kv_allocated_len += x
+            r.decode_batch_idx += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")

@@ -29,7 +29,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=184, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=149, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=200, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestOpenAIServer(CustomTestCase):
@@ -89,7 +89,9 @@ class TestOpenAIServer(CustomTestCase):
 
         if logprobs:
             assert response.choices[0].logprobs
-            assert isinstance(response.choices[0].logprobs.tokens[0], str)
+            assert isinstance(
+                response.choices[0].logprobs.tokens[0], str
+            ), f"{response=}"
             assert isinstance(response.choices[0].logprobs.top_logprobs[1], dict)
             ret_num_top_logprobs = len(response.choices[0].logprobs.top_logprobs[1])
 
@@ -155,6 +157,9 @@ class TestOpenAIServer(CustomTestCase):
 
             if logprobs:
                 assert response.choices[0].logprobs, f"no logprobs in response"
+                print(
+                    f"{response=}, {response.choices[0]=}, {response.choices[0].logprobs=}"
+                )
                 assert isinstance(
                     response.choices[0].logprobs.tokens[0], str
                 ), f"{response.choices[0].logprobs.tokens[0]} is not a string"

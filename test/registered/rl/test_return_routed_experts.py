@@ -1,7 +1,3 @@
-from sglang.test.ci.ci_register import register_cuda_ci
-
-register_cuda_ci(est_time=180, suite="stage-c-test-large-4-gpu")
-
 import asyncio
 import logging
 import unittest
@@ -16,6 +12,7 @@ from sglang.srt.layers.moe.routed_experts_capturer import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,6 +20,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=180, suite="stage-c-test-large-4-gpu")
 
 SHAREGPT_URL = (
     "https://huggingface.co/datasets/anon8231489123/"

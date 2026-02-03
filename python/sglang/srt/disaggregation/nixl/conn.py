@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import os
 import struct
 import threading
 import time
@@ -23,8 +22,8 @@ from sglang.srt.disaggregation.common.conn import (
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -161,15 +160,13 @@ class NixlKVManager(CommonKVManager):
 
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
-                float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
+                envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
             )
             # Heartbeat failure should be at least 1
             self.max_failures = max(
-                get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
+                envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
             )
-            self.waiting_timeout = get_int_env_var(
-                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
-            )
+            self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
             self._start_heartbeat_checker_thread()
         else:
             raise ValueError(

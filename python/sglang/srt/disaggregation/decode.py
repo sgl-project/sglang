@@ -1030,5 +1030,9 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in alloc_reqs:
                     sparse_coordinator.on_request_begin(req)
                     sparse_coordinator.trigger_async_offload_prompt_cache(req)
+                # TODO(hzh): Support async offload later; Async offload will Cause IMA Issue
+                sparse_coordinator.check_prompt_offload_completion(
+                    self.tree_cache, blocking=True
+                )
 
             self.waiting_queue.extend(alloc_reqs)

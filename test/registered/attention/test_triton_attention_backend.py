@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 # Triton attention backend integration test with latency benchmark and MMLU eval
-register_cuda_ci(est_time=200, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=200, suite="stage-b-test-large-1-gpu")
 register_amd_ci(est_time=1110, suite="stage-b-test-small-1-gpu-amd")
 
 

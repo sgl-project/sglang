@@ -1,0 +1,92 @@
+name: CI Coverage Overview
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6 AM UTC
+  pull_request:
+    paths:
+      - '.github/workflows/ci-coverage-overview.yml'
+      - 'scripts/ci/ci_coverage_report.py'
+      - 'test/registered/**'
+  workflow_dispatch:
+    inputs:
+      output_format:
+        description: 'Output format'
+        required: false
+        default: 'markdown'
+        type: choice
+        options:
+          - markdown
+          - json
+
+jobs:
+  summary:
+    name: Summary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Summary Report
+        run: |
+          python scripts/ci/ci_coverage_report.py --section summary
+
+  by-folder:
+    name: Tests by Folder
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Tests by Folder Report
+        run: |
+          python scripts/ci/ci_coverage_report.py --section by-folder
+
+  by-suite:
+    name: Tests by Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate Tests by Suite Report
+        run: |
+          python scripts/ci/ci_coverage_report.py --section by-suite
+
+  json-export:
+    name: JSON Export
+    runs-on: ubuntu-latest
+    if: inputs.output_format == 'json'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Generate JSON Report
+        run: |
+          python scripts/ci/ci_coverage_report.py --output-format json > ci_coverage.json
+
+      - name: Upload JSON artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-coverage-report
+          path: ci_coverage.json

@@ -255,7 +255,6 @@ def filter_moe_weight_param_global_expert(name, x, num_local_experts):
     """
     return (
         not getattr(x, "_sglang_require_global_experts", False)
-        and not name.endswith("_blockscale_swizzled")
         and x.data.ndim > 0
         and x.data.shape[0] == num_local_experts
     )

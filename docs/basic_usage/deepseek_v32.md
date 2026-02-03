@@ -394,7 +394,7 @@ python -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode continuous-split \
+  --nsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
   --disable-radix-cache \
@@ -419,7 +419,7 @@ python -m sglang.launch_server \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
   --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode continuous-split \
+  --nsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
   --disable-radix-cache \

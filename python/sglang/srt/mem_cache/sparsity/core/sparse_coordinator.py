@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
+from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
     SparseKVCacheManager,
@@ -13,7 +15,8 @@ from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -60,13 +63,13 @@ class RequestTrackers:
         self.last_device_indices = torch.full(
             (max_pool_size, num_layers, self.device_buffer_cnt // self.page_size),
             -1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.last_top_k_result = torch.full(
             (max_pool_size, num_layers, self.device_buffer_cnt // self.page_size),
             -1,
-            dtype=torch.int64,
+            dtype=torch.int32,
             device=device,
         )
         self.req_to_tokens_host = torch.full(
@@ -75,27 +78,36 @@ class RequestTrackers:
             dtype=torch.int64,
             device=device,
         )
-        self.should_load_device_indices = torch.full(
-            (max_pool_size, self.device_buffer_cnt),
+
+        stride_per_block = self.topk_tokens_cnt * page_size + 1
+        self.transfer_tasks_src = torch.full(
+            (max_pool_size * stride_per_block,),
             -1,
             dtype=torch.int64,
             device=device,
         )
-        self.should_load_host_indices = torch.full(
-            (max_pool_size, self.device_buffer_cnt),
+        self.transfer_tasks_dst = torch.full(
+            (max_pool_size * stride_per_block,),
             -1,
             dtype=torch.int64,
             device=device,
+        )
+
+        lru_size = self.device_buffer_cnt // self.page_size
+        self._lru_init = torch.arange(lru_size, dtype=torch.int16, device=device)
+        self.lru_slots = (
+            self._lru_init.view(1, 1, -1)
+            .repeat(max_pool_size, num_layers, 1)
+            .contiguous()
         )
 
     def _reset_state(self, idx: int) -> None:
         """Reset all tensor states for a request slot."""
         self.req_to_tokens_host[idx].fill_(-1)
         self.curr_device_indices[idx].fill_(-1)
-        self.should_load_device_indices[idx].fill_(-1)
-        self.should_load_host_indices[idx].fill_(-1)
         self.last_top_k_result[idx].fill_(-1)
         self.last_device_indices[idx].fill_(-1)
+        self.lru_slots[idx].copy_(self._lru_init)
         self.repr_constructed[idx] = False
         self.prompt_lens[idx] = 0
         self.last_constructed_page[idx] = 0
@@ -110,6 +122,31 @@ class RequestTrackers:
         self._reset_state(idx)
         return host_indices
 
+    def init_topk_indices(self, req_pool_idx: int, req_to_token_pool) -> None:
+        # Store device indices
+        if self.page_size > 1:
+            num_pages = self.device_buffer_cnt // self.page_size
+            page_starts = torch.arange(num_pages, device=self.device) * self.page_size
+            page_indices = (
+                req_to_token_pool.req_to_token[req_pool_idx, page_starts]
+                // self.page_size
+            )
+            self.last_device_indices[req_pool_idx] = page_indices
+            self.last_top_k_result[req_pool_idx] = torch.arange(
+                num_pages, device=self.device
+            )
+            self.lru_slots[req_pool_idx] = torch.arange(num_pages, device=self.device)
+        else:
+            indices_len = self.device_buffer_cnt
+            self.last_device_indices[req_pool_idx] = req_to_token_pool.req_to_token[
+                req_pool_idx, :indices_len
+            ]
+            self.last_top_k_result[req_pool_idx] = torch.arange(
+                indices_len, device=self.device
+            )
+            self.lru_slots[req_pool_idx] = torch.arange(indices_len, device=self.device)
+        self.hierarchical_sparse_enabled[req_pool_idx] = True
+
 
 @dataclass
 class SparseConfig:
@@ -118,7 +155,7 @@ class SparseConfig:
     backend: str
     algorithm: str
     page_size: int = 64
-    topk_tokens_cnt: int = 1024  # Top-k tokens selected by sparse algorithm
+    topk_tokens_cnt: int = 2048  # Top-k tokens selected by sparse algorithm
     device_buffer_cnt: int = 2048  # Device buffer size for LRU management
     sparse_extra_config: dict = field(
         default_factory=dict
@@ -181,7 +218,7 @@ class SparseCoordinator:
             self.config.topk_tokens_cnt,
             self.config.device_buffer_cnt,
             self.req_to_token_pool.max_context_len,
-            self.page_size,
+            1 if self.algorithm.topk_mode() == "token" else self.page_size,
         )
         self.sparse_kv_cache_manager.req_states = self.states
 
@@ -206,7 +243,13 @@ class SparseCoordinator:
         """
         if req.req_pool_idx is not None:
             self.states.register(req.req_pool_idx, len(req.origin_input_ids))
-        logger.info(f"Request {req.rid}, prompt length: {len(req.origin_input_ids)}")
+
+            # In pd-disaggregation mode, decode node should Re-Construct representations
+            self._maybe_construct_representations(
+                layer_ids=list(range(self.start_layer, self.end_layer)),
+                req_pool_indices=torch.tensor([req.req_pool_idx], device=self.device),
+                seq_lens=torch.tensor([len(req.origin_input_ids)], device=self.device),
+            )
 
     def trigger_async_offload_prompt_cache(self, req: "Req") -> None:
         """Trigger async offload of prompt cache."""
@@ -219,14 +262,17 @@ class SparseCoordinator:
             return
 
         self.sparse_kv_cache_manager.offload_prompt_kvcache(req)
-        logger.info(f"Request {req.rid} async offload prompt cache begin")
 
-    def check_prompt_offload_completion(self, tree_cache):
+    def check_prompt_offload_completion(self, tree_cache, blocking=False):
         """
         Check if the prompt KV cache offload has completed.
         If completed, update the request state and return the requests.
         """
-        reqs = self.sparse_kv_cache_manager.poll_prompt_offload_completion()
+        reqs = (
+            self.sparse_kv_cache_manager.poll_prompt_offload_completion()
+            if not blocking
+            else self.sparse_kv_cache_manager.block_poll_prompt_offload_completion()
+        )
         for req in reqs:
             assert (
                 not req.hierarchical_sparse_enabled
@@ -238,27 +284,8 @@ class SparseCoordinator:
             )
 
             if req.hierarchical_sparse_enabled:
-                # Store device indices
-                num_pages = self.states.device_buffer_cnt // self.page_size
-                page_starts = (
-                    torch.arange(num_pages, device=self.device) * self.page_size
-                )
-                page_indices = (
-                    self.req_to_token_pool.req_to_token[req.req_pool_idx, page_starts]
-                    // self.page_size
-                )
-                self.states.last_device_indices[req.req_pool_idx] = page_indices
-                self.states.last_top_k_result[req.req_pool_idx] = torch.arange(
-                    num_pages, device=self.device
-                )
-                self.states.hierarchical_sparse_enabled[req.req_pool_idx] = True
-            logger.info(f"Request {req.rid} async offload prompt cache done.")
+                self.states.init_topk_indices(req.req_pool_idx, self.req_to_token_pool)
         return reqs
-
-    def get_hierarchical_sparse_req_masks(
-        self, req_pool_indices: torch.Tensor
-    ) -> torch.Tensor:
-        return self.states.hierarchical_sparse_enabled[req_pool_indices]
 
     def on_request_end(self, req: "Req") -> None:
         """
@@ -278,9 +305,6 @@ class SparseCoordinator:
             assert (
                 len(host_indices) == req_seqlen
             ), f"Host indices mismatch: {len(host_indices)} != {req_seqlen}"
-            logger.info(
-                f"Request {req.rid} ended, released {len(host_indices)} host indices"
-            )
 
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """
@@ -318,6 +342,10 @@ class SparseCoordinator:
             and self.sparse_kv_cache_manager is not None
         )
 
+    def should_hook_attention(self) -> bool:
+        """Check if attention hooks should be enabled for sparse attention."""
+        return not isinstance(self.algorithm, DeepSeekNSAAlgorithm)
+
     def attention_begin(
         self,
         query: torch.Tensor,
@@ -334,9 +362,6 @@ class SparseCoordinator:
         Identify important KV entries via sparse algorithm, load offloaded KVCache if needed,
         and adapt attention metadata for the attention backend.
         """
-        if attn_metadata is None:
-            return
-
         if layer.layer_id == self.start_layer:
             self.backend_adaptor.save_original_metadata(attn_metadata)
 
@@ -358,12 +383,10 @@ class SparseCoordinator:
         layer_id = layer.layer_id
 
         # Maybe construct representations
-        self.algorithm.construct_representations(
-            layer_id=layer_id,
+        self._maybe_construct_representations(
+            layer_ids=[layer_id],
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
-            forward_batch=forward_batch,
         )
 
         # Maybe update representations
@@ -375,6 +398,18 @@ class SparseCoordinator:
             forward_batch=forward_batch,
         )
 
+    def _maybe_construct_representations(
+        self, layer_ids: List[int], req_pool_indices, seq_lens
+    ) -> None:
+        for layer_id in layer_ids:
+            self.algorithm.construct_representations(
+                layer_id=layer_id,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                k_buffer=self.token_to_kv_pool.get_key_buffer(layer_id),
+                forward_batch=None,
+            )
+
     def _handle_sparse_retrieve(
         self,
         query: torch.Tensor,
@@ -385,7 +420,7 @@ class SparseCoordinator:
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
         # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        sparse_mask = self.states.hierarchical_sparse_enabled[req_pool_indices]
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer.layer_id,
@@ -397,7 +432,7 @@ class SparseCoordinator:
         )
 
         # Adapt Attention Metadata
-        return self.backend_adaptor.adapt_for_attn_metadata(
+        result = self.backend_adaptor.adapt_for_attn_metadata(
             selected_indices=selected_indices,
             valid_lengths=valid_lengths,
             sparse_mask=sparse_mask,
@@ -407,11 +442,7 @@ class SparseCoordinator:
             page_size=self.page_size,
             layer_id=layer.layer_id,
         )
-
-    def _compute_sparse_mask(self, req_pool_indices):
-        mask = self.states.hierarchical_sparse_enabled[req_pool_indices]
-        mask = mask & self.states.repr_constructed[req_pool_indices]
-        return mask
+        return result
 
     def _maybe_truncate_kv_cache_after_prompt_offloaded(
         self, req: "Req", req_to_token_pool, tree_cache
@@ -419,17 +450,17 @@ class SparseCoordinator:
         """
         Truncate device KV cache after prompt is offloaded to host.
 
-        Strategy: Keep prefix (for representations) + last page (for rolling decode),
-        free the middle part to save device memory.
-
-        Example: If allocated 40 pages and topk page cnt is 32, keep first 31 pages + last 1 page = 32 pages total.
+        Two strategies based on page_size:
+        - page_size > 1: Keep prefix + last page, free middle (page-based caching)
+        - page_size == 1: Keep first target_len tokens, free rest (token-wise caching)
         """
         if req.is_chunked > 0 or req.finished() or req.hierarchical_sparse_enabled:
             return
 
-        # Check if truncation needed
         kv_keep_len = self.get_hierarchical_sparse_truncated_len()
         allocated_len = req.kv_allocated_len
+        page_size = tree_cache.page_size
+
         if allocated_len < kv_keep_len:
             return
 
@@ -437,44 +468,60 @@ class SparseCoordinator:
             req.hierarchical_sparse_enabled = True
             return
 
-        # Align allocation to page boundary if needed
-        page_size = tree_cache.page_size
-        if page_size > 1 and allocated_len % page_size != 0:
-            slots_needed = page_size - (allocated_len % page_size)
-            last_slot = req_to_token_pool.req_to_token[
-                req.req_pool_idx, allocated_len - 1
+        if page_size > 1 and self.algorithm.topk_mode() == "page":
+            # Page-based truncation: align and keep prefix + last page
+            if allocated_len % page_size != 0:
+                slots_needed = page_size - (allocated_len % page_size)
+                last_slot = req_to_token_pool.req_to_token[
+                    req.req_pool_idx, allocated_len - 1
+                ]
+
+                remaining_slots = torch.arange(
+                    last_slot + 1,
+                    last_slot + 1 + slots_needed,
+                    dtype=torch.int32,
+                )
+
+                req_to_token_pool.req_to_token[
+                    req.req_pool_idx, allocated_len : allocated_len + slots_needed
+                ] = remaining_slots
+                allocated_len += slots_needed
+                req.kv_allocated_len = allocated_len
+
+            keep_prefix_len = kv_keep_len - page_size
+            last_page_start = allocated_len - page_size
+
+            free_indices = req_to_token_pool.req_to_token[
+                req.req_pool_idx, keep_prefix_len:last_page_start
+            ]
+            if len(free_indices) > 0:
+                tree_cache.token_to_kv_pool_allocator.free(free_indices)
+
+            last_page_slots = req_to_token_pool.req_to_token[
+                req.req_pool_idx, last_page_start:allocated_len
+            ].clone()
+            req_to_token_pool.req_to_token[
+                req.req_pool_idx, keep_prefix_len:kv_keep_len
+            ] = last_page_slots
+
+            logger.info(
+                f"Page-based truncated req {req.req_pool_idx}: allocated={allocated_len} -> {kv_keep_len}, freed [{keep_prefix_len}:{last_page_start}]"
+            )
+        elif self.algorithm.topk_mode() == "token":
+            # Token-wise truncation: keep first kv_keep_len tokens
+            free_start = kv_keep_len
+            free_indices = req_to_token_pool.req_to_token[
+                req.req_pool_idx, free_start:allocated_len
             ]
 
-            # The page containing last_slot is already allocated, just fill remaining slots
-            # These slots [last_slot+1, ..., last_slot+slots_needed] are in the same page
-            remaining_slots = torch.arange(
-                last_slot + 1,
-                last_slot + 1 + slots_needed,
-                dtype=torch.int32,
+            if len(free_indices) > 0:
+                tree_cache.token_to_kv_pool_allocator.free(free_indices)
+
+            logger.info(
+                f"Token-wise truncated req {req.req_pool_idx}: allocated={allocated_len} -> {kv_keep_len}, freed [{free_start}:{allocated_len}]"
             )
-
-            req_to_token_pool.req_to_token[
-                req.req_pool_idx, allocated_len : allocated_len + slots_needed
-            ] = remaining_slots
-            allocated_len += slots_needed
-            req.kv_allocated_len = allocated_len
-
-        # Truncate: keep prefix + last page, free middle
-        keep_prefix_len = kv_keep_len - page_size
-        last_page_start = allocated_len - page_size
-
-        free_indices = req_to_token_pool.req_to_token[
-            req.req_pool_idx, keep_prefix_len:last_page_start
-        ]
-        if len(free_indices) > 0:
-            tree_cache.token_to_kv_pool_allocator.free(free_indices)
-
-        last_page_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, last_page_start:allocated_len
-        ].clone()
-        req_to_token_pool.req_to_token[
-            req.req_pool_idx, keep_prefix_len:kv_keep_len
-        ] = last_page_slots
+        else:
+            raise ValueError(f"Invalid topk mode: {self.algorithm.topk_mode()}")
 
         req.kv_committed_len = kv_keep_len
         req.kv_allocated_len = kv_keep_len
@@ -483,8 +530,108 @@ class SparseCoordinator:
         ].to(dtype=torch.int64, copy=True)
         req.hierarchical_sparse_enabled = True
 
-        logger.info(
-            f"Truncated req {req.req_pool_idx}: allocated={allocated_len} -> truncated_len={kv_keep_len}, freed [{keep_prefix_len}:{last_page_start}]"
+    def alloc_for_hierarchical_sparse_decode(
+        self, batch: "ScheduleBatch", token_per_req: int, alloc_tokens_func
+    ) -> torch.Tensor:
+        """
+        Allocate KV cache for hierarchical sparse decode batch and write to req_to_token_pool.
+        """
+        bs = batch.seq_lens.shape[0]
+        seq_lens_next = batch.seq_lens + token_per_req
+        page_size = batch.tree_cache.page_size
+        req_pool_indices = batch.req_pool_indices
+
+        if batch.model_config.is_encoder_decoder:
+            locs = batch.encoder_lens + batch.seq_lens
+        else:
+            locs = batch.seq_lens.clone()
+
+        kv_truncated_len = self.get_hierarchical_sparse_truncated_len()
+        hierarchical_sparse_masks = self.states.hierarchical_sparse_enabled[
+            req_pool_indices
+        ]
+
+        truncated_indices = hierarchical_sparse_masks.nonzero(as_tuple=True)[0]
+        non_truncated_indices = (~hierarchical_sparse_masks).nonzero(as_tuple=True)[0]
+
+        out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
+
+        num_truncated = truncated_indices.shape[0]
+        num_non_truncated = non_truncated_indices.shape[0]
+
+        if num_truncated > 0:
+            if self.algorithm.topk_mode() == "page":
+                decode_offsets = locs[truncated_indices]
+                rolling_positions = (kv_truncated_len - page_size) + (
+                    decode_offsets % page_size
+                )
+            else:
+                rolling_positions = torch.full(
+                    (num_truncated,),
+                    kv_truncated_len - 1,
+                    dtype=torch.int32,
+                    device=batch.device,
+                )
+
+            out_cache_loc[truncated_indices] = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices[truncated_indices],
+                rolling_positions,
+            ]
+
+        if num_non_truncated > 0:
+            if batch.tree_cache.page_size == 1:
+                non_truncated_out = alloc_tokens_func(
+                    batch.tree_cache, num_non_truncated * token_per_req
+                )
+            else:
+                non_truncated_last_loc = batch.req_to_token_pool.req_to_token[
+                    batch.req_pool_indices[non_truncated_indices],
+                    batch.seq_lens[non_truncated_indices] - 1,
+                ]
+                non_truncated_indices_cpu = non_truncated_indices.cpu()
+                non_truncated_out = alloc_tokens_func(
+                    tree_cache=batch.tree_cache,
+                    seq_lens=seq_lens_next[non_truncated_indices],
+                    seq_lens_cpu=batch.seq_lens_cpu[non_truncated_indices_cpu]
+                    + token_per_req,
+                    last_loc=non_truncated_last_loc,
+                    token_per_req=token_per_req,
+                )
+
+            out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
+            batch.req_to_token_pool.write(
+                (
+                    batch.req_pool_indices[non_truncated_indices],
+                    locs[non_truncated_indices],
+                ),
+                out_cache_loc[non_truncated_indices],
+            )
+
+        return out_cache_loc
+
+    def _alloc_for_nsa_index_k(
+        self, batch: "ScheduleBatch", token_per_req: int, seq_lens_next, locs
+    ):
+        """Allocate index_k tokens for NSA decode."""
+        allocator = batch.tree_cache.token_to_kv_pool_allocator
+        index_k_last_loc = batch.req_to_token_pool.req_to_nsa_index_k[
+            batch.req_pool_indices, batch.seq_lens - 1
+        ]
+
+        out_index_cache_loc = allocator.alloc_decode_for_index_k(
+            seq_lens_next, batch.seq_lens_cpu + token_per_req, index_k_last_loc
+        )
+
+        if out_index_cache_loc is None:
+            error_msg = (
+                f"Decode out of memory for index_k. Try to lower your batch size.\n"
+                f"Try to allocate {len(seq_lens_next) * token_per_req} tokens.\n"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        batch.req_to_token_pool.write_index_token(
+            (batch.req_pool_indices, locs), out_index_cache_loc.to(torch.int32)
         )
 
     def get_hierarchical_sparse_truncated_len(self) -> Optional[int]:

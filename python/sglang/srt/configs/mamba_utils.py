@@ -10,7 +10,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, etc."""
+"""Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, LFM2, etc."""
 
 import os
 from abc import ABC
@@ -41,16 +41,19 @@ class Mamba2StateDType:
     temporal: torch.dtype
 
 
-CONV_DTYPE = torch.bfloat16
-
-
 def mamba2_state_dtype() -> Mamba2StateDType:
     dtype_map = {
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
     }
-    ssm_dtype = dtype_map[os.environ["SGLANG_MAMBA_SSM_DTYPE"]]
-    return Mamba2StateDType(conv=CONV_DTYPE, temporal=ssm_dtype)
+    conv_dtype = dtype_map.get(
+        os.environ.get("SGLANG_MAMBA_CONV_DTYPE", "bfloat16"), torch.bfloat16
+    )
+    ssm_dtype = dtype_map.get(
+        os.environ.get("SGLANG_MAMBA_SSM_DTYPE", "float32"), torch.float32
+    )
+    return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 
 @dataclass(kw_only=True, frozen=True)

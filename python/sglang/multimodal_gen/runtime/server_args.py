@@ -235,7 +235,9 @@ class ServerArgs:
 
     # Attention
     attention_backend: str = None
-    diffusers_attention_backend: str = None  # for diffusers backend only
+    cache_dit_config: str | dict[str, Any] | None = (
+        None  # cache-dit config for diffusers
+    )
 
     # Distributed executor backend
     nccl_port: Optional[int] = None
@@ -327,6 +329,8 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+
+    output_path: str | None = "outputs/"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -450,15 +454,25 @@ class ServerArgs:
             "--attention-backend",
             type=str,
             default=None,
-            choices=[e.name.lower() for e in AttentionBackendEnum] + ["fa3", "fa4"],
-            help="The attention backend to use. If not specified, the backend is automatically selected based on hardware and installed packages.",
+            help=(
+                "The attention backend to use. For SGLang-native pipelines, use "
+                "values like fa, torch_sdpa, sage_attn, etc. For diffusers pipelines, "
+                "use diffusers attention backend names such as flash, _flash_3_hub, "
+                "sage, or xformers."
+            ),
         )
         parser.add_argument(
             "--diffusers-attention-backend",
             type=str,
+            dest="attention_backend",
             default=None,
-            help="Attention backend for diffusers pipelines (e.g., flash, _flash_3_hub, sage, xformers). "
-            "See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--cache-dit-config",
+            type=str,
+            default=ServerArgs.cache_dit_config,
+            help="Path to a Cache-DiT YAML/JSON config. Enables cache-dit for diffusers backend.",
         )
 
         # HuggingFace specific parameters
@@ -681,6 +695,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.webui_port,
             help="Whether to use webui for better display",
+        )
+        parser.add_argument(
+            "--output-path",
+            type=str,
+            default=ServerArgs.output_path,
+            help="Directory path to save generated images/videos",
         )
 
         # LoRA
@@ -991,7 +1011,7 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
-        if self.attention_backend is None:
+        if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
             self._set_default_attention_backend()
 
         # parallelism

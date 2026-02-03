@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from concurrent import futures
 from typing import TYPE_CHECKING, List
 
@@ -17,7 +18,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
 
-GRAMMAR_TIMEOUT = envs.SGLANG_GRAMMAR_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +35,16 @@ class GrammarManager:
             )
         else:
             self.grammar_backend = None
+
+        self.grammar_sync_group = scheduler.dp_tp_cpu_group
+        self.grammar_sync_size = scheduler.dp_tp_group.world_size
+        self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
+        self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
+
+        self.SGLANG_GRAMMAR_POLL_INTERVAL = envs.SGLANG_GRAMMAR_POLL_INTERVAL.get()
+        self.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = (
+            envs.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS.get()
+        )
 
     def __len__(self):
         return len(self.grammar_queue)
@@ -95,69 +105,91 @@ class GrammarManager:
         return add_to_grammar_queue
 
     def get_ready_grammar_requests(self) -> List[Req]:
-        """Move requests whose grammar objects are ready from grammar_queue to waiting_queue."""
+        """
+        Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
 
-        num_ready_reqs = 0
-        num_timeout_reqs = 0
-        for req in self.grammar_queue:
-            try:
-                if req.finished():  # It is aborted by AbortReq
-                    num_ready_reqs += 1
+        Rank i returns two sets ready_reqs_i, failed_reqs_i
+        ready_reqs_all = all_gather(ready_reqs_i)
+        failed_reqs_all = all_gather(failed_reqs_i)
+
+        ready_reqs = intersect(ready_reqs_all)
+        failed_reqs = union(failed_reqs_all)
+        """
+        ready_req_idxs: set[int] = set()
+        failed_req_idxs: set[int] = set()
+
+        # Poll for ready requests
+        start_time = time.perf_counter()
+        while time.perf_counter() - start_time < self.SGLANG_GRAMMAR_POLL_INTERVAL:
+            for i, req in enumerate(self.grammar_queue):
+                if i in ready_req_idxs:
                     continue
 
-                req.grammar = req.grammar.result(timeout=0.03)
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
+                if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                    ready_req_idxs.add(i)
+                    continue
 
-                num_ready_reqs += 1
-            except futures._base.TimeoutError:
-                req.grammar_wait_ct += 1
-                # NOTE(lianmin): this timeout is the waiting time of the above line. It is
-                # not the waiting time from it enters the grammar queue.
-                if req.grammar_wait_ct > GRAMMAR_TIMEOUT / 0.03:
-                    num_timeout_reqs = 1
-                break
+                assert isinstance(req.grammar, futures.Future), f"{req=}"
+                if req.grammar.done():
+                    ready_req_idxs.add(i)
 
-        if self.server_args.enable_dp_attention:
-            tp_size = self.scheduler.attn_tp_size
-            tp_group = self.scheduler.attn_tp_cpu_group
+            # Sleep a bit to avoid busy waiting
+            time.sleep(self.SGLANG_GRAMMAR_POLL_INTERVAL / 10)
+
+        # Check failed requests
+        for i, req in enumerate(self.grammar_queue):
+            if i not in ready_req_idxs:
+                self.grammar_queue[i].grammar_wait_ct += 1
+                if (
+                    self.grammar_queue[i].grammar_wait_ct
+                    >= self.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS
+                ):
+                    # Timeout after max poll iterations
+                    # The actual waiting time is SGLANG_GRAMMAR_MAX_POLL_ITERATIONS * max(SGLANG_GRAMMAR_POLL_INTERVAL, GPU_forward_batch_latency)
+                    failed_req_idxs.add(i)
+
+        # Sync ready and failed requests across all ranks
+        if self.grammar_sync_size == 1:
+            synced_ready_req_idxs = ready_req_idxs
+            synced_failed_req_idxs = failed_req_idxs
         else:
-            tp_size = self.scheduler.tp_size
-            tp_group = self.scheduler.tp_cpu_group
-
-        if tp_size > 1:
-            # Sync across TP ranks to make sure they have the same number of ready requests
-            tensor = torch.tensor([num_ready_reqs, num_timeout_reqs], dtype=torch.int32)
-            torch.distributed.all_reduce(
-                tensor, op=torch.distributed.ReduceOp.MAX, group=tp_group
+            all_gather_output = [None] * self.grammar_sync_size
+            torch.distributed.all_gather_object(
+                all_gather_output,
+                (ready_req_idxs, failed_req_idxs),
+                group=self.grammar_sync_group,
             )
-            num_ready_reqs_max, num_timeout_reqs_max = tensor.tolist()
+            synced_ready_req_idxs = set.intersection(*[x[0] for x in all_gather_output])
+            synced_failed_req_idxs = set.union(*[x[1] for x in all_gather_output])
 
-            for i in range(num_ready_reqs, num_ready_reqs_max):
-                req = self.grammar_queue[i]
-                if req.finished():  # It is aborted by AbortReq
-                    continue
-                req.grammar = req.grammar.result()
-                self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
-                if req.grammar is INVALID_GRAMMAR_OBJ:
-                    error_msg = f"Invalid grammar request: {req.grammar_key=}"
-                    req.set_finish_with_abort(error_msg)
-        else:
-            num_ready_reqs_max = num_ready_reqs
-            num_timeout_reqs_max = num_timeout_reqs
-
-        for i in range(num_ready_reqs, num_ready_reqs + num_timeout_reqs_max):
+        # Return ready requests
+        return_reqs: List[Req] = []
+        for i in synced_ready_req_idxs:
             req = self.grammar_queue[i]
+            return_reqs.append(req)
+            if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                continue
+
+            req.grammar = req.grammar.result()
+            self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+            if req.grammar is INVALID_GRAMMAR_OBJ:
+                error_msg = f"Invalid grammar request: {req.grammar_key=}"
+                req.set_finish_with_abort(error_msg)
+
+        # Return failed requests
+        for i in synced_failed_req_idxs:
+            req = self.grammar_queue[i]
+            return_reqs.append(req)
+
             req.grammar.cancel()
             self.grammar_backend.set_cache(req.grammar_key, INVALID_GRAMMAR_OBJ)
-            error_msg = f"Grammar preprocessing timed out for {req.grammar_key=}"
+            error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
             req.set_finish_with_abort(error_msg)
 
-        num_ready_reqs = num_ready_reqs_max + num_timeout_reqs_max
-
-        ready_grammar_reqs = self.grammar_queue[:num_ready_reqs]
-        self.grammar_queue = self.grammar_queue[num_ready_reqs:]
-
-        return ready_grammar_reqs
+        # Remove finished requests from grammar_queue
+        self.grammar_queue = [
+            req
+            for i, req in enumerate(self.grammar_queue)
+            if i not in synced_ready_req_idxs and i not in synced_failed_req_idxs
+        ]
+        return return_reqs

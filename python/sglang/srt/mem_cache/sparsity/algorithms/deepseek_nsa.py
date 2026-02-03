@@ -49,6 +49,9 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
             None,
         )
 
+    def topk_mode(self) -> str:
+        return "token"
+
     def initialize_representation_pool(
         self,
         start_layer: int,

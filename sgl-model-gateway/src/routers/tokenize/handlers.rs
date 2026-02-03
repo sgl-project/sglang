@@ -14,7 +14,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     app_context::AppContext,
-    core::{steps::TokenizerConfigRequest, Job},
+    core::{steps::TokenizerConfigRequest, Job, UNKNOWN_MODEL_ID},
     protocols::tokenize::{
         AddTokenizerRequest, AddTokenizerResponse, CountResult, DetokenizeRequest,
         DetokenizeResponse, ListTokenizersResponse, RemoveTokenizerResponse, TextResult,
@@ -45,8 +45,8 @@ fn get_tokenizer(registry: &TokenizerRegistry, model: &str) -> Result<Arc<dyn To
         return Ok(tokenizer);
     }
 
-    // Try "default" if model is "default" or empty
-    if model == "default" || model.is_empty() {
+    // Try UNKNOWN_MODEL_ID if model is "unknown" or empty
+    if model == UNKNOWN_MODEL_ID || model.is_empty() {
         // Try to find any tokenizer as fallback
         let entries = registry.list();
         if let Some(first) = entries.first() {
@@ -227,11 +227,15 @@ pub async fn add_tokenizer(context: &Arc<AppContext>, request: AddTokenizerReque
     let tokenizer_id = TokenizerRegistry::generate_id();
 
     // Create the job with the pre-generated ID
+    // Note: API-initiated tokenizer loads don't use caching by default
+    // Caching is applied for startup and worker-initiated loads based on router config
     let config = TokenizerConfigRequest {
         id: tokenizer_id.clone(),
         name: request.name.clone(),
         source: request.source.clone(),
         chat_template_path: request.chat_template_path.clone(),
+        cache_config: None,
+        fail_on_duplicate: true,
     };
 
     let job = Job::AddTokenizer {
@@ -414,9 +418,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_tokenizer_default_fallback() {
+    fn test_get_tokenizer_unknown_model_fallback() {
         let registry = create_test_registry();
-        let result = get_tokenizer(&registry, "default");
+        let result = get_tokenizer(&registry, UNKNOWN_MODEL_ID);
         assert!(result.is_ok());
     }
 

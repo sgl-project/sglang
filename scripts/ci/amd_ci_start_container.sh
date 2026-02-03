@@ -167,6 +167,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
+  -e PYTHONPATH="/opt/tilelang:${PYTHONPATH:-}" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
   --name ci_sglang \

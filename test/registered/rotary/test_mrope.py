@@ -1,8 +1,4 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
 # Rotary Embedding - MRoPE tests (1-GPU)
-register_cuda_ci(est_time=10, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
 
 from typing import NamedTuple
 
@@ -22,6 +18,10 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="stage-b-test-large-1-gpu")
+register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

@@ -531,6 +531,8 @@ pub struct HealthConfig {
     pub failure_threshold: u32,
     /// Number of consecutive successes before marking healthy
     pub success_threshold: u32,
+    /// Whether to disable health checks for this worker
+    pub disable_health_check: bool,
 }
 
 impl Default for HealthConfig {
@@ -541,6 +543,7 @@ impl Default for HealthConfig {
             endpoint: "/health".to_string(),
             failure_threshold: 3,
             success_threshold: 2,
+            disable_health_check: false,
         }
     }
 }
@@ -698,6 +701,13 @@ impl Worker for BasicWorker {
     }
 
     async fn check_health_async(&self) -> WorkerResult<()> {
+        if self.metadata.health_config.disable_health_check {
+            if !self.is_healthy() {
+                self.set_healthy(true);
+            }
+            return Ok(());
+        }
+
         let health_result = match &self.metadata.connection_mode {
             ConnectionMode::Http => self.http_health_check().await?,
             ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
@@ -1249,6 +1259,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         chat_template: worker.chat_template(model_id).map(String::from),
         bootstrap_port,
         metadata: worker.metadata().labels.clone(),
+        disable_health_check: worker.metadata().health_config.disable_health_check,
         job_status: None,
     }
 }
@@ -1322,6 +1333,7 @@ mod tests {
         assert_eq!(config.endpoint, "/health");
         assert_eq!(config.failure_threshold, 3);
         assert_eq!(config.success_threshold, 2);
+        assert!(!config.disable_health_check);
     }
 
     #[test]
@@ -1332,12 +1344,14 @@ mod tests {
             endpoint: "/healthz".to_string(),
             failure_threshold: 5,
             success_threshold: 3,
+            disable_health_check: true,
         };
         assert_eq!(config.timeout_secs, 10);
         assert_eq!(config.check_interval_secs, 60);
         assert_eq!(config.endpoint, "/healthz");
         assert_eq!(config.failure_threshold, 5);
         assert_eq!(config.success_threshold, 3);
+        assert!(config.disable_health_check);
     }
 
     #[test]
@@ -1376,6 +1390,7 @@ mod tests {
             endpoint: "/custom-health".to_string(),
             failure_threshold: 4,
             success_threshold: 2,
+            disable_health_check: false,
         };
 
         use crate::core::BasicWorkerBuilder;

@@ -224,6 +224,8 @@ class DecodingStage(PipelineStage):
         else:
             trajectory_decoded = None
 
+        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+
         # Update batch with decoded image
         output_batch = OutputBatch(
             output=frames,

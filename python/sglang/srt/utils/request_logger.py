@@ -130,7 +130,7 @@ class RequestLogger:
         if not self.log_requests:
             return
 
-        e2e_latency_ms = out["meta_info"]["e2e_latency"] * 1000
+        e2e_latency_ms = out["meta_info"].get("e2e_latency", 0) * 1000
         if self.log_exceeded_ms > 0 and e2e_latency_ms < self.log_exceeded_ms:
             return
 

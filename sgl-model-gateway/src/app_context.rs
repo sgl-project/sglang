@@ -4,14 +4,11 @@ use std::{
 };
 
 use reqwest::Client;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     config::RouterConfig,
-    core::{
-        steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService,
-        UNKNOWN_MODEL_ID,
-    },
+    core::{steps::WorkflowEngines, JobQueue, LoadMonitor, WorkerRegistry, WorkerService},
     data_connector::{
         create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     },
@@ -21,12 +18,7 @@ use crate::{
     policies::PolicyRegistry,
     reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::router_manager::RouterManager,
-    tokenizer::{
-        cache::{CacheConfig, CachedTokenizer},
-        factory as tokenizer_factory,
-        registry::TokenizerRegistry,
-        traits::Tokenizer,
-    },
+    tokenizer::registry::TokenizerRegistry,
     tool_parser::ParserFactory as ToolParserFactory,
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
 };
@@ -396,56 +388,6 @@ impl AppContextBuilder {
         self
     }
 
-    /// Load tokenizer if tokenizer_path is provided
-    ///
-    /// This is a pure function that loads the tokenizer from the provided path
-    /// and applies caching configuration. Returns None if no tokenizer path is configured.
-    fn maybe_tokenizer(config: &RouterConfig) -> Result<Option<Arc<dyn Tokenizer>>, String> {
-        // Check if tokenizer path is provided
-        let tokenizer_path = match config
-            .tokenizer_path
-            .clone()
-            .or_else(|| config.model_path.clone())
-        {
-            Some(path) => path,
-            None => {
-                info!("Tokenizer path is not provided, will load from worker on the fly");
-                return Ok(None);
-            }
-        };
-
-        // Load base tokenizer
-        let base_tokenizer = tokenizer_factory::create_tokenizer_with_chat_template_blocking(
-            &tokenizer_path,
-            config.chat_template.as_deref(),
-        )
-        .map_err(|e| {
-            format!(
-                "Failed to create tokenizer from '{}': {}. \
-                Ensure the path is valid and points to a tokenizer file (tokenizer.json) \
-                or a HuggingFace model ID. For directories, ensure they contain tokenizer files.",
-                tokenizer_path, e
-            )
-        })?;
-
-        // Conditionally wrap with caching layer if at least one cache is enabled
-        let tokenizer: Arc<dyn Tokenizer> =
-            if config.tokenizer_cache.enable_l0 || config.tokenizer_cache.enable_l1 {
-                let cache_config = CacheConfig {
-                    enable_l0: config.tokenizer_cache.enable_l0,
-                    l0_max_entries: config.tokenizer_cache.l0_max_entries,
-                    enable_l1: config.tokenizer_cache.enable_l1,
-                    l1_max_memory: config.tokenizer_cache.l1_max_memory,
-                };
-                Arc::new(CachedTokenizer::new(base_tokenizer, cache_config)) as Arc<dyn Tokenizer>
-            } else {
-                // Use base tokenizer directly without caching
-                base_tokenizer
-            };
-
-        Ok(Some(tokenizer))
-    }
-
     /// Create reasoning parser factory for gRPC mode or IGW mode
     fn with_reasoning_parser_factory(mut self) -> Self {
         // Initialize reasoning parser factory
@@ -460,34 +402,16 @@ impl AppContextBuilder {
         self
     }
 
-    /// Create tokenizer registry and optionally load tokenizer
-    /// If a tokenizer is successfully loaded, it is registered with a key derived from
-    /// tokenizer_path or model_path (falling back to UNKNOWN_MODEL_ID if neither exists).
-    fn with_tokenizer_registry(mut self, config: &RouterConfig) -> Result<Self, String> {
-        // Create empty tokenizer registry
-        let registry = Arc::new(TokenizerRegistry::new());
-
-        // Try to load router-level tokenizer if path is provided
-        if let Some(tokenizer) = Self::maybe_tokenizer(config)? {
-            // Determine registration key: prefer tokenizer_path, then model_path, finally UNKNOWN_MODEL_ID
-            let source = config
-                .tokenizer_path
-                .as_ref()
-                .or(config.model_path.as_ref())
-                .map(|s| s.as_str())
-                .unwrap_or(UNKNOWN_MODEL_ID);
-
-            let tokenizer_id = TokenizerRegistry::generate_id();
-            registry.register(&tokenizer_id, source, source, tokenizer.clone());
-            info!(
-                "Tokenizer loaded and registered with name '{}' id={} (vocab_size: {})",
-                source,
-                tokenizer_id,
-                tokenizer.vocab_size()
-            );
-        }
-
-        self.tokenizer_registry = Some(registry);
+    /// Create empty tokenizer registry
+    ///
+    /// Tokenizers are loaded via the tokenizer_registration workflow, which is triggered:
+    /// - At startup (if --tokenizer-path or --model-path is provided)
+    /// - When workers connect (registers under model_id)
+    /// - Via POST /v1/tokenizers API (registers under user-specified name)
+    ///
+    /// This unified approach ensures consistent behavior (caching, validation) across all paths.
+    fn with_tokenizer_registry(mut self, _config: &RouterConfig) -> Result<Self, String> {
+        self.tokenizer_registry = Some(Arc::new(TokenizerRegistry::new()));
         Ok(self)
     }
 

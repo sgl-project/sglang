@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
 from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
     SparseKVCacheManager,
 )
+from sglang.srt.utils import bind_to_closest_numa_node_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def _create_backend_adaptor(
 ):
     """Create backend adaptor."""
     if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
-        return NSABackendAdaptor(device, req_to_token_pool)
+        return NSABackendAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device, req_to_token_pool, sparse_kv_cache_manager)
@@ -73,7 +74,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
             # Extract algorithm and backend
             algorithm = extra_config.pop("algorithm", "quest")
             backend = extra_config.pop("backend", "flashattention")
-
+            topk_tokens_cnt = extra_config.pop("topk_tokens_cnt", 2048)
+            device_buffer_cnt = extra_config.pop("device_buffer_cnt", 2048)
             # Everything else goes to algorithm_extra_config
             sparse_extra_config = extra_config
         except json.JSONDecodeError as e:
@@ -85,6 +87,8 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         algorithm=algorithm,
         backend=backend,
         page_size=server_args.page_size,
+        topk_tokens_cnt=topk_tokens_cnt,
+        device_buffer_cnt=device_buffer_cnt,
         sparse_extra_config=sparse_extra_config,
     )
     return config
@@ -101,6 +105,7 @@ def create_sparse_coordinator(
     server_args,
     **kwargs,
 ) -> SparseCoordinator:
+    bind_to_closest_numa_node_cuda()
     config = _parse_sparse_config(server_args)
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     sparse_kv_cache_manager = SparseKVCacheManager(

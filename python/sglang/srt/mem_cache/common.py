@@ -7,9 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.factory import (
     get_sparse_coordinator,
@@ -236,7 +234,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
     if tree_cache is None:
         return
 
-    if isinstance(tree_cache, (SWAChunkCache, ChunkCache)):
+    if tree_cache.is_chunk_cache():
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
@@ -250,11 +248,13 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(full_num_tokens, swa_num_tokens)
+            tree_cache.evict(
+                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+            )
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:
-            tree_cache.evict(num_tokens)
+            tree_cache.evict(EvictParams(num_tokens=num_tokens))
 
 
 def alloc_paged_token_slots_extend(
@@ -310,14 +310,14 @@ def alloc_req_slots(
         mamba_available_size = req_to_token_pool.mamba_pool.available_size()
         factor = (
             MAMBA_STATE_PER_REQ_PREFIX_CACHE
-            if isinstance(tree_cache, MambaRadixCache)
+            if tree_cache.supports_mamba()
             else MAMBA_STATE_PER_REQ_NO_CACHE
         )
         mamba_state_needed = num_reqs * factor
         if mamba_available_size < mamba_state_needed:
-            if tree_cache is not None and isinstance(tree_cache, MambaRadixCache):
+            if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
-                tree_cache.evict_mamba(mamba_num)
+                tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
         req_pool_indices = req_to_token_pool.alloc(num_reqs, reqs)
     else:
         req_pool_indices = req_to_token_pool.alloc(num_reqs)
@@ -344,18 +344,7 @@ def alloc_for_extend(
         req_pool_indices: request pool indices as list
     """
     # free out-of-window swa tokens
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req, pre_len in zip(batch.reqs, batch.prefix_lens):
-            if batch.enable_overlap:
-                # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
-                if req.extend_batch_idx < 2:
-                    continue
-                else:
-                    batch.tree_cache.evict_swa(
-                        req, pre_len - batch.tree_cache.chunked_prefill_size
-                    )
-            else:
-                batch.tree_cache.evict_swa(req, pre_len)
+    batch.maybe_evict_swa()
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
@@ -446,16 +435,18 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     Returns:
         out_cache_loc: allocated cache locations
     """
+    # Allocate hierarchical sparse mode
     if is_hierarchical_sparse_attention_enabled():
-        return alloc_for_hierarchical_sparse_decode(batch, token_per_req)
+        alloc_tokens_func = (
+            alloc_paged_token_slots_decode
+            if batch.tree_cache.page_size > 1
+            else alloc_token_slots
+        )
+        return get_sparse_coordinator().alloc_for_hierarchical_sparse_decode(
+            batch, token_per_req, alloc_tokens_func
+        )
 
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        for req in batch.reqs:
-            # We set evict_swa condition here with two reasons:
-            # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-            # 2. Evict swa every window_size tokens to reduce the overhead.
-            if req.decode_batch_idx % batch.tree_cache.window_size == 1:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+    batch.maybe_evict_swa()
 
     bs = batch.seq_lens.shape[0]
 
@@ -489,87 +480,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
-def alloc_for_hierarchical_sparse_decode(
-    batch: ScheduleBatch, token_per_req: int
-) -> torch.Tensor:
-    """
-    Allocate KV cache for hierarchical sparse decode batch and write to req_to_token_pool.
-    """
-    if isinstance(batch.tree_cache, SWAChunkCache):
-        raise RuntimeError(
-            "SWAChunkCache is not supported for hierarchical sparse decode"
-        )
-
-    bs = batch.seq_lens.shape[0]
-    seq_lens_next = batch.seq_lens + token_per_req
-    page_size = batch.tree_cache.page_size
-    req_pool_indices = batch.req_pool_indices
-    sparse_coordinator = get_sparse_coordinator()
-
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + batch.seq_lens
-    else:
-        locs = batch.seq_lens.clone()
-
-    # Find truncated and non-truncated requests
-    kv_truncated_len = sparse_coordinator.get_hierarchical_sparse_truncated_len()
-    hierarchical_sparse_masks = sparse_coordinator.get_hierarchical_sparse_req_masks(
-        req_pool_indices
-    )
-    out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
-
-    # Handle truncated requests: reuse a pre-allocated rolling page per request
-    if hierarchical_sparse_masks.any():
-        truncated_indices = hierarchical_sparse_masks.nonzero(as_tuple=True)[0]
-        # Map logical decode positions onto the reserved rolling page in a round-robin way
-        decode_offsets = locs[truncated_indices]
-        rolling_positions = (kv_truncated_len - page_size) + (
-            decode_offsets % page_size
-        )
-        out_cache_loc[truncated_indices] = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices[truncated_indices],
-            rolling_positions,
-        ]
-
-    # Handle non-truncated requests: allocate normally
-    if (~hierarchical_sparse_masks).any():
-        non_truncated_indices = (~hierarchical_sparse_masks).nonzero(as_tuple=True)[0]
-        if batch.tree_cache.page_size == 1:
-            non_truncated_out = alloc_token_slots(
-                batch.tree_cache, len(non_truncated_indices) * token_per_req
-            )
-        else:
-            non_truncated_last_loc = batch.req_to_token_pool.req_to_token[
-                batch.req_pool_indices[non_truncated_indices],
-                batch.seq_lens[non_truncated_indices] - 1,
-            ]
-            non_truncated_out = alloc_paged_token_slots_decode(
-                tree_cache=batch.tree_cache,
-                seq_lens=seq_lens_next[non_truncated_indices],
-                seq_lens_cpu=batch.seq_lens_cpu[non_truncated_indices.cpu()]
-                + token_per_req,
-                last_loc=non_truncated_last_loc,
-                token_per_req=token_per_req,
-            )
-
-        out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
-        batch.req_to_token_pool.write(
-            (
-                batch.req_pool_indices[non_truncated_indices],
-                locs[non_truncated_indices],
-            ),
-            out_cache_loc[non_truncated_indices],
-        )
-    return out_cache_loc
-
-
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # MambaRadixCache may alloc mamba state before alloc KV cache
     if req.req_pool_idx is None:
-        assert isinstance(
-            tree_cache, MambaRadixCache
+        assert (
+            tree_cache.supports_mamba()
         ), "Only MambaRadixCache can handle abort with prefix cache hit before alloc"
         return
 
