@@ -85,10 +85,8 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 
         if use_list_input:
             prompt_arg = [prompt_input, prompt_input]
-            num_choices = len(prompt_arg)
         else:
             prompt_arg = prompt_input
-            num_choices = 1
 
         response = client.completions.create(
             model=self.model,
@@ -136,7 +134,6 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
 
         hidden_states_list = []
         for response in generator:
-            usage = response.usage
             for choice in response.choices:
                 if hasattr(choice, "hidden_states"):
                     assert return_hidden_states
@@ -190,7 +187,6 @@ class BaseTestOpenAIServerWithHiddenStates(ABC):
             extra_body=dict(return_hidden_states=return_hidden_states),
         )
 
-        is_firsts = {}
         hidden_states_list = []
 
         for response in generator:

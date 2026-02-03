@@ -165,8 +165,8 @@ class TestLoRALoadFromTensor(CustomTestCase):
         self.assertTrue(
             result.success, f"Failed to unload LoRA: {result.error_message}"
         )
-        with self.assertRaises(ValueError) as context:
-            output_lora = self.engine.generate(
+        with self.assertRaises(ValueError):
+            self.engine.generate(
                 prompt=[TEST_PROMPT],
                 sampling_params={
                     "max_new_tokens": MAX_NEW_TOKENS,
