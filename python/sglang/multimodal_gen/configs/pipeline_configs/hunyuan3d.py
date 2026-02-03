@@ -28,16 +28,26 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     shape_box_v: float = 1.01
     shape_octree_resolution: int = 384
     shape_mc_level: float = 0.0
-    shape_mc_algo: Optional[str] = None
+    shape_mc_algo: Optional[str] = "mc"
     shape_num_chunks: int = 8000
     shape_output_type: str = "trimesh"
 
+    # Delight model configuration
+    delight_enable: bool = True
+    delight_prompt: str = "3D image"
+    delight_negative_prompt: str = "2D image"
+    delight_strength: float = 0.8
+    delight_num_inference_steps: int = 40
+    delight_guidance_scale: float = 7.5
+    delight_cfg_image: float = 1.5
+
     # Paint model configuration
     paint_enable: bool = False
-    paint_num_inference_steps: int = 15
+    paint_num_inference_steps: int = 30
     paint_guidance_scale: float = 3.0
     paint_resolution: int = 512
-    paint_texture_size: int = 4096
+    paint_render_size: int = 2048
+    paint_texture_size: int = 2048
     paint_use_remesh: bool = True
     paint_save_glb: bool = True
     paint_turbo_mode: bool = False  # Enable turbo mode for faster inference

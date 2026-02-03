@@ -295,10 +295,6 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
         self.pipeline = None
         self._loaded = False
 
-        # Delight parameters
-        self.cfg_image = 1.5
-        self.cfg_text = 1.0
-
     def _load_delight_model(self, server_args: ServerArgs):
         """Lazy load the delight model."""
         if self._loaded:
@@ -382,14 +378,16 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
         image = image.convert("RGB")
 
         image = self.pipeline(
-            prompt="",
+            prompt=self.config.delight_prompt,
+            negative_prompt=self.config.delight_negative_prompt,
             image=image,
             generator=torch.manual_seed(42),
             height=512,
             width=512,
-            num_inference_steps=50,
-            image_guidance_scale=self.cfg_image,
-            guidance_scale=self.cfg_text,
+            strength=self.config.delight_strength,
+            num_inference_steps=self.config.delight_num_inference_steps,
+            image_guidance_scale=self.config.delight_cfg_image,
+            guidance_scale=self.config.delight_guidance_scale,
         ).images[0]
 
         image_tensor = torch.tensor(np.array(image) / 255.0).to("cuda")
@@ -409,6 +407,12 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
 
         # Load reference image
         image = Image.open(batch.image_path)
+
+        # Check if delight is enabled
+        if not self.config.delight_enable:
+            logger.info("Delight preprocessing disabled, using original image")
+            batch.extra["delighted_image"] = image
+            return batch
 
         # Apply delight if model is available
         self._load_delight_model(server_args)
@@ -430,15 +434,15 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
     conditioning inputs for the texture diffusion model.
     """
 
+    # Camera configuration constants for 6 views
+    CAMERA_AZIMS = [0, 90, 180, 270, 0, 180]
+    CAMERA_ELEVS = [0, 0, 0, 0, 90, -90]
+    VIEW_WEIGHTS = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
+
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
         self.config = config
         self.renderer = None
-
-        # Camera configuration for 6 views
-        self.camera_azims = [0, 90, 180, 270, 0, 180]
-        self.camera_elevs = [0, 0, 0, 0, 90, -90]
-        self.view_weights = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
 
     def _init_renderer(self):
         """Initialize the mesh renderer."""
@@ -447,12 +451,9 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
 
         from sglang.multimodal_gen.runtime.models.mesh3d_utils import MeshRender
 
-        render_size = getattr(self.config, "paint_resolution", 512)
-        texture_size = getattr(self.config, "paint_texture_size", 2048)
-
         self.renderer = MeshRender(
-            default_resolution=render_size,
-            texture_size=texture_size,
+            default_resolution=self.config.paint_render_size,
+            texture_size=self.config.paint_texture_size,
         )
         logger.info("Mesh renderer initialized")
 
@@ -466,19 +467,19 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
 
         # Render normal maps
         normal_maps = self.renderer.render_normal_multiview(
-            self.camera_elevs, self.camera_azims, use_abs_coor=True
+            self.CAMERA_ELEVS, self.CAMERA_AZIMS, use_abs_coor=True
         )
 
         # Render position maps
         position_maps = self.renderer.render_position_multiview(
-            self.camera_elevs, self.camera_azims
+            self.CAMERA_ELEVS, self.CAMERA_AZIMS
         )
 
         batch.extra["normal_maps"] = normal_maps
         batch.extra["position_maps"] = position_maps
-        batch.extra["camera_azims"] = self.camera_azims
-        batch.extra["camera_elevs"] = self.camera_elevs
-        batch.extra["view_weights"] = self.view_weights
+        batch.extra["camera_azims"] = self.CAMERA_AZIMS
+        batch.extra["camera_elevs"] = self.CAMERA_ELEVS
+        batch.extra["view_weights"] = self.VIEW_WEIGHTS
         batch.extra["renderer"] = self.renderer
 
         logger.info(f"Rendered {len(normal_maps)} views for texture generation")
@@ -990,9 +991,16 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
         if self.paint_unet is not None:
             try:
-                num_steps = getattr(self.config, "paint_num_inference_steps", 15)
-                guidance_scale = getattr(self.config, "paint_guidance_scale", 3.0)
-                render_size = getattr(self.config, "paint_resolution", 512)
+                # Get parameters from batch (SamplingParams) or fallback to config
+                num_steps = (
+                    getattr(batch, "paint_num_inference_steps", None)
+                    or self.config.paint_num_inference_steps
+                )
+                guidance_scale = (
+                    getattr(batch, "paint_guidance_scale", None)
+                    or self.config.paint_guidance_scale
+                )
+                render_size = self.config.paint_resolution
                 device = self.device
 
                 batch.extra["paint_num_in_batch"] = len(normal_maps)
@@ -1019,7 +1027,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
             except Exception as e:
                 logger.error(f"Paint pipeline execution failed: {e}")
                 # Fallback
-                render_size = getattr(self.config, "paint_resolution", 512)
+                render_size = self.config.paint_resolution
                 multiview_textures = [
                     delighted_image.resize((render_size, render_size))
                     for _ in range(len(normal_maps))
@@ -1029,7 +1037,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
             logger.warning(
                 "Paint pipeline not available, using reference image for all views"
             )
-            render_size = getattr(self.config, "paint_resolution", 512)
+            render_size = self.config.paint_resolution
             multiview_textures = [
                 delighted_image.resize((render_size, render_size))
                 for _ in range(len(normal_maps))

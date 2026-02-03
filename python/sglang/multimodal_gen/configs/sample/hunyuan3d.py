@@ -14,6 +14,10 @@ class Hunyuan3DSamplingParams(SamplingParams):
     shape_num_inference_steps: int = 50
     shape_guidance_scale: float = 5.0
 
+    # Paint/texture generation parameters
+    paint_num_inference_steps: int = 30
+    paint_guidance_scale: float = 3.0
+
     def __post_init__(self):
         """Validate parameters after initialization."""
         # Set default empty prompt for image-to-3D generation (prompt not required)
@@ -24,3 +28,9 @@ class Hunyuan3DSamplingParams(SamplingParams):
 
         if self.shape_guidance_scale < 0:
             raise ValueError("shape_guidance_scale must be non-negative")
+
+        if self.paint_num_inference_steps <= 0:
+            raise ValueError("paint_num_inference_steps must be positive")
+
+        if self.paint_guidance_scale < 0:
+            raise ValueError("paint_guidance_scale must be non-negative")
