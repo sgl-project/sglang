@@ -226,34 +226,13 @@ def mesh_uv_wrap(mesh: Any) -> Any:
     Returns:
         Mesh with UV coordinates.
     """
-    import time
-
     try:
         import xatlas
     except ImportError:
-        print("[DEBUG UV] xatlas not available, skipping UV unwrap")
         logger.warning("xatlas not available, skipping UV unwrap")
         return mesh
 
-    print(
-        f"[DEBUG UV] mesh_uv_wrap called - vertices: {len(mesh.vertices)}, faces: {len(mesh.faces)}"
-    )
-
-    # Use xatlas for UV unwrapping
-    # Returns:
-    #   vmapping: mapping from new vertices to original vertices
-    #   indices: new face indices using new vertex numbering
-    #   uvs: UV coordinates for new vertices
-    print(
-        "[DEBUG UV] Calling xatlas.parametrize()... this may take a while for large meshes"
-    )
-    start_time = time.time()
     vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
-    elapsed = time.time() - start_time
-    print(f"[DEBUG UV] xatlas.parametrize() completed in {elapsed:.2f} seconds")
-    print(
-        f"[DEBUG UV] Result - vmapping: {len(vmapping)}, indices: {len(indices)}, uvs: {len(uvs)}"
-    )
 
     # Remap vertices according to xatlas output
     # vmapping contains indices into the original vertex array

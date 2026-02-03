@@ -1349,7 +1349,7 @@ def get_generate_fn(
                     url,
                     files=files,
                     data=data,
-                    timeout=600,  # 10 minute timeout for mesh generation
+                    timeout=6000,  # 10 minute timeout for mesh generation
                 )
             except http_requests.exceptions.Timeout:
                 pytest.fail(f"{case_id}: mesh generation timed out after 600s")

@@ -53,7 +53,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     delight_cfg_image: float = 1.5
 
     # Paint model configuration
-    paint_enable: bool = False
+    paint_enable: bool = True
     paint_num_inference_steps: int = 30
     paint_guidance_scale: float = 3.0
     paint_resolution: int = 512

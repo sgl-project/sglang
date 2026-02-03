@@ -262,20 +262,12 @@ class Hunyuan3DPaintUVUnwrapStage(PipelineStage):
         if isinstance(mesh, list):
             mesh = mesh[0]
 
-        print(
-            f"[DEBUG UV] Input mesh - vertices: {len(mesh.vertices)}, faces: {len(mesh.faces)}"
-        )
-
-        # UV unwrap
         try:
-            print("[DEBUG UV] Starting xatlas UV unwrap...")
             start_time = time.time()
             mesh = mesh_uv_wrap(mesh)
             elapsed = time.time() - start_time
-            print(f"[DEBUG UV] UV unwrapping completed in {elapsed:.2f} seconds")
-            logger.info("UV unwrapping completed")
+            logger.info(f"UV unwrapping completed in {elapsed:.2f}s")
         except Exception as e:
-            print(f"[DEBUG UV] UV unwrapping failed: {e}")
             logger.warning(f"UV unwrapping failed: {e}")
 
         batch.extra["paint_mesh"] = mesh
@@ -709,9 +701,28 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
         batch.extra["paint_ref_latents"] = self._encode_images(image_vae)
 
+        # Resize normal/position maps to paint_resolution before encoding
+        # This ensures latent dimensions match between noise and condition maps
+        target_size = self.config.paint_resolution
         if isinstance(normal_maps, list):
+            normal_maps = [
+                (
+                    img.resize((target_size, target_size))
+                    if hasattr(img, "resize")
+                    else img
+                )
+                for img in normal_maps
+            ]
             normal_maps = self._convert_pil_list_to_tensor([normal_maps], device)
         if isinstance(position_maps, list):
+            position_maps = [
+                (
+                    img.resize((target_size, target_size))
+                    if hasattr(img, "resize")
+                    else img
+                )
+                for img in position_maps
+            ]
             position_maps = self._convert_pil_list_to_tensor([position_maps], device)
 
         if normal_maps is not None:
