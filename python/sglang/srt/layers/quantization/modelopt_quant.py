@@ -212,6 +212,28 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        if self.exclude_modules:
+            # Wildcard patterns (e.g., "model.visual*") can break _map_name's
+            # prefix matching: "model.visual*" doesn't startswith "model.visual."
+            # so it falls through to the shorter "model." prefix and gets
+            # incorrectly remapped. Replace '*' with a dotted placeholder so
+            # prefix matching works, then restore the wildcard afterward.
+            _WILDCARD = ".__wildcard_placeholder__"
+            new_exclude = []
+            for module in self.exclude_modules:
+                temp = module.replace("*", _WILDCARD)
+                mapped = hf_to_sglang_mapper._map_name(temp)
+                if mapped is not None:
+                    new_exclude.append(mapped.replace(_WILDCARD, "*"))
+                else:
+                    new_exclude.append(module)
+            self.exclude_modules = new_exclude
+        if self.packed_modules_mapping:
+            self.packed_modules_mapping = hf_to_sglang_mapper.apply_dict(
+                self.packed_modules_mapping
+            )
+
 
 class ModelOptFp8Config(ModelOptQuantConfig):
     """Configuration for ModelOpt FP8 quantization, including serialization and compatibility checks."""
