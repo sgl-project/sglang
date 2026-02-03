@@ -343,7 +343,7 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        if envs."FORWARD_NATIVE_TOPK".get():
+        if envs.FORWARD_NATIVE_TOPK.get():
             return self.forward_native(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
