@@ -125,6 +125,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
                     input_size=kwargs.get("input_size", input_size_per_partition),
                     output_size=kwargs.get("output_size", output_size_per_partition),
                 )
+
+            # NOTE: ideally, weight_loader should be refactored to be aware of `param_name`.
+            layer.weight._param_name = "weight"
+            layer.weight_scale_inv._param_name = "weight_scale_inv"
         else:
             original_weight_loader = weight_loader
             if not self.is_checkpoint_mxfp4_serialized:
@@ -214,11 +218,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
             loaded_weight: torch.Tensor,
             shard_id: int | str | None = None,
         ):
-            param_name = None
-            for name, p in layer.named_parameters():
-                if p.shape == param.shape and p.dtype == p.dtype:
-                    param_name = name
-                    break
+            param_name = getattr(param, "_param_name", None)
 
             is_weight = param_name == "weight"
             is_weight_scale_inv = param_name == "weight_scale_inv"
