@@ -46,7 +46,7 @@ logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
 
 
-def _apply_rotary_emb(
+def _apply_rotary_emb_naive(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
@@ -73,6 +73,46 @@ def _apply_rotary_emb(
         return torch.cat((o1, o2), dim=-1)
     else:
         return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+
+def _apply_rotary_emb_flashinfer(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [batch_size, seq_len, num_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    # TODO(triple-mu): The current FlashInfer kernel path introduces redundant computation for K.
+    k = torch.empty_like(x)
+    x, _ = _apply_rotary_emb_qk_flashinfer(x, k, cos, sin, is_neox_style=is_neox_style)
+    return x
+
+
+def _apply_rotary_emb(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [batch_size, seq_len, num_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    if _is_cuda and apply_rope_with_cos_sin_cache_inplace is not None:
+        return _apply_rotary_emb_flashinfer(x, cos, sin, is_neox_style=is_neox_style)
+    else:
+        return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
 
 
 def _apply_rotary_emb_qk_naive(
