@@ -1677,7 +1677,10 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hierarchical_cache:
+                if self.enable_hicache_storage:
+                    # Release prefetch events associated with the request
+                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
@@ -1705,6 +1708,9 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
+                if self.enable_hicache_storage:
+                    # Release prefetch events associated with the request
+                    self.tree_cache.release_aborted_request(req.rid)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2024,6 +2030,10 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+                # Pop the number of tokens loaded from storage (L3 hits)
+                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                    req.rid
+                )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
