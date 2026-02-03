@@ -98,7 +98,8 @@ ONLINE_QUANTIZATION_CHOICES = [
     # Modelopt has some online quantization support through ModelOptModelLoader.
     "modelopt_fp8",
     "modelopt_fp4",
-    "modelopt" "fp8",  # MOE + linear.
+    "modelopt",
+    "fp8",  # MOE + linear.
     "mxfp8",  # MOE + linear.
     "w8a8_fp8",  # linear + MOE (only half support => should likely be deprecated in favor of fp8, see https://github.com/sgl-project/sglang/issues/4524)
     "moe_wna16",  # custom loading logic for gptq/awq checkpoints (likely untested/unused)
