@@ -1,6 +1,4 @@
 """
-LM Evaluation Harness integration for SGLang tests.
-
 This module provides a mixin class for running lm-eval harness evaluations
 against SGLang servers
 """
@@ -54,13 +52,9 @@ class LMEvalMixin:
         # Flush cache before evaluation
         requests.get(self.base_url + "/flush_cache")
 
-        print(f"Starting lm-eval test for {self.model_config_name}")
-        print(f"Model config path: {Path(self.model_config_name).resolve()}")
         eval_config = yaml.safe_load(
             Path(self.model_config_name).read_text(encoding="utf-8")
         )
-        print(f"Loaded eval config: {eval_config}")
-        # Run evaluation
         results = self.launch_lm_eval(eval_config)
 
         rtol = eval_config.get("rtol", self.default_rtol)
@@ -83,11 +77,8 @@ class LMEvalMixin:
 
     def launch_lm_eval(self, eval_config: dict[str, Any]) -> dict:
         """
-        Launch lm-eval evaluation against a running SGLang server.
-
         Args:
             eval_config: Configuration dictionary with model and task settings
-            tp_size: Tensor parallel size (used if running in-process backend)
         """
         import lm_eval
 
@@ -114,4 +105,5 @@ class LMEvalMixin:
                 gen_kwargs=eval_config.get("gen_kwargs"),
                 batch_size=batch_size,
             )
+
         return results
