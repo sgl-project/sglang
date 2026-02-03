@@ -34,7 +34,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 "--context-length",
                 "3000",  # Required for Qwen MOE model.
                 "--tensor-parallel-size",
-                "1",
+                cls.tp if hasattr(cls, "tp") else "1",
                 "--log-level",
                 "debug",
             ],
@@ -75,7 +75,7 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
             self.skipTest("not is_cuda_alike")
 
         # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
-        assert self.peak_memory < 6
+        assert self.peak_memory < 6  # TP=1
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -107,7 +107,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
             self.skipTest("not is_cuda_alike")
 
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
-        assert self.peak_memory < 21.5
+        assert self.peak_memory < 21.5  # TP=1
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -124,3 +124,38 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
 
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
         self.assertGreater(metrics["accuracy"], 0.9)
+
+
+class TestFP8ToMXFP4Dense(TestOnlineQuantizationMemoryLoad):
+    model = "/mnt/fxmarty/Qwen_Qwen3-8B-FP8"
+
+    def test_peak_memory(self):
+        if not is_cuda_alike():
+            self.skipTest("not is_cuda_alike")
+
+        # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1)
+        assert self.peak_memory < 7  # TP=1
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=8,
+            data_path=None,
+            num_questions=500,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+
+        # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
+        self.assertGreater(metrics["accuracy"], 0.88)
+
+
+class TestFP8ToMXFP4DenseTP1(TestFP8ToMXFP4Dense):
+    tp = 1
+
+
+class TestFP8ToMXFP4DenseTP2(TestFP8ToMXFP4Dense):
+    tp = 2

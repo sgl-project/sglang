@@ -312,8 +312,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 scale_dtype = torch.uint8 if use_mxfp8 else torch.float32
                 scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.empty
 
-                print("scale of shape", (output_size_per_partition + block_n - 1) // block_n,
-                        (input_size_per_partition + block_k - 1) // block_k)
                 scale = BlockQuantScaleParameter(
                     data=scale_init(
                         (output_size_per_partition + block_n - 1) // block_n,

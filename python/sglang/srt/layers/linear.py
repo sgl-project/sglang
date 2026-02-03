@@ -618,33 +618,23 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         if output_dim is not None:
             shard_offset = sum(self.output_sizes[:loaded_shard_id]) // self.tp_size
             shard_size = self.output_sizes[loaded_shard_id] // self.tp_size
-            print("shard_size here", shard_size)
-            print("self.output_sizes", self.output_sizes)
             # Special case for quantization.
             # If quantized, we need to adjust the offset and size to account
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                print("IN packed_dim == output_dim")
                 shard_size = shard_size // param.pack_factor
-                print("shard_size", shard_size)
                 shard_offset = shard_offset // param.pack_factor
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
                 )
-                print("shard_size", shard_size)
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
             if use_bitsandbytes_4bit:
-                raise ValueError()
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
 
-            print("output_dim", output_dim)
-            print("shard_offset", shard_offset)
-            print("shard_size", shard_size)
-            print("param_data", param_data.shape)
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
 
@@ -744,8 +734,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: Optional[int] = None,
     ):
-        # raise ValueError("IN weight_loader_v2")
-        print("IN weight_loader_v2")
         if loaded_shard_id is None:
             if isinstance(param, PerTensorScaleParameter):
                 param.load_merged_column_weight(

@@ -12,6 +12,7 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkMoEMethod
 from sglang.srt.layers.quantization.quark.schemes import (
@@ -21,7 +22,6 @@ from sglang.srt.layers.quantization.quark.schemes import (
 )
 from sglang.srt.layers.quantization.quark.utils import deep_compare, should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.utils import get_device_capability
 
@@ -40,7 +40,7 @@ class QuarkConfig(QuantizationConfig):
         pack_method: str = "reorder",
         is_prequantized: bool = False,
         online_scheme: Optional[str] = None,
-        dequantization_config: Optional[dict[str, Any]] = None
+        dequantization_config: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -116,7 +116,8 @@ class QuarkConfig(QuantizationConfig):
         if config["quant_method"] != "quark":
             assert "requantization_method" in config
 
-            if (config["quant_method"] == "fp8"
+            if (
+                config["quant_method"] == "fp8"
                 and config["requantization_method"] == "quark_mxfp4"
                 and config["activation_scheme"] == "dynamic"
             ):
@@ -125,7 +126,7 @@ class QuarkConfig(QuantizationConfig):
                 quark_config = cls(
                     quant_config=quant_config,
                     is_prequantized=False,
-                    dequantization_config=dequantization_config
+                    dequantization_config=dequantization_config,
                 )
             else:
                 raise NotImplementedError("Not supported")
@@ -399,7 +400,7 @@ class QuarkConfig(QuantizationConfig):
                 weight_config,
                 input_config,
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
-                dequantization_config=self.dequantization_config
+                dequantization_config=self.dequantization_config,
             )
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(

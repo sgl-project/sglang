@@ -490,7 +490,6 @@ class Qwen3ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            print("----- loading", name)
             if "Embedding" in self.config.name_or_path:
                 name = add_prefix(name, "model")
 
@@ -535,9 +534,6 @@ class Qwen3ForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                print("param", param.shape, param.dtype)
-                print("loaded_weight", loaded_weight.shape, loaded_weight.dtype)
-                print("shard_id", shard_id)
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
@@ -550,8 +546,6 @@ class Qwen3ForCausalLM(nn.Module):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    print("param", param.shape, param.dtype)
-                    print("weight_loader", weight_loader)
                     weight_loader(param, loaded_weight)
                 else:
                     logger.warning(f"Parameter {name} not found in params_dict")

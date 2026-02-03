@@ -80,9 +80,9 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
 
-QUANT_METHOD_SUPPORTS_DEQUANTIZATION = [
-    "quark_mxfp4"
-]
+
+QUANT_METHOD_SUPPORTS_DEQUANTIZATION = ["quark_mxfp4"]
+
 
 class ModelConfig:
     def __init__(
@@ -879,8 +879,9 @@ class ModelConfig:
                     )
                     self.quantization = quant_method
                 elif self.quantization in QUANT_METHOD_SUPPORTS_DEQUANTIZATION:
-                    print("DOING DEQUANTIZATION")
-                    print("quant_cfg", quant_cfg)
+                    logger.info_once(
+                        f"Requantizing from quant_method='{quant_method}' to the requested online quantization='{self.quantization}'. Beware that requantization may incur a loss in accuracy, the requantized model should be re-validated/re-evaluated. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+                    )
                 else:
                     raise ValueError(
                         "Quantization method specified in the model config "
