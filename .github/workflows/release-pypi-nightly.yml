@@ -14,6 +14,11 @@ on:
         description: 'Specific commit SHA to build (leave empty for latest)'
         required: false
         type: string
+      cuda_version:
+        description: 'CUDA version (e.g., 129 or 130)'
+        required: false
+        default: '129'
+        type: string
 
 concurrency:
   group: release-pypi-nightly-${{ github.ref }}
@@ -49,7 +54,21 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
 
-          # Build wheel - setuptools-scm automatically generates version from git tags
+          # Parse git describe output to detect exact tag builds (distance=0)
+          # Use same command as pyproject.toml to ensure version consistency
+          DESC=$(git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long 2>/dev/null || echo 'v0.0.0-0-g0000000')
+          DIST=$(echo "$DESC" | cut -d- -f2)
+
+          # If building at exact tag (distance=0), force dev0 version for unique wheel names
+          if [ "$DIST" = "0" ]; then
+            TAG=$(echo "$DESC" | cut -d- -f1)
+            HASH=$(echo "$DESC" | cut -d- -f3-)
+            FORCE_VERSION="${TAG#v}.dev0+${HASH}"
+            echo "Building at exact tag, forcing version to: $FORCE_VERSION"
+            export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
+          fi
+
+          # Build wheel
           python3 -m build --wheel
 
           # Extract version from built wheel filename
@@ -128,6 +147,7 @@ jobs:
           python3 scripts/update_nightly_whl_index.py \
             --commit-hash ${{ needs.build-nightly-wheel.outputs.commit_hash }} \
             --nightly-version ${{ needs.build-nightly-wheel.outputs.nightly_version }} \
+            --cuda-version ${{ inputs.cuda_version || '129' }} \
             --build-date ${{ needs.build-nightly-wheel.outputs.build_date }}
 
       - name: Push wheel index

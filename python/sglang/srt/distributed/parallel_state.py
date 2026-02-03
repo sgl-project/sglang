@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda_alike,
     is_hip,
+    is_musa,
     is_npu,
     is_shm_available,
     is_xpu,
@@ -58,6 +59,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+_is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -238,15 +240,43 @@ class GroupCoordinator:
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+        if is_cuda_alike():
+            device_id = (
+                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
             )
-            # a cpu_group to allow direct coordination between processes through
-            # the CPU. The backend is chosen based on `torch_distributed_backend`
+            self.device = torch.device(f"cuda:{device_id}")
+        elif _is_npu:
+            self.device = torch.device(f"npu:{local_rank}")
+        elif _is_xpu:
+            self.device = torch.device(f"xpu:{local_rank}")
+        elif _is_musa:
+            self.device = torch.device(f"musa:{local_rank}")
+        else:
+            self.device = torch.device("cpu")
+        self.device_module = torch.get_device_module(self.device)
+
+        for ranks in group_ranks:
+            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
             if "mooncake" in torch_distributed_backend:
-                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
+                from mooncake.ep import MooncakeBackendOptions
+
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake",
+                    pg_options=MooncakeBackendOptions(active_ranks),
+                )
+                cpu_group = torch.distributed.new_group(
+                    ranks,
+                    backend="mooncake-cpu",
+                    pg_options=MooncakeBackendOptions(active_ranks_cpu),
+                )
             else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
                     ranks, backend="gloo", timeout=gloo_timeout
                 )
@@ -256,20 +286,11 @@ class GroupCoordinator:
                 self.rank_in_group = ranks.index(self.rank)
                 self.device_group = device_group
                 self.cpu_group = cpu_group
+                self.active_ranks = active_ranks
+                self.active_ranks_cpu = active_ranks_cpu
 
         assert self.cpu_group is not None
         assert self.device_group is not None
-
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
-        self.device_module = torch.get_device_module(self.device)
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -1343,7 +1364,7 @@ def init_model_parallel_group(
         group_ranks=group_ranks,
         local_rank=local_rank,
         torch_distributed_backend=backend,
-        use_pynccl=not (_is_npu or _is_xpu),
+        use_pynccl=not (_is_npu or _is_xpu or backend == "mooncake"),
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
@@ -1886,6 +1907,8 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
             torch.xpu.empty_cache()
         elif hasattr(torch, "npu") and torch.npu.is_available():
             torch.npu.empty_cache()
+        elif hasattr(torch, "musa") and torch.musa.is_available():
+            torch.musa.empty_cache()
 
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
