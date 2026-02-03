@@ -8,7 +8,7 @@ import torch
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.dequantization import dequantize_fp8
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
 from sglang.srt.utils import is_hip, set_weight_attrs
@@ -73,7 +73,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
         input_size_per_partition: int,
         params_dtype: torch.dtype,
         weight_loader: Callable,
-        **kwargs
+        **kwargs,
     ):
         self.input_size_per_partition = input_size_per_partition
 
@@ -85,6 +85,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
         # If dequantization_config is provided, we need to create FP8 weights first
         # for dequantization from FP8 checkpoint to MXFP4
         if self.dequantization_config is not None:
+            if not isinstance(self.dequantization_config, Fp8Config):
+                raise NotImplementedError(
+                    f"Requantization in QuarkW4A4MXFP4 from {self.dequantization_config.__class__.__name__} is not supported, only Fp8Config is supported."
+                )
             # Create FP8 weights for re-quantization from FP8 checkpoint
             # Extract necessary parameters from dequantization_config
             self.weight_block_size = self.dequantization_config.weight_block_size

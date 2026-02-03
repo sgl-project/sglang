@@ -129,7 +129,9 @@ class QuarkConfig(QuantizationConfig):
                     dequantization_config=dequantization_config,
                 )
             else:
-                raise NotImplementedError("Not supported")
+                raise NotImplementedError(
+                    f"Requantization into {config['requantization_method']} is not supported, from the original quant_method={config['quant_method']} and activation_scheme={config['activation_scheme']}. "
+                )
 
             return quark_config
 
