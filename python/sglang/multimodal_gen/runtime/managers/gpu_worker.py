@@ -162,6 +162,7 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):
@@ -186,7 +187,9 @@ class GPUWorker:
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                # Avoid logging warmup perf records that share the same request_id.
+                if not req.is_warmup:
+                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
