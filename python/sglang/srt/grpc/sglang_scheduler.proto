@@ -566,7 +566,3 @@ message AggregateMetrics {
   double avg_throughput = 5;
   double avg_utilization = 6;
 }
-
-// =====================
-// Encoder Messages (for EPD mode)
-// =====================
