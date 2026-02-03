@@ -254,7 +254,7 @@ class ConditionalCrossAttention(nn.Module):
             k_view = rearrange(k, "b l (h d) -> b l h d", d=self.head_dim)
             y_cos = y_cos[..., :half_dim].to(k_view.device)
             y_sin = y_sin[..., :half_dim].to(k_view.device)
-            k_view, _ = _apply_rotary_emb(k_view, y_cos, y_sin, is_neox_style=True)
+            k_view = _apply_rotary_emb(k_view, y_cos, y_sin, is_neox_style=True)
             k = rearrange(k_view, "b l h d -> b l (h d)")
 
         q = rearrange(q, "b l (h d) -> b l h d", h=self.num_heads_per_rank)
