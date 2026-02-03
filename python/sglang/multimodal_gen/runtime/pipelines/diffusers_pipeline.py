@@ -136,7 +136,7 @@ class DiffusersExecutionStage(PipelineStage):
 
             result = self._convert_to_tensor(data)
             if result is not None:
-                logger.info(
+                logger.debug(
                     "Extracted output from '%s': shape=%s, dtype=%s",
                     attr,
                     result.shape,
@@ -225,7 +225,7 @@ class DiffusersExecutionStage(PipelineStage):
         # Ensure correct shape for downstream processing
         output = self._fix_output_shape(output)
 
-        logger.info("Final output tensor shape: %s", output.shape)
+        logger.debug("Final output tensor shape: %s", output.shape)
         return output
 
     def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
@@ -585,7 +585,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
         video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
         self.is_video_pipeline = any(ind in pipe_class_name for ind in video_indicators)
-        logger.info(
+        logger.debug(
             "Detected pipeline type: %s",
             "video" if self.is_video_pipeline else "image",
         )
