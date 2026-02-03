@@ -14,10 +14,12 @@ from sglang.test.test_utils import (
 )
 
 
-class TestRTNQuantization(CustomTestCase):
+class _BaseRTNQuantizationTest(CustomTestCase):
+    MODEL = ""
+
     @classmethod
     def setUpClass(cls):
-        cls.model = "/models/Llama-3.1-8B-Instruct"
+        cls.model = cls.MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -105,6 +107,14 @@ class TestRTNQuantization(CustomTestCase):
         self.assertGreater(len(result["choices"]), 0)
         self.assertIn("message", result["choices"][0])
         self.assertIn("content", result["choices"][0]["message"])
+
+
+class TestRTNQuantizationLinear(_BaseRTNQuantizationTest):
+    MODEL = "meta-llama/Llama-3.1-8B-Instruct"
+
+
+class TestRTNQuantizationMoE(_BaseRTNQuantizationTest):
+    MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
 
 if __name__ == "__main__":
