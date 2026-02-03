@@ -1526,11 +1526,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         # Create mask for indices that belong to this DCP rank
         mask = (topk_indices % self.dcp_size == self.dcp_rank) & (topk_indices >= 0)
 
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
+            topk_indices //= self.dcp_size
+
         # Set invalid indices to -1 in-place
         topk_indices[~mask] = -1
-
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
-            topk_indices[mask] //= self.dcp_size
 
         return topk_indices
 
