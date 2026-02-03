@@ -4,12 +4,17 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+NVFP4_E2M1_MAX = 6.0
+NVFP4_FP8_E4M3_MAX = 448.0
 
 
 class Fp4GemmRunnerBackend(Enum):
@@ -84,3 +89,30 @@ def get_fp4_gemm_runner_backend() -> Fp4GemmRunnerBackend:
     if FP4_GEMM_RUNNER_BACKEND is None:
         FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend.AUTO
     return FP4_GEMM_RUNNER_BACKEND
+
+
+def nvfp4_online_scale_enabled() -> bool:
+    return envs.SGLANG_NVFP4_ONLINE_SCALE.get()
+
+
+def nvfp4_compute_input_scale_and_inv(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.numel() == 0:
+        input_scale = x.new_tensor(0.0, dtype=torch.float32)
+        input_scale_inv = x.new_tensor(0.0, dtype=torch.float32)
+        return input_scale, input_scale_inv
+
+    global_amax = x.abs().max().to(torch.float32)
+    global_encode_scale = torch.div(NVFP4_FP8_E4M3_MAX * NVFP4_E2M1_MAX, global_amax)
+    global_encode_scale = torch.clamp(
+        global_encode_scale, max=torch.finfo(torch.float32).max
+    )
+    global_encode_scale = torch.where(
+        global_encode_scale == 0.0, 1.0, global_encode_scale
+    )
+
+    global_decode_scale = torch.div(1.0, global_encode_scale)
+    input_scale = global_decode_scale
+    input_scale_inv = global_encode_scale
+    return input_scale, input_scale_inv

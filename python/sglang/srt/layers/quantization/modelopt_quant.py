@@ -31,7 +31,11 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+from sglang.srt.layers.quantization.fp4_utils import (
+    get_fp4_gemm_runner_backend,
+    nvfp4_compute_input_scale_and_inv,
+    nvfp4_online_scale_enabled,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
@@ -39,7 +43,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     is_layer_skipped,
@@ -201,6 +208,12 @@ class ModelOptQuantConfig(QuantizationConfig):
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return Moe(self)
         return None
 
@@ -1116,7 +1129,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_shape = [x_m, w_n]
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+        input_scale_inv = layer.input_scale_inv
+        alpha = layer.alpha
+        if nvfp4_online_scale_enabled():
+            input_scale, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+            alpha = input_scale * layer.weight_scale_2
+
+        x_fp4, x_scale_interleaved = fp4_quantize(x, input_scale_inv)
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight.dtype == torch.uint8
@@ -1133,7 +1152,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             w,
             x_scale_interleaved,
             w_scale_interleaved,
-            layer.alpha,
+            alpha,
             output_dtype,
             w_n,
         )
@@ -1316,15 +1335,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         # GEMM 1 scale processing
         if layer.moe_runner_config.is_gated:
-            if not torch.allclose(
-                layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]
-            ):
-                logger.warning_once(
-                    "w1_weight_scale_2 must match w3_weight_scale_2. "
-                    "Accuracy may be affected."
-                )
+            if layer.w13_weight_scale_2.dim() == 1:
+                # Some checkpoints store a shared scale for w1/w3.
+                w13_weight_scale_2 = layer.w13_weight_scale_2
+            else:
+                if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
+                    layer.w13_weight_scale_2[:, 0],
+                    layer.w13_weight_scale_2[:, 1],
+                ):
+                    logger.warning_once(
+                        "w1_weight_scale_2 must match w3_weight_scale_2. "
+                        "Accuracy may be affected."
+                    )
 
-            w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+                w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
         else:
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
@@ -1495,6 +1519,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 hidden_size=layer.w13_weight.shape[2] * 2,
             )  # k
 
+        # Preallocate online-scale buffers to avoid cuda graph capture allocations.
+        layer.nvfp4_online_w13_input_scale_quant = torch.empty_like(
+            layer.w13_input_scale_quant
+        )
+        layer.nvfp4_online_g1_alphas = torch.empty_like(layer.g1_alphas)
+
     @property
     def load_up_proj_weight_first(self) -> bool:
         # FlashInfer CUTLASS kernel assumes [Up, Gate] Proj as W13
@@ -1566,6 +1596,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            w13_input_scale_quant = layer.w13_input_scale_quant
+            g1_alphas = layer.g1_alphas
+            if nvfp4_online_scale_enabled():
+                input_scale_inv = getattr(
+                    layer.dispatcher, "last_input_scale_inv", None
+                )
+                if input_scale_inv is None:
+                    _, input_scale_inv = nvfp4_compute_input_scale_and_inv(x)
+                if hasattr(layer, "nvfp4_online_w13_input_scale_quant"):
+                    w13_input_scale_quant = layer.nvfp4_online_w13_input_scale_quant
+                    w13_input_scale_quant.copy_(
+                        input_scale_inv.expand_as(w13_input_scale_quant)
+                    )
+                else:
+                    w13_input_scale_quant = torch.full_like(
+                        layer.w13_input_scale_quant, input_scale_inv
+                    )
+                input_scale = torch.where(
+                    input_scale_inv > 0,
+                    1.0 / input_scale_inv,
+                    input_scale_inv,
+                )
+                if hasattr(layer, "nvfp4_online_g1_alphas"):
+                    g1_alphas = layer.nvfp4_online_g1_alphas
+                    g1_alphas.copy_(layer.g1_alphas)
+                    g1_alphas.mul_(layer.w13_input_scale_quant)
+                    g1_alphas.mul_(input_scale)
+                else:
+                    g1_alphas = input_scale * (
+                        layer.g1_alphas * layer.w13_input_scale_quant
+                    )
 
             output_dtype = torch.bfloat16
 
@@ -1598,9 +1659,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 input_sf=x_sf,
                 # swizzled_input_sf=not get_moe_a2a_backend().is_flashinfer(),
                 quant_scales=[
-                    layer.w13_input_scale_quant,
+                    w13_input_scale_quant,
                     layer.w13_blockscale_swizzled.view(torch.int32),
-                    layer.g1_alphas,
+                    g1_alphas,
                     layer.w2_input_scale_quant,
                     layer.w2_blockscale_swizzled.view(torch.int32),
                     layer.g2_alphas,
