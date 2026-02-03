@@ -173,12 +173,15 @@ class BaseFormatDetector(ABC):
                 # mistakenly identify that as the start of a new tool.
                 # We also skip the separator match when it is actually the start of
                 # an eot_token (e.g. separator="\n" and eot_token="\n</tool_call>").
-                eot_suffix = self.eot_token[len(self.tool_call_separator) :]
                 is_separator = (
                     self.current_tool_id > 0
                     and current_text.startswith(self.tool_call_separator)
-                    and not current_text[len(self.tool_call_separator) :].startswith(
-                        eot_suffix
+                    and not (
+                        self.eot_token
+                        and self.eot_token.startswith(self.tool_call_separator)
+                        and current_text[len(self.tool_call_separator) :].startswith(
+                            self.eot_token[len(self.tool_call_separator) :]
+                        )
                     )
                 )
                 if is_separator:
