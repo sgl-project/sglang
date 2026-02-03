@@ -171,7 +171,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
 
 
-def _alloc_extend_naive(
+def alloc_extend_naive(
     prefix_lens,
     seq_lens,
     last_loc,
