@@ -179,6 +179,8 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         context: app_context.clone(),
         concurrency_queue_tx: None,
         router_manager: None,
+        mesh_handler: None,
+        mesh_sync_manager: None,
     });
 
     let request_id_headers = vec!["x-request-id".to_string(), "x-correlation-id".to_string()];
@@ -742,7 +744,7 @@ async fn test_wasm_module_execution() {
 
     // Execute the module
     use smg::wasm::{
-        spec::sgl::model_gateway::middleware_types,
+        spec::smg::gateway::middleware_types,
         types::{WasmComponentInput, WasmComponentOutput},
     };
 

@@ -186,7 +186,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             )
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
-            # tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
+            tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
             tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
         else:
@@ -221,7 +221,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 )  # token-index  # token-index  # feature-index
                 loaded_x = tl.load(x_ptrs, mask_x, 0.0)
 
-                # tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
+                tl.debug_barrier()  # need this due to the bug in tl.where not enforcing this when data is the result of another tl.load
                 new_conv_state = tl.where(
                     mask, conv_state, loaded_x
                 )  # BUG in 'tl.where'  which requires a barrier before this
@@ -728,7 +728,7 @@ def _causal_conv1d_update_kernel(
         & (idx_feats < dim)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    # tl.debug_barrier()
+    tl.debug_barrier()
 
     new_conv_state = tl.where(mask, conv_state, loaded_x)
 
