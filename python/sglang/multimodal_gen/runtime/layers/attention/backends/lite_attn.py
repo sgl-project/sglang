@@ -86,7 +86,13 @@ def lite_attn_func_op(
     lite = _LITE_ATTN.get(int(handle))
     if lite is None:
         raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
-    return lite(q, k, v, scale=softmax_scale, return_softmax_lse=False)
+    return lite(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        scale=softmax_scale,
+        return_softmax_lse=False,
+    )
 
 
 @register_custom_op(fake_impl=lite_attn_fake_out_lse)
@@ -104,7 +110,13 @@ def lite_attn_func_op_lse(
     lite = _LITE_ATTN.get(int(handle))
     if lite is None:
         raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
-    return lite(q, k, v, scale=softmax_scale, return_softmax_lse=True)
+    return lite(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        scale=softmax_scale,
+        return_softmax_lse=True,
+    )
 
 
 def _get_lite_attn_params_from_server_args() -> dict[str, Any]:
