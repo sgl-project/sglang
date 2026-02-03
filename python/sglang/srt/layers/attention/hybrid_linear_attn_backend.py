@@ -808,6 +808,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._use_flashinfer_gdn_decode = False
         self._flashinfer_gdn_mtp = None
         self._use_flashinfer_gdn_mtp = False
+        prefill_backend, decode_backend = (
+            get_global_server_args().get_attention_backends()
+        )
+        enable_flashinfer_prefill = prefill_backend == "flashinfer"
+        enable_flashinfer_decode = decode_backend == "flashinfer"
+        enable_flashinfer_mtp = decode_backend == "flashinfer"
         if is_flashinfer_available() and torch.cuda.get_device_capability()[0] == 9:
             try:
                 from flashinfer.gdn_prefill import (
@@ -815,24 +821,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 self._flashinfer_gdn_prefill = flashinfer_chunk_gated_delta_rule
-                self._use_flashinfer_gdn_prefill = True
-                rank0_log("FlashInfer GDN prefill kernel enabled.")
+                self._use_flashinfer_gdn_prefill = enable_flashinfer_prefill
+                if enable_flashinfer_prefill:
+                    rank0_log("FlashInfer GDN prefill kernel enabled.")
 
                 from flashinfer.gdn_decode import (
                     gated_delta_rule_decode_pretranspose as flashinfer_gdn_decode,
                 )
 
                 self._flashinfer_gdn_decode = flashinfer_gdn_decode
-                self._use_flashinfer_gdn_decode = True
-                rank0_log("FlashInfer GDN decode kernel enabled.")
+                self._use_flashinfer_gdn_decode = enable_flashinfer_decode
+                if enable_flashinfer_decode:
+                    rank0_log("FlashInfer GDN decode kernel enabled.")
 
                 from flashinfer.gdn_decode import (
                     gated_delta_rule_mtp as flashinfer_gdn_mtp,
                 )
 
                 self._flashinfer_gdn_mtp = flashinfer_gdn_mtp
-                self._use_flashinfer_gdn_mtp = True
-                rank0_log("FlashInfer GDN MTP kernel enabled.")
+                self._use_flashinfer_gdn_mtp = enable_flashinfer_mtp
+                if enable_flashinfer_mtp:
+                    rank0_log("FlashInfer GDN MTP kernel enabled.")
             except Exception as exc:
                 rank0_log(
                     f"FlashInfer GDN kernels unavailable, "
@@ -1036,7 +1045,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self._use_flashinfer_gdn_mtp and retrieve_parent_token is None
             )
             if use_flashinfer:
-                # todo(yingyi): FlashInfer expects state in [N, H, V, K]; SGLang stores [N, H, K, V].
+                # FlashInfer expects state in [N, H, V, K].
                 draft_token_num = forward_batch.spec_info.draft_token_num
                 batch_size = seq_len // draft_token_num
                 q_for_kernel = query.view(
@@ -1106,7 +1115,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # FlashInfer expects alpha in probability space, not log space.
                 g_for_kernel = g.squeeze(0).to(torch.float32, copy=False).exp()
                 beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
-                # FlashInfer expects state in [N, H, V, K], SGLang stores state in [N, H, V, K] in flashinfer path
+                # FlashInfer expects state in [N, H, V, K].
                 initial_state = ssm_states[cache_indices]
                 output, output_state = self._flashinfer_gdn_prefill(
                     q=q_for_kernel,
