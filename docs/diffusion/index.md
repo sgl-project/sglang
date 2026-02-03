@@ -61,8 +61,8 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 ### Reference
 
 - **[Environment Variables](environment_variables.md)** - Configuration via environment variables
-- **[Contributing](contributing.md)** - Contribution guidelines and commit message conventions
 - **[Support New Models](support_new_models.md)** - Guide for adding new diffusion models
+- **[Contributing](contributing.md)** - Contribution guidelines and commit message conventions
 - **[CI Performance](ci_perf.md)** - Performance baseline generation script
 
 ### Diffusion Language Models
