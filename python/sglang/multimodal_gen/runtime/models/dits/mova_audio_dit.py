@@ -236,6 +236,7 @@ class WanAudioModel(CachableDiT, OffloadableDiTMixin):
             .reshape(f, -1)
             .to(x.device)
         )
+        freqs = torch.cat([freqs.real, freqs.imag], dim=-1).float()
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)
