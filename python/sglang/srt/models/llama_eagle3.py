@@ -37,7 +37,68 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+from sglang.srt.models.llama import (
+    LlamaDecoderLayer,
+    LlamaForCausalLM,
+    LlamaMLP,
+)
+
+
+class BasicDecoderLayer(LlamaDecoderLayer):
+    """
+    The traditional decoder layer.
+    """
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config, layer_id, quant_config, prefix)
+        self.hidden_size = config.hidden_size
+
+        if config.model_type == "llama4_text":
+            inter_size = config.intermediate_size_mlp
+        else:
+            inter_size = config.intermediate_size
+        self.mlp = LlamaMLP(
+            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+        )
+
+        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = None  # not needed for decoder
+        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Basic decoder layer forward pass with self-attention and mlp.
+        """
+        residual = hidden_states
+        hidden_states = self.hidden_norm(hidden_states)
+
+        # Self Attention
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # Fully Connected
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -109,6 +170,7 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.num_hidden_layers = config.num_hidden_layers
 
         self.is_mrope_enabled = (
             hasattr(config, "rope_scaling")
@@ -137,17 +199,24 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(
-                    config,
-                    i,
-                    quant_config=quant_config,
-                    prefix=add_prefix(f"midlayers.{i}", prefix),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
+        self.midlayer = LlamaDecoderLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            prefix=add_prefix(f"midlayers.0", prefix),
         )
+        if self.num_hidden_layers > 1:
+            self.additional_layers = nn.ModuleList(
+                [
+                    BasicDecoderLayer(
+                        config,
+                        i,
+                        quant_config=quant_config,
+                        prefix=add_prefix(f"midlayers.{i}", prefix),
+                    )
+                    for i in range(1, config.num_hidden_layers)
+                ]
+            )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -176,14 +245,22 @@ class LlamaModel(nn.Module):
             return hidden_states, [hidden_states]
 
         residual = None
-        for layer in self.midlayers:
-            hidden_states, residual = layer(
-              positions,
-              embeds,
-              hidden_states,
-              forward_batch,
-              residual,
-            )
+        hidden_states, residual = self.midlayer(
+            positions,
+            embeds,
+            hidden_states,
+            forward_batch,
+            residual,
+        )
+
+        if self.num_hidden_layers > 1:
+            for layer in self.additional_layers:
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
