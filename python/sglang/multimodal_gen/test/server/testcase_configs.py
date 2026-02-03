@@ -433,6 +433,12 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     ),
 ]
 
+# Hunyuan3D shape generation sampling params
+HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
+    prompt="",  # Not used for I2M
+    image_path=Path(__file__).parent.parent / "test_files" / "hunyuan3d_demo.png",
+)
+
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -543,6 +549,17 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             custom_validator="video",
         ),
         TI2V_sampling_params,
+    ),
+    # === Image to Mesh (I2M) ===
+    DiffusionTestCase(
+        "hunyuan3d_shape_gen",
+        DiffusionServerArgs(
+            model_path="tencent/Hunyuan3D-2",
+            modality="3d",
+            warmup=0,
+            custom_validator="mesh",
+        ),
+        HUNYUAN3D_SHAPE_sampling_params,
     ),
 ]
 

@@ -711,10 +711,174 @@ class VideoPerformanceValidator(PerformanceValidator):
             )
 
 
+class MeshValidator:
+    """Validator for 3D mesh generation with tolerance-based geometric comparison."""
+
+    # Reference mesh file path
+    REFERENCE_MESH_PATH = (
+        Path(__file__).parent.parent / "test_files" / "hunyuan3d_reference.obj"
+    )
+
+    # Tolerance thresholds for mesh comparison (relaxed for generation variance)
+    VERTEX_COUNT_TOLERANCE = 0.001  # 10% tolerance
+    FACE_COUNT_TOLERANCE = 0.001  # 10% tolerance
+    BBOX_TOLERANCE = 0.005  # 5% tolerance for bounding box dimensions
+
+    def __init__(self, **kwargs):
+        """Initialize mesh validator. Accepts kwargs for compatibility with validator registry."""
+        pass
+
+    def validate(self, mesh_path: str) -> dict:
+        """
+        Validate generated mesh against reference mesh.
+
+        Args:
+            mesh_path: Path to the generated mesh file
+
+        Returns:
+            Dictionary with validation results
+        """
+        try:
+            import trimesh
+        except ImportError:
+            logger.error(
+                "trimesh is required for mesh validation. Install with: pip install trimesh"
+            )
+            return {"all_passed": False, "error": "trimesh not installed"}
+
+        results = {
+            "all_passed": True,
+            "checks": {},
+        }
+
+        # Load generated mesh
+        try:
+            generated_mesh = trimesh.load(mesh_path)
+            if isinstance(generated_mesh, trimesh.Scene):
+                generated_mesh = generated_mesh.dump(concatenate=True)
+        except Exception as e:
+            logger.error(f"Failed to load generated mesh: {e}")
+            results["all_passed"] = False
+            results["error"] = f"Failed to load generated mesh: {e}"
+            return results
+
+        # Load reference mesh
+        if not self.REFERENCE_MESH_PATH.exists():
+            logger.error(f"Reference mesh not found at {self.REFERENCE_MESH_PATH}")
+            results["all_passed"] = False
+            results["error"] = f"Reference mesh not found at {self.REFERENCE_MESH_PATH}"
+            return results
+
+        try:
+            reference_mesh = trimesh.load(str(self.REFERENCE_MESH_PATH))
+            if isinstance(reference_mesh, trimesh.Scene):
+                reference_mesh = reference_mesh.dump(concatenate=True)
+        except Exception as e:
+            logger.error(f"Failed to load reference mesh: {e}")
+            results["all_passed"] = False
+            results["error"] = f"Failed to load reference mesh: {e}"
+            return results
+
+        # Check 1: Vertex count comparison
+        gen_vertex_count = len(generated_mesh.vertices)
+        ref_vertex_count = len(reference_mesh.vertices)
+        vertex_diff_ratio = abs(gen_vertex_count - ref_vertex_count) / max(
+            ref_vertex_count, 1
+        )
+        vertex_passed = vertex_diff_ratio <= self.VERTEX_COUNT_TOLERANCE
+        results["checks"]["vertex_count"] = {
+            "generated": gen_vertex_count,
+            "reference": ref_vertex_count,
+            "diff_ratio": vertex_diff_ratio,
+            "tolerance": self.VERTEX_COUNT_TOLERANCE,
+            "passed": vertex_passed,
+        }
+        if not vertex_passed:
+            results["all_passed"] = False
+            logger.warning(
+                f"Vertex count check failed: generated={gen_vertex_count}, "
+                f"reference={ref_vertex_count}, diff_ratio={vertex_diff_ratio:.4f}"
+            )
+
+        # Check 2: Face count comparison
+        gen_face_count = len(generated_mesh.faces)
+        ref_face_count = len(reference_mesh.faces)
+        face_diff_ratio = abs(gen_face_count - ref_face_count) / max(ref_face_count, 1)
+        face_passed = face_diff_ratio <= self.FACE_COUNT_TOLERANCE
+        results["checks"]["face_count"] = {
+            "generated": gen_face_count,
+            "reference": ref_face_count,
+            "diff_ratio": face_diff_ratio,
+            "tolerance": self.FACE_COUNT_TOLERANCE,
+            "passed": face_passed,
+        }
+        if not face_passed:
+            results["all_passed"] = False
+            logger.warning(
+                f"Face count check failed: generated={gen_face_count}, "
+                f"reference={ref_face_count}, diff_ratio={face_diff_ratio:.4f}"
+            )
+
+        # Check 3: Bounding box comparison
+        gen_bbox = generated_mesh.bounding_box.bounds
+        ref_bbox = reference_mesh.bounding_box.bounds
+        gen_bbox_size = gen_bbox[1] - gen_bbox[0]  # max - min
+        ref_bbox_size = ref_bbox[1] - ref_bbox[0]
+
+        bbox_passed = True
+        bbox_details = {}
+        for i, axis in enumerate(["x", "y", "z"]):
+            diff_ratio = abs(gen_bbox_size[i] - ref_bbox_size[i]) / max(
+                ref_bbox_size[i], 1e-6
+            )
+            axis_passed = diff_ratio <= self.BBOX_TOLERANCE
+            bbox_details[axis] = {
+                "generated": float(gen_bbox_size[i]),
+                "reference": float(ref_bbox_size[i]),
+                "diff_ratio": float(diff_ratio),
+                "passed": axis_passed,
+            }
+            if not axis_passed:
+                bbox_passed = False
+
+        results["checks"]["bounding_box"] = {
+            "tolerance": self.BBOX_TOLERANCE,
+            "passed": bbox_passed,
+            "axes": bbox_details,
+        }
+        if not bbox_passed:
+            results["all_passed"] = False
+            logger.warning(f"Bounding box check failed: {bbox_details}")
+
+        # Print comparison summary (use print to ensure visibility)
+        print("=" * 60)
+        print("[MeshValidator] Comparison Results:")
+        print(
+            f"  Vertex Count: generated={gen_vertex_count}, reference={ref_vertex_count}, diff={vertex_diff_ratio:.4f} (tolerance={self.VERTEX_COUNT_TOLERANCE})"
+        )
+        print(
+            f"  Face Count:   generated={gen_face_count}, reference={ref_face_count}, diff={face_diff_ratio:.4f} (tolerance={self.FACE_COUNT_TOLERANCE})"
+        )
+        print(
+            f"  BBox X:       generated={gen_bbox_size[0]:.4f}, reference={ref_bbox_size[0]:.4f}, diff={bbox_details['x']['diff_ratio']:.4f} (tolerance={self.BBOX_TOLERANCE})"
+        )
+        print(
+            f"  BBox Y:       generated={gen_bbox_size[1]:.4f}, reference={ref_bbox_size[1]:.4f}, diff={bbox_details['y']['diff_ratio']:.4f} (tolerance={self.BBOX_TOLERANCE})"
+        )
+        print(
+            f"  BBox Z:       generated={gen_bbox_size[2]:.4f}, reference={ref_bbox_size[2]:.4f}, diff={bbox_details['z']['diff_ratio']:.4f} (tolerance={self.BBOX_TOLERANCE})"
+        )
+        print(f"  All Passed:   {results['all_passed']}")
+        print("=" * 60)
+
+        return results
+
+
 # Registry of validators by name
 VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
+    "mesh": MeshValidator,
 }
 
 
@@ -1146,7 +1310,97 @@ def get_generate_fn(
                 },
             )
 
-    if modality == "video":
+    def generate_mesh(case_id, client) -> str:
+        """I2M: Image to Mesh generation using HTTP API (same pattern as image_edit)."""
+        import requests as http_requests
+
+        if not sampling_params.image_path:
+            pytest.skip(f"{case_id}: no input image configured for mesh generation")
+
+        image_path = sampling_params.image_path
+        if isinstance(image_path, Path):
+            image_path = str(image_path)
+
+        if not Path(image_path).exists():
+            pytest.skip(f"{case_id}: image file missing: {image_path}")
+
+        # Get server base URL from client
+        base_url = str(client.base_url).rstrip("/")
+        # Remove /v1 suffix if present to get the root URL
+        if base_url.endswith("/v1"):
+            base_url = base_url[:-3]
+
+        # Use /v1/images/edits endpoint (same as image_edit)
+        # Server routes based on model's data_type (MESH for Hunyuan3D)
+        url = f"{base_url}/v1/images/edits"
+
+        # Prepare multipart form data with identical parameters as reference script
+        # Reference: seed=42, guidance_scale=5.0, num_inference_steps=50
+        with open(image_path, "rb") as img_file:
+            files = {"image": (Path(image_path).name, img_file, "image/png")}
+            data = {
+                "prompt": "generate 3d mesh",  # Required field, content not used for I2M
+                "model": model_path,
+                "seed": "42",
+                "guidance_scale": "5.0",
+                "num_inference_steps": "50",
+                "response_format": "url",  # Get file path in response
+            }
+
+            logger.info(f"[Mesh Gen] Sending request to {url}")
+
+            try:
+                response = http_requests.post(
+                    url,
+                    files=files,
+                    data=data,
+                    timeout=600,  # 10 minute timeout for mesh generation
+                )
+            except http_requests.exceptions.Timeout:
+                pytest.fail(f"{case_id}: mesh generation timed out after 600s")
+            except Exception as e:
+                pytest.fail(f"{case_id}: mesh generation request failed: {e}")
+
+        if response.status_code != 200:
+            logger.error(
+                f"[Mesh Gen] Request failed with status {response.status_code}"
+            )
+            logger.error(f"[Mesh Gen] Response: {response.text}")
+            pytest.fail(f"{case_id}: mesh generation failed: {response.text}")
+
+        result = response.json()
+
+        # Extract mesh file path from response
+        # For mesh, the output is returned as file_path in the response data
+        mesh_path = None
+        if "data" in result and len(result["data"]) > 0:
+            data_item = result["data"][0]
+            # Try different possible keys for the mesh path
+            mesh_path = (
+                data_item.get("file_path")
+                or data_item.get("url")
+                or data_item.get("revised_prompt")
+            )
+
+        if not mesh_path or not Path(mesh_path).exists():
+            # Fallback: check if output is directly in result
+            mesh_path = result.get("output")
+            if isinstance(mesh_path, list) and len(mesh_path) > 0:
+                mesh_path = mesh_path[0]
+
+        if not mesh_path:
+            pytest.fail(f"{case_id}: no mesh path in response: {result}")
+
+        if not Path(mesh_path).exists():
+            pytest.fail(f"{case_id}: mesh file not found at {mesh_path}")
+
+        logger.info(f"[Mesh Gen] Mesh generated successfully at {mesh_path}")
+
+        return str(mesh_path)
+
+    if modality == "3d":
+        fn = generate_mesh
+    elif modality == "video":
         if sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):
                 fn = generate_text_url_image_to_video
