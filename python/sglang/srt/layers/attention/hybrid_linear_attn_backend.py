@@ -819,7 +819,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 rank0_log("FlashInfer GDN prefill kernel enabled.")
 
                 from flashinfer.gdn_decode import (
-                    gated_delta_rule_decode as flashinfer_gdn_decode,
+                    gated_delta_rule_decode_pretranspose as flashinfer_gdn_decode,
                 )
 
                 self._flashinfer_gdn_decode = flashinfer_gdn_decode
@@ -1111,7 +1111,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g_for_kernel = g.squeeze(0).to(torch.float32, copy=False).exp()
                 beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
                 # FlashInfer expects state in [N, H, V, K], SGLang stores state in [N, H, K, V]
-                initial_state = ssm_states[cache_indices].transpose(-1, -2).contiguous()
+                initial_state = ssm_states[cache_indices]
                 output, output_state = self._flashinfer_gdn_prefill(
                     q=q_for_kernel,
                     k=k_for_kernel,
@@ -1124,7 +1124,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     use_qk_l2norm_in_kernel=False,
                 )
                 # FlashInfer expects state in [N, H, V, K], SGLang stores state in [N, H, K, V].
-                output_state = output_state.transpose(-1, -2).contiguous()
                 ssm_states[cache_indices] = output_state.to(
                     ssm_states.dtype, copy=False
                 )
