@@ -395,6 +395,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    enable_reasoning_tokens: bool = False
     reasoning_parser: Optional[str] = None
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
@@ -3328,6 +3329,11 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--enable-reasoning-tokens",
+            action="store_true",
+            help="Enable calculation and reporting of reasoning tokens in usage.completion_tokens_details for each openai request.",
         )
         parser.add_argument(
             "--reasoning-parser",
