@@ -261,6 +261,9 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = temp_param.data
             else:
                 sharded_tensor = full_tensor
+
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             sharded_tensor = distribute_tensor(
@@ -296,6 +299,8 @@ def load_model_from_full_model_state_dict(
             sharded_tensor = torch.zeros_like(
                 meta_sharded_param, device=device, dtype=param_dtype
             )
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
         else:
             # Initialize with zeros and distribute
             full_tensor = torch.zeros_like(
