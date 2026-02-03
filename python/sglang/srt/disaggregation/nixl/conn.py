@@ -776,10 +776,19 @@ class NixlKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        estimated_num_pages: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.started_transfer = False
         self.conclude_state = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
+        super().__init__(
+            mgr,
+            bootstrap_addr,
+            bootstrap_room,
+            prefill_dp_rank,
+            estimated_num_pages,
+            request_id,
+        )
 
         # Track this room with its bootstrap address for heartbeat monitoring
         if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
