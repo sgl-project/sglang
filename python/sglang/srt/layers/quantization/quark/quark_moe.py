@@ -13,7 +13,10 @@ from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
 )
-from sglang.srt.layers.quantization.dequantization import dequantize_fp8
+from sglang.srt.layers.quantization.dequantization import (
+    copy_missing_attrs,
+    dequantize_fp8,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
@@ -24,7 +27,7 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
-from sglang.srt.layers.quantization.dequantization import dequantize_fp8
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
@@ -59,16 +62,6 @@ OCP_MX_BLOCK_SIZE = 32
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuarkConfig
-
-
-def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
-    """Copies any attrs present in `old` but not in `new` to `new`"""
-    new_attrs = set(dir(new))
-    attrs_to_set = {}
-    for attr in dir(old):
-        if attr not in new_attrs:
-            attrs_to_set[attr] = getattr(old, attr)
-    set_weight_attrs(new, attrs_to_set)
 
 
 class QuarkMoEMethod(FusedMoEMethodBase):
@@ -134,7 +127,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         if not self.is_checkpoint_mxfp4_serialized:
             logger.info_once(
-                "Using online MXFP4 quantization for MoE layers from a higher precision checkpoint. "
+                "Using online MXFP4 quantization in MoE layers from a higher precision checkpoint. "
                 "Beware that this optimization may degrade prediction quality - please validate your model accuracy. "
                 "More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
             )
@@ -380,8 +373,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             shard_id: str,
             expert_id: int,
         ):
-            print("weight_name", weight_name)
-            print("layer._fp8_loaded_numel", layer._fp8_loaded_numel)
             # Determine which parameter we're loading
             is_w13_weight = "w13_weight" in weight_name and "scale" not in weight_name
             is_w2_weight = "w2_weight" in weight_name and "scale" not in weight_name
@@ -397,15 +388,17 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                     torch.empty_like(layer.w13_weight.data, device=layer._load_device),
                     requires_grad=False,
                 )
-                _copy_missing_attrs(layer.w13_weight, materialized)
+                copy_missing_attrs(layer.w13_weight, materialized)
                 layer.w13_weight = materialized
 
                 # w13_weight_scale_inv
                 materialized = torch.nn.Parameter(
-                    torch.empty_like(layer.w13_weight_scale_inv.data, device=layer._load_device),
+                    torch.empty_like(
+                        layer.w13_weight_scale_inv.data, device=layer._load_device
+                    ),
                     requires_grad=False,
                 )
-                _copy_missing_attrs(layer.w13_weight_scale_inv, materialized)
+                copy_missing_attrs(layer.w13_weight_scale_inv, materialized)
                 layer.w13_weight_scale_inv = materialized
 
                 # w2_weight
@@ -414,16 +407,18 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                     torch.empty_like(layer.w2_weight.data, device=layer._load_device),
                     requires_grad=False,
                 )
-                _copy_missing_attrs(layer.w2_weight, materialized)
+                copy_missing_attrs(layer.w2_weight, materialized)
                 layer.w2_weight = materialized
 
                 # w2_weight_scale_inv
                 assert layer.w2_weight_scale_inv.device.type == "meta"
                 materialized = torch.nn.Parameter(
-                    torch.empty_like(layer.w2_weight_scale_inv.data, device=layer._load_device),
+                    torch.empty_like(
+                        layer.w2_weight_scale_inv.data, device=layer._load_device
+                    ),
                     requires_grad=False,
                 )
-                _copy_missing_attrs(layer.w2_weight_scale_inv, materialized)
+                copy_missing_attrs(layer.w2_weight_scale_inv, materialized)
                 layer.w2_weight_scale_inv = materialized
 
             if is_w13_weight:
@@ -454,8 +449,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 + layer.w13_weight_scale_inv.numel()
                 + layer.w2_weight_scale_inv.numel()
             )
-            print("layer._fp8_loaded_numel", layer._fp8_loaded_numel)
-            print("total_target_numel", total_target_numel)
 
             # Perform dequantization and requantization when all data is loaded
             if layer._fp8_loaded_numel == total_target_numel:
@@ -463,7 +456,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                     raise NotImplementedError(
                         "MXFP4 quantization for MoE is only supported on AMD GPUs."
                     )
-            
+
                 assert layer.w13_weight.device.type == "cuda"
                 assert layer.w13_weight_scale_inv.device.type == "cuda"
 
@@ -474,25 +467,16 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                     block_size=self.weight_block_size,
                 )
 
-                qw13_weight = torch.empty(
-                    w13_bf16.shape[0],
-                    w13_bf16.shape[1],
-                    w13_bf16.shape[2] // 2,
-                    dtype=torch.uint8,
-                    device=layer._load_device,
-                )
-                w13_weight_scale = torch.empty(
-                    w13_bf16.shape[0],
-                    w13_bf16.shape[1],
-                    w13_bf16.shape[2] // OCP_MX_BLOCK_SIZE,
-                    dtype=torch.uint8,
-                    device=layer._load_device,
-                )
+                qw13_weight_list = []
+                w13_weight_scale_list = []
+                for expert_idx in range(w13_bf16.shape[0]):
+                    # NOTE: dynamic_mxfp4_quant does not accept 3D inputs.
+                    qweight, weight_scale = dynamic_mxfp4_quant(w13_bf16[expert_idx])
+                    qw13_weight_list.append(qweight)
+                    w13_weight_scale_list.append(weight_scale)
 
-                for expert in range(w13_bf16.shape[0]):
-                    qweight, weight_scale = dynamic_mxfp4_quant(w13_bf16[expert])
-                    qw13_weight[expert] = qweight
-                    w13_weight_scale[expert] = weight_scale
+                qw13_weight = torch.stack(qw13_weight_list)
+                w13_weight_scale = torch.stack(w13_weight_scale_list)
 
                 # Dequantize and requantize w2
                 w2_bf16 = dequantize_fp8(
@@ -501,25 +485,16 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                     block_size=self.weight_block_size,
                 )
 
-                qw2_weight = torch.empty(
-                    w2_bf16.shape[0],
-                    w2_bf16.shape[1],
-                    w2_bf16.shape[2] // 2,
-                    dtype=torch.uint8,
-                    device=layer._load_device,
-                )
-                w2_weight_scale = torch.empty(
-                    w2_bf16.shape[0],
-                    w2_bf16.shape[1],
-                    w2_bf16.shape[2] // OCP_MX_BLOCK_SIZE,
-                    dtype=torch.uint8,
-                    device=layer._load_device,
-                )
+                qw2_weight_list = []
+                w2_weight_scale_list = []
+                for expert_idx in range(w2_bf16.shape[0]):
+                    # NOTE: dynamic_mxfp4_quant does not accept 3D inputs.
+                    qweight, weight_scale = dynamic_mxfp4_quant(w2_bf16[expert_idx])
+                    qw2_weight_list.append(qweight)
+                    w2_weight_scale_list.append(weight_scale)
 
-                for expert in range(w2_bf16.shape[0]):
-                    qweight, weight_scale = dynamic_mxfp4_quant(w2_bf16[expert])
-                    qw2_weight[expert] = qweight
-                    w2_weight_scale[expert] = weight_scale
+                qw2_weight = torch.stack(qw2_weight_list)
+                w2_weight_scale = torch.stack(w2_weight_scale_list)
 
                 # Replace FP8 parameters with MXFP4 parameters
                 layer.w13_weight = torch.nn.Parameter(qw13_weight, requires_grad=False)
@@ -577,7 +552,10 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not self.is_checkpoint_mxfp4_serialized or self.dequantization_config is not None:
+        if (
+            not self.is_checkpoint_mxfp4_serialized
+            or self.dequantization_config is not None
+        ):
             # Quantization already happened during weight loading.
             # This covers both:
             # - Online quantization from BF16/FP16 -> MXFP4

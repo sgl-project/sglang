@@ -7,11 +7,14 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization import QuantizationConfig
-from sglang.srt.layers.quantization.dequantization import dequantize_fp8
+from sglang.srt.layers.quantization.dequantization import (
+    copy_missing_attrs,
+    dequantize_fp8,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import is_hip, set_weight_attrs
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 if _is_hip:
@@ -24,16 +27,6 @@ __all__ = ["QuarkW4A4MXFP4"]
 logger = logging.getLogger(__name__)
 
 OCP_MX_BLOCK_SIZE = 32
-
-
-def _copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
-    """Copies any attrs present in `old` but not in `new` to `new`"""
-    new_attrs = set(dir(new))
-    attrs_to_set = {}
-    for attr in dir(old):
-        if attr not in new_attrs:
-            attrs_to_set[attr] = getattr(old, attr)
-    set_weight_attrs(new, attrs_to_set)
 
 
 class QuarkW4A4MXFP4(QuarkScheme):
@@ -54,7 +47,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
         if not self.is_checkpoint_mxfp4_serialized:
             logger.info_once(
-                "Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
+                "Using online MXFP4 quantization in dense linear layers from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
             )
 
     @classmethod
@@ -237,7 +230,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
                         output_dim=0,
                         weight_loader=param._weight_loader,
                     )
-                    _copy_missing_attrs(param, materialized_weight)
+                    copy_missing_attrs(param, materialized_weight)
                     layer.weight = materialized_weight
                 param = layer.weight
 
@@ -251,7 +244,7 @@ class QuarkW4A4MXFP4(QuarkScheme):
                         output_dim=0,
                         weight_loader=param._weight_loader,
                     )
-                    _copy_missing_attrs(param, materialized_scale)
+                    copy_missing_attrs(param, materialized_scale)
                     layer.weight_scale_inv = materialized_scale
                 param = layer.weight_scale_inv
 

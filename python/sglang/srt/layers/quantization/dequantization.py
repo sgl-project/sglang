@@ -8,6 +8,17 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
+from sglang.srt.utils import set_weight_attrs
+
+
+def copy_missing_attrs(old: torch.Tensor, new: torch.Tensor) -> None:
+    """Copies any attrs present in `old` but not in `new` to `new`"""
+    new_attrs = set(dir(new))
+    attrs_to_set = {}
+    for attr in dir(old):
+        if attr not in new_attrs:
+            attrs_to_set[attr] = getattr(old, attr)
+    set_weight_attrs(new, attrs_to_set)
 
 
 def dequantize_fp8(

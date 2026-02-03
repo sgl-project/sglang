@@ -1037,7 +1037,6 @@ class Qwen3MoeForCausalLM(nn.Module):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
         for name, loaded_weight in weights:
-            print("----- loading", name)
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None

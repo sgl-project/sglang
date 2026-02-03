@@ -775,7 +775,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         tp_size = get_tensor_model_parallel_world_size()
 
         if block_quant:
-            block_n, block_k = quant_config.weight_block_size[0], quant_config.weight_block_size[1]
+            block_n, block_k = (
+                quant_config.weight_block_size[0],
+                quant_config.weight_block_size[1],
+            )
 
             # Validate block quantization shapes
             if intermediate_size_per_partition % block_n != 0:

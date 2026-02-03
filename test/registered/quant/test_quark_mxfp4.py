@@ -142,9 +142,9 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
     tp = 1
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: TODO (TP=1)
-        self._test_peak_memory(threshold=22)  # TP=1
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: 29.103 GiB (TP=1)
+        self._test_peak_memory(threshold=21)  # TP=1
 
     def test_gsm8k(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: TODO
-        self._test_gsm8k(accuracy_threshold=0.9)
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
+        self._test_gsm8k(accuracy_threshold=0.92)
