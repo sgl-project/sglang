@@ -633,7 +633,7 @@ class WanDistResample(nn.Module):
                 WanUpsample(scale_factor=(2.0, 2.0), mode="nearest-exact"),
                 WanDistConv2d(dim, upsample_out_dim, 3, padding=1),
             )
-            self.time_conv = WanCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
+            self.time_conv = WanDistCausalConv3d(dim, dim * 2, (3, 1, 1), padding=(1, 0, 0))
 
         elif mode == "downsample2d":
             self.resample = nn.Sequential(
