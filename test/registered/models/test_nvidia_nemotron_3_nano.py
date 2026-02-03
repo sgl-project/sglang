@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
+from sglang.test.kits.lm_eval_kit import LMEvalMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(est_time=180, suite="stage-b-test-large-2-gpu")
@@ -15,22 +15,22 @@ NEMOTRON_3_NANO_THINKING_ARGS = [
 ]
 
 
-class TestNvidiaNemotron3Nano30BBF16(GSM8KMixin, DefaultServerBase):
-    """Test Nemotron-3-Nano-30B BF16 model with GSM8K accuracy evaluation."""
+class TestNvidiaNemotron3Nano30BBF16(LMEvalMixin, DefaultServerBase):
+    """Test Nemotron-3-Nano-30B BF16 model with lm-eval GSM8K evaluation."""
 
     model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-    gsm8k_accuracy_thres = 0.45
+    model_config_name = "lm_eval_configs/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.yaml"
     other_args = [
         "--tp-size",
         "2",
     ] + NEMOTRON_3_NANO_THINKING_ARGS
 
 
-class TestNvidiaNemotron3Nano30BFP8(GSM8KMixin, DefaultServerBase):
-    """Test Nemotron-3-Nano-30B FP8 model with GSM8K accuracy evaluation."""
+class TestNvidiaNemotron3Nano30BFP8(LMEvalMixin, DefaultServerBase):
+    """Test Nemotron-3-Nano-30B FP8 model with lm-eval GSM8K evaluation."""
 
     model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
-    gsm8k_accuracy_thres = 0.30
+    model_config_name = "lm_eval_configs/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8.yaml"
     other_args = [
         "--tp-size",
         "2",
