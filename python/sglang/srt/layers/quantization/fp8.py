@@ -267,6 +267,9 @@ class Fp8LinearMethod(LinearMethodBase):
         input_size: int,
         output_size: int,
     ):
+        """
+        Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
+        """
         # Copy the layer attributes
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
@@ -748,24 +751,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         extra_weight_attrs: dict,
     ):
         """
-        Create FP8 MoE weight parameters.
-
-        This static method creates w13_weight, w2_weight and their corresponding scales
-        for FP8 quantized MoE layers. It can be reused for both:
-        - Direct FP8 checkpoint loading
-        - FP8 checkpoint loading with requantization to other formats (e.g., MXFP4)
-
-        Args:
-            layer: The MoE layer module
-            num_experts: Number of experts in the MoE layer
-            hidden_size: Hidden dimension size
-            intermediate_size_per_partition: Intermediate size per TP partition
-            block_quant: Whether to use block-wise quantization
-            quant_config: Quantization configuration
-            use_mxfp8: Whether to use MXFP8 format
-            is_checkpoint_fp8_serialized: Whether checkpoint is FP8 serialized
-            params_dtype: Parameter dtype
-            extra_weight_attrs: Extra weight attributes for weight loading
+        Registers weights into `layer`. This static method can be reused by other quantization methods that require loading FP8 checkpoints first (e.g. requantization to other formats as MXFP4).
         """
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 

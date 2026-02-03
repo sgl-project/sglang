@@ -91,8 +91,12 @@ class QuarkW4A4MXFP4(QuarkScheme):
                     "use_mxfp8=True is not supported in Quark MXFP4 requantization."
                 )
 
-            # Determine if block quantization is used
             block_quant = self.weight_block_size is not None
+
+            if not block_quant:
+                raise NotImplementedError(
+                    "Only block_quant=True is supported in Quark MXFP4 requantization, got block_quant=False."
+                )
 
             layer._fp8_weight_loaded_numel = 0
             layer._fp8_scale_loaded_numel = 0
@@ -103,8 +107,8 @@ class QuarkW4A4MXFP4(QuarkScheme):
                 layer, weight_loader
             )
 
-            # Create FP8 weight parameters on meta device to avoid memory overhead
-            # They will be materialized on first load in the weight loader
+            # Create FP8 MoE weight parameters on meta device to avoid device memory overhead during weight loading, as the resulting model uses MXFP4 using less device memory.
+            # The weight loader handles progressive FP8 weight materialization on device.
             with torch.device("meta"):
                 Fp8LinearMethod.create_fp8_weight_(
                     layer=layer,

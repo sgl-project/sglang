@@ -17,6 +17,7 @@ from sglang.srt.layers.quantization.dequantization import (
     copy_missing_attrs,
     dequantize_fp8,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
@@ -148,37 +149,36 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
         # Handle FP8 to MXFP4 requantization
         if self.dequantization_config is not None:
-            from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
-
             if not isinstance(self.dequantization_config, Fp8Config):
                 raise NotImplementedError(
                     f"Requantization in QuarkW4A4MXFp4MoEMethod from {self.dequantization_config.__class__.__name__} is not supported, only Fp8Config is supported."
                 )
-
-            # Extract necessary parameters from dequantization_config
-            self.weight_block_size = self.dequantization_config.weight_block_size
 
             if self.dequantization_config.use_mxfp8:
                 raise NotImplementedError(
                     "use_mxfp8=True is not supported in Quark MXFP4 requantization."
                 )
 
-            # Determine if block quantization is used
-            block_quant = self.weight_block_size is not None
+            block_quant = self.dequantization_config.weight_block_size is not None
 
-            # Initialize tracking attributes for FP8->MXFP4 conversion
+            if not block_quant:
+                raise NotImplementedError(
+                    "Only block_quant=True is supported in Quark MXFP4 requantization, got block_quant=False."
+                )
+
+            # `_fp8_loaded_numel` is used to trigger weight materialization on cuda device from meta and to trigger FP8 -> MXFP4 requantization once all weights are loaded.
             layer._fp8_loaded_numel = 0
             layer._load_device = torch.get_default_device()
 
-            # Wrap the weight loader to handle FP8->MXFP4 conversion
+            # Custom weight loader handling FP8->MXFP4 conversion.
             fp8_to_mxfp4_weight_loader = self.get_online_fp8_to_mxfp4_weight_loader(
                 layer, original_weight_loader
             )
 
             extra_weight_attrs["weight_loader"] = fp8_to_mxfp4_weight_loader
 
-            # Create FP8 MoE weight parameters on meta device to avoid memory overhead
-            # They will be materialized on first load in the weight loader
+            # Create FP8 MoE weight parameters on meta device to avoid device memory overhead during weight loading, as the resulting model uses MXFP4 using less device memory.
+            # The weight loader handles progressive FP8 weight materialization on device.
             with torch.device("meta"):
                 Fp8MoEMethod.create_fp8_moe_weight_(
                     layer=layer,
@@ -373,7 +373,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             shard_id: str,
             expert_id: int,
         ):
-            # Determine which parameter we're loading
             is_w13_weight = "w13_weight" in weight_name and "scale" not in weight_name
             is_w2_weight = "w2_weight" in weight_name and "scale" not in weight_name
             is_w13_scale = "w13_weight_scale_inv" in weight_name
@@ -430,10 +429,9 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
             elif is_w2_scale:
                 param = layer.w2_weight_scale_inv
 
-            # Move to device
             loaded_weight = loaded_weight.to(layer._load_device)
 
-            # Track how much data we're loading
+            # Track how much data we are actually loading (`narrow` used in weight loader)
             copy_numel_counter = CopyNumelCounter()
             with copy_numel_counter:
                 original_weight_loader(
@@ -442,7 +440,6 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
 
             layer._fp8_loaded_numel += copy_numel_counter.copied_numel
 
-            # Calculate total target numel (all weights and scales)
             total_target_numel = (
                 layer.w13_weight.numel()
                 + layer.w2_weight.numel()
@@ -450,7 +447,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 + layer.w2_weight_scale_inv.numel()
             )
 
-            # Perform dequantization and requantization when all data is loaded
+            # Perform dequantization and requantization only when all data is loaded.
             if layer._fp8_loaded_numel == total_target_numel:
                 if dynamic_mxfp4_quant is None:
                     raise NotImplementedError(
@@ -464,7 +461,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 w13_bf16 = dequantize_fp8(
                     layer.w13_weight,
                     layer.w13_weight_scale_inv,
-                    block_size=self.weight_block_size,
+                    block_size=self.dequantization_config.weight_block_size,
                 )
 
                 qw13_weight_list = []
@@ -482,7 +479,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 w2_bf16 = dequantize_fp8(
                     layer.w2_weight,
                     layer.w2_weight_scale_inv,
-                    block_size=self.weight_block_size,
+                    block_size=self.dequantization_config.weight_block_size,
                 )
 
                 qw2_weight_list = []
