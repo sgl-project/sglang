@@ -35,10 +35,16 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
+        # Extract speculative decoding metrics (sum across all responses)
+        spec_verify_ct = sum(r["meta_info"].get("spec_verify_ct", 0) for r in responses)
+        sd_completion_tokens = sum(r["meta_info"].get("sd_completion_tokens", 0) for r in responses)
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            spec_verify_ct=spec_verify_ct if spec_verify_ct > 0 else None,
+            sd_completion_tokens=sd_completion_tokens if sd_completion_tokens > 0 else None,
         )
 
     @staticmethod
@@ -74,6 +80,8 @@ class UsageProcessor:
         prompt_tokens: int,
         completion_tokens: int,
         cached_tokens: Optional[PromptTokensDetails] = None,
+        spec_verify_ct: Optional[int] = None,
+        sd_completion_tokens: Optional[int] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
@@ -81,4 +89,6 @@ class UsageProcessor:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
+            spec_verify_ct=spec_verify_ct,
+            sd_completion_tokens=sd_completion_tokens,
         )

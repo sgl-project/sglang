@@ -109,6 +109,7 @@ class ChatCompletionSampler(SamplerBase):
         self.reasoning_effort = reasoning_effort
         self.extra_body = extra_body
         self.image_format = "url"
+        self.last_response_metadata = []  # Track metadata for acceptance length calculation
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=}"
         )
@@ -151,6 +152,15 @@ class ChatCompletionSampler(SamplerBase):
                     reasoning_effort=self.reasoning_effort,
                     extra_body=self.extra_body,
                 )
+                # Store metadata for acceptance length calculation
+                if hasattr(response, 'usage') and response.usage:
+                    metadata = {}
+                    # Convert usage object to dict-like access
+                    usage_dict = response.usage.model_dump() if hasattr(response.usage, 'model_dump') else {}
+                    for key in ['completion_tokens', 'spec_verify_ct', 'sd_completion_tokens']:
+                        if key in usage_dict:
+                            metadata[key] = usage_dict[key]
+                    self.last_response_metadata.append(metadata)
                 return response.choices[0].message.content or ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:

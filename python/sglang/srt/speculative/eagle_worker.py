@@ -315,16 +315,28 @@ class EAGLEWorker(TpModelWorker):
         logger.info("Capture target normal decode cuda graph begin.")
         target_runner = self.target_worker.model_runner
 
-        # Backup
+        # Backup local state
         old_spec_algo = target_runner.spec_algorithm
         old_attn_backend = target_runner.attn_backend
         old_graph_runner = target_runner.graph_runner
+        
+        # Backup instance variables that get modified by init_attention_backend()
+        old_prefill_backend_str = getattr(target_runner, 'prefill_attention_backend_str', None)
+        old_decode_backend_str = getattr(target_runner, 'decode_attention_backend_str', None)
+        old_init_new_workspace = getattr(target_runner, 'init_new_workspace', None)
+        
+        # Backup global state that gets modified by init_attention_backend()
+        from sglang.srt.server_args import get_global_server_args
+        global_args = get_global_server_args()
+        old_global_prefill_backend = global_args.prefill_attention_backend
+        old_global_decode_backend = global_args.decode_attention_backend
 
         try:
             # Switch to normal decode mode
             target_runner.spec_algorithm = SpeculativeAlgorithm.NONE
 
             # Init attention backend for normal decode
+            # WARNING: This modifies both instance and global state
             target_runner.init_attention_backend()
             self.target_normal_decode_attn_backend = target_runner.attn_backend
 
@@ -339,10 +351,22 @@ class EAGLEWorker(TpModelWorker):
             self.target_normal_decode_graph_runner = target_runner.graph_runner
 
         finally:
-            # Restore
+            # Restore local state
             target_runner.spec_algorithm = old_spec_algo
             target_runner.attn_backend = old_attn_backend
             target_runner.graph_runner = old_graph_runner
+            
+            # Restore instance variables
+            if old_prefill_backend_str is not None:
+                target_runner.prefill_attention_backend_str = old_prefill_backend_str
+            if old_decode_backend_str is not None:
+                target_runner.decode_attention_backend_str = old_decode_backend_str
+            if old_init_new_workspace is not None:
+                target_runner.init_new_workspace = old_init_new_workspace
+            
+            # Restore global state
+            global_args.prefill_attention_backend = old_global_prefill_backend
+            global_args.decode_attention_backend = old_global_decode_backend
 
         logger.info("Capture target normal decode cuda graph end.")
 
@@ -475,8 +499,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Use the MAB manager to select the best strategy for this batch size
         selected_strategy = self.mab_manager.select_strategy(batch_size)
-
-        #print(f"[MAB] Selected strategy: {selected_strategy} for batch_size={batch_size}")
+        print(f"[MAB] Selected strategy: {selected_strategy} for batch_size={batch_size}")
 
         # Apply the selected strategy
         self.set_mab_strategy(selected_strategy)
@@ -679,19 +702,16 @@ class EAGLEWorker(TpModelWorker):
                 # We need to set input_ids to the last generated token per request
                 bs = len(batch.reqs)
                 
-                if batch.output_ids is not None and batch.output_ids.numel() == bs:
-                    # Use output_ids if available and has correct shape
-                    batch.input_ids = batch.output_ids
-                    batch.output_ids = None
-                else:
-                    # Fallback: gather the last output token from each request
-                    batch.input_ids = torch.tensor(
-                        [req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1] 
-                         for req in batch.reqs],
-                        dtype=torch.int64,
-                        device=batch.device,
-                    )
-                    batch.output_ids = None
+                # CRITICAL: When adaptive SD disables speculation, we MUST NOT reuse batch.output_ids
+                # because it contains speculative verification data, not the actual last generated tokens.
+                # Always gather the last output token from each request manually.
+                batch.input_ids = torch.tensor(
+                    [req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1] 
+                     for req in batch.reqs],
+                    dtype=torch.int64,
+                    device=batch.device,
+                )
+                batch.output_ids = None
                 
                 # Slice out_cache_loc for normal decode
                 # In spec mode, out_cache_loc has shape [bs * spec_steps * topk]

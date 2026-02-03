@@ -468,6 +468,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                spec_verify_ct = final_res.meta_info.get("spec_verify_ct")
+                sd_completion_tokens = final_res.meta_info.get("sd_completion_tokens")
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -482,18 +484,24 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
                 num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
                 num_reasoning_tokens = 0
+                spec_verify_ct = None
+                sd_completion_tokens = None
             else:
                 # Final fallback
                 num_prompt_tokens = 0
                 num_generated_tokens = 0
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
+                spec_verify_ct = None
+                sd_completion_tokens = None
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
+            spec_verify_ct=spec_verify_ct,
+            sd_completion_tokens=sd_completion_tokens,
         )
         if self.enable_prompt_tokens_details and num_cached_tokens:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
