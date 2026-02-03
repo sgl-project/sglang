@@ -55,3 +55,89 @@ pre-commit run --all-files
   - Reuse the launched server as much as possible to reduce server launch time.
 - Do not use absolute links (e.g., `https://docs.sglang.io/get_started/install.html`). Always prefer relative links (e.g., `../get_started/install.md`).
 - Follow the existing examples to learn how to launch a server, send a query and other common styles.
+
+## Documentation Build and Markdown Export Workflow
+
+### Overview
+
+The SGLang documentation pipeline is based on **Sphinx** and supports rendering Jupyter notebooks (`.ipynb`) into HTML for web display.
+To support downstream documentation systems that cannot ingest HTML, we introduce an additional **Markdown export path** while keeping the existing build logic unchanged.
+
+The key idea is to **reuse the existing build directory (`_build/html`)** and colocate Markdown artifacts alongside the rendered website.
+
+---
+
+### Current Documentation Build Flow
+
+#### 1. Notebook Execution (`make compile`)
+
+The `make compile` target is responsible for executing notebooks before rendering:
+
+* Finds all `.ipynb` files under `docs/` (excluding `_build/`)
+* Executes notebooks in parallel using GNU Parallel
+* Wraps execution with `retry` to reduce flaky failures
+* Executes notebooks via `jupyter nbconvert --execute --inplace`
+* Records execution timing in `logs/timing.log`
+
+This step ensures notebooks contain up-to-date outputs before rendering.
+
+---
+
+#### 2. Web Rendering (`make html`)
+
+After compilation, Sphinx builds the website:
+
+* Reads Markdown, reStructuredText, and Jupyter notebooks
+* Renders them into HTML pages
+* Outputs the website into:
+
+```
+docs/_build/html/
+```
+
+This directory is the source for online documentation hosting.
+
+---
+
+### Added Capability: Markdown Export (`make markdown`)
+
+To support downstream consumers, we add a **new Makefile target**:
+
+```bash
+make markdown
+```
+
+This target:
+
+* Does **not modify** `make compile`
+* Scans all `.ipynb` files (excluding `_build/`)
+* Converts notebooks directly to Markdown using `jupyter nbconvert --to markdown`
+* Writes Markdown artifacts into the existing build directory:
+
+```
+docs/_build/html/markdown/<relative-path>.md
+```
+
+Example:
+
+```
+docs/advanced_features/lora.ipynb
+→ docs/_build/html/markdown/advanced_features/lora.md
+```
+
+---
+
+### Recommended CI Execution Order
+
+In CI, the documentation pipeline follows this order:
+
+```bash
+make compile    # execute notebooks (ensure outputs are up to date)
+make html       # build website as usual
+make markdown   # export markdown artifacts into _build/html/markdown
+```
+
+This ensures that:
+
+* The website renders correctly
+* Markdown artifacts reflect the same notebook state as the web pages
