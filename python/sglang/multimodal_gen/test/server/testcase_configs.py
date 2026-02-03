@@ -661,7 +661,7 @@ TWO_GPU_CASES_A = [
             modality="image",
             num_gpus=2,
             warmup=True,
-            extras=["--use-fsdp-inference"]
+            extras=["--use-fsdp-inference"],
         ),
         T2I_sampling_params,
     ),
