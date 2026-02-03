@@ -289,6 +289,7 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
+    sequence_score: Optional[float] = None  # Score for this sequence in beam search
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -805,6 +806,14 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    sgl_ext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sgl_ext is None:
+            data.pop("sgl_ext", None)
+        return data
 
 
 class ChatCompletionStreamResponse(BaseModel):

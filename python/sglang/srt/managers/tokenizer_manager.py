@@ -45,6 +45,9 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
+from sglang.srt.managers.beam_search_tokenizer_manager_mixin import (
+    BeamSearchTokenizerManagerMixin,
+)
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -185,7 +188,11 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixin):
+class TokenizerManager(
+    BeamSearchTokenizerManagerMixin,
+    TokenizerCommunicatorMixin,
+    TokenizerManagerMultiItemMixin,
+):
     """TokenizerManager is a process that tokenizes the text."""
 
     def __init__(
@@ -518,8 +525,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 state = self._send_one_request(obj, tokenized_obj, created_time)
+                is_stream = hasattr(obj, "stream") and obj.stream
                 async for response in self._wait_one_response(obj, state, request):
-                    yield response
+                    if isinstance(response, list) and is_stream:
+                        # Beam search response is a list of beam results
+                        # Stream: yield each beam result individually
+                        for beam_result in response:
+                            yield beam_result
+                    else:
+                        yield response
             else:
                 async for response in self._handle_batch_request(
                     obj, request, created_time
@@ -1128,7 +1142,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             out = state.out_list[-1]
 
             state.out_list = []
-            if state.finished:
+
+            if out.get("beam_results"):
+                if state.finished:
+                    final_out = await self.wait_beam_search_response(out, state, obj)
+                    yield final_out
+                    break
+            elif state.finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
                 if not state.response_sent_to_client_ts:
@@ -1191,6 +1211,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state.event.clear()
 
             if is_stream:
+                # For beam search, skip intermediate results and only yield when finished
+                if out.get("beam_results"):
+                    continue
+
                 # Record response sent time right before we send response.
                 if not state.response_sent_to_client_ts:
                     state.response_sent_to_client_ts = time.time()
@@ -1292,7 +1316,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         is_stream = hasattr(obj, "stream") and obj.stream
         if not is_stream:
             outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
-            yield outputs
+            # Flatten beam search results: if each output is a list (beam search), flatten [[]] to []
+            if outputs and isinstance(outputs[0], list):
+                flattened_outputs = []
+                for output in outputs:
+                    flattened_outputs.extend(output)
+                yield flattened_outputs
+            else:
+                yield outputs
         else:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
@@ -1305,8 +1336,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     gen = task_map.pop(task)
                     try:
                         result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
+                        if isinstance(result, list) and result:
+                            # For beam search, only the first element has complete meta_info with id
+                            # All beams in the list belong to the same request
+                            request_id = result[0]["meta_info"]["id"]
+                            index = rid_to_index[request_id]
+                            for beam_result in result:
+                                beam_result["index"] = index
+                                yield beam_result
+                        else:
+                            result["index"] = rid_to_index[result["meta_info"]["id"]]
+                            yield result
                         new_task = asyncio.create_task(gen.__anext__())
                         task_map[new_task] = gen
                     except StopAsyncIteration:
@@ -1516,6 +1556,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 self._add_metric_if_present(
                     recv_obj, "prefill_finished_ts", meta_info, i
                 )
+
+            if self.maybe_handle_beam_search_output(recv_obj, i, rid, state, meta_info):
+                continue
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
