@@ -9,22 +9,17 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    fa_ver,
+    flash_attn_func,
+    flash_attn_varlen_func_op,
+    flash_attn_varlen_func_op_lse,
+)
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
-logger = init_logger(__name__)
-
-try:
-    from lite_attention import LiteAttention as _LiteAttention
-
-    _lite_attention_available = True
-except ImportError:
-    _LiteAttention = None
-    _lite_attention_available = False
-
-_LITE_ATTN_REGISTRY: dict[int, Any] = {}
+_LITE_ATTN: dict[int, Any] = {}
 
 
 def lite_attn_fake_out(
@@ -63,13 +58,33 @@ def lite_attn_func_op(
     softmax_scale: float,
     is_ring: bool = False,
 ) -> torch.Tensor:
-    lite = _LITE_ATTN_REGISTRY.get(int(handle))
-    if lite is None:
-        raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
-
     skipping = (q.shape[1] == k.shape[1]) and (not is_ring)
-    if skipping != bool(getattr(lite, "enable_skipping", False)):
-        lite.enable_skip_optimization(enable=skipping)
+    if not skipping:
+        if fa_ver == 4:
+            return flash_attn_varlen_func_op(
+                q=q,
+                k=k,
+                v=v,
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=k.shape[1],
+                softmax_scale=softmax_scale,
+                causal=False,
+                return_softmax_lse=False,
+                ver=4,
+            )
+        return flash_attn_func(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            softmax_scale=softmax_scale,
+            causal=False,
+            return_softmax_lse=False,
+            ver=fa_ver,
+        )
+
+    lite = _LITE_ATTN[int(handle)]
     return lite(q, k, v, scale=softmax_scale, return_softmax_lse=False)
 
 
@@ -82,14 +97,34 @@ def lite_attn_func_op_lse(
     softmax_scale: float,
     is_ring: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    lite = _LITE_ATTN_REGISTRY.get(int(handle))
-    if lite is None:
-        raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
     skipping = (q.shape[1] == k.shape[1]) and (not is_ring)
-    if skipping != bool(getattr(lite, "enable_skipping", False)):
-        lite.enable_skip_optimization(enable=skipping)
-    out, lse = lite(q, k, v, scale=softmax_scale, return_softmax_lse=True)
-    return out, lse
+    if not skipping:
+        if fa_ver == 4:
+            return flash_attn_varlen_func_op_lse(
+                q=q,
+                k=k,
+                v=v,
+                max_seqlen_q=q.shape[1],
+                max_seqlen_k=k.shape[1],
+                softmax_scale=softmax_scale,
+                causal=False,
+                return_softmax_lse=True,
+                ver=4,
+            )
+        return flash_attn_func(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=q.shape[1],
+            max_seqlen_k=k.shape[1],
+            softmax_scale=softmax_scale,
+            causal=False,
+            return_softmax_lse=True,
+            ver=fa_ver,
+        )
+
+    lite = _LITE_ATTN[int(handle)]
+    return lite(q, k, v, scale=softmax_scale, return_softmax_lse=True)
 
 
 def _get_lite_attn_params_from_server_args() -> dict[str, Any]:
@@ -129,11 +164,6 @@ class LiteAttentionImpl(AttentionImpl):
         prefix: str = "",
         **extra_impl_args,
     ) -> None:
-        if not _lite_attention_available:
-            raise ImportError(
-                "LiteAttention backend is not installed. Install it (Hopper-only) and retry."
-            )
-
         self.causal = causal
         self.softmax_scale = softmax_scale
 
@@ -145,7 +175,9 @@ class LiteAttentionImpl(AttentionImpl):
         )
         use_int8 = extra_impl_args.pop("use_int8", params["use_int8"])
 
-        self._lite = _LiteAttention(
+        from lite_attention import LiteAttention
+
+        self._lite = LiteAttention(
             enable_skipping=True,
             threshold=float(threshold),
             max_batch_size=int(max_batch_size),
@@ -153,7 +185,14 @@ class LiteAttentionImpl(AttentionImpl):
             use_int8=bool(use_int8),
         )
         self._lite_handle = id(self._lite)
-        _LITE_ATTN_REGISTRY[self._lite_handle] = self._lite
+        _LITE_ATTN[self._lite_handle] = self._lite
+
+    def __del__(self) -> None:
+        try:
+            _LITE_ATTN.pop(getattr(self, "_lite_handle", None), None)
+        except Exception:
+            pass
+
     def forward(
         self,
         query: torch.Tensor,
