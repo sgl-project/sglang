@@ -138,8 +138,6 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
-
         self.midlayers = nn.ModuleList(
             [
                 LlamaDecoderLayer(
