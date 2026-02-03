@@ -768,7 +768,10 @@ class ServerArgs:
         return parser
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
+        if not self.host:
+            # --host='' enables dual-stack binding; empty host isn't a valid URL host, so default to loopback.
+            return f"http://127.0.0.1:{self.port}"
+        elif is_valid_ipv6_address(self.host):
             return f"http://[{self.host}]:{self.port}"
         else:
             return f"http://{self.host}:{self.port}"
