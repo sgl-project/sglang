@@ -27,7 +27,6 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
@@ -166,47 +165,28 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-        if (
-            query.is_cuda
-            and (self.norm_q.variance_epsilon == self.norm_k.variance_epsilon)
-            and can_use_fused_inplace_qknorm(self.head_dim, query.dtype)
-        ):
-            query, key = apply_qk_norm(
-                q=query,
-                k=key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=self.head_dim,
-                allow_inplace=True,
-            )
-        else:
-            query = self.norm_q(query)
-            key = self.norm_k(key)
+        query, key = apply_qk_norm(
+            q=query,
+            k=key,
+            q_norm=self.norm_q,
+            k_norm=self.norm_k,
+            head_dim=self.head_dim,
+            allow_inplace=True,
+        )
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
-            if (
-                encoder_query.is_cuda
-                and (
-                    self.norm_added_q.variance_epsilon
-                    == self.norm_added_k.variance_epsilon
-                )
-                and can_use_fused_inplace_qknorm(self.head_dim, encoder_query.dtype)
-            ):
-                encoder_query, encoder_key = apply_qk_norm(
-                    q=encoder_query,
-                    k=encoder_key,
-                    q_norm=self.norm_added_q,
-                    k_norm=self.norm_added_k,
-                    head_dim=self.head_dim,
-                    allow_inplace=True,
-                )
-            else:
-                encoder_query = self.norm_added_q(encoder_query)
-                encoder_key = self.norm_added_k(encoder_key)
+            encoder_query, encoder_key = apply_qk_norm(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
             bsz, seq_len, _, _ = query.shape
             query = torch.cat([encoder_query, query], dim=1)
@@ -561,11 +541,11 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             )
         hidden_states, _ = self.x_embedder(hidden_states)
 
-        temb = (
-            self.time_text_embed(timestep, pooled_projections)
-            if guidance is None
-            else self.time_text_embed(timestep, guidance, pooled_projections)
-        )
+        # Only pass guidance to time_text_embed if the model supports it
+        if self.config.guidance_embeds and guidance is not None:
+            temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = self.time_text_embed(timestep, pooled_projections)
 
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 

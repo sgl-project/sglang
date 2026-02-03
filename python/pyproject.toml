@@ -28,8 +28,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.1", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.1",
+  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.2",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -66,10 +66,10 @@ dependencies = [
   "timm==1.0.16",
   "torch_memory_saver==0.0.9",
   "torch==2.9.1",
+  "torchao==0.9.0",
   "torchaudio==2.9.1",
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
-  "torchao==0.9.0",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
@@ -80,6 +80,22 @@ dependencies = [
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
   "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
 ]
 
 [project.optional-dependencies]
@@ -93,10 +109,11 @@ diffusion = [
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
   "remote-pdb",
-  "st_attn==0.0.7",
-  "vsa==0.0.4",
-  "runai_model_streamer",
-  "cache-dit==1.1.8"
+  "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "runai_model_streamer>=0.15.5",
+  "cache-dit==1.2.0",
+  "addict"
 ]
 
 tracing = [
@@ -122,6 +139,11 @@ test = [
 
 dev = ["sglang[test]"]
 
+all = [
+  "sglang[diffusion]",
+  "sglang[tracing]",
+]
+
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
 vsa = ["torch", "setuptools"]
@@ -135,16 +157,8 @@ sglang = "sglang.cli.main:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
-  "srt/layers/moe/fused_moe_triton/configs/*/*.json",
-  "srt/layers/quantization/configs/*.json",
-  "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.cpp",
-  "srt/mem_cache/cpp_radix_tree/*.h",
-  "srt/speculative/cpp_ngram/*.cpp",
-  "srt/speculative/cpp_ngram/*.h",
-  "jit_kernel/include/sgl_kernel/*.h",
-  "jit_kernel/include/sgl_kernel/*.cuh",
-  "jit_kernel/csrc/*.cuh"
+  "srt/**/*",
+  "jit_kernel/**/*"
 ]
 
 [tool.setuptools.packages.find]
@@ -175,7 +189,3 @@ version_file = "sglang/_version.py"
 git_describe_command = ["bash", "-c", "git tag --list --sort=-version:refname 'v*.*.*' | head -1 | xargs git describe --tags --long"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
-
-[tool.codespell]
-ignore-words-list = "ans, als, hel, boostrap, childs, te, vas, hsa, ment"
-skip = "*.json,*.jsonl,*.patch,*.txt"
