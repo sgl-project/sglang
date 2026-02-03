@@ -33,6 +33,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -150,6 +152,10 @@ class MLP(nn.Module):
 
 
 class CrossAttention(nn.Module):
+    """
+    Cross-attention module with SGLang attention backend support.
+    """
+
     def __init__(
         self,
         qdim,
@@ -161,6 +167,7 @@ class CrossAttention(nn.Module):
         with_decoupled_ca=False,
         decoupled_ca_dim=16,
         decoupled_ca_weight=1.0,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -172,13 +179,11 @@ class CrossAttention(nn.Module):
         assert (
             self.head_dim % 8 == 0 and self.head_dim <= 128
         ), "Only support head_dim <= 128 and divisible by 8"
-        self.scale = self.head_dim**-0.5
 
         self.to_q = nn.Linear(qdim, qdim, bias=qkv_bias)
         self.to_k = nn.Linear(kdim, qdim, bias=qkv_bias)
         self.to_v = nn.Linear(kdim, qdim, bias=qkv_bias)
 
-        # TODO: eps should be 1 / 65530 if using fp16
         self.q_norm = (
             norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6)
             if qk_norm
@@ -191,6 +196,19 @@ class CrossAttention(nn.Module):
         )
         self.out_proj = nn.Linear(qdim, qdim, bias=True)
 
+        if supported_attention_backends is None:
+            supported_attention_backends = {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+
+        self.local_attn = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+        )
+
         self.with_dca = with_decoupled_ca
         if self.with_dca:
             self.kv_proj_dca = nn.Linear(kdim, 2 * qdim, bias=qkv_bias)
@@ -201,6 +219,12 @@ class CrossAttention(nn.Module):
             )
             self.dca_dim = decoupled_ca_dim
             self.dca_weight = decoupled_ca_weight
+            self.local_attn_dca = LocalAttention(
+                num_heads=num_heads,
+                head_size=self.head_dim,
+                causal=False,
+                supported_attention_backends=supported_attention_backends,
+            )
 
     def forward(self, x, y):
         """
@@ -210,10 +234,8 @@ class CrossAttention(nn.Module):
             (batch, seqlen1, hidden_dim) (where hidden_dim = num heads * head dim)
         y: torch.Tensor
             (batch, seqlen2, hidden_dim2)
-        freqs_cis_img: torch.Tensor
-            (batch, hidden_dim // 2), RoPE for image
         """
-        b, s1, c = x.shape  # [b, s1, D]
+        b, s1, c = x.shape
 
         if self.with_dca:
             token_len = y.shape[1]
@@ -221,64 +243,38 @@ class CrossAttention(nn.Module):
             kv_dca = self.kv_proj_dca(context_dca).view(
                 b, self.dca_dim, 2, self.num_heads, self.head_dim
             )
-            k_dca, v_dca = kv_dca.unbind(dim=2)  # [b, s, h, d]
+            k_dca, v_dca = kv_dca.unbind(dim=2)
             k_dca = self.k_norm_dca(k_dca)
             y = y[:, : (token_len - self.dca_dim), :]
 
-        _, s2, c = y.shape  # [b, s2, 1024]
+        _, s2, _ = y.shape
         q = self.to_q(x)
         k = self.to_k(y)
         v = self.to_v(y)
 
-        kv = torch.cat((k, v), dim=-1)
-        split_size = kv.shape[-1] // self.num_heads // 2
-        kv = kv.view(1, -1, self.num_heads, split_size * 2)
-        k, v = torch.split(kv, split_size, dim=-1)
-
-        q = q.view(b, s1, self.num_heads, self.head_dim)  # [b, s1, h, d]
-        k = k.view(b, s2, self.num_heads, self.head_dim)  # [b, s2, h, d]
-        v = v.view(b, s2, self.num_heads, self.head_dim)  # [b, s2, h, d]
+        q = q.view(b, s1, self.num_heads, self.head_dim)
+        k = k.view(b, s2, self.num_heads, self.head_dim)
+        v = v.view(b, s2, self.num_heads, self.head_dim)
 
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True, enable_math=False, enable_mem_efficient=True
-        ):
-            q, k, v = map(
-                lambda t: rearrange(t, "b n h d -> b h n d", h=self.num_heads),
-                (q, k, v),
-            )
-            context = (
-                F.scaled_dot_product_attention(q, k, v)
-                .transpose(1, 2)
-                .reshape(b, s1, -1)
-            )
+        context = self.local_attn(q, k, v)
+        context = context.flatten(2)
 
         if self.with_dca:
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True, enable_math=False, enable_mem_efficient=True
-            ):
-                k_dca, v_dca = map(
-                    lambda t: rearrange(t, "b n h d -> b h n d", h=self.num_heads),
-                    (k_dca, v_dca),
-                )
-                context_dca = (
-                    F.scaled_dot_product_attention(q, k_dca, v_dca)
-                    .transpose(1, 2)
-                    .reshape(b, s1, -1)
-                )
-
+            context_dca = self.local_attn_dca(q, k_dca, v_dca)
+            context_dca = context_dca.flatten(2)
             context = context + self.dca_weight * context_dca
 
-        out = self.out_proj(context)  # context.reshape - B, L1, -1
+        out = self.out_proj(context)
 
         return out
 
 
 class Attention(nn.Module):
     """
-    We rename some layer names to align with flash attention
+    Self-attention module with SGLang attention backend support.
     """
 
     def __init__(
@@ -288,22 +284,21 @@ class Attention(nn.Module):
         qkv_bias=True,
         qk_norm=False,
         norm_layer=nn.LayerNorm,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         assert self.dim % num_heads == 0, "dim should be divisible by num_heads"
         self.head_dim = self.dim // num_heads
-        # This assertion is aligned with flash attention
         assert (
             self.head_dim % 8 == 0 and self.head_dim <= 128
         ), "Only support head_dim <= 128 and divisible by 8"
-        self.scale = self.head_dim**-0.5
 
         self.to_q = nn.Linear(dim, dim, bias=qkv_bias)
         self.to_k = nn.Linear(dim, dim, bias=qkv_bias)
         self.to_v = nn.Linear(dim, dim, bias=qkv_bias)
-        # TODO: eps should be 1 / 65530 if using fp16
+
         self.q_norm = (
             norm_layer(self.head_dim, elementwise_affine=True, eps=1e-6)
             if qk_norm
@@ -316,6 +311,18 @@ class Attention(nn.Module):
         )
         self.out_proj = nn.Linear(dim, dim)
 
+        if supported_attention_backends is None:
+            supported_attention_backends = {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        self.local_attn = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+        )
+
     def forward(self, x):
         B, N, C = x.shape
 
@@ -323,27 +330,15 @@ class Attention(nn.Module):
         k = self.to_k(x)
         v = self.to_v(x)
 
-        qkv = torch.cat((q, k, v), dim=-1)
-        split_size = qkv.shape[-1] // self.num_heads // 3
-        qkv = qkv.view(1, -1, self.num_heads, split_size * 3)
-        q, k, v = torch.split(qkv, split_size, dim=-1)
+        q = q.view(B, N, self.num_heads, self.head_dim)
+        k = k.view(B, N, self.num_heads, self.head_dim)
+        v = v.view(B, N, self.num_heads, self.head_dim)
 
-        q = q.reshape(B, N, self.num_heads, self.head_dim).transpose(
-            1, 2
-        )  # [b, h, s, d]
-        k = k.reshape(B, N, self.num_heads, self.head_dim).transpose(
-            1, 2
-        )  # [b, h, s, d]
-        v = v.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
-        q = self.q_norm(q)  # [b, h, s, d]
-        k = self.k_norm(k)  # [b, h, s, d]
-
-        with torch.backends.cuda.sdp_kernel(
-            enable_flash=True, enable_math=False, enable_mem_efficient=True
-        ):
-            x = F.scaled_dot_product_attention(q, k, v)
-            x = x.transpose(1, 2).reshape(B, N, -1)
+        x = self.local_attn(q, k, v)
+        x = x.flatten(2)
 
         x = self.out_proj(x)
         return x
@@ -477,6 +472,7 @@ class HunYuanDiTBlock(nn.Module):
         num_experts: int = 8,
         moe_top_k: int = 2,
         mlp_ratio: float = 4.0,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -493,6 +489,7 @@ class HunYuanDiTBlock(nn.Module):
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
             norm_layer=qk_norm_layer,
+            supported_attention_backends=supported_attention_backends,
         )
 
         # ========================= FFN =========================
@@ -519,6 +516,7 @@ class HunYuanDiTBlock(nn.Module):
             decoupled_ca_dim=decoupled_ca_dim,
             decoupled_ca_weight=decoupled_ca_weight,
             init_scale=init_scale,
+            supported_attention_backends=supported_attention_backends,
         )
         self.norm3 = norm_layer(hidden_size, elementwise_affine=True, eps=1e-6)
 
@@ -693,6 +691,7 @@ class HunYuanDiTPlain(nn.Module):
         num_moe_layers: int = 6,
         num_experts: int = 8,
         moe_top_k: int = 2,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -772,6 +771,7 @@ class HunYuanDiTPlain(nn.Module):
                     use_moe=True if depth - layer <= num_moe_layers else False,
                     num_experts=num_experts,
                     moe_top_k=moe_top_k,
+                    supported_attention_backends=supported_attention_backends,
                 )
                 for layer in range(depth)
             ]
@@ -929,20 +929,41 @@ class _FluxSelfAttention(nn.Module):
         dim: int,
         num_heads: int = 8,
         qkv_bias: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
+        self.head_dim = dim // num_heads
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.norm = _FluxQKNorm(head_dim)
+        self.norm = _FluxQKNorm(self.head_dim)
         self.proj = nn.Linear(dim, dim)
+
+        if supported_attention_backends is None:
+            supported_attention_backends = {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        self.local_attn = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+        )
 
     def forward(self, x: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
         qkv = self.qkv(x)
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        q, k = self.norm(q, k, v)
-        x = _flux_attention(q, k, v, pe=pe)
+        B, L, _ = qkv.shape
+        qkv = qkv.view(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v_for_norm = v.transpose(1, 2)
+        q, k = self.norm(q, k, v_for_norm)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        x = self.local_attn(q, k, v)
+        x = x.flatten(2)
         x = self.proj(x)
         return x
 
@@ -980,15 +1001,20 @@ class _FluxDoubleStreamBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float,
         qkv_bias: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.num_heads = num_heads
         self.hidden_size = hidden_size
+        self.head_dim = hidden_size // num_heads
         self.img_mod = _FluxModulation(hidden_size, double=True)
         self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_attn = _FluxSelfAttention(
-            dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias
+            dim=hidden_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            supported_attention_backends=supported_attention_backends,
         )
 
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -1001,7 +1027,10 @@ class _FluxDoubleStreamBlock(nn.Module):
         self.txt_mod = _FluxModulation(hidden_size, double=True)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_attn = _FluxSelfAttention(
-            dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias
+            dim=hidden_size,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            supported_attention_backends=supported_attention_backends,
         )
 
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -1009,6 +1038,18 @@ class _FluxDoubleStreamBlock(nn.Module):
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
             _FluxGELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+
+        if supported_attention_backends is None:
+            supported_attention_backends = {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        self.local_attn_joint = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def forward(
@@ -1021,27 +1062,38 @@ class _FluxDoubleStreamBlock(nn.Module):
         img_modulated = self.img_norm1(img)
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
 
+        B, img_L, _ = img_modulated.shape
         img_qkv = self.img_attn.qkv(img_modulated)
-        img_q, img_k, img_v = rearrange(
-            img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads
-        )
-        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+        img_qkv = img_qkv.view(B, img_L, 3, self.num_heads, self.head_dim)
+        img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
+        img_q_t = img_q.transpose(1, 2)
+        img_k_t = img_k.transpose(1, 2)
+        img_v_t = img_v.transpose(1, 2)
+        img_q_t, img_k_t = self.img_attn.norm(img_q_t, img_k_t, img_v_t)
+        img_q = img_q_t.transpose(1, 2)
+        img_k = img_k_t.transpose(1, 2)
 
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_L = txt_modulated.shape[1]
         txt_qkv = self.txt_attn.qkv(txt_modulated)
-        txt_q, txt_k, txt_v = rearrange(
-            txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads
-        )
-        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+        txt_qkv = txt_qkv.view(B, txt_L, 3, self.num_heads, self.head_dim)
+        txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
+        txt_q_t = txt_q.transpose(1, 2)
+        txt_k_t = txt_k.transpose(1, 2)
+        txt_v_t = txt_v.transpose(1, 2)
+        txt_q_t, txt_k_t = self.txt_attn.norm(txt_q_t, txt_k_t, txt_v_t)
+        txt_q = txt_q_t.transpose(1, 2)
+        txt_k = txt_k_t.transpose(1, 2)
 
-        q = torch.cat((txt_q, img_q), dim=2)
-        k = torch.cat((txt_k, img_k), dim=2)
-        v = torch.cat((txt_v, img_v), dim=2)
+        q = torch.cat((txt_q, img_q), dim=1)
+        k = torch.cat((txt_k, img_k), dim=1)
+        v = torch.cat((txt_v, img_v), dim=1)
 
-        attn = _flux_attention(q, k, v, pe=pe)
+        attn = self.local_attn_joint(q, k, v)
+        attn = attn.flatten(2)
 
-        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1] :]
+        txt_attn, img_attn = attn[:, :txt_L], attn[:, txt_L:]
 
         img = img + img_mod1.gate * self.img_attn.proj(img_attn)
         img = img + img_mod2.gate * self.img_mlp(
@@ -1067,27 +1119,37 @@ class _FluxSingleStreamBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         qk_scale: Optional[float] = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
 
         self.hidden_dim = hidden_size
         self.num_heads = num_heads
-        head_dim = hidden_size // num_heads
-        self.scale = qk_scale or head_dim**-0.5
+        self.head_dim = hidden_size // num_heads
 
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        # qkv and mlp_in
         self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim)
-        # proj and mlp_out
         self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size)
 
-        self.norm = _FluxQKNorm(head_dim)
+        self.norm = _FluxQKNorm(self.head_dim)
 
         self.hidden_size = hidden_size
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
         self.mlp_act = _FluxGELU(approximate="tanh")
         self.modulation = _FluxModulation(hidden_size, double=False)
+
+        if supported_attention_backends is None:
+            supported_attention_backends = {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        self.local_attn = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            causal=False,
+            supported_attention_backends=supported_attention_backends,
+        )
 
     def forward(
         self, x: torch.Tensor, vec: torch.Tensor, pe: torch.Tensor
@@ -1099,12 +1161,19 @@ class _FluxSingleStreamBlock(nn.Module):
             self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
         )
 
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        q, k = self.norm(q, k, v)
+        B, L, _ = qkv.shape
+        qkv = qkv.view(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        q_t, k_t = self.norm(q_t, k_t, v_t)
+        q = q_t.transpose(1, 2)
+        k = k_t.transpose(1, 2)
 
-        # compute attention
-        attn = _flux_attention(q, k, v, pe=pe)
-        # compute activation in mlp stream, cat again and run second linear layer
+        attn = self.local_attn(q, k, v)
+        attn = attn.flatten(2)
+
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         return x + mod.gate * output
 
@@ -1147,6 +1216,7 @@ class Hunyuan3D2DiT(nn.Module):
         time_factor: float = 1000,
         guidance_embed: bool = False,
         ckpt_path: Optional[str] = None,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -1189,6 +1259,7 @@ class Hunyuan3D2DiT(nn.Module):
                     self.num_heads,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
+                    supported_attention_backends=supported_attention_backends,
                 )
                 for _ in range(depth)
             ]
@@ -1200,6 +1271,7 @@ class Hunyuan3D2DiT(nn.Module):
                     self.hidden_size,
                     self.num_heads,
                     mlp_ratio=mlp_ratio,
+                    supported_attention_backends=supported_attention_backends,
                 )
                 for _ in range(depth_single_blocks)
             ]

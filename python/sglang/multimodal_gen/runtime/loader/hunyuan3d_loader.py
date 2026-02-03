@@ -9,6 +9,7 @@ from typing import Any, ClassVar, Dict
 import torch
 
 from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
+from sglang.multimodal_gen.runtime.loader.fsdp_load import set_default_dtype
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -102,6 +103,11 @@ class Hunyuan3DShapeLoader(ComponentLoader):
             with open(config_path, "r") as f:
                 model_config = yaml.safe_load(f)
 
+            # Determine dtype before instantiating models
+            dtype = torch.float16
+            if config.shape_variant and "bf16" in config.shape_variant:
+                dtype = torch.bfloat16
+
             # Load checkpoint
             if config.shape_use_safetensors:
                 import safetensors.torch
@@ -117,33 +123,29 @@ class Hunyuan3DShapeLoader(ComponentLoader):
             else:
                 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
-            # Instantiate and load models using internal implementations
-            model = self.instantiate_from_config(model_config["model"])
-            model.load_state_dict(ckpt["model"], strict=False)
-
-            vae = self.instantiate_from_config(model_config["vae"])
-            vae.load_state_dict(ckpt["vae"], strict=False)
-
-            conditioner = self.instantiate_from_config(model_config["conditioner"])
-
-            conditioner_params = sum(p.numel() for p in conditioner.parameters())
-
-            cond_result = None
-            conditioner_from_ckpt = "conditioner" in ckpt
-            if conditioner_from_ckpt:
-                conditioner.load_state_dict(ckpt["conditioner"], strict=False)
-
-            image_processor = self.instantiate_from_config(
-                model_config["image_processor"]
-            )
-
-            scheduler = self.instantiate_from_config(model_config["scheduler"])
-
-            # Set device and dtype
-            dtype = torch.float16
-            if config.shape_variant and "bf16" in config.shape_variant:
-                dtype = torch.bfloat16
+            # Instantiate and load models with correct dtype for attention backend selection
             device = get_local_torch_device()
+            with set_default_dtype(dtype):
+                model = self.instantiate_from_config(model_config["model"])
+                model.load_state_dict(ckpt["model"], strict=False)
+
+                vae = self.instantiate_from_config(model_config["vae"])
+                vae.load_state_dict(ckpt["vae"], strict=False)
+
+                conditioner = self.instantiate_from_config(model_config["conditioner"])
+
+                conditioner_params = sum(p.numel() for p in conditioner.parameters())
+
+                cond_result = None
+                conditioner_from_ckpt = "conditioner" in ckpt
+                if conditioner_from_ckpt:
+                    conditioner.load_state_dict(ckpt["conditioner"], strict=False)
+
+                image_processor = self.instantiate_from_config(
+                    model_config["image_processor"]
+                )
+
+                scheduler = self.instantiate_from_config(model_config["scheduler"])
 
             for module in (model, vae, conditioner):
                 module.to(device=device, dtype=dtype)

@@ -17,11 +17,13 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.mesh3d_utils import export_to_trimesh
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
@@ -277,110 +279,39 @@ class Hunyuan3DShapeDenoisingStage(PipelineStage):
         guidance = batch.extra["shape_guidance"]
         do_cfg = batch.extra["shape_do_cfg"]
 
-        print(f"[DEBUG] guidance_scale: {batch.guidance_scale}")
-        print(f"[DEBUG] num_inference_steps: {batch.num_inference_steps}")
-        print(f"[DEBUG] do_cfg: {batch.extra['shape_do_cfg']}")
         for i, t in enumerate(timesteps):
-            if do_cfg:
-                latent_model_input = torch.cat([latents] * 2)
-            else:
-                latent_model_input = latents
+            with StageProfiler(
+                f"denoising_step_{i}",
+                logger=logger,
+                timings=batch.timings,
+                perf_dump_path_provided=batch.perf_dump_path is not None,
+            ):
+                if do_cfg:
+                    latent_model_input = torch.cat([latents] * 2)
+                else:
+                    latent_model_input = latents
 
-            timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
-            timestep = timestep / self.scheduler.config.num_train_timesteps
+                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
+                timestep = timestep / self.scheduler.config.num_train_timesteps
 
-            if i == 1:
-                print(
-                    f"[SGLANG] Step 1 INPUT - latents: min={latents.min():.6f}, max={latents.max():.6f}, mean={latents.mean():.6f}"
-                )
-                print(f"[SGLANG] Step 1 INPUT - latents[0,0,:5]: {latents[0,0,:5]}")
-                print(f"[SGLANG] Step 1 INPUT - timestep: {timestep[0].item():.6f}")
-                print(f"[SGLANG] Step 1 INPUT - t (raw): {t.item():.6f}")
+                with set_forward_context(
+                    current_timestep=i,
+                    attn_metadata=None,
+                    forward_batch=batch,
+                ):
+                    noise_pred = self.model(
+                        latent_model_input, timestep, cond, guidance=guidance
+                    )
 
-            noise_pred = self.model(
-                latent_model_input, timestep, cond, guidance=guidance
-            )
+                if do_cfg:
+                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + batch.guidance_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
 
-            if i in [0, 1, 2, 3, 4, 5]:
-                print(
-                    f"[SGLANG] Step {i} - noise_pred: min={noise_pred.min():.4f}, max={noise_pred.max():.4f}, mean={noise_pred.mean():.4f}"
-                )
-            if do_cfg:
-                noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-                if i == 0:
-                    print(
-                        f"[SGLANG] Step 0 CFG - noise_pred_cond[0,0,0]: {noise_pred_cond[0,0,0].item():.6f}"
-                    )
-                    print(
-                        f"[SGLANG] Step 0 CFG - noise_pred_uncond[0,0,0]: {noise_pred_uncond[0,0,0].item():.6f}"
-                    )
-                    print(
-                        f"[SGLANG] Step 0 CFG - cond stats: min={noise_pred_cond.min():.4f}, max={noise_pred_cond.max():.4f}, mean={noise_pred_cond.mean():.6f}"
-                    )
-                    print(
-                        f"[SGLANG] Step 0 CFG - uncond stats: min={noise_pred_uncond.min():.4f}, max={noise_pred_uncond.max():.4f}, mean={noise_pred_uncond.mean():.6f}"
-                    )
-                    print(
-                        f"[SGLANG] Step 0 - cond_tensor[0,0,:5] (conditional): {cond['main'][0,0,:5]}"
-                    )
-                    print(
-                        f"[SGLANG] Step 0 - cond_tensor[1,0,:5] (unconditional): {cond['main'][1,0,:5]}"
-                    )
-                noise_pred = noise_pred_uncond + batch.guidance_scale * (
-                    noise_pred_cond - noise_pred_uncond
-                )
+                outputs = self.scheduler.step(noise_pred, t, latents)
+                latents = outputs.prev_sample
 
-            if i == 0:
-                print(
-                    f"[SGLANG] Stage4 step0 - noise_pred (after CFG) stats: min={noise_pred.min():.4f}, max={noise_pred.max():.4f}, mean={noise_pred.mean():.4f}"
-                )
-                print(
-                    f"[SGLANG] Step 0 CALC - latents[0,0,0] (input, fp16): {latents[0,0,0].item():.6f}"
-                )
-                print(
-                    f"[SGLANG] Step 0 CALC - latents[0,0,0] (as fp32): {latents[0,0,0].float().item():.6f}"
-                )
-                print(
-                    f"[SGLANG] Step 0 CALC - noise_pred[0,0,0] (after CFG): {noise_pred[0,0,0].item():.6f}"
-                )
-                sigma_0 = self.scheduler.sigmas[0].item()
-                sigma_1 = self.scheduler.sigmas[1].item()
-                print(
-                    f"[SGLANG] Step 0 CALC - sigma={sigma_0:.8f}, sigma_next={sigma_1:.8f}"
-                )
-                print(
-                    f"[SGLANG] Step 0 CALC - (sigma_next - sigma) = {(sigma_1 - sigma_0):.8f}"
-                )
-                expected = (
-                    latents[0, 0, 0].float().item()
-                    + (sigma_1 - sigma_0) * noise_pred[0, 0, 0].float().item()
-                )
-                print(
-                    f"[SGLANG] Step 0 CALC - expected prev_sample[0,0,0] = {expected:.6f}"
-                )
-            if i in [0, 10, 20, 30, 40]:
-                sigma = self.scheduler.sigmas[i]
-                sigma_next = self.scheduler.sigmas[i + 1]
-                print(
-                    f"[SGLANG] Step {i} - sigma={sigma:.6f}, sigma_next={sigma_next:.6f}"
-                )
-            outputs = self.scheduler.step(noise_pred, t, latents)
-            latents = outputs.prev_sample
-            if i in [0, 10, 20, 30, 40, 49]:
-                print(
-                    f"[SGLANG] Stage4 step{i} - latents: min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
-                )
-            if i == 0:
-                print(
-                    f"[SGLANG] Stage4 step0 - latents after step: min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
-                )
-                print(
-                    f"[SGLANG] Step 0 RESULT - actual latents[0,0,0]: {latents[0,0,0].item():.6f}"
-                )
-        print(
-            f"[SGLANG] Stage4 final - latents stats: min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
-        )
-        print(f"[SGLANG] Stage4 final - latents[0,0,:5]: {latents[0,0,:5]}")
         batch.extra["shape_latents"] = latents
         return batch
 
@@ -410,35 +341,11 @@ class Hunyuan3DShapeExportStage(PipelineStage):
                 )
 
         latents = batch.extra["shape_latents"]
-        print(
-            f"[SGLANG] Stage5 - input latents: min={latents.min():.4f}, max={latents.max():.4f}"
-        )
-        print(
-            f"[DEBUG] Before VAE - latents stats: "
-            f"min={latents.min().item():.4f}, max={latents.max().item():.4f}, "
-            f"mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
-        )
 
         if self.config.shape_output_type != "latent":
             latents = 1.0 / self.vae.scale_factor * latents
-            print(f"[SGLANG] Stage5 - scale_factor: {self.vae.scale_factor}")
-            print(
-                f"[SGLANG] Stage5 - scaled latents: min={latents.min():.4f}, max={latents.max():.4f}"
-            )
-            print(
-                f"[DEBUG] After scale - latents: min={latents.min():.4f}, max={latents.max():.4f}"
-            )
             latents = self.vae(latents)
-            print(f"[SGLANG] Stage5 - decoded latents shape: {latents.shape}")
-            print(
-                f"[SGLANG] Stage5 - decoded latents: min={latents.min():.4f}, max={latents.max():.4f}"
-            )
-            print(
-                f"[SGLANG] Stage5 - output latents: min={latents.min():.4f}, max={latents.max():.4f}"
-            )
-            print(
-                f"[DEBUG] After VAE forward - latents: min={latents.min():.4f}, max={latents.max():.4f}"
-            )
+
             outputs = self.vae.latents2mesh(
                 latents,
                 bounds=self.config.shape_box_v,

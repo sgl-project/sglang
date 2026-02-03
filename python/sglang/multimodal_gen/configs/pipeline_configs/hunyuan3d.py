@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
+from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
+from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
+from sglang.multimodal_gen.configs.models.vaes.hunyuan3d import Hunyuan3DVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -13,11 +15,20 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 class Hunyuan3D2PipelineConfig(PipelineConfig):
     """Pipeline configuration for Hunyuan3D image-to-mesh generation."""
 
+    task_type: ModelTaskType = ModelTaskType.I2M
+
+    # Subfolder paths
     shape_subfolder: str = "hunyuan3d-dit-v2-0"
     paint_subfolder: str = "hunyuan3d-paint-v2-0"
     delight_subfolder: str = "hunyuan3d-delight-v2-0"
 
-    task_type: ModelTaskType = ModelTaskType.I2M
+    # DiT configuration
+    dit_config: DiTConfig = field(default_factory=Hunyuan3DDiTConfig)
+    dit_precision: str = "fp16"
+
+    # VAE configuration
+    vae_config: VAEConfig = field(default_factory=Hunyuan3DVAEConfig)
+    vae_precision: str = "fp32"
 
     # Shape model configuration
     shape_model_path: Optional[str] = None
@@ -50,4 +61,13 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     paint_texture_size: int = 2048
     paint_use_remesh: bool = True
     paint_save_glb: bool = True
-    paint_turbo_mode: bool = False  # Enable turbo mode for faster inference
+    paint_turbo_mode: bool = False
+
+    def __post_init__(self):
+        self.vae_config.load_encoder = False
+        self.vae_config.load_decoder = True
+
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        latent_shape = self.vae_config.arch_config.latent_shape
+        shape = (batch_size, *latent_shape)
+        return shape
