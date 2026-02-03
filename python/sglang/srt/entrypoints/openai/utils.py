@@ -70,3 +70,16 @@ def process_hidden_states_from_ret(
     if hidden_states is not None:
         hidden_states = hidden_states[-1] if len(hidden_states) > 1 else []
     return hidden_states
+
+
+def process_routed_experts_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[str]:
+    """Process routed experts from a ret item in non-streaming response."""
+    if not getattr(request, "return_routed_experts", False):
+        return None
+    return ret_item["meta_info"].get("routed_experts", None)
