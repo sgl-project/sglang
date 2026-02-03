@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 @pytest.mark.e2e
 @pytest.mark.model("qwen-vl-7b")
 @pytest.mark.workers(encode=1, prefill=1, decode=1)
+@pytest.mark.epd_backend("zmq_to_scheduler")
 @pytest.mark.parametrize("setup_backend", ["epd"], indirect=True)
 class TestEPDMMMU:
     """MMMU evaluation using EPD routing."""

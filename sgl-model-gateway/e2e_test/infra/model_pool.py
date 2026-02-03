@@ -153,6 +153,7 @@ class ModelInstance:
     key: str  # Unique instance key (e.g., "llama-8b:http:prefill_0")
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None  # For prefill workers in PD mode
+    transfer_backend: str | None = None  # For EPD prefill/decode workers
     last_used: float = 0.0  # Timestamp for MRU eviction
     _healthy: bool = False  # Track if initial health check passed
 
@@ -516,6 +517,7 @@ class ModelPool:
         bootstrap_port: int | None = None,
         ib_device: str | None = None,
         encoder_urls: list[str] | None = None,
+        transfer_backend: str | None = None,
         extra_args: list[str] | None = None,
         instance_key: str | None = None,
     ) -> ModelInstance:
@@ -529,6 +531,7 @@ class ModelPool:
             bootstrap_port: Bootstrap port for prefill workers in PD/EPD mode.
             ib_device: InfiniBand device for PD disaggregation.
             encoder_urls: Encoder worker URLs for EPD prefill workers.
+            transfer_backend: EPD transfer backend for prefill/decode workers.
             extra_args: Additional CLI args for specialized workers.
             instance_key: Custom instance key, or None to auto-generate.
 
@@ -636,6 +639,7 @@ class ModelPool:
             key=key,
             worker_type=worker_type,
             bootstrap_port=bootstrap_port,
+            transfer_backend=transfer_backend,
             last_used=time.time(),
         )
         self.instances[key] = instance
@@ -1101,6 +1105,7 @@ class ModelPool:
         wait_for_gpus: bool = True,
         gpu_wait_timeout: int = 300,
         encoder_urls: list[str] | None = None,
+        epd_transfer_backend: str | None = None,
     ) -> list[ModelInstance]:
         """Launch workers of any type.
 
@@ -1117,6 +1122,7 @@ class ModelPool:
                 are in use by other tests (with eviction enabled).
             gpu_wait_timeout: Max seconds to wait for GPUs (default 5 min).
             encoder_urls: Optional encoder URLs for EPD prefill workers.
+            epd_transfer_backend: Optional EPD transfer backend override.
 
         Returns:
             List of launched ModelInstance objects.
@@ -1127,7 +1133,11 @@ class ModelPool:
         while True:
             with self._lock:
                 result = self._launch_workers_unlocked(
-                    workers, startup_timeout, allow_eviction, encoder_urls=encoder_urls
+                    workers,
+                    startup_timeout,
+                    allow_eviction,
+                    encoder_urls=encoder_urls,
+                    epd_transfer_backend=epd_transfer_backend,
                 )
                 if result is not None:
                     return result
@@ -1157,6 +1167,7 @@ class ModelPool:
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
         allow_eviction: bool = True,
         encoder_urls: list[str] | None = None,
+        epd_transfer_backend: str | None = None,
     ) -> list[ModelInstance] | None:
         """Internal launch logic. Caller must hold _lock.
 
@@ -1270,7 +1281,11 @@ class ModelPool:
             if new_encoder_urls:
                 epd_encoder_urls.extend(new_encoder_urls)
 
-            transfer_backend = os.getenv("EPD_TRANSFER_BACKEND", "mooncake")
+            transfer_backend = (
+                epd_transfer_backend
+                if epd_transfer_backend is not None
+                else os.getenv("EPD_TRANSFER_BACKEND", "mooncake")
+            )
             epd_ib_device = ib_device if transfer_backend == "mooncake" else None
             prefill_extra_args = [
                 "--disaggregation-transfer-backend",
@@ -1305,6 +1320,7 @@ class ModelPool:
                     bootstrap_port=bootstrap_port,
                     ib_device=epd_ib_device,
                     encoder_urls=epd_encoder_urls or None,
+                    transfer_backend=transfer_backend,
                     extra_args=prefill_extra_args,
                     instance_key=w.key,
                 )
@@ -1317,6 +1333,7 @@ class ModelPool:
                     gpu_slot=slot_map.get(w.key),
                     worker_type=w.worker_type,
                     ib_device=epd_ib_device,
+                    transfer_backend=transfer_backend,
                     extra_args=decode_extra_args,
                     instance_key=w.key,
                 )

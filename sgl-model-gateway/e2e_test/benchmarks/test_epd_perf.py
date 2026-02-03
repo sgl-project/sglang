@@ -6,6 +6,7 @@ import pytest
 @pytest.mark.e2e
 @pytest.mark.model("qwen-vl-7b")
 @pytest.mark.workers(encode=2, prefill=2, decode=2)
+@pytest.mark.epd_backend("mooncake")
 @pytest.mark.parametrize("setup_backend", ["epd"], indirect=True)
 class TestEPDPerf:
     """Performance benchmark for EPD disaggregation router."""

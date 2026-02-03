@@ -306,6 +306,7 @@ def _setup_epd_backend(
     num_prefill = workers_config.get("prefill") or 1
     num_decode = workers_config.get("decode") or 1
     mode = ConnectionMode.GRPC
+    transfer_backend = get_marker_value(request, "epd_backend")
 
     existing_encodes = model_pool.get_workers_by_type(
         model_id, WorkerType.ENCODE, mode=mode
@@ -316,6 +317,19 @@ def _setup_epd_backend(
     existing_decodes = model_pool.get_workers_by_type(
         model_id, WorkerType.DECODE, mode=mode
     )
+
+    if transfer_backend:
+        def _filter_backend(workers):
+            matched = []
+            for w in workers:
+                if w.transfer_backend == transfer_backend:
+                    matched.append(w)
+                else:
+                    w.release()
+            return matched
+
+        existing_prefills = _filter_backend(existing_prefills)
+        existing_decodes = _filter_backend(existing_decodes)
 
     encodes = existing_encodes
     prefills = existing_prefills
@@ -368,6 +382,7 @@ def _setup_epd_backend(
                 workers_to_launch,
                 startup_timeout=300,
                 encoder_urls=encoder_urls,
+                epd_transfer_backend=transfer_backend,
             )
             if not new_instances:
                 pytest.fail(

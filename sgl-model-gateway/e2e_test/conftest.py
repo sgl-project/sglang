@@ -60,6 +60,13 @@ This module defines several pytest markers for configuring E2E tests:
         @pytest.mark.gateway(policy="random")
         @pytest.mark.gateway(extra_args=["--cache-routing"])
 
+@pytest.mark.epd_backend(name)
+    Configure the EPD transfer backend (e.g., "mooncake", "zmq_to_scheduler").
+
+    Examples:
+        @pytest.mark.epd_backend("mooncake")
+        @pytest.mark.epd_backend("zmq_to_scheduler")
+
 @pytest.mark.e2e
     Mark test as an end-to-end test requiring GPU workers.
 
