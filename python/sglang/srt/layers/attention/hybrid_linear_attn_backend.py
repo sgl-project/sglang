@@ -918,7 +918,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )  # [B, 1, HV, V]
             a_for_kernel = a.view(bs, 1, -1)  # [B, 1, HV]
             b_for_kernel = b.view(bs, 1, -1)  # [B, 1, HV]
-            # todo(yingyi): FlashInfer gated_delta_rule_decode expects state in [N, H, K, V]; SGLang stores [N, H, K, V].
+            # FlashInfer gated_delta_rule_decode expects state in [N, H, K, V]; SGLang stores [N, H, K, V].
             state_for_kernel = ssm_states[cache_indices]
             # FlashInfer uses DLPack; parameters must not require grad.
             a_log = layer.A_log.detach()
