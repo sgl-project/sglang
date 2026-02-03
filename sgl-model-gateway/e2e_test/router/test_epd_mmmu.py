@@ -11,7 +11,6 @@ Requirements:
 Configuration via markers:
     @pytest.mark.model("model-id")  # Override default model
     @pytest.mark.workers(encode=6, prefill=1, decode=1)  # Custom worker counts
-    @pytest.mark.epd_backend("zmq_to_scheduler")  # Transfer backend
     @pytest.mark.gateway(policy="round_robin")  # Gateway configuration
 
 Usage:
@@ -36,7 +35,6 @@ logger = logging.getLogger(__name__)
 @pytest.mark.e2e
 @pytest.mark.model("qwen-vl-7b")
 @pytest.mark.workers(encode=6, prefill=1, decode=1)
-@pytest.mark.epd_backend("zmq_to_scheduler")
 @pytest.mark.parametrize("setup_backend", ["epd"], indirect=True)
 class TestEPDMMMU:
     """MMMU evaluation tests using EPD disaggregated routing."""

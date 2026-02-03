@@ -1265,6 +1265,13 @@ class ModelPool:
 
             epd_encoder_urls: list[str] = list(encoder_urls) if encoder_urls else []
             new_encoder_urls: list[str] = []
+            encoder_transfer_backend = os.getenv(
+                "EPD_ENCODER_TRANSFER_BACKEND", "zmq_to_scheduler"
+            )
+            encode_extra_args = [
+                "--encoder-transfer-backend",
+                encoder_transfer_backend,
+            ]
 
             for w in encodes:
                 instance = self._launch_model(
@@ -1273,6 +1280,7 @@ class ModelPool:
                     gpu_slot=slot_map.get(w.key),
                     worker_type=w.worker_type,
                     ib_device=ib_device,
+                    extra_args=encode_extra_args,
                     instance_key=w.key,
                 )
                 instances.append(instance)
@@ -1284,12 +1292,17 @@ class ModelPool:
             transfer_backend = (
                 epd_transfer_backend
                 if epd_transfer_backend is not None
-                else os.getenv("EPD_TRANSFER_BACKEND", "mooncake")
+                else os.getenv(
+                    "EPD_KV_TRANSFER_BACKEND",
+                    os.getenv("EPD_TRANSFER_BACKEND", "mooncake"),
+                )
             )
             epd_ib_device = ib_device if transfer_backend == "mooncake" else None
             prefill_extra_args = [
                 "--disaggregation-transfer-backend",
                 transfer_backend,
+                "--encoder-transfer-backend",
+                encoder_transfer_backend,
                 "--mem-fraction-static",
                 "0.9",
                 "--disable-radix-cache",
@@ -1303,6 +1316,8 @@ class ModelPool:
             decode_extra_args = [
                 "--disaggregation-transfer-backend",
                 transfer_backend,
+                "--encoder-transfer-backend",
+                encoder_transfer_backend,
                 "--mem-fraction-static",
                 "0.9",
                 "--skip-server-warmup",
