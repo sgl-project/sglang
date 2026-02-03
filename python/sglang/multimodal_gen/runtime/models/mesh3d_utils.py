@@ -29,6 +29,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+# Import C++ mesh processor extension
+from sglang.multimodal_gen.csrc.render.mesh_processor import meshVerticeInpaint
 
 # =============================================================================
 # Camera Utilities
@@ -303,156 +305,6 @@ def remesh_mesh(
 
     ms.save_current_mesh(output_path)
     return output_path
-
-
-# =============================================================================
-# Mesh Texture Inpainting
-# =============================================================================
-
-
-def meshVerticeInpaint_smooth(
-    texture: np.ndarray,
-    mask: np.ndarray,
-    vtx_pos: np.ndarray,
-    vtx_uv: np.ndarray,
-    pos_idx: np.ndarray,
-    uv_idx: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Inpaint texture using mesh vertex connectivity.
-
-    This function propagates colors from painted vertices to unpainted vertices
-    using the mesh connectivity graph, weighted by inverse distance.
-
-    Args:
-        texture: Input texture [H, W, C], float32 in [0, 1]
-        mask: Valid region mask [H, W], uint8 (255 = valid)
-        vtx_pos: Vertex positions [V, 3]
-        vtx_uv: UV coordinates [V, 2]
-        pos_idx: Face vertex indices [F, 3]
-        uv_idx: Face UV indices [F, 3]
-
-    Returns:
-        new_texture: Inpainted texture [H, W, C]
-        new_mask: Updated mask [H, W]
-    """
-    texture_height, texture_width, texture_channel = texture.shape
-    vtx_num = vtx_pos.shape[0]
-
-    # Initialize vertex data
-    vtx_mask = np.zeros(vtx_num, dtype=np.float32)
-    vtx_color = [np.zeros(texture_channel, dtype=np.float32) for _ in range(vtx_num)]
-    uncolored_vtxs = []
-
-    # Build adjacency graph
-    G = [[] for _ in range(vtx_num)]
-
-    # Sample colors from texture for each vertex
-    for i in range(uv_idx.shape[0]):
-        for k in range(3):
-            vtx_uv_idx = uv_idx[i, k]
-            vtx_idx = pos_idx[i, k]
-            uv_v = int(round(vtx_uv[vtx_uv_idx, 0] * (texture_width - 1)))
-            uv_u = int(round((1.0 - vtx_uv[vtx_uv_idx, 1]) * (texture_height - 1)))
-
-            # Clamp UV coordinates
-            uv_u = max(0, min(uv_u, texture_height - 1))
-            uv_v = max(0, min(uv_v, texture_width - 1))
-
-            if mask[uv_u, uv_v] > 0:
-                vtx_mask[vtx_idx] = 1.0
-                vtx_color[vtx_idx] = texture[uv_u, uv_v].copy()
-            else:
-                uncolored_vtxs.append(vtx_idx)
-
-            # Add edge to adjacency graph
-            G[pos_idx[i, k]].append(pos_idx[i, (k + 1) % 3])
-
-    # Iteratively propagate colors
-    smooth_count = 2
-    last_uncolored_vtx_count = 0
-
-    while smooth_count > 0:
-        uncolored_vtx_count = 0
-
-        for vtx_idx in uncolored_vtxs:
-            sum_color = np.zeros(texture_channel, dtype=np.float32)
-            total_weight = 0.0
-            vtx_0 = vtx_pos[vtx_idx]
-
-            for connected_idx in G[vtx_idx]:
-                if vtx_mask[connected_idx] > 0:
-                    vtx1 = vtx_pos[connected_idx]
-                    dist = np.sqrt(np.sum((vtx_0 - vtx1) ** 2))
-                    dist_weight = 1.0 / max(dist, 1e-4)
-                    dist_weight *= dist_weight
-                    sum_color += vtx_color[connected_idx] * dist_weight
-                    total_weight += dist_weight
-
-            if total_weight > 0:
-                vtx_color[vtx_idx] = sum_color / total_weight
-                vtx_mask[vtx_idx] = 1.0
-            else:
-                uncolored_vtx_count += 1
-
-        if last_uncolored_vtx_count == uncolored_vtx_count:
-            smooth_count -= 1
-        else:
-            smooth_count += 1
-        last_uncolored_vtx_count = uncolored_vtx_count
-
-    # Write back colors to texture
-    new_texture = texture.copy()
-    new_mask = mask.copy()
-
-    for face_idx in range(uv_idx.shape[0]):
-        for k in range(3):
-            vtx_uv_idx = uv_idx[face_idx, k]
-            vtx_idx = pos_idx[face_idx, k]
-
-            if vtx_mask[vtx_idx] == 1.0:
-                uv_v = int(round(vtx_uv[vtx_uv_idx, 0] * (texture_width - 1)))
-                uv_u = int(round((1.0 - vtx_uv[vtx_uv_idx, 1]) * (texture_height - 1)))
-
-                # Clamp UV coordinates
-                uv_u = max(0, min(uv_u, texture_height - 1))
-                uv_v = max(0, min(uv_v, texture_width - 1))
-
-                new_texture[uv_u, uv_v] = vtx_color[vtx_idx]
-                new_mask[uv_u, uv_v] = 255
-
-    return new_texture, new_mask
-
-
-def meshVerticeInpaint(
-    texture: np.ndarray,
-    mask: np.ndarray,
-    vtx_pos: np.ndarray,
-    vtx_uv: np.ndarray,
-    pos_idx: np.ndarray,
-    uv_idx: np.ndarray,
-    method: str = "smooth",
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Inpaint texture using mesh connectivity.
-
-    Args:
-        texture: Input texture [H, W, C]
-        mask: Valid region mask [H, W]
-        vtx_pos: Vertex positions [V, 3]
-        vtx_uv: UV coordinates [V, 2]
-        pos_idx: Face vertex indices [F, 3]
-        uv_idx: Face UV indices [F, 3]
-        method: Inpainting method ("smooth")
-
-    Returns:
-        new_texture: Inpainted texture
-        new_mask: Updated mask
-    """
-    if method == "smooth":
-        return meshVerticeInpaint_smooth(
-            texture, mask, vtx_pos, vtx_uv, pos_idx, uv_idx
-        )
-    else:
-        raise ValueError(f"Invalid method '{method}'. Use 'smooth'.")
 
 
 # =============================================================================
@@ -1509,9 +1361,8 @@ __all__ = [
     "convert_obj_to_glb",
     "mesh_uv_wrap",
     "remesh_mesh",
-    # Mesh inpainting
+    # Mesh inpainting (C++ extension)
     "meshVerticeInpaint",
-    "meshVerticeInpaint_smooth",
     # Rendering utilities
     "stride_from_shape",
     "scatter_add_nd_with_count",
