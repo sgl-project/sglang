@@ -374,9 +374,7 @@ class ReasoningParser:
             reasoning_with_end = reasoning_part + think_end_token
         else:
             # No think_end_token found
-            # If we're in reasoning mode or force_reasoning, use all content
-            if self.detector._in_reasoning or getattr(
-                self.detector, "force_reasoning", False
+            if self.detector._in_reasoning:
             ):
                 reasoning_with_end = full_content
             else:
