@@ -43,6 +43,7 @@ import logging
 import re
 import time
 from enum import Enum, auto
+from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
@@ -95,8 +96,26 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+# Constant used as the base offset for MM (multimodal) pad values.
+# This ensures pad_values don't overlap with valid text token IDs.
+MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+    if vocab_size > MM_PAD_SHIFT_VALUE:
+        raise ValueError(
+            f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
+            f"MM pad_values may overlap with valid token IDs. "
+            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+        )
+
+
+def _compute_pad_value(hash: int) -> int:
+    """Compute pad value from hash."""
+    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
 class BaseFinishReason:
@@ -262,7 +281,7 @@ class MultimodalDataItem:
             import uuid
 
             self.hash = uuid.uuid4().int
-            self.pad_value = self.hash % (1 << 30)
+            self.pad_value = _compute_pad_value(self.hash)
             return
         if self.hash is None:
             if self.feature is not None:
@@ -271,7 +290,7 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -1096,6 +1115,9 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -2264,6 +2286,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            server_args = get_global_server_args()
+
+            if (
+                self.forward_mode.is_decode()
+                and server_args.enable_piecewise_cuda_graph
+                and not self.tree_cache.is_chunk_cache()
+            ):
+                return
+
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -2278,7 +2309,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            server_args = get_global_server_args()
                             pre_len = (
                                 pre_len - server_args.chunked_prefill_size
                                 if server_args.chunked_prefill_size > 0
