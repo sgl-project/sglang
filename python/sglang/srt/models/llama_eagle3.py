@@ -178,11 +178,11 @@ class LlamaModel(nn.Module):
         residual = None
         for layer in self.midlayers:
             hidden_states, residual = layer(
-              positions,
-              embeds,
-              hidden_states,
-              forward_batch,
-              residual,
+                positions,
+                embeds,
+                hidden_states,
+                forward_batch,
+                residual,
             )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
@@ -208,6 +208,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
+
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         self.load_lm_head_from_target = False
