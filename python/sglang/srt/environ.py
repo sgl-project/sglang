@@ -460,6 +460,9 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
+    # Forward native implementation for topk for model MiniMax-M2
+    FORWARD_NATIVE_TOPK = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
