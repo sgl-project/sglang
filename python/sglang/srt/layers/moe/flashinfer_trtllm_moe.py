@@ -174,7 +174,6 @@ def fake_trtllm_fp8_per_tensor_scale_moe_wrapper(
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
-    tile_tokens_dim: Optional[int] = None,
     routing_method_type: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
