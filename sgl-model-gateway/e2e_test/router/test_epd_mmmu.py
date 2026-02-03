@@ -1,4 +1,26 @@
-"""EPD routing tests for multimodal MMMU evaluation."""
+"""MMMU evaluation tests for EPD (Encode-Prefill-Decode) disaggregated routing.
+
+EPD disaggregation splits encoder, prefill, and decode across different
+workers for improved throughput and resource utilization.
+
+Requirements:
+    - sgl_kernel package
+    - GPUs: num_encode + num_prefill + num_decode (default: 8 GPUs for 6+1+1)
+    - Optional: InfiniBand for high-performance transfers
+
+Configuration via markers:
+    @pytest.mark.model("model-id")  # Override default model
+    @pytest.mark.workers(encode=6, prefill=1, decode=1)  # Custom worker counts
+    @pytest.mark.epd_backend("zmq_to_scheduler")  # Transfer backend
+    @pytest.mark.gateway(policy="round_robin")  # Gateway configuration
+
+Usage:
+    # Basic (6 encode + 1 prefill + 1 decode)
+    pytest e2e_test/router/test_epd_mmmu.py -v
+
+    # Run specific test
+    pytest e2e_test/router/test_epd_mmmu.py::TestEPDMMMU::test_epd_mmmu -v
+"""
 
 from __future__ import annotations
 
@@ -13,13 +35,18 @@ logger = logging.getLogger(__name__)
 
 @pytest.mark.e2e
 @pytest.mark.model("qwen-vl-7b")
-@pytest.mark.workers(encode=1, prefill=1, decode=1)
+@pytest.mark.workers(encode=6, prefill=1, decode=1)
 @pytest.mark.epd_backend("zmq_to_scheduler")
 @pytest.mark.parametrize("setup_backend", ["epd"], indirect=True)
 class TestEPDMMMU:
-    """MMMU evaluation using EPD routing."""
+    """MMMU evaluation tests using EPD disaggregated routing."""
 
     def test_epd_mmmu(self, setup_backend):
+        """Basic MMMU evaluation with EPD disaggregation.
+
+        Runs MMMU with 6 encode + 1 prefill + 1 decode worker and validates
+        accuracy meets threshold (>= 0.45).
+        """
         _, model, _, gateway = setup_backend
 
         args = SimpleNamespace(
@@ -35,3 +62,4 @@ class TestEPDMMMU:
         assert (
             metrics["score"] >= 0.45
         ), f"EPD MMMU score {metrics['score']:.2f} below threshold 0.45"
+        logger.info("EPD MMMU score: %.2f (threshold: 0.45)", metrics["score"])
