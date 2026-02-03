@@ -1,6 +1,6 @@
-# Comprehensive Guide: DP, DPA, and Router
+# Comprehensive Guide: DP, DPA, and SGLang Model Gateway
 
-This guide explains Data Parallelism Attention (DPA), a parallelism strategy optimized for MLA-based models like DeepSeek, and how to deploy it with Router-based DP for production.
+This guide explains Data Parallelism Attention (DPA), a parallelism strategy optimized for MLA-based models like DeepSeek, and how to deploy it with SGLang Model Gateway (SMG) for production.
 
 ## Understanding Data Parallelism (DP)
 
@@ -33,7 +33,7 @@ The most common parallelism strategy for inference is **Tensor Parallelism (TP)*
 DPA addresses these limitations by applying **data parallelism specifically to the attention component**. Each DP worker:
 - Processes different batches independently
 - Maintains its own KV cache (no duplication)
-- Enables 4x larger batch sizes due to memory savings
+- Enables significantly larger batch sizes due to memory savings
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -72,8 +72,8 @@ DPA addresses these limitations by applying **data parallelism specifically to t
 **Key benefits of DPA:**
 
 1. **Significantly reduced KV cache memory**: Each DP worker only stores KV cache for its own batches
-2. **Larger batch sizes**: Memory savings allow for 4x larger batch sizes
-3. **Up to 1.9x decoding throughput improvement**: Demonstrated on DeepSeek models
+2. **Larger batch sizes**: Memory savings enable larger batch sizes
+3. **Improved decoding throughput**: Significant throughput gains for MLA-based models
 4. **Independent batch handling**: Each DP worker handles different types of batches (prefill, decode, idle) independently
 
 ### DPA with Expert Parallelism for MoE
@@ -100,15 +100,9 @@ For detailed EP configuration (DeepEP, Two-Batch Overlap, EPLB), see [Expert Par
 
 ### Target Models
 
-DPA is designed for MLA-based architectures (e.g., DeepSeek family) and is enabled **explicitly** via the `--enable-dp-attention` server flag.
+**DPA is specifically optimized for MLA (Multi-Head Latent Attention) based models**, such as the DeepSeek family. For standard multi-head attention models (like Llama, Qwen, etc.), standard DP or TP is recommended.
 
-| Model Family | Architecture Feature | How to enable |
-|--------------|---------------------|---------------|
-| **DeepSeek-V2** | MLA with single KV head | Add `--enable-dp-attention` |
-| **DeepSeek-V3 / V3.1 / R1** | MLA with single KV head | Add `--enable-dp-attention` |
-| **DeepSeek-Coder-V2** | MLA with single KV head | Add `--enable-dp-attention` |
-
-**Note**: DPA is optimized for MLA-based architectures. For standard multi-head attention models (like Llama, Qwen, etc.), standard DP or TP is recommended.
+To enable DPA, add `--enable-dp-attention` to your server launch command.
 
 ### Activation Logic
 
@@ -123,7 +117,7 @@ python -m sglang.launch_server \
 
 ---
 
-## Native DP vs. Router-Based DP
+## Native DP vs. SGLang Model Gateway (SMG)
 
 ### Native DP Mode
 
@@ -143,24 +137,24 @@ python -m sglang.launch_server \
 - Limited load balancing intelligence
 - No cache-aware routing
 
-### Router-Based DP (Recommended)
+### SGLang Model Gateway (Recommended)
 
-**We strongly recommend using the SGLang Router for production-grade Data Parallelism.** The Router provides significant advantages over native DP mode.
+**We strongly recommend using the SGLang Model Gateway (SMG) for production-grade Data Parallelism.** SMG provides significant advantages over native DP mode.
 
 ```bash
-# Router-based DP mode (Recommended)
+# SMG-based DP mode (Recommended)
 python -m sglang_router.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --dp-size 4
 ```
 
-**Advantages of Router-Based DP:**
+**Advantages of SMG-Based DP:**
 
-| Feature | Native DP | Router-Based DP |
-|---------|-----------|-----------------|
+| Feature | Native DP | SMG-Based DP |
+|---------|-----------|--------------|
 | **Load Balancing** | Basic round-robin | Advanced policies (cache-aware, power-of-two, etc.) |
-| **Cache Awareness** | ❌ No | ✅ Yes - up to 3.8x higher cache hit rate |
-| **Throughput** | Baseline | Up to 1.9x improvement |
+| **Cache Awareness** | ❌ No | ✅ Yes - significantly higher cache hit rate |
+| **Throughput** | Baseline | Significant improvement |
 | **Multi-Node Support** | Limited | ✅ Full support |
 | **Worker Health Monitoring** | Basic | ✅ Circuit breakers, health checks |
 | **Reliability** | Basic | ✅ Retries, rate limiting, queuing |
@@ -169,9 +163,9 @@ python -m sglang_router.launch_server \
 
 ### Comparison Summary
 
-#### Cache-Aware Router Performance
+**Cache-Aware Routing Performance**
 
-The cache-aware routing policy in SGLang Router significantly improves performance for workloads with shared prefixes:
+The cache-aware routing policy in SMG significantly improves performance for workloads with shared prefixes:
 
 | Metric | Without Cache-Aware | With Cache-Aware Router |
 |--------|---------------------|-------------------------|
@@ -180,14 +174,14 @@ The cache-aware routing policy in SGLang Router significantly improves performan
 
 *Benchmark from [SGLang v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), workload with multiple long prefix groups, 8x A100 80GB GPUs, dp-size=8*
 
-#### When to Use Each
+**When to Use Each**
 
 **Use Native DP when:**
 - Quick prototyping or development
 - Single-node deployments with simple workloads
 - You don't need advanced load balancing
 
-**Use Router-Based DP when:**
+**Use SMG-Based DP when:**
 - Production deployments
 - Multi-node distributed setups
 - Workloads with shared prefixes (high cache reuse potential)
@@ -196,11 +190,11 @@ The cache-aware routing policy in SGLang Router significantly improves performan
 
 ---
 
-## Practical Implementation: DP Routing via Router
+## Practical Implementation: DP Routing via SMG
 
 ### Quick Start
 
-#### Installation
+**Installation**
 
 ```bash
 pip install sglang-router
@@ -208,9 +202,9 @@ pip install sglang-router
 pip install "sglang[all]"
 ```
 
-#### Option 1: Co-launch Workers and Router (Simplest)
+**Option 1: Co-launch Workers and SMG (Simplest)**
 
-This is the easiest way to get started - the router and workers are launched together:
+This is the easiest way to get started - SMG and workers are launched together:
 
 ```bash
 python -m sglang_router.launch_server \
@@ -220,7 +214,7 @@ python -m sglang_router.launch_server \
     --port 30000
 ```
 
-#### Option 2: Separate Launch (Multi-Node)
+**Option 2: Separate Launch (Multi-Node)**
 
 For distributed deployments across multiple machines:
 
@@ -238,7 +232,7 @@ python -m sglang.launch_server \
     --port 8000
 ```
 
-**Step 2: Launch router pointing to workers**
+**Step 2: Launch SMG pointing to workers**
 
 ```bash
 python -m sglang_router.launch_router \
@@ -248,12 +242,12 @@ python -m sglang_router.launch_router \
     --port 30000
 ```
 
-#### Option 3: Dynamic Worker Registration
+**Option 3: Dynamic Worker Registration**
 
 For elastic deployments where workers can be added/removed dynamically:
 
 ```bash
-# Launch router first
+# Launch SMG first
 python -m sglang_router.launch_router \
     --policy cache_aware \
     --host 0.0.0.0 \
@@ -271,7 +265,7 @@ curl -X POST http://localhost:30000/workers \
 
 ### Load Balancing Policies
 
-The router supports multiple load balancing policies:
+SMG supports multiple load balancing policies:
 
 | Policy | Description | Best For |
 |--------|-------------|----------|
@@ -280,7 +274,7 @@ The router supports multiple load balancing policies:
 | `random` | Random worker selection | Baseline, testing |
 | `power_of_two` | Samples two workers, picks lighter one | Low latency requirements |
 
-#### Cache-Aware Policy (Default, Recommended)
+**Cache-Aware Policy (Default, Recommended)**
 
 The cache-aware policy provides the best performance for most workloads:
 
@@ -304,7 +298,7 @@ python -m sglang_router.launch_router \
 ### Best Practices
 
 1. **Start with `cache_aware` policy** - It provides the best balance between cache locality and load distribution for most workloads
-2. **Use Router-Based DP for production** - Prefer `sglang_router.launch_server` over `sglang.launch_server` for better reliability and observability
+2. **Use SMG for production** - Prefer `sglang_router.launch_server` over `sglang.launch_server` for better reliability and observability
 3. **Enable health checks** - Configure `--router-health-check-interval-secs` to detect and remove unhealthy workers automatically
 
 **Recommended command with best practices applied:**
@@ -324,7 +318,7 @@ For advanced configuration (circuit breakers, retries, Prometheus metrics, K8s i
 
 ### Verifying Traffic Distribution
 
-After launching your router, verify that traffic is being distributed correctly:
+After launching SMG, verify that traffic is being distributed correctly:
 
 **1. Check worker status:**
 
@@ -356,14 +350,14 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway](sgl_model_
 | Strategy | Use Case | Key Benefit |
 |----------|----------|-------------|
 | **Native DP** (`--dp-size`) | Development, simple workloads | Easy to configure, single process |
-| **Router-Based DP** | Production, multi-node | Cache-aware routing, high availability |
-| **DPA** | DeepSeek/MLA models | Eliminates KV cache duplication, 1.9x throughput |
-| **DPA + EP** | DeepSeek MoE models | Up to 5x throughput vs vanilla TP |
+| **SMG-Based DP** | Production, multi-node | Cache-aware routing, high availability |
+| **DPA** | DeepSeek/MLA models | Eliminates KV cache duplication, improved throughput |
+| **DPA + EP** | DeepSeek MoE models | Significant throughput improvement vs vanilla TP |
 
 **Recommended production setup for DeepSeek:**
 1. Enable **DPA** for attention layers (`--enable-dp-attention`)
 2. Enable **EP** for MoE layers (`--ep 8 --moe-a2a-backend deepep`)
-3. Use **Router-Based DP** with **cache_aware** policy
+3. Use **SMG** with **cache_aware** policy
 
 **Related documentation:**
 - [Expert Parallelism](expert_parallelism.md) - DeepEP, Two-Batch Overlap, EPLB
