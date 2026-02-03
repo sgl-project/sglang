@@ -1104,19 +1104,6 @@ class SWARadixCache(BasePrefixCache):
 
         self.full_evictable_size_ -= len(node.key)
 
-    def _collect_leaves(self) -> List[TreeNode]:
-        ret_list = []
-        stack = [self.root_node]
-
-        while stack:
-            cur_node = stack.pop()
-            if len(cur_node.children) == 0:
-                ret_list.append(cur_node)
-            else:
-                stack.extend(cur_node.children.values())
-
-        return ret_list
-
     def _collect_nontombstone_nodes(self) -> List[TreeNode]:
         ret_list = []
         stack = [self.root_node]
