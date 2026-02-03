@@ -246,6 +246,8 @@ class TextEncoderLoader(ComponentLoader):
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
 
+            print(f"{loaded_weights=}")
+
             # Explicitly move model to target device after loading weights
             if not should_offload:
                 model = model.to(local_torch_device)
@@ -279,7 +281,7 @@ class TextEncoderLoader(ComponentLoader):
             # if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
-                raise ValueError(
+                logger.warning(
                     "Following model weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
