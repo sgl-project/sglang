@@ -457,7 +457,6 @@ class ReasoningParser:
         else:
             # No think_end_token found
             if self.detector._in_reasoning:
-            ):
                 reasoning_with_end = full_content
             else:
                 return 0
