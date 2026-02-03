@@ -132,8 +132,8 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         self.add_stage(
             stage_name="shape_denoising_stage",
             stage=Hunyuan3DShapeDenoisingStage(
+                transformer=self.get_module("hy3dshape_model"),
                 scheduler=self.get_module("hy3dshape_scheduler"),
-                model=self.get_module("hy3dshape_model"),
             ),
         )
         self.add_stage(

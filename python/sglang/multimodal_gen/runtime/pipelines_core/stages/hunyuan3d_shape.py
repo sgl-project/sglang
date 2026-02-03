@@ -21,9 +21,15 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.mesh3d_utils import export_to_trimesh
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 
 logger = init_logger(__name__)
 
@@ -148,13 +154,6 @@ class Hunyuan3DShapePreprocessStage(PipelineStage):
         cond_inputs = _prepare_shape_image(self.image_processor, batch.image_path)
         image = cond_inputs.pop("image")
 
-        print(f"[SGLANG] Stage1 - image shape: {image.shape}")
-        print(
-            f"[SGLANG] Stage1 - image stats: min={image.min():.4f}, max={image.max():.4f}, mean={image.mean():.4f}"
-        )
-        if "mask" in cond_inputs:
-            print(f"[SGLANG] Stage1 - mask shape: {cond_inputs['mask'].shape}")
-
         batch.extra["shape_cond_inputs"] = cond_inputs
         batch.extra["shape_image"] = image
         return batch
@@ -197,8 +196,8 @@ class Hunyuan3DShapeConditioningStage(PipelineStage):
 
             cond = cat_recursive(cond, un_cond)
 
-        batch.extra["shape_cond"] = cond
-        batch.extra["shape_do_cfg"] = do_cfg
+        batch.prompt_embeds = [cond]
+        batch.do_classifier_free_guidance = do_cfg
         batch.extra["shape_image"] = image
         return batch
 
@@ -233,87 +232,211 @@ class Hunyuan3DShapeLatentStage(PipelineStage):
             sigmas=sigmas,
         )
 
-        print(f"[DEBUG] sigmas: {sigmas}")
-        print(f"[DEBUG] timesteps: {timesteps}")
-
         generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(batch.seed)
 
         latents = self._prepare_latents(batch_size, dtype, device, generator)
 
-        print(f"[SGLANG] Stage3 - latents shape: {latents.shape}")
-        print(
-            f"[SGLANG] Stage3 - latents stats: min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
-        )
-        print(f"[SGLANG] Stage3 - latents[0,0,:5]: {latents[0,0,:5]}")
-        print(f"[DEBUG] seed: {batch.seed}")
-        print(f"[DEBUG] latents shape: {latents.shape}")
-        print(
-            f"[DEBUG] latents stats: min={latents.min():.4f}, max={latents.max():.4f}, mean={latents.mean():.4f}"
-        )
         guidance = None
         if hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True:
             guidance = torch.tensor(
                 [batch.guidance_scale] * batch_size, device=device, dtype=dtype
             )
 
-        batch.extra["shape_timesteps"] = timesteps
-        batch.extra["shape_latents"] = latents
+        batch.timesteps = timesteps
+        batch.latents = latents
         batch.extra["shape_guidance"] = guidance
         return batch
 
 
-class Hunyuan3DShapeDenoisingStage(PipelineStage):
-    """Denoising stage for shape generation."""
+class Hunyuan3DShapeDenoisingStage(DenoisingStage):
+    """Denoising stage for Hunyuan3D shape generation.
 
-    def __init__(self, scheduler: Any, model: Any) -> None:
-        super().__init__()
-        self.scheduler = scheduler
-        self.model = model
+    Inherits from DenoisingStage and adapts methods for Hunyuan3D-specific:
+    - Conditioning structure (dict-based)
+    - Timestep normalization
+    - CFG handling (concat latents pattern)
+    """
 
+    def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
+        super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
+
+    def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
+        """Prepare Hunyuan3D-specific variables for the denoising loop."""
+        timesteps = batch.timesteps
+        if timesteps is None:
+            raise ValueError("Timesteps must be provided")
+
+        latents = batch.latents
+        if latents is None:
+            raise ValueError("Latents must be provided")
+
+        cond = batch.prompt_embeds[0] if batch.prompt_embeds else None
+        if cond is None:
+            raise ValueError("Conditioning (prompt_embeds) must be provided")
+
+        guidance = batch.extra.get("shape_guidance")
+        do_cfg = batch.do_classifier_free_guidance
+
+        return {
+            "timesteps": timesteps,
+            "latents": latents,
+            "cond": cond,
+            "guidance": guidance,
+            "do_cfg": do_cfg,
+            "num_inference_steps": batch.num_inference_steps,
+        }
+
+    def _predict_noise(
+        self,
+        current_model,
+        latent_model_input,
+        timestep,
+        target_dtype,
+        guidance: torch.Tensor,
+        **kwargs,
+    ):
+        """Hunyuan3D-specific noise prediction with normalized timestep."""
+        cond = kwargs.get("encoder_hidden_states")
+        timestep_norm = timestep / self.scheduler.config.num_train_timesteps
+        return current_model(latent_model_input, timestep_norm, cond, guidance=guidance)
+
+    def _predict_noise_with_cfg(
+        self,
+        current_model,
+        latent_model_input: torch.Tensor,
+        timestep,
+        batch: Req,
+        timestep_index: int,
+        attn_metadata,
+        target_dtype,
+        current_guidance_scale,
+        image_kwargs: dict[str, Any],
+        pos_cond_kwargs: dict[str, Any],
+        neg_cond_kwargs: dict[str, Any],
+        server_args,
+        guidance,
+        latents,
+    ):
+        """Hunyuan3D-specific CFG: concat latents, single forward, then split."""
+        cond = pos_cond_kwargs.get("encoder_hidden_states")
+        do_cfg = batch.do_classifier_free_guidance
+
+        if do_cfg:
+            latent_input = torch.cat([latent_model_input] * 2)
+        else:
+            latent_input = latent_model_input
+
+        timestep_expanded = timestep.expand(latent_input.shape[0]).to(latents.dtype)
+
+        with set_forward_context(
+            current_timestep=timestep_index,
+            attn_metadata=attn_metadata,
+            forward_batch=batch,
+        ):
+            noise_pred = self._predict_noise(
+                current_model=current_model,
+                latent_model_input=latent_input,
+                timestep=timestep_expanded,
+                target_dtype=target_dtype,
+                guidance=guidance,
+                encoder_hidden_states=cond,
+            )
+
+        if do_cfg:
+            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+            noise_pred = noise_pred_uncond + current_guidance_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
+
+        return noise_pred
+
+    def _post_denoising_loop(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        trajectory_latents: list,
+        trajectory_timesteps: list,
+        server_args: ServerArgs,
+        is_warmup: bool = False,
+    ):
+        """Store final latents in standard batch attribute."""
+        batch.latents = latents
+
+    @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        timesteps = batch.extra["shape_timesteps"]
-        latents = batch.extra["shape_latents"]
-        cond = batch.extra["shape_cond"]
-        guidance = batch.extra["shape_guidance"]
-        do_cfg = batch.extra["shape_do_cfg"]
+        """Run the Hunyuan3D denoising loop."""
+        prepared = self._prepare_denoising_loop(batch, server_args)
+        timesteps = prepared["timesteps"]
+        latents = prepared["latents"]
+        cond = prepared["cond"]
+        guidance = prepared["guidance"]
+        do_cfg = prepared["do_cfg"]
+        num_inference_steps = prepared["num_inference_steps"]
 
-        for i, t in enumerate(timesteps):
-            with StageProfiler(
-                f"denoising_step_{i}",
-                logger=logger,
-                timings=batch.timings,
-                perf_dump_path_provided=batch.perf_dump_path is not None,
-            ):
-                if do_cfg:
-                    latent_model_input = torch.cat([latents] * 2)
-                else:
-                    latent_model_input = latents
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        is_warmup = batch.is_warmup
 
-                timestep = t.expand(latent_model_input.shape[0]).to(latents.dtype)
-                timestep = timestep / self.scheduler.config.num_train_timesteps
-
-                with set_forward_context(
-                    current_timestep=i,
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                noise_pred = self._predict_noise_with_cfg(
+                    current_model=self.transformer,
+                    latent_model_input=latents,
+                    timestep=t,
+                    batch=batch,
+                    timestep_index=i,
                     attn_metadata=None,
-                    forward_batch=batch,
-                ):
-                    noise_pred = self.model(
-                        latent_model_input, timestep, cond, guidance=guidance
-                    )
-
-                if do_cfg:
-                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + batch.guidance_scale * (
-                        noise_pred_cond - noise_pred_uncond
-                    )
+                    target_dtype=latents.dtype,
+                    current_guidance_scale=batch.guidance_scale,
+                    image_kwargs={},
+                    pos_cond_kwargs={"encoder_hidden_states": cond},
+                    neg_cond_kwargs={},
+                    server_args=server_args,
+                    guidance=guidance,
+                    latents=latents,
+                )
 
                 outputs = self.scheduler.step(noise_pred, t, latents)
                 latents = outputs.prev_sample
 
-        batch.extra["shape_latents"] = latents
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps
+                    and (i + 1) % self.scheduler.order == 0
+                    and progress_bar is not None
+                ):
+                    progress_bar.update()
+
+                if not is_warmup:
+                    self.step_profile()
+
+        self._post_denoising_loop(
+            batch=batch,
+            latents=latents,
+            trajectory_latents=[],
+            trajectory_timesteps=[],
+            server_args=server_args,
+            is_warmup=is_warmup,
+        )
         return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify Hunyuan3D denoising stage inputs."""
+        result = VerificationResult()
+        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
+        result.add_check("latents", batch.latents, V.is_tensor)
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
+        result.add_check(
+            "num_inference_steps", batch.num_inference_steps, V.positive_int
+        )
+        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify Hunyuan3D denoising stage outputs."""
+        result = VerificationResult()
+        result.add_check("latents", batch.latents, V.is_tensor)
+        return result
 
 
 class Hunyuan3DShapeExportStage(PipelineStage):
@@ -325,7 +448,6 @@ class Hunyuan3DShapeExportStage(PipelineStage):
         self.config = config
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        # Update surface extractor if specified
         if self.config.shape_mc_algo is not None:
             try:
                 from sglang.multimodal_gen.runtime.models.vaes.hunyuan3d_vae import (
@@ -340,7 +462,7 @@ class Hunyuan3DShapeExportStage(PipelineStage):
                     f"Could not load SurfaceExtractors for mc_algo={self.config.shape_mc_algo}"
                 )
 
-        latents = batch.extra["shape_latents"]
+        latents = batch.latents
 
         if self.config.shape_output_type != "latent":
             latents = 1.0 / self.vae.scale_factor * latents
