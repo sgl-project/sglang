@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
@@ -600,6 +601,96 @@ class TestBufferLossBugFix(CustomTestCase):
         self.assertEqual(result.reasoning_text, "")
         self.assertTrue(detector._in_reasoning)
         self.assertTrue(detector.stripped_think_start)
+
+
+class TestCalculateReasoningTokens(CustomTestCase):
+    """Test cases for calculate_reasoning_tokens method."""
+
+    def setUp(self):
+        """Set up mock tokenizer for testing."""
+        self.mock_tokenizer = Mock()
+        self.mock_tokenizer.encode.return_value = [1, 2, 3, 4, 5]  # 5 tokens
+
+    def test_calculate_reasoning_tokens_with_end_token(self):
+        """Test calculating reasoning tokens when end token is present."""
+        parser = ReasoningParser("qwen3")
+        full_content = "<think>Let me think about this</think>The answer is 42."
+
+        # Mock tokenizer to return specific token count for reasoning part
+        self.mock_tokenizer.encode.return_value = list(range(10))  # 10 tokens
+
+        tokens = parser.calculate_reasoning_tokens(full_content, self.mock_tokenizer)
+
+        # Should include reasoning content + end_token
+        self.assertGreater(tokens, 0)
+        # Verify encode was called with reasoning part + end_token
+        call_args = self.mock_tokenizer.encode.call_args[0][0]
+        self.assertIn("Let me think about this", call_args)
+        self.assertIn("</think>", call_args)
+
+    def test_calculate_reasoning_tokens_without_end_token_force_reasoning(self):
+        """Test calculating reasoning tokens without end token but with force_reasoning."""
+        parser = ReasoningParser("deepseek-r1")  # force_reasoning=True
+        full_content = "I need to think about this step by step."
+
+        self.mock_tokenizer.encode.return_value = list(range(8))  # 8 tokens
+
+        tokens = parser.calculate_reasoning_tokens(full_content, self.mock_tokenizer)
+
+        # Should count all content as reasoning
+        self.assertGreater(tokens, 0)
+        call_args = self.mock_tokenizer.encode.call_args[0][0]
+        self.assertIn("I need to think about this step by step.", call_args)
+
+    def test_calculate_reasoning_tokens_without_end_token_no_reasoning(self):
+        """Test calculating reasoning tokens when no end token and not in reasoning mode."""
+        parser = ReasoningParser("qwen3")  # force_reasoning=False
+        full_content = "Just normal text without reasoning tokens."
+
+        tokens = parser.calculate_reasoning_tokens(full_content, self.mock_tokenizer)
+
+        # Should return 0 when not in reasoning mode and no end token
+        self.assertEqual(tokens, 0)
+
+    def test_calculate_reasoning_tokens_with_start_token(self):
+        """Test calculating reasoning tokens includes start token when present."""
+        parser = ReasoningParser("qwen3")
+        full_content = "<think>thinking</think>answer"
+
+        self.mock_tokenizer.encode.return_value = list(range(5))
+
+        tokens = parser.calculate_reasoning_tokens(full_content, self.mock_tokenizer)
+
+        # Should include start_token in the count
+        self.assertGreater(tokens, 0)
+        call_args = self.mock_tokenizer.encode.call_args[0][0]
+        self.assertIn("<think>", call_args)
+
+    def test_calculate_reasoning_tokens_empty_reasoning(self):
+        """Test calculating reasoning tokens for empty reasoning block."""
+        parser = ReasoningParser("qwen3")
+        full_content = "<think></think>answer"
+
+        self.mock_tokenizer.encode.return_value = [1, 2]  # Just start and end tokens
+
+        tokens = parser.calculate_reasoning_tokens(full_content, self.mock_tokenizer)
+
+        # Should count at least the tokens
+        self.assertGreaterEqual(tokens, 0)
+
+    def test_calculate_reasoning_tokens_kimi_format(self):
+        """Test calculating reasoning tokens for Kimi format."""
+        parser = ReasoningParser("kimi")
+        full_content = "◁think▷Let me consider◁/think▷The answer"
+
+        self.mock_tokenizer.encode.return_value = list(range(6))
+
+        tokens = parser.calculate_reasoning_tokens(full_content, self.mock_tokenizer)
+
+        self.assertGreater(tokens, 0)
+        call_args = self.mock_tokenizer.encode.call_args[0][0]
+        self.assertIn("◁think▷", call_args)
+        self.assertIn("◁/think▷", call_args)
 
 
 if __name__ == "__main__":

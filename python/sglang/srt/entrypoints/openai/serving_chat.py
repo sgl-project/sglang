@@ -612,6 +612,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        reasoning_tokens = {}
         routed_experts = {}
 
         try:
@@ -688,7 +689,6 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
-
                         # Add usage stats if continuous_usage_stats is enabled
                         if (
                             request.stream_options
@@ -812,6 +812,25 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            if (
+                self.tokenizer_manager.server_args.enable_reasoning_tokens
+                and self.reasoning_parser
+            ):
+                is_force_reasoning = (
+                    self.template_manager.force_reasoning
+                    or self._get_reasoning_from_request(request)
+                )
+                reasoning_parser = ReasoningParser(
+                    self.reasoning_parser,
+                    request.stream_reasoning,
+                    is_force_reasoning,
+                )
+                for index, full_content in stream_buffers.items():
+                    reasoning_tokens[index] = (
+                        reasoning_parser.calculate_reasoning_tokens(
+                            full_content, self.tokenizer_manager.tokenizer
+                        )
+                    )
             if request.return_routed_experts and routed_experts:
                 for index, choice_routed_experts in routed_experts.items():
                     if choice_routed_experts is not None:
@@ -841,6 +860,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    reasoning_tokens=reasoning_tokens,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -919,7 +939,14 @@ class OpenAIServingChat(OpenAIServingBase):
                         force_reasoning=is_force_reasoning,
                         request=request,
                     )
+                    if self.tokenizer_manager.server_args.enable_reasoning_tokens:
+                        ret_item["meta_info"]["reasoning_tokens"] = (
+                            parser.calculate_reasoning_tokens(
+                                text, self.tokenizer_manager.tokenizer
+                            )
+                        )
                     reasoning_text, text = parser.parse_non_stream(text)
+
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
