@@ -481,9 +481,12 @@ class HFRunner:
                 ),
             )
 
-            text = self.tokenizer.decode(
-                outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
-            )
+            # Use incremental decoding to match SRT's behavior:
+            # Decode full sequence, then extract new text by string slicing.
+            # This preserves word boundary spaces (e.g., "on the" vs "on" + "the").
+            input_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            full_text = self.tokenizer.decode(outputs[0][0], skip_special_tokens=True)
+            text = full_text[len(input_text) :]
 
             # Check if the text is empty or only whitespace.
             if not text.strip():
