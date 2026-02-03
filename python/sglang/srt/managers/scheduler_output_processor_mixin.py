@@ -47,16 +47,14 @@ class SchedulerOutputProcessorMixin:
     """
 
     def _get_storage_backend_type(self) -> str:
-        """Get storage backend type from tree_cache, caching the result."""
-        if not hasattr(self, "_cached_storage_backend_type"):
-            storage_backend_type = "none"
-            cache_controller = getattr(self.tree_cache, "cache_controller", None)
-            if cache_controller and hasattr(cache_controller, "storage_backend"):
-                storage_backend = cache_controller.storage_backend
-                if storage_backend is not None:
-                    storage_backend_type = type(storage_backend).__name__
-            self._cached_storage_backend_type = storage_backend_type
-        return self._cached_storage_backend_type
+        """Get storage backend type from tree_cache."""
+        storage_backend_type = "none"
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        if cache_controller and hasattr(cache_controller, "storage_backend"):
+            storage_backend = cache_controller.storage_backend
+            if storage_backend is not None:
+                storage_backend_type = type(storage_backend).__name__
+        return storage_backend_type
 
     def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
         """Get detailed cache breakdown for a request, if available.
