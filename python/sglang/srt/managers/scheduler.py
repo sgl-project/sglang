@@ -1497,7 +1497,6 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
-            session_prefix_len = 0
         else:
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
@@ -1508,7 +1507,6 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
-            session_prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -1517,11 +1515,13 @@ class Scheduler(
             # For session requests, adjust mm_inputs offsets by the prefix length.
             # Session.create_req prepends previous context to origin_input_ids,
             # so offsets from the new prompt need to be shifted.
-            if session_prefix_len > 0:
+            if len(recv_req.input_ids) < len(req.origin_input_ids):  # Session continuation
+                assert recv_req.session_params.id in self.sessions
+                prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
                 for mm_item in image_inputs.mm_items:
                     if mm_item.offsets:
                         mm_item.offsets = [
-                            (start + session_prefix_len, end + session_prefix_len)
+                            (start + prefix_len, end + prefix_len)
                             for start, end in mm_item.offsets
                         ]
 
