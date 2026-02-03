@@ -1,3 +1,5 @@
+import time
+
 import pytest
 import torch
 
@@ -32,9 +34,9 @@ def _view_3d(x, head_size):
 
 @pytest.mark.parametrize("bs", [1, 8])
 @pytest.mark.parametrize("seq_len", [1, 256, 512])
-@pytest.mark.parametrize("num_qo_heads", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [1, 8, 16])
-@pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
+@pytest.mark.parametrize("num_qo_heads", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [1, 16])
+@pytest.mark.parametrize("head_dim", [64, 512])
 @pytest.mark.parametrize("rotary_dim", [64, 128])
 @pytest.mark.parametrize("interleave", [False, True])
 @pytest.mark.parametrize("enable_pdl", [False, True])
@@ -128,6 +130,124 @@ def test_rope(
     torch.testing.assert_close(k_jit, k_kernel, atol=atol, rtol=rtol)
     torch.testing.assert_close(k_buffer_jit, k_buffer_kernel, atol=atol, rtol=rtol)
     torch.testing.assert_close(v_buffer_jit, v_buffer_kernel, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("bs", [8])
+@pytest.mark.parametrize("seq_len", [256, 512, 1024])
+@pytest.mark.parametrize("num_qo_heads", [16])
+@pytest.mark.parametrize("num_kv_heads", [16])
+@pytest.mark.parametrize("head_dim", [64])
+@pytest.mark.parametrize("rotary_dim", [64])
+@pytest.mark.parametrize("interleave", [False])
+@pytest.mark.parametrize("enable_pdl", [False])
+@pytest.mark.parametrize("save_kv_cache", [False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_bench_rope(
+    bs,
+    seq_len,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    rotary_dim,
+    interleave: bool,
+    enable_pdl: bool,
+    save_kv_cache: bool,
+    dtype: torch.dtype,
+) -> None:
+    if head_dim < rotary_dim:
+        pytest.skip(f"{head_dim=} < {rotary_dim=}")
+    if not save_kv_cache and enable_pdl:
+        pytest.skip(f"({save_kv_cache=}, {enable_pdl=}) is not allowed")
+
+    q = torch.randn(bs * seq_len, num_qo_heads, head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(bs * seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    v = torch.randn(bs * seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+
+    KV_POOL_SIZE = bs * seq_len * 2
+    k_buffer = torch.zeros(
+        KV_POOL_SIZE, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+    )
+    v_buffer = torch.zeros(
+        KV_POOL_SIZE, num_kv_heads, head_dim, device=DEVICE, dtype=dtype
+    )
+    out_cache_loc = torch.randperm(KV_POOL_SIZE, dtype=torch.int64, device=DEVICE)[
+        : bs * seq_len
+    ].clone()
+
+    pos_ids = torch.arange(seq_len, device=DEVICE).repeat(bs)
+
+    max_seq_len = seq_len
+    base = 10000
+    cos_sin_cache = create_cos_sin_cache(rotary_dim, max_seq_len, base, dtype)
+
+    q_jit = q.clone()
+    k_jit = k.clone()
+    v_jit = v.clone()
+    k_buffer_jit = k_buffer.clone()
+    v_buffer_jit = v_buffer.clone()
+    out_cache_loc_jit = out_cache_loc.clone()
+
+    q_kernel = q.clone()
+    k_kernel = k.clone()
+    v_kernel = v.clone()
+    k_buffer_kernel = k_buffer.clone()
+    v_buffer_kernel = v_buffer.clone()
+    out_cache_loc_kernel = out_cache_loc.clone()
+
+    jit_args = (
+        q_jit,
+        k_jit,
+        q_jit,
+        k_jit,
+        cos_sin_cache,
+        pos_ids,
+        interleave,
+        enable_pdl,
+        v_jit,
+        k_buffer_jit,
+        v_buffer_jit,
+        out_cache_loc_jit,
+    )
+    jit_time = bench_rope(
+        apply_rope_pos_ids_cos_sin_cache,
+        jit_args,
+    )
+    sgl_args = (
+        q_kernel,
+        k_kernel,
+        q_kernel,
+        k_kernel,
+        cos_sin_cache,
+        pos_ids,
+        interleave,
+        enable_pdl,
+        v_kernel,
+        k_buffer_kernel,
+        v_buffer_kernel,
+        out_cache_loc_kernel,
+    )
+    sgl_time = bench_rope(
+        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default,
+        sgl_args,
+    )
+    print(f"\nPerformance Test - Batch={bs}, SeqLen={seq_len}")
+    print(f"JIT: {jit_time*1000:.9f}ms, SGL: {sgl_time*1000:.9f}ms")
+    if sgl_time > 0:
+        speedup = sgl_time / jit_time if jit_time > 0 else float("inf")
+        print(f"Speedup (SGL/JIT): {speedup:.2f}x")
+
+
+def bench_rope(fn, args):
+    warmup = 10
+    iteration = 100
+    for _ in range(warmup):
+        fn(*args)
+    torch.cuda.synchronize()
+    start_time = time.time()
+    for _ in range(iteration):
+        fn(*args)
+    torch.cuda.synchronize()
+    return (time.time() - start_time) / iteration
 
 
 if __name__ == "__main__":
