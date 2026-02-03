@@ -2,11 +2,15 @@ import time
 
 import pytest
 import torch
-
-torch.ops.load_library(
-    "/usr/local/lib/python3.12/dist-packages/sgl_kernel/sm100/common_ops.abi3.so"
+from sgl_kernel import FusedSetKVBufferArg as FusedSetKVBufferArgKernel
+from sgl_kernel import (
+    apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace_kernel,
 )
-from sglang.jit_kernel.rope import apply_rope_pos_ids_cos_sin_cache
+
+from sglang.jit_kernel.rope import FusedSetKVBufferArg as FusedSetKVBufferArgJit
+from sglang.jit_kernel.rope import (
+    apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace_jit,
+)
 
 DEVICE = "cuda"
 
@@ -59,9 +63,9 @@ def test_rope(
     if not save_kv_cache and enable_pdl:
         pytest.skip(f"({save_kv_cache=}, {enable_pdl=}) is not allowed")
 
-    q = torch.randn(bs * seq_len, num_qo_heads, head_dim, device=DEVICE, dtype=dtype)
-    k = torch.randn(bs * seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
-    v = torch.randn(bs * seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    q = torch.randn(bs * seq_len, num_qo_heads * head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
+    v = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
 
     KV_POOL_SIZE = bs * seq_len * 2
     k_buffer = torch.zeros(
@@ -86,6 +90,14 @@ def test_rope(
     k_buffer_jit = k_buffer.clone()
     v_buffer_jit = v_buffer.clone()
     out_cache_loc_jit = out_cache_loc.clone()
+    fused_set_kv_buffer_arg_jit = FusedSetKVBufferArgJit(
+        value=v_jit,
+        k_buffer=k_buffer_jit.view(k_buffer_jit.shape[0], -1),
+        v_buffer=v_buffer_jit.view(v_buffer_jit.shape[0], -1),
+        k_scale=None,
+        v_scale=None,
+        cache_loc=out_cache_loc_jit,
+    )
 
     q_kernel = q.clone()
     k_kernel = k.clone()
@@ -93,35 +105,38 @@ def test_rope(
     k_buffer_kernel = k_buffer.clone()
     v_buffer_kernel = v_buffer.clone()
     out_cache_loc_kernel = out_cache_loc.clone()
-
-    apply_rope_pos_ids_cos_sin_cache(
-        q_jit,
-        k_jit,
-        q_jit,
-        k_jit,
-        cos_sin_cache,
-        pos_ids,
-        interleave,
-        enable_pdl,
-        v_jit,
-        k_buffer_jit,
-        v_buffer_jit,
-        out_cache_loc_jit,
+    fused_set_kv_buffer_arg_kernel = FusedSetKVBufferArgKernel(
+        value=v_kernel,
+        k_buffer=k_buffer_kernel.view(k_buffer_kernel.shape[0], -1),
+        v_buffer=v_buffer_kernel.view(v_buffer_kernel.shape[0], -1),
+        k_scale=None,
+        v_scale=None,
+        cache_loc=out_cache_loc_kernel,
     )
 
-    torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default(
-        q_kernel,
-        k_kernel,
-        q_kernel,
-        k_kernel,
-        cos_sin_cache,
-        pos_ids,
-        interleave,
-        enable_pdl,
-        v_kernel,
-        k_buffer_kernel,
-        v_buffer_kernel,
-        out_cache_loc_kernel,
+    apply_rope_with_cos_sin_cache_inplace_jit(
+        positions=pos_ids,
+        query=q_jit,
+        key=k_jit,
+        head_size=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=(not interleave),
+        fused_set_kv_buffer_arg=(
+            fused_set_kv_buffer_arg_jit if save_kv_cache else None
+        ),
+        enable_pdl=enable_pdl,
+    )
+    apply_rope_with_cos_sin_cache_inplace_kernel(
+        positions=pos_ids,
+        query=q_kernel,
+        key=k_kernel,
+        head_size=head_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=(not interleave),
+        fused_set_kv_buffer_arg=(
+            fused_set_kv_buffer_arg_kernel if save_kv_cache else None
+        ),
+        enable_pdl=enable_pdl,
     )
 
     atol = 1e-3 if dtype != torch.float32 else 1e-6
@@ -159,9 +174,9 @@ def test_bench_rope(
     if not save_kv_cache and enable_pdl:
         pytest.skip(f"({save_kv_cache=}, {enable_pdl=}) is not allowed")
 
-    q = torch.randn(bs * seq_len, num_qo_heads, head_dim, device=DEVICE, dtype=dtype)
-    k = torch.randn(bs * seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
-    v = torch.randn(bs * seq_len, num_kv_heads, head_dim, device=DEVICE, dtype=dtype)
+    q = torch.randn(bs * seq_len, num_qo_heads * head_dim, device=DEVICE, dtype=dtype)
+    k = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
+    v = torch.randn(bs * seq_len, num_kv_heads * head_dim, device=DEVICE, dtype=dtype)
 
     KV_POOL_SIZE = bs * seq_len * 2
     k_buffer = torch.zeros(
@@ -194,46 +209,38 @@ def test_bench_rope(
     v_buffer_kernel = v_buffer.clone()
     out_cache_loc_kernel = out_cache_loc.clone()
 
-    jit_args = (
-        q_jit,
-        k_jit,
-        q_jit,
-        k_jit,
-        cos_sin_cache,
-        pos_ids,
-        interleave,
-        enable_pdl,
-        v_jit,
-        k_buffer_jit,
-        v_buffer_jit,
-        out_cache_loc_jit,
-    )
+    jit_args = {
+        "positions": pos_ids,
+        "query": q_jit,
+        "key": k_jit,
+        "head_size": head_dim,
+        "cos_sin_cache": cos_sin_cache,
+        "is_neox": (not interleave),
+        "fused_set_kv_buffer_arg": None,
+        "enable_pdl": enable_pdl,
+    }
     jit_time = bench_rope(
-        apply_rope_pos_ids_cos_sin_cache,
+        apply_rope_with_cos_sin_cache_inplace_jit,
         jit_args,
     )
-    sgl_args = (
-        q_kernel,
-        k_kernel,
-        q_kernel,
-        k_kernel,
-        cos_sin_cache,
-        pos_ids,
-        interleave,
-        enable_pdl,
-        v_kernel,
-        k_buffer_kernel,
-        v_buffer_kernel,
-        out_cache_loc_kernel,
-    )
-    sgl_time = bench_rope(
-        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache.default,
-        sgl_args,
+    kernel_args = {
+        "positions": pos_ids,
+        "query": q_kernel,
+        "key": k_kernel,
+        "head_size": head_dim,
+        "cos_sin_cache": cos_sin_cache,
+        "is_neox": (not interleave),
+        "fused_set_kv_buffer_arg": None,
+        "enable_pdl": enable_pdl,
+    }
+    kernel_time = bench_rope(
+        apply_rope_with_cos_sin_cache_inplace_kernel,
+        kernel_args,
     )
     print(f"\nPerformance Test - Batch={bs}, SeqLen={seq_len}")
-    print(f"JIT: {jit_time*1000:.9f}ms, SGL: {sgl_time*1000:.9f}ms")
-    if sgl_time > 0:
-        speedup = sgl_time / jit_time if jit_time > 0 else float("inf")
+    print(f"JIT: {jit_time*1000:.9f}ms, SGL: {kernel_time*1000:.9f}ms")
+    if kernel_time > 0:
+        speedup = kernel_time / jit_time if jit_time > 0 else float("inf")
         print(f"Speedup (SGL/JIT): {speedup:.2f}x")
 
 
@@ -241,11 +248,11 @@ def bench_rope(fn, args):
     warmup = 10
     iteration = 100
     for _ in range(warmup):
-        fn(*args)
+        fn(**args)
     torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(iteration):
-        fn(*args)
+        fn(**args)
     torch.cuda.synchronize()
     return (time.time() - start_time) / iteration
 
