@@ -611,8 +611,7 @@ def traverse_tree(
                 # Wrap in try-except to handle case where grammar terminates
                 # between check and call (e.g., in recursive DFS calls)
                 try:
-                    if not grammar.is_terminated():
-                        grammar.fill_vocab_mask(allocate_token_bitmask, curr)
+                    grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 except RuntimeError:
                     pass
                 if retrieve_next_token[curr] != -1 and not grammar.is_terminated():
