@@ -3,17 +3,14 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from flash_attn_interface import (
+    flash_attn_varlen_func as flash_attn_varlen_func_upstream,
+)
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    fa_ver,
-    flash_attn_func,
-    flash_attn_varlen_func_op,
-    flash_attn_varlen_func_op_lse,
 )
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -28,7 +25,6 @@ def lite_attn_fake_out(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
-    is_ring: bool = False,
 ) -> torch.Tensor:
     b, s, h = q.shape[:3]
     dv = v.shape[-1]
@@ -41,12 +37,38 @@ def lite_attn_fake_out_lse(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
-    is_ring: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    out = lite_attn_fake_out(handle, q, k, v, softmax_scale, is_ring)
+    out = lite_attn_fake_out(handle, q, k, v, softmax_scale)
     b, s, h = q.shape[:3]
     lse = q.new_empty((b, h, s), dtype=torch.float32)
     return out, lse
+
+
+def _fa3(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    return_softmax_lse: bool,
+):
+    bsz, qlen, nheads_q = q.shape[:3]
+    dv = v.shape[-1]
+    out = flash_attn_varlen_func_upstream(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        None,
+        None,
+        qlen,
+        k.shape[1],
+        softmax_scale=softmax_scale,
+        causal=False,
+        return_attn_probs=return_softmax_lse,
+    )
+    if return_softmax_lse:
+        out_tensor, softmax_lse = out
+        return out_tensor.reshape(bsz, qlen, nheads_q, dv), softmax_lse
+    return out.reshape(bsz, qlen, nheads_q, dv)
 
 
 @register_custom_op(fake_impl=lite_attn_fake_out)
@@ -56,39 +78,14 @@ def lite_attn_func_op(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
-    is_ring: bool = False,
 ) -> torch.Tensor:
-    skipping = (q.shape[1] == k.shape[1]) and (not is_ring)
+    skipping = q.shape[1] == k.shape[1]
     if not skipping:
-        if fa_ver == 4:
-            return flash_attn_varlen_func_op(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=None,
-                cu_seqlens_k=None,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                softmax_scale=softmax_scale,
-                causal=False,
-                return_softmax_lse=False,
-                ver=4,
-            )
-        return flash_attn_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
-            softmax_scale=softmax_scale,
-            causal=False,
-            return_softmax_lse=False,
-            ver=fa_ver,
-        )
+        return _fa3(q, k, v, softmax_scale, False)
 
-    lite = _LITE_ATTN[int(handle)]
+    lite = _LITE_ATTN.get(int(handle))
+    if lite is None:
+        raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
     return lite(q, k, v, scale=softmax_scale, return_softmax_lse=False)
 
 
@@ -99,39 +96,14 @@ def lite_attn_func_op_lse(
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
-    is_ring: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    skipping = (q.shape[1] == k.shape[1]) and (not is_ring)
+    skipping = q.shape[1] == k.shape[1]
     if not skipping:
-        if fa_ver == 4:
-            return flash_attn_varlen_func_op_lse(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=None,
-                cu_seqlens_k=None,
-                max_seqlen_q=q.shape[1],
-                max_seqlen_k=k.shape[1],
-                softmax_scale=softmax_scale,
-                causal=False,
-                return_softmax_lse=True,
-                ver=4,
-            )
-        return flash_attn_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=None,
-            cu_seqlens_k=None,
-            max_seqlen_q=q.shape[1],
-            max_seqlen_k=k.shape[1],
-            softmax_scale=softmax_scale,
-            causal=False,
-            return_softmax_lse=True,
-            ver=fa_ver,
-        )
+        return _fa3(q, k, v, softmax_scale, True)
 
-    lite = _LITE_ATTN[int(handle)]
+    lite = _LITE_ATTN.get(int(handle))
+    if lite is None:
+        raise RuntimeError(f"Invalid LiteAttention handle: {handle}")
     return lite(q, k, v, scale=softmax_scale, return_softmax_lse=True)
 
 
@@ -212,11 +184,10 @@ class LiteAttentionImpl(AttentionImpl):
     ):
         if self.causal:
             raise ValueError("LiteAttention backend does not support causal attention.")
-        is_ring = attn_metadata is None
         if return_softmax_lse:
             return lite_attn_func_op_lse(
-                self._lite_handle, query, key, value, self.softmax_scale, is_ring
+                self._lite_handle, query, key, value, self.softmax_scale
             )
         return lite_attn_func_op(
-            self._lite_handle, query, key, value, self.softmax_scale, is_ring
+            self._lite_handle, query, key, value, self.softmax_scale
         )
