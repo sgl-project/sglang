@@ -1,9 +1,9 @@
-import os
 import unittest
 
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -85,8 +85,9 @@ class TestMamba(unittest.TestCase):
             state_size=128,
             conv_kernel=4,
         )
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
-        mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
 
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -115,24 +116,25 @@ class TestMamba(unittest.TestCase):
         )
 
         # alloc req
-        req_index = req_to_token_pool.alloc(1, [req])
+        req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
         # free req
-        req_to_token_pool.free(req_index)
+        req_to_token_pool.free_mamba_cache(req)
+        req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
         req.mamba_pool_idx = None
-        req_index = req_to_token_pool.alloc(1, [req])
-        req_to_token_pool.free(req_index, free_mamba_cache=False)
+        req_to_token_pool.alloc([req])
+        req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
         # alloc again
-        req_index = req_to_token_pool.alloc(1, [req])
+        req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
@@ -159,17 +161,17 @@ class TestMamba(unittest.TestCase):
         mamba_layers = [
             i for i in range(num_layers) if i not in full_attention_layer_ids
         ]
-        os.environ["SGLANG_MAMBA_SSM_DTYPE"] = "bfloat16"
-        shape = Mamba2StateShape.create(
-            tp_world_size=1,
-            intermediate_size=4096,
-            n_groups=16,
-            num_heads=32,
-            head_dim=128,
-            state_size=128,
-            conv_kernel=4,
-        )
-        mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=4096,
+                n_groups=16,
+                num_heads=32,
+                head_dim=128,
+                state_size=128,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
 
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -224,7 +226,7 @@ class TestMamba(unittest.TestCase):
                 origin_input_ids=[],
                 sampling_params=sampling_params,
             )
-            req_to_token_pool.alloc(1, reqs=[req])
+            req_to_token_pool.alloc([req])
             return req
 
         mamba_pool = req_to_token_pool.mamba_pool
