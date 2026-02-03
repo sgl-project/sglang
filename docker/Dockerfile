@@ -60,11 +60,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
-    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends \
     # Core system utilities
-    tzdata \
     ca-certificates \
     software-properties-common \
     netcat-openbsd \
@@ -494,7 +491,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     python3.12-dev \
     wget \
     # Core system utilities
-    tzdata \
     ca-certificates \
     netcat-openbsd \
     curl \

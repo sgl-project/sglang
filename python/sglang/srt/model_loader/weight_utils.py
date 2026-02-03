@@ -840,12 +840,8 @@ def multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-
-        return result
+                return safetensors.torch.load(f.read())
+        return safetensors.torch.load_file(st_file, device="cpu")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
