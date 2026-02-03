@@ -244,16 +244,16 @@ class ConditionalCrossAttention(nn.Module):
         if x_freqs is not None:
             x_cos, x_sin = x_freqs
             q_view = rearrange(q, "b l (h d) -> b l h d", d=self.head_dim)
-            x_cos = x_cos[..., :half_dim].to(q_view.device).squeeze(0)
-            x_sin = x_sin[..., :half_dim].to(q_view.device).squeeze(0)
+            x_cos = x_cos[..., :half_dim].to(q_view.device)
+            x_sin = x_sin[..., :half_dim].to(q_view.device)
             q_view = _apply_rotary_emb(q_view, x_cos, x_sin, is_neox_style=True)
             q = rearrange(q_view, "b l h d -> b l (h d)")
 
         if y_freqs is not None:
             y_cos, y_sin = y_freqs
             k_view = rearrange(k, "b l (h d) -> b l h d", d=self.head_dim)
-            y_cos = y_cos[..., :half_dim].to(k_view.device).squeeze(0)
-            y_sin = y_sin[..., :half_dim].to(k_view.device).squeeze(0)
+            y_cos = y_cos[..., :half_dim].to(k_view.device)
+            y_sin = y_sin[..., :half_dim].to(k_view.device)
             k_view, _ = _apply_rotary_emb(k_view, y_cos, y_sin, is_neox_style=True)
             k = rearrange(k_view, "b l h d -> b l (h d)")
 

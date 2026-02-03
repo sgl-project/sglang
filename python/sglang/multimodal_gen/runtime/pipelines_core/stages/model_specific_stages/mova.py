@@ -701,9 +701,10 @@ class MOVADenoisingStage(PipelineStage):
                 ],
                 dim=-1,
             )
-            .reshape(full_visual_seq_len, 1, -1)
+            .reshape(full_visual_seq_len, -1)
             .to(visual_x.device)
         )
+        visual_freqs = torch.cat([visual_freqs.real, visual_freqs.imag], dim=-1).float()
 
         # Patchify audio latents
         audio_x, (f,) = self.audio_dit.patchify(audio_x, None)
@@ -720,9 +721,10 @@ class MOVADenoisingStage(PipelineStage):
                 ],
                 dim=-1,
             )
-            .reshape(full_audio_seq_len, 1, -1)
+            .reshape(full_audio_seq_len, -1)
             .to(audio_x.device)
         )
+        audio_freqs = torch.cat([audio_freqs.real, audio_freqs.imag], dim=-1).float()
 
         # Shard sequences for SP
         visual_x, visual_pad_len = self._shard_sequence_for_sp(visual_x, dim=1)
