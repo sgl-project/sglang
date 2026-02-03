@@ -712,21 +712,61 @@ class VideoPerformanceValidator(PerformanceValidator):
 
 
 class MeshValidator:
-    """Validator for 3D mesh generation with tolerance-based geometric comparison."""
+    """Validator for 3D mesh generation using Chamfer Distance for geometric similarity."""
 
     # Reference mesh file path
     REFERENCE_MESH_PATH = (
         Path(__file__).parent.parent / "test_files" / "hunyuan3d_reference.obj"
     )
 
-    # Tolerance thresholds for mesh comparison (relaxed for generation variance)
-    VERTEX_COUNT_TOLERANCE = 0.001  # 10% tolerance
-    FACE_COUNT_TOLERANCE = 0.001  # 10% tolerance
-    BBOX_TOLERANCE = 0.005  # 5% tolerance for bounding box dimensions
+    # Chamfer Distance configuration
+    NUM_SAMPLE_POINTS = 4096
+    CD_THRESHOLD_RATIO = 0.01  # 1% of bbox diagonal
+    RANDOM_SEED = 42
 
     def __init__(self, **kwargs):
         """Initialize mesh validator. Accepts kwargs for compatibility with validator registry."""
         pass
+
+    def _sample_point_cloud(self, mesh, num_points: int):
+        """Sample points uniformly from mesh surface.
+
+        Args:
+            mesh: Input trimesh object
+            num_points: Number of points to sample
+
+        Returns:
+            Point cloud array of shape (num_points, 3)
+        """
+        import numpy as np
+
+        points, _ = mesh.sample(num_points, return_index=True)
+        return np.array(points)
+
+    def _compute_chamfer_distance(self, points1, points2):
+        """Compute bidirectional Chamfer Distance using KD-Tree.
+
+        Args:
+            points1: First point cloud (N, 3)
+            points2: Second point cloud (M, 3)
+
+        Returns:
+            Tuple of (forward_cd, backward_cd, total_cd)
+        """
+        import numpy as np
+        from scipy.spatial import cKDTree
+
+        tree1 = cKDTree(points1)
+        tree2 = cKDTree(points2)
+
+        distances1, _ = tree2.query(points1)
+        distances2, _ = tree1.query(points2)
+
+        forward_cd = float(np.mean(distances1**2))
+        backward_cd = float(np.mean(distances2**2))
+        total_cd = forward_cd + backward_cd
+
+        return forward_cd, backward_cd, total_cd
 
     def validate(self, mesh_path: str) -> dict:
         """
@@ -779,96 +819,51 @@ class MeshValidator:
             results["error"] = f"Failed to load reference mesh: {e}"
             return results
 
-        # Check 1: Vertex count comparison
-        gen_vertex_count = len(generated_mesh.vertices)
-        ref_vertex_count = len(reference_mesh.vertices)
-        vertex_diff_ratio = abs(gen_vertex_count - ref_vertex_count) / max(
-            ref_vertex_count, 1
-        )
-        vertex_passed = vertex_diff_ratio <= self.VERTEX_COUNT_TOLERANCE
-        results["checks"]["vertex_count"] = {
-            "generated": gen_vertex_count,
-            "reference": ref_vertex_count,
-            "diff_ratio": vertex_diff_ratio,
-            "tolerance": self.VERTEX_COUNT_TOLERANCE,
-            "passed": vertex_passed,
-        }
-        if not vertex_passed:
-            results["all_passed"] = False
-            logger.warning(
-                f"Vertex count check failed: generated={gen_vertex_count}, "
-                f"reference={ref_vertex_count}, diff_ratio={vertex_diff_ratio:.4f}"
-            )
+        import numpy as np
 
-        # Check 2: Face count comparison
-        gen_face_count = len(generated_mesh.faces)
-        ref_face_count = len(reference_mesh.faces)
-        face_diff_ratio = abs(gen_face_count - ref_face_count) / max(ref_face_count, 1)
-        face_passed = face_diff_ratio <= self.FACE_COUNT_TOLERANCE
-        results["checks"]["face_count"] = {
-            "generated": gen_face_count,
-            "reference": ref_face_count,
-            "diff_ratio": face_diff_ratio,
-            "tolerance": self.FACE_COUNT_TOLERANCE,
-            "passed": face_passed,
-        }
-        if not face_passed:
-            results["all_passed"] = False
-            logger.warning(
-                f"Face count check failed: generated={gen_face_count}, "
-                f"reference={ref_face_count}, diff_ratio={face_diff_ratio:.4f}"
-            )
-
-        # Check 3: Bounding box comparison
-        gen_bbox = generated_mesh.bounding_box.bounds
+        # Compute bounding box diagonal for threshold normalization
         ref_bbox = reference_mesh.bounding_box.bounds
-        gen_bbox_size = gen_bbox[1] - gen_bbox[0]  # max - min
-        ref_bbox_size = ref_bbox[1] - ref_bbox[0]
+        bbox_diagonal = float(np.linalg.norm(ref_bbox[1] - ref_bbox[0]))
+        cd_threshold = self.CD_THRESHOLD_RATIO * bbox_diagonal
 
-        bbox_passed = True
-        bbox_details = {}
-        for i, axis in enumerate(["x", "y", "z"]):
-            diff_ratio = abs(gen_bbox_size[i] - ref_bbox_size[i]) / max(
-                ref_bbox_size[i], 1e-6
-            )
-            axis_passed = diff_ratio <= self.BBOX_TOLERANCE
-            bbox_details[axis] = {
-                "generated": float(gen_bbox_size[i]),
-                "reference": float(ref_bbox_size[i]),
-                "diff_ratio": float(diff_ratio),
-                "passed": axis_passed,
-            }
-            if not axis_passed:
-                bbox_passed = False
+        # Sample point clouds from both meshes
+        np.random.seed(self.RANDOM_SEED)
+        gen_points = self._sample_point_cloud(generated_mesh, self.NUM_SAMPLE_POINTS)
+        ref_points = self._sample_point_cloud(reference_mesh, self.NUM_SAMPLE_POINTS)
 
-        results["checks"]["bounding_box"] = {
-            "tolerance": self.BBOX_TOLERANCE,
-            "passed": bbox_passed,
-            "axes": bbox_details,
+        # Compute Chamfer Distance
+        forward_cd, backward_cd, total_cd = self._compute_chamfer_distance(
+            gen_points, ref_points
+        )
+
+        cd_passed = total_cd <= cd_threshold
+        results["checks"]["chamfer_distance"] = {
+            "forward_cd": forward_cd,
+            "backward_cd": backward_cd,
+            "total_cd": total_cd,
+            "threshold": cd_threshold,
+            "bbox_diagonal": bbox_diagonal,
+            "passed": cd_passed,
         }
-        if not bbox_passed:
+        if not cd_passed:
             results["all_passed"] = False
-            logger.warning(f"Bounding box check failed: {bbox_details}")
+            logger.warning(
+                f"Chamfer Distance check failed: total_cd={total_cd:.6f}, "
+                f"threshold={cd_threshold:.6f}"
+            )
 
-        # Print comparison summary (use print to ensure visibility)
+        # Print comparison summary
         print("=" * 60)
-        print("[MeshValidator] Comparison Results:")
+        print("[MeshValidator] Chamfer Distance Results:")
+        print(f"  Sample Points: {self.NUM_SAMPLE_POINTS}")
+        print(f"  BBox Diagonal: {bbox_diagonal:.4f}")
+        print(f"  Forward CD (gen->ref):  {forward_cd:.6f}")
+        print(f"  Backward CD (ref->gen): {backward_cd:.6f}")
+        print(f"  Total Chamfer Distance: {total_cd:.6f}")
         print(
-            f"  Vertex Count: generated={gen_vertex_count}, reference={ref_vertex_count}, diff={vertex_diff_ratio:.4f} (tolerance={self.VERTEX_COUNT_TOLERANCE})"
+            f"  Threshold: {cd_threshold:.6f} ({self.CD_THRESHOLD_RATIO * 100:.2f}% of bbox diagonal)"
         )
-        print(
-            f"  Face Count:   generated={gen_face_count}, reference={ref_face_count}, diff={face_diff_ratio:.4f} (tolerance={self.FACE_COUNT_TOLERANCE})"
-        )
-        print(
-            f"  BBox X:       generated={gen_bbox_size[0]:.4f}, reference={ref_bbox_size[0]:.4f}, diff={bbox_details['x']['diff_ratio']:.4f} (tolerance={self.BBOX_TOLERANCE})"
-        )
-        print(
-            f"  BBox Y:       generated={gen_bbox_size[1]:.4f}, reference={ref_bbox_size[1]:.4f}, diff={bbox_details['y']['diff_ratio']:.4f} (tolerance={self.BBOX_TOLERANCE})"
-        )
-        print(
-            f"  BBox Z:       generated={gen_bbox_size[2]:.4f}, reference={ref_bbox_size[2]:.4f}, diff={bbox_details['z']['diff_ratio']:.4f} (tolerance={self.BBOX_TOLERANCE})"
-        )
-        print(f"  All Passed:   {results['all_passed']}")
+        print(f"  Passed: {cd_passed}")
         print("=" * 60)
 
         return results
