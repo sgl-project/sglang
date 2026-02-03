@@ -46,14 +46,14 @@ def compute_rope_cos_sin(
     making it compatible with FSDP meta device initialization.
 
     Args:
-        position_ids: Position IDs tensor [B, L] or [1, L]
+        position_ids: Position IDs tensor [L]
         head_dim: Dimension of each attention head
         base: RoPE base frequency (default: 10000.0)
         device: Target device
         dtype: Output dtype
 
     Returns:
-        (cos, sin): Each with shape [B, L, head_dim]
+        (cos, sin): Each with shape [L, head_dim]
     """
     device = device or position_ids.device
     dtype = dtype or torch.float32
@@ -504,7 +504,7 @@ class DualTowerConditionalBridge(
         dtype = dtype or torch.float32
 
         # Audio positions: 0, 1, 2, ..., L_a-1
-        audio_pos = torch.arange(L_a, device=device, dtype=torch.float32).unsqueeze(0)
+        audio_pos = torch.arange(L_a, device=device, dtype=torch.float32)
 
         # Video positions: Align video frames to audio step units
         if self.apply_first_frame_bias_in_rope:
