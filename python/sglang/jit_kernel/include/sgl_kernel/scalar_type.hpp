@@ -59,8 +59,7 @@ class ScalarType {
   static constexpr ScalarType float_(uint8_t exponent, uint8_t mantissa, bool finite_values_only, NanRepr nan_repr) {
     assert(nan_repr < NAN_REPR_ID_MAX);
     assert(mantissa > 0 && exponent > 0);
-    assert(
-        nan_repr != NAN_IEEE_754);
+    assert(nan_repr != NAN_IEEE_754);
     return ScalarType(exponent, mantissa, true, 0, finite_values_only, nan_repr);
   }
 

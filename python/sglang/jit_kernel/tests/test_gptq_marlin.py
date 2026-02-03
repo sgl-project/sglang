@@ -1,8 +1,7 @@
 import pytest
 import torch
-from sgl_kernel.scalar_type import scalar_types
-
 from sgl_kernel import gptq_marlin_gemm as aot_gptq_marlin_gemm
+from sgl_kernel.scalar_type import scalar_types
 
 from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
 from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace

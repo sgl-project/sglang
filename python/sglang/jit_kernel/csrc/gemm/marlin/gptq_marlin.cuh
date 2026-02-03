@@ -21,11 +21,12 @@
 
 #pragma once
 
-#include "kernel.h"
-#include "marlin_template.h"
+#include <sgl_kernel/tensor.h>
 
 #include <sgl_kernel/scalar_type.hpp>
-#include <sgl_kernel/tensor.h>
+
+#include "kernel.h"
+#include "marlin_template.h"
 
 namespace device::marlin {
 
@@ -541,9 +542,7 @@ void marlin_mm(
     bool is_zp_float) {
   if (has_zp) {
     host::RuntimeCheck(
-        q_type == host::kU4 || q_type == host::kU8,
-        "q_type must be u4 or u8 when has_zp = True. Got = ",
-        q_type.str());
+        q_type == host::kU4 || q_type == host::kU8, "q_type must be u4 or u8 when has_zp = True. Got = ", q_type.str());
   } else {
     host::RuntimeCheck(
         q_type == host::kU4B8 || q_type == host::kU8B128 || q_type == host::kFE4M3fn || q_type == host::kFE2M1f,
@@ -552,7 +551,8 @@ void marlin_mm(
         q_type.str());
   }
 
-  host::RuntimeCheck(prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [", prob_m, ", ", prob_n, ", ", prob_k, "]");
+  host::RuntimeCheck(
+      prob_m > 0 && prob_n > 0 && prob_k > 0, "Invalid MNK = [", prob_m, ", ", prob_n, ", ", prob_k, "]");
 
   int group_blocks = 0;
   if (has_act_order) {
@@ -593,8 +593,7 @@ void marlin_mm(
     // Permute A columns
     int block_rows = div_ceil(prob_m, sms);
     host::LaunchKernel(sms, default_threads, stream)(
-        permute_cols_kernel,
-        A_ptr, perm_ptr, a_tmp_ptr, prob_m, prob_k, lda, block_rows);
+        permute_cols_kernel, A_ptr, perm_ptr, a_tmp_ptr, prob_m, prob_k, lda, block_rows);
     A_ptr = a_tmp_ptr;
     lda = prob_k;
 
@@ -751,15 +750,30 @@ void marlin_mm(
           num_bits);
     }
 
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new));
+    host::RuntimeDeviceCheck(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, max_shared_mem_new));
 
     bool part_use_atomic_add = use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
     host::LaunchKernel(blocks, num_threads, stream, max_shared_mem_new)(
         kernel,
-        A_ptr, B_ptr, C_ptr, C_tmp_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr, num_groups,
-        prob_m_split, prob_n, prob_k, lda, locks, part_use_atomic_add,
-        use_fp32_reduce, max_shared_mem_new);
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        C_tmp_ptr,
+        s_ptr,
+        s2_ptr,
+        zp_ptr,
+        g_idx_ptr,
+        num_groups,
+        prob_m_split,
+        prob_n,
+        prob_k,
+        lda,
+        locks,
+        part_use_atomic_add,
+        use_fp32_reduce,
+        max_shared_mem_new);
 
     A_ptr += prob_m_split * (lda / 8);
     C_ptr += prob_m_split * (prob_n / 8);
@@ -803,11 +817,7 @@ void gptq_marlin_gemm(
 
   // Verify a: [M, K]
   auto lda = SymbolicSize{"lda"};
-  TensorMatcher({M, K})
-      .with_strides({lda, 1})
-      .with_dtype<scalar_t>()
-      .with_device(device)
-      .verify(a);
+  TensorMatcher({M, K}).with_strides({lda, 1}).with_dtype<scalar_t>().with_device(device).verify(a);
 
   int64_t size_m = M.unwrap();
   int64_t size_k = K.unwrap();
@@ -815,21 +825,22 @@ void gptq_marlin_gemm(
   // Verify b_q_weight: [K/tile_size, packed_N]
   RuntimeCheck(
       size_k % device::marlin::tile_size == 0,
-      "size_k = ", size_k,
-      " is not divisible by tile_size = ", device::marlin::tile_size);
+      "size_k = ",
+      size_k,
+      " is not divisible by tile_size = ",
+      device::marlin::tile_size);
   int64_t expected_bqw_dim0 = size_k / device::marlin::tile_size;
   auto bqw_dim0 = SymbolicSize{"bqw_dim0"};
   auto bqw_dim1 = SymbolicSize{"bqw_dim1"};
   bqw_dim0.set_value(expected_bqw_dim0);
-  TensorMatcher({bqw_dim0, bqw_dim1})
-      .with_dtype<int32_t>()
-      .with_device(device)
-      .verify(b_q_weight);
+  TensorMatcher({bqw_dim0, bqw_dim1}).with_dtype<int32_t>().with_device(device).verify(b_q_weight);
 
   RuntimeCheck(
       b_q_weight.size(1) % device::marlin::tile_size == 0,
-      "b_q_weight.size(1) = ", b_q_weight.size(1),
-      " is not divisible by tile_size = ", device::marlin::tile_size);
+      "b_q_weight.size(1) = ",
+      b_q_weight.size(1),
+      " is not divisible by tile_size = ",
+      device::marlin::tile_size);
   int64_t actual_size_n = (b_q_weight.size(1) / device::marlin::tile_size) * pack_factor;
   N.set_value(actual_size_n);
   int64_t size_n = N.unwrap();
@@ -840,16 +851,11 @@ void gptq_marlin_gemm(
 
   // Verify b_scales: [num_groups, N]
   auto num_groups_sym = SymbolicSize{"num_groups"};
-  TensorMatcher({num_groups_sym, N})
-      .with_device(device)
-      .verify(b_scales);
+  TensorMatcher({num_groups_sym, N}).with_device(device).verify(b_scales);
   int num_groups = static_cast<int>(num_groups_sym.unwrap());
 
   // Verify c: [M, N]
-  TensorMatcher({M, N})
-      .with_dtype<scalar_t>()
-      .with_device(device)
-      .verify(c);
+  TensorMatcher({M, N}).with_dtype<scalar_t>().with_device(device).verify(c);
 
   // Early return for zero-size M
   if (size_m == 0) return;
@@ -862,9 +868,12 @@ void gptq_marlin_gemm(
   if (has_act_order) {
     RuntimeCheck(
         (g_idx_size == size_k && perm_size == size_k),
-        "Unexpected g_idx.size(0) = ", g_idx_size,
-        " and perm.size(0) = ", perm_size,
-        ", where size_k = ", size_k);
+        "Unexpected g_idx.size(0) = ",
+        g_idx_size,
+        " and perm.size(0) = ",
+        perm_size,
+        ", where size_k = ",
+        size_k);
   }
 
   // Determine has_zp from b_zeros size
@@ -873,19 +882,18 @@ void gptq_marlin_gemm(
 
   if (has_zp) {
     RuntimeCheck(
-        b_q_type == kU4 || b_q_type == kU8,
-        "b_q_type must be u4 or u8 when has_zp = True. Got = ", b_q_type.str());
+        b_q_type == kU4 || b_q_type == kU8, "b_q_type must be u4 or u8 when has_zp = True. Got = ", b_q_type.str());
   } else {
     RuntimeCheck(
         b_q_type == kU4B8 || b_q_type == kU8B128 || b_q_type == kFE4M3fn || b_q_type == kFE2M1f,
         "b_q_type must be uint4b8, uint8b128, float8_e4m3fn or float4_e2m1f when "
-        "has_zp = False. Got = ", b_q_type.str());
+        "has_zp = False. Got = ",
+        b_q_type.str());
   }
 
   if (has_zp && is_zp_float) {
     RuntimeCheck(
-        std::is_same<scalar_t, fp16_t>::value,
-        "Computation type must be float16 (half) when using float zero points.");
+        std::is_same<scalar_t, fp16_t>::value, "Computation type must be float16 (half) when using float zero points.");
   }
 
   // Verify b_zeros shape
@@ -901,8 +909,10 @@ void gptq_marlin_gemm(
           b_zeros.size(0) == num_groups, "b_zeros dim 0 = ", b_zeros.size(0), " is not num_groups = ", num_groups);
       RuntimeCheck(
           b_zeros.size(1) == size_n / pack_factor,
-          "b_zeros dim 1 = ", b_zeros.size(1),
-          " is not size_n / pack_factor = ", size_n / pack_factor);
+          "b_zeros dim 1 = ",
+          b_zeros.size(1),
+          " is not size_n / pack_factor = ",
+          size_n / pack_factor);
     }
   }
 
@@ -926,8 +936,7 @@ void gptq_marlin_gemm(
     }
   } else {
     if (num_groups > 1) {
-      RuntimeCheck(
-          size_k % num_groups == 0, "size_k = ", size_k, ", is not divisible by num_groups = ", num_groups);
+      RuntimeCheck(size_k % num_groups == 0, "size_k = ", size_k, ", is not divisible by num_groups = ", num_groups);
       group_size = static_cast<int>(size_k / num_groups);
     } else {
       group_size = -1;
@@ -937,8 +946,10 @@ void gptq_marlin_gemm(
   // Verify workspace and get device info
   RuntimeCheck(
       size_n % device::marlin::min_thread_n == 0,
-      "size_n = ", size_n,
-      ", is not divisible by min_thread_n = ", device::marlin::min_thread_n);
+      "size_n = ",
+      size_n,
+      ", is not divisible by min_thread_n = ",
+      device::marlin::min_thread_n);
 
   DLDevice dl_device = device.unwrap();
   int dev = dl_device.device_id;
@@ -948,9 +959,7 @@ void gptq_marlin_gemm(
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
 
   RuntimeCheck(
-      workspace.size(0) >= sms,
-      "workspace.size(0) = ", workspace.size(0),
-      " is below min_workspace_size = ", sms);
+      workspace.size(0) >= sms, "workspace.size(0) = ", workspace.size(0), " is below min_workspace_size = ", sms);
 
   // Hardcoded defaults (auto config)
   int thread_k_init = -1;
