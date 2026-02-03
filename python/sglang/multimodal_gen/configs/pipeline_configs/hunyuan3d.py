@@ -45,17 +45,17 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
 
     # Delight model configuration
     delight_enable: bool = True
-    delight_prompt: str = "3D image"
-    delight_negative_prompt: str = "2D image"
-    delight_strength: float = 0.8
-    delight_num_inference_steps: int = 40
-    delight_guidance_scale: float = 7.5
-    delight_cfg_image: float = 1.5
+    delight_prompt: str = ""  # Original uses empty prompt
+    delight_negative_prompt: str = ""
+    delight_strength: float = 1.0  # Original doesn't set strength
+    delight_num_inference_steps: int = 50  # Original: 50
+    delight_guidance_scale: float = 1.0  # Original: cfg_text=1.0
+    delight_cfg_image: float = 1.5  # Original: cfg_image=1.5
 
     # Paint model configuration
     paint_enable: bool = True
     paint_num_inference_steps: int = 30
-    paint_guidance_scale: float = 3.0
+    paint_guidance_scale: float = 2.0  # Original turbo: 2.0
     paint_resolution: int = 512
     paint_render_size: int = 2048
     paint_texture_size: int = 2048
