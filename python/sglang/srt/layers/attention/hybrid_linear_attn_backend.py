@@ -255,6 +255,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_next_token_list = []
         self.retrieve_next_sibling_list = []
         self.retrieve_parent_token_list = []
+        self.intermediate_state_indices_list = []  # Pre-allocated for CUDA graph
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
@@ -517,6 +518,10 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
+            # Pre-allocate intermediate_state_indices: [0, 1, 2, ..., i]
+            self.intermediate_state_indices_list.append(
+                torch.arange(i + 1, dtype=torch.int32, device=self.device)
+            )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
         )
@@ -559,6 +564,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
+            )
+        elif forward_mode.is_target_verify():
+            # topk == 1, still need intermediate_state_indices for speculative decoding
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -624,6 +637,14 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
+            )
+        elif forward_mode.is_target_verify():
+            # topk == 1, still need intermediate_state_indices for speculative decoding
+            return ForwardMetadata(
+                query_start_loc=self.query_start_loc_list[bs - 1],
+                mamba_cache_indices=self.state_indices_list[bs - 1],
+                intermediate_state_indices=self.intermediate_state_indices_list[bs - 1],
             )
         else:
             return ForwardMetadata(
@@ -1053,62 +1074,30 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         if self.ssm_k_last:
-            # K-last decode currently uses V-last Triton kernel.
-            # Optimize K==V case with in-place transpose to avoid allocating V-last buffers.
-            kv_same = head_k_dim == head_v_dim
-            if kv_same and ssm_states.is_contiguous():
-                # K-last -> V-last in-place for the kernel
-                in_place_transpose_indexed(ssm_states, cache_indices)
-                core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    q=query,
-                    k=key,
-                    v=value,
-                    a=a,
-                    b=b,
-                    initial_state_source=ssm_states,
-                    initial_state_indices=cache_indices,
-                    cu_seqlens=query_start_loc,
-                    use_qk_l2norm_in_kernel=True,
-                    softplus_beta=1.0,
-                    softplus_threshold=20.0,
-                )
-                # V-last -> K-last: transpose back to pool layout
-                in_place_transpose_indexed(ssm_states, cache_indices)
-            else:
-                # Fallback: materialize a V-last buffer (needed for K!=V)
-                valid_mask = cache_indices >= 0
-                if valid_mask.any():
-                    valid_cache_indices = cache_indices[valid_mask]
-                    ssm_input = ssm_states[valid_cache_indices]  # [valid, HV, V, K]
-                    ssm_states_v_last = ssm_input.transpose(-1, -2).contiguous()  # [valid, HV, K, V]
-
-                    core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                        A_log=A_log,
-                        dt_bias=dt_bias,
-                        q=query,
-                        k=key,
-                        v=value,
-                        a=a,
-                        b=b,
-                        initial_state_source=ssm_states_v_last,
-                        initial_state_indices=torch.arange(
-                            ssm_states_v_last.shape[0],
-                            dtype=torch.int32,
-                            device=cache_indices.device,
-                        ),
-                        cu_seqlens=query_start_loc,
-                        use_qk_l2norm_in_kernel=True,
-                        softplus_beta=1.0,
-                        softplus_threshold=20.0,
-                    )
-                    # V-last -> K-last: transpose back and write to pool
-                    ssm_states[valid_cache_indices] = ssm_states_v_last.transpose(-1, -2)
-                else:
-                    core_attn_out = value.new_zeros(
-                        (1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
-                    )
+            # K-last decode uses V-last Triton kernel with in-place transpose.
+            # Requires K==V (always true for Qwen3-Next) for in-place transpose.
+            assert head_k_dim == head_v_dim, "K-last decode requires K==V for in-place transpose"
+            assert ssm_states.is_contiguous(), "K-last decode requires contiguous ssm_states"
+            
+            # K-last -> V-last in-place for the kernel
+            in_place_transpose_indexed(ssm_states, cache_indices)
+            core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+            )
+            # V-last -> K-last: transpose back to pool layout
+            in_place_transpose_indexed(ssm_states, cache_indices)
         else:
             # V-last mode: ssm_states shape is (pool_size+1, HV, K, V)
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
@@ -1182,9 +1171,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            intermediate_state_indices = torch.arange(
-                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
-            )
+            # Use pre-allocated indices from CUDA graph state to avoid sync
+            intermediate_state_indices = forward_metadata.intermediate_state_indices
+            if intermediate_state_indices is None:
+                # Fallback for non-CUDA-graph path
+                intermediate_state_indices = torch.arange(
+                    cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+                )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

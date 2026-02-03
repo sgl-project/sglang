@@ -37,6 +37,8 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    # For speculative decoding intermediate state indexing (pre-allocated to avoid sync)
+    intermediate_state_indices: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
