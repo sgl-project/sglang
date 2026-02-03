@@ -297,22 +297,21 @@ class KimiK2Detector(Qwen3Detector):
         is returned as normal_text.
 
         Key design:
-        - We intercept the parent's buffer after adding new_text
-        - Check for tool call markers in the combined buffer
-        - If found while in reasoning, force end reasoning and return
-        - Otherwise, restore buffer and delegate to parent
+        - Use a temporary combined_text variable to check for markers
+        - This decouples from parent's implementation details
+        - If marker found while in reasoning, handle it directly
+        - Otherwise, delegate to parent without any state modification
         """
-        # First, add new_text to buffer (same as parent would do)
-        self._buffer += new_text
-
         # Only check for tool call markers when in reasoning mode
         if self._in_reasoning:
-            marker_idx, marker = self._find_tool_call_marker(self._buffer)
+            # Check in combined buffer without modifying self._buffer yet
+            combined_text = self._buffer + new_text
+            marker_idx, marker = self._find_tool_call_marker(combined_text)
 
             if marker_idx != -1:
                 # Tool call marker found - force end reasoning mode
-                text_before_marker = self._buffer[:marker_idx]
-                text_from_marker = self._buffer[marker_idx:]
+                text_before_marker = combined_text[:marker_idx]
+                text_from_marker = combined_text[marker_idx:]
 
                 # Process reasoning text: remove think tokens
                 reasoning_text = text_before_marker.rstrip()
@@ -329,9 +328,7 @@ class KimiK2Detector(Qwen3Detector):
                 )
 
         # No tool call marker found (or not in reasoning mode)
-        # Restore buffer and delegate to parent
-        # Note: We need to undo our buffer modification since parent will add new_text again
-        self._buffer = self._buffer[: -len(new_text)] if new_text else self._buffer
+        # Delegate to parent directly without any buffer modification
         return super().parse_streaming_increment(new_text)
 
 
