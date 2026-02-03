@@ -11,6 +11,7 @@ from .constants import (  # Enums; Convenience sets; Fixture parameters; Default
     ENV_MODELS,
     ENV_SHOW_ROUTER_LOGS,
     ENV_SHOW_WORKER_LOGS,
+    ENV_IB_DEVICE,
     ENV_SKIP_BACKEND_SETUP,
     ENV_SKIP_MODEL_POOL,
     ENV_STARTUP_TIMEOUT,
@@ -96,6 +97,7 @@ __all__ = [
     "ENV_SKIP_BACKEND_SETUP",
     "ENV_SHOW_ROUTER_LOGS",
     "ENV_SHOW_WORKER_LOGS",
+    "ENV_IB_DEVICE",
     # GPU allocation
     "GPUAllocator",
     "GPUInfo",

@@ -132,6 +132,11 @@ def detect_ib_device() -> str | None:
     Returns:
         Device name if found (e.g., "mlx5_0"), None otherwise.
     """
+    override = os.environ.get("E2E_IB_DEVICE")
+    if override:
+        logger.info("Using E2E IB device override: %s", override)
+        return override
+
     try:
         subprocess.run(
             ["ibv_devinfo", "-l"],
