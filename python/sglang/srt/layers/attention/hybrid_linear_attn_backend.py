@@ -899,8 +899,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 b=b_for_kernel,
                 use_qk_l2norm=True,
             )
-            # todo(yingyi): FlashInfer gated_delta_rule_decode expects state in [N, H, V, K]; SGLang stores [N, H, K, V].
-            output_state = output_state
             ssm_states[cache_indices] = output_state.to(ssm_states.dtype, copy=False)
             core_attn_out = output.permute(1, 0, 2, 3)
         else:
@@ -1052,11 +1050,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 a_for_kernel = a.view(batch_size, draft_token_num, -1)
                 b_for_kernel = b.view(batch_size, draft_token_num, -1)
-                # todo(yingyi): FlashInfer expects state in [N, H, V, K]; SGLang stores [N, H, K, V].
-                initial_state = ssm_states.transpose(-1, -2).contiguous()
-                intermediate_state_buffer = intermediate_state_cache.transpose(
-                    -1, -2
-                ).contiguous()
+                initial_state = ssm_states
+                intermediate_state_buffer = intermediate_state_cache
                 # FlashInfer uses DLPack; parameters must not require grad.
                 a_log = layer.A_log.detach()
                 dt_bias = layer.dt_bias.detach()
@@ -1076,7 +1071,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
                 core_attn_out = output.view(
                     1, seq_len, layer.num_v_heads, layer.head_v_dim
-                ).contiguous()
+                )
             else:
                 core_attn_out = fused_recurrent_gated_delta_rule_update(
                     q=query,
@@ -1100,6 +1095,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 or not forward_batch.mamba_track_mask.any()
             )
             if use_flashinfer:
+                # todo(yingyi): relax contiguous requirement
                 q_for_kernel = query.squeeze(0).contiguous()
                 k_for_kernel = key.squeeze(0).contiguous()
                 v_for_kernel = value.squeeze(0).contiguous()
@@ -1110,7 +1106,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # FlashInfer expects alpha in probability space, not log space.
                 g_for_kernel = g.squeeze(0).to(torch.float32, copy=False).exp()
                 beta_for_kernel = beta.squeeze(0).to(torch.float32, copy=False)
-                # FlashInfer expects state in [N, H, V, K], SGLang stores state in [N, H, K, V]
+                # FlashInfer expects state in [N, H, V, K], SGLang stores state in [N, H, V, K] in flashinfer path
                 initial_state = ssm_states[cache_indices]
                 output, output_state = self._flashinfer_gdn_prefill(
                     q=q_for_kernel,
@@ -1123,7 +1119,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cu_seqlens=query_start_loc.to(torch.int64),
                     use_qk_l2norm_in_kernel=False,
                 )
-                # FlashInfer expects state in [N, H, V, K], SGLang stores state in [N, H, K, V].
                 ssm_states[cache_indices] = output_state.to(
                     ssm_states.dtype, copy=False
                 )
