@@ -192,3 +192,24 @@ class TestErrorHandling:
             content=b"{ invalid json }",
         )
         assert 400 <= response.status_code < 500
+
+    def test_messages_create__returns_501_when_unsupported_beta_feature(
+        self, model_name
+    ):
+        """Test that unsupported anthropic-beta features return 501 Not Implemented."""
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "dummy-key")
+        response = httpx.post(
+            f"{get_base_url()}/v1/messages",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "anthropic-beta": "advanced-tool-use-2025-11-20",
+            },
+            json={
+                "model": model_name,
+                "max_tokens": 100,
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+        assert response.status_code == 501
+        assert "not implemented" in response.text.lower()

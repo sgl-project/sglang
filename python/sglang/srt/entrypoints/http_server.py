@@ -1524,12 +1524,37 @@ def _validate_anthropic_version(raw_request: Request) -> None:
         )
 
 
+UNSUPPORTED_ANTHROPIC_BETA_FEATURES = frozenset(
+    {
+        "advanced-tool-use-2025-11-20",
+    }
+)
+
+
+def _validate_anthropic_beta_features(raw_request: Request) -> None:
+    """Check for unsupported anthropic-beta features and raise error if found."""
+    beta_header = raw_request.headers.get("anthropic-beta", "")
+    if not beta_header:
+        return
+
+    requested_features = {f.strip() for f in beta_header.split(",")}
+    unsupported = requested_features & UNSUPPORTED_ANTHROPIC_BETA_FEATURES
+
+    if unsupported:
+        raise HTTPException(
+            status_code=501,
+            detail=f"Beta feature(s) not implemented: {', '.join(sorted(unsupported))}. "
+            "This server does not support Anthropic's advanced tool use (code execution) feature.",
+        )
+
+
 @app.post("/v1/messages", dependencies=[Depends(validate_json_request)])
 async def anthropic_v1_messages(
     request: AnthropicMessagesRequest, raw_request: Request
 ):
     """Anthropic-compatible messages endpoint."""
     _validate_anthropic_version(raw_request)
+    _validate_anthropic_beta_features(raw_request)
     return await raw_request.app.state.anthropic_serving_messages.handle_request(
         request, raw_request
     )
@@ -1545,6 +1570,7 @@ async def anthropic_v1_count_tokens(
     See: https://platform.claude.com/docs/en/build-with-claude/token-counting
     """
     _validate_anthropic_version(raw_request)
+    _validate_anthropic_beta_features(raw_request)
     return await raw_request.app.state.anthropic_serving_messages.handle_count_tokens_request(
         request, raw_request
     )
