@@ -1510,14 +1510,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
     def _filter_topk_indices_by_dcp(self, topk_indices: torch.Tensor) -> torch.Tensor:
         """Filter topk_indices to keep only indices where index % dcp_size == dcp_rank.
 
-        This is used for DCP (distributed compute parallel) to ensure each rank
+        This is used for DCP (decode context parallel) to ensure each rank
         only processes its assigned portion of the KV cache.
 
         Args:
             topk_indices: Tensor of shape [num_tokens, topk] containing topk indices
 
         Returns:
-            Filtered tensor with the same shape, where indices not matching
+            The same tensor (modified in-place), where indices not matching
             the DCP rank are set to -1
         """
         if self.dcp_size <= 1:
@@ -1526,13 +1526,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         # Create mask for indices that belong to this DCP rank
         mask = (topk_indices % self.dcp_size == self.dcp_rank) & (topk_indices >= 0)
 
-        # Create result tensor initialized with -1
-        result = torch.full_like(topk_indices, -1, dtype=topk_indices.dtype)
+        # Set invalid indices to -1 in-place
+        topk_indices[~mask] = -1
 
-        # Copy only the indices that match this DCP rank
-        result[mask] = topk_indices[mask]
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
+            topk_indices[mask] //= self.dcp_size
 
-        return result
+        return topk_indices
 
     def forward_absorb_prepare(
         self,
