@@ -6,7 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    EvictResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
@@ -151,7 +156,7 @@ class LMCRadixCache(RadixCache):
         prefix_pad = value.numel() % chunk_size
 
         if self.token_to_kv_pool_allocator.available_size() < uncached_len:
-            self.evict(uncached_len)
+            self.evict(EvictParams(num_tokens=uncached_len))
 
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
@@ -248,10 +253,10 @@ class LMCRadixCache(RadixCache):
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
 
-    def evict(self, num_tokens: int) -> None:  # type: ignore[override]
+    def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
         if self.disable:
-            return
+            return EvictResult()
 
         self.store_stream.synchronize()
         with self._node_lock:
@@ -259,7 +264,7 @@ class LMCRadixCache(RadixCache):
                 self.dec_lock_ref(node)
             self._in_flight_nodes.clear()
 
-        super().evict(num_tokens)
+        return super().evict(params)
 
     def pretty_print(self):  # type: ignore[override]
         super().pretty_print()

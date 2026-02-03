@@ -1177,11 +1177,49 @@ def validate_cache_lightweight(
             logger.debug("Failed to validate index file %s: %s", index_path, e)
             return False
     else:
-        # No index file, check for at least one shard
-        # *.safetensors already covers model-*.safetensors pattern
-        has_shards = bool(glob_module.glob(os.path.join(snapshot_dir, "*.safetensors")))
-        if not has_shards:
+        # No index file - check for weight files and validate shard completeness
+        safetensors_files = glob_module.glob(
+            os.path.join(snapshot_dir, "*.safetensors")
+        )
+        if not safetensors_files:
             return False
+
+        # Check shard completeness for sharded models (e.g., model-00001-of-00047.safetensors)
+        # Pattern: prefix-NNNNN-of-NNNNN.safetensors
+        shard_pattern = re.compile(r"(.*?)-(\d+)-of-(\d+)\.safetensors$")
+        shard_groups = {}
+
+        for f in safetensors_files:
+            base_name = os.path.basename(f)
+            match = shard_pattern.match(base_name)
+            if match:
+                prefix = match.group(1)
+                shard_id = int(match.group(2))
+                total_shards = int(match.group(3))
+                group_key = f"{prefix}-of-{total_shards}"
+
+                if group_key not in shard_groups:
+                    shard_groups[group_key] = {
+                        "total": total_shards,
+                        "found_shards": set(),
+                    }
+                shard_groups[group_key]["found_shards"].add(shard_id)
+
+        # Validate each shard group has all expected shards
+        for group_key, group_info in shard_groups.items():
+            total_shards = group_info["total"]
+            found_shards = group_info["found_shards"]
+            expected_shards = set(range(1, total_shards + 1))
+            missing_shards = expected_shards - found_shards
+
+            if missing_shards:
+                logger.debug(
+                    "Shard validation failed: missing shards %s in %s for %s",
+                    sorted(missing_shards),
+                    group_key,
+                    snapshot_dir,
+                )
+                return False
 
     # Check hf_quant_config.json if required (for modelopt quantization)
     if requires_hf_quant_config:
@@ -1212,6 +1250,38 @@ def _validate_safetensors_file(file_path: str) -> bool:
     except Exception as e:
         logger.warning(
             "Corrupted safetensors file detected: %s - %s: %s",
+            file_path,
+            type(e).__name__,
+            str(e),
+        )
+        return False
+
+
+def _validate_pytorch_bin_file(file_path: str) -> bool:
+    """
+    Validate that a PyTorch .bin file is readable and not corrupted.
+
+    This catches corruption issues like truncated downloads or invalid archives
+    that would cause errors like:
+    "RuntimeError: PytorchStreamReader failed reading file data/X: invalid header
+    or archive is corrupted"
+
+    Args:
+        file_path: Path to the .bin file
+
+    Returns:
+        True if the file is valid, False if corrupted
+    """
+    try:
+        import torch
+
+        # Use weights_only=True for security and to avoid executing arbitrary code
+        # mmap=False to fully read the file and catch all corruption
+        torch.load(file_path, map_location="cpu", weights_only=True, mmap=False)
+        return True
+    except Exception as e:
+        logger.warning(
+            "Corrupted PyTorch bin file detected: %s - %s: %s",
             file_path,
             type(e).__name__,
             str(e),
@@ -1366,10 +1436,14 @@ def _validate_sharded_model(
                 [],
             )
 
-        # Validate safetensors files for corruption
+        # Validate weight files for corruption
         if group_info["suffix"] == "safetensors":
             for f in group_info["files"]:
                 if not _validate_safetensors_file(f):
+                    corrupted_files.append(f)
+        elif group_info["suffix"] == "bin":
+            for f in group_info["files"]:
+                if not _validate_pytorch_bin_file(f):
                     corrupted_files.append(f)
 
         # Check for required index file for safetensors shards
@@ -1561,7 +1635,7 @@ def ci_validate_and_cleanup_local_snapshot(
                 )
                 return False
 
-        # Also validate single (non-sharded) safetensors files
+        # Also validate single (non-sharded) weight files
         for f in local_weight_files:
             base_name = os.path.basename(f)
             # Check if this is a single model file (not sharded)
@@ -1572,6 +1646,21 @@ def ci_validate_and_cleanup_local_snapshot(
                 "adapter_model.safetensors",
             ]:
                 if not _validate_safetensors_file(f):
+                    log_info_on_rank0(
+                        logger,
+                        f"Corrupted model file {base_name} for {model_name_or_path}. "
+                        "Will selectively clean and re-download this file.",
+                    )
+                    # Selective cleanup for single file
+                    _cleanup_corrupted_files_selective(model_name_or_path, [f])
+                    return False
+            # Also validate single PyTorch .bin files
+            elif base_name in [
+                "pytorch_model.bin",
+                "model.bin",
+                "adapter_model.bin",
+            ]:
+                if not _validate_pytorch_bin_file(f):
                     log_info_on_rank0(
                         logger,
                         f"Corrupted model file {base_name} for {model_name_or_path}. "
@@ -1613,11 +1702,14 @@ def _validate_weights_after_download(
     if not weight_files:
         return True  # No weight files to validate
 
-    # Validate safetensors files
+    # Validate weight files (safetensors and .bin)
     corrupted_files = []
     for f in weight_files:
         if f.endswith(".safetensors") and os.path.exists(f):
             if not _validate_safetensors_file(f):
+                corrupted_files.append(os.path.basename(f))
+        elif f.endswith(".bin") and os.path.exists(f):
+            if not _validate_pytorch_bin_file(f):
                 corrupted_files.append(os.path.basename(f))
 
     if corrupted_files:
@@ -1637,6 +1729,35 @@ def _validate_weights_after_download(
     return True
 
 
+def _get_lock_file_path(model_name_or_path: str) -> str:
+    """
+    Generate a unique lock file path for download coordination.
+
+    Uses file-based locking (fcntl.flock) to ensure only one process downloads
+    while others wait. This works regardless of how processes are spawned
+    (mp.Process, torchrun, etc.).
+
+    Args:
+        model_name_or_path: Model identifier
+
+    Returns:
+        Path to the lock file
+    """
+    # Create a unique hash based on model name only (not cache_dir)
+    # This ensures all processes coordinate on the same lock regardless of
+    # cache_dir configuration differences between processes
+    key_hash = hashlib.sha256(model_name_or_path.encode()).hexdigest()[:16]
+
+    # Use /dev/shm (shared memory filesystem) for lock files because:
+    # 1. It's always local to the machine (not NFS)
+    # 2. It properly supports file locking
+    # 3. It's shared across all processes on the same machine
+    # Fall back to /tmp if /dev/shm doesn't exist
+    if os.path.isdir("/dev/shm"):
+        return f"/dev/shm/sglang_download_lock_{key_hash}"
+    return f"/tmp/sglang_download_lock_{key_hash}"
+
+
 def ci_download_with_validation_and_retry(
     model_name_or_path: str,
     allow_patterns: List[str],
@@ -1650,6 +1771,14 @@ def ci_download_with_validation_and_retry(
 
     This function handles the download of model weights in CI environments,
     with automatic validation and retry logic for handling corrupted downloads.
+
+    Uses file-based locking (fcntl.flock) to prevent HuggingFace hub race
+    conditions where multiple processes try to download simultaneously,
+    causing .incomplete file conflicts. Only one process downloads at a time;
+    others wait for the lock then use the cached result.
+
+    This approach works regardless of how processes are spawned (mp.Process,
+    torchrun, etc.) since it doesn't rely on environment variables.
 
     Args:
         model_name_or_path: The model name or path
@@ -1665,7 +1794,8 @@ def ci_download_with_validation_and_retry(
     Raises:
         RuntimeError: If download fails after max_retries attempts
     """
-    # Lazy imports to avoid circular dependencies
+    import fcntl
+
     import huggingface_hub.constants
     from huggingface_hub import snapshot_download
     from tqdm.auto import tqdm
@@ -1675,43 +1805,87 @@ def ci_download_with_validation_and_retry(
             kwargs["disable"] = True
             super().__init__(*args, **kwargs)
 
-    # Retry loop for handling corrupted downloads
-    for attempt in range(max_retries):
-        hf_folder = snapshot_download(
+    # Use file-based locking to serialize downloads across all processes
+    # This prevents HF hub race conditions with .incomplete files
+    lock_file_path = _get_lock_file_path(model_name_or_path)
+
+    # Log lock file path for debugging
+    logger.info(
+        "[CI Download] Process %d using lock file: %s",
+        os.getpid(),
+        lock_file_path,
+    )
+
+    # Create lock file if it doesn't exist
+    lock_file = open(lock_file_path, "w")
+
+    try:
+        # Acquire exclusive lock - blocks until lock is available
+        # This ensures only one process downloads at a time
+        logger.info(
+            "[CI Download] Process %d waiting to acquire lock for %s",
+            os.getpid(),
             model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        logger.info(
+            "[CI Download] Process %d ACQUIRED lock for %s",
+            os.getpid(),
+            model_name_or_path,
         )
 
-        # Validate downloaded files to catch corruption early
-        is_valid = _validate_weights_after_download(
-            hf_folder, allow_patterns, model_name_or_path
+        # Now we have exclusive access - perform download with retry logic
+        hf_folder = None
+        for attempt in range(max_retries):
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                # Force single-threaded downloads to prevent race conditions on NFS
+                # HF hub defaults to max_workers=8, which can cause .incomplete file
+                # conflicts when multiple threads operate on the same files
+                max_workers=1,
+            )
+
+            # Validate downloaded files to catch corruption early
+            is_valid = _validate_weights_after_download(
+                hf_folder, allow_patterns, model_name_or_path
+            )
+
+            if is_valid:
+                return hf_folder
+
+            # Validation failed, corrupted files were cleaned up
+            if attempt < max_retries - 1:
+                log_info_on_rank0(
+                    logger,
+                    f"Retrying download for {model_name_or_path} "
+                    f"(attempt {attempt + 2}/{max_retries})...",
+                )
+            else:
+                raise RuntimeError(
+                    f"Downloaded model files are still corrupted for "
+                    f"{model_name_or_path} after {max_retries} attempts. "
+                    "This may indicate a persistent issue with the model files "
+                    "on Hugging Face Hub or network problems."
+                )
+
+        # Should never reach here, but return hf_folder just in case
+        return hf_folder
+
+    finally:
+        # Always release the lock
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+        logger.info(
+            "[CI Download] Process %d RELEASED lock for %s",
+            os.getpid(),
+            model_name_or_path,
         )
-
-        if is_valid:
-            return hf_folder
-
-        # Validation failed, corrupted files were cleaned up
-        if attempt < max_retries - 1:
-            log_info_on_rank0(
-                logger,
-                f"Retrying download for {model_name_or_path} "
-                f"(attempt {attempt + 2}/{max_retries})...",
-            )
-        else:
-            raise RuntimeError(
-                f"Downloaded model files are still corrupted for "
-                f"{model_name_or_path} after {max_retries} attempts. "
-                "This may indicate a persistent issue with the model files "
-                "on Hugging Face Hub or network problems."
-            )
-
-    # This should never be reached, but just in case
-    return hf_folder
 
 
 def ci_validate_and_clean_hf_cache(model_path: str) -> None:
@@ -1777,9 +1951,20 @@ def ci_validate_and_clean_hf_cache(model_path: str) -> None:
                 if not _validate_safetensors_file(sf_file):
                     corrupted_files.append(sf_file)
 
+            # Also find and validate PyTorch .bin files
+            bin_files = glob_module.glob(os.path.join(snapshot_dir, "*.bin"))
+
+            for bin_file in bin_files:
+                # Skip broken symlinks (os.path.exists returns False for them)
+                if not os.path.exists(bin_file):
+                    continue
+
+                if not _validate_pytorch_bin_file(bin_file):
+                    corrupted_files.append(bin_file)
+
         if corrupted_files:
             logger.warning(
-                "HFRunner: Found %d corrupted safetensors file(s) for %s. "
+                "HFRunner: Found %d corrupted weight file(s) for %s. "
                 "Removing to force re-download.",
                 len(corrupted_files),
                 model_path,

@@ -28,6 +28,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     LogProbs,
     MessageProcessingResult,
+    SglExt,
     ToolCall,
     ToolCallProcessingResult,
     ToolChoice,
@@ -37,6 +38,7 @@ from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
+    process_routed_experts_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -298,6 +300,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_room=request.bootstrap_room,
             data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
+            return_routed_experts=request.return_routed_experts,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             require_reasoning=self._get_reasoning_from_request(request),
@@ -454,6 +457,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if request.chat_template_kwargs
                         else {}
                     ),
+                    return_dict=False,
                 )
             except Exception as e:
                 # If the first attempt fails, try transforming the tools format
@@ -476,6 +480,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             if request.chat_template_kwargs
                             else {}
                         ),
+                        return_dict=False,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -608,6 +613,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         reasoning_tokens = {}
+        routed_experts = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -619,18 +625,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
+                finish_reason = content["meta_info"]["finish_reason"]
                 choice_logprobs = None
                 if request.logprobs:
-                    choice_logprobs = self._process_streaming_logprobs(
-                        content, n_prev_tokens.get(index, 0)
-                    )
-                    n_prev_tokens[index] = len(
+                    n_prev_token = n_prev_tokens.get(index, 0)
+                    total_output_logprobs = len(
                         content["meta_info"]["output_token_logprobs"]
                     )
-
-                finish_reason = content["meta_info"]["finish_reason"]
+                    # When finish_reason is set and all logprobs have been sent,
+                    # any remaining text is just buffered text being flushed by the
+                    # detokenizer (it holds back text at word boundaries). Return None
+                    # for logprobs since no new tokens were generated for this text.
+                    if n_prev_token < total_output_logprobs or finish_reason is None:
+                        choice_logprobs = self._process_streaming_logprobs(
+                            content, n_prev_token
+                        )
+                    n_prev_tokens[index] = total_output_logprobs
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # Track finish_reason for each index
@@ -818,6 +831,27 @@ class OpenAIServingChat(OpenAIServingBase):
                             full_content, self.tokenizer_manager.tokenizer
                         )
                     )
+            if request.return_routed_experts and routed_experts:
+                for index, choice_routed_experts in routed_experts.items():
+                    if choice_routed_experts is not None:
+                        routed_experts_chunk = ChatCompletionStreamResponse(
+                            id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            choices=[
+                                ChatCompletionResponseStreamChoice(
+                                    index=index,
+                                    delta=DeltaMessage(
+                                        sgl_ext=SglExt(
+                                            routed_experts=choice_routed_experts
+                                        )
+                                    ),
+                                    finish_reason=None,
+                                )
+                            ],
+                            model=request.model,
+                        )
+                        yield (f"data: {routed_experts_chunk.model_dump_json()}\n\n")
+
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
@@ -885,6 +919,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
+            routed_experts = process_routed_experts_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
@@ -902,6 +937,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model_type=reasoning_parser,
                         stream_reasoning=False,
                         force_reasoning=is_force_reasoning,
+                        request=request,
                     )
                     if self.tokenizer_manager.server_args.enable_reasoning_tokens:
                         ret_item["meta_info"]["reasoning_tokens"] = (
@@ -951,6 +987,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                sgl_ext=(
+                    SglExt(routed_experts=routed_experts) if routed_experts else None
+                ),
             )
             choices.append(choice_data)
 
@@ -1155,6 +1194,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
+                request,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
@@ -1184,15 +1224,22 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
         if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
-            # qwen3, glm45, nano_v3, and interns1 are reasoning by default
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
             return (
                 not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
+                or request.chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
             )
         return True  # default
 
