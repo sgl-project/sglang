@@ -232,23 +232,6 @@ impl RequestExecutionStage {
             )
         })?;
 
-        let result =
-            Self::execute_prefill_decode_grpc(proto_request, prefill_client, decode_client).await;
-
-        // Record circuit breaker outcomes for each worker
-        workers.record_dual_outcomes(result.is_ok(), result.is_ok());
-
-        result
-    }
-
-    /// Execute gRPC requests to prefill and decode workers in parallel
-    ///
-    /// Shared logic for PD mode and EPD mode (prefill handles encoder dispatch).
-    async fn execute_prefill_decode_grpc(
-        proto_request: ProtoGenerateRequest,
-        prefill_client: &mut crate::routers::grpc::client::GrpcClient,
-        decode_client: &mut crate::routers::grpc::client::GrpcClient,
-    ) -> Result<ExecutionResult, Response> {
         let prefill_request = proto_request.clone_inner();
         let decode_request = proto_request;
 
@@ -257,10 +240,13 @@ impl RequestExecutionStage {
             decode_client.generate(decode_request)
         );
 
+        // Record circuit breaker outcomes for each worker individually
+        workers.record_dual_outcomes(prefill_result.is_ok(), decode_result.is_ok());
+
         // Handle prefill result
         let prefill_stream = prefill_result.map_err(|e| {
             error!(
-                function = "execute_prefill_decode_grpc",
+                function = "execute_dual_dispatch",
                 error = %e,
                 "Prefill worker failed to start"
             );
@@ -273,7 +259,7 @@ impl RequestExecutionStage {
         // Handle decode result
         let decode_stream = decode_result.map_err(|e| {
             error!(
-                function = "execute_prefill_decode_grpc",
+                function = "execute_dual_dispatch",
                 error = %e,
                 "Decode worker failed to start"
             );
