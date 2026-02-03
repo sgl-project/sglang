@@ -1,78 +1,8 @@
 import torch
-import triton
-import triton.language as tl
 
-
-@triton.jit
-def _get_k_and_s_triton_kernel(
-    buf_ptr,
-    page_indices_ptr,
-    k_out_ptr,
-    s_out_ptr,
-    seq_len_ptr,
-    seq_len_num: tl.constexpr,
-    page_size: tl.constexpr,
-    buf_numel_per_page: tl.constexpr,
-    index_head_dim: tl.constexpr,
-    s_offset_in_page: tl.constexpr,
-    page_indice_batch_offset: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    batch_id = tl.program_id(0)
-    token_id = tl.program_id(1)
-
-    # Calculate which page and offset within page
-    page_idx = token_id // page_size
-    token_offset_in_page = token_id % page_size
-
-    # Load batch id seq len from seq_len_ptr
-    seq_len = tl.load(seq_len_ptr + batch_id)
-
-    if token_id >= seq_len:
-        return
-
-    pre_batch_idx = tl.arange(0, seq_len_num)
-    mask_pre_batch_idx = pre_batch_idx < batch_id
-    prev_seq_lens = tl.load(seq_len_ptr + pre_batch_idx, mask=mask_pre_batch_idx)
-    seq_len_offset = tl.sum(prev_seq_lens)
-    # seq_len_offset = tl.load(seq_len_offset_ptr + batch_id)
-    k_offset_batch = seq_len_offset * index_head_dim
-    s_offset_batch = seq_len_offset * 4
-
-    # Load the page index from page_indices
-    page_index = tl.load(
-        page_indices_ptr + page_idx + batch_id * page_indice_batch_offset
-    )
-
-    # ===== Load K data (128 bytes) =====
-    # Calculate source offset for K in buf
-    k_src_base_offset = (
-        page_index * buf_numel_per_page + token_offset_in_page * index_head_dim
-    )
-
-    # Load 128 bytes (index_head_dim elements)
-    k_offsets = tl.arange(0, BLOCK_SIZE_K)
-    k_mask = (k_offsets < index_head_dim) & (token_id < seq_len)
-    k_data = tl.load(buf_ptr + k_src_base_offset + k_offsets, mask=k_mask)
-
-    # # Store K to output
-    k_dst_offset = token_id * index_head_dim
-    tl.store(k_out_ptr + k_dst_offset + k_offsets + k_offset_batch, k_data, mask=k_mask)
-
-    # # ===== Load S data (4 bytes) =====
-    # # Calculate source offset for S in buf
-    s_src_base_offset = (
-        page_index * buf_numel_per_page + s_offset_in_page + token_offset_in_page * 4
-    )
-
-    # # Load 4 bytes (fp32 scale)
-    s_offsets = tl.arange(0, 4)
-    s_mask = (s_offsets < 4) & (token_id < seq_len)
-    s_data = tl.load(buf_ptr + s_src_base_offset + s_offsets, mask=s_mask)
-
-    # # Store S to output
-    s_dst_offset = token_id * 4
-    tl.store(s_out_ptr + s_dst_offset + s_offsets + s_offset_batch, s_data, mask=s_mask)
+from sglang.srt.layers.attention.nsa.index_buf_accessor import (
+    _get_k_and_s_triton_kernel,
+)
 
 
 def golden_torch_gen(
@@ -172,7 +102,7 @@ def get_k_and_s_triton():
         k_out_ptr=triton_k_out,
         s_out_ptr=triton_s_out,
         seq_len_ptr=seq_len_tensor,
-        seq_len_num=seq_num_pow2,
+        seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
         buf_numel_per_page=buf_numel_per_page,
         index_head_dim=index_head_dim,
@@ -208,7 +138,7 @@ def get_k_and_s_triton():
             k_out_ptr=triton_k_out,
             s_out_ptr=triton_s_out,
             seq_len_ptr=seq_len_tensor,
-            seq_len_num=seq_num_pow2,
+            seq_len_num_pow=seq_num_pow2,
             page_size=page_size,
             buf_numel_per_page=buf_numel_per_page,
             index_head_dim=index_head_dim,
@@ -226,7 +156,7 @@ def get_k_and_s_triton():
         k_out_ptr=triton_k_out,
         s_out_ptr=triton_s_out,
         seq_len_ptr=seq_len_tensor,
-        seq_len_num=seq_num_pow2,
+        seq_len_num_pow=seq_num_pow2,
         page_size=page_size,
         buf_numel_per_page=buf_numel_per_page,
         index_head_dim=index_head_dim,

@@ -529,7 +529,7 @@ class Indexer(MultiPlatformOp):
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
             k_fp8 = k_fp8.view(torch.float8_e4m3fn)
-            
+
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
 
