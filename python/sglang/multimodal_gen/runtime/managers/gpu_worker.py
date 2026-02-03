@@ -163,6 +163,7 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):

@@ -116,24 +116,25 @@ class TestMamba(unittest.TestCase):
         )
 
         # alloc req
-        req_index = req_to_token_pool.alloc(1, [req])
+        req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
         # free req
-        req_to_token_pool.free(req_index)
+        req_to_token_pool.free_mamba_cache(req)
+        req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size
 
         # alloc req without free mamba cache
         req.mamba_pool_idx = None
-        req_index = req_to_token_pool.alloc(1, [req])
-        req_to_token_pool.free(req_index, free_mamba_cache=False)
+        req_to_token_pool.alloc([req])
+        req_to_token_pool.free(req)
         assert req_to_token_pool.available_size() == max_num_reqs
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
         # alloc again
-        req_index = req_to_token_pool.alloc(1, [req])
+        req_to_token_pool.alloc([req])
         assert req_to_token_pool.available_size() == max_num_reqs - 1
         assert req_to_token_pool.mamba_pool.available_size() == mamba_cache_size - 1
 
@@ -225,7 +226,7 @@ class TestMamba(unittest.TestCase):
                 origin_input_ids=[],
                 sampling_params=sampling_params,
             )
-            req_to_token_pool.alloc(1, reqs=[req])
+            req_to_token_pool.alloc([req])
             return req
 
         mamba_pool = req_to_token_pool.mamba_pool
