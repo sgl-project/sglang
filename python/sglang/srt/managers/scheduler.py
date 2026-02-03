@@ -2172,11 +2172,15 @@ class Scheduler(
                     ),
                 )
             self.new_token_ratio = new_token_ratio
-            for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.send_to_tokenizer.send_output(
-                    AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+            if reqs_to_abort:
+                logger.warning(
+                    f"abort {len(reqs_to_abort)} requests because no space left for any request"
                 )
+                for req in reqs_to_abort:
+                    abort_reason: FINISH_ABORT = req.to_finish
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(abort_message=abort_reason.message, rid=req.rid), req
+                    )
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "

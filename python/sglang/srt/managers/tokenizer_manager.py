@@ -2134,7 +2134,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        state: ReqState = self.rid_to_state[recv_obj.rid]
+        logger.debug(f"handle abort req {recv_obj.rid}, state: {state}")
         state.finished = True
 
         abort_message = recv_obj.abort_message or "Abort in waiting queue"
@@ -2144,7 +2145,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         }
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
-        meta_info = {"id": recv_obj.rid, "finish_reason": finish_reason}
+        meta_info = {
+            "id": recv_obj.rid,
+            "finish_reason": finish_reason,
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+            "weight_version": self.server_args.weight_version,
+            "total_retractions": 0,
+        }
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(

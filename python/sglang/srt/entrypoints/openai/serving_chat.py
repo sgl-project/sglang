@@ -620,10 +620,11 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                completion_tokens[index] = content["meta_info"]["completion_tokens"]
-                cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
-                hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                meta_info = content.get("meta_info", {})
+                prompt_tokens[index] = meta_info.get("prompt_tokens", 0)
+                completion_tokens[index] = meta_info.get("completion_tokens", 0)
+                cached_tokens[index] = meta_info.get("cached_tokens", 0)
+                hidden_states[index] = meta_info.get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
@@ -632,7 +633,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
                     total_output_logprobs = len(
-                        content["meta_info"]["output_token_logprobs"]
+                        meta_info.get("output_token_logprobs", [])
                     )
                     # When finish_reason is set and all logprobs have been sent,
                     # any remaining text is just buffered text being flushed by the
@@ -660,7 +661,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         logprobs=None,
                     )
                     chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
+                        id=meta_info.get("id", ""),
                         created=int(time.time()),
                         choices=[choice_data],
                         model=request.model,
@@ -683,7 +684,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             finish_reason=None,
                         )
                         chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=meta_info.get("id", ""),
                             created=int(time.time()),
                             choices=[choice_data],
                             model=request.model,
@@ -738,7 +739,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             logprobs=choice_logprobs,
                         )
                         chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=meta_info.get("id", ""),
                             created=int(time.time()),
                             choices=[choice_data],
                             model=request.model,
@@ -797,7 +798,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             else []
                         )
                         hidden_states_chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=meta_info.get("id", ""),
                             created=int(time.time()),
                             choices=[
                                 ChatCompletionResponseStreamChoice(
@@ -843,7 +844,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=meta_info.get("id", ""),
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
@@ -901,8 +902,9 @@ class OpenAIServingChat(OpenAIServingBase):
             hidden_states = process_hidden_states_from_ret(ret_item, request)
             routed_experts = process_routed_experts_from_ret(ret_item, request)
 
-            finish_reason = ret_item["meta_info"]["finish_reason"]
-            text = ret_item["text"]
+            ret_meta_info = ret_item.get("meta_info", {})
+            finish_reason = ret_meta_info.get("finish_reason")
+            text = ret_item.get("text", "")
 
             # Handle reasoning content
             reasoning_text = None
@@ -973,13 +975,14 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
         )
 
+        meta_info = ret[0].get("meta_info", {})
         return ChatCompletionResponse(
-            id=ret[0]["meta_info"]["id"],
+            id=meta_info.get("id", ""),
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata={"weight_version": meta_info.get("weight_version")},
         )
 
     def _process_logprobs_tokens(
@@ -1026,9 +1029,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
+        meta_info = ret_item.get("meta_info", {})
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
-            output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
+            output_token_logprobs=meta_info.get("output_token_logprobs", []),
+            output_top_logprobs=meta_info.get("output_top_logprobs", None),
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
@@ -1137,13 +1141,16 @@ class OpenAIServingChat(OpenAIServingBase):
         self, content: Dict[str, Any], n_prev_token: int
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
+        meta_info = content.get("meta_info", {})
+        output_token_logprobs = meta_info.get("output_token_logprobs", [])
+        output_top_logprobs = meta_info.get("output_top_logprobs", [])
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
-                n_prev_token:
-            ],
-            output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
-                n_prev_token:
-            ],
+            output_token_logprobs=(
+                output_token_logprobs[n_prev_token:] if output_token_logprobs else []
+            ),
+            output_top_logprobs=(
+                output_top_logprobs[n_prev_token:] if output_top_logprobs else []
+            ),
         )
 
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=False)
@@ -1248,6 +1255,7 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = parser.parse_stream_chunk(delta)
 
         # Yield normal text
+        meta_info = content.get("meta_info", {})
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -1255,7 +1263,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=meta_info.get("id", ""),
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
@@ -1263,8 +1271,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if request.stream_options and request.stream_options.continuous_usage_stats:
-                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                prompt_tokens = meta_info.get("prompt_tokens", 0)
+                completion_tokens = meta_info.get("completion_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
@@ -1305,7 +1313,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=meta_info.get("id", ""),
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
@@ -1313,8 +1321,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Add usage stats if continuous_usage_stats is enabled
             if request.stream_options and request.stream_options.continuous_usage_stats:
-                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
-                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                prompt_tokens = meta_info.get("prompt_tokens", 0)
+                completion_tokens = meta_info.get("completion_tokens", 0)
                 chunk.usage = UsageProcessor.calculate_token_usage(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
@@ -1384,8 +1392,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason=None,  # Don't send finish_reason with this chunk
             )
 
+            meta_info = content.get("meta_info", {})
             chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
+                id=meta_info.get("id", ""),
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,

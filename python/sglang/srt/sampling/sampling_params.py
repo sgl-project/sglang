@@ -194,6 +194,26 @@ class SamplingParams:
 
             self.stop_regex_max_len = stop_regex_max_len
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_new_tokens": self.max_new_tokens,
+            "stop_strs": self.stop_strs,
+            "stop_token_ids": self.stop_token_ids,
+            "stop_regex_strs": self.stop_regex_strs,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "stop_str_max_len": self.stop_str_max_len,
+            "stop_regex_max_len": self.stop_regex_max_len,
+            "top_k": self.top_k,
+            "presence_penalty": getattr(self, "presence_penalty", None),
+            "frequency_penalty": getattr(self, "frequency_penalty", None),
+            "repetition_penalty": getattr(self, "repetition_penalty", None),
+            "custom_params": getattr(self, "custom_params", None),
+            "json_schema": getattr(self, "json_schema", None),
+            "regex": getattr(self, "regex", None),
+            "ebnf": getattr(self, "ebnf", None),
+        }
+
 
 # This function gets a strict upperbound on the maximum number of tokens that would need
 # to be buffered to match the input regex string
