@@ -39,7 +39,6 @@ jobs:
           cd docs
           make clean
           make compile
-          make markdown
 
       - name: Push HTML to sgl-project.github.io
         timeout-minutes: 30
@@ -48,6 +47,7 @@ jobs:
         run: |
           cd docs
           make html
+          make markdown
           python3 wrap_run_llm.py
 
           cd _build/html
