@@ -213,7 +213,7 @@ def get_attn_tp_context():
     return ATTN_TP_CONTEXT
 
 
-def _delay_gather_for_dsa():
+def delay_gather_for_dsa():
     return (
         get_global_server_args().enable_attn_tp_input_scattered
         and get_attn_tp_context().is_nsa
@@ -643,7 +643,7 @@ class CommunicateSimpleFn:
         if (input_mode == ScatterMode.SCATTERED) and (
             output_mode == ScatterMode.TP_ATTN_FULL
         ):
-            if _delay_gather_for_dsa():
+            if delay_gather_for_dsa():
                 return CommunicateSimpleFn._trivial
             return CommunicateSimpleFn._scattered_to_tp_attn_full
 

@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.communicator import (
     ScatterMode,
-    _delay_gather_for_dsa,
+    delay_gather_for_dsa,
     get_attn_tp_context,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
@@ -346,7 +346,7 @@ def forward_dsa_prepare_npu(
             q_lora = m.q_a_layernorm(q)
 
     else:
-        if _delay_gather_for_dsa():
+        if delay_gather_for_dsa():
             fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         else:
             fused_qkv_a_proj_out = get_attn_tp_context().fetch_qkv_latent()
@@ -357,7 +357,8 @@ def forward_dsa_prepare_npu(
         # overlap qk norm
         q = m.q_a_layernorm(q)
         if (
-            _delay_gather_for_dsa()
+            delay_gather_for_dsa()
+            and get_attn_tp_context().input_scattered
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):

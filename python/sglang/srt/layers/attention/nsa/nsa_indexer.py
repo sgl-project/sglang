@@ -31,7 +31,11 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
 )
-from sglang.srt.layers.communicator import ScatterMode, _delay_gather_for_dsa
+from sglang.srt.layers.communicator import (
+    ScatterMode,
+    delay_gather_for_dsa,
+    get_attn_tp_context,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1038,7 +1042,8 @@ class Indexer(CustomOp):
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
         if (
-            _delay_gather_for_dsa()
+            delay_gather_for_dsa()
+            and get_attn_tp_context().input_scattered
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
@@ -1125,7 +1130,8 @@ class Indexer(CustomOp):
             torch.npu.current_stream().wait_event(q_rope_event)
         torch.npu.current_stream().wait_event(weights_event)
         if (
-            _delay_gather_for_dsa()
+            delay_gather_for_dsa()
+            and get_attn_tp_context().input_scattered
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
