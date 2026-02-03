@@ -6,7 +6,6 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <c10/cuda/CUDAGuard.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cuda_fp16.h>
@@ -138,9 +137,8 @@ void launch_kernel(
     int num_kv_heads,
     int head_size,
     dim3 grid,
-    dim3 block,
-    const cudaStream_t stream) {
-  rotary_embedding_kernel<scalar_t, IS_NEOX><<<grid, block, 0, stream>>>(
+    dim3 block) {
+  rotary_embedding_kernel<scalar_t, IS_NEOX><<<grid, block, 0>>>(
       positions_data_ptr,
       static_cast<scalar_t*>(query_ptr),
       static_cast<scalar_t*>(key_ptr),
@@ -183,8 +181,7 @@ void dispatch_by_dtype(
     int num_kv_heads,
     int head_size,
     dim3 grid,
-    dim3 block,
-    const cudaStream_t stream) {
+    dim3 block) {
   using namespace host;
   DISPATCH_DTYPE(
       query_dtype.code,
@@ -202,19 +199,7 @@ void dispatch_by_dtype(
       num_kv_heads,
       head_size,
       grid,
-      block,
-      stream);
-}
-
-inline c10::Device toC10Device(const DLDevice& d) {
-  switch (d.device_type) {
-    case kDLCPU:
-      return c10::Device(c10::kCPU);
-    case kDLCUDA:
-      return c10::Device(c10::kCUDA, d.device_id);
-    default:
-      TORCH_CHECK(false, "Unsupported DLDeviceType: ", (int)d.device_type);
-  }
+      block)
 }
 
 struct RotaryEmbeddingKernel {
@@ -279,9 +264,6 @@ struct RotaryEmbeddingKernel {
     dim3 grid(num_tokens);
     dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
 
-    const at::cuda::OptionalCUDAGuard device_guard(toC10Device(query.device()));
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
     auto positions_data_ptr = static_cast<const int64_t*>(positions.data_ptr());
 
     if (is_neox) {
@@ -299,8 +281,7 @@ struct RotaryEmbeddingKernel {
           num_kv_heads,
           head_size,
           grid,
-          block,
-          stream);
+          block);
     } else {
       dispatch_by_dtype<false>(
           positions_data_ptr,
@@ -316,8 +297,7 @@ struct RotaryEmbeddingKernel {
           num_kv_heads,
           head_size,
           grid,
-          block,
-          stream);
+          block);
     }
   }
 };
