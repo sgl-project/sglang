@@ -702,7 +702,7 @@ class QwenImageTransformerBlock(nn.Module):
         #   - residual_out = gate_x * x + residual_x
         # - x = norm(residual_out) * (1 + scale) + shift
         # TODO: clean code here
-        is_scale_residual = gate_x is not None
+        is_scale_residual = isinstance(norm_module, ScaleResidualLayerNormScaleShift)
 
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
@@ -750,14 +750,12 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
                 if is_scale_residual:
-                    modulated, residual_out = (
-                        norm_module(
-                            residual=residual_x,
-                            x=x,
-                            gate=gate_x,
-                            shift=shift_result,
-                            scale=scale_result,
-                        ),
+                    modulated, residual_out = norm_module(
+                        residual=residual_x,
+                        x=x,
+                        gate=gate_x,
+                        shift=shift_result,
+                        scale=scale_result,
                     )
                     return modulated, residual_out, gate_result
                 else:
