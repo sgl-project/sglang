@@ -66,18 +66,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         cls.stdout.close()
         cls.stderr.close()
 
-
-class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
-    model = "Qwen/Qwen3-8B"
-
-    def test_peak_memory(self):
+    def _test_peak_memory(self, threshold):
+        """Helper method to test peak memory against a threshold."""
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
+        assert self.peak_memory < threshold
 
-        # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
-        assert self.peak_memory < 6
-
-    def test_gsm8k(self):
+    def _test_gsm8k(self, accuracy_threshold):
+        """Helper method to test GSM8K accuracy against a threshold."""
         args = SimpleNamespace(
             num_shots=8,
             data_path=None,
@@ -89,9 +85,19 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
+        self.assertGreater(metrics["accuracy"], accuracy_threshold)
 
+
+class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
+    model = "Qwen/Qwen3-8B"
+
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
+        self._test_peak_memory(threshold=6)  # TP=1
+
+    def test_gsm8k(self):
         # Original Qwen/Qwen3-8B reference accuracy: ~0.92
-        self.assertGreater(metrics["accuracy"], 0.85)
+        self._test_gsm8k(accuracy_threshold=0.85)
 
 
 class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
@@ -103,24 +109,9 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
-        if not is_cuda_alike():
-            self.skipTest("not is_cuda_alike")
-
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
-        assert self.peak_memory < 21.5
+        self._test_peak_memory(threshold=21.5)  # TP=1
 
     def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=8,
-            data_path=None,
-            num_questions=500,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval(args)
-        print(f"{metrics=}")
-
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
-        self.assertGreater(metrics["accuracy"], 0.9)
+        self._test_gsm8k(accuracy_threshold=0.9)
