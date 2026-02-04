@@ -57,6 +57,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_cuda,
     is_npu,
+    is_mindspore,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -242,6 +243,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self.cuda_graph_runner_for_draft_extend = None
 
         if self.server_args.disable_cuda_graph:
+            return
+
+        if is_mindspore():
+            logger.info("Skip CUDA graph capture for MindSpore backend.")
             return
 
         Device2DraftCudaGraphRunner = {
