@@ -64,9 +64,14 @@ class TestGpuId(CustomTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("Paris", response.text)
         # Filter out the memory usage values of each device
-        result = run_command(
-           "npu-smi info | grep '/ 65536' | awk -F '|' '{print $4}' | awk '{print $5}' | awk -F '/' '{print $1}'"
-        ).split("\n")
+        cmd = "npu-smi info | grep '/ 65536' | awk -F '|' '{print $4}' | awk '{print $5}' | awk -F '/' '{print $1}'"
+        raw_result = run_command(cmd)
+
+        result = []
+        if raw_result is not None:
+            result = [line.strip() for line in raw_result.split("\n") if line.strip()]
+        else:
+            print(f"执行命令 '{cmd}' 失败，返回结果为None")
         for i in range(len(result)-1):
             # Occupied devices show high memory usage.
             if i in [self.device_id, self.device_id + self.step]:

@@ -3,6 +3,8 @@
 import os
 import subprocess
 
+import logging
+
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 HF_MODEL_WEIGHTS_DIR = "/root/.cache/huggingface/hub/"
@@ -90,6 +92,10 @@ Qwen3_30B_A3B_Instruct_2507_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-Instruct-2507"
 )
 QWEN3_32B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-32B")
+QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-32B-Eagle3")
+QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
+)
 QWEN3_235B_A22B_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "vllm-ascend/Qwen3-235B-A22B-W8A8"
 )
@@ -213,7 +219,7 @@ def run_command(cmd, shell=True):
         )
         return result.stdout
     except subprocess.CalledProcessError as e:
-        print(f"execute command error: {e}")
+        logging.warning(f"execute command error: {e}")
         return None
 
 
@@ -242,16 +248,16 @@ def get_device_ids(index=None):
                     device_id = int(line)
                     device_ids.append(device_id)
                 except ValueError:
-                    print(f"Device ID '{line}' cannot be converted to an integer and has been skipped")
+                    logging.warning(f"Device ID '{line}' cannot be converted to an integer and has been skipped")
 
     if index is not None:
         if not isinstance(index, int):
-            print(f"Index {index} must be an integer type")
+            logging.warning(f"Index {index} must be an integer type")
             return None
         if 0 <= index < len(device_ids):
             return device_ids[index]
         else:
-            print(f"Index {index} is invalid, the length of device ID list is {len(device_ids)}")
+            logging.warning(f"Index {index} is invalid, the length of device ID list is {len(device_ids)}")
             return None
 
     return device_ids

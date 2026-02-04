@@ -23,7 +23,7 @@ class TestAscendDistTimeout(CustomTestCase):
     """
     @classmethod
     def setUpClass(cls):
-        cls.models = DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH
+        cls.model = DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH
         cls.accuracy = 0.95
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)

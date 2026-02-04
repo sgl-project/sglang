@@ -25,7 +25,7 @@ class TestAscendEagle3(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.models = QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH
+        cls.model = QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH
         cls.accuracy= 0.81
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
@@ -68,7 +68,7 @@ class TestAscendEagle3(CustomTestCase):
 
     def test_gsm8k(self):
         process = popen_launch_server(
-            self.models,
+            self.model,
             self.base_url,
             timeout=1500,
             other_args=[

@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
-class TestL1Cache(CustomTestCase):
+class TestL2Cache(CustomTestCase):
     """Testcase: Test shows that L2 cache is enabled,
     and inference request outputs shorter than the page size will not be reused
 

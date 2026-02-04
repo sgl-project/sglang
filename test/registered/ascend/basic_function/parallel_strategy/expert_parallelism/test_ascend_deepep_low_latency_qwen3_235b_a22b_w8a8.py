@@ -18,7 +18,7 @@ register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 
 class TestDeepEpLowLatencyQwen3235B(CustomTestCase):
-    """Testcase: This test case verifies that the Qwen3-235B-A22B-W8A8 model with DeepEP's auto mode achieves an
+    """Testcase: This test case verifies that the Qwen3-235B-A22B-W8A8 model with DeepEP's low_latency mode achieves an
     accuracy of greater than or equal to 0.5 on MMLU and greater than or equal to 0.94 on GSM8K.
 
     [Test Category] Parameter

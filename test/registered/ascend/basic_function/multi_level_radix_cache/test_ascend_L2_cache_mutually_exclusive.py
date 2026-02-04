@@ -12,7 +12,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
-class TestSkipServerWarmup(CustomTestCase):
+class TestL2CacheMutuallyExclusive(CustomTestCase):
     """Testcase: The test parameter disable-radix-cache and enable-hierarchical-cache
                 are mutually exclusive and cannot be used simultaneously.
 
