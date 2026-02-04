@@ -71,6 +71,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_flashinfer_available,
@@ -619,7 +620,7 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        if not _is_npu:
+        if not _is_npu or forward_batch.forward_mode.is_extend():
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1119,14 +1120,16 @@ class Qwen3MoeForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-        # TODO mimic deepseek
-        # Lazy initialization of expert weights cache to avoid slowing down load_weights
         if not hasattr(self, "routed_experts_weights_of_layer"):
-            self.routed_experts_weights_of_layer = {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-            }
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(self.start_layer, self.end_layer)
+                    if isinstance(
+                        self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock
+                    )
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
