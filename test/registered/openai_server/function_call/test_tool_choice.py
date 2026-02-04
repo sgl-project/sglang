@@ -12,7 +12,7 @@ import unittest
 
 import openai
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -853,6 +853,35 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
 #         )
 #         cls.base_url += "/v1"
 #         cls.tokenizer = get_tokenizer(cls.model)
+
+
+@unittest.skipIf(is_hip(), "Disabled for AMD")
+class TestToolChoiceLfm2(TestToolChoiceLlama32):
+    """Test tool_choice functionality with LiquidAI LFM2 model"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
+
+        cls.model = "LiquidAI/LFM2.5-1.2B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--tool-call-parser",
+                "lfm2",
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
 
 
 if __name__ == "__main__":

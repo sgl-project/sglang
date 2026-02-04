@@ -44,7 +44,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -128,7 +128,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
 from sglang.srt.managers.overlap_utils import FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
@@ -560,6 +560,7 @@ class Scheduler(
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.forward_stream,
             _,
             _,
             _,
@@ -615,6 +616,7 @@ class Scheduler(
             or self.tp_worker.model_runner.mamba2_config is not None
         )
 
+        self.sliding_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
@@ -644,6 +646,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=server_args.chunked_prefill_size,
+            sliding_window_size=self.sliding_window_size,
         )
 
         if (
@@ -657,9 +660,7 @@ class Scheduler(
             else:
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
-                self.tree_cache = SWAChunkCache(
-                    params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWAChunkCache(params)
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
@@ -678,9 +679,7 @@ class Scheduler(
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
-                self.tree_cache = SWARadixCache(
-                    params=params, sliding_window_size=self.sliding_window_size
-                )
+                self.tree_cache = SWARadixCache(params=params)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
@@ -714,17 +713,6 @@ class Scheduler(
         else:
             self.decode_offload_manager = None
 
-        self.decode_mem_cache_buf_multiplier = (
-            1
-            if self.spec_algorithm.is_none()
-            else (
-                server_args.speculative_num_draft_tokens
-                + (
-                    (server_args.speculative_eagle_topk or 1)
-                    * (server_args.speculative_num_steps or 1)
-                )
-            )
-        )
         self._hicache_storage_op_lock = threading.RLock()
         self._hicache_fault_detach_inflight = False
         self._hicache_storage_last_config = None
@@ -885,7 +873,7 @@ class Scheduler(
             self.prefill_delayer = PrefillDelayer(
                 dp_size=self.dp_size,
                 attn_tp_size=self.attn_tp_size,
-                cpu_group=self.tp_worker.get_tp_group().cpu_group,
+                cpu_group=self.tp_cpu_group,
                 server_args=self.server_args,
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
@@ -1065,12 +1053,13 @@ class Scheduler(
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            self.mm_receiver = MMReceiver(
+            self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
-                tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
+                tp_rank=self.tp_rank,
                 tp_group=self.tp_group,
+                scheduler=self,
             )
 
     def init_overlap(self):
@@ -1079,7 +1068,6 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
 
-        self.forward_stream: CudaStream = self.device_module.Stream()
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
@@ -1305,6 +1293,7 @@ class Scheduler(
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = unwrap_shm_features(recv_req)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1371,7 +1360,16 @@ class Scheduler(
             and self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs, abort_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
+            for req, error_msg, error_code in abort_reqs:
+
+                status_code = (
+                    HTTPStatus.BAD_REQUEST
+                    if error_code == 400
+                    else HTTPStatus.INTERNAL_SERVER_ERROR
+                )
+                prepare_abort(req, error_msg, status_code=status_code)
+                self.stream_output([req], req.return_logprob)
 
         if self.enable_trace:
             for req in recv_reqs:
@@ -1517,6 +1515,18 @@ class Scheduler(
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
+    def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
+        for req in batch.reqs:
+            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
+                continue
+            # For session requests, keep mm_inputs for the next request
+            if req.session_id:
+                continue
+            # For non-session requests, clear features and mm_inputs
+            for item in mm_inputs.mm_items:
+                item.feature = None
+            req.multimodal_inputs = None
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -1574,7 +1584,7 @@ class Scheduler(
                 if recv_req.bootstrap_room is None:
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
-                        f"boostrap room id. {req.rid=}"
+                        f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
@@ -1605,6 +1615,19 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+
+            # For session requests, adjust mm_inputs offsets by the prefix length.
+            # Session.create_req prepends previous context to origin_input_ids,
+            # so offsets from the new prompt need to be shifted.
+            if len(recv_req.input_ids) < len(req.origin_input_ids):
+                assert recv_req.session_params.id in self.sessions
+                prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+                for mm_item in image_inputs.mm_items:
+                    if mm_item.offsets:
+                        mm_item.offsets = [
+                            (start + prefix_len, end + prefix_len)
+                            for start, end in mm_item.offsets
+                        ]
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -1643,13 +1666,14 @@ class Scheduler(
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
-            if req.is_prefill_only:
+            if recv_req.return_logprob and recv_req.token_ids_logprob is None:
+                # If logprob is required but neither token_ids_logprob nor logprob_start_len is
+                # set, return the logprobs for output tokens by default
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+            elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-            elif recv_req.return_logprob:
-                # If return_logprob is True, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids) - 1
             else:
                 # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1
@@ -1774,7 +1798,10 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hierarchical_cache:
+                if self.enable_hicache_storage:
+                    # Release prefetch events associated with the request
+                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
@@ -1802,6 +1829,9 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
+                if self.enable_hicache_storage:
+                    # Release prefetch events associated with the request
+                    self.tree_cache.release_aborted_request(req.rid)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -1889,11 +1919,6 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
-        # Chunked request keeps its rid but will get a new req_pool_idx
-        if self.tp_worker.model_runner.mambaish_config is not None:
-            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
-        else:
-            self.req_to_token_pool.free(req.req_pool_idx)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()
@@ -2126,6 +2151,10 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+                # Pop the number of tokens loaded from storage (L3 hits)
+                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                    req.rid
+                )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -2186,14 +2215,10 @@ class Scheduler(
         if self.dllm_staging_reqs.non_empty():
             self.dllm_staging_reqs.update_chunked_status()
 
-        # Print stats
-        if self.current_scheduler_metrics_enabled:
-            self.log_prefill_stats(
-                adder,
-                can_run_list,
-                running_bs=len(self.running_batch.reqs),
-                running_bs_offline_batch=0,
-            )
+        # Record for logging prefill stats after forward
+        self.adder = adder
+        self.can_run_list = can_run_list
+        self.running_bs = len(self.running_batch.reqs)
 
         # Record metrics
         for req in can_run_list:
@@ -2255,29 +2280,15 @@ class Scheduler(
             return batch
 
         # Check if decode out of memory
-        if (
-            kv_full_retract_flag := not batch.check_decode_mem(
-                self.decode_mem_cache_buf_multiplier
-            )
-        ) or (TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0):
-            if self.is_hybrid_swa:
-                old_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                old_available_tokens = self.token_to_kv_pool_allocator.available_size()
+        if (kv_full_retract_flag := not batch.check_decode_mem()) or (
+            TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
+        ):
+            old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args, self.decode_mem_cache_buf_multiplier
+                self.server_args
             )
-            if self.is_hybrid_swa:
-                new_available_tokens = min(
-                    self.token_to_kv_pool_allocator.full_available_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size(),
-                )
-            else:
-                new_available_tokens = self.token_to_kv_pool_allocator.available_size()
+            new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
             self.num_retracted_reqs = len(retracted_reqs)
@@ -2522,6 +2533,7 @@ class Scheduler(
             self.process_batch_result_idle(batch, result)
 
         self.log_batch_result_stats(batch, result)
+        self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
@@ -2557,7 +2569,7 @@ class Scheduler(
             return False
         if len(self.waiting_queue) != 0:
             return False
-        if hasattr(self, "grammar_queue") and len(self.grammar_queue) != 0:
+        if len(self.grammar_manager.grammar_queue) != 0:
             return False
         return True
 

@@ -19,7 +19,10 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.1
+ARG FLASHINFER_VERSION=0.6.2
+ARG MOONCAKE_VERSION=0.3.8.post1
+#if need other arg please add in MOONCAKE_COMPILE_ARG
+ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -55,11 +58,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
-    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends \
     # Core system utilities
-    tzdata \
     ca-certificates \
     software-properties-common \
     netcat-openbsd \
@@ -269,11 +269,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
+# Install Mooncake
+RUN --mount=type=cache,target=/root/.cache/pip \
+    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    if [ "$CUDA_MAJOR" -ge 13 ]; then \
+        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
+        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
+        cd Mooncake && \
+        bash dependencies.sh && \
+        mkdir -p build && \
+        cd build && \
+        cmake .. ${MOONCAKE_COMPILE_ARG} && \
+        make -j$(nproc) && \
+        make install; \
+    else \
+        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
+        python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
+    fi
 # Install essential Python packages
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
-    mooncake-transfer-engine==0.3.8.post1 \
     pre-commit \
     pytest \
     black \
@@ -309,6 +325,7 @@ RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12"
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.1.1 ; \
@@ -424,6 +441,8 @@ RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-p
         ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
     fi
 
+RUN python3 -m pip install --upgrade "urllib3>=2.6.3"
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -470,7 +489,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     python3.12-dev \
     wget \
     # Core system utilities
-    tzdata \
     ca-certificates \
     netcat-openbsd \
     curl \
@@ -505,6 +523,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
     libnccl2 \
     libnccl-dev \
+    # GPG key verification
+    gnupg2 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
