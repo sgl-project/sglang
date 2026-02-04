@@ -151,6 +151,9 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # track per-request tokens loaded from storage (L3 hits)
+        # key: request_id, value: number of tokens actually loaded from storage
+        self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -572,6 +575,8 @@ class HiRadixCache(RadixCache):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        # Clear per-request tracking dicts
+        self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1089,10 +1094,12 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
+        # Track tokens actually loaded from storage for this request (L3 hits)
+        loaded_from_storage = min_completed_tokens - matched_length
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(
-                min_completed_tokens - matched_length
-            )
+            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
         return True
 
@@ -1104,6 +1111,14 @@ class HiRadixCache(RadixCache):
         if operation.host_indices is None:
             return
         operation.mark_terminate()
+
+    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        """
+        Pop and return the number of tokens loaded from storage for a request.
+        Returns 0 if no prefetch was done or was revoked.
+        This should be called after check_prefetch_progress() returns True.
+        """
+        return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
@@ -1357,6 +1372,9 @@ class HiRadixCache(RadixCache):
         return InsertResult(prefix_len=total_prefix_length)
 
     def release_aborted_request(self, rid: str):
+        # Clean up storage hit tracking for aborted request
+        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+
         if rid not in self.ongoing_prefetch:
             return
 
