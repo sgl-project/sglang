@@ -311,6 +311,14 @@ def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
 
+def rms_norm_scale_shift(
+    x: torch.Tensor, eps: float, scale: torch.Tensor, shift: torch.Tensor
+) -> torch.Tensor:
+    """Helper function to apply RMS norm followed by scale and shift."""
+    normed = F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
+    return normed * (1 + scale) + shift
+
+
 class LTX2TextProjection(nn.Module):
     def __init__(
         self,
@@ -791,8 +799,8 @@ class LTX2TransformerBlock(nn.Module):
         vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
             self.scale_shift_table, batch_size, temb, slice(0, 3)
         )
-        norm_hidden_states = (
-            rms_norm(hidden_states, self.norm_eps) * (1 + vscale_msa) + vshift_msa
+        norm_hidden_states = rms_norm_scale_shift(
+            hidden_states, self.norm_eps, vscale_msa, vshift_msa
         )
         attn_hidden_states = self.attn1(norm_hidden_states, pe=video_rotary_emb)
         hidden_states = hidden_states + attn_hidden_states * vgate_msa
@@ -800,8 +808,8 @@ class LTX2TransformerBlock(nn.Module):
         ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
             self.audio_scale_shift_table, batch_size, temb_audio, slice(0, 3)
         )
-        norm_audio_hidden_states = (
-            rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_msa) + ashift_msa
+        norm_audio_hidden_states = rms_norm_scale_shift(
+            audio_hidden_states, self.norm_eps, ascale_msa, ashift_msa
         )
         attn_audio_hidden_states = self.audio_attn1(
             norm_audio_hidden_states, pe=audio_rotary_emb
@@ -925,8 +933,8 @@ class LTX2TransformerBlock(nn.Module):
         vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
             self.scale_shift_table, batch_size, temb, slice(3, None)
         )
-        norm_hidden_states = (
-            rms_norm(hidden_states, self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
+        norm_hidden_states = rms_norm_scale_shift(
+            hidden_states, self.norm_eps, vscale_mlp, vshift_mlp
         )
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + ff_output * vgate_mlp
@@ -934,8 +942,8 @@ class LTX2TransformerBlock(nn.Module):
         ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
             self.audio_scale_shift_table, batch_size, temb_audio, slice(3, None)
         )
-        norm_audio_hidden_states = (
-            rms_norm(audio_hidden_states, self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
+        norm_audio_hidden_states = rms_norm_scale_shift(
+            audio_hidden_states, self.norm_eps, ascale_mlp, ashift_mlp
         )
         audio_ff_output = self.audio_ff(norm_audio_hidden_states)
         audio_hidden_states = audio_hidden_states + audio_ff_output * agate_mlp
