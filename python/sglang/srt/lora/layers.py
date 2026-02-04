@@ -602,7 +602,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_a_weights = None
         self.down_lora_b_weights = None
         self._lora_runner = None
-        self.max_lora_rank = 0  # Will be set by LoRAManager
 
     def set_lora_info(
         self,
@@ -631,7 +630,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             return None
 
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
-        from sglang.srt.lora.moe_dispatch import moe_dispatch
 
         # Get dispatch info from TopKOutput
         topk_ids = topk_output.topk_ids  # [num_tokens, top_k]
@@ -642,24 +640,26 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_ranks = batch_info.lora_ranks  # [num_loras]
         scalings = batch_info.scalings  # [num_loras]
 
-        # Use global max LoRA rank set by LoRAManager
-        max_lora_rank = self.max_lora_rank
-
-        # Create adapter_enabled tensor for the current batch
-        # All LoRAs in the batch are enabled by definition
-        adapter_enabled = torch.ones(
-            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
-        )
+        # Compute max LoRA rank from current batch ranks
+        max_lora_rank = int(torch.max(lora_ranks))
 
         # Use precomputed per-token LoRA indices from forward batch
         lora_indices = self.lora_backend.forward_batch.token_lora_indices
 
-        # Dispatch tokens to experts
-        token_ids, expert_ids, _, lora_ids = moe_dispatch(
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            lora_indices=lora_indices,
-        )
+        # Create adapter_enabled tensor for the current batch
+        # Only enable LoRA adapters that are actually used in this batch
+        # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
+        adapter_enabled = torch.zeros(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
+        unique_lora_ids = torch.unique(lora_indices)
+        adapter_enabled[unique_lora_ids] = 1
+
+        # TODO: Jonahbernard: check if this is correct
+        # Flatten dispatch info (no longer using moe_dispatch)
+        num_tokens, top_k = topk_ids.shape
+        device = topk_ids.device
+        token_ids = torch.arange(num_tokens, device=device, dtype=torch.int32).repeat_interleave(top_k)
+        expert_ids = topk_ids.flatten().to(torch.int32)
+        lora_ids = lora_indices.repeat_interleave(top_k)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
@@ -669,7 +669,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             token_ids=token_ids,
             expert_ids=expert_ids,
             lora_ids=lora_ids,
-            token_lora_indices=lora_indices,
+            token_lora_mapping=lora_indices,
             lora_ranks=lora_ranks,
             lora_scalings=scalings,
             adapter_enabled=adapter_enabled,
@@ -724,11 +724,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Create LoRA-enabled MoeRunner if not already created
         if self._lora_runner is None:
             from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-
             self._lora_runner = MoeRunner(
                 base_layer.quant_method.runner.runner_backend,
                 base_layer.moe_runner_config,
-                lora_enabled=True,
+                lora_enabled=True
             )
 
         # Build quant info (for unquantized, this is straightforward)
