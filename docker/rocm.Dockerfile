@@ -2,6 +2,9 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
+# Usage (to build SGLang ROCm + Mori docker image):
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.8 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.8-rocm700-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -95,6 +98,10 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # AITER
+# Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
+# (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
+# leak into AITER's version when AITER uses setuptools_scm)
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -161,9 +168,9 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
 # Build SGLang
 ARG BUILD_TYPE=all
 
-# Set version for setuptools_scm if provided (for nightly builds)
+# Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
+# pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}
 
 RUN pip install IPython \
     && pip install orjson \
@@ -188,9 +195,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip]"; \
        fi
 
 RUN python -m pip cache purge

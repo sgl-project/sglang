@@ -187,7 +187,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -203,15 +203,15 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Print Log Information
         run: |
-          bash scripts/ci/npu_log_print.sh
+          bash scripts/ci/npu/npu_log_print.sh
 
       - name: Run test
         timeout-minutes: 240
@@ -223,7 +223,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -246,7 +245,7 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -262,15 +261,15 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
-          curl -o /tmp/test.jsonl -L https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Print Log Information
         run: |
-          bash scripts/ci/npu_log_print.sh
+          bash scripts/ci/npu/npu_log_print.sh
 
       - name: Run test
         timeout-minutes: 240
@@ -282,7 +281,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
