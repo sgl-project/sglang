@@ -315,34 +315,19 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_marconi: bool = False
-    marconi_mode: Optional[str] = None
-    marconi_eff_weight: float = 0.0
-    marconi_bootstrap_window_size: Optional[int] = None
-    marconi_bootstrap_multiplier: int = 5
-    marconi_tuning_interval: int = 500
-    marconi_admission_policy: str = "thresholded"
+    marconi_admission_policy: Optional[str] = None
     marconi_admission_min_hits: int = 2
     marconi_admission_min_success_ratio: float = 0.1
-    marconi_admission_decay: float = 0.995
-    marconi_admission_score_threshold: float = 1.0
-    marconi_admission_max_nodes: Optional[int] = None
-    marconi_admission_max_tokens: Optional[int] = None
-    marconi_admission_prune_interval: int = 200
+    marconi_admission_score_threshold: float = 0.5
+    marconi_admission_decay: float = 0.99
+    marconi_eff_weight: Optional[float] = None
     marconi_eviction_hot_weight: float = 0.2
-    marconi_eviction_pin_threshold: int = 8
-    marconi_eviction_pin_ttl: int = 500
-    marconi_eviction_regret_window: int = 1000
-    marconi_eviction_regret_max_entries: int = 20000
-    marconi_eviction_weight_mamba: float = 1.0
-    marconi_eviction_weight_attn: float = 1.0
-    marconi_eviction_weight_mlp: float = 1.0
-    marconi_tuning_max_workers: Optional[int] = None
     marconi_branch_align_interval: Optional[int] = None
     marconi_prefill_hint_window: int = 0
-    marconi_track_buffer_size: Optional[int] = None
-    marconi_track_max_points: Optional[int] = None
+    marconi_two_pass_branch_prefill: Optional[bool] = None
+    marconi_track_buffer_size: int = 2
+    marconi_track_max_points: int = 2
     marconi_mamba_layer_mask: Optional[str] = None
-    marconi_two_pass_branch_prefill: bool = True
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -2268,27 +2253,40 @@ class ServerArgs:
             setattr(self, name, value)
 
     def _handle_marconi_mode(self):
-        if self.marconi_mode is None:
-            return
-
-        mode = self.marconi_mode.lower()
-        if mode == "taxonomy":
-            self.marconi_admission_policy = "taxonomy"
-            self._marconi_set_if_default("marconi_two_pass_branch_prefill", False)
-            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.0)
-            self._marconi_set_if_default("marconi_eviction_pin_threshold", 0)
-            self._marconi_set_if_default("marconi_eviction_pin_ttl", 0)
-            self._marconi_set_if_default("marconi_eviction_regret_window", 0)
-            self._marconi_set_if_default("marconi_eff_weight", 0.75)
-        elif mode == "thresholded":
+        if self.marconi_admission_policy is None:
+            if not self.enable_marconi:
+                return
             self.marconi_admission_policy = "thresholded"
-            self._marconi_set_if_default("marconi_two_pass_branch_prefill", True)
-            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.2)
-            self._marconi_set_if_default("marconi_eviction_pin_threshold", 8)
-            self._marconi_set_if_default("marconi_eviction_pin_ttl", 500)
-            self._marconi_set_if_default("marconi_eviction_regret_window", 1000)
+
+        mode = self.marconi_admission_policy.lower()
+        if mode == "taxonomy":
+            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.0)
+            self._marconi_set_if_default("marconi_branch_align_interval", 512)
+            self._marconi_set_if_default("marconi_prefill_hint_window", 0)
+            self._marconi_set_if_default("marconi_eff_weight", 0.75)
+            if self.marconi_two_pass_branch_prefill is None:
+                self.marconi_two_pass_branch_prefill = False
+        elif mode == "thresholded":
+            self._marconi_set_if_default("marconi_admission_min_hits", 2)
+            self._marconi_set_if_default("marconi_admission_min_success_ratio", 0.1)
+            self._marconi_set_if_default("marconi_admission_score_threshold", 0.5)
+            self._marconi_set_if_default("marconi_admission_decay", 0.99)
+            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.4)
+            self._marconi_set_if_default("marconi_branch_align_interval", 512)
+            self._marconi_set_if_default("marconi_prefill_hint_window", 0)
+            self._marconi_set_if_default("marconi_eff_weight", 0.0)
+            if self.marconi_two_pass_branch_prefill is None:
+                self.marconi_two_pass_branch_prefill = True
         else:
-            raise ValueError("marconi_mode must be one of: thresholded, taxonomy.")
+            raise ValueError(
+                "marconi_admission_policy must be one of: thresholded, taxonomy."
+            )
+
+        if self.enable_marconi:
+            if self.mamba_scheduler_strategy == "auto":
+                self.mamba_scheduler_strategy = "extra_buffer"
+            if self.marconi_mamba_layer_mask is None:
+                self.marconi_mamba_layer_mask = "all"
 
     def _handle_load_format(self):
         if (
@@ -2434,64 +2432,8 @@ class ServerArgs:
             if self.disable_radix_cache:
                 logger.warning("Marconi is disabled because radix cache is disabled.")
                 self.enable_marconi = False
-            if self.marconi_bootstrap_window_size is not None and (
-                self.marconi_bootstrap_window_size <= 0
-            ):
-                raise ValueError(
-                    "marconi_bootstrap_window_size must be positive when set."
-                )
-            if self.marconi_bootstrap_multiplier <= 0:
-                raise ValueError("marconi_bootstrap_multiplier must be positive.")
-            if self.marconi_tuning_interval <= 0:
-                raise ValueError("marconi_tuning_interval must be positive.")
-            if self.marconi_admission_policy not in ("taxonomy", "thresholded"):
-                raise ValueError(
-                    "marconi_admission_policy must be one of: taxonomy, thresholded."
-                )
-            if self.marconi_admission_min_hits <= 0:
-                raise ValueError("marconi_admission_min_hits must be positive.")
-            if not (0.0 <= self.marconi_admission_min_success_ratio <= 1.0):
-                raise ValueError(
-                    "marconi_admission_min_success_ratio must be in [0, 1]."
-                )
-            if not (0.0 < self.marconi_admission_decay <= 1.0):
-                raise ValueError("marconi_admission_decay must be in (0, 1].")
-            if self.marconi_admission_score_threshold < 0.0:
-                raise ValueError(
-                    "marconi_admission_score_threshold must be non-negative."
-                )
-            if self.marconi_admission_max_nodes is not None and (
-                self.marconi_admission_max_nodes <= 0
-            ):
-                raise ValueError("marconi_admission_max_nodes must be positive.")
-            if self.marconi_admission_max_tokens is not None and (
-                self.marconi_admission_max_tokens <= 0
-            ):
-                raise ValueError("marconi_admission_max_tokens must be positive.")
-            if self.marconi_admission_prune_interval <= 0:
-                raise ValueError("marconi_admission_prune_interval must be positive.")
             if self.marconi_eviction_hot_weight < 0.0:
                 raise ValueError("marconi_eviction_hot_weight must be non-negative.")
-            if self.marconi_eviction_pin_threshold < 0:
-                raise ValueError("marconi_eviction_pin_threshold must be non-negative.")
-            if self.marconi_eviction_pin_ttl < 0:
-                raise ValueError("marconi_eviction_pin_ttl must be non-negative.")
-            if self.marconi_eviction_regret_window < 0:
-                raise ValueError("marconi_eviction_regret_window must be non-negative.")
-            if self.marconi_eviction_regret_max_entries <= 0:
-                raise ValueError(
-                    "marconi_eviction_regret_max_entries must be positive."
-                )
-            if self.marconi_eviction_weight_mamba < 0.0:
-                raise ValueError("marconi_eviction_weight_mamba must be non-negative.")
-            if self.marconi_eviction_weight_attn < 0.0:
-                raise ValueError("marconi_eviction_weight_attn must be non-negative.")
-            if self.marconi_eviction_weight_mlp < 0.0:
-                raise ValueError("marconi_eviction_weight_mlp must be non-negative.")
-            if self.marconi_tuning_max_workers is not None and (
-                self.marconi_tuning_max_workers <= 0
-            ):
-                raise ValueError("marconi_tuning_max_workers must be positive.")
             if self.marconi_branch_align_interval is not None:
                 if self.marconi_branch_align_interval <= 0:
                     raise ValueError(
@@ -2503,21 +2445,10 @@ class ServerArgs:
                     )
             if self.marconi_prefill_hint_window < 0:
                 raise ValueError("marconi_prefill_hint_window must be non-negative.")
-            if self.marconi_track_buffer_size is not None:
-                if self.marconi_track_buffer_size <= 0:
-                    raise ValueError(
-                        "marconi_track_buffer_size must be positive when set."
-                    )
-                if not self.enable_mamba_extra_buffer():
-                    logger.warning(
-                        "marconi_track_buffer_size is set but mamba extra buffer is disabled; "
-                        "multi-track capture will be ignored."
-                    )
-            if (
-                self.marconi_track_max_points is not None
-                and self.marconi_track_max_points <= 0
-            ):
-                raise ValueError("marconi_track_max_points must be positive when set.")
+            if self.marconi_track_buffer_size <= 0:
+                raise ValueError("marconi_track_buffer_size must be positive.")
+            if self.marconi_track_max_points <= 0:
+                raise ValueError("marconi_track_max_points must be positive.")
 
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
@@ -3082,138 +3013,47 @@ class ServerArgs:
             help="Enable Marconi eviction and tuning for hybrid radix cache.",
         )
         parser.add_argument(
-            "--marconi-mode",
-            type=str,
-            default=ServerArgs.marconi_mode,
-            help="Marconi admission mode. 'thresholded' uses taxonomy + thresholds; "
-            "'taxonomy' uses taxonomy-only admission.",
-        )
-        parser.add_argument(
-            "--marconi-eff-weight",
-            type=float,
-            default=ServerArgs.marconi_eff_weight,
-            help="Marconi efficiency weight (alpha) for eviction scoring.",
-        )
-        parser.add_argument(
-            "--marconi-bootstrap-window-size",
-            type=int,
-            default=ServerArgs.marconi_bootstrap_window_size,
-            help="Fixed bootstrap window size for Marconi tuning. If unset, uses marconi-bootstrap-multiplier.",
-        )
-        parser.add_argument(
-            "--marconi-bootstrap-multiplier",
-            type=int,
-            default=ServerArgs.marconi_bootstrap_multiplier,
-            help="Bootstrap window size multiplier when fixed window size is not set.",
-        )
-        parser.add_argument(
-            "--marconi-tuning-interval",
-            type=int,
-            default=ServerArgs.marconi_tuning_interval,
-            help="Number of requests per tuning window for Marconi.",
-        )
-        parser.add_argument(
             "--marconi-admission-policy",
+            type=str,
             default=ServerArgs.marconi_admission_policy,
-            choices=["taxonomy", "thresholded"],
-            help="Admission policy for Marconi. 'taxonomy' uses speculative insertion taxonomy; "
-            "'thresholded' uses hit/score thresholds.",
+            help="Marconi admission policy. 'thresholded' uses taxonomy + thresholds; "
+            "'taxonomy' uses taxonomy-only admission.",
         )
         parser.add_argument(
             "--marconi-admission-min-hits",
             type=int,
             default=ServerArgs.marconi_admission_min_hits,
-            help="Minimum observed hits before admitting an input prefix branch.",
+            help="Minimum hits required for thresholded admission.",
         )
         parser.add_argument(
             "--marconi-admission-min-success-ratio",
             type=float,
             default=ServerArgs.marconi_admission_min_success_ratio,
-            help="Minimum cache-hit success ratio to admit a branch.",
-        )
-        parser.add_argument(
-            "--marconi-admission-decay",
-            type=float,
-            default=ServerArgs.marconi_admission_decay,
-            help="Exponential decay for admission scores (0-1).",
+            help="Minimum success ratio for thresholded admission.",
         )
         parser.add_argument(
             "--marconi-admission-score-threshold",
             type=float,
             default=ServerArgs.marconi_admission_score_threshold,
-            help="Admission score threshold for branch checkpointing.",
+            help="Score threshold for thresholded admission.",
         )
         parser.add_argument(
-            "--marconi-admission-max-nodes",
-            type=int,
-            default=ServerArgs.marconi_admission_max_nodes,
-            help="Maximum nodes in admission tree before pruning.",
+            "--marconi-admission-decay",
+            type=float,
+            default=ServerArgs.marconi_admission_decay,
+            help="Exponential decay factor for admission scoring.",
         )
         parser.add_argument(
-            "--marconi-admission-max-tokens",
-            type=int,
-            default=ServerArgs.marconi_admission_max_tokens,
-            help="Maximum token count in admission tree before pruning.",
-        )
-        parser.add_argument(
-            "--marconi-admission-prune-interval",
-            type=int,
-            default=ServerArgs.marconi_admission_prune_interval,
-            help="Prune admission tree every N insertions.",
+            "--marconi-eff-weight",
+            type=float,
+            default=ServerArgs.marconi_eff_weight,
+            help="Weight for FLOP efficiency in Marconi eviction utility.",
         )
         parser.add_argument(
             "--marconi-eviction-hot-weight",
             type=float,
             default=ServerArgs.marconi_eviction_hot_weight,
             help="Weight for hotness in Marconi eviction utility.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-pin-threshold",
-            type=int,
-            default=ServerArgs.marconi_eviction_pin_threshold,
-            help="Hit count threshold to pin hot prefixes from eviction.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-pin-ttl",
-            type=int,
-            default=ServerArgs.marconi_eviction_pin_ttl,
-            help="Pin TTL in logical access time units.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-regret-window",
-            type=int,
-            default=ServerArgs.marconi_eviction_regret_window,
-            help="Window to count eviction regret on re-admission.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-regret-max-entries",
-            type=int,
-            default=ServerArgs.marconi_eviction_regret_max_entries,
-            help="Max entries to keep in the eviction regret table.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-weight-mamba",
-            type=float,
-            default=ServerArgs.marconi_eviction_weight_mamba,
-            help="Latency weight for mamba FLOPs in eviction utility.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-weight-attn",
-            type=float,
-            default=ServerArgs.marconi_eviction_weight_attn,
-            help="Latency weight for attention FLOPs in eviction utility.",
-        )
-        parser.add_argument(
-            "--marconi-eviction-weight-mlp",
-            type=float,
-            default=ServerArgs.marconi_eviction_weight_mlp,
-            help="Latency weight for MLP FLOPs in eviction utility.",
-        )
-        parser.add_argument(
-            "--marconi-tuning-max-workers",
-            type=int,
-            default=ServerArgs.marconi_tuning_max_workers,
-            help="Maximum workers for Marconi tuning executor (default: auto).",
         )
         parser.add_argument(
             "--marconi-branch-align-interval",
@@ -3228,35 +3068,36 @@ class ServerArgs:
             help="Window size for prefix-aware prefill ordering (0 disables).",
         )
         parser.add_argument(
+            "--marconi-two-pass-branch-prefill",
+            action="store_true",
+            dest="marconi_two_pass_branch_prefill",
+            default=None,
+            help="Enable two-pass prefill for branch checkpoints.",
+        )
+        parser.add_argument(
+            "--marconi-no-two-pass-branch-prefill",
+            action="store_false",
+            dest="marconi_two_pass_branch_prefill",
+            default=None,
+            help="Disable two-pass prefill for branch checkpoints.",
+        )
+        parser.add_argument(
             "--marconi-track-buffer-size",
             type=int,
             default=ServerArgs.marconi_track_buffer_size,
-            help="Override per-request mamba track buffer size for multi-branch capture.",
+            help="Marconi track buffer size (ring slots per request).",
         )
         parser.add_argument(
             "--marconi-track-max-points",
             type=int,
             default=ServerArgs.marconi_track_max_points,
-            help="Maximum track points per request per prefill (defaults to buffer size).",
+            help="Maximum tracked checkpoints per request.",
         )
         parser.add_argument(
             "--marconi-mamba-layer-mask",
             type=str,
             default=ServerArgs.marconi_mamba_layer_mask,
             help="Optional mamba layer mask for cached state (e.g., '0,2,4-6').",
-        )
-        parser.add_argument(
-            "--marconi-two-pass-branch-prefill",
-            dest="marconi_two_pass_branch_prefill",
-            action="store_true",
-            default=ServerArgs.marconi_two_pass_branch_prefill,
-            help="Enable two-pass prefill for Marconi branch checkpoints.",
-        )
-        parser.add_argument(
-            "--marconi-no-two-pass-branch-prefill",
-            dest="marconi_two_pass_branch_prefill",
-            action="store_false",
-            help="Disable two-pass prefill for Marconi branch checkpoints.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

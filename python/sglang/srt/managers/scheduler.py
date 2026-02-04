@@ -163,7 +163,12 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.marconi_config import MarconiConfig, MarconiModelStats
+from sglang.srt.mem_cache.marconi_config import (
+    DEFAULT_MARCONI_EFF_WEIGHT_TAXONOMY,
+    DEFAULT_MARCONI_EFF_WEIGHT_THRESHOLD,
+    MarconiConfig,
+    MarconiModelStats,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -734,37 +739,37 @@ class Scheduler(
                     logger.warning(
                         "Marconi is enabled but model stats could not be derived."
                     )
+                marconi_policy = (
+                    server_args.marconi_admission_policy or "thresholded"
+                ).lower()
+                if marconi_policy == "taxonomy":
+                    admission_policy = "taxonomy"
+                    default_two_pass = False
+                    default_eff_weight = DEFAULT_MARCONI_EFF_WEIGHT_TAXONOMY
+                else:
+                    admission_policy = "thresholded"
+                    default_two_pass = True
+                    default_eff_weight = DEFAULT_MARCONI_EFF_WEIGHT_THRESHOLD
                 marconi_two_pass_branch_prefill = (
                     server_args.marconi_two_pass_branch_prefill
+                    if server_args.marconi_two_pass_branch_prefill is not None
+                    else default_two_pass
+                )
+                eff_weight = (
+                    server_args.marconi_eff_weight
+                    if server_args.marconi_eff_weight is not None
+                    else default_eff_weight
                 )
                 marconi_config = MarconiConfig(
                     enable=True,
-                    eff_weight=server_args.marconi_eff_weight,
-                    bootstrap_window_size=server_args.marconi_bootstrap_window_size,
-                    bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,
-                    tuning_interval=server_args.marconi_tuning_interval,
+                    eff_weight=eff_weight,
                     model_stats=marconi_model_stats,
-                    admission_policy=server_args.marconi_admission_policy,
+                    admission_policy=admission_policy,
                     admission_min_hits=server_args.marconi_admission_min_hits,
                     admission_min_success_ratio=server_args.marconi_admission_min_success_ratio,
-                    admission_decay=server_args.marconi_admission_decay,
                     admission_score_threshold=server_args.marconi_admission_score_threshold,
-                    admission_max_nodes=server_args.marconi_admission_max_nodes,
-                    admission_max_tokens=server_args.marconi_admission_max_tokens,
-                    admission_prune_interval=server_args.marconi_admission_prune_interval,
+                    admission_decay=server_args.marconi_admission_decay,
                     eviction_hot_weight=server_args.marconi_eviction_hot_weight,
-                    eviction_pin_threshold=server_args.marconi_eviction_pin_threshold,
-                    eviction_pin_ttl=server_args.marconi_eviction_pin_ttl,
-                    eviction_regret_window=server_args.marconi_eviction_regret_window,
-                    eviction_regret_max_entries=server_args.marconi_eviction_regret_max_entries,
-                    eviction_latency_weights=(
-                        server_args.marconi_eviction_weight_mamba,
-                        server_args.marconi_eviction_weight_attn,
-                        server_args.marconi_eviction_weight_mlp,
-                    ),
-                    tuning_max_workers=server_args.marconi_tuning_max_workers,
-                    track_buffer_size=server_args.marconi_track_buffer_size,
-                    track_max_points=server_args.marconi_track_max_points,
                     mamba_layer_mask=server_args.marconi_mamba_layer_mask,
                     two_pass_branch_prefill=marconi_two_pass_branch_prefill,
                 )
@@ -2104,8 +2109,13 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        marconi_policy = (
+            self.server_args.marconi_admission_policy or "thresholded"
+        ).lower()
         marconi_two_pass_branch_prefill = (
             self.server_args.marconi_two_pass_branch_prefill
+            if self.server_args.marconi_two_pass_branch_prefill is not None
+            else marconi_policy != "taxonomy"
         )
         adder = PrefillAdder(
             self.page_size,

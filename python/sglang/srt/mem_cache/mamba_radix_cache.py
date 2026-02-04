@@ -20,7 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
-from collections import OrderedDict, defaultdict
+from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -35,11 +35,6 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.marconi_admission_cache import MarconiAdmissionTree
-from sglang.srt.mem_cache.marconi_tuning_cache import (
-    MarconiConfigTuner,
-    MarconiTuningCache,
-    TuningNode,
-)
 from sglang.srt.mem_cache.marconi_utils import (
     get_attn_flops,
     get_kv_cache_size_bytes,
@@ -89,7 +84,6 @@ class TreeNode:
         self.last_access_time = get_last_access_time()
 
         self.hit_count = 0
-        self.pin_until = 0.0
         # store the host indices of KV cache
         self.host_value = None
 
@@ -388,14 +382,9 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_enabled = bool(
             self.marconi_config is not None and self.marconi_config.enable
         )
-        self.marconi_track_buffer_size = None
-        self.marconi_track_max_points = None
         self.marconi_mamba_layer_mask_bits = None
         self.marconi_mamba_layer_mask_indices = None
         self.marconi_mamba_layer_mask_full_bits = None
-        self.marconi_tuner = None
-        self.marconi_tune_future = None
-        self.marconi_tune_generation = 0
         if self.marconi_enabled:
             self.marconi_model_stats = self.marconi_config.model_stats
             if self.marconi_model_stats is None:
@@ -405,11 +394,6 @@ class MambaRadixCache(BasePrefixCache):
                 )
         if self.marconi_enabled:
             self.marconi_eff_weight = self.marconi_config.eff_weight
-            self.marconi_bootstrap_window_size = (
-                self.marconi_config.bootstrap_window_size
-            )
-            self.marconi_bootstrap_multiplier = self.marconi_config.bootstrap_multiplier
-            self.marconi_tuning_interval = self.marconi_config.tuning_interval
             self.marconi_admission_min_hits = self.marconi_config.admission_min_hits
             self.marconi_admission_min_success_ratio = (
                 self.marconi_config.admission_min_success_ratio
@@ -418,42 +402,8 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_admission_score_threshold = (
                 self.marconi_config.admission_score_threshold
             )
-            self.marconi_admission_max_nodes = self.marconi_config.admission_max_nodes
-            self.marconi_admission_max_tokens = self.marconi_config.admission_max_tokens
-            self.marconi_admission_prune_interval = (
-                self.marconi_config.admission_prune_interval
-            )
             self.marconi_eviction_hot_weight = self.marconi_config.eviction_hot_weight
-            self.marconi_eviction_pin_threshold = (
-                self.marconi_config.eviction_pin_threshold
-            )
-            self.marconi_eviction_pin_ttl = self.marconi_config.eviction_pin_ttl
-            self.marconi_eviction_regret_window = (
-                self.marconi_config.eviction_regret_window
-            )
-            self.marconi_eviction_regret_max_entries = (
-                self.marconi_config.eviction_regret_max_entries
-            )
-            self.marconi_track_buffer_size = self.marconi_config.track_buffer_size
-            self.marconi_track_max_points = self.marconi_config.track_max_points
-            latency_weights = self.marconi_config.eviction_latency_weights
-            if latency_weights is None or len(latency_weights) < 3:
-                self.marconi_eviction_latency_weights = (1.0, 1.0, 1.0)
-            else:
-                self.marconi_eviction_latency_weights = (
-                    float(latency_weights[0]),
-                    float(latency_weights[1]),
-                    float(latency_weights[2]),
-                )
-            weights = (
-                list(self.marconi_config.tuning_weights)
-                if self.marconi_config.tuning_weights is not None
-                else None
-            )
-            self.marconi_tuner = MarconiConfigTuner(
-                weights=weights,
-                max_workers=self.marconi_config.tuning_max_workers,
-            )
+            self.marconi_eviction_latency_weights = (1.0, 1.0, 1.0)
             (
                 self.marconi_mamba_layer_mask_bits,
                 self.marconi_mamba_layer_mask_indices,
@@ -465,9 +415,6 @@ class MambaRadixCache(BasePrefixCache):
                 min_success_ratio=self.marconi_admission_min_success_ratio,
                 decay=self.marconi_admission_decay,
                 score_threshold=self.marconi_admission_score_threshold,
-                max_nodes=self.marconi_admission_max_nodes,
-                max_tokens=self.marconi_admission_max_tokens,
-                prune_interval=self.marconi_admission_prune_interval,
             )
             if self.marconi_enabled
             else None
@@ -592,24 +539,13 @@ class MambaRadixCache(BasePrefixCache):
         if self.marconi_enabled:
             self.marconi_admission_match_count = 0
             self.marconi_admission_branch_count = 0
-            self.marconi_request_count = 0
-            self.marconi_request_history_windowed = []
             self.marconi_num_reqs_before_eviction = None
-            self.marconi_evicted_prefixes = OrderedDict()
-            self.marconi_eviction_regret = 0
-            if self.marconi_tuner is not None:
-                self.marconi_tuner.tree_snapshot = None
-            self.marconi_tune_future = None
-            self.marconi_tune_generation = 0
             self.marconi_admission_tree = MarconiAdmissionTree(
                 policy=self.marconi_config.admission_policy,
                 min_hits=self.marconi_admission_min_hits,
                 min_success_ratio=self.marconi_admission_min_success_ratio,
                 decay=self.marconi_admission_decay,
                 score_threshold=self.marconi_admission_score_threshold,
-                max_nodes=self.marconi_admission_max_nodes,
-                max_tokens=self.marconi_admission_max_tokens,
-                prune_interval=self.marconi_admission_prune_interval,
             )
 
     def _marconi_filter_free_indices(
@@ -751,15 +687,13 @@ class MambaRadixCache(BasePrefixCache):
                 )
                 logger.info(
                     "Marconi live stats: matches=%d hit_rate=%.4f token_hit_rate=%.4f "
-                    "admission_branch_rate=%.4f evict_full=%d evict_mamba=%d "
-                    "eviction_regret=%d",
+                    "admission_branch_rate=%.4f evict_full=%d evict_mamba=%d",
                     self.marconi_live_match_count,
                     hit_rate,
                     token_hit_rate,
                     admission_branch_rate,
                     self.marconi_live_evict_full,
                     self.marconi_live_evict_mamba,
-                    getattr(self, "marconi_eviction_regret", 0),
                 )
             if (
                 self.marconi_admission_tree is not None
@@ -877,9 +811,6 @@ class MambaRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
-        if self.marconi_enabled and kv_committed_len > 0 and is_insert:
-            self._marconi_record_request(req, kv_committed_len)
-
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -1126,131 +1057,6 @@ class MambaRadixCache(BasePrefixCache):
         )
 
         self.dec_lock_ref(req.last_node)
-
-    def _marconi_record_request(self, req: Req, total_tokens: int) -> None:
-        self.marconi_request_count += 1
-        if self.marconi_tuner is None:
-            return
-        self._marconi_maybe_snapshot()
-        if self.marconi_tuner.tree_snapshot is None:
-            return
-        input_ids = list(req.origin_input_ids)
-        output_ids = list(req.output_ids)
-        committed_output_len = max(total_tokens - len(input_ids), 0)
-        if committed_output_len < len(output_ids):
-            output_ids = output_ids[:committed_output_len]
-        self.marconi_request_history_windowed.append(
-            (req.extra_key, input_ids, output_ids)
-        )
-        self._marconi_maybe_tune()
-
-    def _marconi_tuning_capacity_bytes(self) -> Optional[int]:
-        stats = self.marconi_model_stats
-        if stats is None:
-            return None
-        kv_capacity_tokens = getattr(self.token_to_kv_pool_allocator, "size", None)
-        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
-        mamba_capacity_states = (
-            getattr(mamba_pool, "size", None) if mamba_pool else None
-        )
-        if kv_capacity_tokens is None or mamba_capacity_states is None:
-            return None
-        kv_bytes_per_token = get_kv_cache_size_bytes(
-            1, stats.model_dim, stats.kv_cache_dtype_size
-        )
-        kv_capacity_bytes = (
-            kv_capacity_tokens * stats.num_attn_layers * kv_bytes_per_token
-        )
-        mamba_capacity_bytes = (
-            mamba_capacity_states
-            * stats.num_mamba_layers
-            * stats.mamba_state_size_bytes
-        )
-        return kv_capacity_bytes + mamba_capacity_bytes
-
-    def _marconi_copy_tree(self, src_node: TreeNode, dst_node: "TuningNode") -> int:
-        max_ts = int(src_node.last_access_time)
-        for child in src_node.children.values():
-            key_tokens = tuple(child.key.token_ids)
-            new_node = TuningNode(
-                key=key_tokens,
-                value=list(key_tokens),
-                extra_key=child.key.extra_key,
-                mamba_present=self._node_has_full_mamba_state(child),
-            )
-            new_node.parent = dst_node
-            new_node.last_access_time = int(child.last_access_time)
-            new_node.prefix_len = dst_node.prefix_len + len(new_node.value)
-            dst_node.children[get_child_key(child.key)] = new_node
-            max_ts = max(max_ts, self._marconi_copy_tree(child, new_node))
-        return max_ts
-
-    def _marconi_build_tuning_cache(self) -> Optional[MarconiTuningCache]:
-        stats = self.marconi_model_stats
-        if stats is None:
-            return None
-        capacity_bytes = self._marconi_tuning_capacity_bytes()
-        if capacity_bytes is None:
-            return None
-        tuning_cache = MarconiTuningCache(
-            model_stats=stats,
-            capacity_bytes=capacity_bytes,
-            eff_weight=self.marconi_eff_weight,
-            tuning_interval=self.marconi_tuning_interval,
-            latency_weights=self.marconi_eviction_latency_weights,
-        )
-        max_ts = self._marconi_copy_tree(self.root_node, tuning_cache.root_node)
-        tuning_cache.logical_ts = max_ts
-        return tuning_cache
-
-    def _marconi_maybe_snapshot(self) -> None:
-        if self.marconi_tuner is None:
-            return
-        if self.marconi_bootstrap_window_size is None:
-            return
-        if self.marconi_request_count < self.marconi_bootstrap_window_size:
-            return
-        if self.marconi_tuner.tree_snapshot is None:
-            self.marconi_tuner.tree_snapshot = self._marconi_build_tuning_cache()
-            if self.marconi_tuner.tree_snapshot is not None:
-                self.marconi_request_history_windowed = []
-
-    def _marconi_maybe_tune(self) -> None:
-        if self.marconi_tuner is None:
-            return
-        if self.marconi_bootstrap_window_size is None:
-            return
-        if self.marconi_request_count < self.marconi_bootstrap_window_size:
-            return
-        if self.marconi_tune_future is not None:
-            if not self.marconi_tune_future.done():
-                return
-            try:
-                generation, best_eff_weight = self.marconi_tune_future.result()
-            except Exception:
-                generation, best_eff_weight = None, None
-            self.marconi_tune_future = None
-            if (
-                generation is not None
-                and generation == self.marconi_tune_generation
-                and best_eff_weight is not None
-            ):
-                self.marconi_eff_weight = best_eff_weight
-            self.marconi_tuner.tree_snapshot = self._marconi_build_tuning_cache()
-        if len(self.marconi_request_history_windowed) < self.marconi_tuning_interval:
-            return
-        if self.marconi_tuner.tree_snapshot is None:
-            return
-        self.marconi_tune_generation += 1
-        generation = self.marconi_tune_generation
-        history = self.marconi_request_history_windowed
-        self.marconi_request_history_windowed = []
-        self.marconi_tune_future = self.marconi_tuner.submit(
-            self.marconi_tuner.tree_snapshot,
-            history,
-            self.marconi_tuning_interval,
-            generation,
-        )
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -1618,20 +1424,6 @@ class MambaRadixCache(BasePrefixCache):
     def total_size(self) -> Tuple[int, int]:
         return self._total_size_helper()
 
-    def _marconi_prepare_eviction(self) -> None:
-        if self.marconi_num_reqs_before_eviction is None:
-            self.marconi_num_reqs_before_eviction = max(1, self.marconi_request_count)
-            if self.marconi_bootstrap_window_size is None:
-                self.marconi_bootstrap_window_size = (
-                    self.marconi_bootstrap_multiplier
-                    * self.marconi_num_reqs_before_eviction
-                )
-
-    def _marconi_node_pinned(self, node: TreeNode) -> bool:
-        if self.marconi_eviction_pin_ttl <= 0:
-            return False
-        return node.pin_until > TreeNode.last_access_time_counter_float
-
     def _marconi_node_mamba_layers(self, node: TreeNode) -> int:
         stats = self.marconi_model_stats
         if stats is None or node.mamba_value is None:
@@ -1644,50 +1436,16 @@ class MambaRadixCache(BasePrefixCache):
             return 0
         return int(node.mamba_layer_mask_bits.bit_count())
 
-    def _marconi_record_eviction(self, node: TreeNode) -> None:
-        if not self.marconi_enabled:
-            return
-        if node is None or node.key is None:
-            return
-        key = (node.key.extra_key, tuple(node.key.token_ids))
-        self.marconi_evicted_prefixes[key] = TreeNode.last_access_time_counter_float
-        if (
-            self.marconi_eviction_regret_max_entries > 0
-            and len(self.marconi_evicted_prefixes)
-            > self.marconi_eviction_regret_max_entries
-        ):
-            self.marconi_evicted_prefixes.popitem(last=False)
-
-    def _marconi_check_regret(self, node: TreeNode) -> None:
-        if not self.marconi_enabled:
-            return
-        if node is None or node.key is None:
-            return
-        key = (node.key.extra_key, tuple(node.key.token_ids))
-        evicted_ts = self.marconi_evicted_prefixes.get(key)
-        if evicted_ts is None:
-            return
-        if (
-            TreeNode.last_access_time_counter_float - evicted_ts
-            <= self.marconi_eviction_regret_window
-        ):
-            self.marconi_eviction_regret += 1
-            node.hit_count += 1
-
-    def _marconi_collect_leaf_nodes(self, ignore_pin: bool = False) -> List[TreeNode]:
+    def _marconi_collect_leaf_nodes(self) -> List[TreeNode]:
         nodes = []
         for node in self._collect_leaves():
             if node == self.root_node:
                 continue
             if node.full_lock_ref == 0 and node.mamba_lock_ref == 0:
-                if not ignore_pin and self._marconi_node_pinned(node):
-                    continue
                 nodes.append(node)
         return nodes
 
-    def _marconi_collect_leaf_and_single_child_nodes(
-        self, ignore_pin: bool = False
-    ) -> List[TreeNode]:
+    def _marconi_collect_leaf_and_single_child_nodes(self) -> List[TreeNode]:
         nodes = []
         stack = [self.root_node]
         while stack:
@@ -1699,8 +1457,6 @@ class MambaRadixCache(BasePrefixCache):
                     # For internal nodes (one child), we only tombstone the Mamba state,
                     # so only mamba_lock_ref == 0 is required.
                     if len(node.children) == 0 and node.full_lock_ref > 0:
-                        continue
-                    if not ignore_pin and self._marconi_node_pinned(node):
                         continue
                     nodes.append(node)
             stack.extend(node.children.values())
@@ -1774,8 +1530,6 @@ class MambaRadixCache(BasePrefixCache):
         full_num_evicted = 0
         while full_num_evicted < full_num_tokens:
             candidates = self._marconi_collect_leaf_nodes()
-            if not candidates and self.marconi_eviction_pin_threshold > 0:
-                candidates = self._marconi_collect_leaf_nodes(ignore_pin=True)
             if not candidates:
                 break
             node = self._marconi_select_node(candidates)
@@ -1796,10 +1550,6 @@ class MambaRadixCache(BasePrefixCache):
         mamba_num_evicted = 0
         while mamba_num_evicted < mamba_num:
             candidates = self._marconi_collect_leaf_and_single_child_nodes()
-            if not candidates and self.marconi_eviction_pin_threshold > 0:
-                candidates = self._marconi_collect_leaf_and_single_child_nodes(
-                    ignore_pin=True
-                )
             if not candidates:
                 break
             node = self._marconi_select_node(candidates)
@@ -1834,8 +1584,6 @@ class MambaRadixCache(BasePrefixCache):
         ), f"leaf node mamba value must not be None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
         if self.marconi_enabled:
-            self._marconi_record_eviction(x)
-        if self.marconi_enabled:
             self._marconi_kv_mask_remove(x.value)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
@@ -1862,7 +1610,6 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or mamba_num <= 0:
             return
         if self.marconi_enabled:
-            self._marconi_prepare_eviction()
             self._marconi_evict_mamba(mamba_num)
             return
         # get the least recently used node that is not locked, doesn't have to be a leaf
@@ -1898,7 +1645,6 @@ class MambaRadixCache(BasePrefixCache):
         if self.disable or full_num_tokens <= 0:
             return
         if self.marconi_enabled:
-            self._marconi_prepare_eviction()
             self._marconi_evict_full(full_num_tokens)
             return
 
@@ -2100,12 +1846,6 @@ class MambaRadixCache(BasePrefixCache):
             cur_time = get_last_access_time()
             node_update.last_access_time = cur_time
             node_update.hit_count += 1
-            if (
-                self.marconi_eviction_pin_threshold > 0
-                and node_update.hit_count >= self.marconi_eviction_pin_threshold
-                and self.marconi_eviction_pin_ttl > 0
-            ):
-                node_update.pin_until = cur_time + self.marconi_eviction_pin_ttl
         else:
             self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
             self.mamba_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
@@ -2284,7 +2024,6 @@ class MambaRadixCache(BasePrefixCache):
             self.full_evictable_size_ += len(value)
             if self.marconi_enabled:
                 self._marconi_kv_mask_add(new_node.value)
-                self._marconi_check_regret(new_node)
             # If we already attached a mamba state at the branch checkpoint, do not
             # attach (and double-count) the same state at the new leaf.
             if not mamba_value_attached:
@@ -2330,7 +2069,6 @@ class MambaRadixCache(BasePrefixCache):
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
             if self.marconi_enabled:
-                self._marconi_record_eviction(node.parent)
                 self._marconi_kv_mask_remove(node.parent.value)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)

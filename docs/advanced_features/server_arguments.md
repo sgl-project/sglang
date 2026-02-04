@@ -145,15 +145,26 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--disable-hybrid-swa-memory` | Disable the hybrid SWA memory. | `False` | bool flag (set to enable) |
 | `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used. | `lru` | `lru`, `lfu` |
 | `--enable-marconi` | Enable Marconi eviction and tuning for the Mamba radix cache. | `False` | bool flag (set to enable) |
-| `--marconi-mode` | Marconi admission mode. `thresholded` uses taxonomy + thresholds; `taxonomy` uses taxonomy-only admission. | `None` | `thresholded`, `taxonomy` |
-| `--marconi-eff-weight` | Initial efficiency weight (alpha) for Marconi eviction scoring. | `0.0` | Type: float |
-| `--marconi-bootstrap-window-size` | Fixed bootstrap window size for Marconi tuning. | `None` | Type: int |
-| `--marconi-bootstrap-multiplier` | Multiplier for bootstrap window size when a fixed size is not provided. | `5` | Type: int |
-| `--marconi-tuning-interval` | Number of requests per Marconi tuning window. | `500` | Type: int |
+| `--marconi-admission-policy` | Marconi admission policy. `thresholded` uses taxonomy + thresholds; `taxonomy` uses taxonomy-only admission. If Marconi is enabled and this is unset, it defaults to `thresholded`. | `None` | `thresholded`, `taxonomy` |
+| `--marconi-admission-min-hits` | Minimum hits for thresholded admission. Default follows the `thresholded` preset. | `2` | Type: int |
+| `--marconi-admission-min-success-ratio` | Minimum success ratio for thresholded admission. Default follows the `thresholded` preset. | `0.1` | Type: float |
+| `--marconi-admission-score-threshold` | Score threshold for thresholded admission. Default follows the `thresholded` preset. | `0.5` | Type: float |
+| `--marconi-admission-decay` | Exponential decay for admission scoring. Default follows the `thresholded` preset. | `0.99` | Type: float |
+| `--marconi-eff-weight` | FLOP-efficiency weight for eviction utility. Default follows the preset (`taxonomy`=0.75, `thresholded`=0.0). | `None` | Type: float |
+| `--marconi-branch-align-interval` | Alignment interval for Marconi branch checkpoints. Default follows the preset (512 for both). | `None` | Type: int |
+| `--marconi-prefill-hint-window` | Window size for prefix-aware prefill ordering (0 disables). Default follows the preset (0 for both). | `0` | Type: int |
+| `--marconi-two-pass-branch-prefill` | Enable two-pass prefill for branch checkpoints. | `None` | Type: bool |
+| `--marconi-no-two-pass-branch-prefill` | Disable two-pass prefill for branch checkpoints. | `None` | Type: bool |
+| `--marconi-track-buffer-size` | Track buffer size (ring slots per request). | `2` | Type: int |
+| `--marconi-track-max-points` | Max tracked checkpoints per request. | `2` | Type: int |
+| `--marconi-mamba-layer-mask` | Optional mamba layer mask for cached state (e.g., `0,2,4-6`). | `None` | Type: str |
+| `--marconi-eviction-hot-weight` | Weight for hotness in Marconi eviction utility. Default follows the preset (`taxonomy`=0.0, `thresholded`=0.4). | `0.2` | Type: float |
 
 ### Marconi mode defaults
-`--marconi-mode` provides a production-friendly preset that sets the admission policy and key eviction/checkpoint defaults.
-Advanced Marconi flags still work and will override the mode defaults if explicitly set.
+`--marconi-admission-policy` provides a production-friendly preset that sets the admission policy and key eviction/checkpoint defaults.
+When Marconi is enabled and `--mamba-scheduler-strategy` is left at `auto`, it is promoted to `extra_buffer`.
+If `--marconi-mamba-layer-mask` is not set, it defaults to `all` under Marconi.
+Other Marconi tuning parameters are fixed in code to keep the CLI surface minimal.
 
 - `thresholded`: taxonomy + thresholds (stable default behavior).
 - `taxonomy`: taxonomy-only admission (more aggressive reuse; use when workloads are highly shared and ordered).
