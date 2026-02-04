@@ -2,7 +2,7 @@ import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
-    Qwen3_30B_A3B_Instruct_2507_WEIGHTS_PATH,
+    QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,7 +17,7 @@ class TestQwen330B(GSM8KAscendMixin, CustomTestCase):
     [Test Target] Qwen/Qwen3-30B-A3B-Instruct-2507
     """
 
-    model = Qwen3_30B_A3B_Instruct_2507_WEIGHTS_PATH
+    model = QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH
     accuracy = 0.90
     other_args = [
         "--trust-remote-code",
