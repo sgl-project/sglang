@@ -214,7 +214,6 @@ class HiRadixCache(RadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
             storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
         self.enable_storage = enable_storage
@@ -1503,6 +1502,8 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
+                    # Emit BlockStored(GPU) for restored node
+                    self._record_tier_store_event(node, MEDIUM_GPU)
                 else:
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
@@ -1518,6 +1519,8 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
+                    # Emit BlockStored(GPU) for restored split node
+                    self._record_tier_store_event(new_node, MEDIUM_GPU)
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
@@ -1542,6 +1545,9 @@ class HiRadixCache(RadixCache):
             # Compute hash_value if storage is enabled
             if self.enable_storage:
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+            # Emit BlockStored(GPU) for new node
+            self._record_tier_store_event(new_node, MEDIUM_GPU)
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
