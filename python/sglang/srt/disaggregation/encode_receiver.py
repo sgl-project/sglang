@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 import pickle
 import random
 import threading
@@ -18,6 +17,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
@@ -306,9 +306,7 @@ class MMReceiverHTTP(MMReceiverBase):
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             self.scheduler = scheduler
-            self.wait_timeout = float(
-                os.getenv("SGLANG_ENCODER_RECV_IMAGE_TIMEOUT", "180.0")
-            )
+            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -443,8 +441,8 @@ class MMReceiverHTTP(MMReceiverBase):
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
-                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
-                        408,
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",  # error_msg
+                        408,  # error_code
                     )
                 )
             else:  # status_value == WaitingImageRequestStatus.PENDING

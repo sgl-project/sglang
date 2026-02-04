@@ -29,6 +29,7 @@ from sglang.srt.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -199,7 +200,7 @@ class MMEncoder:
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
         )
-        self.send_timeout = float(os.getenv("SGLANG_ENCODER_SEND_TIMEOUT", "180.0"))
+        self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
