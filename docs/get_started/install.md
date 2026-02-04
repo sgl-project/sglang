@@ -226,7 +226,9 @@ Apply the gateway configuration.
 dstack apply -f gateway.yaml
 ```
 
-Once the gateway is assigned a hostname, go to your domain's DNS settings and add a DNS record for `*.<gateway domain>`.
+Once the gateway is assigned a hostname, go to your domain's DNS settings and add `A` record so that `*.<gateway domain>` points to `<gateway IP address>`
+
+You can then access the service endpoint at `https://<run name>.<gateway domain>/`
 
 See the [SGLang example](https://dstack.ai/examples/inference/sglang/) for more details.
 </details>
