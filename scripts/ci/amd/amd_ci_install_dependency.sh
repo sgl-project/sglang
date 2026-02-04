@@ -222,21 +222,16 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # clone a fresh copy to /sgl-workspace/aiter
     docker exec ci_sglang git clone https://github.com/ROCm/aiter.git /sgl-workspace/aiter
 
-    # checkout correct version
+    # checkout correct version and revert problematic commit
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         git fetch --all && \
         git checkout ${REPO_AITER_COMMIT} && \
-        git submodule update --init --recursive
-    "
-
-    # Revert commit ca7948e (mla ps support paged64 and 3buffer for ds3.2 #1950)
-    echo "[CI-AITER-CHECK] Reverting commit ca7948e14759446142dc792375e46ef9bec3fee1..."
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
         git config user.email 'ci@sglang.local' && \
         git config user.name 'CI Bot' && \
-        git revert --no-edit ca7948e14759446142dc792375e46ef9bec3fee1
+        echo '[CI-AITER-CHECK] Reverting commit ca7948e (mla ps support paged64 and 3buffer for ds3.2 #1950)...' && \
+        git revert --no-edit ca7948e14759446142dc792375e46ef9bec3fee1 && \
+        git submodule update --init --recursive
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
