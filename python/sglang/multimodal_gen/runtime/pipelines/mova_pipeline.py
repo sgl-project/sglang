@@ -16,8 +16,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
     TextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import MOVADenoisingStage, \
-    MOVADecodingStage, MOVALatentPreparationStage, MOVATimestepPreparationStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
+    MOVADecodingStage,
+    MOVADenoisingStage,
+    MOVALatentPreparationStage,
+    MOVATimestepPreparationStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

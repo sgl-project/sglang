@@ -21,8 +21,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
     ConditioningStage,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import \
-    QwenImageLayeredBeforeDenoisingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image_layered import (
+    QwenImageLayeredBeforeDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
