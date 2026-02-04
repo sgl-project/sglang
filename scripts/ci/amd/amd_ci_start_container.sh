@@ -154,8 +154,12 @@ else
     CACHE_VOLUME=""
 fi
 
+NOFILE_LIMIT="${SGLANG_NOFILE_LIMIT:-1048576}"
+ULIMIT_ARGS=(--ulimit "nofile=${NOFILE_LIMIT}:${NOFILE_LIMIT}")
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
+  "${ULIMIT_ARGS[@]}" \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
   --group-add video \
