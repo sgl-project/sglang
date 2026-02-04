@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 """
 Copyright 2023-2024 SGLang Team
@@ -68,14 +67,11 @@ class RadixKey:
         self,
         token_ids: List[int],
         extra_key: Optional[str] = None,
-        is_bigram: bool = False,
     ):
         # token ids sequence
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
-        # is bigram key
-        self.is_bigram = is_bigram
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -338,14 +334,24 @@ class RadixCache(BasePrefixCache):
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
-    def maybe_bigram_convert(
+
+    # Can be deprecated in the future
+    def maybe_eagle_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-        if self.is_eagle and not key.is_bigram:
-            key.token_ids = convert_to_bigram_key(key.token_ids)
-            if value is not None:
-                value = value[: len(key)]
-
+        """Convert key/value for EAGLE mode using Real Dummy Allocation approach.
+        
+        In EAGLE mode, we use ALL N allocated KV indices as-is. Position 0 holds
+        a real (but unused) KV index - the "dummy" which is created by target model
+        but not used in EAGLE's attention due to the one-token shift.
+        
+        This approach:
+        - Keeps keys as native unigrams (integers) - same as non-EAGLE mode
+        - Uses all N KV slots for N tokens (No Bigram Conversions)
+        - EAGLE's attention naturally skips position 0 due to the shifted input
+        - Simplifies memory accounting: what you allocate = what you track
+        """
+        # Real dummy approach: no conversion needed, use keys and values as-is
         return key, value
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -386,7 +392,7 @@ class RadixCache(BasePrefixCache):
                 subsequent match efficiency and does not duplicate data.
         """
         key = params.key
-        key, _ = self.maybe_bigram_convert(key)
+        key, _ = self.maybe_eagle_convert(key)
 
         def empty_match_result():
             return MatchResult(
@@ -431,7 +437,7 @@ class RadixCache(BasePrefixCache):
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
-        key, value = self.maybe_bigram_convert(key, value)
+        key, value = self.maybe_eagle_convert(key, value)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority)
         return InsertResult(prefix_len=prefix_len)
@@ -461,11 +467,11 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
-        keys = self._page_align_keys(keys)
+        # Real Dummy Allocation: use fill_ids as-is (no bigram conversion)
+        # In EAGLE mode, position 0 is the "dummy" slot - allocated but unused by attention
+        keys = self._page_align_keys(req.fill_ids)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(keys, req.extra_key)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -499,11 +505,11 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
-        keys = self._page_align_keys(keys)
+        # Real Dummy Allocation: use fill_ids as-is (no bigram conversion)
+        # In EAGLE mode, position 0 is the "dummy" slot - allocated but unused by attention
+        keys = self._page_align_keys(req.fill_ids)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        radix_key = RadixKey(keys, req.extra_key)
 
         # Radix Cache takes one ref in memory pool
         result = self.insert(
@@ -544,7 +550,7 @@ class RadixCache(BasePrefixCache):
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
-        # - eagle case: bigram keys will only cache len - 1 kv indices
+        # - Real Dummy Allocation: all N KV indices are cached for N tokens
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
