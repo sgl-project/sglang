@@ -22,7 +22,21 @@ namespace {
 
 constexpr int TopK = 2048;
 constexpr int kThreadsPerBlock = 1024;
-constexpr size_t kSmem = 32 * 1024 * sizeof(uint32_t);  // 128KB
+
+#ifdef USE_ROCM
+// On ROCm, the per-workgroup LDS budget depends on the target arch, so we inject a
+// per-arch value from `setup_rocm.py` via `-DSGL_TOPK_DYNAMIC_SMEM_BYTES=...`.
+#ifdef SGL_TOPK_DYNAMIC_SMEM_BYTES
+constexpr size_t kSmem = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
+#else
+constexpr size_t kSmem = 48 * 1024;  // bytes
+#endif
+#else
+// Reduced from 128KB to 32KB to improve occupancy.
+// Each radix pass needs at most ~TopK candidates in the threshold bin,
+// so 4K entries per round (2 rounds = 8K entries = 32KB) is sufficient.
+constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);  // 32KB (bytes)
+#endif
 
 struct FastTopKParams {
   const float* __restrict__ input;         // [B, input_stride]
@@ -401,8 +415,18 @@ auto get_params(
 template <auto* f, size_t max_dynamic_smem>
 void setup_kernel_smem_once() {
   [[maybe_unused]]
-  static const auto result =
-      [] { return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem); }();
+  static const auto result = [] {
+#ifdef USE_ROCM
+    // hipify will turn cudaFuncSetAttribute -> hipFuncSetAttribute. On ROCm,
+    // hipFuncSetAttribute expects `const void*` and hipcc does not accept passing
+    // a function pointer directly, so cast explicitly.
+    return ::cudaFuncSetAttribute(
+        reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#else
+    // CUDA: keep original behavior (no cast needed).
+    return ::cudaFuncSetAttribute(f, ::cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_smem);
+#endif
+  }();
   TORCH_CHECK(result == cudaSuccess, "set_up_kernel_once failed:", ::cudaGetErrorString(result));
 }
 

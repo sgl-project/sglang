@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - sgl-router/bindings/python/pyproject.toml
+      - sgl-model-gateway/bindings/python/pyproject.toml
   workflow_dispatch:
 
 jobs:
@@ -50,9 +50,9 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move sgl-router folder to root and delete sglang-repo
+      - name: Move sgl-model-gateway folder to root and delete sglang-repo
         run: |
-          mv sglang-repo/sgl-router/* .
+          mv sglang-repo/sgl-model-gateway/* .
           rm -rf sglang-repo
           ls -alt
         shell: bash
@@ -123,9 +123,9 @@ jobs:
         with:
           path: sglang-repo
 
-      - name: Move sgl-router folder to root and delete sglang-repo
+      - name: Move sgl-model-gateway folder to root and delete sglang-repo
         run: |
-          mv sglang-repo/sgl-router/* .
+          mv sglang-repo/sgl-model-gateway/* .
           rm -rf sglang-repo
           ls -alt
 

@@ -7,7 +7,6 @@ Base class for composed pipelines.
 This module defines the base class for pipelines that are composed of multiple stages.
 """
 
-import argparse
 import os
 from abc import ABC, abstractmethod
 from typing import Any, cast
@@ -15,14 +14,13 @@ from typing import Any, cast
 import torch
 from tqdm import tqdm
 
-from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
 from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -49,7 +47,6 @@ class ComposedPipelineBase(ABC):
     _extra_config_module_map: dict[str, str] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
-    post_init_called: bool = False
     executor: PipelineExecutor | None = None
 
     # the name of the pipeline it associated with, in diffusers
@@ -85,14 +82,14 @@ class ComposedPipelineBase(ABC):
 
         if self._required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        # temp disable for duplicate initialing tp
-        # maybe_init_distributed_environment_and_model_parallel(
-        #     server_args.tp_size, server_args.sp_size
-        # )
 
+        # [module_name, gpu memory usage]
+        self.memory_usages: dict[str, float] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
+
+        self.__post_init__()
 
     def build_executor(self, server_args: ServerArgs):
         # TODO
@@ -103,50 +100,12 @@ class ComposedPipelineBase(ABC):
         # return SyncExecutor(server_args=server_args)
         return ParallelExecutor(server_args=server_args)
 
-    def post_init(self) -> None:
+    def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
-        if self.post_init_called:
-            return
-        self.post_init_called = True
-
         self.initialize_pipeline(self.server_args)
-        if self.server_args.enable_torch_compile:
-            self.modules["transformer"] = torch.compile(self.modules["transformer"])
-            logger.info("Torch Compile enabled for DiT")
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: str,
-        device: str | None = None,
-        torch_dtype: torch.dtype | None = None,
-        pipeline_config: str | PipelineConfig | None = None,
-        args: argparse.Namespace | None = None,
-        required_config_modules: list[str] | None = None,
-        loaded_modules: dict[str, torch.nn.Module] | None = None,
-        **kwargs,
-    ) -> "ComposedPipelineBase":
-        """
-        Load a pipeline from a pretrained model.
-        loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
-        If provided, loaded_modules will be used instead of loading from config/pretrained weights.
-        """
-        kwargs["model_path"] = model_path
-        server_args = ServerArgs.from_kwargs(**kwargs)
-
-        logger.info("server_args in from_pretrained: %s", server_args)
-
-        pipe = cls(
-            model_path,
-            server_args,
-            required_config_modules=required_config_modules,
-            loaded_modules=loaded_modules,
-        )
-        pipe.post_init()
-        return pipe
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         if module_name not in self.modules:
@@ -223,12 +182,25 @@ class ComposedPipelineBase(ABC):
             "boundary_ratio" in model_index
             and model_index["boundary_ratio"] is not None
         ):
-            logger.info(
-                "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
+            has_transformer = (
+                "transformer" in model_index
+                or "transformer_2" in model_index
+                or "transformer" in self.required_config_modules
+                or "transformer_2" in self.required_config_modules
             )
-            self.required_config_modules.append("transformer_2")
+            if has_transformer:
+                logger.info(
+                    "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
+                )
+                if "transformer_2" not in self.required_config_modules:
+                    self.required_config_modules.append("transformer_2")
+            else:
+                logger.info(
+                    "Boundary ratio found in model_index.json without transformers; "
+                    "using it for pipeline config only."
+                )
             logger.info(
-                "MoE pipeline detected. Setting boundary ratio to %s",
+                "Setting boundary ratio to %s",
                 model_index["boundary_ratio"],
             )
             server_args.pipeline_config.dit_config.boundary_ratio = model_index[
@@ -276,7 +248,7 @@ class ComposedPipelineBase(ABC):
         required_modules = self.required_config_modules
         logger.info("Loading required components: %s", required_modules)
 
-        components = {}
+        loaded_components = {}
         for module_name, (
             transformers_or_diffusers,
             architecture,
@@ -294,7 +266,7 @@ class ComposedPipelineBase(ABC):
                 continue
             if loaded_modules is not None and module_name in loaded_modules:
                 logger.info("Using module %s already provided", module_name)
-                components[module_name] = loaded_modules[module_name]
+                loaded_components[module_name] = loaded_modules[module_name]
                 continue
 
             # we load the module from the extra config module map if it exists
@@ -316,26 +288,32 @@ class ComposedPipelineBase(ABC):
                 )
             else:
                 component_model_path = os.path.join(self.model_path, load_module_name)
-            module = PipelineComponentLoader.load_module(
-                module_name=load_module_name,
+            module, memory_usage = PipelineComponentLoader.load_component(
+                component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
-            logger.info("Loaded module %s from %s", module_name, component_model_path)
 
-            if module_name in components:
+            self.memory_usages[load_module_name] = memory_usage
+
+            if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
-            components[module_name] = module
+            loaded_components[module_name] = module
 
         # Check if all required modules were loaded
         for module_name in required_modules:
-            if module_name not in components or components[module_name] is None:
+            if (
+                module_name not in loaded_components
+                or loaded_components[module_name] is None
+            ):
                 raise ValueError(
-                    f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
+                    f"Required module: {module_name} was not found in loaded modules: {list(loaded_components.keys())}"
                 )
 
-        return components
+        logger.debug("Memory usage of loaded modules: %s", self.memory_usages)
+
+        return loaded_components
 
     def add_stage(self, stage_name: str, stage: PipelineStage):
         assert self.modules is not None, "No modules are registered"
@@ -349,7 +327,7 @@ class ComposedPipelineBase(ABC):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Generate a video or image using the pipeline.
 
@@ -359,8 +337,6 @@ class ComposedPipelineBase(ABC):
         Returns:
             Req: The batch with the generated video or image.
         """
-        if not self.post_init_called:
-            self.post_init()
 
         if self.is_lora_set() and not self.is_lora_effective():
             logger.warning(
@@ -368,9 +344,11 @@ class ComposedPipelineBase(ABC):
             )
 
         # Execute each stage
-        logger.info(
-            "Running pipeline stages: %s",
-            list(self._stage_name_mapping.keys()),
-            main_process_only=True,
-        )
-        return self.executor.execute(self.stages, batch, server_args)
+        if not batch.is_warmup and not batch.suppress_logs:
+            logger.info(
+                "Running pipeline stages: %s",
+                list(self._stage_name_mapping.keys()),
+                main_process_only=True,
+            )
+
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)

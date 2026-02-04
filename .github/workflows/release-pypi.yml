@@ -1,10 +1,8 @@
 name: Release PyPI
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
+    tags:
+      - 'v[0-9]+.*'
   workflow_dispatch:
 
 jobs:
@@ -20,12 +18,14 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required for setuptools-scm to determine version from tags
 
       - name: Upload to pypi
         run: |
           cd python
           cp ../README.md ../LICENSE .
-          pip install build
+          pip install build wheel setuptools setuptools-scm
           python3 -m build
           pip install twine
           python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}

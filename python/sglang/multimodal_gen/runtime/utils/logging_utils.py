@@ -4,12 +4,12 @@
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/logger.py
 """Logging configuration for sglang.multimodal_gen."""
 import argparse
+import contextlib
 import datetime
 import logging
 import os
 import sys
 import time
-import warnings
 from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
@@ -18,11 +18,11 @@ from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
 
-SGLANG_DIFFUSION_CONFIGURE_LOGGING = envs.SGLANG_DIFFUSION_CONFIGURE_LOGGING
-SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
+# color
+CYAN = "\033[1;36m"
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
@@ -68,21 +68,7 @@ DEFAULT_LOGGING_CONFIG = {
 }
 
 
-class NewLineFormatter(logging.Formatter):
-    """Adds logging prefix to newlines to align multi-line messages."""
-
-    def __init__(self, fmt, datefmt=None, style="%"):
-        logging.Formatter.__init__(self, fmt, datefmt, style)
-
-    def format(self, record):
-        msg = logging.Formatter.format(self, record)
-        if record.message != "":
-            parts = msg.split(record.message)
-            msg = msg.replace("\n", "\r\n" + parts[0])
-        return msg
-
-
-class ColoredFormatter(NewLineFormatter):
+class ColoredFormatter(logging.Formatter):
     """A logging formatter that adds color to log levels."""
 
     LEVEL_COLORS = {
@@ -91,16 +77,13 @@ class ColoredFormatter(NewLineFormatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        """Adds color to the log level name."""
-        original_levelname = record.levelname
-        color = self.LEVEL_COLORS.get(record.levelno)
-        if color:
-            record.levelname = f"{color}{original_levelname}{RESET}"
+        """Adds color to the log"""
 
         formatted_message = super().format(record)
 
+        color = self.LEVEL_COLORS.get(record.levelno)
         if color:
-            record.levelname = original_levelname
+            formatted_message = f"{color}{formatted_message}{RESET}"
 
         return formatted_message
 
@@ -142,6 +125,7 @@ def get_is_local_main_process():
 
 
 def _log_process_aware(
+    server_log_level: int,
     level: int,
     logger_self: Logger,
     msg: object,
@@ -153,12 +137,12 @@ def _log_process_aware(
     """Helper function to log a message if the process rank matches the criteria."""
     is_main_process = get_is_main_process()
     is_local_main_process = get_is_local_main_process()
-
     should_log = (
         not main_process_only
         and not local_main_process_only
         or (main_process_only and is_main_process)
         or (local_main_process_only and is_local_main_process)
+        or server_log_level <= logging.DEBUG
     )
 
     if should_log:
@@ -234,6 +218,8 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
+    server_log_level = logger.getEffectiveLevel()
+
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -252,6 +238,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
+                server_log_level,
                 level,
                 self,
                 msg,
@@ -281,7 +268,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
     setattr(
         logger,
         "error",
-        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+        MethodType(_create_patched_method(logging.ERROR, False, False), logger),
     )
 
     return cast(_SGLDiffusionLogger, logger)
@@ -372,55 +359,73 @@ def set_uvicorn_logging_configs():
 def configure_logger(server_args, prefix: str = ""):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=log_format,
-        datefmt=datefmt,
-        force=True,
-    )
+
+    formatter = ColoredFormatter(log_format, datefmt=datefmt)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, server_args.log_level.upper()))
 
     set_uvicorn_logging_configs()
 
 
-def suppress_loggers(loggers_to_suppress: list[str]):
+def suppress_loggers(loggers_to_suppress: list[str], level: int = logging.WARNING):
     original_levels = {}
 
     for logger_name in loggers_to_suppress:
         logger = logging.getLogger(logger_name)
         original_levels[logger_name] = logger.level
-        logger.setLevel(logging.WARNING)
+        logger.setLevel(level)
 
     return original_levels
 
 
-@contextmanager
-def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
+def globally_suppress_loggers():
+    # globally suppress some obsessive loggers
+    target_names = [
+        "imageio",
+        "imageio_ffmpeg",
+        "PIL",
+        "PIL_Image",
+        "python_multipart.multipart",
+        "filelock",
+        "urllib3",
+    ]
+
+    for name in target_names:
+        logging.getLogger(name).setLevel(logging.ERROR)
+
+
+# source: https://github.com/vllm-project/vllm/blob/a11f4a81e027efd9ef783b943489c222950ac989/vllm/utils/system_utils.py#L60
+@contextlib.contextmanager
+def suppress_stdout():
     """
-    A context manager to temporarily suppress specified loggers.
+    Suppress stdout from C libraries at the file descriptor level.
 
-    Args:
-        not_suppress_on_main_rank (bool): If True, loggers will not be
-            suppressed on the main process (rank 0).
+    Only suppresses stdout, not stderr, to preserve error messages.
+    Example:
+        with suppress_stdout():
+            # C library calls that would normally print to stdout
+            torch.distributed.new_group(ranks, backend="gloo")
     """
-    # This is a global setting that we want to apply to all ranks
-    warnings.filterwarnings(
-        "ignore", category=UserWarning, message="The given NumPy array is not writable"
-    )
+    # Don't suppress if logging level is DEBUG
 
-    should_suppress = True
-    if not_suppress_on_main_rank:
-        if get_is_main_process() == 0:
-            should_suppress = False
-
-    loggers_to_suppress = ["urllib3", "imageio", "imageio_ffmpeg", "PIL", "PIL_Image"]
-    original_levels = suppress_loggers(loggers_to_suppress)
+    stdout_fd = sys.stdout.fileno()
+    stdout_dup = os.dup(stdout_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
 
     try:
+        sys.stdout.flush()
+        os.dup2(devnull_fd, stdout_fd)
         yield
     finally:
-        if should_suppress:
-            for logger_name, level in original_levels.items():
-                logging.getLogger(logger_name).setLevel(level)
+        sys.stdout.flush()
+        os.dup2(stdout_dup, stdout_fd)
+        os.close(stdout_dup)
+        os.close(devnull_fd)
 
 
 class GenerationTimer:
@@ -444,10 +449,6 @@ def log_generation_timer(
             total_requests,
             prompt[:100],
         )
-    else:
-        max_len = 100
-        suffix = "..." if len(prompt) > max_len else ""
-        logger.info(f"Processing prompt: {prompt[:100]}{suffix}")
 
     timer = GenerationTimer()
     timer.start_time = time.perf_counter()
@@ -455,7 +456,10 @@ def log_generation_timer(
         yield timer
         timer.end_time = time.perf_counter()
         timer.duration = timer.end_time - timer.start_time
-        logger.info("Pixel data generated successfully in %.2f seconds", timer.duration)
+        logger.info(
+            f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
+            timer.duration,
+        )
     except Exception as e:
         if request_idx is not None:
             logger.error(
@@ -476,7 +480,7 @@ def log_batch_completion(
     logger: logging.Logger, num_outputs: int, total_time: float
 ) -> None:
     logger.info(
-        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        f"Completed batch processing. Generated %d outputs in {GREEN}%.2f{RESET} seconds",
         num_outputs,
         total_time,
     )

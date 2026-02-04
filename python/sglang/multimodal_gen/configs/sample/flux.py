@@ -8,9 +8,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 @dataclass
 class FluxSamplingParams(SamplingParams):
-    # Video parameters
-    # height: int = 1024
-    # width: int = 1024
     num_frames: int = 1
     # Denoising stage
     guidance_scale: float = 1.0
@@ -23,3 +20,9 @@ class FluxSamplingParams(SamplingParams):
         # FIXME
         # self.height = default_sample_size * vae_scale_factor
         # self.width = default_sample_size * vae_scale_factor
+
+
+@dataclass
+class Flux2KleinSamplingParams(FluxSamplingParams):
+    # Klein is step-distilled, so default to 4 steps
+    num_inference_steps: int = 4

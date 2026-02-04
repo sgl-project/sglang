@@ -102,12 +102,38 @@ class ChoiceLogprobs(BaseModel):
     content: List[ChatCompletionTokenLogprob]
 
 
+class CachedTokensDetails(BaseModel):
+    """Detailed breakdown of cached tokens by cache source."""
+
+    device: int = 0  # Tokens from device cache (GPU)
+    host: int = 0  # Tokens from host cache (CPU memory)
+    # L3 storage fields are only present when storage backend is enabled
+    storage: Optional[int] = None  # Tokens from L3 storage backend
+    storage_backend: Optional[str] = None  # Type of storage backend used
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields so they don't appear in response when L3 is disabled
+        if self.storage is None:
+            data.pop("storage", None)
+        if self.storage_backend is None:
+            data.pop("storage_backend", None)
+        return data
+
+
+class PromptTokensDetails(BaseModel):
+    """Details about prompt tokens."""
+
+    cached_tokens: int = 0
+
+
 class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
-    # only used to return cached tokens when --enable-cache-report is set
-    prompt_tokens_details: Optional[Dict[str, int]] = None
+    # Used to return cached tokens info when --enable-cache-report is set
+    prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
 
 
@@ -232,6 +258,8 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -257,6 +285,9 @@ class CompletionRequest(BaseModel):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
 
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
+
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
@@ -275,6 +306,23 @@ class CompletionRequest(BaseModel):
         if v is not None and v <= 0:
             raise ValueError("max_tokens must be positive")
         return v
+
+
+class SglExt(BaseModel):
+    """SGLang extension fields for OpenAI-compatible responses.
+
+    Future SGLang-specific extensions to OpenAI-compatible response objects
+    should be added as fields here rather than directly on the choice object.
+    """
+
+    routed_experts: Optional[str] = None
+    cached_tokens_details: Optional[CachedTokensDetails] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Remove None fields to keep response clean
+        return {k: v for k, v in data.items() if v is not None}
 
 
 class CompletionResponseChoice(BaseModel):
@@ -301,6 +349,14 @@ class CompletionResponse(BaseModel):
     choices: List[CompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class CompletionResponseStreamChoice(BaseModel):
@@ -326,6 +382,14 @@ class CompletionStreamResponse(BaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
@@ -336,10 +400,14 @@ class ChatCompletionMessageContentTextPart(BaseModel):
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
@@ -369,6 +437,15 @@ ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentAudioPart,
 ]
 
+# Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
+# Can be a simple string (text-only) or a list of multimodal content parts
+RerankContentPart = Union[
+    ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentImagePart,
+    ChatCompletionMessageContentVideoPart,
+]
+RerankContent = Union[str, List[RerankContentPart]]
+
 
 class FunctionResponse(BaseModel):
     """Function response."""
@@ -387,7 +464,7 @@ class ToolCall(BaseModel):
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool", "function"]
+    role: Literal["system", "assistant", "tool", "function", "developer"]
     content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
@@ -395,15 +472,16 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool", "function"}:
+            if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
                 raise ValueError(
-                    "'role' must be one of 'system', 'assistant', 'tool', or 'function' (case-insensitive)."
+                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
                 )
             return v_lower
         raise ValueError("'role' must be a string")
@@ -485,6 +563,8 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    return_routed_experts: bool = False
+    return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -512,6 +592,10 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # SGLang multimodal tiling controls (extensions)
+    max_dynamic_patch: Optional[int] = None
+    min_dynamic_patch: Optional[int] = None
+
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
@@ -529,6 +613,9 @@ class ChatCompletionRequest(BaseModel):
     bootstrap_host: Optional[Union[List[str], str]] = None
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For data parallel rank routing
+    data_parallel_rank: Optional[int] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -630,7 +717,7 @@ class ChatCompletionRequest(BaseModel):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_tokens or self.max_completion_tokens,
+            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -649,6 +736,7 @@ class ChatCompletionRequest(BaseModel):
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,
+            "sampling_seed": self.seed,
         }
 
         if self.response_format and self.response_format.type == "json_schema":
@@ -723,6 +811,14 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: UsageInfo
     metadata: Optional[Dict[str, Any]] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class DeltaMessage(BaseModel):
@@ -759,11 +855,20 @@ class ChatCompletionStreamResponse(BaseModel):
     model: str
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = None
+    sglext: Optional[SglExt] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.sglext is None:
+            data.pop("sglext", None)
+        return data
 
 
 class MultimodalEmbeddingInput(BaseModel):
     text: Optional[str] = None
     image: Optional[str] = None
+    video: Optional[str] = None
 
 
 EmbeddingInput = Union[
@@ -855,15 +960,60 @@ class ScoringResponse(BaseModel):
 
 
 class V1RerankReqInput(BaseModel):
-    query: str
-    documents: List[str]
+    query: RerankContent = Field(
+        ...,
+        description="The query to match against documents. Can be a string (text-only) "
+        "or a list of content parts for multimodal queries (text, image_url, video_url).",
+    )
+    documents: List[RerankContent] = Field(
+        ...,
+        description="List of documents to rank. Each document can be a string (text-only) "
+        "or a list of content parts for multimodal documents (text, image_url, video_url).",
+    )
+    instruct: Optional[str] = Field(
+        default=None,
+        description="The instruct to the reranker model.",
+    )
+    top_n: Optional[int] = Field(
+        default=None,
+        description="Maximum number of documents to return. Defaults to returning all documents. "
+        "If specified value is greater than the total number of documents, all documents will be returned.",
+    )
+    return_documents: bool = Field(
+        default=True,
+        description="Whether to return documents in the response. Only included when set to true.",
+    )
+
+    @field_validator("top_n")
+    @classmethod
+    def validate_top_n(cls, v):
+        if v is not None and v < 1:
+            raise ValueError("Value error, parameter top_n should be larger than 0.")
+        return v
+
+    def is_multimodal(self) -> bool:
+        """Check if the request contains any multimodal content."""
+        if isinstance(self.query, list):
+            return True
+        for doc in self.documents:
+            if isinstance(doc, list):
+                return True
+        return False
 
 
 class RerankResponse(BaseModel):
     score: float
-    document: str
+    document: Optional[str] = None
     index: int
     meta_info: Optional[dict] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Exclude document field if it's None
+        if self.document is None:
+            data.pop("document", None)
+        return data
 
 
 class TokenizeRequest(BaseModel):

@@ -19,9 +19,10 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import get_int_env_var, is_blackwell
+from sglang.srt.utils import is_blackwell
 
 
 class SboFlags:
@@ -40,7 +41,11 @@ class SboFlags:
 
     @classmethod
     def enable_combine_shared_two_stream_overlap(cls):
-        return is_sbo_enabled() and not cls.enable_dispatch_shared_one_stream_overlap()
+        return (
+            is_sbo_enabled()
+            and not cls.enable_dispatch_shared_one_stream_overlap()
+            and not envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get()
+        )
 
     @classmethod
     def enable_dispatch_shared_one_stream_overlap(cls):
@@ -87,9 +92,11 @@ def compute_overlap_args(dispatch_output, alt_stream):
     total_num_sms = torch.cuda.get_device_properties(
         device="cuda"
     ).multi_processor_count
-    communicate_num_sms = get_int_env_var(
-        "SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS", 32 if is_blackwell() else 3
-    )
+
+    if envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.is_set():
+        communicate_num_sms = envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.get()
+    else:
+        communicate_num_sms = 32 if is_blackwell() else 3
     compute_num_sms = total_num_sms - communicate_num_sms
 
     assert alt_stream is not None

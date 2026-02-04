@@ -19,10 +19,17 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    is_musa,
+    log_info_on_rank0,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_musa = is_musa()
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +54,9 @@ class CustomAllreduce:
     if _is_hip:
         # crossover is at 16MB buffer size for ROCm
         _MAX_CAR_SIZE = 2 * 8192 * 1024
+    if _is_musa:
+        # crossover is at 128MB buffer size for MUSA
+        _MAX_CAR_SIZE = 16 * 8196 * 1024
 
     # max_size: max supported allreduce size
     def __init__(
@@ -129,7 +139,7 @@ class CustomAllreduce:
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
         # this checks hardware and driver support for NVLink
-        if _is_cuda or _is_hip:
+        if _is_cuda or _is_hip or _is_musa:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
@@ -210,6 +220,8 @@ class CustomAllreduce:
         """
         lib = CudaRTLibrary()
         pointer = lib.cudaMalloc(size_in_bytes)
+        if _is_musa:
+            lib.cudaMemset(pointer, 0, size_in_bytes)
         handle = lib.cudaIpcGetMemHandle(pointer)
         world_size = dist.get_world_size(group=group)
         rank = dist.get_rank(group=group)
@@ -325,12 +337,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         if _is_hip:
             if self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         return False
@@ -373,6 +385,23 @@ class CustomAllreduce:
             )
         return out
 
+    def deterministic_all_reduce(
+        self,
+        inp: torch.Tensor,
+        *,
+        out: torch.Tensor = None,
+        registered: bool = False,
+    ):
+        """Deterministic all-reduce using 1-stage kernel with fixed ordering (AMD only)."""
+        if out is None:
+            out = torch.empty_like(inp)
+        if registered:
+            ops.deterministic_all_reduce_reg(self._ptr, inp, out)
+        else:
+            reg_buffer = self.buffer.view(inp.dtype)[: inp.numel()]
+            ops.deterministic_all_reduce_unreg(self._ptr, inp, reg_buffer, out)
+        return out
+
     def custom_all_reduce(self, input: torch.Tensor) -> Optional[torch.Tensor]:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -411,20 +440,55 @@ class CustomAllreduce:
 
 
 def dispatch_custom_allreduce():
-    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
-    if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
+
+    On AMD with 1-stage AR enabled, use sglang's CustomAllreduce (has deterministic_all_reduce method).
+    Otherwise use AiterCustomAllreduce if available.
+    """
+    if _is_cuda or _is_musa:
+        return CustomAllreduce
+
+    assert _is_hip
+
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.get():
+            logger.debug(
+                "[AR] All-reduce: 1-stage kernel (SGLANG_USE_1STAGE_ALLREDUCE=1)"
+            )
+        else:
+            logger.debug("[AR] All-reduce: default (SGLANG_USE_1STAGE_ALLREDUCE=0)")
+    elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+        logger.debug(
+            "[AR] All-reduce: 1-stage kernel (deterministic inference enabled)"
+        )
+    else:
+        logger.debug("[AR] All-reduce: default")
+
+    # Check if 1-stage AR should be used
+    if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+        use_1stage = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+    else:
+        use_1stage = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+
+    # On AMD with 1-stage AR, use sglang's CustomAllreduce
+    # (AiterCustomAllreduce doesn't have deterministic_all_reduce method)
+    if use_1stage:
+        return CustomAllreduce
+
+    if get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
         try:
             from aiter.dist.device_communicators.custom_all_reduce import (
                 CustomAllreduce as AiterCustomAllreduce,
             )
 
-            logger.info("Using AiterCustomAllreduce for ROCm.")
+            logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             return AiterCustomAllreduce
         except ImportError as e:
             logger.warning(
-                "Aiter custom all-reduce not available (optional dependency missing); "
+                "[AR] Aiter custom all-reduce not available; "
                 "falling back to sglang CustomAllreduce. Details: %s",
                 e,
             )
             return CustomAllreduce
+
     return CustomAllreduce

@@ -90,14 +90,24 @@ else:
 configs = list(itertools.product(batch_size_range, seq_len_range))
 
 
+if VLLM_AVAILABLE:
+    line_vals = ["vllm", "sglang"]
+    line_names = ["VLLM", "SGL Kernel"]
+    styles = [("blue", "-"), ("green", "-")]
+else:
+    line_vals = ["sglang"]
+    line_names = ["SGL Kernel"]
+    styles = [("green", "-")]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size", "seq_len"],
         x_vals=configs,
         line_arg="provider",
-        line_vals=["vllm", "sglang"],
-        line_names=["VLLM", "SGL Kernel"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=styles,
         ylabel="us",
         plot_name="per-tensor-quant-fp8-performance",
         args={},

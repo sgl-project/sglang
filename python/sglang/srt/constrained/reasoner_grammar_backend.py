@@ -25,7 +25,7 @@ from .base_grammar_backend import (
 
 
 class ReasonerGrammarObject(BaseGrammarObject):
-    def __init__(self, grammar: BaseGrammarObject, think_end_id):
+    def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
@@ -33,6 +33,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # 0     means just ended thinking in the last token
         # +     means number of tokens after thinking ended
         self.tokens_after_think_end = -1
+
+    def maybe_init_reasoning(self, reasoning: bool):
+        self.tokens_after_think_end = -1 if reasoning else 0
 
     def transfer_state(self, token: int) -> int:
         if self.tokens_after_think_end == -1 and token == self.think_end_id:
@@ -50,6 +53,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self.tokens_after_think_end >= 0:
             self.grammar.accept_token(token)
         self.transfer_state(token)
+
+    def is_terminated(self):
+        return self.grammar.is_terminated()
 
     def rollback(self, k):
         steps_after_think = min(k, self.tokens_after_think_end)
@@ -106,9 +112,13 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         self.grammar_backend = grammar_backend
         self.think_end_id = think_end_id
 
-    def _init_value_dispatch(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
-        ret = self.grammar_backend._init_value_dispatch(key)
+    def _init_value_dispatch(
+        self, key: Tuple[str, str], reasoning: bool
+    ) -> Optional[BaseGrammarObject]:
+        ret = self.grammar_backend._init_value_dispatch(key, reasoning)
         # avoid wrapping invalid grammar, so that the scheduler can detect it
         if ret is None or ret is INVALID_GRAMMAR_OBJ:
             return ret
-        return ReasonerGrammarObject(ret, self.think_end_id)
+        obj = ReasonerGrammarObject(ret, self.think_end_id)
+        obj.maybe_init_reasoning(reasoning)
+        return obj
