@@ -177,29 +177,10 @@ GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
 #############################################
-# 1. Extract AITER_COMMIT from correct Dockerfile block
+# 1. Use fixed AITER commit from main branch
 #############################################
-if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
-else
-    echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT="\([^"]*\)".*/\1/')
-fi
-
-
-if [[ -z "${REPO_AITER_COMMIT}" ]]; then
-    echo "[CI-AITER-CHECK] ERROR: Failed to extract AITER_COMMIT from Dockerfile."
-    exit 1
-fi
-
-echo "[CI-AITER-CHECK] Dockerfile expects AITER_COMMIT=${REPO_AITER_COMMIT}"
+REPO_AITER_COMMIT="f252f19515e4128c168461629e60bca1478ea974"
+echo "[CI-AITER-CHECK] Using AITER_COMMIT=${REPO_AITER_COMMIT} (main branch)"
 
 #############################################
 # 2. Check container pre-installed AITER version
@@ -247,16 +228,6 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         git fetch --all && \
         git checkout ${REPO_AITER_COMMIT} && \
         git submodule update --init --recursive
-    "
-
-    # Cherry-pick PR #1965: revert use ck rmsnorm because of residual_out accuracy
-    echo "[CI-AITER-CHECK] Cherry-picking PR #1965 (jun/revert_rmsnorm)..."
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        git config user.email 'ci@sglang.local' && \
-        git config user.name 'CI Bot' && \
-        git fetch origin jun/revert_rmsnorm && \
-        git cherry-pick FETCH_HEAD
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
