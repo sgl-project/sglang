@@ -2771,7 +2771,7 @@ class ServerArgs:
             "--model",
             type=str,
             help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
-            required=True,
+            default="/mnt/data/models/DeepSeek-V3.2",
         )
         parser.add_argument(
             "--tokenizer-path",
@@ -2882,7 +2882,7 @@ class ServerArgs:
         parser.add_argument(
             "--port",
             type=int,
-            default=ServerArgs.port,
+            default=30001,
             help="The port of the HTTP server.",
         )
         parser.add_argument(
@@ -3178,7 +3178,7 @@ class ServerArgs:
             "--tensor-parallel-size",
             "--tp-size",
             type=int,
-            default=ServerArgs.tp_size,
+            default=1,
             help="The tensor parallelism size.",
         )
         parser.add_argument(
@@ -3601,7 +3601,7 @@ class ServerArgs:
             "--json-model-override-args",
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
-            default=ServerArgs.json_model_override_args,
+            default='{"num_hidden_layers": 1}',
         )
         parser.add_argument(
             "--preferred-sampling-params",

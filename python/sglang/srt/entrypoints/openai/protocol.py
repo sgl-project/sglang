@@ -1310,6 +1310,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    prompt_ids_list: Optional[List[List[int]]] = None
 
 
 class ToolCallProcessingResult(NamedTuple):
