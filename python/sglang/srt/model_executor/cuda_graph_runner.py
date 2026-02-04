@@ -379,11 +379,12 @@ class CudaGraphRunner:
             and model_runner.eagle_use_aux_hidden_state
         ):
             self.model_runner.model.set_eagle3_layers_to_capture()
-        
+
         if self.is_spec:
-            self.draft_token_num = torch.ones(
-                (len(self.capture_bs),), dtype=torch.int32
-            ) * self.num_tokens_per_bs
+            self.draft_token_num = (
+                torch.ones((len(self.capture_bs),), dtype=torch.int32)
+                * self.num_tokens_per_bs
+            )
 
         # Capture
         try:

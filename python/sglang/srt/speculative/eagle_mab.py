@@ -10,6 +10,8 @@ from typing import Deque, Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
 class MABConfig:
     """Class for handling MAB configuration validation and parsing."""
 
@@ -207,7 +209,13 @@ class BucketedEpsilonGreedyMAB(BaseMAB):
     epsilon-greedy learning for other ranges where exploration is beneficial.
     """
 
-    def __init__(self, strategies: List[str], bs_threshold: Optional[List[int]] = None, epsilon: float = 0.1, **kwargs):
+    def __init__(
+        self,
+        strategies: List[str],
+        bs_threshold: Optional[List[int]] = None,
+        epsilon: float = 0.1,
+        **kwargs,
+    ):
         super().__init__(strategies, **kwargs)
         self.epsilon = epsilon
 
@@ -258,8 +266,12 @@ class BucketedEpsilonGreedyMAB(BaseMAB):
                 max_batch = self.bs_threshold[i + 1] - 1
             else:
                 max_batch = float("inf")
-            self.batch_bucket_mapping.append((min_batch, max_batch, self.bucket_list[i]))
-            self.batch_strategy_mapping[(min_batch, max_batch)] = self.draft_tokens_groups[self.bucket_list[i]]
+            self.batch_bucket_mapping.append(
+                (min_batch, max_batch, self.bucket_list[i])
+            )
+            self.batch_strategy_mapping[(min_batch, max_batch)] = (
+                self.draft_tokens_groups[self.bucket_list[i]]
+            )
 
     def select_strategy(self, batch_size: int = None) -> str:
         """Choose strategy using hybrid approach."""
@@ -291,7 +303,9 @@ class BucketedEpsilonGreedyMAB(BaseMAB):
 
         return max(strategy_scores, key=strategy_scores.get)
 
-    def get_strategy_bs_range(self, strategy: str) -> Tuple[Optional[int], Optional[int]]:
+    def get_strategy_bs_range(
+        self, strategy: str
+    ) -> Tuple[Optional[int], Optional[int]]:
         """Get batch size range for a given strategy."""
         for min_batch, max_batch, draft_tokens in self.batch_bucket_mapping:
             if strategy in self.draft_tokens_groups[draft_tokens]:
@@ -302,13 +316,15 @@ class BucketedEpsilonGreedyMAB(BaseMAB):
 class PredefinedMappingStrategy(BaseMAB):
     """Simple predefined strategy selector based on batch size ranges."""
 
-    def __init__(self, strategies: List[str], bs_threshold: List[int] = [1, 2, 5, 21], **kwargs):
+    def __init__(
+        self, strategies: List[str], bs_threshold: List[int] = [1, 2, 5, 21], **kwargs
+    ):
         super().__init__(strategies, **kwargs)
         self.bs_threshold = bs_threshold
 
-        assert len(strategies) == len(self.bs_threshold), (
-            "PredefinedMappingStrategy requires exactly same mapping number."
-        )
+        assert len(strategies) == len(
+            self.bs_threshold
+        ), "PredefinedMappingStrategy requires exactly same mapping number."
 
         # Parse and sort strategies by draft_tokens (descending)
         strategy_tokens_pairs = []
@@ -330,7 +346,9 @@ class PredefinedMappingStrategy(BaseMAB):
                 max_batch = float("inf")
             self.batch_ranges.append((min_batch, max_batch, self.sorted_strategies[i]))
 
-        logger.info("FixedMappingStrategy initialized with sorted strategies (steps_topk_verifyTokens):")
+        logger.info(
+            "FixedMappingStrategy initialized with sorted strategies (steps_topk_verifyTokens):"
+        )
         for min_batch, max_batch, strategy in self.batch_ranges:
             tokens = MABConfig.parse_config(strategy)[2]
             range_str = (
@@ -366,12 +384,18 @@ class MABGroupManager:
 
     # Map algorithm names to their factory functions
     ALGORITHM_FACTORIES = {
-        "EG": lambda strategies, window_size, bs_threshold: EpsilonGreedyMAB(strategies=strategies, window_size=window_size),
-        "UCB1": lambda strategies, window_size, bs_threshold: UCB1MAB(strategies=strategies, window_size=window_size),
+        "EG": lambda strategies, window_size, bs_threshold: EpsilonGreedyMAB(
+            strategies=strategies, window_size=window_size
+        ),
+        "UCB1": lambda strategies, window_size, bs_threshold: UCB1MAB(
+            strategies=strategies, window_size=window_size
+        ),
         "PREDEFINED": lambda strategies, window_size, bs_threshold: PredefinedMappingStrategy(
             strategies=strategies, window_size=window_size, bs_threshold=bs_threshold
         ),
-        "BEG": lambda strategies, window_size, bs_threshold: BucketedEpsilonGreedyMAB(strategies=strategies, window_size=window_size, bs_threshold=bs_threshold),
+        "BEG": lambda strategies, window_size, bs_threshold: BucketedEpsilonGreedyMAB(
+            strategies=strategies, window_size=window_size, bs_threshold=bs_threshold
+        ),
     }
 
     def __init__(

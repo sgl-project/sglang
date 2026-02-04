@@ -214,7 +214,9 @@ class EAGLEWorker(TpModelWorker):
         self.adaptive_spec_threshold = (
             server_args.adaptive_speculative_batch_size_threshold
         )
-        self.adaptive_spec_warmup_checks = 10  # Number of consecutive checks to enable SD
+        self.adaptive_spec_warmup_checks = (
+            10  # Number of consecutive checks to enable SD
+        )
         self.adaptive_spec_consecutive_checks = (
             0  # Counter for consecutive qualifying checks
         )
@@ -319,14 +321,19 @@ class EAGLEWorker(TpModelWorker):
         old_spec_algo = target_runner.spec_algorithm
         old_attn_backend = target_runner.attn_backend
         old_graph_runner = target_runner.graph_runner
-        
+
         # Backup instance variables that get modified by init_attention_backend()
-        old_prefill_backend_str = getattr(target_runner, 'prefill_attention_backend_str', None)
-        old_decode_backend_str = getattr(target_runner, 'decode_attention_backend_str', None)
-        old_init_new_workspace = getattr(target_runner, 'init_new_workspace', None)
-        
+        old_prefill_backend_str = getattr(
+            target_runner, "prefill_attention_backend_str", None
+        )
+        old_decode_backend_str = getattr(
+            target_runner, "decode_attention_backend_str", None
+        )
+        old_init_new_workspace = getattr(target_runner, "init_new_workspace", None)
+
         # Backup global state that gets modified by init_attention_backend()
         from sglang.srt.server_args import get_global_server_args
+
         global_args = get_global_server_args()
         old_global_prefill_backend = global_args.prefill_attention_backend
         old_global_decode_backend = global_args.decode_attention_backend
@@ -355,7 +362,7 @@ class EAGLEWorker(TpModelWorker):
             target_runner.spec_algorithm = old_spec_algo
             target_runner.attn_backend = old_attn_backend
             target_runner.graph_runner = old_graph_runner
-            
+
             # Restore instance variables
             if old_prefill_backend_str is not None:
                 target_runner.prefill_attention_backend_str = old_prefill_backend_str
@@ -363,7 +370,7 @@ class EAGLEWorker(TpModelWorker):
                 target_runner.decode_attention_backend_str = old_decode_backend_str
             if old_init_new_workspace is not None:
                 target_runner.init_new_workspace = old_init_new_workspace
-            
+
             # Restore global state
             global_args.prefill_attention_backend = old_global_prefill_backend
             global_args.decode_attention_backend = old_global_decode_backend
@@ -418,9 +425,14 @@ class EAGLEWorker(TpModelWorker):
         if batch_size <= self.adaptive_spec_threshold:
             self.adaptive_spec_consecutive_checks += 1
 
-            if self.adaptive_spec_consecutive_checks >= self.adaptive_spec_warmup_checks:
+            if (
+                self.adaptive_spec_consecutive_checks
+                >= self.adaptive_spec_warmup_checks
+            ):
                 if not self.adaptive_spec_enabled:
-                    print(f"ENABLING SD AFTER {self.adaptive_spec_consecutive_checks} CHECKS ★★★")
+                    print(
+                        f"ENABLING SD AFTER {self.adaptive_spec_consecutive_checks} CHECKS ★★★"
+                    )
                     logger.debug(
                         f"[AdaptiveSpec] ENABLING speculation after "
                         f"{self.adaptive_spec_consecutive_checks} checks (batch_size={batch_size}). "
@@ -480,7 +492,9 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = resources.draft_cuda_graph_runner
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self.target_worker.model_runner.attn_backend = resources.target_attn_backend
-        self.target_worker.model_runner.graph_runner = resources.target_cuda_graph_runner
+        self.target_worker.model_runner.graph_runner = (
+            resources.target_cuda_graph_runner
+        )
 
         # Update speculative decoding settings
         self.update_speculative_args(mab_strategy)
@@ -499,7 +513,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Use the MAB manager to select the best strategy for this batch size
         selected_strategy = self.mab_manager.select_strategy(batch_size)
-        print(f"[MAB] Selected strategy: {selected_strategy} for batch_size={batch_size}")
+        print(
+            f"[MAB] Selected strategy: {selected_strategy} for batch_size={batch_size}"
+        )
 
         # Apply the selected strategy
         self.set_mab_strategy(selected_strategy)
@@ -624,7 +640,9 @@ class EAGLEWorker(TpModelWorker):
 
         # Set up resources for all strategies (draft model resources are strategy-specific)
         for mab_strategy in self.mab_strategies:
-            logger.info(f"Initializing draft model resources for strategy {mab_strategy}")
+            logger.info(
+                f"Initializing draft model resources for strategy {mab_strategy}"
+            )
             _, _, draft_tokens = MABConfig.parse_config(mab_strategy)
 
             # Temporarily update parameters for draft model initialization
@@ -633,7 +651,9 @@ class EAGLEWorker(TpModelWorker):
                 self.mab_manager.get_strategy_bs_range(mab_strategy)
             )
 
-            logger.info(f"Initializing draft model cuda graph with strategy {mab_strategy} ")
+            logger.info(
+                f"Initializing draft model cuda graph with strategy {mab_strategy} "
+            )
             # Initialize draft worker resources (these are strategy-specific)
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
@@ -677,15 +697,17 @@ class EAGLEWorker(TpModelWorker):
             events["processing_start"].record()
 
         enable_sd = self.should_enable_sd(batch)
-        
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            
+
             if enable_sd:
                 with self.draft_tp_context(self.draft_model_runner.tp_group):
-                    self.forward_draft_extend(batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu)
+                    self.forward_draft_extend(
+                        batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                    )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
@@ -697,22 +719,28 @@ class EAGLEWorker(TpModelWorker):
                 # Temporarily disable spec to make target worker treat this as normal decode
                 batch.spec_algorithm = SpeculativeAlgorithm.NONE
                 batch.spec_info = None
-                
+
                 # Prepare batch for normal decode since it was prepared with skip_prepare=True
                 # We need to set input_ids to the last generated token per request
                 bs = len(batch.reqs)
-                
+
                 # CRITICAL: When adaptive SD disables speculation, we MUST NOT reuse batch.output_ids
                 # because it contains speculative verification data, not the actual last generated tokens.
                 # Always gather the last output token from each request manually.
                 batch.input_ids = torch.tensor(
-                    [req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1] 
-                     for req in batch.reqs],
+                    [
+                        (
+                            req.output_ids[-1]
+                            if req.output_ids
+                            else req.origin_input_ids[-1]
+                        )
+                        for req in batch.reqs
+                    ],
                     dtype=torch.int64,
                     device=batch.device,
                 )
                 batch.output_ids = None
-                
+
                 # Slice out_cache_loc for normal decode
                 # In spec mode, out_cache_loc has shape [bs * spec_steps * topk]
                 # In normal mode, we only need [bs]
@@ -722,21 +750,24 @@ class EAGLEWorker(TpModelWorker):
                     batch.seq_lens_cpu.add_(1)
 
                 original_out_cache_loc = batch.out_cache_loc
-                if batch.out_cache_loc is not None and batch.out_cache_loc.numel() >= bs:
+                if (
+                    batch.out_cache_loc is not None
+                    and batch.out_cache_loc.numel() >= bs
+                ):
                     batch.out_cache_loc = batch.out_cache_loc[:bs]
-                
+
                 model_worker_batch = batch.get_model_worker_batch()
-                
+
                 # Restore original after creating model_worker_batch
                 batch.out_cache_loc = original_out_cache_loc
-                
+
                 # Swap resources if we have them
                 use_normal_graph = (
                     self.adaptive_spec_threshold is not None
                     and hasattr(self, "target_normal_decode_graph_runner")
                     and self.target_normal_decode_graph_runner is not None
                 )
-                
+
                 if use_normal_graph:
                     old_attn = self.target_worker.model_runner.attn_backend
                     old_graph = self.target_worker.model_runner.graph_runner
@@ -746,7 +777,7 @@ class EAGLEWorker(TpModelWorker):
                     self.target_worker.model_runner.graph_runner = (
                         self.target_normal_decode_graph_runner
                     )
-                
+
                 try:
                     batch_result = self.target_worker.forward_batch_generation(
                         model_worker_batch
@@ -755,14 +786,14 @@ class EAGLEWorker(TpModelWorker):
                     if use_normal_graph:
                         self.target_worker.model_runner.attn_backend = old_attn
                         self.target_worker.model_runner.graph_runner = old_graph
-                
+
                 return GenerationBatchResult(
                     logits_output=batch_result.logits_output,
                     next_token_ids=batch_result.next_token_ids,
                     num_accepted_tokens=0,  # No speculation
                     can_run_cuda_graph=batch_result.can_run_cuda_graph,
                 )
-            
+
             if self.use_mab:
                 batch_size = batch.batch_size()
                 strategy = self.select_mab_strategy(batch_size)
@@ -772,7 +803,7 @@ class EAGLEWorker(TpModelWorker):
             # Slice topk resources for spec_info
             batch.spec_info.topk_p = batch.spec_info.topk_p[:, : self.topk]
             batch.spec_info.topk_index = batch.spec_info.topk_index[:, : self.topk]
-            
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -795,7 +826,9 @@ class EAGLEWorker(TpModelWorker):
 
             if self.use_mab:
                 events["processing_end"].record()
-                self.record_mab_strategy_metrics(events, verify_output.accept_length_per_req_cpu)
+                self.record_mab_strategy_metrics(
+                    events, verify_output.accept_length_per_req_cpu
+                )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -1109,8 +1142,10 @@ class EAGLEWorker(TpModelWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info, real_parents = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+            input_ids, hidden_states, scores, tree_info, real_parents = (
+                select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
             )
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
@@ -1122,12 +1157,11 @@ class EAGLEWorker(TpModelWorker):
 
             # Overwrite the kv cache to keep the causal relationship of branch.
             if i > 0:
-                src_cache_loc = out_cache_loc[i-1][real_parents]
-                tgt_cache_loc = out_cache_loc[i-1]
+                src_cache_loc = out_cache_loc[i - 1][real_parents]
+                tgt_cache_loc = out_cache_loc[i - 1]
                 self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                     tgt_cache_loc, src_cache_loc
                 )
-
 
             # Set inputs
             forward_batch.input_ids = input_ids
@@ -1188,7 +1222,7 @@ class EAGLEWorker(TpModelWorker):
             retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
                 spec_info.retrive_next_token.shape
-            ).cpu()    
+            ).cpu()
 
         # Forward
         batch_result = self.target_worker.forward_batch_generation(

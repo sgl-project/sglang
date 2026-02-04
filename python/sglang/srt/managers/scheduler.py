@@ -314,7 +314,9 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
         # Init adaptive speculative decoding
-        self.adaptive_spec_threshold = server_args.adaptive_speculative_batch_size_threshold
+        self.adaptive_spec_threshold = (
+            server_args.adaptive_speculative_batch_size_threshold
+        )
         self.in_spec_transition = False
         self.spec_transition_remaining_reqs = 0
 
@@ -1073,12 +1075,16 @@ class Scheduler(
             if self._engine_paused:
                 continue
             # Check for pending transition before getting batch
-            if self.draft_worker and hasattr(self.draft_worker, "check_and_trigger_transition"):
+            if self.draft_worker and hasattr(
+                self.draft_worker, "check_and_trigger_transition"
+            ):
                 if self.draft_worker.check_and_trigger_transition():
                     # Reset cache and allocator to ensure clean state before transition
                     self.tree_cache.reset()
                     self.token_to_kv_pool_allocator.clear()
-                    self.req_to_token_pool.free_slots = list(range(self.req_to_token_pool.size))
+                    self.req_to_token_pool.free_slots = list(
+                        range(self.req_to_token_pool.size)
+                    )
 
                     # Collect all requests from running batch
                     reqs_to_requeue = []
@@ -1143,12 +1149,16 @@ class Scheduler(
             if self._engine_paused:
                 continue
             # Check for pending transition before getting batch
-            if self.draft_worker and hasattr(self.draft_worker, "check_and_trigger_transition"):
+            if self.draft_worker and hasattr(
+                self.draft_worker, "check_and_trigger_transition"
+            ):
                 if self.draft_worker.check_and_trigger_transition():
                     # Reset cache and allocator to ensure clean state before transition
                     self.tree_cache.reset()
                     self.token_to_kv_pool_allocator.clear()
-                    self.req_to_token_pool.free_slots = list(range(self.req_to_token_pool.size))
+                    self.req_to_token_pool.free_slots = list(
+                        range(self.req_to_token_pool.size)
+                    )
 
                     # Collect all requests from running batch
                     reqs_to_requeue = []
@@ -2047,18 +2057,19 @@ class Scheduler(
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
-        
+
         # Limit batch size during speculative decoding transition to avoid OOM
         max_prefill_tokens_for_batch = self.max_prefill_tokens
         if self.in_spec_transition and self.spec_transition_remaining_reqs > 0:
-            max_prefill_tokens_for_batch = self.max_prefill_tokens // 4  # FIXME: make it configurable
-            
+            max_prefill_tokens_for_batch = (
+                self.max_prefill_tokens // 4
+            )  # FIXME: make it configurable
+
             logger.debug(
                 f"[AdaptiveSpec] In transition, limiting max_prefill_tokens to "
                 f"{max_prefill_tokens_for_batch} (remaining: "
                 f"{self.spec_transition_remaining_reqs})"
             )
-
 
         # Prefill policy
         adder = PrefillAdder(
@@ -2240,7 +2251,9 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode(skip_prepare=not self.running_batch.spec_algorithm.is_none())
+                self.running_batch.prepare_for_decode(
+                    skip_prepare=not self.running_batch.spec_algorithm.is_none()
+                )
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
             self.running_batch = ScheduleBatch(
@@ -2312,7 +2325,7 @@ class Scheduler(
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
-        
+
         # Disable spec algorithm if batch size exceeds adaptive spec threshold
         if (
             self.adaptive_spec_threshold is not None
@@ -2323,7 +2336,9 @@ class Scheduler(
             batch.spec_algorithm = SpeculativeAlgorithm.NONE
 
         # Update batch tensors
-        batch.prepare_for_decode(skip_prepare=not self.running_batch.spec_algorithm.is_none())
+        batch.prepare_for_decode(
+            skip_prepare=not self.running_batch.spec_algorithm.is_none()
+        )
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
@@ -2525,7 +2540,9 @@ class Scheduler(
                 )
                 if self.spec_transition_remaining_reqs == 0:
                     self.in_spec_transition = False
-                    logger.debug("[AdaptiveSpec] Transition complete, all requests re-processed")
+                    logger.debug(
+                        "[AdaptiveSpec] Transition complete, all requests re-processed"
+                    )
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2705,7 +2722,10 @@ class Scheduler(
                 # Reset adaptive spec parameters if enabled
                 if hasattr(self.draft_worker, "draft_worker"):
                     draft_worker = self.draft_worker.draft_worker
-                    if hasattr(draft_worker, "adaptive_spec_threshold") and draft_worker.adaptive_spec_threshold is not None:
+                    if (
+                        hasattr(draft_worker, "adaptive_spec_threshold")
+                        and draft_worker.adaptive_spec_threshold is not None
+                    ):
                         draft_worker.reset_adaptive_spec_params()
 
             # TODO: allow optional empty cache
