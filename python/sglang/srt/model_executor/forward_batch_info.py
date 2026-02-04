@@ -392,6 +392,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            decode_start_or_none=batch.decode_start_or_none,
+            decoding_reqs=batch.decoding_reqs,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
