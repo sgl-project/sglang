@@ -144,6 +144,45 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def parse_with_separated_reasoning(
+        self, reasoning_text: Optional[str], normal_text: str
+    ) -> Tuple[Optional[str], str, list[ToolCallItem]]:
+        """
+        Parse tool calls from text that has been separated into reasoning and normal content.
+
+        Some models (e.g., kimi_k2) can emit tool calls inside reasoning/thinking blocks.
+        When separate_reasoning=True, this content is split into reasoning_text and normal_text.
+        This method parses tools from both locations and returns clean text + tool calls.
+
+        Args:
+            reasoning_text: The reasoning content (may contain tool calls) or None
+            normal_text: The normal content (may contain tool calls)
+
+        Returns:
+            A tuple containing:
+            - Clean reasoning text (with tool calls removed) or None if no reasoning
+            - Clean normal text (with tool calls removed)
+            - A list of all tool calls parsed from both texts
+        """
+        if not self.tools:
+            return reasoning_text, normal_text, []
+
+        all_tool_calls: list[ToolCallItem] = []
+        clean_reasoning = reasoning_text
+        clean_normal = normal_text
+
+        # Parse tools from reasoning text if present
+        if reasoning_text and self.detector.has_tool_call(reasoning_text):
+            clean_reasoning, calls = self.parse_non_stream(reasoning_text)
+            all_tool_calls.extend(calls)
+
+        # Parse tools from normal text if present
+        if normal_text and self.detector.has_tool_call(normal_text):
+            clean_normal, calls = self.parse_non_stream(normal_text)
+            all_tool_calls.extend(calls)
+
+        return clean_reasoning, clean_normal, all_tool_calls
+
     def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.

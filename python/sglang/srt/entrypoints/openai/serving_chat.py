@@ -673,89 +673,129 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
+                reasoning_text = None
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
-                    if reasoning_text:
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(reasoning_content=reasoning_text),
-                            finish_reason=None,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
 
-                        # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
-                            chunk.usage = UsageProcessor.calculate_token_usage(
-                                prompt_tokens=prompt_tokens.get(index, 0),
-                                completion_tokens=completion_tokens.get(index, 0),
-                            )
-
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-
-                # Handle tool calls
+                # Handle tool calls that may appear in reasoning and/or normal text
+                # Some models (e.g., kimi_k2) can emit tool calls inside thinking blocks
                 if (
                     request.tool_choice != "none"
                     and request.tools
                     and self.tool_call_parser
                 ):
-                    async for chunk in self._process_tool_call_stream(
-                        index,
-                        delta,
-                        parser_dict,
-                        content,
-                        request,
-                        has_tool_calls,
-                    ):
-                        if chunk:
-                            yield chunk
-
-                    # Send any remaining tool call arguments when generation finishes
-                    if finish_reason_type is not None and index in parser_dict:
-                        parser = parser_dict[index]
-                        remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, index
+                    # Create parser if needed
+                    if index not in parser_dict:
+                        parser_dict[index] = FunctionCallParser(
+                            tools=request.tools,
+                            tool_call_parser=self.tool_call_parser,
                         )
-                        if remaining_chunk:
-                            yield remaining_chunk
+                    tool_parser = parser_dict[index]
 
-                else:
-                    # Regular content
-                    if delta:
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(content=delta),
-                            finish_reason=None,
-                            matched_stop=None,
-                            logprobs=choice_logprobs,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-
-                        # Add usage stats if continuous_usage_stats is enabled
-                        if (
-                            request.stream_options
-                            and request.stream_options.continuous_usage_stats
-                        ):
-                            chunk.usage = UsageProcessor.calculate_token_usage(
-                                prompt_tokens=prompt_tokens.get(index, 0),
-                                completion_tokens=completion_tokens.get(index, 0),
+                    # If we have separated reasoning, check both reasoning and normal text for tools
+                    if reasoning_text is not None:
+                        clean_reasoning, clean_delta, tool_calls = (
+                            tool_parser.parse_with_separated_reasoning(
+                                reasoning_text, delta
                             )
+                        )
+                        reasoning_text = clean_reasoning
+                        delta = clean_delta
 
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        # Emit tool calls found in either location
+                        if tool_calls:
+                            history_tool_calls_cnt = self._get_history_tool_calls_cnt(
+                                request
+                            )
+                            for call_item in tool_calls:
+                                has_tool_calls[index] = True
+                                chunk = self._create_tool_call_chunk(
+                                    call_item,
+                                    content,
+                                    request,
+                                    index,
+                                    history_tool_calls_cnt,
+                                )
+                                yield f"data: {chunk.model_dump_json()}\n\n"
+                    else:
+                        # No reasoning separation - use standard streaming tool handling
+                        async for chunk in self._process_tool_call_stream(
+                            index,
+                            delta,
+                            parser_dict,
+                            content,
+                            request,
+                            has_tool_calls,
+                        ):
+                            if chunk:
+                                yield chunk
+
+                        # Send any remaining tool call arguments when generation finishes
+                        if finish_reason_type is not None and index in parser_dict:
+                            parser = parser_dict[index]
+                            remaining_chunk = self._check_for_unstreamed_tool_args(
+                                parser, content, request, index
+                            )
+                            if remaining_chunk:
+                                yield remaining_chunk
+
+                # Emit reasoning content if present
+                if reasoning_text:
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(reasoning_content=reasoning_text),
+                        finish_reason=None,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+
+                    # Add usage stats if continuous_usage_stats is enabled
+                    if (
+                        request.stream_options
+                        and request.stream_options.continuous_usage_stats
+                    ):
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            completion_tokens=completion_tokens.get(index, 0),
+                        )
+
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # Emit regular content if present (and not handled by tool streaming)
+                if delta and not (
+                    request.tools and self.tool_call_parser and reasoning_text is None
+                ):
+                    choice_data = ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(content=delta),
+                        finish_reason=None,
+                        matched_stop=None,
+                        logprobs=choice_logprobs,
+                    )
+                    chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[choice_data],
+                        model=request.model,
+                    )
+
+                    # Add usage stats if continuous_usage_stats is enabled
+                    if (
+                        request.stream_options
+                        and request.stream_options.continuous_usage_stats
+                    ):
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            completion_tokens=completion_tokens.get(index, 0),
+                        )
+
+                    yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -935,7 +975,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         status_code=500,
                     )
 
-            # Handle tool calls
+            # Handle tool calls that may appear in reasoning and/or normal text
+            # Some models (e.g., kimi_k2) can emit tool calls inside thinking blocks
             tool_calls = None
             if (
                 request.tool_choice != "none"
@@ -943,13 +984,51 @@ class OpenAIServingChat(OpenAIServingBase):
                 and self.tool_call_parser
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
-                    text,
-                    request.tools,
-                    finish_reason,
-                    request.tool_choice,
-                    history_tool_calls_cnt,
-                )
+
+                # If we have separated reasoning, check both reasoning and normal text for tools
+                if reasoning_text is not None:
+                    tool_parser = FunctionCallParser(
+                        tools=request.tools,
+                        tool_call_parser=self.tool_call_parser,
+                    )
+                    clean_reasoning, clean_text, call_items = (
+                        tool_parser.parse_with_separated_reasoning(reasoning_text, text)
+                    )
+                    reasoning_text = clean_reasoning
+                    text = clean_text
+
+                    # Convert ToolCallItems to ToolCalls
+                    if call_items:
+                        if finish_reason["type"] == "stop":
+                            finish_reason["type"] = "tool_calls"
+                            finish_reason["matched"] = None
+                        tool_calls = []
+                        for call_item in call_items:
+                            tool_id = self._process_tool_call_id(
+                                call_item, history_tool_calls_cnt
+                            )
+                            tool_calls.append(
+                                ToolCall(
+                                    id=tool_id,
+                                    index=getattr(call_item, "tool_index", None),
+                                    function=FunctionResponse(
+                                        name=call_item.name,
+                                        arguments=call_item.parameters,
+                                    ),
+                                )
+                            )
+                else:
+                    # No reasoning separation - use standard tool handling
+                    result = self._process_tool_calls(
+                        text,
+                        request.tools,
+                        finish_reason,
+                        request.tool_choice,
+                        history_tool_calls_cnt,
+                    )
+                    tool_calls = result.tool_calls
+                    text = result.text
+                    finish_reason = result.finish_reason
 
             choice_data = ChatCompletionResponseChoice(
                 index=idx,
@@ -1053,11 +1132,48 @@ class OpenAIServingChat(OpenAIServingBase):
             # Align with Kimi-K2 format: functions.{name}:{index}
             # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
             # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
-            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt + call_item.tool_index}"
             logger.debug(
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
             return tool_call_id
+
+    def _create_tool_call_chunk(
+        self,
+        call_item: ToolCallItem,
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+        index: int,
+        history_tool_calls_cnt: int,
+    ) -> ChatCompletionStreamResponse:
+        """Create a streaming chunk for a tool call."""
+        tool_call_id = (
+            self._process_tool_call_id(call_item, history_tool_calls_cnt)
+            if call_item.name
+            else None
+        )
+
+        tool_call = ToolCall(
+            id=tool_call_id,
+            index=call_item.tool_index,
+            function=FunctionResponse(
+                name=call_item.name,
+                arguments=call_item.parameters,
+            ),
+        )
+
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=index,
+            delta=DeltaMessage(tool_calls=[tool_call]),
+            finish_reason=None,
+        )
+
+        return ChatCompletionStreamResponse(
+            id=content["meta_info"]["id"],
+            created=int(time.time()),
+            choices=[choice_data],
+            model=request.model,
+        )
 
     def _process_tool_calls(
         self,
