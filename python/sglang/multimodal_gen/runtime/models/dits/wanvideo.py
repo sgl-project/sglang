@@ -894,7 +894,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states, _ = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
             batch_size,

@@ -229,6 +229,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         tp_group = tp_group or get_tp_group()
         tp_rank = get_group_rank(tp_group)
         self.tp_size = get_group_size(tp_group)
+        self.tp_group = tp_group
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
