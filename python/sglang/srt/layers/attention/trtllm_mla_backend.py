@@ -839,8 +839,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
+        # Decide current layer's KV cache type
+        cur_layer_kv_dtype = forward_batch.get_cur_layer_kv_dtype(layer.layer_id)
+        if cur_layer_kv_dtype is None:
+            # If None, it means heterogeneous KV cache is not enabled,
+            # so we fall back to the default data type of the attention backend.
+            cur_layer_kv_dtype = self.data_type
+
         merge_query = q_rope is not None
-        if self.data_type == torch.float8_e4m3fn:
+        if cur_layer_kv_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
@@ -881,7 +888,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
             query = query.to(self.q_data_type) * llama_4_scaling
-            query = query.to(self.data_type)
+            query = query.to(cur_layer_kv_dtype)
 
         # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
         if query.dim() == 3:
@@ -964,8 +971,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+
+        # Decide current layer's KV cache type
+        cur_layer_kv_dtype = forward_batch.get_cur_layer_kv_dtype(layer.layer_id)
+        if cur_layer_kv_dtype is None:
+            # If None, it means heterogeneous KV cache is not enabled,
+            # so we fall back to the default data type of the attention backend.
+            cur_layer_kv_dtype = self.data_type
+
         if (
-            self.data_type == torch.float8_e4m3fn
+            cur_layer_kv_dtype == torch.float8_e4m3fn
         ) and forward_batch.forward_mode.is_target_verify():
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -1007,7 +1022,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
             q = q.to(self.q_data_type) * llama_4_scaling
-            q = q.to(self.data_type)
+
+            # FP4 KV cache is stored as FP4 but accessed as dequantized (bfloat16),
+            # so don't convert q to FP4
+            def is_fp4_kv_cache():
+                return hasattr(torch, "float4_e2m1fn_x2") and (
+                    cur_layer_kv_dtype == torch.float4_e2m1fn_x2
+                    or (
+                        cur_layer_kv_dtype == torch.bfloat16
+                        and self.data_type == torch.float4_e2m1fn_x2
+                    )
+                )
+
+            if not is_fp4_kv_cache():
+                q = q.to(cur_layer_kv_dtype)
 
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -1029,6 +1057,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
 
+            # Decide current layer's KV cache type
+            cur_layer_kv_dtype = forward_batch.get_cur_layer_kv_dtype(layer.layer_id)
+            if cur_layer_kv_dtype is None:
+                # If None, it means heterogeneous KV cache is not enabled,
+                # so we fall back to the default data type of the attention backend.
+                cur_layer_kv_dtype = self.data_type
+
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
@@ -1038,7 +1073,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 if getattr(layer, "k_scale_float", None) is not None
                 else 1.0
             )
-            q = q.to(self.data_type)
+
+            def is_fp4_kv_cache():
+                return hasattr(torch, "float4_e2m1fn_x2") and (
+                    cur_layer_kv_dtype == torch.float4_e2m1fn_x2
+                    or (
+                        cur_layer_kv_dtype == torch.bfloat16
+                        and self.data_type == torch.float4_e2m1fn_x2
+                    )
+                )
+
+            if not is_fp4_kv_cache():
+                q = q.to(cur_layer_kv_dtype)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
             if forward_batch.forward_mode.is_target_verify():
@@ -1095,7 +1141,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q = actual_cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
 
-            assert kv_cache.dtype == self.data_type
+            # assert kv_cache.dtype == self.data_type
 
             raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
                 query=q,
@@ -1130,7 +1176,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
         q_scale = k_scale = v_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn:
+        # Decide current layer's KV cache type
+        cur_layer_kv_dtype = forward_batch.get_cur_layer_kv_dtype(layer.layer_id)
+        if cur_layer_kv_dtype is None:
+            # If None, it means heterogeneous KV cache is not enabled,
+            # so we fall back to the default data type of the attention backend.
+            cur_layer_kv_dtype = self.data_type
+
+        if cur_layer_kv_dtype == torch.float8_e4m3fn:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
 
         common_trtllm_args = {

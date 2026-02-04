@@ -375,6 +375,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    def get_cur_layer_kv_dtype(self, layer_id: int) -> Optional[torch.dtype]:
+        """Get the KV cache data type for a specific layer if it's heterogeneous.
+        Returns None if the KV cache is homogeneous.
+        """
+        if (
+            self.token_to_kv_pool is not None
+            and hasattr(self.token_to_kv_pool, "per_layer_dtypes")
+            and self.token_to_kv_pool.per_layer_dtypes is not None
+        ):
+            return self.token_to_kv_pool.per_layer_dtypes.get(layer_id)
+        return None
+
     @classmethod
     def init_new(
         cls,

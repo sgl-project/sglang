@@ -1448,13 +1448,20 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
+
+        cur_layer_kv_dtype = forward_batch.get_cur_layer_kv_dtype(self.layer_id)
+        if cur_layer_kv_dtype is None:
+            # If None, it means heterogeneous KV cache is not enabled,
+            # so we fall back to the default data type of the attention backend.
+            cur_layer_kv_dtype = forward_batch.attn_backend.data_type
+
         return (
             self.current_attention_backend == "trtllm_mla"
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+            and cur_layer_kv_dtype == torch.float8_e4m3fn
         )
 
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
@@ -1733,8 +1740,13 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
+                cur_layer_kv_dtype = forward_batch.get_cur_layer_kv_dtype(self.layer_id)
+                if cur_layer_kv_dtype is None:
+                    # If None, it means heterogeneous KV cache is not enabled,
+                    # so we fall back to the default data type of the attention backend.
+                    cur_layer_kv_dtype = self.kv_cache_dtype
                 kv_cache_dtype = (
-                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+                    fp8_dtype if cur_layer_kv_dtype == "fp8_e4m3" else q_nope_out.dtype
                 )
 
                 q, _, _, k = fused_qk_rope_cat_and_cache_mla(
