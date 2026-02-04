@@ -29,6 +29,7 @@ class TestQwen332B(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--disable-cuda-graph",
         "--tp-size",
+        "4",
     ]
 
 
