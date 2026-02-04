@@ -987,7 +987,7 @@ class MambaRadixCache(BasePrefixCache):
                 mamba_ping_pong_track_buffer_to_keep = None
 
             mamba_value = mamba_value_src
-            if self.marconi_enabled and layer_indices is not None:
+            if self.marconi_enabled:
                 primary_mamba_forked = self.req_to_token_pool.mamba_pool.fork_from(
                     mamba_value_src, layer_indices=layer_indices
                 )
@@ -1106,6 +1106,11 @@ class MambaRadixCache(BasePrefixCache):
             mamba_exist = True
 
         if mamba_exist:
+            mamba_ping_pong_track_buffer_to_keep = None
+
+        # Finished requests should not keep ping-pong buffers; keeping one slot
+        # can leave mamba pages allocated but not tracked in the cache.
+        if self.enable_mamba_extra_buffer:
             mamba_ping_pong_track_buffer_to_keep = None
 
         free_mamba_cache = (

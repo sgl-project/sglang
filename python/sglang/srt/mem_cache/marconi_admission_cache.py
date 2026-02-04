@@ -32,7 +32,7 @@ class MarconiAdmissionTree:
     def __init__(
         self,
         *,
-        policy: str = "paper",
+        policy: str = "taxonomy",
         min_hits: int = 2,
         min_success_ratio: float = 0.1,
         decay: float = 0.995,
@@ -42,7 +42,7 @@ class MarconiAdmissionTree:
         prune_interval: int = 200,
     ):
         self.root_node = AdmissionNode()
-        if policy not in ("paper", "thresholded"):
+        if policy not in ("taxonomy", "thresholded"):
             raise ValueError(f"Unknown Marconi admission policy: {policy}")
         self.policy = policy
         self.min_hits = min_hits
@@ -73,7 +73,7 @@ class MarconiAdmissionTree:
     def _eligible(self, node: Optional[AdmissionNode]) -> bool:
         if node is None:
             return False
-        if self.policy == "paper":
+        if self.policy == "taxonomy":
             return True
         if node.hit_count < self.min_hits:
             return False

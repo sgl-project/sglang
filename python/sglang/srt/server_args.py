@@ -315,6 +315,7 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_marconi: bool = False
+    marconi_mode: Optional[str] = None
     marconi_eff_weight: float = 0.0
     marconi_bootstrap_window_size: Optional[int] = None
     marconi_bootstrap_multiplier: int = 5
@@ -752,6 +753,9 @@ class ServerArgs:
 
         # Handle speculative decoding logic.
         self._handle_speculative_decoding()
+
+        # Handle Marconi mode defaults.
+        self._handle_marconi_mode()
 
         # Handle model loading format.
         self._handle_load_format()
@@ -2258,6 +2262,34 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+    def _marconi_set_if_default(self, name: str, value):
+        default = getattr(type(self), name)
+        if getattr(self, name) == default:
+            setattr(self, name, value)
+
+    def _handle_marconi_mode(self):
+        if self.marconi_mode is None:
+            return
+
+        mode = self.marconi_mode.lower()
+        if mode == "taxonomy":
+            self.marconi_admission_policy = "taxonomy"
+            self._marconi_set_if_default("marconi_two_pass_branch_prefill", False)
+            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.0)
+            self._marconi_set_if_default("marconi_eviction_pin_threshold", 0)
+            self._marconi_set_if_default("marconi_eviction_pin_ttl", 0)
+            self._marconi_set_if_default("marconi_eviction_regret_window", 0)
+            self._marconi_set_if_default("marconi_eff_weight", 0.75)
+        elif mode == "thresholded":
+            self.marconi_admission_policy = "thresholded"
+            self._marconi_set_if_default("marconi_two_pass_branch_prefill", True)
+            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.2)
+            self._marconi_set_if_default("marconi_eviction_pin_threshold", 8)
+            self._marconi_set_if_default("marconi_eviction_pin_ttl", 500)
+            self._marconi_set_if_default("marconi_eviction_regret_window", 1000)
+        else:
+            raise ValueError("marconi_mode must be one of: thresholded, taxonomy.")
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -2412,9 +2444,9 @@ class ServerArgs:
                 raise ValueError("marconi_bootstrap_multiplier must be positive.")
             if self.marconi_tuning_interval <= 0:
                 raise ValueError("marconi_tuning_interval must be positive.")
-            if self.marconi_admission_policy not in ("paper", "thresholded"):
+            if self.marconi_admission_policy not in ("taxonomy", "thresholded"):
                 raise ValueError(
-                    "marconi_admission_policy must be one of: paper, thresholded."
+                    "marconi_admission_policy must be one of: taxonomy, thresholded."
                 )
             if self.marconi_admission_min_hits <= 0:
                 raise ValueError("marconi_admission_min_hits must be positive.")
@@ -3050,6 +3082,13 @@ class ServerArgs:
             help="Enable Marconi eviction and tuning for hybrid radix cache.",
         )
         parser.add_argument(
+            "--marconi-mode",
+            type=str,
+            default=ServerArgs.marconi_mode,
+            help="Marconi admission mode. 'thresholded' uses taxonomy + thresholds; "
+            "'taxonomy' uses taxonomy-only admission.",
+        )
+        parser.add_argument(
             "--marconi-eff-weight",
             type=float,
             default=ServerArgs.marconi_eff_weight,
@@ -3076,8 +3115,8 @@ class ServerArgs:
         parser.add_argument(
             "--marconi-admission-policy",
             default=ServerArgs.marconi_admission_policy,
-            choices=["paper", "thresholded"],
-            help="Admission policy for Marconi. 'paper' uses speculative insertion taxonomy; "
+            choices=["taxonomy", "thresholded"],
+            help="Admission policy for Marconi. 'taxonomy' uses speculative insertion taxonomy; "
             "'thresholded' uses hit/score thresholds.",
         )
         parser.add_argument(
