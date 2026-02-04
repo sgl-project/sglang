@@ -464,7 +464,6 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        # The original for loop is replaced by numpy optimization for different TP size on prefill node
         prefill_kv_indices_reshaped = prefill_kv_indices.astype(np.int64).reshape(-1, 1)
         dst_kv_indices_reshaped = dst_kv_indices.astype(np.int64).reshape(-1, 1)
         token_offsets = np.arange(page_size, dtype=np.int64).reshape(1, -1)
