@@ -60,6 +60,7 @@ def clear_tmpfiles():
         (3, 1),
     ]
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
 def test_wan_dist_conv_2d(
     dim: int,
     batch_size: int,
@@ -68,17 +69,18 @@ def test_wan_dist_conv_2d(
     ulysses_degree: int,
     ring_degree: int,
     kernel_size: int,
-    padding: int
+    padding: int,
+    dtype: torch.dtype,
 ):
     actual_output_file = tmpfile()
 
     conv2d = nn.Conv2d(dim, dim * 3, kernel_size, padding=padding)
     saved_model_file = tmpfile(conv2d.state_dict())
 
-    conv2d = conv2d.eval().requires_grad_(False).to(device)
+    conv2d = conv2d.eval().requires_grad_(False).to(device).to(dtype)
 
     # latent shape [B, C, H, W]
-    x = torch.randn(batch_size, dim, height, width)
+    x = torch.randn(batch_size, dim, height, width, dtype=dtype)
     input_data_file = tmpfile(x)
     x = x.to(device)
 
@@ -100,6 +102,7 @@ def test_wan_dist_conv_2d(
             ring_degree,
             sequence_parallel_size,
             actual_output_file,
+            dtype,
         ),
         nprocs=sequence_parallel_size,
         join=True,
@@ -112,7 +115,14 @@ def test_wan_dist_conv_2d(
     if actual.shape[-2] != expected_height:
         actual = actual[..., :expected_height, :]
 
-    assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+    if dtype == torch.bfloat16 or dtype == torch.float16:
+        atol, rtol = 5e-2, 5e-2
+    elif dtype == torch.float32:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 1e-5, 1e-5
+
+    assert_close(actual, expected, atol=atol, rtol=rtol)
 
     clear_tmpfiles()
 
@@ -129,6 +139,7 @@ def test_wan_dist_conv_2d(
         ((3, 1, 1), (1, 0, 0)), # time_conv
     ]
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
 def test_wan_dist_conv_3d(
     dim: int,
     batch_size: int,
@@ -138,16 +149,17 @@ def test_wan_dist_conv_3d(
     ring_degree: int,
     kernel_size: int | tuple,
     padding: int | tuple,
+    dtype: torch.dtype,
 ):
     actual_output_file = tmpfile()
 
     conv3d = WanCausalConv3d(dim, dim * 3, kernel_size, padding=padding)
     saved_model_file = tmpfile(conv3d.state_dict())
 
-    conv3d = conv3d.eval().requires_grad_(False).to(device)
+    conv3d = conv3d.eval().requires_grad_(False).to(device).to(dtype)
 
     # latent shape [B, C, H, W]
-    x = torch.randn(batch_size, dim, 30, height, width)
+    x = torch.randn(batch_size, dim, 30, height, width, dtype=dtype)
     input_data_file = tmpfile(x)
     x = x.to(device)
 
@@ -169,6 +181,7 @@ def test_wan_dist_conv_3d(
             ring_degree,
             sequence_parallel_size,
             actual_output_file,
+            dtype,
         ),
         nprocs=sequence_parallel_size,
         join=True,
@@ -199,7 +212,8 @@ def _test_dist_conv(
     ulysses_degree: int,
     ring_degree: int,
     sequence_parallel_size: int,
-    output_file: str
+    output_file: str,
+    dtype: torch.dtype,
 ):
     set_envar({
         "MASTER_ADDR": "localhost",
@@ -231,7 +245,7 @@ def _test_dist_conv(
 
     dist_conv = conv_cls(dim, dim * 3, kernel_size, padding=padding)
     dist_conv.load_state_dict(torch.load(saved_model_file))
-    dist_conv = dist_conv.eval().requires_grad_(False).to(current_device)
+    dist_conv = dist_conv.eval().requires_grad_(False).to(current_device).to(dtype)
 
     x = torch.load(input_data_file).to(current_device)
     padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
@@ -259,6 +273,7 @@ def _test_dist_conv(
 @pytest.mark.parametrize("ulysses_degree", [2, 4])
 @pytest.mark.parametrize("ring_degree", [1])
 @pytest.mark.parametrize("mode", ["upsample2d", "upsample3d"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
 def test_wan_dist_resample(
     dim: int,
     batch_size: int,
@@ -267,16 +282,17 @@ def test_wan_dist_resample(
     ulysses_degree: int,
     ring_degree: int,
     mode: str,
+    dtype: torch.dtype,
 ):
     actual_output_file = tmpfile()
 
     resample = WanResample(dim, mode=mode)
     saved_model_file = tmpfile(resample.state_dict())
 
-    resample = resample.eval().requires_grad_(False).to(device)
+    resample = resample.eval().requires_grad_(False).to(device).to(dtype)
 
     # latent shape [B, C, H, W]
-    x = torch.randn(batch_size, dim, 1, height, width)
+    x = torch.randn(batch_size, dim, 1, height, width, dtype=dtype)
     input_data_file = tmpfile(x)
     x = x.to(device)
 
@@ -296,6 +312,7 @@ def test_wan_dist_resample(
             ring_degree,
             sequence_parallel_size,
             actual_output_file,
+            dtype,
         ),
         nprocs=sequence_parallel_size,
         join=True,
@@ -308,7 +325,15 @@ def test_wan_dist_resample(
     expected_height = expected.shape[-2]
     if actual.shape[-2] != expected_height:
         actual = actual[..., :expected_height, :]
-    assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+
+    if dtype == torch.bfloat16 or dtype == torch.float16:
+        atol, rtol = 5e-2, 5e-2
+    elif dtype == torch.float32:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 1e-5, 1e-5
+
+    assert_close(actual, expected, atol=atol, rtol=rtol)
 
     clear_tmpfiles()
 
@@ -322,7 +347,8 @@ def _test_wan_dist_resample(
     ulysses_degree: int,
     ring_degree: int,
     sequence_parallel_size: int,
-    output_file: str
+    output_file: str,
+    dtype: torch.dtype,
 ):
     set_envar({
         "MASTER_ADDR": "localhost",
@@ -354,7 +380,7 @@ def _test_wan_dist_resample(
 
     resample = WanDistResample(dim, mode=mode)
     resample.load_state_dict(torch.load(saved_model_file))
-    resample = resample.eval().requires_grad_(False).to(current_device)
+    resample = resample.eval().requires_grad_(False).to(current_device).to(dtype)
 
     x = torch.load(input_data_file).to(current_device)
     padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
@@ -385,6 +411,7 @@ def _test_wan_dist_resample(
 @pytest.mark.parametrize("ring_degree", [1])
 @pytest.mark.parametrize("in_dim", [192, 384])
 @pytest.mark.parametrize("out_dim", [192, 384])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
 def test_wan_dist_residual_block(
     batch_size: int,
     height: int,
@@ -393,15 +420,16 @@ def test_wan_dist_residual_block(
     ring_degree: int,
     in_dim: int,
     out_dim: int,
+    dtype: torch.dtype,
 ):
     actual_output_file = tmpfile()
 
     residual_block = WanResidualBlock(in_dim, out_dim)
     saved_model_file = tmpfile(residual_block.state_dict())
-    residual_block = residual_block.eval().requires_grad_(False).to(device)
+    residual_block = residual_block.eval().requires_grad_(False).to(device).to(dtype)
 
     # latent shape [B, C, H, W]
-    x = torch.randn(batch_size, in_dim, 1, height, width)
+    x = torch.randn(batch_size, in_dim, 1, height, width, dtype=dtype)
     input_data_file = tmpfile(x)
     x = x.to(device)
 
@@ -421,6 +449,7 @@ def test_wan_dist_residual_block(
             out_dim,
             sequence_parallel_size,
             actual_output_file,
+            dtype,
         ),
         nprocs=sequence_parallel_size,
         join=True,
@@ -434,7 +463,14 @@ def test_wan_dist_residual_block(
     if actual.shape[-2] != expected_height:
         actual = actual[..., :expected_height, :]
 
-    assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+    if dtype == torch.bfloat16 or dtype == torch.float16:
+        atol, rtol = 5e-2, 5e-2
+    elif dtype == torch.float32:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 1e-5, 1e-5
+
+    assert_close(actual, expected, atol=atol, rtol=rtol)
 
     clear_tmpfiles()
 
@@ -448,7 +484,8 @@ def _test_wan_dist_residual_block(
     in_dim: int,
     out_dim: int,
     sequence_parallel_size: int,
-    output_file: str
+    output_file: str,
+    dtype,
 ):
     set_envar({
         "MASTER_ADDR": "localhost",
@@ -481,7 +518,7 @@ def _test_wan_dist_residual_block(
 
     residual_block = WanDistResidualBlock(in_dim, out_dim)
     residual_block.load_state_dict(torch.load(saved_model_file))
-    residual_block = residual_block.eval().requires_grad_(False).to(current_device)
+    residual_block = residual_block.eval().requires_grad_(False).to(current_device).to(dtype)
 
     x = torch.load(input_data_file).to(current_device)
     padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
@@ -509,12 +546,14 @@ def _test_wan_dist_residual_block(
 @pytest.mark.parametrize("width", [40])
 @pytest.mark.parametrize("ulysses_degree", [2, 4])
 @pytest.mark.parametrize("ring_degree", [1])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
 def test_wan_parallel_decoder(
     batch_size: int,
     height: int,
     width: int,
     ulysses_degree: int,
     ring_degree: int,
+    dtype: torch.dtype,
 ):
     actual_output_file = tmpfile()
 
@@ -531,10 +570,10 @@ def test_wan_parallel_decoder(
         is_residual=vae_config.is_residual,
     )
     saved_model_file = tmpfile(decoder.state_dict())
-    decoder = decoder.eval().requires_grad_(False).to(device)
+    decoder = decoder.eval().requires_grad_(False).to(device).to(dtype)
 
     # generate latent
-    z = torch.randn(batch_size, vae_config.z_dim, 1, height, width)
+    z = torch.randn(batch_size, vae_config.z_dim, 1, height, width, dtype=dtype)
     input_data_file = tmpfile(z)
     z = z.to(device)
 
@@ -552,6 +591,7 @@ def test_wan_parallel_decoder(
             ring_degree,
             sequence_parallel_size,
             actual_output_file,
+            dtype,
         ),
         nprocs=sequence_parallel_size,
         join=True,
@@ -560,8 +600,14 @@ def test_wan_parallel_decoder(
     with open(actual_output_file, "rb") as f:
         actual = torch.load(f)
 
-    assert actual.shape == expected.shape
-    assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+    if dtype == torch.bfloat16 or dtype == torch.float16:
+        atol, rtol = 5e-2, 5e-2
+    elif dtype == torch.float32:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 1e-5, 1e-5
+
+    assert_close(actual, expected, atol=atol, rtol=rtol)
 
     clear_tmpfiles()
 
@@ -574,7 +620,8 @@ def _test_wan_parallel_decoder(
     ulysses_degree: int,
     ring_degree: int,
     sequence_parallel_size: int,
-    output_file: str
+    output_file: str,
+    dtype: torch.dtype,
 ):
     set_envar({
         "MASTER_ADDR": "localhost",
@@ -620,7 +667,7 @@ def _test_wan_parallel_decoder(
         use_parallel_decode=True,
     )
     parallel_decoder.load_state_dict(torch.load(saved_model_file))
-    parallel_decoder = parallel_decoder.eval().requires_grad_(False).to(current_device)
+    parallel_decoder = parallel_decoder.eval().requires_grad_(False).to(current_device).to(dtype)
 
     z = torch.load(input_data_file).to(current_device)
 
