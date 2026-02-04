@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import pathlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -14,6 +15,11 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
+    import flashinfer
+
+    flashinfer_dir = pathlib.Path(flashinfer.__file__).parent.resolve()
+    assert (flashinfer_dir / "data" / "include").exists()
+    flashinfer_include_path = (flashinfer_dir / "data" / "include").resolve()
     return load_jit(
         "apply_rope_pos_ids_cos_sin_cache",
         cuda_files=["elementwise/rope.cuh"],
@@ -23,9 +29,7 @@ def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
                 "ApplyRopePosIdsCosSinCacheKernel::run",
             )
         ],
-        extra_include_paths=[
-            "/usr/local/lib/python3.12/dist-packages/flashinfer/data/include",
-        ],
+        extra_include_paths=[str(flashinfer_include_path)],
     )
 
 
