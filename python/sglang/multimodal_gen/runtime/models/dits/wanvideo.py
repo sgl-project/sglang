@@ -786,10 +786,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
         if forward_batch is not None:
-            sp_shard_mode = forward_batch.sp_shard_mode
-            sequence_shard_enabled = sp_shard_mode == "sequence" and self.sp_size > 1
+            sequence_shard_enabled = (
+                forward_batch.enable_sequence_shard and self.sp_size > 1
+            )
         else:
-            sp_shard_mode = None
             sequence_shard_enabled = False
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache

@@ -219,9 +219,6 @@ class PipelineConfig:
     # Compilation
     # enable_torch_compile: bool = False
 
-    # "frame" shard by `frame` dimension, "sequence" shard by `frame * H * W` dimension
-    sp_shard_mode: str = "frame"
-
     # calculate the adjust size for condition image
     # width: original condition image width
     # height: original condition image height
@@ -346,7 +343,7 @@ class PipelineConfig:
 
     def shard_latents_for_sp(self, batch, latents):
         # general logic for video models
-        if getattr(batch, "sp_shard_mode", "frame") == "sequence":
+        if batch.enable_sequence_shard:
             return latents, False
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if latents.dim() != 5:
