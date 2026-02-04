@@ -1945,7 +1945,6 @@ class Scheduler(
             return None
 
         running_bs = len(self.running_batch.reqs)
-        num_running_reqs_by_priority = self._count_reqs_by_priority(self.running_batch.reqs)
 
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
@@ -2033,7 +2032,6 @@ class Scheduler(
                         continue
 
             running_bs = len(self.running_batch.reqs)
-            num_running_reqs_by_priority = self._count_reqs_by_priority(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -2121,6 +2119,7 @@ class Scheduler(
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
+        self.num_running_reqs_by_priority = self._count_reqs_by_priority(self.running_batch.reqs)
 
         # Record metrics
         for req in can_run_list:
