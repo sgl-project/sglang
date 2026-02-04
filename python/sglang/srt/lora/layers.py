@@ -592,16 +592,33 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
     def __init__(
         self,
-        base_layer: nn.Module,
+        base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
     ):
+        # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
         # LoRA tensors will be set by LoRAManager
         self.gate_up_lora_a_weights = None
         self.gate_up_lora_b_weights = None
         self.down_lora_a_weights = None
         self.down_lora_b_weights = None
-        self._lora_runner = None
+
+        # initialize triton_lora moe runner for batches with lora enabled
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+        self._lora_runner = MoeRunner(
+            base_layer.quant_method.runner.runner_backend,
+            base_layer.moe_runner_config,
+            lora_enabled=True
+        )
+
+        # Pre-compute quant info for efficiency (weights don't change during inference)
+        self._quant_info = TritonMoeQuantInfo(
+            w13_weight=base_layer.w13_weight,
+            w2_weight=base_layer.w2_weight,
+            b13=getattr(base_layer, "w13_weight_bias", None),
+            b2=getattr(base_layer, "w2_weight_bias", None),
+        )
 
     def set_lora_info(
         self,
@@ -626,52 +643,36 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         Returns None if LoRA is not enabled or weights are not set.
         """
-        if not self.set_lora or self.gate_up_lora_a_weights is None:
-            return None
-
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
-
-        # Get dispatch info from TopKOutput
-        topk_ids = topk_output.topk_ids  # [num_tokens, top_k]
-        topk_weights = topk_output.topk_weights  # [num_tokens, top_k]
 
         # Get LoRA batch info from backend
         batch_info = self.lora_backend.batch_info
         lora_ranks = batch_info.lora_ranks  # [num_loras]
-        scalings = batch_info.scalings  # [num_loras]
 
         # Compute max LoRA rank from current batch ranks
-        max_lora_rank = int(torch.max(lora_ranks))
+        if hasattr(batch_info, "max_lora_rank") and batch_info.max_lora_rank is not None:
+            max_lora_rank = batch_info.max_lora_rank
+        else:
+            max_lora_rank = int(torch.max(lora_ranks))
 
-        # Use precomputed per-token LoRA indices from forward batch
-        lora_indices = self.lora_backend.forward_batch.token_lora_indices
+        # Use precomputed per-token LoRA indices from forward batch (int32 for kernel use)
+        lora_indices = self.lora_backend.forward_batch.token_lora_indices.to(
+            torch.int32
+        )
 
         # Create adapter_enabled tensor for the current batch
         # Only enable LoRA adapters that are actually used in this batch
         # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
         adapter_enabled = torch.zeros(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
-        unique_lora_ids = torch.unique(lora_indices)
-        adapter_enabled[unique_lora_ids] = 1
-
-        # TODO: Jonahbernard: check if this is correct
-        # Flatten dispatch info (no longer using moe_dispatch)
-        num_tokens, top_k = topk_ids.shape
-        device = topk_ids.device
-        token_ids = torch.arange(num_tokens, device=device, dtype=torch.int32).repeat_interleave(top_k)
-        expert_ids = topk_ids.flatten().to(torch.int32)
-        lora_ids = lora_indices.repeat_interleave(top_k)
+        adapter_enabled.index_fill_(0, lora_indices.long(), 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
             down_lora_a_weights=self.down_lora_a_weights,
             down_lora_b_weights=self.down_lora_b_weights,
-            token_ids=token_ids,
-            expert_ids=expert_ids,
-            lora_ids=lora_ids,
             token_lora_mapping=lora_indices,
             lora_ranks=lora_ranks,
-            lora_scalings=scalings,
             adapter_enabled=adapter_enabled,
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
@@ -685,15 +686,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         1. After gate_up projection, before activation
         2. After down projection, before final reduction
         """
-        # If LoRA is not enabled, just run base MoE
-        if not self.set_lora or self.gate_up_lora_a_weights is None:
-            return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
         # Build LoRA info for this batch
         lora_info = self._get_lora_info(topk_output)
 
-        # For now, we use the integrated runner approach only for Triton backend
-        # This wraps the base layer's forward with LoRA integration
+        # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
 
     def _forward_with_lora(
@@ -705,54 +702,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     ):
         """
         Run MoE forward with LoRA integration at the correct points.
-
-        This method hooks into the base layer's computation to add LoRA deltas
-        at the right stages.
         """
-        from sglang.srt.lora.lora_moe_runners import TritonRunnerCoreWithLoRA
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-
         # Get the base layer's dispatch and combine logic
         base_layer = self.base_layer
-        origin_hidden_states_dim = hidden_states.shape[-1]
 
-        # Dispatch tokens
+        # Dispatch tokens (doesn't do much in the LoRA case)
         dispatch_output = base_layer.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Create LoRA-enabled MoeRunner if not already created
-        if self._lora_runner is None:
-            from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
-            self._lora_runner = MoeRunner(
-                base_layer.quant_method.runner.runner_backend,
-                base_layer.moe_runner_config,
-                lora_enabled=True
-            )
+        # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
+        quant_info = self._quant_info
 
-        # Build quant info (for unquantized, this is straightforward)
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=base_layer.w13_weight,
-            w2_weight=base_layer.w2_weight,
-            b13=getattr(base_layer, "w13_weight_bias", None),
-            b2=getattr(base_layer, "w2_weight_bias", None),
-        )
-
-        # Run with LoRA integration using the MoeRunner infrastructure
+        # Run the only lora moe runner (Triton)
         combine_input = self._lora_runner.run(
             dispatch_output, quant_info, lora_info=lora_info
         )
 
-        # Combine and return
+        # Combine and return (doesn't do much in the LoRA case)
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
-        final_hidden_states = final_hidden_states[
-            ..., :origin_hidden_states_dim
-        ].contiguous()
-
-        if base_layer.reduce_results and (
-            base_layer.moe_tp_size > 1 or base_layer.moe_ep_size > 1
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
 
