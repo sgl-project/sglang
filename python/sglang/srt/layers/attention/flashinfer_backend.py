@@ -499,7 +499,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 num_decode_reqs = 0
                 num_prefill_reqs = bs
 
-            if num_prefill_reqs > 0 or num_decode_reqs > 0:
+            if num_prefill_reqs > 0 and num_decode_reqs > 0:
                 self.indices_updater_pod.update(
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
@@ -1031,6 +1031,8 @@ class FlashInferAttnBackend(AttentionBackend):
             q_d,
             paged_kv_cache,
             causal_p=True,
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
         )
 
         num_tokens_p = o_p.size(0)
@@ -1763,7 +1765,7 @@ class FlashInferIndicesUpdaterPOD:
             q_data_type=self.q_data_type, kv_data_type=self.data_type,
         )
 
-        
+
 class FlashInferMultiStepDraftBackend:
     """
     Wrap multiple flashinfer attention backends as one for multiple consecutive
