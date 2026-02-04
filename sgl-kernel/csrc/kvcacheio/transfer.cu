@@ -762,20 +762,20 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t elem_size = dst_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
     const int device_id = at::cuda::current_device();
-    cudaMemcpyAttributes default_attrs{};
-    default_attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    default_attrs.srcLocHint.type = cudaMemLocationTypeDevice;
-    default_attrs.srcLocHint.id = device_id;
-    default_attrs.dstLocHint.type = cudaMemLocationTypeHost;
-    default_attrs.dstLocHint.id = 0;
-    default_attrs.flags = 0;
+    cudaMemcpyAttributes attrs{};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+    attrs.srcLocHint.id = device_id;
+    attrs.dstLocHint.type = cudaMemLocationTypeHost;
+    attrs.dstLocHint.id = 0;
+    attrs.flags = 0;
 
     const size_t num_copies =
         static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
     std::vector<void*> batch_srcs;
     std::vector<void*> batch_dsts;
     std::vector<size_t> batch_sizes;
-    std::vector<size_t> batch_attrs_idxs(1, 0);
+    std::vector<size_t> attrs_idxs(1, 0);
     batch_srcs.reserve(num_copies);
     batch_dsts.reserve(num_copies);
     batch_sizes.reserve(num_copies);
@@ -830,8 +830,8 @@ inline void transfer_kv_page_first_direct_impl(
           batch_srcs.data(),
           batch_sizes.data(),
           num_copies,
-          &default_attrs,
-          batch_attrs_idxs.data(),
+          &attrs,
+          attrs_idxs.data(),
           1,
           &fail_idx,
           batch_stream);
@@ -855,20 +855,20 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t elem_size = src_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
     const int device_id = at::cuda::current_device();
-    cudaMemcpyAttributes default_attrs{};
-    default_attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    default_attrs.srcLocHint.type = cudaMemLocationTypeHost;
-    default_attrs.srcLocHint.id = 0;
-    default_attrs.dstLocHint.type = cudaMemLocationTypeDevice;
-    default_attrs.dstLocHint.id = device_id;
-    default_attrs.flags = 0;
+    cudaMemcpyAttributes attrs{};
+    attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    attrs.srcLocHint.type = cudaMemLocationTypeHost;
+    attrs.srcLocHint.id = 0;
+    attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+    attrs.dstLocHint.id = device_id;
+    attrs.flags = 0;
 
     const size_t num_copies =
         static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
     std::vector<void*> batch_srcs;
     std::vector<void*> batch_dsts;
     std::vector<size_t> batch_sizes;
-    std::vector<size_t> batch_attrs_idxs(1, 0);
+    std::vector<size_t> attrs_idxs(1, 0);
     batch_srcs.reserve(num_copies);
     batch_dsts.reserve(num_copies);
     batch_sizes.reserve(num_copies);
@@ -922,8 +922,8 @@ inline void transfer_kv_page_first_direct_impl(
           batch_srcs.data(),
           batch_sizes.data(),
           num_copies,
-          &default_attrs,
-          batch_attrs_idxs.data(),
+          &attrs,
+          attrs_idxs.data(),
           1,
           &fail_idx,
           batch_stream);
