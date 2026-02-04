@@ -1,13 +1,14 @@
-import unittest
-import requests
 import os
 import sys
 import time
+import unittest
 from datetime import datetime
 
+import requests
+
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 LOG_DUMP_FILE = f"server_request_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-CUSTOM_SERVER_WAIT_TIME = 20 
+CUSTOM_SERVER_WAIT_TIME = 20
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -27,6 +28,7 @@ class TestEnableRequestTimeStatsLogging(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --enable-request-time-stats-logging
     """
+
     @classmethod
     def setUpClass(cls):
         # 1. Save the original stdout/stderr file descriptors at the operating system level
@@ -35,9 +37,7 @@ class TestEnableRequestTimeStatsLogging(CustomTestCase):
 
         # 2. Open the log file (OS-level file descriptor for redirection)
         cls.log_fd = os.open(
-            LOG_DUMP_FILE,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-            0o644
+            LOG_DUMP_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644
         )
         cls.log_file = open(LOG_DUMP_FILE, "a+", encoding="utf-8")
 
@@ -46,14 +46,13 @@ class TestEnableRequestTimeStatsLogging(CustomTestCase):
         os.dup2(cls.log_fd, sys.stderr.fileno())
 
         # 4. Launch the model server with specified configuration
-        other_args = (
-            [
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--enable-request-time-stats-logging",
-            ]
-        )
+        other_args = [
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--enable-request-time-stats-logging",
+        ]
+        
 
         cls.process = popen_launch_server(
             LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
@@ -91,15 +90,19 @@ class TestEnableRequestTimeStatsLogging(CustomTestCase):
         if not os.path.exists(LOG_DUMP_FILE):
             print("\n[Log Tip] Log file does not exist, no content to print")
             return
-        
-        print("\n" + "="*80)
+
+        print("\n" + "=" * 80)
         print("Full Server Log Content:")
-        print("="*80)
+        print("=" * 80)
         with open(LOG_DUMP_FILE, "r", encoding="utf-8", errors="ignore") as f:
             full_log = f.read()
             # Print full log (if the log is too large, only print the last 5000 characters to avoid console flooding)
-            print(full_log if len(full_log) <= 5000 else f"[Log Too Long, Only Showing Last 5000 Characters]\n{full_log[-5000:]}")
-        print("="*80)
+            print(
+                full_log
+                if len(full_log) <= 5000
+                else f"[Log Too Long, Only Showing Last 5000 Characters]\n{full_log[-5000:]}"
+            )
+        print("=" * 80)
         print("Log printing completed")
 
     @classmethod
@@ -116,7 +119,7 @@ class TestEnableRequestTimeStatsLogging(CustomTestCase):
     def read_log_file(self):
         if not os.path.exists(LOG_DUMP_FILE):
             return ""
-        
+
         with open(LOG_DUMP_FILE, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
 
@@ -153,6 +156,7 @@ class TestEnableRequestTimeStatsLogging(CustomTestCase):
             server_logs,
             f"Keyword not found in server logs: {target_keyword}\nLog file path: {os.path.abspath(LOG_DUMP_FILE)}\nLog content preview (last 2000 characters):\n{server_logs[-2000:] if len(server_logs) > 2000 else server_logs}",
         )
+
 
 if __name__ == "__main__":
     unittest.main()
