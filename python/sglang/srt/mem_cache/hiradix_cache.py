@@ -762,8 +762,10 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
-            # Emit tier transition events: GPU -> CPU_TIER1
-            self._record_tier_remove_event(node, MEDIUM_GPU)
+            # Emit BlockStored for CPU_TIER1 - block is now ALSO in L2
+            # Note: We don't emit BlockRemoved(GPU) here because the GPU memory
+            # is still allocated. BlockRemoved(GPU) is emitted in _evict_backuped()
+            # when the GPU memory is actually freed.
             self._record_tier_store_event(node, MEDIUM_CPU_TIER1)
         else:
             return 0
@@ -957,6 +959,8 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
+        # Emit BlockRemoved(GPU) before freeing - block is leaving GPU tier
+        self._record_tier_remove_event(node, MEDIUM_GPU)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
@@ -969,6 +973,8 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
+        # Emit BlockRemoved(GPU) before freeing - block is being deleted from GPU
+        self._record_tier_remove_event(node, MEDIUM_GPU)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
