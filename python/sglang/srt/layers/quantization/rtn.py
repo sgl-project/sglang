@@ -6,7 +6,6 @@ import logging
 import os
 from typing import Any, List, Optional
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -32,6 +31,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.rtn_utils import (
     fix_weights,
+    repack_weights,
     rtn_dequantize,
     rtn_quantize,
 )
@@ -441,162 +441,14 @@ class RTNMoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
-def _get_perms():
-    perm = []
-    for i in range(32):
-        perm1 = []
-        col = i // 4
-        for block in [0, 1]:
-            for row in [
-                2 * (i % 4),
-                2 * (i % 4) + 1,
-                2 * (i % 4 + 4),
-                2 * (i % 4 + 4) + 1,
-            ]:
-                perm1.append(16 * row + col + 8 * block)
-        for j in range(4):
-            perm.extend([p + 256 * j for p in perm1])
-
-    perm_arr = np.array(perm)
-    interleave = np.array([0, 2, 4, 6, 1, 3, 5, 7])
-    perm_arr = perm_arr.reshape((-1, 8))[:, interleave].ravel()
-    perm_tensor = torch.from_numpy(perm_arr)
-    scale_perm = []
-    for i in range(8):
-        scale_perm.extend([i + 8 * j for j in range(8)])
-    scale_perm_single = []
-    for i in range(4):
-        scale_perm_single.extend([2 * i + j for j in [0, 1, 8, 9, 16, 17, 24, 25]])
-    return perm_tensor, scale_perm, scale_perm_single
-
-
-_perm, _scale_perm, _scale_perm_single = _get_perms()
-
-
-def pack_for_marlin(weight, scale, qbits):
-    batch = weight.shape[0]
-
-    n = weight.size(1)
-    k = weight.size(2)
-    groupsize = k // scale.size(2)
-
-    tile = 16
-    s = scale.permute(0, 2, 1)
-    w = weight.permute(0, 2, 1)
-    if groupsize != k:
-        w = w.reshape((batch, -1, groupsize, n))
-        w = w.permute(0, 2, 1, 3)
-        w = w.reshape((batch, groupsize, -1))
-        s = s.reshape((batch, 1, -1))
-
-    if groupsize != k:
-        w = w.reshape((batch, groupsize, -1, n))
-        w = w.permute(0, 2, 1, 3)
-        w = w.reshape((batch, k, n)).contiguous()
-        s = s.reshape((batch, -1, len(_scale_perm)))[:, :, _scale_perm]
-    else:
-        s = s.reshape((batch, -1, len(_scale_perm_single)))[:, :, _scale_perm_single]
-    s = s.reshape((batch, -1, n)).contiguous()
-    w = w.reshape((batch, k // tile, tile, n // tile, tile))
-    w = w.permute((0, 1, 3, 2, 4))
-    w = w.reshape((batch, k // tile, n * tile))
-    res = w
-    res = res.reshape((batch, -1, _perm.numel()))[:, :, _perm].reshape(res.shape)
-    if qbits == 4:
-        q = torch.zeros(
-            (batch, res.shape[1], res.shape[2] // 2), dtype=torch.int8, device=w.device
-        )
-        for i in range(2):
-            q |= res[:, :, i::2] << 4 * i
-        q = q.reshape(batch, -1, n).contiguous()
-    else:
-        q = res.clone()
-        q[:, :, 2::8] = res[:, :, 4::8]
-        q[:, :, 3::8] = res[:, :, 5::8]
-        q[:, :, 4::8] = res[:, :, 2::8]
-        q[:, :, 5::8] = res[:, :, 3::8]
-        q = q.reshape(batch, -1, n).to(torch.int8).contiguous()
-
-    return q, s
-
-
-def repack_8bit_into_32bit(input):
-    output = torch.zeros(
-        (input.shape[0], input.shape[1], input.shape[2] // 4),
-        dtype=torch.int32,
-        device=input.device,
-    )
-    for i in range(4):
-        output |= (input[:, :, i::4] & 0xFF).to(torch.int32) << 8 * i
-
-    return output
-
-
-def repack_weights(qweight, scale, weight_bits):
-    batch_present = len(qweight.shape) == 3
-    if not batch_present:
-        qweight = qweight.unsqueeze(0)
-        scale = scale.unsqueeze(0)
-
-    if weight_bits == 4:
-        qweight_unpacked = torch.empty(
-            (qweight.shape[0], qweight.shape[1] * 2, qweight.shape[2]),
-            dtype=torch.uint8,
-            device=qweight.device,
-        )
-        for i in range(2):
-            qweight_unpacked[:, :, i::2] = ((qweight << 4 * (1 - i)) >> 4).reshape(
-                qweight.shape[0], qweight.shape[1] * 2, qweight.shape[2] // 2
-            )
-    else:
-        qweight_unpacked = qweight
-
-    qweight_packed, scale_packed = pack_for_marlin(qweight_unpacked, scale, weight_bits)
-    qweight_repacked = repack_8bit_into_32bit(qweight_packed.to(torch.uint8))
-    qweight_reshaped = qweight_repacked.reshape(
-        qweight.shape[0], qweight.shape[2] // 16, -1
-    )
-    if not batch_present:
-        qweight_reshaped = qweight_reshaped.squeeze(0)
-        scale_packed = scale_packed.squeeze(0)
-
-    return qweight_reshaped, scale_packed
-
-
 def init_workspace(device):
     global _rtn_marlin_workspace
     if _rtn_marlin_workspace is None or _rtn_marlin_workspace.device != device:
         _rtn_marlin_workspace = marlin_make_workspace(device, max_blocks_per_sm=4)
 
 
-class RTNMarlinLinearMethod(LinearMethodBase):
+class RTNMarlinLinearMethod(RTNLinearMethod):
     """Linear method for RTN with Marlin kernels."""
-
-    def __init__(self, quant_config: RTNConfig):
-        self.quant_config = quant_config
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        input_size_per_partition: int,
-        output_partition_sizes: list[int],
-        input_size: int,
-        output_size: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        # We misuse RTNLinearMethod to create the weights, so that we can use
-        # the same loading logic as RTNLinearMethod
-        self.rtn_method = RTNLinearMethod(self.quant_config)
-        self.rtn_method.create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_bits = self.quant_config.weight_bits
@@ -625,31 +477,12 @@ class RTNMarlinLinearMethod(LinearMethodBase):
         )
 
 
-class RTNMarlinMoEMethod(FusedMoEMethodBase):
+class RTNMarlinMoEMethod(RTNMoEMethod):
     """MoE method for RTN with Marlin kernels."""
 
     def __init__(self, quant_config: RTNConfig):
-        self.quant_config = quant_config
+        super().__init__(quant_config)
         self.is_k_full = True
-
-    def create_weights(
-        self,
-        layer: torch.nn.Module,
-        num_experts: int,
-        hidden_size: int,
-        intermediate_size_per_partition: int,
-        params_dtype: torch.dtype,
-        **extra_weight_attrs,
-    ):
-        self.rtn_method = RTNMoEMethod(self.quant_config)
-        self.rtn_method.create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
-        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         weight_bits = self.quant_config.weight_bits
