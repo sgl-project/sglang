@@ -25,6 +25,7 @@ class TuningNode:
     children: Optional[dict[object, "TuningNode"]] = None
     last_access_time: int = 0
     prefix_len: int = 0
+    mamba_present: bool = True
 
     def __post_init__(self):
         if self.children is None:
@@ -38,11 +39,16 @@ class MarconiTuningCache:
         capacity_bytes: int,
         eff_weight: float,
         tuning_interval: int,
+        latency_weights: Optional[Tuple[float, float, float]] = None,
     ):
         self.model_stats = model_stats
         self.capacity_bytes = capacity_bytes
         self.eff_weight = eff_weight
         self.tuning_interval = tuning_interval
+        if latency_weights is None:
+            self.latency_weights = (1.0, 1.0, 1.0)
+        else:
+            self.latency_weights = latency_weights
         self.root_node = TuningNode(key=tuple(), value=[])
         self.logical_ts = 0
         self.request_history: List[Tuple[bool, int, int]] = []
@@ -73,27 +79,21 @@ class MarconiTuningCache:
         record_request: bool = True,
     ):
         self._tick()
-        prefix_token_ids: List[List[int]] = []
-        nodes_accessed = [self.root_node]
-        prefix_len = self._match_prefix_helper(
-            self.root_node,
-            tuple(input_token_ids),
-            prefix_token_ids,
-            nodes_accessed,
-            extra_key,
+        value_parts, matched_len, last_node, best_value_len = self._match_prefix_helper(
+            self.root_node, tuple(input_token_ids), extra_key
         )
-        prefix_token_ids = [t for part in prefix_token_ids for t in part]
+        prefix_token_ids = [t for part in value_parts[:best_value_len] for t in part]
         num_tokens_skipped = len(prefix_token_ids)
-        branchoff_required = prefix_len > num_tokens_skipped
+        branchoff_required = matched_len > num_tokens_skipped
 
         if record_request:
             cache_hit = num_tokens_skipped > 0
             self.request_history.append(
                 (cache_hit, len(input_token_ids), num_tokens_skipped)
             )
-        if len(nodes_accessed) > 1:
-            nodes_accessed[-1].last_access_time = self.logical_ts
-        return prefix_token_ids, branchoff_required, prefix_len
+        if last_node is not None and last_node is not self.root_node:
+            last_node.last_access_time = self.logical_ts
+        return prefix_token_ids, branchoff_required, matched_len
 
     def insert(self, token_ids: List[int], extra_key: Optional[str] = None) -> None:
         _, branchoff_required, prefix_len = self.match_prefix(
@@ -115,11 +115,13 @@ class MarconiTuningCache:
         if self.get_tree_size() + bytes_needed > self.capacity_bytes:
             bytes_to_remove = self.get_tree_size() + bytes_needed - self.capacity_bytes
             self.evict(bytes_to_remove)
+        branch_checkpoint_len = prefix_len if branchoff_required else None
         self._insert_helper(
             node=self.root_node,
             key=tuple(token_ids),
             value=token_ids,
             extra_key=extra_key,
+            branch_checkpoint_len=branch_checkpoint_len,
         )
 
     def get_tree_size(self) -> int:
@@ -184,11 +186,14 @@ class MarconiTuningCache:
             if node_to_evict is None:
                 break
             if len(node_to_evict.children) == 0:
-                bytes_evicted += (
+                mamba_bytes = (
                     self.model_stats.num_mamba_layers
                     * self.model_stats.mamba_state_size_bytes
-                    + self.model_stats.num_attn_layers
-                    * get_kv_cache_size_bytes(
+                    if node_to_evict.mamba_present
+                    else 0
+                )
+                bytes_evicted += mamba_bytes + self.model_stats.num_attn_layers * (
+                    get_kv_cache_size_bytes(
                         len(node_to_evict.value),
                         self.model_stats.model_dim,
                         self.model_stats.kv_cache_dtype_size,
@@ -196,10 +201,11 @@ class MarconiTuningCache:
                 )
                 self._delete_leaf(node_to_evict)
             else:
-                bytes_evicted += (
-                    self.model_stats.num_mamba_layers
-                    * self.model_stats.mamba_state_size_bytes
-                )
+                if node_to_evict.mamba_present:
+                    bytes_evicted += (
+                        self.model_stats.num_mamba_layers
+                        * self.model_stats.mamba_state_size_bytes
+                    )
                 self._evict_intermediate_node(node_to_evict)
 
     def _select_node(self, nodes: List[TuningNode]) -> Optional[TuningNode]:
@@ -219,6 +225,7 @@ class MarconiTuningCache:
         recency_scores = normalize(recency_scores)
 
         efficiency_scores = []
+        mamba_weight, attn_weight, mlp_weight = self.latency_weights
         for node in nodes:
             seqlen_total = node.prefix_len
             seqlen_child = len(node.value)
@@ -229,6 +236,8 @@ class MarconiTuningCache:
                 self.model_stats.model_dim,
                 self.model_stats.ssm_state_size,
             )
+            if not node.mamba_present:
+                flops_savings_mamba = 0.0
             flops_savings_attn = self.model_stats.num_attn_layers * (
                 get_attn_flops(seqlen_total, self.model_stats.model_dim)
                 - get_attn_flops(seqlen_parent, self.model_stats.model_dim)
@@ -238,7 +247,9 @@ class MarconiTuningCache:
                 - get_mlp_flops(seqlen_parent, self.model_stats.model_dim)
             )
             total_flops_savings = (
-                flops_savings_mamba + flops_savings_attn + flops_savings_mlp
+                mamba_weight * flops_savings_mamba
+                + attn_weight * flops_savings_attn
+                + mlp_weight * flops_savings_mlp
             )
             total_memory = (
                 self.model_stats.num_mamba_layers
@@ -264,26 +275,31 @@ class MarconiTuningCache:
         self,
         node: TuningNode,
         key: Tuple[int, ...],
-        value: List[List[int]],
-        nodes_accessed: List[TuningNode],
         extra_key: Optional[str],
-    ) -> int:
-        if len(key) == 0:
-            return 0
-        child_key = self._child_key(extra_key, key)
-        if child_key in node.children:
-            child = node.children[child_key]
+    ) -> Tuple[List[List[int]], int, Optional[TuningNode], int]:
+        value_parts: List[List[int]] = []
+        matched_len = 0
+        best_value_len = 0
+        last_node: Optional[TuningNode] = node
+        while len(key) > 0:
+            child_key = self._child_key(extra_key, key)
+            child = node.children.get(child_key)
+            if child is None:
+                break
             prefix_len = self._key_match(child.key, key)
+            matched_len += prefix_len
             if prefix_len < len(child.key):
-                return prefix_len + self._match_prefix_helper(
-                    child, key[prefix_len:], value, nodes_accessed, extra_key
-                )
-            value.append(child.value)
-            nodes_accessed.append(child)
-            return prefix_len + self._match_prefix_helper(
-                child, key[prefix_len:], value, nodes_accessed, extra_key
-            )
-        return 0
+                if prefix_len > 0:
+                    value_parts.append(child.value[:prefix_len])
+                last_node = child
+                break
+            value_parts.append(child.value)
+            node = child
+            last_node = child
+            key = key[prefix_len:]
+            if child.mamba_present:
+                best_value_len = len(value_parts)
+        return value_parts, matched_len, last_node, best_value_len
 
     def _insert_helper(
         self,
@@ -291,29 +307,62 @@ class MarconiTuningCache:
         key: Tuple[int, ...],
         value: List[int],
         extra_key: Optional[str],
+        branch_checkpoint_len: Optional[int] = None,
+        prefix_offset: int = 0,
     ) -> int:
         if len(key) == 0:
             return 0
 
         child_key = self._child_key(extra_key, key)
+        total_prefix_length = prefix_offset
         if child_key in node.children:
             child = node.children[child_key]
             prefix_len = self._key_match(child.key, key)
             if prefix_len == len(child.key):
                 if prefix_len == len(key):
+                    if (
+                        branch_checkpoint_len is not None
+                        and total_prefix_length + prefix_len == branch_checkpoint_len
+                        and not child.mamba_present
+                    ):
+                        child.mamba_present = True
                     return prefix_len
                 key = key[prefix_len:]
                 value = value[prefix_len:]
-                return prefix_len + self._insert_helper(child, key, value, extra_key)
+                total_prefix_length += prefix_len
+                return prefix_len + self._insert_helper(
+                    child,
+                    key,
+                    value,
+                    extra_key,
+                    branch_checkpoint_len=branch_checkpoint_len,
+                    prefix_offset=total_prefix_length,
+                )
 
             new_node = self._split_node(child.key, child, prefix_len, extra_key)
+            total_prefix_length += prefix_len
+            if (
+                branch_checkpoint_len is not None
+                and total_prefix_length == branch_checkpoint_len
+                and not new_node.mamba_present
+            ):
+                new_node.mamba_present = True
             return prefix_len + self._insert_helper(
-                new_node, key[prefix_len:], value[prefix_len:], extra_key
+                new_node,
+                key[prefix_len:],
+                value[prefix_len:],
+                extra_key,
+                branch_checkpoint_len=branch_checkpoint_len,
+                prefix_offset=total_prefix_length,
             )
 
         if len(key):
             new_node = TuningNode(
-                key=key, value=value, parent=node, extra_key=extra_key
+                key=key,
+                value=value,
+                parent=node,
+                extra_key=extra_key,
+                mamba_present=True,
             )
             new_node.prefix_len = node.prefix_len + len(value)
             node.children[self._child_key(extra_key, key)] = new_node
@@ -331,6 +380,7 @@ class MarconiTuningCache:
             value=child.value[:split_len],
             parent=child.parent,
             extra_key=extra_key,
+            mamba_present=False,
         )
         new_node.prefix_len = new_node.parent.prefix_len + len(new_node.value)
         new_node.children = {self._child_key(extra_key, key[split_len:]): child}
@@ -355,6 +405,7 @@ class MarconiTuningCache:
             value=node.value + child.value,
             parent=node.parent,
             extra_key=node.extra_key,
+            mamba_present=child.mamba_present,
         )
         new_node.prefix_len = node.parent.prefix_len + len(new_node.value)
         new_node.children = child.children
@@ -378,7 +429,7 @@ class MarconiTuningCache:
 
     def _count_cached_tokens(self, node: TuningNode) -> Tuple[int, int]:
         if node.value:
-            total_mamba_states = 1
+            total_mamba_states = 1 if node.mamba_present else 0
             total_kv_tokens = len(node.value)
         else:
             total_mamba_states, total_kv_tokens = 0, 0
@@ -390,10 +441,13 @@ class MarconiTuningCache:
 
 
 class MarconiConfigTuner:
-    def __init__(self, weights: Optional[List[float]] = None):
+    def __init__(
+        self, weights: Optional[List[float]] = None, max_workers: Optional[int] = None
+    ):
         self.tree_snapshot: Optional[MarconiTuningCache] = None
         self.num_tunings = 0
         self.executor: Optional[ProcessPoolExecutor] = None
+        self.max_workers = max_workers
         self.weights = weights or [
             0.0,
             0.1,
@@ -421,7 +475,13 @@ class MarconiConfigTuner:
     def _ensure_executor(self) -> None:
         if self.executor is None:
             ctx = mp.get_context("spawn")
-            self.executor = ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+            max_workers = self.max_workers
+            if max_workers is None:
+                try:
+                    max_workers = max(1, min(4, mp.cpu_count()))
+                except Exception:
+                    max_workers = 1
+            self.executor = ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx)
 
     def tune(
         self,

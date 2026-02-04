@@ -29,7 +29,7 @@ import dataclasses
 import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -325,21 +325,41 @@ class MambaPool:
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64, device=self.device)
 
-    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
-        for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
+    def copy_from(
+        self,
+        src_index: torch.Tensor,
+        dst_index: torch.Tensor,
+        layer_indices: Optional[Sequence[int]] = None,
+    ):
+        if layer_indices is None:
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
+                    :, src_index
+                ]
+            self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
                 :, src_index
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
-        ]
-        return
+            return
 
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
+        # Copy selected layers only (used by Marconi selective caching).
+        for layer in layer_indices:
+            for i in range(len(self.mamba_cache.conv)):
+                self.mamba_cache.conv[i][layer, dst_index] = self.mamba_cache.conv[i][
+                    layer, src_index
+                ]
+            self.mamba_cache.temporal[layer, dst_index] = self.mamba_cache.temporal[
+                layer, src_index
+            ]
+
+    def fork_from(
+        self,
+        src_index: torch.Tensor,
+        layer_indices: Optional[Sequence[int]] = None,
+    ) -> Optional[torch.Tensor]:
         dst_index = self.alloc(1)
         if dst_index == None:
             return None
-        self.copy_from(src_index, dst_index)
+        self.copy_from(src_index, dst_index, layer_indices=layer_indices)
         return dst_index
 
     def get_contiguous_buf_infos(self):
@@ -386,6 +406,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
         enable_mamba_extra_buffer: bool,
+        mamba_track_buffer_size: Optional[int] = None,
         speculative_num_draft_tokens: int = None,
     ):
         super().__init__(
@@ -394,9 +415,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-        self.mamba_ping_pong_track_buffer_size = (
-            2 if speculative_num_draft_tokens is None else 1
-        )
+        default_track_size = 2 if speculative_num_draft_tokens is None else 1
+        if mamba_track_buffer_size is not None:
+            if speculative_num_draft_tokens is not None:
+                self.mamba_ping_pong_track_buffer_size = 1
+            else:
+                self.mamba_ping_pong_track_buffer_size = max(1, mamba_track_buffer_size)
+        else:
+            self.mamba_ping_pong_track_buffer_size = default_track_size
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
@@ -505,10 +531,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
-        if self.mamba_ping_pong_track_buffer_size == 2:
-            return 1 - mamba_next_track_idx
-        else:
-            return mamba_next_track_idx
+        if self.mamba_ping_pong_track_buffer_size <= 1:
+            return 0
+        # Keep the most recently written slot in the ring buffer.
+        return (mamba_next_track_idx - 1) % self.mamba_ping_pong_track_buffer_size
 
     # For chunk prefill, we can not free mamba cache, we need use it in the future
     def free(
@@ -531,10 +557,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     ].squeeze(0)
                 )
                 if mamba_ping_pong_track_buffer_to_keep is not None:
-                    assert mamba_ping_pong_track_buffer_to_keep in [
-                        0,
-                        1,
-                    ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                    if (
+                        mamba_ping_pong_track_buffer_to_keep < 0
+                        or mamba_ping_pong_track_buffer_to_keep
+                        >= self.mamba_ping_pong_track_buffer_size
+                    ):
+                        raise ValueError(
+                            "mamba_ping_pong_track_buffer_to_keep must be within "
+                            f"[0, {self.mamba_ping_pong_track_buffer_size - 1}], "
+                            f"{mamba_ping_pong_track_buffer_to_keep=}"
+                        )
                     idx_to_free = list(range(self.mamba_ping_pong_track_buffer_size))
                     idx_to_free.remove(mamba_ping_pong_track_buffer_to_keep)
                     mamba_ping_pong_track_buffer_to_free = (

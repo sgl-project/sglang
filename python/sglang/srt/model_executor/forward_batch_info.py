@@ -262,6 +262,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Multi-track entries for Marconi (prefill only)
+    mamba_track_entry_req_indices: Optional[torch.Tensor] = None  # shape: [n]
+    mamba_track_entry_indices: Optional[torch.Tensor] = None  # shape: [n]
+    mamba_track_entry_seqlens: Optional[torch.Tensor] = None  # shape: [n]
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -391,6 +395,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_track_entry_req_indices=batch.mamba_track_entry_req_indices,
+            mamba_track_entry_indices=batch.mamba_track_entry_indices,
+            mamba_track_entry_seqlens=batch.mamba_track_entry_seqlens,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,

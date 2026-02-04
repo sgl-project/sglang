@@ -57,7 +57,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import (
@@ -593,6 +592,20 @@ class Req:
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Marconi rehydrate / roll-forward state (attn-only reuse).
+        self.marconi_rehydrate_len: Optional[int] = None
+        self.marconi_rehydrate_from: Optional[int] = None
+        self.marconi_rehydrate_pending: bool = False
+        self.marconi_rehydrate_active: bool = False
+        self.marconi_rehydrate_last_node: Any = None
+        self.marconi_saved_fill_ids: Optional[List[int]] = None
+        self.marconi_saved_prefix_indices: Optional[torch.Tensor] = None
+        self.marconi_saved_last_node: Any = None
+        self.marconi_saved_last_host_node: Any = None
+        self.marconi_saved_host_hit_length: int = 0
+        self.marconi_override_out_cache_loc: Optional[torch.Tensor] = None
+        self.marconi_force_mamba_track: bool = False
+        self.marconi_track_entries: Optional[List[Tuple[int, int]]] = None
 
         # Check finish
         self.tokenizer = None
@@ -912,6 +925,91 @@ class Req:
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+
+    def prepare_marconi_rehydrate(self):
+        if (
+            not self.marconi_rehydrate_pending
+            or self.marconi_rehydrate_active
+            or self.marconi_rehydrate_len is None
+        ):
+            return
+
+        if self.marconi_saved_fill_ids is None:
+            self.marconi_saved_fill_ids = list(self.fill_ids)
+            self.marconi_saved_prefix_indices = self.prefix_indices
+            self.marconi_saved_last_node = self.last_node
+            self.marconi_saved_last_host_node = self.last_host_node
+            self.marconi_saved_host_hit_length = self.host_hit_length
+
+        rehydrate_len = min(
+            self.marconi_rehydrate_len, len(self.marconi_saved_fill_ids)
+        )
+        rehydrate_from = (
+            self.marconi_rehydrate_from
+            if self.marconi_rehydrate_from is not None
+            else 0
+        )
+        rehydrate_from = min(rehydrate_from, rehydrate_len)
+
+        # Limit the active prefix to the existing mamba checkpoint.
+        if self.marconi_saved_prefix_indices is not None:
+            self.prefix_indices = self.marconi_saved_prefix_indices[:rehydrate_from]
+        else:
+            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+
+        self.fill_ids = self.marconi_saved_fill_ids[:rehydrate_len]
+        self.cache_protected_len = len(self.prefix_indices)
+        self.kv_cache_protected_len = self.cache_protected_len
+        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+
+        if (
+            self.marconi_saved_prefix_indices is not None
+            and rehydrate_len > rehydrate_from
+        ):
+            self.marconi_override_out_cache_loc = self.marconi_saved_prefix_indices[
+                rehydrate_from:rehydrate_len
+            ]
+        else:
+            self.marconi_override_out_cache_loc = None
+
+        # Force mamba state tracking at the end of the rehydrate pass.
+        self.marconi_force_mamba_track = True
+        self.marconi_rehydrate_active = True
+
+        if self.marconi_saved_last_node is not None:
+            # Lock the full prefix during rehydrate to prevent eviction.
+            self.last_node = self.marconi_saved_last_node
+
+    def finish_marconi_rehydrate(self):
+        if not self.marconi_rehydrate_active:
+            return
+
+        if self.marconi_saved_fill_ids is not None:
+            self.fill_ids = self.marconi_saved_fill_ids
+        if self.marconi_saved_prefix_indices is not None:
+            self.prefix_indices = self.marconi_saved_prefix_indices
+        if self.marconi_saved_last_node is not None:
+            self.last_node = self.marconi_saved_last_node
+        if self.marconi_saved_last_host_node is not None:
+            self.last_host_node = self.marconi_saved_last_host_node
+        self.host_hit_length = self.marconi_saved_host_hit_length
+
+        self.cache_protected_len = len(self.prefix_indices)
+        self.kv_cache_protected_len = self.cache_protected_len
+        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+
+        self.marconi_override_out_cache_loc = None
+        self.marconi_force_mamba_track = False
+        self.marconi_rehydrate_pending = False
+        self.marconi_rehydrate_active = False
+        self.marconi_rehydrate_len = None
+        self.marconi_rehydrate_from = None
+        self.marconi_rehydrate_last_node = None
+        self.marconi_saved_fill_ids = None
+        self.marconi_saved_prefix_indices = None
+        self.marconi_saved_last_node = None
+        self.marconi_saved_last_host_node = None
+        self.marconi_saved_host_hit_length = 0
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1267,6 +1365,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Multi-track entries for Marconi (prefill only)
+    mamba_track_entry_req_indices: Optional[torch.Tensor] = None  # shape: [n]
+    mamba_track_entry_indices: Optional[torch.Tensor] = None  # shape: [n]
+    mamba_track_entry_seqlens: Optional[torch.Tensor] = None  # shape: [n]
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1541,6 +1643,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_mask_cpu = []
         mamba_track_indices_cpu = []
         mamba_track_seqlens_cpu = []
+        mamba_track_entry_req_indices_cpu = []
+        mamba_track_entry_indices_cpu = []
+        mamba_track_entry_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1569,9 +1674,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if get_global_server_args().enable_mamba_extra_buffer():
                 self._mamba_radix_cache_v2_req_prepare_for_extend(
                     req,
+                    i,
                     mamba_track_mask_cpu,
                     mamba_track_indices_cpu,
                     mamba_track_seqlens_cpu,
+                    mamba_track_entry_req_indices_cpu,
+                    mamba_track_entry_indices_cpu,
+                    mamba_track_entry_seqlens_cpu,
                 )
 
             if self.return_logprob:
@@ -1676,6 +1785,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 dtype=torch.int64,
                 device=self.device,
             )
+            if mamba_track_entry_indices_cpu:
+                self.mamba_track_entry_req_indices = torch.tensor(
+                    mamba_track_entry_req_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.mamba_track_entry_indices = torch.tensor(
+                    mamba_track_entry_indices_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self.mamba_track_entry_seqlens = torch.tensor(
+                    mamba_track_entry_seqlens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                self.mamba_track_entry_req_indices = None
+                self.mamba_track_entry_indices = None
+                self.mamba_track_entry_seqlens = None
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -1689,82 +1818,97 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
+        req_batch_idx: int,
         mamba_track_mask_cpu: List[bool],
         mamba_track_indices_cpu: List[int],
         mamba_track_seqlens_cpu: List[int],
+        mamba_track_entry_req_indices_cpu: List[int],
+        mamba_track_entry_indices_cpu: List[int],
+        mamba_track_entry_seqlens_cpu: List[int],
     ):
-        def _force_track_h(i: int) -> int:
-            assert i % FLA_CHUNK_SIZE == 0
-            # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with FLA_CHUNK_SIZE-> retrieve from last_recurrent_state
-            #    a) is the last position -> retrieve from last_recurrent_state
-            #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with FLA_CHUNK_SIZE -> retrieve from h
-            # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
-            # to force the math calculation to retrieve the correct mamba state from h.
-            return i + 1
+        server_args = get_global_server_args()
+        mamba_cache_chunk_size = server_args.mamba_cache_chunk_size
+        prefix_len = len(req.prefix_indices)
+        extend_len = req.extend_input_len
+        end_len = prefix_len + extend_len
 
-        mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
-        mask = req.extend_input_len >= mamba_cache_chunk_size
-        mamba_track_mask_cpu.append(mask)
-        mamba_track_indices_cpu.append(
-            req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
-        )
-        mamba_track_seqlen = -1
-        if mask:
-            # mamba_track_seqlen is used to calculate the indices to track in
-            # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
-            # fact that the ssm state between aligned and non-aligned are retrieved differently,
-            # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
-            # otherwise retrieved from h (i.e. unaligned).
-            # We need to pass the non-aligned seqlen to the calculation. Even though
-            # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
-            mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+        track_points: List[int] = []
+        if extend_len > 0:
+            # Always consider the end of this extend.
+            track_points.append(end_len)
 
-            # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
-            # mamba radix cache to track which seqlen this mamba state should store at.
-            mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_input_len // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
-
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on FLA_CHUNK_SIZE
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > FLA_CHUNK_SIZE, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
-            )
-            if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
-                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
-
-            req.mamba_next_track_idx = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
-                )
-            )
             if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
-                branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % mamba_cache_chunk_size == 0
-                if (
-                    req.mamba_branching_seqlen >= len(req.prefix_indices)
-                    and req.mamba_branching_seqlen < mamba_track_seqlen
-                    and branching_seqlen_aligned_mask
-                ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
-            req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
-        mamba_track_seqlens_cpu.append(mamba_track_seqlen)
+                if prefix_len < req.mamba_branching_seqlen <= end_len:
+                    track_points.append(req.mamba_branching_seqlen)
+
+            if not req.marconi_force_mamba_track:
+                # Add aligned checkpoints if multi-track is enabled.
+                if req.mamba_ping_pong_track_buffer is not None:
+                    buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
+                else:
+                    buffer_size = 0
+                max_points = server_args.marconi_track_max_points
+                if max_points is None:
+                    max_points = buffer_size if buffer_size > 0 else 1
+                if max_points > len(track_points):
+                    align_interval = (
+                        server_args.marconi_branch_align_interval
+                        or mamba_cache_chunk_size
+                    )
+                    if align_interval <= 0:
+                        align_interval = mamba_cache_chunk_size
+                    if align_interval > 0:
+                        aligned_points: List[int] = []
+                        start = ((prefix_len // align_interval) + 1) * align_interval
+                        while start < end_len:
+                            if start != req.mamba_branching_seqlen:
+                                aligned_points.append(start)
+                            start += align_interval
+                        # Prefer points closest to the end.
+                        for p in reversed(aligned_points):
+                            if len(track_points) >= max_points:
+                                break
+                            track_points.append(p)
+
+        # Filter and de-duplicate.
+        track_points = sorted(set(track_points))
+        if self.page_size > 1:
+            track_points = [p for p in track_points if p % self.page_size == 0]
+
+        if req.mamba_ping_pong_track_buffer is None or len(track_points) == 0:
+            mamba_track_mask_cpu.append(False)
+            mamba_track_indices_cpu.append(0)
+            mamba_track_seqlens_cpu.append(-1)
+            req.marconi_track_entries = None
+            return
+
+        buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
+        max_points = server_args.marconi_track_max_points
+        if max_points is None:
+            max_points = buffer_size
+        max_points = max(1, min(max_points, buffer_size))
+        if len(track_points) > max_points:
+            track_points = track_points[-max_points:]
+
+        start_idx = req.mamba_next_track_idx or 0
+        slots = [
+            req.mamba_ping_pong_track_buffer[(start_idx + i) % buffer_size].item()
+            for i in range(len(track_points))
+        ]
+        req.mamba_next_track_idx = (start_idx + len(track_points)) % buffer_size
+
+        req.marconi_track_entries = list(zip(track_points, slots))
+        for seqlen, slot in req.marconi_track_entries:
+            mamba_track_entry_req_indices_cpu.append(req_batch_idx)
+            mamba_track_entry_indices_cpu.append(slot)
+            mamba_track_entry_seqlens_cpu.append(seqlen)
+
+        # Keep a primary track entry for backward-compatible paths.
+        primary_seqlen, primary_slot = req.marconi_track_entries[-1]
+        mamba_track_mask_cpu.append(True)
+        mamba_track_indices_cpu.append(primary_slot)
+        mamba_track_seqlens_cpu.append(primary_seqlen)
+        req.mamba_last_track_seqlen = primary_seqlen
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
@@ -2102,6 +2246,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_entry_req_indices = None
+        self.mamba_track_entry_indices = None
+        self.mamba_track_entry_seqlens = None
+        self.mamba_track_entry_req_indices = None
+        self.mamba_track_entry_indices = None
+        self.mamba_track_entry_seqlens = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2248,6 +2398,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_entry_req_indices=self.mamba_track_entry_req_indices,
+            mamba_track_entry_indices=self.mamba_track_entry_indices,
+            mamba_track_entry_seqlens=self.mamba_track_entry_seqlens,
         )
 
     def copy(self):
@@ -2272,6 +2425,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_entry_req_indices=self.mamba_track_entry_req_indices,
+            mamba_track_entry_indices=self.mamba_track_entry_indices,
+            mamba_track_entry_seqlens=self.mamba_track_entry_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
         )
 
@@ -2382,3 +2538,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_track_entry_req_indices: Optional[torch.Tensor] = None  # shape: [n]
+    mamba_track_entry_indices: Optional[torch.Tensor] = None  # shape: [n]
+    mamba_track_entry_seqlens: Optional[torch.Tensor] = None  # shape: [n]

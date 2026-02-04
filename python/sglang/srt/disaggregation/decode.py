@@ -145,6 +145,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         cache_params: "Mamba2CacheParams",
         speculative_num_draft_tokens: int,
         enable_mamba_extra_buffer: bool,
+        mamba_track_buffer_size: Optional[int],
         pre_alloc_size: int,
     ):
         DecodeReqToTokenPool.__init__(
@@ -155,9 +156,14 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
         )
-        self.mamba_ping_pong_track_buffer_size = (
-            2 if speculative_num_draft_tokens is None else 1
-        )
+        default_track_size = 2 if speculative_num_draft_tokens is None else 1
+        if mamba_track_buffer_size is not None:
+            if speculative_num_draft_tokens is not None:
+                self.mamba_ping_pong_track_buffer_size = 1
+            else:
+                self.mamba_ping_pong_track_buffer_size = max(1, mamba_track_buffer_size)
+        else:
+            self.mamba_ping_pong_track_buffer_size = default_track_size
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(

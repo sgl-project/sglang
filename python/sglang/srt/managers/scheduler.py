@@ -673,6 +673,64 @@ class Scheduler(
                             mamba_state_size_bytes=mamba_state_size_bytes,
                         )
                 if marconi_model_stats is None:
+                    hybrid_pattern = getattr(hf_config, "hybrid_override_pattern", None)
+                    if hybrid_pattern:
+                        num_mamba_layers = hybrid_pattern.count("M")
+                        num_attn_layers = hybrid_pattern.count("*")
+                        num_hidden_layers = getattr(
+                            hf_config, "num_hidden_layers", None
+                        )
+                        num_mlp_layers = num_hidden_layers or (
+                            num_mamba_layers + num_attn_layers
+                        )
+                        ssm_state_size = getattr(
+                            hf_config, "ssm_state_size", None
+                        ) or getattr(hf_config, "mamba_state_dim", None)
+                        model_dim = (
+                            getattr(hf_config, "hidden_size", None)
+                            or getattr(hf_config, "d_model", None)
+                            or getattr(hf_config, "n_embd", None)
+                        )
+                        kv_cache_dtype = getattr(
+                            self.tp_worker.model_runner, "kv_cache_dtype", None
+                        )
+                        if kv_cache_dtype is not None:
+                            kv_cache_dtype_size = torch._utils._element_size(
+                                kv_cache_dtype
+                            )
+                            if is_float4_e2m1fn_x2(kv_cache_dtype):
+                                kv_cache_dtype_size = max(1, kv_cache_dtype_size // 2)
+                        else:
+                            kv_cache_dtype_size = 2
+                        mamba_state_size_bytes = None
+                        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+                        if mamba_pool is not None and getattr(
+                            mamba_pool, "num_mamba_layers", None
+                        ):
+                            try:
+                                total_bytes = mamba_pool.mamba_cache.mem_usage_bytes()
+                                slots = max(1, getattr(mamba_pool, "size", 0) + 1)
+                                mamba_state_size_bytes = int(
+                                    total_bytes
+                                    / (slots * max(mamba_pool.num_mamba_layers, 1))
+                                )
+                            except Exception:
+                                mamba_state_size_bytes = None
+                        if (
+                            model_dim is not None
+                            and ssm_state_size is not None
+                            and mamba_state_size_bytes is not None
+                        ):
+                            marconi_model_stats = MarconiModelStats(
+                                model_dim=model_dim,
+                                ssm_state_size=ssm_state_size,
+                                num_mamba_layers=num_mamba_layers,
+                                num_attn_layers=num_attn_layers,
+                                num_mlp_layers=num_mlp_layers,
+                                kv_cache_dtype_size=kv_cache_dtype_size,
+                                mamba_state_size_bytes=mamba_state_size_bytes,
+                            )
+                if marconi_model_stats is None:
                     logger.warning(
                         "Marconi is enabled but model stats could not be derived."
                     )
@@ -683,6 +741,28 @@ class Scheduler(
                     bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,
                     tuning_interval=server_args.marconi_tuning_interval,
                     model_stats=marconi_model_stats,
+                    admission_min_hits=server_args.marconi_admission_min_hits,
+                    admission_min_success_ratio=server_args.marconi_admission_min_success_ratio,
+                    admission_decay=server_args.marconi_admission_decay,
+                    admission_score_threshold=server_args.marconi_admission_score_threshold,
+                    admission_max_nodes=server_args.marconi_admission_max_nodes,
+                    admission_max_tokens=server_args.marconi_admission_max_tokens,
+                    admission_prune_interval=server_args.marconi_admission_prune_interval,
+                    eviction_hot_weight=server_args.marconi_eviction_hot_weight,
+                    eviction_pin_threshold=server_args.marconi_eviction_pin_threshold,
+                    eviction_pin_ttl=server_args.marconi_eviction_pin_ttl,
+                    eviction_regret_window=server_args.marconi_eviction_regret_window,
+                    eviction_regret_max_entries=server_args.marconi_eviction_regret_max_entries,
+                    eviction_latency_weights=(
+                        server_args.marconi_eviction_weight_mamba,
+                        server_args.marconi_eviction_weight_attn,
+                        server_args.marconi_eviction_weight_mlp,
+                    ),
+                    tuning_max_workers=server_args.marconi_tuning_max_workers,
+                    attn_only_reuse=server_args.marconi_attn_only_reuse,
+                    track_buffer_size=server_args.marconi_track_buffer_size,
+                    track_max_points=server_args.marconi_track_max_points,
+                    mamba_layer_mask=server_args.marconi_mamba_layer_mask,
                 )
 
         # Create cache
@@ -1642,7 +1722,10 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
-            req.init_next_round_input(self.tree_cache)
+            if not getattr(req, "_prefill_matched_this_round", False):
+                req.init_next_round_input(self.tree_cache)
+            req._prefill_matched_this_round = False
+
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
@@ -2050,6 +2133,28 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
+        if (
+            self.server_args.enable_marconi
+            and self.server_args.marconi_prefill_hint_window > 0
+            and self.waiting_queue
+        ):
+            window = min(
+                len(self.waiting_queue), self.server_args.marconi_prefill_hint_window
+            )
+            candidates = list(self.waiting_queue[:window])
+            for cand in candidates:
+                if not getattr(cand, "_prefill_matched_this_round", False):
+                    cand.init_next_round_input(self.tree_cache)
+                    cand._prefill_matched_this_round = True
+            candidates.sort(
+                key=lambda r: (
+                    -(r.marconi_cache_len or 0),
+                    -len(r.prefix_indices),
+                    -len(r.origin_input_ids),
+                )
+            )
+            self.waiting_queue = candidates + self.waiting_queue[window:]
+
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
 
@@ -2087,7 +2192,18 @@ class Scheduler(
                     # skip staging requests that are ongoing prefetch
                     continue
 
-            req.init_next_round_input(self.tree_cache)
+            if not getattr(req, "_prefill_matched_this_round", False):
+                req.init_next_round_input(self.tree_cache)
+            req._prefill_matched_this_round = False
+
+            if (
+                self.server_args.enable_marconi
+                and getattr(req, "marconi_rehydrate_pending", False)
+                and not getattr(req, "marconi_rehydrate_active", False)
+            ):
+                if len(adder.can_run_list) > 0:
+                    break
+                req.prepare_marconi_rehydrate()
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(
@@ -2107,6 +2223,12 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 break
 
+            if self.server_args.enable_marconi and getattr(
+                req, "marconi_rehydrate_active", False
+            ):
+                # Rehydrate batches run alone.
+                break
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
@@ -2120,6 +2242,9 @@ class Scheduler(
         self.waiting_queue = [
             x for x in self.waiting_queue if x not in set(can_run_list)
         ]
+        for req in self.waiting_queue:
+            if getattr(req, "_prefill_matched_this_round", False):
+                req._prefill_matched_this_round = False
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
