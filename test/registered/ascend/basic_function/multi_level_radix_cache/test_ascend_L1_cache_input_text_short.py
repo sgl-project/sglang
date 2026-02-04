@@ -28,16 +28,16 @@ class TestL1Cache(CustomTestCase):
         cls.model = QWEN3_32B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--mem-fraction-static",
-                0.8,
-                "--tp-size",
-                2,
-                "--base-gpu-id",
-                4,
-            ]
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--mem-fraction-static",
+            0.8,
+            "--tp-size",
+            2,
+            "--base-gpu-id",
+            4,
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -52,7 +52,7 @@ class TestL1Cache(CustomTestCase):
 
     def test_L1_cache(self):
         # with two identical short text input requests, the token will not be reused.
-        texts = ["who am i?","who am i?"]
+        texts = ["who am i?", "who am i?"]
         for text in texts:
             response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/generate",
