@@ -87,6 +87,12 @@ _AITER_PARTITION_SIZE_ROCM = 256
 
 
 class AiterAttnBackend(AttentionBackend):
+    @staticmethod
+    def get_max_num_partitions(max_context_len: int) -> int:
+        return (
+            max_context_len + _AITER_PARTITION_SIZE_ROCM - 1
+        ) // _AITER_PARTITION_SIZE_ROCM
+
     def __init__(
         self,
         model_runner: ModelRunner,

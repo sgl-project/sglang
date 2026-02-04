@@ -44,6 +44,87 @@ _is_npu = is_npu()
 
 
 class ModelRunnerKVCacheMixin:
+    def _solve_max_tokens_with_aiter_workspace(
+        self: ModelRunner, rest_memory_bytes: int, cell_size: int, num_layers: int
+    ) -> int:
+        """
+        Solve for max_total_num_tokens accounting for aiter attention workspace memory.
+
+        We need to satisfy:
+        - kv_memory + workspace_memory = rest_memory
+        - kv_memory = max_total_num_tokens * cell_size
+        - workspace_memory = max_num_reqs * workspace_constant
+        - max_num_reqs = clamp(max_total_num_tokens / context_len * 512, 2048, 4096)
+
+        The `max_num_reqs` function is piecewise, so we solve for each piece and pick the valid solution.
+        """
+        from sglang.srt.configs.model_config import AttentionArch
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        # Get attention parameters
+        num_head = self.model_config.num_attention_heads // get_attention_tp_size()
+        head_dim = self.model_config.head_dim
+        max_context_len = self.model_config.context_len
+        use_mla = self.model_config.attention_arch == AttentionArch.MLA
+
+        # For MLA, workspace is allocated dynamically, not during init
+        if use_mla:
+            return rest_memory_bytes // cell_size
+
+        max_num_partitions = AiterAttnBackend.get_max_num_partitions(max_context_len)
+
+        # Resolve `max_total_num_tokens` based on the `workspace_size` required by aiter_backend.py:
+        # workspace_size = (max_num_reqs * num_head * max_num_partitions * head_dim) * 4
+        #                + 2 * (max_num_reqs * num_head * max_num_partitions) * 4
+
+        # i.e. `workspace_size = max_num_reqs * W` introducing the known constant W.
+        W = num_head * max_num_partitions * (head_dim * 4 + 8)
+
+        context_len = self.model_config.context_len
+
+        # We then have from `ModelRunnerKVCacheMixin.init_memory_pool`:
+        #           max_num_reqs = clamp(max_total_num_tokens / context_len * 512, 2048, 4096)
+
+        # With the constraint: rest_memory_bytes = kv_memory + aiter_memory
+        #                                        = max_total_num_tokens * cell_size + max_num_reqs * W
+
+        # This creates three cases:
+
+        # Case 2: Linear region in-between, typically where we'll be.
+        # 2048 <= max_total_num_tokens / context_len * 512 <= 4096
+        #                 <=> max_num_reqs = max_total_num_tokens * 512 / context_len
+        # Injecting in rest_memory_bytes = kv_memory + aiter_memory we get:
+        # max_total_num_tokens * cell_size + (max_total_num_tokens * 512 / context_len) * W = rest_memory_bytes
+        #         <=> max_total_num_tokens * (cell_size + 512 * W / context_len) = rest_memory_bytes
+        #         <=> max_total_num_tokens = rest_memory_bytes / (cell_size + 512 * W / context_len)
+        candidate_max_total_num_tokens = rest_memory_bytes / (
+            cell_size + 512 * W / context_len
+        )
+        if 2048 <= candidate_max_total_num_tokens / context_len * 512 <= 4096:
+            return int(candidate_max_total_num_tokens)
+
+        # Case 1: max_total_num_tokens / context_len * 512 <= 2048
+        #                 <=> max_num_reqs = 2048
+        # Injecting in rest_memory_bytes = kv_memory + aiter_memory:
+        #  max_total_num_tokens * cell_size + 2048 * W = rest_memory_bytes
+        #        <=> max_total_num_tokens = (rest_memory_bytes - 2048 * W) / cell_size
+        candidate_max_total_num_tokens = (rest_memory_bytes - 2048 * W) / cell_size
+        if candidate_max_total_num_tokens / context_len * 512 <= 2048:
+            return int(candidate_max_total_num_tokens)
+
+        # Case 3: max_total_num_tokens / context_len * 512 >= 4096
+        #                 <=> max_num_reqs = 4096
+        # Injecting in rest_memory_bytes = kv_memory + aiter_memory we get:
+        #  max_total_num_tokens * cell_size + 4096 * W = rest_memory_bytes
+        #       <=> max_total_num_tokens = (rest_memory_bytes - 4096 * W) / cell_size
+        candidate_max_total_num_tokens = (rest_memory_bytes - 4096 * W) / cell_size
+        if candidate_max_total_num_tokens / context_len * 512 >= 4096:
+            return int(candidate_max_total_num_tokens)
+
+        raise ValueError(
+            "Something went wrong in the memory allocation for KV cache. Please open an issue."
+        )
+
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
@@ -141,7 +222,25 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        return int(rest_memory * (1 << 30)) // cell_size
+        rest_memory_bytes = int(rest_memory * (1 << 30))
+
+        # NOTE: No special handling for the cases `self.mambaish_config is not None` and when `max_running_requests` is specified.
+        if (
+            self.server_args.attention_backend == "aiter"
+            and self.mambaish_config is None
+            and self.server_args.max_running_requests is None
+        ):
+            # `max_total_num_tokens` is used in `ModelRunnerKVCacheMixin.init_memory_pool` to define
+            # `max_num_reqs`, which is in turn used in AITER attention backend to define GPU HBM buffers for the attention.
+            # The default strategy below to resolve `max_total_num_tokens` does NOT take into account the memory required for the attention backend, potentially resulting in OOM errors in AITER buffers allocation.
+            max_total_num_tokens = self._solve_max_tokens_with_aiter_workspace(
+                rest_memory_bytes, cell_size, num_layers
+            )
+        else:
+            # No workspace overhead for other backends
+            max_total_num_tokens = rest_memory_bytes // cell_size
+
+        return max_total_num_tokens
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
