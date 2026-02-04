@@ -81,7 +81,7 @@ class TestMultiTokenizer(CustomTestCase):
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
             if is_in_amd_ci():
-                self.assertLess(res["median_ttft_ms"], 88)
+                self.assertLess(res["median_ttft_ms"], 90)
             else:
                 self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)

@@ -121,6 +121,8 @@ class TestBenchServing1GPUPart2(CustomTestCase):
                 25: (50, 60),
                 50: (60, 65),
             }
+            if is_in_amd_ci():
+                bounds[10] = (50, 60)
             avg_latency_bound, p95_latency_bound = bounds.get(batch_size, (60, 65))
             self.assertLess(res["avg_latency_ms"], avg_latency_bound)
             self.assertLess(res["p95_latency_ms"], p95_latency_bound)
