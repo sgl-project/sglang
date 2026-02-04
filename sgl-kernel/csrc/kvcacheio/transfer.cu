@@ -4,6 +4,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <algorithm>
+#include <limits>
+#include <vector>
 
 #ifndef USE_ROCM
 #define WARP_SIZE 32
@@ -758,6 +761,24 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t src_stride0 = src_ptrs[0].stride(0);
     const int64_t elem_size = dst_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
+    const int device_id = at::cuda::current_device();
+    cudaMemcpyAttributes default_attrs{};
+    default_attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    default_attrs.srcLocHint.type = cudaMemLocationTypeDevice;
+    default_attrs.srcLocHint.id = device_id;
+    default_attrs.dstLocHint.type = cudaMemLocationTypeHost;
+    default_attrs.dstLocHint.id = 0;
+    default_attrs.flags = 0;
+
+    const size_t num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) *
+                              static_cast<size_t>(is_mla ? 1 : 2);
+    std::vector<void*> batch_srcs;
+    std::vector<void*> batch_dsts;
+    std::vector<size_t> batch_sizes;
+    std::vector<size_t> batch_attrs_idxs(1, 0);
+    batch_srcs.reserve(num_copies);
+    batch_dsts.reserve(num_copies);
+    batch_sizes.reserve(num_copies);
 
     for (const auto i : c10::irange(num_pages)) {
       auto s_index = src_indices_ptr[i * page_size];
@@ -767,15 +788,61 @@ inline void transfer_kv_page_first_direct_impl(
         const char* src_k_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
         char* dst_k_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
                           (start_layer_id + j) * dst_stride1 * elem_size;
-        C10_CUDA_CHECK(cudaMemcpyAsync(dst_k_ptr, src_k_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
+        batch_srcs.push_back(const_cast<char*>(src_k_ptr));
+        batch_dsts.push_back(dst_k_ptr);
+        batch_sizes.push_back(copy_size_bytes);
 
         if (!is_mla) {
           const char* src_v_ptr =
               static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) + s_index * src_stride0 * elem_size;
           char* dst_v_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
                             (start_layer_id + j) * dst_stride1 * elem_size;
-          C10_CUDA_CHECK(cudaMemcpyAsync(dst_v_ptr, src_v_ptr, copy_size_bytes, cudaMemcpyDeviceToHost, stream));
+          batch_srcs.push_back(const_cast<char*>(src_v_ptr));
+          batch_dsts.push_back(dst_v_ptr);
+          batch_sizes.push_back(copy_size_bytes);
         }
+      }
+    }
+
+    TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
+    if (num_copies > 0) {
+      size_t fail_idx = std::numeric_limits<size_t>::max();
+      cudaStream_t batch_stream = stream;
+      cudaEvent_t start_event = nullptr;
+      cudaEvent_t end_event = nullptr;
+      if (stream == nullptr || stream == 0) {
+        at::cuda::CUDAStream pooled_stream = at::cuda::getStreamFromPool();
+        batch_stream = pooled_stream.stream();
+        TORCH_WARN(
+            "cudaMemcpyBatchAsync does not support legacy NULL stream; "
+            "switching to pooled stream. stream=",
+            static_cast<const void*>(stream),
+            " pooled=",
+            static_cast<const void*>(batch_stream));
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&start_event, cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&end_event, cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(start_event, stream));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(batch_stream, start_event, 0));
+      }
+
+      cudaError_t err = cudaMemcpyBatchAsync(
+          batch_dsts.data(),
+          batch_srcs.data(),
+          batch_sizes.data(),
+          num_copies,
+          &default_attrs,
+          batch_attrs_idxs.data(),
+          1,
+          &fail_idx,
+          batch_stream);
+      if (err != cudaSuccess) {
+        TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+      }
+      if (start_event != nullptr) {
+        C10_CUDA_CHECK(cudaEventRecord(end_event, batch_stream));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, end_event, 0));
+        C10_CUDA_CHECK(cudaEventDestroy(start_event));
+        C10_CUDA_CHECK(cudaEventDestroy(end_event));
       }
     }
   } else {
@@ -787,6 +854,24 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t dst_stride0 = dst_ptrs[0].stride(0);
     const int64_t elem_size = src_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
+    const int device_id = at::cuda::current_device();
+    cudaMemcpyAttributes default_attrs{};
+    default_attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    default_attrs.srcLocHint.type = cudaMemLocationTypeHost;
+    default_attrs.srcLocHint.id = 0;
+    default_attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+    default_attrs.dstLocHint.id = device_id;
+    default_attrs.flags = 0;
+
+    const size_t num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) *
+                              static_cast<size_t>(is_mla ? 1 : 2);
+    std::vector<void*> batch_srcs;
+    std::vector<void*> batch_dsts;
+    std::vector<size_t> batch_sizes;
+    std::vector<size_t> batch_attrs_idxs(1, 0);
+    batch_srcs.reserve(num_copies);
+    batch_dsts.reserve(num_copies);
+    batch_sizes.reserve(num_copies);
 
     for (const auto i : c10::irange(num_pages)) {
       auto s_index = src_indices_ptr[i * page_size] / page_size;
@@ -796,14 +881,60 @@ inline void transfer_kv_page_first_direct_impl(
         const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
                                 (start_layer_id + j) * src_stride1 * elem_size;
         char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
-        C10_CUDA_CHECK(cudaMemcpyAsync(dst_k_ptr, src_k_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
+        batch_srcs.push_back(const_cast<char*>(src_k_ptr));
+        batch_dsts.push_back(dst_k_ptr);
+        batch_sizes.push_back(copy_size_bytes);
 
         if (!is_mla) {
           const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
                                   (start_layer_id + j) * src_stride1 * elem_size;
           char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
-          C10_CUDA_CHECK(cudaMemcpyAsync(dst_v_ptr, src_v_ptr, copy_size_bytes, cudaMemcpyHostToDevice, stream));
+          batch_srcs.push_back(const_cast<char*>(src_v_ptr));
+          batch_dsts.push_back(dst_v_ptr);
+          batch_sizes.push_back(copy_size_bytes);
         }
+      }
+    }
+
+    TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
+    if (num_copies > 0) {
+      size_t fail_idx = std::numeric_limits<size_t>::max();
+      cudaStream_t batch_stream = stream;
+      cudaEvent_t start_event = nullptr;
+      cudaEvent_t end_event = nullptr;
+      if (stream == nullptr || stream == 0) {
+        at::cuda::CUDAStream pooled_stream = at::cuda::getStreamFromPool();
+        batch_stream = pooled_stream.stream();
+        TORCH_WARN(
+            "cudaMemcpyBatchAsync does not support legacy NULL stream; "
+            "switching to pooled stream. stream=",
+            static_cast<const void*>(stream),
+            " pooled=",
+            static_cast<const void*>(batch_stream));
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&start_event, cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventCreateWithFlags(&end_event, cudaEventDisableTiming));
+        C10_CUDA_CHECK(cudaEventRecord(start_event, stream));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(batch_stream, start_event, 0));
+      }
+
+      cudaError_t err = cudaMemcpyBatchAsync(
+          batch_dsts.data(),
+          batch_srcs.data(),
+          batch_sizes.data(),
+          num_copies,
+          &default_attrs,
+          batch_attrs_idxs.data(),
+          1,
+          &fail_idx,
+          batch_stream);
+      if (err != cudaSuccess) {
+        TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+      }
+      if (start_event != nullptr) {
+        C10_CUDA_CHECK(cudaEventRecord(end_event, batch_stream));
+        C10_CUDA_CHECK(cudaStreamWaitEvent(stream, end_event, 0));
+        C10_CUDA_CHECK(cudaEventDestroy(start_event));
+        C10_CUDA_CHECK(cudaEventDestroy(end_event));
       }
     }
   }
