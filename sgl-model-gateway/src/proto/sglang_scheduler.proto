@@ -129,9 +129,6 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
-
-  // For EPD mode: whether prefill should wait for embeddings from encoder
-  optional bool need_wait_for_encoder = 18;
 }
 
 message TokenizedInput {
