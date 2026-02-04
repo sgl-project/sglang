@@ -1273,7 +1273,7 @@ struct DeviceGemmFp8RowwiseSm120 {
           sizeof(typename CollectiveEpilogue::SharedStorage))>,
       MainloopScheduleType>::CollectiveOp;
   using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, TileSchedulerType>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   template <typename Descriptor, typename T>
   static auto args_from_tensor(torch::Tensor const& tensor) {
@@ -1310,7 +1310,8 @@ typename GemmType::Gemm::Arguments prepare_sm120_fp8_args(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const c10::optional<torch::Tensor>& bias,
+    typename GemmType::Gemm::GemmKernel::TileSchedulerArguments scheduler = {}) {
   using Gemm = typename GemmType::Gemm;
   using ElementT = typename Gemm::ElementA;
   using ElementC = typename Gemm::ElementC;
@@ -1341,7 +1342,6 @@ typename GemmType::Gemm::Arguments prepare_sm120_fp8_args(
 
   typename GemmKernel::ProblemShape prob_shape = {m, n, k, 1};
   cutlass::KernelHardwareInfo hw_info;
-  typename GemmKernel::TileSchedulerArguments scheduler = {};
 
   auto ptr_c = static_cast<ElementOutput*>(out.data_ptr());
 
@@ -1373,8 +1373,9 @@ void launch_sm120_fp8_scaled_mm(
     torch::Tensor const& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
-  auto args = prepare_sm120_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
+    const c10::optional<torch::Tensor>& bias,
+    typename Gemm::Gemm::GemmKernel::TileSchedulerArguments scheduler = {}) {
+  auto args = prepare_sm120_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias, scheduler);
 
   typename Gemm::Gemm gemm_op;
   size_t workspace_size = gemm_op.get_workspace_size(args);
@@ -1435,6 +1436,46 @@ void sm120_fp8_dispatch_bias(
   }
 }
 
+// SplitK dispatch variant using StreamKScheduler.
+// Divides K dimension across multiple thread blocks (default: splits=2).
+// Note: Not used in production dispatch; retained for experimentation.
+template <
+    typename OutType,
+    typename CTAShape,
+    typename ClusterShape,
+    typename MainloopScheduleType>
+void sm120_fp8_dispatch_splitk(
+    torch::Tensor& out,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const c10::optional<torch::Tensor>& bias,
+    int splits = 2) {
+  using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
+  using ElementInput = cutlass::float_e4m3_t;
+  using ElementOutput = OutType;
+  using AccumElementType = float;
+  using TileSchedulerType = cutlass::gemm::StreamKScheduler;
+
+  using Gemm = DeviceGemmFp8RowwiseSm120<
+      ElementInput,
+      ElementOutput,
+      AccumElementType,
+      CTAShape,
+      ClusterShape,
+      MainloopScheduleType,
+      EpilogueScheduleType,
+      TileSchedulerType,
+      false>;
+
+  typename Gemm::Gemm::GemmKernel::TileSchedulerArguments scheduler_args;
+  scheduler_args.splits = splits;
+  scheduler_args.decomposition_mode = cutlass::gemm::kernel::detail::DecompositionMode::SplitK;
+
+  return launch_sm120_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias, scheduler_args);
+}
+
 template <typename OutType>
 void sm120_fp8_dispatch_shape(
     torch::Tensor& out,
@@ -1443,7 +1484,30 @@ void sm120_fp8_dispatch_shape(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  return sm120_fp8_dispatch_bias<OutType>(out, a, b, scales_a, scales_b, bias);
+  uint32_t const m = a.size(0);
+
+  // M-adaptive tile dispatch for SM120 FP8 GEMM decode optimization.
+  // - M<=128: 64x64x128 tiles improve SM utilization during decode phase
+  // - M>128:  128x128x128 tiles maintain throughput for prefill phase
+  // Uses Pingpong schedule with FastAccum and PersistentScheduler.
+  using FastPingpongSchedule = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
+  using TileScheduler = cutlass::gemm::PersistentScheduler;
+
+  if (m <= 128) {
+    return sm120_fp8_dispatch_bias<
+        OutType,
+        Shape<_64, _64, _128>,
+        Shape<_1, _1, _1>,
+        FastPingpongSchedule,
+        TileScheduler>(out, a, b, scales_a, scales_b, bias);
+  } else {
+    return sm120_fp8_dispatch_bias<
+        OutType,
+        Shape<_128, _128, _128>,
+        Shape<_1, _1, _1>,
+        FastPingpongSchedule,
+        TileScheduler>(out, a, b, scales_a, scales_b, bias);
+  }
 }
 #endif
 
