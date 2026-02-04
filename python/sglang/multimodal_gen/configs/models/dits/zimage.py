@@ -9,10 +9,8 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 
 def is_zimage_layer(n: str, m) -> bool:
     """Returns if the module should be sharded for Z-Image model."""
-    #  main transformer layers
     if "layers" in n and str.isdigit(n.split(".")[-1]):
         return True
-    # noise_refiner and context_refiner layers
     if ("noise_refiner" in n or "context_refiner" in n) and str.isdigit(
         n.split(".")[-1]
     ):
