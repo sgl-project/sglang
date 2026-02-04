@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -46,6 +47,7 @@ _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_deepgemm_bf16_gemm = envs.SGLANG_USE_DEEPGEMM_BF16_GEMM.get()
 
 if _use_aiter:
     from aiter import ActivationType
@@ -147,6 +149,40 @@ class UnquantizedLinearMethod(LinearMethodBase):
             if len(x_shapes) == 3:
                 output = output.view(x_shapes[0], x_shapes[1], -1)
             return output
+
+        if (
+            _use_deepgemm_bf16_gemm
+            and x.is_cuda
+            and not _is_hip
+            and not _is_npu
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+        ):
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                weight = layer.weight
+                if weight.stride(-1) == 1 or weight.stride(-2) == 1:
+                    x_shape = x.shape
+                    x_2d = x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x
+                    if x_2d.stride(-1) != 1 and x_2d.stride(-2) != 1:
+                        x_2d = x_2d.contiguous()
+
+                    out_dtype = torch.result_type(x_2d, weight)
+                    if bias is not None:
+                        out_dtype = torch.promote_types(out_dtype, bias.dtype)
+
+                    out_2d = torch.empty(
+                        (x_2d.shape[0], weight.shape[0]),
+                        device=x.device,
+                        dtype=out_dtype,
+                    )
+                    deep_gemm_wrapper.gemm_nt_bf16(x_2d, weight, out_2d)
+                    if bias is not None:
+                        out_2d.add_(bias)
+                    if x.dim() != 2:
+                        return out_2d.view(*x_shape[:-1], weight.shape[0])
+                    return out_2d
 
         return F.linear(x, layer.weight, bias)
 
@@ -318,11 +354,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
+        backend = get_moe_runner_backend()
+        if backend.is_auto():
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
         self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
@@ -382,7 +420,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )[0]
             return StandardCombineInput(hidden_states=output)
         else:
-            if _use_aiter:
+            if backend.is_deep_gemm():
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    DeepGemmMoeQuantInfo,
+                )
+
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=False,
+                )
+                return self.runner.run(dispatch_output, quant_info)
+            elif _use_aiter:
                 assert not moe_runner_config.no_combine, "unsupported"
                 topk_weights, topk_ids, _ = topk_output
                 if moe_runner_config.apply_router_weight_on_input:

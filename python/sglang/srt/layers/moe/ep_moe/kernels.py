@@ -1038,6 +1038,38 @@ def fill_gateup_input_triton_kernel(
                 tl.store(scale_dst_ptr + offset, in_scale, mask=mask)
 
 
+@triton.jit
+def fill_gateup_input_bf16_triton_kernel(
+    input_ptr,
+    gateup_input_ptr,
+    src2dst_ptr,
+    topk_ids_ptr,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    OutDtype = gateup_input_ptr.dtype.element_ty
+
+    src_idx_int32 = tl.program_id(0)
+    src_idx = src_idx_int32.to(tl.int64)
+    src2dst_ptr = src2dst_ptr + src_idx * topk
+    topk_ids_ptr = topk_ids_ptr + src_idx * topk
+    src_ptr = input_ptr + src_idx * hidden_size
+
+    vec = tl.arange(0, BLOCK_SIZE)
+    for idx in range(topk):
+        expert_id = tl.load(topk_ids_ptr + idx)
+        if expert_id >= 0:
+            dst_idx_int32 = tl.load(src2dst_ptr + idx)
+            dst_idx = dst_idx_int32.to(tl.int64)
+            dst_ptr = gateup_input_ptr + dst_idx * hidden_size
+            for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
+                offset = start_offset + vec
+                mask = offset < hidden_size
+                in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
+                tl.store(dst_ptr + offset, in_data, mask=mask)
+
+
 def moe_ep_deepgemm_preprocess(
     topk_ids: torch.Tensor,
     num_local_experts: int,
@@ -1112,6 +1144,63 @@ def moe_ep_deepgemm_preprocess(
         src2dst,
         gateup_input,
         gateup_input_scale,
+    )
+
+
+def moe_ep_deepgemm_bf16_preprocess(
+    topk_ids: torch.Tensor,
+    num_local_experts: int,
+    hidden_states: torch.Tensor,
+    top_k: int,
+):
+    reorder_topk_ids, reorder_ids = torch.sort(topk_ids.view(-1), stable=True)
+    seg_indptr = torch.zeros(
+        num_local_experts + 1, device=topk_ids.device, dtype=torch.int64
+    )
+    src2dst = torch.empty(topk_ids.numel(), device=topk_ids.device, dtype=torch.int32)
+    masked_m = torch.empty(num_local_experts, device=topk_ids.device, dtype=torch.int32)
+
+    compute_seg_indptr_triton_kernel[(num_local_experts + 1,)](
+        reorder_topk_ids, seg_indptr, topk_ids.numel()
+    )
+
+    grid = lambda meta: (triton.cdiv(topk_ids.numel(), meta["BLOCK_SIZE"]),)
+    compute_masked_m_triton_kernel[(num_local_experts,)](seg_indptr, masked_m)
+
+    # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m})
+    m_max = (hidden_states.size(0) // 256 + 1) * 256
+    expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
+    gateup_input = torch.empty(
+        (num_local_experts, m_max, hidden_states.size(1)),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+
+    deepgemm_compute_src2dst_triton_kernel[grid](
+        topk_ids,
+        reorder_ids,
+        seg_indptr,
+        src2dst,
+        m_max,
+        topk_ids.numel(),
+        BLOCK_SIZE=256,
+    )
+
+    fill_gateup_input_bf16_triton_kernel[(hidden_states.shape[0],)](
+        hidden_states,
+        gateup_input,
+        src2dst,
+        topk_ids,
+        top_k,
+        hidden_states.size(1),
+        BLOCK_SIZE=1024,
+    )
+
+    return (
+        masked_m,
+        expected_m,
+        src2dst,
+        gateup_input,
     )
 
 
