@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type
 
 import torch
 from torch.distributed import ProcessGroup
@@ -116,19 +116,31 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        assert (
+            len(chunked) <= 1
+        ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert all(
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
+
+        need_size = len(reqs) - len(chunked)
         if need_size > len(self.free_slots):
             return None
-
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return select_index
+        offset = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_index[offset]
+                offset += 1
+        return [r.req_pool_idx for r in reqs]
 
-    def free(self, free_index: Union[int, List[int]]):
-        if isinstance(free_index, (int,)):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, req: "Req"):
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
@@ -652,16 +664,11 @@ class DecodePreallocQueue:
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
-        if isinstance(self.req_to_token_pool, HybridMambaDecodeReqToTokenPool):
-            req_pool_indices = self.req_to_token_pool.alloc(1, [req])
-        else:
-            req_pool_indices = self.req_to_token_pool.alloc(1)
+        req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
-
-        req.req_pool_idx = req_pool_indices[0]
 
         # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
