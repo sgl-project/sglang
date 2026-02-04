@@ -100,7 +100,6 @@ class Req:
     raw_audio_latent_shape: tuple[int, ...] | None = None
 
     # Audio Parameters
-    fps: float = 24.0
     generate_audio: bool = True
 
     raw_latent_shape: torch.Tensor | None = None
@@ -295,6 +294,7 @@ class Req:
                        width: {target_width}
                       height: {target_height}
                   num_frames: {self.num_frames}
+                         fps: {self.fps}
                       prompt: {self.prompt}
                   neg_prompt: {self.negative_prompt}
                         seed: {self.seed}

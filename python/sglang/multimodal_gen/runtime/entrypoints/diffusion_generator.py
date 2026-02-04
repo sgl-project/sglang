@@ -229,7 +229,10 @@ class DiffGenerator:
                     if output_batch.error:
                         raise Exception(f"{output_batch.error}")
 
-                    if output_batch.output is None:
+                    if (
+                        output_batch.output is None
+                        and output_batch.output_file_paths is None
+                    ):
                         logger.error(
                             "Received empty output from scheduler for prompt %d",
                             request_idx + 1,
