@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed import (
@@ -492,6 +493,11 @@ class PipelineConfig:
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
 
+        # Add T5 configuration arguments
+        from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+
+        T5Config.add_cli_args(parser, prefix=f"{prefix_with_dot}t5-config")
+
         return parser
 
     def update_config_from_dict(self, args: dict[str, Any], prefix: str = "") -> None:
@@ -503,6 +509,14 @@ class PipelineConfig:
         update_config_from_args(
             self.dit_config, args, f"{prefix_with_dot}dit_config", pop_args=True
         )
+        for text_encoder_config in self.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                update_config_from_args(
+                    text_encoder_config,
+                    args,
+                    f"{prefix_with_dot}t5_config",
+                    pop_args=True,
+                )
 
     @classmethod
     def from_kwargs(

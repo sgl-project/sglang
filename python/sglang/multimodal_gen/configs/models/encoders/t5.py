@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 from dataclasses import dataclass, field
-from typing import Literal
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
@@ -90,7 +89,7 @@ class T5Config(TextEncoderConfig):
     # Use the SP Group of the transformer as the TP Group of T5.
     parallel_folding: bool = False
     # "sp" or "ulysses" or "ring"
-    parallel_folding_mode: Literal["sp", "ulysses", "ring"] = "sp"
+    parallel_folding_mode: str = "sp"
 
     @staticmethod
     def add_cli_args(
@@ -105,7 +104,8 @@ class T5Config(TextEncoderConfig):
         )
         parser.add_argument(
             f"--{prefix}.parallel-folding-mode",
-            type=Literal["sp", "ulysses", "ring"],
+            type=str,
+            choices=["sp", "ulysses", "ring"],
             dest=f"{prefix.replace('-', '_')}.parallel_folding_mode",
             default=T5Config.parallel_folding_mode,
             help="Parallel folding mode for T5",
