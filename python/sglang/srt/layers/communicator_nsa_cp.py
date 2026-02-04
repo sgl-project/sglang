@@ -18,7 +18,10 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+    nsa_use_prefill_cp,
+)
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSimpleFn,
@@ -27,6 +30,11 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+)
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    attn_tp_reduce_scatter_tensor,
+    get_local_dp_buffer,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -57,27 +65,30 @@ class NSACPLayerCommunicator(LayerCommunicator):
             is_last_layer,
             qkv_latent_func,
         )
+
+    def _post_init_communicate(self):
+        # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
+        if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
+            assert (
+                self._context.attn_dp_size == 1
+            ), f"dp_size should be 1 when moe_runner_backend is none"
         self._communicate_simple_fn = NSACPCommunicateSimpleFn.get_fn(
-            input_mode=self.layer_scatter_modes.layer_input_mode,
-            output_mode=self.layer_scatter_modes.attn_mode,
+            input_mode=ScatterMode.SCATTERED,
+            output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_with_all_reduce_and_layer_norm_fn = (
-            NSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
-                residual_input_mode=self.layer_scatter_modes.layer_input_mode,
-                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
-                residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
-                context=self._context,
-            )
+        self._communicate_with_all_reduce_and_layer_norm_fn = NSACPCommunicateWithAllReduceAndLayerNormFn.get_fn(
+            hidden_states_input_mode=ScatterMode.SCATTERED,
+            residual_input_mode=ScatterMode.SCATTERED,
+            hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
+            residual_output_mode=ScatterMode.SCATTERED,
+            context=self._context,
         )
-        self._communicate_summable_tensor_pair_fn = (
-            NSACPCommunicateSummableTensorPairFn.get_fn(
-                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
-                residual_input_mode=self.layer_scatter_modes.middle_residual_mode,
-                output_mode=self.layer_scatter_modes.layer_output_mode,
-                context=self._context,
-            )
+        self._communicate_summable_tensor_pair_fn = NSACPCommunicateSummableTensorPairFn.get_fn(
+            hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
+            residual_input_mode=ScatterMode.SCATTERED,
+            output_mode=ScatterMode.SCATTERED,
+            context=self._context,
         )
 
 
@@ -91,24 +102,7 @@ class NSACPCommunicateSimpleFn(CommunicateSimpleFn):
         if context.is_same_group_size(input_mode, output_mode):
             return NSACPCommunicateSimpleFn._trivial
 
-        if (input_mode == ScatterMode.SCATTERED) and (
-            output_mode == ScatterMode.TP_ATTN_FULL
-        ):
-            return NSACPCommunicateSimpleFn._scattered_to_tp_attn_full
-
         raise NotImplementedError(f"{input_mode=} {output_mode=}")
-
-    @staticmethod
-    def _scattered_to_tp_attn_full(
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        context: CommunicateContext,
-    ) -> torch.Tensor:
-
-        if nsa_enable_prefill_cp():
-            return hidden_states
-        else:
-            assert False, "Not implemented"
 
 
 class NSACPCommunicateWithAllReduceAndLayerNormFn(
@@ -127,38 +121,15 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        if (
-            context.is_same_group_size(
-                hidden_states_input_mode, hidden_states_output_mode
-            )
-            and context.is_same_group_size(residual_input_mode, residual_output_mode)
-            and context.attn_tp_size == 1
-        ):
+        assert hidden_states_input_mode == ScatterMode.SCATTERED
+        assert residual_input_mode == ScatterMode.SCATTERED
+        assert residual_output_mode == ScatterMode.SCATTERED
+        if hidden_states_output_mode == ScatterMode.SCATTERED:
             return NSACPCommunicateWithAllReduceAndLayerNormFn._simple
 
-        if (
-            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (
-                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-            )
-            and (hidden_states_output_mode == ScatterMode.FULL)
-            and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
-        ):
+        if hidden_states_output_mode == ScatterMode.FULL:
             return partial(
                 NSACPCommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
-                residual_input_mode=residual_input_mode,
-            )
-
-        if (
-            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (
-                residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
-            )
-            and (hidden_states_output_mode == ScatterMode.SCATTERED)
-            and (residual_output_mode == ScatterMode.SCATTERED)
-        ):
-            return partial(
-                NSACPCommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
                 residual_input_mode=residual_input_mode,
             )
 
@@ -176,30 +147,21 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
         *,
         residual_input_mode,
     ):
-        if nsa_enable_prefill_cp():
-            hidden_states += residual
-            if hidden_states.shape[0] != 0:
-                hidden_states = layernorm(hidden_states)
-            return hidden_states, residual
-        else:
-            assert False, "not yet handled"
-
-    @staticmethod
-    def _scatter_hidden_states_and_residual(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layernorm: torch.nn.Module,
-        context: CommunicateContext,
-        *,
-        residual_input_mode,
-    ):
-        if nsa_enable_prefill_cp():
-            if hidden_states.shape[0] != 0:
-                hidden_states, residual = layernorm(hidden_states, residual)
-            return hidden_states, residual
-        else:
-            assert False, "not yet handled"
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+        # for prefill: attn tp scattered -> full
+        # for decode: attn tp full -> full
+        if nsa_use_prefill_cp(forward_batch):
+            assert context.attn_dp_size == 1
+            hidden_states, local_hidden_states = (
+                get_local_dp_buffer(),
+                hidden_states,
+            )
+            attn_tp_all_gather_into_tensor(
+                hidden_states,
+                local_hidden_states,
+            )
+        return hidden_states, residual
 
 
 class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
@@ -219,24 +181,10 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
 
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
-            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (output_mode == ScatterMode.TP_ATTN_FULL)
-        ):
-            return NSACPCommunicateSummableTensorPairFn._scatter_hidden_states
-
-        if (
-            (hidden_states_input_mode == ScatterMode.SCATTERED)
             and (residual_input_mode == ScatterMode.SCATTERED)
-            and (output_mode == ScatterMode.TP_ATTN_FULL)
-        ):
-            return NSACPCommunicateSummableTensorPairFn._gather
-
-        if (
-            (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
-            and (residual_input_mode == ScatterMode.TP_ATTN_FULL)
             and (output_mode == ScatterMode.SCATTERED)
         ):
-            return NSACPCommunicateSummableTensorPairFn._scatter
+            return NSACPCommunicateSummableTensorPairFn._scatter_hidden_states
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
@@ -250,34 +198,13 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         context: CommunicateContext,
         allow_reduce_scatter: bool = False,
     ):
-        if nsa_enable_prefill_cp():
-            return hidden_states, residual
-        else:
-            assert False, "not yet handled"
-
-    @staticmethod
-    def _gather(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        context: CommunicateContext,
-        **kwargs,
-    ):
-        hidden_states += residual
-        residual = None
-        if nsa_enable_prefill_cp():
-            return hidden_states, residual
-        else:
-            assert False, "not yet handled"
-
-    @staticmethod
-    def _scatter(
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        forward_batch: ForwardBatch,
-        context: CommunicateContext,
-    ):
-        if nsa_enable_prefill_cp():
-            return hidden_states, residual
-        else:
-            assert False, "not yet handled"
+        # for prefill: full -> attn tp scattered
+        # for decode: full -> attn tp full
+        if nsa_use_prefill_cp(forward_batch):
+            assert context.attn_dp_size == 1
+            input_hidden_states = hidden_states
+            hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
+                context.attn_tp_rank
+            ]
+            attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        return hidden_states, residual

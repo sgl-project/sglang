@@ -299,10 +299,12 @@ async fn generate_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    let worker_id = format!("worker-{}", config.port);
 
     if should_fail(&config).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
+            [("x-worker-id", worker_id)],
             Json(json!({
                 "error": "Random failure for testing"
             })),
@@ -373,28 +375,33 @@ async fn generate_handler(
 
         let stream = stream::iter(events);
 
-        Sse::new(stream)
-            .keep_alive(KeepAlive::default())
+        (
+            [("x-worker-id", worker_id)],
+            Sse::new(stream).keep_alive(KeepAlive::default()),
+        )
             .into_response()
     } else {
-        Json(json!({
-            "text": "This is a mock response.",
-            "meta_info": {
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "completion_tokens_wo_jump_forward": 5,
-                "input_token_logprobs": null,
-                "output_token_logprobs": null,
-                "first_token_latency": config.response_delay_ms as f64 / 1000.0,
-                "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
-                "time_per_output_token": 0.01,
-                "finish_reason": {
-                    "type": "stop",
-                    "reason": "length"
+        (
+            [("x-worker-id", worker_id)],
+            Json(json!({
+                "text": "This is a mock response.",
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "completion_tokens_wo_jump_forward": 5,
+                    "input_token_logprobs": null,
+                    "output_token_logprobs": null,
+                    "first_token_latency": config.response_delay_ms as f64 / 1000.0,
+                    "time_to_first_token": config.response_delay_ms as f64 / 1000.0,
+                    "time_per_output_token": 0.01,
+                    "finish_reason": {
+                        "type": "stop",
+                        "reason": "length"
+                    }
                 }
-            }
-        }))
-        .into_response()
+            })),
+        )
+            .into_response()
     }
 }
 

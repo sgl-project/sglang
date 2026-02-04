@@ -21,7 +21,7 @@ use crate::routers::{
 ///
 /// # Returns
 /// Vector of GenerateComplete responses, one per index (n parameter)
-pub async fn collect_responses(
+pub(crate) async fn collect_responses(
     execution_result: ExecutionResult,
     merge_logprobs: bool,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
@@ -54,6 +54,13 @@ pub async fn collect_responses(
             }
 
             decode_responses
+        }
+        ExecutionResult::Embedding { .. } => {
+            // Embeddings do not support this path (no generate complete response)
+            return Err(error::internal_error(
+                "invalid_execution_mode",
+                "Embedding result encountered in response collection",
+            ));
         }
     };
 

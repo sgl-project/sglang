@@ -5,7 +5,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
-    update_draft_decode_set_expand_metadata_with_page_size,
+    draft_decode_set_expand_metadata,
 )
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -350,8 +350,13 @@ class TestFlashAttentionBackend(CustomTestCase):
 
 
 class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
-    def test_update_draft_decode_set_expand_metadata_with_page_size(self):
-        bs, topk, decode_length, page_size = 1, 2, 1, 4
+    """
+    All the test cases examples have 1 additional cache location than the decode length.
+    This is to align with the current allocation logic. It does not affect the correctness.
+    """
+
+    def test_draft_decode_set_expand_metadata(self):
+        bs, topk, page_size = 1, 2, 4
 
         cases = [
             (
@@ -364,55 +369,102 @@ class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
                 ),
                 torch.tensor(
                     [
-                        [5],
-                        [7],
+                        [5, 6],
+                        [7, 8],
                     ],
                     dtype=torch.int32,
                 ),
+                1,
             ),
+            # Decode span multiple pages:
+            # duplicated kv cache: 24, 25, 26
+            # decode locations: 27, 28, 29, 30, 31, 32
+            # We need 3 pages in total.
             (
                 torch.tensor(
                     [
-                        [27, 28],
-                        [35, 36],
+                        [27, 28, 29, 30, 31, 32],
+                        [35, 36, 37, 38, 39, 40],
                     ],
                     dtype=torch.int32,
                 ),
                 torch.tensor(
                     [
-                        [6],
-                        [8],
+                        [6, 7, 8, 0, 0, 0],
+                        [8, 9, 10, 0, 0, 0],
                     ],
                     dtype=torch.int32,
                 ),
+                5,
             ),
         ]
 
         last_page_lens = torch.tensor([3], dtype=torch.int32)
-        strided_indices_expand = torch.arange(
-            0, decode_length, page_size, dtype=torch.long
-        )
-
-        for cache_loc, expected_page_table in cases:
+        for cache_loc, expected_page_table, decode_length in cases:
             cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
-            page_table = torch.zeros(bs * topk, decode_length, dtype=torch.int32)
-
-            update_draft_decode_set_expand_metadata_with_page_size(
+            page_table = torch.zeros_like(cache_loc, dtype=torch.int32)
+            draft_decode_set_expand_metadata(
                 cache_seqlens_int32=cache_seqlens_int32,
                 page_table=page_table,
-                cache_loc=cache_loc,
                 last_page_lens=last_page_lens,
-                strided_indices_expand=strided_indices_expand,
                 decode_length=decode_length,
-                bs=bs,
+                cache_loc=cache_loc,
                 topk=topk,
                 page_size=page_size,
             )
 
-            expected_cache_seqlens = torch.tensor([4, 4], dtype=torch.int32)
-
+            expected_cache_seqlens = torch.tensor(
+                [decode_length + 3, decode_length + 3], dtype=torch.int32
+            )
             self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
             self.assertTrue(torch.equal(page_table, expected_page_table))
+
+    def test_update_draft_decode_set_expand_metadata_multi_batch(self):
+        """
+        Ensure expand metadata works when batch size > 1 and last pages differ.
+        """
+        bs, topk, decode_length, page_size = 3, 2, 3, 4
+        cache_loc = torch.tensor(
+            [
+                # First batch: last page duplicate is 1, consecutive pages
+                [1, 2, 3, 4],
+                [6, 7, 8, 9],
+                # Second batch: last page duplicate is 3, non-consecutive pages
+                [3, 8, 9, 10],
+                [14, 15, 16, 17],
+                # Third batch: last page duplicate is 0, consecutive pages
+                [0, 1, 2, 3],
+                [4, 5, 6, 7],
+            ],
+            dtype=torch.int32,
+        )
+        cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
+        last_page_lens = torch.tensor([1, 3, 0], dtype=torch.int32)
+        page_table = torch.zeros_like(cache_loc, dtype=torch.int32)
+        draft_decode_set_expand_metadata(
+            cache_seqlens_int32=cache_seqlens_int32,
+            page_table=page_table,
+            last_page_lens=last_page_lens,
+            decode_length=decode_length,
+            cache_loc=cache_loc,
+            topk=topk,
+            page_size=page_size,
+        )
+
+        expected_cache_seqlens = torch.tensor([4, 4, 6, 6, 3, 3], dtype=torch.int32)
+        expected_page_table = torch.tensor(
+            [
+                [0, 1, 0, 0],
+                [1, 2, 0, 0],
+                [0, 2, 0, 0],
+                [3, 4, 0, 0],
+                [0, 0, 0, 0],
+                [1, 0, 0, 0],
+            ],
+            dtype=torch.int32,
+        )
+        self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
+        self.assertTrue(torch.equal(page_table, expected_page_table))
 
 
 if __name__ == "__main__":

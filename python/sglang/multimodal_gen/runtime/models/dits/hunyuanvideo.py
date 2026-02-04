@@ -15,10 +15,10 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     LocalAttention,
     UlyssesAttention,
 )
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
-    ScaleResidual,
     ScaleResidualLayerNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -80,7 +81,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.img_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
             hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
         )
-        self.img_mlp_residual = ScaleResidual()
+        self.img_mlp_residual = MulAdd()
 
         # Image attention components
         self.img_attn_qkv = ReplicatedLinear(
@@ -126,7 +127,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
             hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
         )
-        self.txt_mlp_residual = ScaleResidual()
+        self.txt_mlp_residual = MulAdd()
 
         # Text attention components
         self.txt_attn_qkv = ReplicatedLinear(
@@ -230,7 +231,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Process image MLP
         img_mlp_out = self.img_mlp(img_mlp_input)
-        img = self.img_mlp_residual(img_residual, img_mlp_out, img_mlp_gate)
+        img = self.img_mlp_residual(img_mlp_out, img_mlp_gate, img_residual)
 
         # Process text attention output
         txt_attn_out, _ = self.txt_attn_proj(
@@ -244,7 +245,7 @@ class MMDoubleStreamBlock(nn.Module):
 
         # Process text MLP
         txt_mlp_out = self.txt_mlp(txt_mlp_input)
-        txt = self.txt_mlp_residual(txt_residual, txt_mlp_out, txt_mlp_gate)
+        txt = self.txt_mlp_residual(txt_mlp_out, txt_mlp_gate, txt_residual)
 
         return img, txt
 
@@ -303,7 +304,7 @@ class MMSingleStreamBlock(nn.Module):
             elementwise_affine=False,
             dtype=dtype,
         )
-        self.output_residual = ScaleResidual()
+        self.output_residual = MulAdd()
 
         # Activation function
         self.mlp_act = nn.GELU(approximate="tanh")
@@ -383,10 +384,10 @@ class MMSingleStreamBlock(nn.Module):
         output, _ = self.linear2(combined)
 
         # Apply residual connection with gating using fused operation
-        return self.output_residual(x, output, mod_gate)
+        return self.output_residual(output, mod_gate, x)
 
 
-class HunyuanVideoTransformer3DModel(CachableDiT):
+class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     """
     HunyuanVideo Transformer backbone adapted for distributed training.
 
@@ -508,7 +509,7 @@ class HunyuanVideoTransformer3DModel(CachableDiT):
                     mlp_ratio=config.mlp_ratio,
                     dtype=config.dtype,
                     supported_attention_backends=self._supported_attention_backends,
-                    prefix=f"{config.prefix}.single_blocks.{i+config.num_layers}",
+                    prefix=f"{config.prefix}.single_blocks.{i + config.num_layers}",
                 )
                 for i in range(config.num_single_layers)
             ]
@@ -523,6 +524,8 @@ class HunyuanVideoTransformer3DModel(CachableDiT):
         )
 
         self.__post_init__()
+
+        self.layer_names = ["double_blocks", "single_blocks"]
 
     # TODO: change the input the FORWARD_BATCH Dict
     # TODO: change output to a dict

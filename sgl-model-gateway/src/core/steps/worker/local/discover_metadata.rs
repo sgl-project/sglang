@@ -1,6 +1,6 @@
 //! Metadata discovery step for local workers.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
+use super::strip_protocol;
 use crate::{
-    core::ConnectionMode,
-    protocols::worker_spec::WorkerConfigRequest,
+    core::{steps::workflow_data::LocalWorkerWorkflowData, ConnectionMode},
     routers::grpc::client::GrpcClient,
     workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
@@ -31,7 +31,10 @@ pub struct ServerInfo {
     pub model_id: Option<String>,
     pub model_path: Option<String>,
     pub served_model_name: Option<String>,
+    pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub load_balance_method: Option<String>,
+    pub disaggregation_mode: Option<String>,
     pub version: Option<String>,
     pub max_batch_size: Option<usize>,
     pub max_total_tokens: Option<usize>,
@@ -50,12 +53,46 @@ pub struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
-/// Strip protocol prefix from URL.
-fn strip_protocol(url: &str) -> String {
-    url.trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .trim_start_matches("grpc://")
-        .to_string()
+/// Fallback function to GET JSON from old endpoint (with "get_" prefix) for backward compatibility.
+async fn get_json_fallback(
+    base_url: &str,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<Value, String> {
+    // FIXME: This fallback logic should be removed together with /get_server_info
+    // and /get_model_info endpoints in http_server.py
+    warn!(
+        concat!(
+            "Endpoint '/{}' returned 404, falling back to '/get_{}' for backward compatibility. ",
+            "The '/get_{}' endpoint is deprecated and will be removed in a future version. ",
+            "Please use '/{}' instead."
+        ),
+        endpoint, endpoint, endpoint, endpoint
+    );
+
+    let old_url = format!("{}/get_{}", base_url, endpoint);
+    let mut req = HTTP_CLIENT.get(&old_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", old_url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            old_url
+        ));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", old_url, e))
 }
 
 /// Get server info from /server_info endpoint.
@@ -72,6 +109,13 @@ pub async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerI
         .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", server_info_url, e))?;
+
+    // If /server_info returns 404, fallback to /get_server_info for backward compatibility
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let json = get_json_fallback(base_url, "server_info", api_key).await?;
+        return serde_json::from_value(json)
+            .map_err(|e| format!("Failed to parse server info: {}", e));
+    }
 
     if !response.status().is_success() {
         return Err(format!(
@@ -103,6 +147,13 @@ pub async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInf
         .send()
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", model_info_url, e))?;
+
+    // If /model_info returns 404, fallback to /get_model_info for backward compatibility
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        let json = get_json_fallback(base_url, "model_info", api_key).await?;
+        return serde_json::from_value(json)
+            .map_err(|e| format!("Failed to parse model info: {}", e));
+    }
 
     if !response.status().is_success() {
         return Err(format!(
@@ -167,17 +218,23 @@ async fn fetch_grpc_metadata(
 pub struct DiscoverMetadataStep;
 
 #[async_trait]
-impl StepExecutor for DiscoverMetadataStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
-        let connection_mode: Arc<ConnectionMode> = context.get_or_err("connection_mode")?;
+impl StepExecutor<LocalWorkerWorkflowData> for DiscoverMetadataStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
+        let connection_mode =
+            context.data.connection_mode.as_ref().ok_or_else(|| {
+                WorkflowError::ContextValueNotFound("connection_mode".to_string())
+            })?;
 
         debug!(
             "Discovering metadata for {} ({:?})",
-            config.url, *connection_mode
+            config.url, connection_mode
         );
 
-        let (discovered_labels, detected_runtime) = match connection_mode.as_ref() {
+        let (discovered_labels, detected_runtime) = match connection_mode {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
 
@@ -192,6 +249,18 @@ impl StepExecutor for DiscoverMetadataStep {
                         server_info.served_model_name.filter(|s| !s.is_empty())
                     {
                         labels.insert("served_model_name".to_string(), served_model_name);
+                    }
+                    if let Some(tp_size) = server_info.tp_size {
+                        labels.insert("tp_size".to_string(), tp_size.to_string());
+                    }
+                    if let Some(dp_size) = server_info.dp_size {
+                        labels.insert("dp_size".to_string(), dp_size.to_string());
+                    }
+                    if let Some(load_balance_method) = server_info.load_balance_method {
+                        labels.insert("load_balance_method".to_string(), load_balance_method);
+                    }
+                    if let Some(disaggregation_mode) = server_info.disaggregation_mode {
+                        labels.insert("disaggregation_mode".to_string(), disaggregation_mode);
                     }
                 }
 
@@ -223,16 +292,18 @@ impl StepExecutor for DiscoverMetadataStep {
             (HashMap::new(), None)
         });
 
+        let url = config.url.clone();
         debug!(
             "Discovered {} metadata labels for {}",
             discovered_labels.len(),
-            config.url
+            url
         );
 
-        context.set("discovered_labels", discovered_labels);
+        // Update workflow data
+        context.data.discovered_labels = discovered_labels;
         if let Some(runtime) = detected_runtime {
             debug!("Detected runtime type: {}", runtime);
-            context.set("detected_runtime_type", runtime);
+            context.data.detected_runtime_type = Some(runtime);
         }
 
         Ok(StepResult::Success)

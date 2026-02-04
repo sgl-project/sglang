@@ -165,7 +165,7 @@ class MiMoV2ModelNextN(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 
@@ -211,11 +211,13 @@ class MiMoV2ModelNextN(nn.Module):
         )
         hidden_states_before_norm = None
         if not forward_batch.forward_mode.is_idle():
+            if forward_batch.return_hidden_states_before_norm:
+                hidden_states_before_norm = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
             if residual is not None:
-                hidden_states_before_norm = hidden_states + residual
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)
             else:
-                hidden_states_before_norm = hidden_states
                 hidden_states = self.final_layernorm(hidden_states)
 
         return hidden_states, hidden_states_before_norm
@@ -227,6 +229,7 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        draft_model_idx: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)

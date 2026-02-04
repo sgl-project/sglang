@@ -6,7 +6,6 @@
 # Copyright 2024 The TorchTune Authors.
 # Copyright 2025 The sglang-diffusion Authors.
 
-import contextlib
 from collections.abc import Callable, Generator
 from itertools import chain
 from typing import Any
@@ -26,6 +25,7 @@ from torch.nn.modules.module import _IncompatibleKeys
 from sglang.multimodal_gen.runtime.loader.utils import (
     get_param_names_mapping,
     hf_to_custom_state_dict,
+    set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -36,32 +36,14 @@ from sglang.multimodal_gen.utils import set_mixed_precision_policy
 logger = init_logger(__name__)
 
 
-# TODO(PY): move this to utils elsewhere
-@contextlib.contextmanager
-def set_default_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
-    """
-    Context manager to set torch's default dtype.
-
-    Args:
-        dtype (torch.dtype): The desired default dtype inside the context manager.
-
-    Returns:
-        ContextManager: context manager for setting default dtype.
-
-    Example:
-        >>> with set_default_dtype(torch.bfloat16):
-        >>>     x = torch.tensor([1, 2, 3])
-        >>>     x.dtype
-        torch.bfloat16
-
-
-    """
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(old_dtype)
+def _make_param_like(
+    actual_param: torch.nn.Parameter, tensor: torch.Tensor
+) -> torch.nn.Parameter:
+    cls = actual_param.__class__
+    new_param = cls.__new__(cls, tensor)
+    new_param.__dict__.update(actual_param.__dict__)
+    new_param.requires_grad = False
+    return new_param
 
 
 # TODO(PY): add compile option
@@ -79,6 +61,7 @@ def maybe_load_fsdp_model(
     fsdp_inference: bool = False,
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
+    strict: bool = True,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -96,7 +79,7 @@ def maybe_load_fsdp_model(
         mp_policy=mp_policy,
     )
 
-    with set_default_dtype(default_dtype), torch.device("meta"):
+    with set_default_torch_dtype(default_dtype), torch.device("meta"):
         model = model_cls(**init_params)
 
     # Check if we should use FSDP
@@ -138,7 +121,7 @@ def maybe_load_fsdp_model(
         weight_iterator,
         device,
         default_dtype,
-        strict=True,
+        strict=strict,
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
@@ -180,8 +163,6 @@ def shard_model(
             which modules to shard with FSDP.
         pin_cpu_memory (bool): If set to True, FSDP will pin the CPU memory of the offloaded parameters.
 
-    Raises:
-        ValueError: If no layer modules were sharded, indicating that no shard_condition was triggered.
     """
     if fsdp_shard_conditions is None or len(fsdp_shard_conditions) == 0:
         logger.warning(
@@ -243,10 +224,9 @@ def load_model_from_full_model_state_dict(
             * **missing_keys** is a list of str containing the missing keys
             * **unexpected_keys** is a list of str containing the unexpected keys
 
-    Raises:
-        NotImplementedError: If got FSDP with more than 1D.
     """
     meta_sd = model.state_dict()
+    param_dict = dict(model.named_parameters())
     sharded_sd = {}
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
@@ -254,13 +234,33 @@ def load_model_from_full_model_state_dict(
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
-            raise ValueError(
-                f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
-            )
+            if strict:
+                raise ValueError(
+                    f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
+                )
+            else:
+                logger.warning(
+                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
+                )
+                continue
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
-            # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-            sharded_tensor = full_tensor
+            actual_param = param_dict.get(target_param_name)
+            weight_loader = (
+                getattr(actual_param, "weight_loader", None)
+                if actual_param is not None
+                else None
+            )
+            if weight_loader is not None:
+                assert actual_param is not None
+                sharded_tensor = torch.empty_like(
+                    meta_sharded_param, device=device, dtype=param_dtype
+                )
+                temp_param = _make_param_like(actual_param, sharded_tensor)
+                weight_loader(temp_param, full_tensor)
+                sharded_tensor = temp_param.data
+            else:
+                sharded_tensor = full_tensor
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             sharded_tensor = distribute_tensor(
