@@ -206,6 +206,9 @@ def alloc_extend_naive(
                 last_loc[i] + 1 + pos_in_page[:num1].view(-1)
             )
 
+        if prefix_lens[i] + num1 == seq_lens[i]:
+            continue
+
         num2 = (
             seq_lens[i] // page_size - (prefix_lens[i] + page_size - 1) // page_size
         ) * page_size
@@ -217,6 +220,9 @@ def alloc_extend_naive(
             out_indices[start_pos[i] + num1 : start_pos[i] + num1 + num2] = (
                 pages.view(-1, 1) + pos_in_page.view(1, -1)
             ).view(-1)
+
+        if prefix_lens[i] + num1 + num2 == seq_lens[i]:
+            continue
 
         num3 = seq_lens[i] - seq_lens[i] // page_size * page_size
         if num3:
