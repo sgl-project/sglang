@@ -66,3 +66,26 @@ docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
 ```
 
 For detailed ROCm system configuration and installation from source, see [AMD GPUs](../../platforms/amd_gpu.md).
+
+## Platform-Specific: MUSA (Moore Threads GPUs)
+
+For Moore Threads GPUs (MTGPU) with the MUSA software stack:
+
+```bash
+# Clone the repository
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+
+# Install the Python packages
+pip install --upgrade pip
+rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+pip install -e "python[all_musa]"
+```
+
+Quick test:
+
+```bash
+sglang generate --model-path black-forest-labs/FLUX.1-dev \
+    --prompt "A logo With Bold Large text: SGL Diffusion" \
+    --save-output
+```

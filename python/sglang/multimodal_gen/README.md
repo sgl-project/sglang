@@ -16,7 +16,7 @@ SGLang Diffusion has the following features:
 
 ### AMD/ROCm Support
 
-SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [ROCm installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation_rocm.md) for setup instructions.
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [installation guide](https://github.com/sgl-project/sglang/tree/main/docs/diffusion/installation.md) for setup instructions.
 
 ### Moore Threads/MUSA Support
 
