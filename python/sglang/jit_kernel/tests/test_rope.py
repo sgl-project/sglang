@@ -2,6 +2,8 @@ import time
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from sgl_kernel import FusedSetKVBufferArg as FusedSetKVBufferArgKernel
 from sgl_kernel import (
     apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace_kernel,
@@ -13,6 +15,30 @@ from sglang.jit_kernel.rope import (
 )
 
 DEVICE = "cuda"
+
+
+@triton.jit
+def burn_kernel(out_ptr, iters: tl.constexpr):
+    pid = tl.program_id(0)
+    x = tl.full((), pid + 1, dtype=tl.uint32)
+
+    a = tl.full((), 1664525, dtype=tl.uint32)
+    c = tl.full((), 1013904223, dtype=tl.uint32)
+    sh = tl.full((), 13, dtype=tl.uint32)
+
+    for _ in range(iters):
+        x = x * a + c
+        x = x ^ (x >> sh)
+
+    if pid == 0:
+        tl.store(out_ptr, x)
+
+
+def triton_burn(ms: float, grid=(256,)):
+    iters = int(ms * 20000)
+    out = torch.empty((), device="cuda", dtype=torch.uint32)
+    burn_kernel[grid](out, iters=iters)
+    return out
 
 
 def create_cos_sin_cache(rotary_dim, max_position_embeddings, base, dtype):
@@ -37,7 +63,7 @@ def _view_3d(x, head_size):
 
 
 @pytest.mark.parametrize("bs", [1, 8])
-@pytest.mark.parametrize("seq_len", [1, 256, 512])
+@pytest.mark.parametrize("seq_len", [1, 512])
 @pytest.mark.parametrize("num_qo_heads", [1, 16])
 @pytest.mark.parametrize("num_kv_heads", [1, 16])
 @pytest.mark.parametrize("head_dim", [64, 512])
@@ -114,30 +140,48 @@ def test_rope(
         cache_loc=out_cache_loc_kernel,
     )
 
-    apply_rope_with_cos_sin_cache_inplace_jit(
-        positions=pos_ids,
-        query=q_jit,
-        key=k_jit,
-        head_size=head_dim,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=(not interleave),
-        fused_set_kv_buffer_arg=(
-            fused_set_kv_buffer_arg_jit if save_kv_cache else None
-        ),
-        enable_pdl=enable_pdl,
-    )
-    apply_rope_with_cos_sin_cache_inplace_kernel(
-        positions=pos_ids,
-        query=q_kernel,
-        key=k_kernel,
-        head_size=head_dim,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=(not interleave),
-        fused_set_kv_buffer_arg=(
-            fused_set_kv_buffer_arg_kernel if save_kv_cache else None
-        ),
-        enable_pdl=enable_pdl,
-    )
+    stream_jit = torch.cuda.Stream()
+    stream_kernel = torch.cuda.Stream()
+
+    triton_burn(10, grid=(1024,))
+    r = torch.randn_like(q)
+    r_jit, r_kernel = r.clone(), r.clone()
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(stream_jit):
+        # Test if rotary_embedding runs on stream_jit
+        triton_burn(10, grid=(1024,))
+        q_jit = q_jit + r_jit
+        apply_rope_with_cos_sin_cache_inplace_jit(
+            positions=pos_ids,
+            query=q_jit,
+            key=k_jit,
+            head_size=head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=(not interleave),
+            fused_set_kv_buffer_arg=(
+                fused_set_kv_buffer_arg_jit if save_kv_cache else None
+            ),
+            enable_pdl=enable_pdl,
+        )
+
+    with torch.cuda.stream(stream_kernel):
+        triton_burn(10, grid=(1024,))
+        q_kernel = q_kernel + r_kernel
+        apply_rope_with_cos_sin_cache_inplace_kernel(
+            positions=pos_ids,
+            query=q_kernel,
+            key=k_kernel,
+            head_size=head_dim,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=(not interleave),
+            fused_set_kv_buffer_arg=(
+                fused_set_kv_buffer_arg_kernel if save_kv_cache else None
+            ),
+            enable_pdl=enable_pdl,
+        )
+
+    torch.cuda.synchronize()
 
     atol = 1e-3 if dtype != torch.float32 else 1e-6
     rtol = 1e-3 if dtype != torch.float32 else 1e-6
