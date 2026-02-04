@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 
-register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 class BaseTestRadixCacheChunkedPrefill(CustomTestCase):
@@ -67,19 +67,16 @@ class BaseTestRadixCacheChunkedPrefill(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.65)
 
 class TestRadixCacheFalseChunkMinus1(BaseTestRadixCacheChunkedPrefill):
-    # Test class for disable_radix_cache=False, chunked_prefill_size=-1
     disable_radix_cache = False
     chunked_prefill_size = "-1"
 
 
 class TestRadixCacheTrueChunk128(BaseTestRadixCacheChunkedPrefill):
-    # Test class for disable_radix_cache=True, chunked_prefill_size=128
     disable_radix_cache = True
     chunked_prefill_size = "128"
 
 
 class TestRadixCacheTrueChunkMinus1(BaseTestRadixCacheChunkedPrefill):
-    # Test class for disable_radix_cache=True, chunked_prefill_size=-1
     disable_radix_cache = True
     chunked_prefill_size = "-1"
 
