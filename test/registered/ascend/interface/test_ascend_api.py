@@ -154,7 +154,6 @@ class TestAscendApi(CustomTestCase):
         self.assertEqual("req_2", response.json()[1]["meta_info"]["id"])
         self.assertIn("Japan", response.json()[1]["text"])
 
-
     def test_api_generate_temperature(self):
         # Verify the randomness of inference results at high temperature.
         response = requests.post(

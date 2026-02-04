@@ -32,6 +32,7 @@ class TestSkipTokenizerInit(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --skip-tokenizer-init
     """
+
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 
     @classmethod
@@ -224,7 +225,6 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     the streaming/non-streaming inference, parallel sampling, log probability return functions,
     and EOS Token termination trigger function all work properly.
     """
-
 
     model = QWEN2_5_VL_3B_INSTRUCT_WEIGHTS_PATH
 
