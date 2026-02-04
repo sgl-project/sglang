@@ -9,6 +9,7 @@ from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
+from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
@@ -23,6 +24,7 @@ from sglang.srt.configs.step3_vl import (
     Step3VisionEncoderConfig,
     Step3VLConfig,
 )
+from sglang.srt.configs.step3p5 import Step3p5Config
 
 __all__ = [
     "AfmoeConfig",
@@ -39,6 +41,7 @@ __all__ = [
     "Step3VisionEncoderConfig",
     "Olmo3Config",
     "KimiLinearConfig",
+    "KimiK25Config",
     "Qwen3NextConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
@@ -48,4 +51,5 @@ __all__ = [
     "NemotronH_Nano_VL_V2_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
+    "Step3p5Config",
 ]

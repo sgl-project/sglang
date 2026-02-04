@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 TEST_MODEL_MATRIX = {
-    "Qwen/Qwen2.5-7B-Instruct": {
+    "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct": {
         "accuracy": 0.85,
         "latency": 180,
         "output_throughput": 20,
