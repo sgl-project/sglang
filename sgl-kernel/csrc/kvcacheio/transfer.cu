@@ -3,8 +3,8 @@
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
-#include <cstdint>
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 #include <vector>
 
@@ -770,8 +770,8 @@ inline void transfer_kv_page_first_direct_impl(
     default_attrs.dstLocHint.id = 0;
     default_attrs.flags = 0;
 
-    const size_t num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) *
-                              static_cast<size_t>(is_mla ? 1 : 2);
+    const size_t num_copies =
+        static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
     std::vector<void*> batch_srcs;
     std::vector<void*> batch_dsts;
     std::vector<size_t> batch_sizes;
@@ -863,8 +863,8 @@ inline void transfer_kv_page_first_direct_impl(
     default_attrs.dstLocHint.id = device_id;
     default_attrs.flags = 0;
 
-    const size_t num_copies = static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) *
-                              static_cast<size_t>(is_mla ? 1 : 2);
+    const size_t num_copies =
+        static_cast<size_t>(num_pages) * static_cast<size_t>(num_layers) * static_cast<size_t>(is_mla ? 1 : 2);
     std::vector<void*> batch_srcs;
     std::vector<void*> batch_dsts;
     std::vector<size_t> batch_sizes;
