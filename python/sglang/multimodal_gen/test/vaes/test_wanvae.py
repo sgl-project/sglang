@@ -19,6 +19,8 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDistConv2d,
     WanResidualBlock,
     WanDistResidualBlock,
+    WanMidBlock,
+    WanDistMidBlock,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     init_distributed_environment,
@@ -540,6 +542,134 @@ def _test_wan_dist_residual_block(
 
     destroy_distributed_environment()
 
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("dim", [192])
+@pytest.mark.parametrize("height", [90])
+@pytest.mark.parametrize("width", [40])
+@pytest.mark.parametrize("ulysses_degree", [2, 4])
+@pytest.mark.parametrize("ring_degree", [1])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
+def test_wan_dist_mid_block(
+    batch_size: int,
+    dim: int,
+    height: int,
+    width: int,
+    ulysses_degree: int,
+    ring_degree: int,
+    dtype: torch.dtype,
+):
+    actual_output_file = tmpfile()
+
+    mid_block = WanMidBlock(dim, dropout=0.0, num_layers=1)
+    saved_model_file = tmpfile(mid_block.state_dict())
+    mid_block.eval().requires_grad_(False).to(device).to(dtype)
+
+    x = torch.randn(batch_size, dim, 1, height, width, dtype=dtype)
+    input_data_file = tmpfile(x)
+    x = x.to(device).to(dtype)
+
+    expected = mid_block(x)
+
+    sequence_parallel_size = ulysses_degree * ring_degree
+
+    mp.spawn(
+        _test_wan_dist_mid_block,
+        args=(
+            sequence_parallel_size,
+            saved_model_file,
+            dim,
+            input_data_file,
+            ulysses_degree,
+            ring_degree,
+            sequence_parallel_size,
+            actual_output_file,
+            dtype,
+        ),
+        nprocs=sequence_parallel_size,
+        join=True,
+    )
+
+    with open(actual_output_file, "rb") as f:
+        actual = torch.load(f)
+
+    expected_height = expected.shape[-2]
+    if actual.shape[-2] != expected_height:
+        actual = actual[..., :expected_height, :]
+
+    if dtype == torch.bfloat16 or dtype == torch.float16:
+        atol, rtol = 5e-2, 5e-2
+    elif dtype == torch.float32:
+        atol, rtol = 5e-3, 5e-3
+    else:
+        atol, rtol = 1e-5, 1e-5
+
+    assert_close(actual, expected, atol=atol, rtol=rtol)
+
+    clear_tmpfiles()
+
+def _test_wan_dist_mid_block(
+    local_rank: int,
+    world_size: int,
+    saved_model_file: str,
+    dim: int,
+    input_data_file: str,
+    ulysses_degree: int,
+    ring_degree: int,
+    sequence_parallel_size: int,
+    actual_output_file: str,
+    dtype: torch.dtype,
+):
+    set_envar({
+        "MASTER_ADDR": "localhost",
+        "MASTER_PORT": "43210",
+        "RANK": str(local_rank),
+        "LOCAL_RANK": str(local_rank),
+        "WORLD_SIZE": str(world_size)
+    })
+
+    torch.cuda.set_device(local_rank)
+    init_distributed_environment(
+        rank=local_rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        backend=backend
+    )
+
+    initialize_model_parallel(
+        data_parallel_size=1,
+        classifier_free_guidance_degree=1,
+        tensor_parallel_degree=1,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        sequence_parallel_degree=sequence_parallel_size,
+        backend=backend
+    )
+
+    global device
+    current_device = torch.device(f"{device}:{local_rank}")
+
+    dist_mid_block = WanDistMidBlock(dim, dropout=0.0, num_layers=1)
+    dist_mid_block.load_state_dict(torch.load(saved_model_file))
+    dist_mid_block = dist_mid_block.eval().requires_grad_(False).to(current_device).to(dtype)
+
+    x = torch.load(input_data_file).to(current_device).to(dtype)
+
+    padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
+    local_padded_height = (x.shape[-2] + padding_len) // world_size
+
+    x_local = torch.chunk(x, world_size, dim=-2)[local_rank]
+
+    out_local = dist_mid_block(x_local, x.shape[-2], local_padded_height)
+
+    if out_local.shape[-2] != local_padded_height:
+        out_local = sp_pad(out_local, padding_len, dim=-2)
+
+    actual = get_sp_group().all_gather(out_local, dim=-2)
+
+    if local_rank == 0:
+        torch.save(actual, actual_output_file)
+
+    destroy_distributed_environment()
 
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("height", [90])
