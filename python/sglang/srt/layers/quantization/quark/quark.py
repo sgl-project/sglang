@@ -475,7 +475,7 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
         """
         Use the output of create_weights and the QuarkScheme
         associated with the layer to apply the forward pass with the
-        layer input.  See LinearMethodBase for param details
+        fused MoE layer. See FusedMoEMethodBase for param details
 
         """
         scheme = layer.scheme
