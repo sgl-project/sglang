@@ -342,7 +342,7 @@ class T5Attention(nn.Module):
         if get_tp_world_size() > 1:
             rank = get_tp_rank()
             attn_bias = attn_bias[
-                :, rank * self.n_heads: (rank + 1) * self.n_heads, :, :
+                :, rank * self.n_heads : (rank + 1) * self.n_heads, :, :
             ]
 
         attn_output = self.attn(q, k, v, attn_bias)
@@ -679,9 +679,9 @@ class UMT5EncoderModel(TextEncoder):
             if "decoder" in name or "lm_head" in name:
                 continue
             for (
-                    param_name,
-                    weight_name,
-                    shard_id,
+                param_name,
+                weight_name,
+                shard_id,
             ) in self.config.arch_config.stacked_params_mapping:
                 if weight_name not in name:
                     continue
