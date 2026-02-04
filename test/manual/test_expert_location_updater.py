@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 from torch.multiprocessing import Process
 
 from sglang.srt.eplb import expert_location_updater
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase, find_available_port
 from sglang.utils import is_in_ci
 
@@ -61,7 +62,7 @@ class TestExpertLocationUpdater(CustomTestCase):
     def test_gpu(self):
         if is_in_ci():
             return
-        self._test_common(device="cuda")
+        self._test_common(device=get_device())
 
     def _test_common(self, device):
         infos = []
@@ -135,6 +136,8 @@ def _run_subprocess(
         )
         if device == "cuda":
             torch.cuda.set_device(f"cuda:{rank}")
+        if device == "xpu":
+            torch.xpu.set_device(f"xpu:{rank}")
 
         for info in infos:
             _execute_test(info, rank=rank, num_gpus=num_gpus, device=device)

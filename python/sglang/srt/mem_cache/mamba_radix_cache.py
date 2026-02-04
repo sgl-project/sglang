@@ -499,13 +499,6 @@ class MambaRadixCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
         """Cache request when it finishes."""
-        # for abort with prefix cache hit and before alloc is called
-        if req.req_pool_idx is None:
-            if req.mamba_pool_idx is not None:
-                self.req_to_token_pool.mamba_pool.free(req.mamba_pool_idx.unsqueeze(-1))
-                req.mamba_pool_idx = None
-            return
-
         kv_committed_len = req.pop_committed_kv_cache()
 
         if self.disable:
@@ -513,7 +506,7 @@ class MambaRadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
+            self.req_to_token_pool.free_mamba_cache(req)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -588,11 +581,11 @@ class MambaRadixCache(BasePrefixCache):
 
         free_mamba_cache = True if self.enable_mamba_extra_buffer else mamba_exist
 
-        self.req_to_token_pool.free(
-            req.req_pool_idx,
-            free_mamba_cache=free_mamba_cache,
-            mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
-        )
+        if free_mamba_cache:
+            self.req_to_token_pool.free_mamba_cache(
+                req,
+                mamba_ping_pong_track_buffer_to_keep=mamba_ping_pong_track_buffer_to_keep,
+            )
 
         self.dec_lock_ref(req.last_node)
 
@@ -1162,19 +1155,6 @@ class MambaRadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
-
-    def _collect_leaves(self) -> List[TreeNode]:
-        ret_list = []
-        stack = [self.root_node]
-
-        while stack:
-            cur_node = stack.pop()
-            if len(cur_node.children) == 0:
-                ret_list.append(cur_node)
-            else:
-                stack.extend(cur_node.children.values())
-
-        return ret_list
 
     def _collect_nontombstone_nodes(self) -> List[TreeNode]:
         ret_list = []
