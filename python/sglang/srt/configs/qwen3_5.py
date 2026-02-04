@@ -10,6 +10,14 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
     model_type = "qwen3_5_text"
     base_config_key = "text_config"
 
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        if self.rope_scaling is None:
+            self.rope_scaling = {}
+
 
 class Qwen3_5Config(PretrainedConfig):
     r"""
