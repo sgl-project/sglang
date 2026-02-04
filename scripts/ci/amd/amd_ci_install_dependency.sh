@@ -211,7 +211,7 @@ echo "[CI-AITER-CHECK] AITER version inside CI image: ${IMAGE_AITER_VERSION}"
 #############################################
 # 3. Decide rebuild
 #############################################
-NEED_REBUILD="false"
+NEED_REBUILD="true"
 
 if [[ "${IMAGE_AITER_VERSION}" == "none" ]]; then
     echo "[CI-AITER-CHECK] No AITER found in image"
@@ -247,6 +247,14 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         git fetch --all && \
         git checkout ${REPO_AITER_COMMIT} && \
         git submodule update --init --recursive
+    "
+
+    # Cherry-pick PR #1965: revert use ck rmsnorm because of residual_out accuracy
+    echo "[CI-AITER-CHECK] Cherry-picking PR #1965 (jun/revert_rmsnorm)..."
+    docker exec ci_sglang bash -c "
+        cd /sgl-workspace/aiter && \
+        git fetch origin jun/revert_rmsnorm && \
+        git cherry-pick FETCH_HEAD
     "
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
