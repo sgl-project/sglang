@@ -41,8 +41,8 @@ if not is_cpu():
         cutedsl_fused_sigmoid_gating_delta_rule_update,
     )
     from sglang.jit_kernel.cutedsl_gdn_transpose import (
-        cutedsl_fused_recurrent_gated_delta_rule_update, 
-        cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update
+        cutedsl_fused_recurrent_gated_delta_rule_update,
+        cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update,
     )
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -825,12 +825,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
         self.use_cutedsl_transpose = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get()
-        rank0_log(f"CuTe DSL GDN decode enabled: use_cutedsl: {use_cutedsl}, use_cutedsl_transpose: {self.use_cutedsl_transpose}")
+        rank0_log(
+            f"CuTe DSL GDN decode enabled: use_cutedsl: {use_cutedsl}, use_cutedsl_transpose: {self.use_cutedsl_transpose}"
+        )
         if use_cutedsl:
             self._decode_kernel_func = cutedsl_fused_sigmoid_gating_delta_rule_update
             self._verify_kernel_func = fused_recurrent_gated_delta_rule_update
         elif self.use_cutedsl_transpose:
-            self._decode_kernel_func = cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update
+            self._decode_kernel_func = (
+                cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update
+            )
             self._verify_kernel_func = cutedsl_fused_recurrent_gated_delta_rule_update
         else:
             self._decode_kernel_func = fused_sigmoid_gating_delta_rule_update
