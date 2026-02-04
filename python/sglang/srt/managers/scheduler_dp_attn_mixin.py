@@ -89,7 +89,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size, 6)
+        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
