@@ -52,6 +52,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
         )
         self._last_arguments = ""
         self.current_tool_id = -1
+        self._normal_text_sent = False
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
@@ -111,6 +112,18 @@ class DeepSeekV31Detector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # Extract normal text before tool call on first detection
+        normal_text_to_return = ""
+        if not self._normal_text_sent:
+            # Find the first tool call marker
+            idx = current_text.find("<｜tool▁call▁begin｜>")
+            if idx != -1:
+                normal_text_to_return = current_text[:idx].strip()
+                self._normal_text_sent = True
+                # Keep the buffer from the tool call marker onwards and continue processing
+                self._buffer = current_text[idx:]
+                current_text = self._buffer
+
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(
@@ -149,7 +162,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                
+
                 # Process arguments (whether first call or subsequent calls)
                 # If first call has arguments, they should also be processed in this call
                 if func_args_raw:
@@ -189,13 +202,15 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         else:
                             self._buffer = ""
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(
+                            normal_text=normal_text_to_return, calls=calls
+                        )
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text_to_return, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
