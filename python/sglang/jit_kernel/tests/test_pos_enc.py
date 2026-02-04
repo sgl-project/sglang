@@ -3,8 +3,34 @@ from typing import Optional, Tuple, Union
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.pos_enc import rotary_embedding
+
+
+@triton.jit
+def burn_kernel(out_ptr, iters: tl.constexpr):
+    pid = tl.program_id(0)
+    x = tl.full((), pid + 1, dtype=tl.uint32)
+
+    a = tl.full((), 1664525, dtype=tl.uint32)
+    c = tl.full((), 1013904223, dtype=tl.uint32)
+    sh = tl.full((), 13, dtype=tl.uint32)
+
+    for _ in range(iters):
+        x = x * a + c
+        x = x ^ (x >> sh)
+
+    if pid == 0:
+        tl.store(out_ptr, x)
+
+
+def triton_burn(ms: float, grid=(256,)):
+    iters = int(ms * 20000)
+    out = torch.empty((), device="cuda", dtype=torch.uint32)
+    burn_kernel[grid](out, iters=iters)
+    return out
 
 
 def create_test_inputs(
@@ -289,27 +315,43 @@ def test_correctness(
         device,
     )
     torch_rotary_emb.cos_sin_cache = cos_sin_cache
+    r = torch.randn_like(query)
 
     # Apply rotary embeddings
     query_jit, key_jit = query.clone(), key.clone()
     query_torch, key_torch = query.clone(), key.clone()
+    stream_jit = torch.get_device_module("cuda").Stream()
+    stream_kernel = torch.get_device_module("cuda").Stream()
 
     if key_is_none:
         key_jit = None
         key_torch = None
-    query_jit_out, key_jit_out = rotary_embedding(
-        positions=pos_ids,
-        query=query_jit,
-        key=key_jit,
-        head_size=head_size,
-        cos_sin_cache=cos_sin_cache,
-        is_neox=is_neox_style,
-    )
+    triton_burn(100.0, grid=(1024,))
 
-    query_torch_out, key_torch_out = torch_rotary_emb.forward_native(
-        positions=pos_ids, query=query_torch, key=key_torch
-    )
+    r_jit, r_torch = r.clone(), r.clone()
+    torch.cuda.synchronize()
 
+    with torch.cuda.stream(stream_jit):
+        # Test if rotary_embedding runs on stream_jit
+        triton_burn(100.0, grid=(1024,))
+        query_jit = query_jit + r_jit
+        query_jit_out, key_jit_out = rotary_embedding(
+            positions=pos_ids,
+            query=query_jit,
+            key=key_jit,
+            head_size=head_size,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox_style,
+        )
+
+    with torch.cuda.stream(stream_kernel):
+        triton_burn(100.0, grid=(1024,))
+        query_torch = query_torch + r_torch
+        query_torch_out, key_torch_out = torch_rotary_emb.forward_native(
+            positions=pos_ids, query=query_torch, key=key_torch
+        )
+
+    torch.cuda.synchronize()
     compare_results(query_jit_out, query_torch_out, dtype)
     compare_results(key_jit_out, key_torch_out, dtype)
 

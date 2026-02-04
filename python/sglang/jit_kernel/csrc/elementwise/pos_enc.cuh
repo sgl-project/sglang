@@ -137,8 +137,9 @@ void launch_kernel(
     int num_kv_heads,
     int head_size,
     dim3 grid,
-    dim3 block) {
-  rotary_embedding_kernel<scalar_t, IS_NEOX><<<grid, block, 0>>>(
+    dim3 block,
+    const cudaStream_t stream) {
+  rotary_embedding_kernel<scalar_t, IS_NEOX><<<grid, block, 0, stream>>>(
       positions_data_ptr,
       static_cast<scalar_t*>(query_ptr),
       static_cast<scalar_t*>(key_ptr),
@@ -181,7 +182,8 @@ void dispatch_by_dtype(
     int num_kv_heads,
     int head_size,
     dim3 grid,
-    dim3 block) {
+    dim3 block,
+    const cudaStream_t stream) {
   using namespace host;
   DISPATCH_DTYPE(
       query_dtype.code,
@@ -199,7 +201,8 @@ void dispatch_by_dtype(
       num_kv_heads,
       head_size,
       grid,
-      block)
+      block,
+      stream);
 }
 
 struct RotaryEmbeddingKernel {
@@ -264,6 +267,9 @@ struct RotaryEmbeddingKernel {
     dim3 grid(num_tokens);
     dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
 
+    auto device = query.device();
+    const cudaStream_t stream = LaunchKernel::resolve_device(device);
+
     auto positions_data_ptr = static_cast<const int64_t*>(positions.data_ptr());
 
     if (is_neox) {
@@ -281,7 +287,8 @@ struct RotaryEmbeddingKernel {
           num_kv_heads,
           head_size,
           grid,
-          block);
+          block,
+          stream);
     } else {
       dispatch_by_dtype<false>(
           positions_data_ptr,
@@ -297,7 +304,8 @@ struct RotaryEmbeddingKernel {
           num_kv_heads,
           head_size,
           grid,
-          block);
+          block,
+          stream);
     }
   }
 };
