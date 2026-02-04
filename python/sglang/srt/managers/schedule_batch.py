@@ -536,6 +536,7 @@ class Req:
         bootstrap_room: Optional[int] = None,
         disagg_mode: Optional[DisaggregationMode] = None,
         data_parallel_rank: Optional[int] = None,
+        remote_dp_rank: Optional[int] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -786,6 +787,9 @@ class Req:
 
         # For data parallel rank routing
         self.data_parallel_rank: Optional[int] = data_parallel_rank
+
+        # For disaggregation
+        self.remote_dp_rank: Optional[int] = remote_dp_rank
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
