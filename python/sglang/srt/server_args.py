@@ -418,7 +418,7 @@ class ServerArgs:
     load_balance_method: str = "auto"
 
     attn_cp_size: int = 1
-    moe_cp_size: int = 1
+    moe_dp_size: int = 1
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -2052,20 +2052,20 @@ class ServerArgs:
             ), "tp_size must be divisible by dp_size * attn_cp_size"
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
-        if self.moe_cp_size > 1:
+        if self.moe_dp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
-                self.tp_size % self.moe_cp_size == 0
-            ), "tp_size must be divisible by moe_cp_size"
+                self.tp_size % self.moe_dp_size == 0
+            ), "tp_size must be divisible by moe_dp_size"
             assert (
-                self.ep_size * self.moe_cp_size <= self.tp_size
-            ), "ep_size * moe_cp_size must be less than or equal to tp_size"
+                self.ep_size * self.moe_dp_size <= self.tp_size
+            ), "ep_size * moe_dp_size must be less than or equal to tp_size"
             assert self.pp_size == 1, "PP is not supported with context parallelism"
 
             if self.ep_size > 1:
                 assert (
-                    self.ep_size * self.moe_cp_size == self.tp_size
-                ), "ep_size * moe_cp_size must be equal to tp_size"
+                    self.ep_size * self.moe_dp_size == self.tp_size
+                ), "ep_size * moe_dp_size must be equal to tp_size"
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -3273,11 +3273,11 @@ class ServerArgs:
             help="The attention context parallelism size.",
         )
         parser.add_argument(
-            "--moe-context-parallel-size",
-            "--moe-cp-size",
+            "--moe-data-parallel-size",
+            "--moe-dp-size",
             type=int,
-            default=ServerArgs.moe_cp_size,
-            help="The moe context parallelism size.",
+            default=ServerArgs.moe_dp_size,
+            help="The moe data parallelism size.",
         )
         parser.add_argument(
             "--pipeline-parallel-size",
@@ -5028,7 +5028,7 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.pp_size = args.pipeline_parallel_size
         args.attn_cp_size = args.attention_context_parallel_size
-        args.moe_cp_size = args.moe_context_parallel_size
+        args.moe_dp_size = args.moe_data_parallel_size
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 

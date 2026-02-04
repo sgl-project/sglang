@@ -8,7 +8,7 @@ groups for different parallelism configurations including:
 - Attention context parallelism (attn_cp)
 - Attention data parallelism (attn_dp)
 - MoE expert parallelism (EP)
-- MoE context parallelism (moe_cp)
+- MoE data parallelism (moe_dp)
 
 These tests call the ACTUAL initialize_model_parallel() function with mocked
 distributed backend to verify the group construction logic.
@@ -155,14 +155,14 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
     Test parallel group construction for 8 GPU configuration with:
     - tensor_model_parallel_size = 8
     - expert_model_parallel_size = 4
-    - moe_context_model_parallel_size = 2
+    - moe_data_model_parallel_size = 2
 
     Expected groups:
         1 tensor model-parallel group:
             [g0, g1, g2, g3, g4, g5, g6, g7]
         2 MoE expert-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]
-        4 MoE context-parallel groups:
+        4 MoE data-parallel groups:
             [g0, g4], [g1, g5], [g2, g6], [g3, g7]
     """
     world_size = 8
@@ -171,7 +171,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
     with patch.object(parallel_state, "_WORLD", None), patch.object(
         parallel_state, "_TP", None
     ), patch.object(parallel_state, "_MOE_EP", None), patch.object(
-        parallel_state, "_MOE_CP", None
+        parallel_state, "_MOE_DP", None
     ), patch.object(
         parallel_state, "_MOE_TP", None
     ), patch.object(
@@ -215,7 +215,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
                 tensor_model_parallel_size=8,
                 expert_model_parallel_size=4,
                 pipeline_model_parallel_size=1,
-                moe_context_model_parallel_size=2,
+                moe_data_model_parallel_size=2,
             )
 
             # Verify TP groups
@@ -245,20 +245,20 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
                 moe_ep_groups == expected_moe_ep
             ), f"Wrong MOE_EP groups: {moe_ep_groups}"
 
-            # Verify MOE_CP groups
-            moe_cp_groups = created_groups.get("moe_cp", [])
+            # Verify MOE_DP groups
+            moe_dp_groups = created_groups.get("moe_dp", [])
             assert (
-                len(moe_cp_groups) == 4
-            ), f"Expected 4 MOE_CP groups, got {len(moe_cp_groups)}"
-            expected_moe_cp = [
+                len(moe_dp_groups) == 4
+            ), f"Expected 4 MOE_DP groups, got {len(moe_dp_groups)}"
+            expected_moe_dp = [
                 [0, 4],
                 [1, 5],
                 [2, 6],
                 [3, 7],
             ]
             assert (
-                moe_cp_groups == expected_moe_cp
-            ), f"Wrong MOE_CP groups: {moe_cp_groups}"
+                moe_dp_groups == expected_moe_dp
+            ), f"Wrong MOE_DP groups: {moe_dp_groups}"
 
             print("TP=8, MoE EP=4, MoE CP=2 group construction verified")
 

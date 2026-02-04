@@ -43,7 +43,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         dp_rank: int,
         moe_ep_rank: int,
         attn_cp_rank: int,
-        moe_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -56,7 +56,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.attn_cp_rank = attn_cp_rank
-        self.moe_cp_rank = moe_cp_rank
+        self.moe_dp_rank = moe_dp_rank
 
         # Args for easy access
         self.device = server_args.device
@@ -94,7 +94,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
-                moe_cp_rank=moe_cp_rank,
+                moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
@@ -138,7 +138,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         dp_rank: Optional[int],
         moe_ep_rank: int,
         attn_cp_rank: int,
-        moe_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -171,7 +171,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             dp_rank,
             moe_ep_rank,
             attn_cp_rank,
-            moe_cp_rank,
+            moe_dp_rank,
             nccl_port,
             target_worker,
         )

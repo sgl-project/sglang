@@ -940,20 +940,20 @@ def _launch_scheduler_processes(
 
                 # Parallelism hierarchy (outermost to innermost):
                 # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
-                # - MoE: Global(TP) -> MOE_CP -> EP -> MOE_TP (innermost)
+                # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
                 attn_tp_size = (
                     server_args.tp_size // attn_dp_size // server_args.attn_cp_size
                 )
                 attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-                moe_cp_rank = tp_rank // (
-                    server_args.tp_size // server_args.moe_cp_size
+                moe_dp_rank = tp_rank // (
+                    server_args.tp_size // server_args.moe_dp_size
                 )
                 moe_ep_rank = (
                     tp_rank
-                    % (server_args.tp_size // server_args.moe_cp_size)
+                    % (server_args.tp_size // server_args.moe_dp_size)
                     // (
                         server_args.tp_size
-                        // server_args.moe_cp_size
+                        // server_args.moe_dp_size
                         // server_args.ep_size
                     )
                 )
@@ -967,7 +967,7 @@ def _launch_scheduler_processes(
                             gpu_id,
                             tp_rank,
                             attn_cp_rank,
-                            moe_cp_rank,
+                            moe_dp_rank,
                             moe_ep_rank,
                             pp_rank,
                             None,

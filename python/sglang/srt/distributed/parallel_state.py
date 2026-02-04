@@ -1425,14 +1425,14 @@ def get_attn_cp_group() -> GroupCoordinator:
     return _ATTN_CP
 
 
-_MOE_CP: Optional[GroupCoordinator] = None
+_MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
 
-def get_moe_cp_group() -> GroupCoordinator:
-    assert _MOE_CP is not None, "moe context model parallel group is not initialized"
-    return _MOE_CP
+def get_moe_dp_group() -> GroupCoordinator:
+    assert _MOE_DP is not None, "moe data parallel group is not initialized"
+    return _MOE_DP
 
 
 def get_moe_ep_group() -> GroupCoordinator:
@@ -1587,7 +1587,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
-    moe_context_model_parallel_size: int = 1,
+    moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
 ) -> None:
@@ -1605,7 +1605,7 @@ def initialize_model_parallel(
             parallelism.
         attention_context_model_parallel_size: number of GPUs used for attention context
             parallelism.
-        moe_context_model_parallel_size: number of GPUs used for moe context
+        moe_data_model_parallel_size: number of GPUs used for moe data
             parallelism.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
@@ -1618,8 +1618,8 @@ def initialize_model_parallel(
             [g0, g2, g4, g6], [g1, g3, g5, g7]
 
     Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
-    attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe context
-    parallelism (moe_cp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
+    attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
+    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
     function will create the following groups:
         2 tensor model-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]
@@ -1627,7 +1627,7 @@ def initialize_model_parallel(
             [g0, g4], [g1, g5], [g2, g6], [g3, g7]
         2 moe expert-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]
-        4 moe context-parallel groups:
+        4 moe data-parallel groups:
             [g0, g4], [g1, g5], [g2, g6], [g3, g7]
 
     Note that for efficiency, the caller should make sure adjacent ranks
@@ -1757,14 +1757,14 @@ def initialize_model_parallel(
         )
 
     moe_ep_size = expert_model_parallel_size
-    moe_cp_size = moe_context_model_parallel_size
-    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_cp_size
+    moe_dp_size = moe_data_model_parallel_size
+    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
 
-    global _MOE_CP
-    assert _MOE_CP is None, "moe context model parallel group is already initialized"
+    global _MOE_DP
+    assert _MOE_DP is None, "moe data parallel group is already initialized"
     # gpus_per_pp_stage = tensor_model_parallel_size * attention_context_model_parallel_size
-    if moe_cp_size == tensor_model_parallel_size:
-        _MOE_CP = _TP
+    if moe_dp_size == tensor_model_parallel_size:
+        _MOE_DP = _TP
     else:
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
@@ -1775,11 +1775,11 @@ def initialize_model_parallel(
                 ) * tensor_model_parallel_size + tp_ep_combined_idx
                 ranks = list(range(st, en, moe_tp_size * moe_ep_size))
                 group_ranks.append(ranks)
-        _MOE_CP = init_model_parallel_group(
+        _MOE_DP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            group_name="moe_cp",
+            group_name="moe_dp",
         )
 
     global _MOE_EP
@@ -1790,11 +1790,11 @@ def initialize_model_parallel(
         # TODO(ch-wan): use split_group to save memory
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for moe_cp_idx in range(moe_cp_size):
+            for moe_dp_idx in range(moe_dp_size):
                 for moe_tp_idx in range(moe_tp_size):
                     st = (
                         tp_group_idx * tensor_model_parallel_size
-                        + moe_cp_idx * moe_ep_size * moe_tp_size
+                        + moe_dp_idx * moe_ep_size * moe_tp_size
                         + moe_tp_idx
                     )
                     en = st + moe_ep_size * moe_tp_size
@@ -1815,14 +1815,14 @@ def initialize_model_parallel(
         # TODO(ch-wan): use split_group to save memory
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
-            for ep_cp_combined_idx in range(moe_ep_size * moe_cp_size):
+            for ep_dp_combined_idx in range(moe_ep_size * moe_dp_size):
                 st = (
                     tp_group_idx * tensor_model_parallel_size
-                    + ep_cp_combined_idx * moe_tp_size
+                    + ep_dp_combined_idx * moe_tp_size
                 )
                 en = (
                     tp_group_idx * tensor_model_parallel_size
-                    + (ep_cp_combined_idx + 1) * moe_tp_size
+                    + (ep_dp_combined_idx + 1) * moe_tp_size
                 )
                 ranks = list(range(st, en))
                 group_ranks.append(ranks)
@@ -2020,15 +2020,15 @@ def get_pipeline_model_parallel_rank():
     return get_pp_group().rank_in_group
 
 
-# MOE_CP
-def get_moe_context_model_parallel_world_size():
-    """Return world size for the moe context model parallel group."""
-    return get_moe_cp_group().world_size
+# MOE_DP
+def get_moe_data_parallel_world_size():
+    """Return world size for the moe data parallel group."""
+    return get_moe_dp_group().world_size
 
 
-def get_moe_context_model_parallel_rank():
-    """Return my rank for the moe context model parallel group."""
-    return get_moe_cp_group().rank_in_group
+def get_moe_data_parallel_rank():
+    """Return my rank for the moe data parallel group."""
+    return get_moe_dp_group().rank_in_group
 
 
 # MOE_EP
@@ -2080,10 +2080,10 @@ def destroy_model_parallel():
         _ATTN_CP.destroy()
     _ATTN_CP = None
 
-    global _MOE_CP
-    if _MOE_CP:
-        _MOE_CP.destroy()
-    _MOE_CP = None
+    global _MOE_DP
+    if _MOE_DP:
+        _MOE_DP.destroy()
+    _MOE_DP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]

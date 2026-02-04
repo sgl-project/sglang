@@ -289,7 +289,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         attn_cp_rank: Optional[int] = None,
-        moe_cp_rank: Optional[int] = None,
+        moe_dp_rank: Optional[int] = None,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
@@ -308,8 +308,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.pp_size = pp_size
         self.attn_cp_rank = attn_cp_rank
         self.attn_cp_size = server_args.attn_cp_size
-        self.moe_cp_rank = moe_cp_rank
-        self.moe_cp_size = server_args.moe_cp_size
+        self.moe_dp_rank = moe_dp_rank
+        self.moe_dp_size = server_args.moe_dp_size
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
@@ -804,7 +804,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 attention_context_model_parallel_size=self.attn_cp_size,
-                moe_context_model_parallel_size=self.moe_cp_size,
+                moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
             )
             initialize_dp_attention(

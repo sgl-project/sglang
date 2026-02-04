@@ -213,7 +213,7 @@ class TpModelWorker(BaseTpWorker):
         moe_ep_rank: int,
         pp_rank: int,
         attn_cp_rank: int,
-        moe_cp_rank: int,
+        moe_dp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
@@ -237,7 +237,7 @@ class TpModelWorker(BaseTpWorker):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.attn_cp_rank = attn_cp_rank
-        self.moe_cp_rank = moe_cp_rank
+        self.moe_dp_rank = moe_dp_rank
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
