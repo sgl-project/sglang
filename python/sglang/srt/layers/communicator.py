@@ -372,6 +372,15 @@ class LayerCommunicator:
                 context=self._context,
             )
         )
+        self._prepare_mlp_communication_type = (
+            CommunicateWithAllReduceAndLayerNormFn.compute_communication_type(
+                hidden_states_input_mode=self.layer_scatter_modes.attn_mode,
+                residual_input_mode=self.layer_scatter_modes.layer_input_mode,
+                hidden_states_output_mode=self.layer_scatter_modes.mlp_mode,
+                residual_output_mode=self.layer_scatter_modes.middle_residual_mode,
+                context=self._context,
+            )
+        )
         self._communicate_summable_tensor_pair_fn = (
             CommunicateSummableTensorPairFn.get_fn(
                 hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
@@ -549,6 +558,9 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_mlp_communication_type(self):
+        return self._prepare_mlp_communication_type
+
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
@@ -697,7 +709,43 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
+        communication_type = (
+            CommunicateWithAllReduceAndLayerNormFn.compute_communication_type(
+                hidden_states_input_mode,
+                residual_input_mode,
+                hidden_states_output_mode,
+                residual_output_mode,
+                context,
+            )
+        )
 
+        if communication_type == "simple":
+            return CommunicateWithAllReduceAndLayerNormFn._simple
+
+        if communication_type == "gather_hidden_states_and_residual":
+            return partial(
+                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
+                residual_input_mode=residual_input_mode,
+            )
+
+        if communication_type == "scatter_hidden_states_and_residual":
+            return partial(
+                CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
+                residual_input_mode=residual_input_mode,
+            )
+
+        raise NotImplementedError(
+            f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
+        )
+
+    @staticmethod
+    def compute_communication_type(
+        hidden_states_input_mode: ScatterMode,
+        residual_input_mode: ScatterMode,
+        hidden_states_output_mode: ScatterMode,
+        residual_output_mode: ScatterMode,
+        context: CommunicateContext,
+    ):
         if (
             context.is_same_group_size(
                 hidden_states_input_mode, hidden_states_output_mode
@@ -705,7 +753,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and context.is_same_group_size(residual_input_mode, residual_output_mode)
             and context.attn_tp_size == 1
         ):
-            return CommunicateWithAllReduceAndLayerNormFn._simple
+            return "simple"
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -715,10 +763,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
-            return partial(
-                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual,
-                residual_input_mode=residual_input_mode,
-            )
+            return "gather_hidden_states_and_residual"
 
         if (
             (hidden_states_input_mode == ScatterMode.TP_ATTN_FULL)
@@ -728,14 +773,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):
-            return partial(
-                CommunicateWithAllReduceAndLayerNormFn._scatter_hidden_states_and_residual,
-                residual_input_mode=residual_input_mode,
-            )
+            return "scatter_hidden_states_and_residual"
 
-        raise NotImplementedError(
-            f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
-        )
+        return "NotImplemented"
 
     @staticmethod
     def _simple(

@@ -2330,6 +2330,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+        # is_dp_mlp means prepare_mlp reduce scatters on token dimension, which will not be gathered until
+        # prepare_attn in next layer.
+        # If true, neither this layer nor the next layer should reduce on the scattered mlp output.
+        self.is_dp_mlp = (
+            self.layer_communicator.prepare_mlp_communication_type()
+            == "scatter_hidden_states_and_residual"
+        )
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -2394,7 +2402,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            not self.is_dp_mlp
+            and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
@@ -2418,7 +2427,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_allreduce_fusion:
+        if not self.is_dp_mlp and not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
