@@ -1,9 +1,6 @@
-"""AMD Kimi-K2.5 MMMU Evaluation Test (8-GPU)
+"""AMD Kimi-K2.5 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests moonshotai/Kimi-K2.5 with MMMU benchmark on MI325.
-
-Kimi-K2.5 is a multimodal model (VLM) based on DeepSeek V3 architecture
-with vision capabilities.
+Tests moonshotai/Kimi-K2.5 with GSM8K few-shot benchmark on MI325.
 
 Registry: nightly-amd-accuracy-8-gpu-kimi-k25 suite
 """
@@ -16,7 +13,7 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -32,11 +29,11 @@ register_amd_ci(
 
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"
 SERVER_LAUNCH_TIMEOUT = 3600
-ACCURACY_THRESHOLD = 0.50  # Conservative threshold for MMMU benchmark
+ACCURACY_THRESHOLD = 0.94
 
 
 class TestKimiK25EvalAMD(CustomTestCase):
-    """Kimi-K2.5 MMMU Evaluation Test for AMD MI325."""
+    """Kimi-K2.5 GSM8K Completion Evaluation Test for AMD MI325."""
 
     @classmethod
     def setUpClass(cls):
@@ -68,36 +65,37 @@ class TestKimiK25EvalAMD(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_kimi_k25_mmmu_accuracy(self):
-        """Test Kimi-K2.5 with MMMU benchmark."""
+    def test_kimi_k25_gsm8k_accuracy(self):
+        """Test Kimi-K2.5 with GSM8K few-shot completion benchmark."""
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
-            base_url=self.base_url,
-            model=KIMI_K25_MODEL_PATH,
-            eval_name="mmmu",
-            num_examples=100,
-            num_threads=64,
-            max_tokens=30,
+            num_shots=8,
+            data_path=None,
+            num_questions=1319,
+            parallel=1319,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
         )
-        metrics = run_eval(args)
-        score = metrics["score"]
+        metrics = run_eval_few_shot_gsm8k(args)
+        acc = metrics["accuracy"]
 
-        passed = score >= ACCURACY_THRESHOLD
+        passed = acc >= ACCURACY_THRESHOLD
         status = "✅ PASS" if passed else "❌ FAIL"
-        print(f"  score={score:.3f} threshold={ACCURACY_THRESHOLD} {status}")
+        print(f"  accuracy={acc:.3f} threshold={ACCURACY_THRESHOLD} {status}")
 
         if is_in_ci():
             summary = "### Kimi-K2.5 Model (MI325)\n\n"
-            summary += "| Model | TP | Score | Threshold | Status |\n"
-            summary += "| ----- | -- | ----- | --------- | ------ |\n"
-            summary += f"| {KIMI_K25_MODEL_PATH} | 8 | {score:.3f} | {ACCURACY_THRESHOLD} | {status} |\n"
+            summary += "| Model | TP | Accuracy | Threshold | Status |\n"
+            summary += "| ----- | -- | -------- | --------- | ------ |\n"
+            summary += f"| {KIMI_K25_MODEL_PATH} | 8 | {acc:.3f} | {ACCURACY_THRESHOLD} | {status} |\n"
             write_github_step_summary(summary)
 
         self.assertGreaterEqual(
-            score,
+            acc,
             ACCURACY_THRESHOLD,
-            f"Kimi-K2.5 score {score:.3f} below threshold {ACCURACY_THRESHOLD}",
+            f"Kimi-K2.5 accuracy {acc:.3f} below threshold {ACCURACY_THRESHOLD}",
         )
 
 
