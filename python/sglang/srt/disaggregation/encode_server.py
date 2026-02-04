@@ -393,22 +393,6 @@ class MMEncoder:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
 
-    async def _convert_frames(self, vr):
-        # TODO: support sample_frames to reduce memory usage
-        total_frames, video_fps = len(vr), vr.get_avg_fps()
-        video_meta_data = {
-            "total_num_frames": total_frames,
-            "fps": video_fps,
-            "duration": total_frames / video_fps,
-        }
-        frames = []
-        for fi in range(total_frames):
-            frame = vr[int(fi)]
-            img_np = frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
-            frame_t = torch.from_numpy(img_np).permute(2, 0, 1)
-            frames.append(frame_t)
-        return frames, video_meta_data
-
     async def _flatten_and_load_videos(self, mm_items):
         if not isinstance(mm_items, (list, tuple)):
             mm_items = [mm_items]
@@ -432,15 +416,9 @@ class MMEncoder:
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs
         else:
-            # fallback to original HF video sample logic for other models
-            video_processed = [
-                await self._convert_frames(video) for video in video_items
-            ]
-            videos, video_metadata = map(list, zip(*video_processed))
-            video_processor_kwargs["do_sample_frames"] = True
-            if video_metadata:
-                video_processor_kwargs["video_metadata"] = video_metadata
-            return videos, video_processor_kwargs
+            raise NotImplementedError(
+                f"Video processing is not supported for {self.model_type} model."
+            )
 
     async def _flatten_and_load_data_by_modality(self, mm_items, modality):
         """
@@ -627,8 +605,9 @@ class MMEncoder:
             mm_inputs, mm_item, get_feature_fn = await self._process_mm_items(
                 mm_items, modality
             )
+        except NotImplementedError as e:
+            raise InternalError(f"Not implemented error: {str(e)}")
         except Exception as e:
-            # TODO: need to specify the error code
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
         try:
             # support mm_cache

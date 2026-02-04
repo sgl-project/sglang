@@ -2493,6 +2493,20 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
+        # Validate model type: only support Qwen models for now
+        hf_config = self.get_model_config().hf_config
+        model_arch = hf_config.architectures[0]
+        if (self.encoder_only or self.language_only) and model_arch not in [
+            "Qwen2VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3OmniMoeForConditionalGeneration",
+        ]:
+            raise ValueError(
+                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+            )
+
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
