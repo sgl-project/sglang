@@ -17,6 +17,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNorm,
     RMSNorm,
@@ -28,7 +29,6 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
 )
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
-    fuse_scale_shift_kernel,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
@@ -350,7 +350,7 @@ class QwenEmbedLayer3DRope(nn.Module):
             if idx != layer_num:
                 video_freq = self._compute_video_freqs(frame, height, width, idx)
             else:
-                ### For the condition image, we set the layer index to -1
+                # For the condition image, we set the layer index to -1
                 video_freq = self._compute_condition_freqs(frame, height, width)
             video_freq = video_freq.to(device)
             vid_freqs.append(video_freq)
@@ -673,6 +673,8 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
+        # Utils
+        self.fuse_mul_add = MulAdd()
 
     def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
@@ -714,14 +716,14 @@ class QwenImageTransformerBlock(nn.Module):
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
                 return (
-                    fuse_scale_shift_kernel(x, scale_result, shift_result),
+                    self.fuse_mul_add(x, scale_result, shift_result, k=1.0),
                     gate_result,
                 )
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-            return fuse_scale_shift_kernel(x, scale_result, shift_result), gate_result
+            return self.fuse_mul_add(x, scale_result, shift_result, k=1.0), gate_result
 
     def forward(
         self,
@@ -759,8 +761,10 @@ class QwenImageTransformerBlock(nn.Module):
         # 4. Splits results back to separate streams
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
-            hidden_states=img_modulated,  # Image stream (will be processed as "sample")
-            encoder_hidden_states=txt_modulated,  # Text stream (will be processed as "context")
+            # Image stream (will be processed as "sample")
+            hidden_states=img_modulated,
+            # Text stream (will be processed as "context")
+            encoder_hidden_states=txt_modulated,
             encoder_hidden_states_mask=encoder_hidden_states_mask,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
@@ -780,13 +784,15 @@ class QwenImageTransformerBlock(nn.Module):
             img_normed2, img_mod2, modulate_index
         )
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
 
         # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        encoder_hidden_states = self.fuse_mul_add(
+            txt_mlp_output, txt_gate2, encoder_hidden_states
+        )
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
