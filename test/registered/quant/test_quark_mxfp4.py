@@ -118,7 +118,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
 
 
 class TestFP8ToMXFP4Dense(TestOnlineQuantizationMemoryLoad):
-    model = "/mnt/fxmarty/Qwen_Qwen3-8B-FP8"
+    model = "Qwen/Qwen3-8B-FP8"
 
     def test_peak_memory(self):
         # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1)
@@ -138,7 +138,7 @@ class TestFP8ToMXFP4DenseTP2(TestFP8ToMXFP4Dense):
 
 
 class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
-    model = "/mnt/fxmarty/Qwen_Qwen3-30B-A3B-Instruct-2507-FP8"
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
     tp = 1
 
     def test_peak_memory(self):
