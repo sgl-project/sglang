@@ -38,6 +38,7 @@ from sglang.srt.layers.moe.moe_runner.triton import (
 )
 from sglang.srt.utils import is_cuda, is_hip
 
+
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
@@ -61,15 +62,11 @@ class LoRAInfo:
     )  # [num_loras, num_experts, max_rank, intermediate_dim]
     down_lora_b_weights: torch.Tensor  # [num_loras, num_experts, hidden_dim, max_rank]
 
-    # Dispatch info (sorted by expert)
-    token_ids: torch.Tensor  # [num_dispatched] - original token indices
-    expert_ids: torch.Tensor  # [num_dispatched] - expert IDs
-    lora_ids: torch.Tensor  # [num_dispatched] - LoRA adapter IDs
-    token_lora_mapping: torch.Tensor  # [num_tokens] - LoRA adapter ID for each token
+    # Per-token LoRA adapter ID [num_tokens]
+    token_lora_mapping: torch.Tensor
 
     # LoRA config per adapter
     lora_ranks: torch.Tensor  # [num_loras]
-    lora_scalings: torch.Tensor  # [num_loras]
     adapter_enabled: torch.Tensor  # [num_loras] - which adapters are enabled
     max_lora_rank: int  # Maximum LoRA rank across all adapters
 
@@ -215,7 +212,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             dtype=hidden_states.dtype,
         )
 
-
         invoke_fused_moe_kernel(
             hidden_states,
             w13,
@@ -263,7 +259,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         # Initialize output tensors (using torch.empty like the reference implementation)
         device = topk_ids.device
-        # TODO: Jonahbernard: check if we can allocate these tensors in LoRAInfo object itself and reuse them for each layer
         sorted_token_ids_lora = torch.empty(
             (max_loras * max_num_tokens_padded,),
             dtype=torch.int32,
@@ -284,7 +279,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         moe_lora_ops.moe_lora_align_block_size(
             topk_ids,
-            token_lora_mapping.to(torch.int32),
+            token_lora_mapping,
             int(lora_info.num_experts),
             int(block_size_m),
             int(max_loras),
@@ -293,12 +288,14 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             sorted_token_ids_lora,
             expert_ids_lora,
             num_tokens_post_padded_lora,
-            lora_info.adapter_enabled.to(torch.int32),
-            lora_ids.to(torch.int32),
+            lora_info.adapter_enabled,
+            lora_ids,
             None,  # expert_map
         )
 
-        # ==============================
+        # Reshape the sorted tensors for fused_moe_lora (expects 2D: max_loras x max_num_tokens_padded)
+        sorted_token_ids_reshaped = sorted_token_ids_lora.view(max_loras, -1)
+        expert_ids_reshaped = expert_ids_lora.view(max_loras, -1)
 
         # ============================================================
         # Stage 1.5: Add LoRA gate_up delta BEFORE activation
@@ -308,8 +305,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             intermediate_cache=intermediate_cache1,
             topk_weights=topk_weights,
             lora_info=lora_info,
-            sorted_token_ids_lora=sorted_token_ids_lora,
-            expert_ids_lora=expert_ids_lora,
+            sorted_token_ids_reshaped=sorted_token_ids_reshaped,
+            expert_ids_reshaped=expert_ids_reshaped,
             num_tokens_post_padded_lora=num_tokens_post_padded_lora,
         )
 
@@ -365,7 +362,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
-
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
@@ -404,11 +400,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             intermediate_cache=intermediate_cache3,
             topk_weights=topk_weights,
             lora_info=lora_info,
-            sorted_token_ids_lora=sorted_token_ids_lora,
-            expert_ids_lora=expert_ids_lora,
+            sorted_token_ids_reshaped=sorted_token_ids_reshaped,
+            expert_ids_reshaped=expert_ids_reshaped,
             num_tokens_post_padded_lora=num_tokens_post_padded_lora,
         )
-
 
         # ============================================================
         # Stage 4: Final reduction (sum across top_k)
@@ -465,8 +460,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         intermediate_cache: torch.Tensor,  # [M, top_k, gate_up_dim]
         topk_weights: torch.Tensor,  # [M, top_k]
         lora_info: LoRAInfo,
-        sorted_token_ids_lora: torch.Tensor,
-        expert_ids_lora: torch.Tensor,
+        sorted_token_ids_reshaped: torch.Tensor,
+        expert_ids_reshaped: torch.Tensor,
         num_tokens_post_padded_lora: torch.Tensor,
     ) -> None:
         """
@@ -480,7 +475,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         M, top_k, gate_up_dim = intermediate_cache.shape
 
-
         # Skip LoRA computation if no LoRA adapters have non-zero rank
         if lora_info.max_lora_rank == 0:
             return
@@ -491,9 +485,10 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         lora_b_stacked = [lora_info.gate_up_lora_b_weights]
 
         max_loras = len(lora_info.lora_ranks)
-        # Reshape the sorted tensors for fused_moe_lora (expects 2D: max_loras x max_num_tokens_padded)
-        sorted_token_ids_reshaped = sorted_token_ids_lora.view(max_loras, -1)
-        expert_ids_reshaped = expert_ids_lora.view(max_loras, -1)
+
+        lora_ids = torch.arange(
+            max_loras, dtype=torch.int32, device=hidden_states.device
+        )
 
         fused_moe_lora(
             output=intermediate_cache,
@@ -506,7 +501,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             num_tokens_post_padded=num_tokens_post_padded_lora,
             max_lora_rank=actual_max_lora_rank,
             top_k_num=top_k,
-            lora_ids=lora_info.lora_ids,
+            lora_ids=lora_ids,
             adapter_enabled=lora_info.adapter_enabled,
             shrink_block_size_m=64,
             shrink_block_size_n=64,
@@ -530,8 +525,8 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         intermediate_cache: torch.Tensor,  # [M, top_k, hidden_dim]
         topk_weights: torch.Tensor,  # [M, top_k]
         lora_info: LoRAInfo,
-        sorted_token_ids_lora: torch.Tensor,
-        expert_ids_lora: torch.Tensor,
+        sorted_token_ids_reshaped: torch.Tensor,
+        expert_ids_reshaped: torch.Tensor,
         num_tokens_post_padded_lora: torch.Tensor,
     ) -> None:
         """
@@ -545,7 +540,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         M, top_k, hidden_dim = intermediate_cache.shape
 
-
         # Skip LoRA computation if no LoRA adapters have non-zero rank
         if lora_info.max_lora_rank == 0:
             return
@@ -554,22 +548,11 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         max_loras = len(lora_info.lora_ranks)
 
-        # Validate weight dimensions match expectations
-        assert (
-            lora_info.down_lora_a_weights.shape[0] == max_loras
-        ), f"Expected {max_loras} LoRAs, got {lora_info.down_lora_a_weights.shape[0]}"
-        assert (
-            lora_info.adapter_enabled.shape[0] >= max_loras
-        ), f"adapter_enabled too small: {lora_info.adapter_enabled.shape[0]} < {max_loras}"
-
         lora_a_stacked = [lora_info.down_lora_a_weights]
         lora_b_stacked = [lora_info.down_lora_b_weights]
 
-        max_loras = len(lora_info.lora_ranks)
-
-        # Reshape the sorted tensors for fused_moe_lora (expects 2D: max_loras x max_num_tokens_padded)
-        sorted_token_ids_reshaped = sorted_token_ids_lora.view(max_loras, -1)
-        expert_ids_reshaped = expert_ids_lora.view(max_loras, -1)
+        device = intermediate_cache.device
+        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
 
         fused_moe_lora(
             output=intermediate_cache,
@@ -582,7 +565,7 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             num_tokens_post_padded=num_tokens_post_padded_lora,
             max_lora_rank=actual_max_lora_rank,
             top_k_num=top_k,
-            lora_ids=lora_info.lora_ids,
+            lora_ids=lora_ids,
             adapter_enabled=lora_info.adapter_enabled,
             shrink_block_size_m=64,
             shrink_block_size_n=64,
