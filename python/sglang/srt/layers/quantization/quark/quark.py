@@ -183,10 +183,7 @@ class QuarkConfig(QuantizationConfig):
         Create a synthetic quant_config for online MXFP4 quantization.
         """
         return {
-            "packed_modules_mapping": {
-                "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-                "gate_up_proj": ["gate_proj", "up_proj"],
-            },
+            "packed_modules_mapping": {},
             "exclude": [],
             "global_quant_config": {
                 "weight": {
