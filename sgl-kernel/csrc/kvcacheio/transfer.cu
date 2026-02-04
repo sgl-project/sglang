@@ -750,24 +750,6 @@ inline void transfer_kv_page_first_direct_impl(
   int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  cudaStream_t batch_stream = stream;
-  cudaEvent_t start_event = nullptr;
-  cudaEvent_t end_event = nullptr;
-  if (stream == nullptr || stream == 0) {
-    at::cuda::CUDAStream pooled_stream = at::cuda::getStreamFromPool();
-    batch_stream = pooled_stream.stream();
-    TORCH_WARN(
-        "cudaMemcpyBatchAsync does not support legacy NULL stream; "
-        "switching to pooled stream. stream=",
-        static_cast<const void*>(stream),
-        " pooled=",
-        static_cast<const void*>(batch_stream));
-    C10_CUDA_CHECK(cudaEventCreateWithFlags(&start_event, cudaEventDisableTiming));
-    C10_CUDA_CHECK(cudaEventCreateWithFlags(&end_event, cudaEventDisableTiming));
-    C10_CUDA_CHECK(cudaEventRecord(start_event, stream));
-    C10_CUDA_CHECK(cudaStreamWaitEvent(batch_stream, start_event, 0));
-  }
-  bool issued_batch = false;
   size_t num_copies = 0;
   std::vector<void*> batch_srcs;
   std::vector<void*> batch_dsts;
@@ -879,20 +861,10 @@ inline void transfer_kv_page_first_direct_impl(
         attrs_idxs.data(),
         1,
         &fail_idx,
-        batch_stream);
+        stream);
     if (err != cudaSuccess) {
       TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
     }
-    issued_batch = true;
-  }
-
-  if (start_event != nullptr) {
-    if (issued_batch) {
-      C10_CUDA_CHECK(cudaEventRecord(end_event, batch_stream));
-      C10_CUDA_CHECK(cudaStreamWaitEvent(stream, end_event, 0));
-    }
-    C10_CUDA_CHECK(cudaEventDestroy(start_event));
-    C10_CUDA_CHECK(cudaEventDestroy(end_event));
   }
 }
 
