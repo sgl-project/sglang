@@ -376,6 +376,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        marconi_two_pass_branch_prefill: bool = True,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -426,6 +427,7 @@ class PrefillAdder:
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
+        self.marconi_two_pass_branch_prefill = marconi_two_pass_branch_prefill
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -598,7 +600,11 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 _rem_tokens = self.rem_chunk_tokens
-        if self.is_hybrid_ssm_cache and req.mamba_branching_seqlen is not None:
+        if (
+            self.is_hybrid_ssm_cache
+            and self.marconi_two_pass_branch_prefill
+            and req.mamba_branching_seqlen is not None
+        ):
             prefix_len = len(req.prefix_indices)
             if prefix_len < req.mamba_branching_seqlen:
                 _rem_tokens = min(_rem_tokens, req.mamba_branching_seqlen - prefix_len)
@@ -804,7 +810,7 @@ class PrefillAdder:
             else:
                 trunc_len = None
                 branch_trunc_len = None
-                if self.is_hybrid_ssm_cache:
+                if self.is_hybrid_ssm_cache and self.marconi_two_pass_branch_prefill:
                     branching_seqlen = req.mamba_branching_seqlen
                     prefix_len = len(req.prefix_indices)
                     if (

@@ -32,6 +32,7 @@ class MarconiAdmissionTree:
     def __init__(
         self,
         *,
+        policy: str = "paper",
         min_hits: int = 2,
         min_success_ratio: float = 0.1,
         decay: float = 0.995,
@@ -41,6 +42,9 @@ class MarconiAdmissionTree:
         prune_interval: int = 200,
     ):
         self.root_node = AdmissionNode()
+        if policy not in ("paper", "thresholded"):
+            raise ValueError(f"Unknown Marconi admission policy: {policy}")
+        self.policy = policy
         self.min_hits = min_hits
         self.min_success_ratio = min_success_ratio
         self.decay = decay
@@ -69,6 +73,8 @@ class MarconiAdmissionTree:
     def _eligible(self, node: Optional[AdmissionNode]) -> bool:
         if node is None:
             return False
+        if self.policy == "paper":
+            return True
         if node.hit_count < self.min_hits:
             return False
         success_ratio = (
@@ -86,8 +92,8 @@ class MarconiAdmissionTree:
         node = self.root_node
         key = tuple(token_ids)
         matched_len = 0
-        reusable_len = 0
         candidate_node: Optional[AdmissionNode] = None
+        candidate_len = 0
         ts = self._tick()
         while key:
             child_key = self._child_key(extra_key, key)
@@ -100,16 +106,18 @@ class MarconiAdmissionTree:
             child.hit_count += 1
             self._update_score(child, ts, add=1.0)
             if prefix_len < len(child.key):
-                candidate_node = child
+                # Speculative insertion would create an intermediate branch here.
+                if self._eligible(child):
+                    candidate_node = child
+                    candidate_len = matched_len
                 break
-            reusable_len += prefix_len
+            if len(child.children) >= 2 and self._eligible(child):
+                candidate_node = child
+                candidate_len = child.prefix_len
             key = key[prefix_len:]
             node = child
-            candidate_node = child
-        branchoff_required = matched_len > reusable_len
-        if branchoff_required and not self._eligible(candidate_node):
-            branchoff_required = False
-        return matched_len, branchoff_required
+        branchoff_required = candidate_node is not None and candidate_len > 0
+        return candidate_len if branchoff_required else matched_len, branchoff_required
 
     def insert(self, token_ids: List[int], extra_key: Optional[str]) -> None:
         node = self.root_node
@@ -176,7 +184,11 @@ class MarconiAdmissionTree:
         return new_node
 
     def record_cache_hit(
-        self, token_ids: List[int], hit_len: int, extra_key: Optional[str]
+        self,
+        token_ids: List[int],
+        hit_len: int,
+        extra_key: Optional[str],
+        weight: float = 0.5,
     ) -> None:
         if hit_len <= 0:
             return
@@ -193,7 +205,7 @@ class MarconiAdmissionTree:
                 break
             child.success_count += 1
             child.last_access_time = ts
-            self._update_score(child, ts, add=0.5)
+            self._update_score(child, ts, add=weight)
             key = key[prefix_len:]
             node = child
 

@@ -319,6 +319,7 @@ class ServerArgs:
     marconi_bootstrap_window_size: Optional[int] = None
     marconi_bootstrap_multiplier: int = 5
     marconi_tuning_interval: int = 500
+    marconi_admission_policy: str = "thresholded"
     marconi_admission_min_hits: int = 2
     marconi_admission_min_success_ratio: float = 0.1
     marconi_admission_decay: float = 0.995
@@ -336,11 +337,11 @@ class ServerArgs:
     marconi_eviction_weight_mlp: float = 1.0
     marconi_tuning_max_workers: Optional[int] = None
     marconi_branch_align_interval: Optional[int] = None
-    marconi_attn_only_reuse: bool = False
     marconi_prefill_hint_window: int = 0
     marconi_track_buffer_size: Optional[int] = None
     marconi_track_max_points: Optional[int] = None
     marconi_mamba_layer_mask: Optional[str] = None
+    marconi_two_pass_branch_prefill: bool = True
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -2411,6 +2412,10 @@ class ServerArgs:
                 raise ValueError("marconi_bootstrap_multiplier must be positive.")
             if self.marconi_tuning_interval <= 0:
                 raise ValueError("marconi_tuning_interval must be positive.")
+            if self.marconi_admission_policy not in ("paper", "thresholded"):
+                raise ValueError(
+                    "marconi_admission_policy must be one of: paper, thresholded."
+                )
             if self.marconi_admission_min_hits <= 0:
                 raise ValueError("marconi_admission_min_hits must be positive.")
             if not (0.0 <= self.marconi_admission_min_success_ratio <= 1.0):
@@ -3069,6 +3074,13 @@ class ServerArgs:
             help="Number of requests per tuning window for Marconi.",
         )
         parser.add_argument(
+            "--marconi-admission-policy",
+            default=ServerArgs.marconi_admission_policy,
+            choices=["paper", "thresholded"],
+            help="Admission policy for Marconi. 'paper' uses speculative insertion taxonomy; "
+            "'thresholded' uses hit/score thresholds.",
+        )
+        parser.add_argument(
             "--marconi-admission-min-hits",
             type=int,
             default=ServerArgs.marconi_admission_min_hits,
@@ -3171,11 +3183,6 @@ class ServerArgs:
             help="Optional alignment interval for Marconi branch checkpoints.",
         )
         parser.add_argument(
-            "--marconi-attn-only-reuse",
-            action="store_true",
-            help="Allow attention-only prefix reuse and roll-forward to rebuild missing mamba state.",
-        )
-        parser.add_argument(
             "--marconi-prefill-hint-window",
             type=int,
             default=ServerArgs.marconi_prefill_hint_window,
@@ -3198,6 +3205,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.marconi_mamba_layer_mask,
             help="Optional mamba layer mask for cached state (e.g., '0,2,4-6').",
+        )
+        parser.add_argument(
+            "--marconi-two-pass-branch-prefill",
+            dest="marconi_two_pass_branch_prefill",
+            action="store_true",
+            default=ServerArgs.marconi_two_pass_branch_prefill,
+            help="Enable two-pass prefill for Marconi branch checkpoints.",
+        )
+        parser.add_argument(
+            "--marconi-no-two-pass-branch-prefill",
+            dest="marconi_two_pass_branch_prefill",
+            action="store_false",
+            help="Disable two-pass prefill for Marconi branch checkpoints.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

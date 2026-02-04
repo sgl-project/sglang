@@ -592,19 +592,6 @@ class Req:
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
-        # Marconi rehydrate / roll-forward state (attn-only reuse).
-        self.marconi_rehydrate_len: Optional[int] = None
-        self.marconi_rehydrate_from: Optional[int] = None
-        self.marconi_rehydrate_pending: bool = False
-        self.marconi_rehydrate_active: bool = False
-        self.marconi_rehydrate_last_node: Any = None
-        self.marconi_saved_fill_ids: Optional[List[int]] = None
-        self.marconi_saved_prefix_indices: Optional[torch.Tensor] = None
-        self.marconi_saved_last_node: Any = None
-        self.marconi_saved_last_host_node: Any = None
-        self.marconi_saved_host_hit_length: int = 0
-        self.marconi_override_out_cache_loc: Optional[torch.Tensor] = None
-        self.marconi_force_mamba_track: bool = False
         self.marconi_track_entries: Optional[List[Tuple[int, int]]] = None
 
         # Check finish
@@ -925,91 +912,6 @@ class Req:
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
-
-    def prepare_marconi_rehydrate(self):
-        if (
-            not self.marconi_rehydrate_pending
-            or self.marconi_rehydrate_active
-            or self.marconi_rehydrate_len is None
-        ):
-            return
-
-        if self.marconi_saved_fill_ids is None:
-            self.marconi_saved_fill_ids = list(self.fill_ids)
-            self.marconi_saved_prefix_indices = self.prefix_indices
-            self.marconi_saved_last_node = self.last_node
-            self.marconi_saved_last_host_node = self.last_host_node
-            self.marconi_saved_host_hit_length = self.host_hit_length
-
-        rehydrate_len = min(
-            self.marconi_rehydrate_len, len(self.marconi_saved_fill_ids)
-        )
-        rehydrate_from = (
-            self.marconi_rehydrate_from
-            if self.marconi_rehydrate_from is not None
-            else 0
-        )
-        rehydrate_from = min(rehydrate_from, rehydrate_len)
-
-        # Limit the active prefix to the existing mamba checkpoint.
-        if self.marconi_saved_prefix_indices is not None:
-            self.prefix_indices = self.marconi_saved_prefix_indices[:rehydrate_from]
-        else:
-            self.prefix_indices = torch.empty((0,), dtype=torch.int64)
-
-        self.fill_ids = self.marconi_saved_fill_ids[:rehydrate_len]
-        self.cache_protected_len = len(self.prefix_indices)
-        self.kv_cache_protected_len = self.cache_protected_len
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
-
-        if (
-            self.marconi_saved_prefix_indices is not None
-            and rehydrate_len > rehydrate_from
-        ):
-            self.marconi_override_out_cache_loc = self.marconi_saved_prefix_indices[
-                rehydrate_from:rehydrate_len
-            ]
-        else:
-            self.marconi_override_out_cache_loc = None
-
-        # Force mamba state tracking at the end of the rehydrate pass.
-        self.marconi_force_mamba_track = True
-        self.marconi_rehydrate_active = True
-
-        if self.marconi_saved_last_node is not None:
-            # Lock the full prefix during rehydrate to prevent eviction.
-            self.last_node = self.marconi_saved_last_node
-
-    def finish_marconi_rehydrate(self):
-        if not self.marconi_rehydrate_active:
-            return
-
-        if self.marconi_saved_fill_ids is not None:
-            self.fill_ids = self.marconi_saved_fill_ids
-        if self.marconi_saved_prefix_indices is not None:
-            self.prefix_indices = self.marconi_saved_prefix_indices
-        if self.marconi_saved_last_node is not None:
-            self.last_node = self.marconi_saved_last_node
-        if self.marconi_saved_last_host_node is not None:
-            self.last_host_node = self.marconi_saved_last_host_node
-        self.host_hit_length = self.marconi_saved_host_hit_length
-
-        self.cache_protected_len = len(self.prefix_indices)
-        self.kv_cache_protected_len = self.cache_protected_len
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
-
-        self.marconi_override_out_cache_loc = None
-        self.marconi_force_mamba_track = False
-        self.marconi_rehydrate_pending = False
-        self.marconi_rehydrate_active = False
-        self.marconi_rehydrate_len = None
-        self.marconi_rehydrate_from = None
-        self.marconi_rehydrate_last_node = None
-        self.marconi_saved_fill_ids = None
-        self.marconi_saved_prefix_indices = None
-        self.marconi_saved_last_node = None
-        self.marconi_saved_last_host_node = None
-        self.marconi_saved_host_hit_length = 0
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1334,6 +1236,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
     is_hybrid_swa: bool = False
+    page_size: int = 1
 
     # Batch configs
     model_config: ModelConfig = None
@@ -1453,6 +1356,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+
+    def __post_init__(self):
+        if self.tree_cache is not None:
+            self.page_size = getattr(self.tree_cache, "page_size", 1)
 
     @classmethod
     def init_new(
@@ -1841,34 +1748,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if prefix_len < req.mamba_branching_seqlen <= end_len:
                     track_points.append(req.mamba_branching_seqlen)
 
-            if not req.marconi_force_mamba_track:
-                # Add aligned checkpoints if multi-track is enabled.
-                if req.mamba_ping_pong_track_buffer is not None:
-                    buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
-                else:
-                    buffer_size = 0
-                max_points = server_args.marconi_track_max_points
-                if max_points is None:
-                    max_points = buffer_size if buffer_size > 0 else 1
-                if max_points > len(track_points):
-                    align_interval = (
-                        server_args.marconi_branch_align_interval
-                        or mamba_cache_chunk_size
-                    )
-                    if align_interval <= 0:
-                        align_interval = mamba_cache_chunk_size
-                    if align_interval > 0:
-                        aligned_points: List[int] = []
-                        start = ((prefix_len // align_interval) + 1) * align_interval
-                        while start < end_len:
-                            if start != req.mamba_branching_seqlen:
-                                aligned_points.append(start)
-                            start += align_interval
-                        # Prefer points closest to the end.
-                        for p in reversed(aligned_points):
-                            if len(track_points) >= max_points:
-                                break
-                            track_points.append(p)
+            # Add aligned checkpoints only when tracking a branch (pure-input reuse).
+            if req.mamba_ping_pong_track_buffer is not None:
+                buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
+            else:
+                buffer_size = 0
+            max_points = server_args.marconi_track_max_points
+            if max_points is None:
+                max_points = buffer_size if buffer_size > 0 else 1
+            if req.mamba_branching_seqlen is not None and max_points > len(
+                track_points
+            ):
+                align_interval = (
+                    server_args.marconi_branch_align_interval or mamba_cache_chunk_size
+                )
+                if align_interval <= 0:
+                    align_interval = mamba_cache_chunk_size
+                if align_interval > 0:
+                    aligned_points: List[int] = []
+                    start = ((prefix_len // align_interval) + 1) * align_interval
+                    while start < end_len:
+                        if start != req.mamba_branching_seqlen:
+                            aligned_points.append(start)
+                        start += align_interval
+                    # Prefer points closest to the end.
+                    for p in reversed(aligned_points):
+                        if len(track_points) >= max_points:
+                            break
+                        track_points.append(p)
 
         # Filter and de-duplicate.
         track_points = sorted(set(track_points))

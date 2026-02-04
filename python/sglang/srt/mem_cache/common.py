@@ -353,9 +353,6 @@ def alloc_for_extend(
 
     bs = len(batch.reqs)
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
-    override_out_cache_loc = [
-        getattr(r, "marconi_override_out_cache_loc", None) for r in batch.reqs
-    ]
 
     # Create tensors for allocation
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
@@ -371,16 +368,7 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
-    has_override = any(loc is not None for loc in override_out_cache_loc)
-    if has_override:
-        if not all(loc is not None for loc in override_out_cache_loc):
-            raise RuntimeError(
-                "Partial override_out_cache_loc is not supported for mixed batches."
-            )
-        out_cache_loc = torch.cat(
-            [loc.to(batch.device, non_blocking=True) for loc in override_out_cache_loc]
-        )
-    elif batch.tree_cache.page_size == 1:
+    if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # Paged allocation - build last_loc

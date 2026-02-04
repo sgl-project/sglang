@@ -24,6 +24,7 @@ class MarconiConfig:
     tuning_interval: int
     tuning_weights: Optional[Sequence[float]] = None
     model_stats: Optional[MarconiModelStats] = None
+    admission_policy: str = "thresholded"
     admission_min_hits: int = 2
     admission_min_success_ratio: float = 0.1
     admission_decay: float = 0.995
@@ -38,7 +39,7 @@ class MarconiConfig:
     eviction_regret_max_entries: int = 20000
     eviction_latency_weights: Optional[Sequence[float]] = None
     tuning_max_workers: Optional[int] = None
-    attn_only_reuse: bool = False
     track_buffer_size: Optional[int] = None
     track_max_points: Optional[int] = None
     mamba_layer_mask: Optional[Union[str, Sequence[int]]] = None
+    two_pass_branch_prefill: bool = True

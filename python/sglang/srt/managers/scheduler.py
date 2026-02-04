@@ -734,6 +734,9 @@ class Scheduler(
                     logger.warning(
                         "Marconi is enabled but model stats could not be derived."
                     )
+                marconi_two_pass_branch_prefill = (
+                    server_args.marconi_two_pass_branch_prefill
+                )
                 marconi_config = MarconiConfig(
                     enable=True,
                     eff_weight=server_args.marconi_eff_weight,
@@ -741,6 +744,7 @@ class Scheduler(
                     bootstrap_multiplier=server_args.marconi_bootstrap_multiplier,
                     tuning_interval=server_args.marconi_tuning_interval,
                     model_stats=marconi_model_stats,
+                    admission_policy=server_args.marconi_admission_policy,
                     admission_min_hits=server_args.marconi_admission_min_hits,
                     admission_min_success_ratio=server_args.marconi_admission_min_success_ratio,
                     admission_decay=server_args.marconi_admission_decay,
@@ -759,10 +763,10 @@ class Scheduler(
                         server_args.marconi_eviction_weight_mlp,
                     ),
                     tuning_max_workers=server_args.marconi_tuning_max_workers,
-                    attn_only_reuse=server_args.marconi_attn_only_reuse,
                     track_buffer_size=server_args.marconi_track_buffer_size,
                     track_max_points=server_args.marconi_track_max_points,
                     mamba_layer_mask=server_args.marconi_mamba_layer_mask,
+                    two_pass_branch_prefill=marconi_two_pass_branch_prefill,
                 )
 
         # Create cache
@@ -2100,6 +2104,9 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        marconi_two_pass_branch_prefill = (
+            self.server_args.marconi_two_pass_branch_prefill
+        )
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -2113,6 +2120,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            marconi_two_pass_branch_prefill=marconi_two_pass_branch_prefill,
         )
 
         if self.dllm_config is not None:
@@ -2196,14 +2204,6 @@ class Scheduler(
                 req.init_next_round_input(self.tree_cache)
             req._prefill_matched_this_round = False
 
-            if (
-                self.server_args.enable_marconi
-                and getattr(req, "marconi_rehydrate_pending", False)
-                and not getattr(req, "marconi_rehydrate_active", False)
-            ):
-                if len(adder.can_run_list) > 0:
-                    break
-                req.prepare_marconi_rehydrate()
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(
@@ -2221,12 +2221,6 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
-                break
-
-            if self.server_args.enable_marconi and getattr(
-                req, "marconi_rehydrate_active", False
-            ):
-                # Rehydrate batches run alone.
                 break
 
         # Update waiting queue
