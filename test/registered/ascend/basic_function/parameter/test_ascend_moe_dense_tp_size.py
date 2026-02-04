@@ -21,6 +21,7 @@ class TestAscendMoeDenseTPSize(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --moe-dense-tp-size
     """
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH

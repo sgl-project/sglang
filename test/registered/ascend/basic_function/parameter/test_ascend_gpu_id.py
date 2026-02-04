@@ -31,11 +31,11 @@ class TestGpuId(CustomTestCase):
         cls.device_id = get_device_ids(0)
         cls.step = 2
         other_args = [
-            "--base-gpu-id", # Starting device ID
+            "--base-gpu-id",  # Starting device ID
             cls.device_id,
             "--tp-size",  # tp = 2 (2 devices required for occupation)
             "2",
-            "--gpu-id-step", # Device ID step size = 2 (occupies the starting device ID and starting device ID + 2)
+            "--gpu-id-step",  # Device ID step size = 2 (occupies the starting device ID and starting device ID + 2)
             cls.step,
             "--attention-backend",
             "ascend",

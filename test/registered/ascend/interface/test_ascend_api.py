@@ -23,6 +23,7 @@ class TestAscendApi(CustomTestCase):
     [Test Category] Interface
     [Test Target] /health; /health_generate; /ping; /model_info; /server_info; /get_load; /v1/models; /v1/models/{model:path}; /generate
     """
+
     @classmethod
     def setUpClass(cls):
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH

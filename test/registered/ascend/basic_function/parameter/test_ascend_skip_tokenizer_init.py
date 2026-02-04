@@ -225,6 +225,7 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     and EOS Token termination trigger function all work properly.
     """
 
+
     model = QWEN2_5_VL_3B_INSTRUCT_WEIGHTS_PATH
 
     @classmethod
