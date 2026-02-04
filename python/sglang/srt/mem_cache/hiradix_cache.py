@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.disaggregation.kv_events import (
     MEDIUM_CPU_TIER1,
+    MEDIUM_CPU_TIER2,
     MEDIUM_GPU,
     BlockRemoved,
     BlockStored,
@@ -689,6 +690,60 @@ class HiRadixCache(RadixCache):
 
             page_index += 1
 
+    def _record_prefetch_store_events(
+        self,
+        token_ids: List[int],
+        hash_values: List[str],
+        parent_hash: Optional[str],
+        medium: str,
+    ):
+        """Record BlockStored events for data fetched from storage.
+
+        This is used when data arrives from remote storage (L3) to host memory (L2).
+        Unlike _record_tier_store_event which operates on TreeNode, this method
+        works directly with token_ids and hash_values from prefetch operations.
+
+        Args:
+            token_ids: List of token IDs that were fetched
+            hash_values: List of hash values for each page (one per page_size tokens)
+            parent_hash: Hash value of the parent block (for chaining)
+            medium: The storage tier where data is being stored
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        if not token_ids or not hash_values:
+            return
+
+        parent_block_hash = None
+        if parent_hash is not None:
+            parent_block_hash = hash_str_to_int64(parent_hash)
+
+        page_index = 0
+        for start in range(0, len(token_ids), self.page_size):
+            if page_index >= len(hash_values):
+                break
+
+            page_tokens = token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(hash_values[page_index])
+
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                )
+            )
+
+            parent_block_hash = block_hash
+            page_index += 1
+
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -727,6 +782,9 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+
+        # Emit tier transition event: CPU_TIER1 -> CPU_TIER2 (L2 -> L3)
+        self._record_tier_store_event(node, MEDIUM_CPU_TIER2)
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -1187,6 +1245,28 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
+        # Emit BlockStored events for data that arrived from storage (L3 -> L2)
+        if loaded_from_storage > 0:
+            # Get hash values for the newly loaded data (after matched_length)
+            start_page = matched_length // self.page_size
+            end_page = min_completed_tokens // self.page_size
+            new_hash_values = hash_value[start_page:end_page]
+            new_token_ids = fetched_token_ids[matched_length:]
+
+            # Get parent hash from the matched prefix
+            parent_hash = None
+            if start_page > 0 and len(hash_value) > 0:
+                parent_hash = hash_value[start_page - 1]
+            elif (
+                last_host_node.hash_value is not None
+                and len(last_host_node.hash_value) > 0
+            ):
+                parent_hash = last_host_node.hash_value[-1]
+
+            self._record_prefetch_store_events(
+                new_token_ids, new_hash_values, parent_hash, MEDIUM_CPU_TIER1
+            )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
