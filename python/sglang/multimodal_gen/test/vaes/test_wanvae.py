@@ -34,6 +34,20 @@ def set_envar(envar_map: dict):
     for k, v in envar_map.items():
         os.environ[k] = str(v)
 
+tmpfiles = []
+
+def tmpfile(obj: torch.Tensor | dict | None = None):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
+        if obj is not None:
+            torch.save(obj, f)
+        tmpfiles.append(f.name)
+        return f.name
+
+def clear_tmpfiles():
+    for filepath in tmpfiles:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
 @pytest.mark.parametrize("dim", [192, 384])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("height", [90])
@@ -56,21 +70,16 @@ def test_wan_dist_conv_2d(
     kernel_size: int,
     padding: int
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        actual_output_file = f.name
+    actual_output_file = tmpfile()
 
     conv2d = nn.Conv2d(dim, dim * 3, kernel_size, padding=padding)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        saved_model_file = f.name
-        torch.save(conv2d.state_dict(), f)
+    saved_model_file = tmpfile(conv2d.state_dict())
 
     conv2d = conv2d.eval().requires_grad_(False).to(device)
 
     # latent shape [B, C, H, W]
     x = torch.randn(batch_size, dim, height, width)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        input_data_file = f.name
-        torch.save(x, f)
+    input_data_file = tmpfile(x)
     x = x.to(device)
 
     expected = conv2d(x)
@@ -105,12 +114,7 @@ def test_wan_dist_conv_2d(
 
     assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
-    if os.path.exists(saved_model_file):
-        os.remove(saved_model_file)
-    if os.path.exists(input_data_file):
-        os.remove(input_data_file)
-    if os.path.exists(actual_output_file):
-        os.remove(actual_output_file)
+    clear_tmpfiles()
 
 @pytest.mark.parametrize("dim", [192, 384])
 @pytest.mark.parametrize("batch_size", [1])
@@ -135,21 +139,16 @@ def test_wan_dist_conv_3d(
     kernel_size: int | tuple,
     padding: int | tuple,
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        actual_output_file = f.name
+    actual_output_file = tmpfile()
 
     conv3d = WanCausalConv3d(dim, dim * 3, kernel_size, padding=padding)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        saved_model_file = f.name
-        torch.save(conv3d.state_dict(), f)
+    saved_model_file = tmpfile(conv3d.state_dict())
 
     conv3d = conv3d.eval().requires_grad_(False).to(device)
 
     # latent shape [B, C, H, W]
     x = torch.randn(batch_size, dim, 30, height, width)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        input_data_file = f.name
-        torch.save(x, f)
+    input_data_file = tmpfile(x)
     x = x.to(device)
 
     expected = conv3d(x)
@@ -185,12 +184,7 @@ def test_wan_dist_conv_3d(
 
     assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
-    if os.path.exists(saved_model_file):
-        os.remove(saved_model_file)
-    if os.path.exists(input_data_file):
-        os.remove(input_data_file)
-    if os.path.exists(actual_output_file):
-        os.remove(actual_output_file)
+    clear_tmpfiles()
 
 
 def _test_dist_conv(
@@ -274,21 +268,16 @@ def test_wan_dist_resample(
     ring_degree: int,
     mode: str,
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        actual_output_file = f.name
+    actual_output_file = tmpfile()
 
     resample = WanResample(dim, mode=mode)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        saved_model_file = f.name
-        torch.save(resample.state_dict(), f)
+    saved_model_file = tmpfile(resample.state_dict())
 
     resample = resample.eval().requires_grad_(False).to(device)
 
     # latent shape [B, C, H, W]
     x = torch.randn(batch_size, dim, 1, height, width)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        input_data_file = f.name
-        torch.save(x, f)
+    input_data_file = tmpfile(x)
     x = x.to(device)
 
     expected = resample(x)
@@ -321,12 +310,7 @@ def test_wan_dist_resample(
         actual = actual[..., :expected_height, :]
     assert_close(actual, expected, atol=5e-3, rtol=5e-3)
 
-    if os.path.exists(actual_output_file):
-        os.remove(actual_output_file)
-    if os.path.exists(saved_model_file):
-        os.remove(saved_model_file)
-    if os.path.exists(input_data_file):
-        os.remove(input_data_file)
+    clear_tmpfiles()
 
 def _test_wan_dist_resample(
     local_rank: int,
@@ -410,20 +394,15 @@ def test_wan_dist_residual_block(
     in_dim: int,
     out_dim: int,
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        actual_output_file = f.name
+    actual_output_file = tmpfile()
 
     residual_block = WanResidualBlock(in_dim, out_dim)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        saved_model_file = f.name
-        torch.save(residual_block.state_dict(), f)
+    saved_model_file = tmpfile(residual_block.state_dict())
     residual_block = residual_block.eval().requires_grad_(False).to(device)
 
     # latent shape [B, C, H, W]
     x = torch.randn(batch_size, in_dim, 1, height, width)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        input_data_file = f.name
-        torch.save(x, f)
+    input_data_file = tmpfile(x)
     x = x.to(device)
 
     expected = residual_block(x)
@@ -457,12 +436,7 @@ def test_wan_dist_residual_block(
 
     assert_close(actual, expected, atol=5e-3, rtol=5e-3)
 
-    if os.path.exists(saved_model_file):
-        os.remove(saved_model_file)
-    if os.path.exists(input_data_file):
-        os.remove(input_data_file)
-    if os.path.exists(actual_output_file):
-        os.remove(actual_output_file)
+    clear_tmpfiles()
 
 def _test_wan_dist_residual_block(
     local_rank: int,
@@ -542,8 +516,7 @@ def test_wan_parallel_decoder(
     ulysses_degree: int,
     ring_degree: int,
 ):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        actual_output_file = f.name
+    actual_output_file = tmpfile()
 
     vae_config = WanVAEConfig()
     decoder = WanDecoder3d(
@@ -557,16 +530,12 @@ def test_wan_parallel_decoder(
         out_channels=vae_config.out_channels,
         is_residual=vae_config.is_residual,
     )
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        saved_model_file = f.name
-        torch.save(decoder.state_dict(), saved_model_file)
+    saved_model_file = tmpfile(decoder.state_dict())
     decoder = decoder.eval().requires_grad_(False).to(device)
 
     # generate latent
     z = torch.randn(batch_size, vae_config.z_dim, 1, height, width)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as f:
-        input_data_file = f.name
-        torch.save(z, f)
+    input_data_file = tmpfile(z)
     z = z.to(device)
 
     expected = decoder(z)
@@ -594,12 +563,7 @@ def test_wan_parallel_decoder(
     assert actual.shape == expected.shape
     assert_close(actual, expected, atol=5e-2, rtol=5e-2)
 
-    if os.path.exists(saved_model_file):
-        os.remove(saved_model_file)
-    if os.path.exists(input_data_file):
-        os.remove(input_data_file)
-    if os.path.exists(actual_output_file):
-        os.remove(actual_output_file)
+    clear_tmpfiles()
 
 
 def _test_wan_parallel_decoder(
