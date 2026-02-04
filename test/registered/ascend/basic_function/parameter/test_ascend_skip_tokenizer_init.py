@@ -1,13 +1,18 @@
 import json
 import unittest
 from io import BytesIO
+
 import requests
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-from sglang.test.ascend.test_ascend_utils import QWEN2_5_VL_3B_INSTRUCT_WEIGHTS_PATH
+
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import (
+    LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
+    QWEN2_5_VL_3B_INSTRUCT_WEIGHTS_PATH,
+)
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_IMAGE_URL,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,7 +20,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -25,9 +29,9 @@ class TestSkipTokenizerInit(CustomTestCase):
     the streaming/non-streaming inference, parallel sampling, log probability return functions,
     and EOS Token termination trigger function all work properly.
 
-        [Test Category] Parameter
-        [Test Target] --skip-tokenizer-init
-        """
+    [Test Category] Parameter
+    [Test Target] --skip-tokenizer-init
+    """
     model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 
     @classmethod
@@ -45,7 +49,6 @@ class TestSkipTokenizerInit(CustomTestCase):
                     "ascend",
                     "--disable-cuda-graph",
                 ]
-
             ),
         )
         cls.eos_token_id = [119690]
@@ -187,7 +190,9 @@ class TestSkipTokenizerInit(CustomTestCase):
         self.run_decode_stream()
 
     def get_input_ids(self, prompt_text) -> list[int]:
-        input_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"][0].tolist()
+        input_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"][
+            0
+        ].tolist()
         return input_ids
 
     def get_request_json(
@@ -219,12 +224,14 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     the streaming/non-streaming inference, parallel sampling, log probability return functions,
     and EOS Token termination trigger function all work properly.
     """
+
+
     model = QWEN2_5_VL_3B_INSTRUCT_WEIGHTS_PATH
 
     @classmethod
     def setUpClass(cls):
         image_path = DEFAULT_IMAGE_URL
-        cls.image_url = ("https://gh.llkk.cc/" + image_path)
+        cls.image_url = "https://gh.llkk.cc/" + image_path
         response = requests.get(cls.image_url)
         cls.image = Image.open(BytesIO(response.content))
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
@@ -234,14 +241,12 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=
-            [
+            other_args=[
                 "--skip-tokenizer-init",
                 "--attention-backend",
                 "ascend",
                 "--disable-cuda-graph",
-            ]
-
+            ],
         )
         cls.eos_token_id = [cls.tokenizer.eos_token_id]
 

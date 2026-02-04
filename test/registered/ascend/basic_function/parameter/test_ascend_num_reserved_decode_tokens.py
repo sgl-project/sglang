@@ -2,15 +2,18 @@ import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH, get_device_ids
-from sglang.test.run_eval import run_eval
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
+from sglang.test.ascend.test_ascend_utils import (
+    LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH,
+    get_device_ids,
+)
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_pd_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
@@ -42,21 +45,19 @@ class TestNumReservedDecodeTokens(TestDisaggregationBase):
 
     @classmethod
     def start_prefill(cls):
-        prefill_args = (
-            [
-                "--disaggregation-mode",
-                "prefill",
-                "--disaggregation-decode-tp",
-                "2",
-                "--disaggregation-transfer-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--attention-backend",
-                "ascend",
-                "--mem-fraction-static",
-                0.8,
-            ]
-        )
+        prefill_args = [
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-decode-tp",
+            "2",
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--attention-backend",
+            "ascend",
+            "--mem-fraction-static",
+            0.8,
+        ]
 
         cls.process_prefill = popen_launch_pd_server(
             cls.model,
@@ -67,25 +68,23 @@ class TestNumReservedDecodeTokens(TestDisaggregationBase):
 
     @classmethod
     def start_decode(cls):
-        decode_args = (
-            [
-                "--disaggregation-mode",
-                "decode",
-                "--base-gpu-id",
-                get_device_ids(1),
-                "--disaggregation-transfer-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--attention-backend",
-                "ascend",
-                "--mem-fraction-static",
-                0.8,
-                "--num-reserved-decode-tokens",
-                128,
-                "--disaggregation-decode-polling-interval",
-                2,
-            ]
-        )
+        decode_args = [
+            "--disaggregation-mode",
+            "decode",
+            "--base-gpu-id",
+            get_device_ids(1),
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--attention-backend",
+            "ascend",
+            "--mem-fraction-static",
+            0.8,
+            "--num-reserved-decode-tokens",
+            128,
+            "--disaggregation-decode-polling-interval",
+            2,
+        ]
         cls.process_decode = popen_launch_pd_server(
             cls.model,
             cls.decode_url,
