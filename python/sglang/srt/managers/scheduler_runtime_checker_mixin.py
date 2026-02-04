@@ -284,25 +284,35 @@ class SchedulerRuntimeCheckerMixin:
                 num_used, token_usage, _, _ = self._get_token_info()
             num_running_reqs = len(self.running_batch.reqs)
             self.stats.num_running_reqs = num_running_reqs
+            self.stats.num_running_reqs_by_priority = self._count_reqs_by_priority(self.running_batch.reqs)
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = round(token_usage, 2)
             self.stats.gen_throughput = 0
             self.stats.num_queue_reqs = len(self.waiting_queue)
+            self.stats.num_queue_reqs_by_priority = self._count_reqs_by_priority(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
                     self.disagg_prefill_bootstrap_queue.queue
                 )
+                self.stats.num_prefill_prealloc_queue_reqs_by_priority = self._count_reqs_by_priority(
+                    self.disagg_prefill_bootstrap_queue.queue)
                 self.stats.num_prefill_inflight_queue_reqs = len(
                     self.disagg_prefill_inflight_queue
                 )
+                self.stats.num_prefill_inflight_queue_reqs_by_priority = self._count_reqs_by_priority(
+                    self.disagg_prefill_inflight_queue)
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
                     self.disagg_decode_prealloc_queue.queue
                 )
+                self.stats.num_decode_prealloc_queue_reqs_by_priority = self._count_reqs_by_priority(
+                    self.disagg_decode_prealloc_queue.queue)
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
+                self.stats.num_decode_transfer_queue_reqs_by_priority = self._count_reqs_by_priority(
+                    self.disagg_decode_transfer_queue.queue)
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
