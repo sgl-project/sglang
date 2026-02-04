@@ -13,7 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import triton

@@ -334,17 +334,16 @@ class RadixCache(BasePrefixCache):
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
-
     # Can be deprecated in the future
     def maybe_eagle_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
         """Convert key/value for EAGLE mode using Real Dummy Allocation approach.
-        
+
         In EAGLE mode, we use ALL N allocated KV indices as-is. Position 0 holds
         a real (but unused) KV index - the "dummy" which is created by target model
         but not used in EAGLE's attention due to the one-token shift.
-        
+
         This approach:
         - Keeps keys as native unigrams (integers) - same as non-EAGLE mode
         - Uses all N KV slots for N tokens (No Bigram Conversions)
