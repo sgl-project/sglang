@@ -219,9 +219,8 @@ class WanCausalConv3d(nn.Conv3d):
         )  # casting needed for mps since amp isn't supported
         return super().forward(x)
 
-def sp_should_padding(x: torch.Tensor, world_size: int = 1, dim: int = -2):
-    len_to_padding = (int(math.ceil(x.shape[dim] / world_size)) * world_size) - x.shape[dim]
-    return len_to_padding != 0, len_to_padding
+def calc_padding_len(x: torch.Tensor, world_size: int = 1, dim: int = -2):
+    return (int(math.ceil(x.shape[dim] / world_size)) * world_size) - x.shape[dim]
 
 def sp_pad(x: torch.Tensor, len_to_pad: int, dim: int = -2):
     x = torch.cat([
@@ -244,9 +243,9 @@ def sp_chunk(x: torch.Tensor, dim: int = -2, world_size: int = 1, rank: int = 0)
     if world_size <= 1:
         return x
 
-    need_padding, len_to_padding = sp_should_padding(x, world_size=world_size, dim=dim)
-    if need_padding:
-        x = sp_pad(x, len_to_padding, dim=dim)
+    padding_len = calc_padding_len(x, world_size=world_size, dim=dim)
+    if padding_len:
+        x = sp_pad(x, padding_len, dim=dim)
 
     return torch.chunk(x, world_size, dim=dim)[rank]
 
@@ -1613,7 +1612,7 @@ class WanDecoder3d(nn.Module):
             origin_height = x.shape[-2]
             expected_height = x.shape[-2] * (2 ** self.upsample_count)
 
-            _, padding_len = sp_should_padding(x, world_size=world_size, dim=-2)
+            padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
             local_padded_height = (x.shape[-2] + padding_len) // world_size
 
             x = torch.chunk(x, world_size, dim=-2)[rank]
