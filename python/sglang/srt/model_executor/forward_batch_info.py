@@ -525,6 +525,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        if model_runner.model_config.is_hybrid_swa:
+            ret.out_cache_loc_swa = ret.token_to_kv_pool.translate_loc_from_full_to_swa(
+                batch.out_cache_loc
+            )
+
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
@@ -845,6 +850,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        if self.out_cache_loc_swa is not None:
+            self.out_cache_loc_swa = self._pad_tensor_to_size(
+                self.out_cache_loc_swa, num_tokens
+            )
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

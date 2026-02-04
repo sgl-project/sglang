@@ -349,6 +349,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            is_hybrid_swa=self.model_runner.model_config.is_hybrid_swa,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -563,6 +564,11 @@ class CudaGraphRunner:
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = (
+            buffers.out_cache_loc_swa[:num_tokens]
+            if buffers.out_cache_loc_swa is not None
+            else None
+        )
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = buffers.encoder_lens[:bs]
@@ -653,6 +659,7 @@ class CudaGraphRunner:
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=seq_lens,
+            out_cache_loc_swa=out_cache_loc_swa,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=attn_backend,
@@ -833,6 +840,8 @@ class CudaGraphRunner:
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
         )
+        if self.model_runner.model_config.is_hybrid_swa:
+            forward_batch.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
         # Store fields
         self.raw_bs = raw_bs

@@ -125,7 +125,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             self.out_cache_loc = cuda_graph_buffers["out_cache_loc"][
                 offset : offset + self.max_num_token
             ]
-            self.swa_out_cache_loc = cuda_graph_buffers["swa_out_cache_loc"][
+            self.out_cache_loc_swa = cuda_graph_buffers["out_cache_loc_swa"][
                 offset : offset + self.max_num_token
             ]
             self.positions = cuda_graph_buffers["positions"][
@@ -424,7 +424,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                     forward_batch.req_to_token_pool.req_to_token,
                     self.eagle_worker.req_to_hidden_states_pool,
                 )
-                self.next_cuda_graph_runner.swa_out_cache_loc.copy_(
+                self.next_cuda_graph_runner.out_cache_loc_swa.copy_(
                     self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
                         self.next_cuda_graph_runner.out_cache_loc
                     )
@@ -516,6 +516,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             seq_lens_cpu=self.seq_lens_cpu,
         )
 
+        if self.model_runner.model_config.is_hybrid_swa:
+            forward_batch.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
+
         # Replay
         self.raw_bs = raw_bs
         self.bs = bs
@@ -598,7 +601,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.cuda_graph_buffers["out_cache_loc"] = torch.ones(
                 (self.offsets[-1],), dtype=torch.int64
             )
-            self.cuda_graph_buffers["swa_out_cache_loc"] = torch.ones(
+            self.cuda_graph_buffers["out_cache_loc_swa"] = torch.ones(
                 (self.offsets[-1],), dtype=torch.int64
             )
             self.cuda_graph_buffers["positions"] = torch.zeros(
@@ -645,7 +648,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers["input_ids"].zero_()
         self.cuda_graph_buffers["seq_lens"].fill_(self.seq_len_fill_value)
         self.cuda_graph_buffers["out_cache_loc"].zero_()
-        self.cuda_graph_buffers["swa_out_cache_loc"].zero_()
+        self.cuda_graph_buffers["out_cache_loc_swa"].zero_()
         self.cuda_graph_buffers["positions"].zero_()
         self.cuda_graph_buffers["accept_length"][: forward_batch.batch_size].copy_(
             batch_result.accept_lens
