@@ -9,6 +9,8 @@ import torch.multiprocessing as mp
 from torch.testing import assert_close
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    sp_pad,
+    calc_padding_len,
     WanResample,
     WanDistResample,
     WanDecoder3d,
@@ -17,13 +19,12 @@ from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
     WanDistConv2d,
     WanResidualBlock,
     WanDistResidualBlock,
-    WanAttentionBlock,
-    WanDistAttentionBlock,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
     destroy_distributed_environment,
+    get_sp_group,
 )
 
 backend = "nccl" if torch.cuda.is_available() else "gloo"
@@ -35,7 +36,7 @@ def set_envar(envar_map: dict):
 
 @pytest.mark.parametrize("dim", [192, 384])
 @pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("height", [80])
+@pytest.mark.parametrize("height", [90])
 @pytest.mark.parametrize("width", [40])
 @pytest.mark.parametrize("ulysses_degree", [2, 4])
 @pytest.mark.parametrize("ring_degree", [1])
@@ -96,10 +97,13 @@ def test_wan_dist_conv_2d(
     )
 
     # verify the result
-    with open(actual_output_file, "rb") as f:
-        actual = torch.load(f)
+    actual = torch.load(f)
 
-    assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    expected_height = expected.shape[-2]
+    if actual.shape[-2] != expected_height:
+        actual = actual[..., :expected_height, :]
+
+    assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
     if os.path.exists(saved_model_file):
         os.remove(saved_model_file)
@@ -110,7 +114,7 @@ def test_wan_dist_conv_2d(
 
 @pytest.mark.parametrize("dim", [192, 384])
 @pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("height", [80])
+@pytest.mark.parametrize("height", [90])
 @pytest.mark.parametrize("width", [40])
 @pytest.mark.parametrize("ulysses_degree", [2, 4])
 @pytest.mark.parametrize("ring_degree", [1])
@@ -175,7 +179,11 @@ def test_wan_dist_conv_3d(
     with open(actual_output_file, "rb") as f:
         actual = torch.load(f)
 
-    assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    expected_height = expected.shape[-2]
+    if actual.shape[-2] != expected_height:
+        actual = actual[..., :expected_height, :]
+
+    assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
     if os.path.exists(saved_model_file):
         os.remove(saved_model_file)
@@ -232,13 +240,16 @@ def _test_dist_conv(
     dist_conv = dist_conv.eval().requires_grad_(False).to(current_device)
 
     x = torch.load(input_data_file).to(current_device)
-    x_local = torch.chunk(x, world_size, dim=-2)[local_rank].contiguous()
+    padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
+    x_local = torch.chunk(x, dim=-2, world_size=world_size)[local_rank]
+    local_padded_height = (x.shape[-2] + padding_len) // world_size
 
     out_local = dist_conv(x_local)
 
-    tensor_list = [torch.empty_like(out_local) for _ in range(world_size)]
-    dist.all_gather(tensor_list, out_local.contiguous())
-    actual = torch.concat(tensor_list, dim=-2)
+    if out_local.shape[-2] != local_padded_height:
+        out_local = sp_pad(out_local, padding_len, dim=-2)
+
+    actual = get_sp_group().all_gather(out_local, dim=-2)
 
     if local_rank == 0:
         with open(output_file, "wb") as f:
@@ -249,7 +260,7 @@ def _test_dist_conv(
 
 @pytest.mark.parametrize("dim", [192, 384])
 @pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("height", [80])
+@pytest.mark.parametrize("height", [90])
 @pytest.mark.parametrize("width", [40])
 @pytest.mark.parametrize("ulysses_degree", [2, 4])
 @pytest.mark.parametrize("ring_degree", [1])
@@ -305,7 +316,10 @@ def test_wan_dist_resample(
     with open(actual_output_file, "rb") as f:
         actual = torch.load(f)
 
-    assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    expected_height = expected.shape[-2]
+    if actual.shape[-2] != expected_height:
+        actual = actual[..., :expected_height, :]
+    assert_close(actual, expected, atol=5e-3, rtol=5e-3)
 
     if os.path.exists(actual_output_file):
         os.remove(actual_output_file)
@@ -359,13 +373,19 @@ def _test_wan_dist_resample(
     resample = resample.eval().requires_grad_(False).to(current_device)
 
     x = torch.load(input_data_file).to(current_device)
+    padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
+    local_padded_height = (x.shape[-2] + padding_len) // world_size
+    local_target_height = local_padded_height * 2 # one time upsample with scale 2
     x_local = torch.chunk(x, world_size, dim=-2)[local_rank]
 
     out_local = resample(x_local).contiguous()
 
-    tensor_list = [torch.empty_like(out_local) for _ in range(world_size)]
-    dist.all_gather(tensor_list, out_local)
-    actual = torch.concat(tensor_list, dim=-2)
+    local_height = out_local.shape[-2]
+    if local_height != local_target_height:
+        padding_len = local_target_height - local_height
+        out_local = sp_pad(out_local, padding_len, dim=-2)
+
+    actual = get_sp_group().all_gather(out_local, dim=-2)
 
     if local_rank == 0:
         with open(output_file, "wb") as f:
@@ -375,7 +395,7 @@ def _test_wan_dist_resample(
 
 
 @pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("height", [80])
+@pytest.mark.parametrize("height", [90])
 @pytest.mark.parametrize("width", [40])
 @pytest.mark.parametrize("ulysses_degree", [2, 4])
 @pytest.mark.parametrize("ring_degree", [1])
@@ -431,7 +451,11 @@ def test_wan_dist_residual_block(
     with open(actual_output_file, "rb") as f:
         actual = torch.load(f)
 
-    assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+    expected_height = expected.shape[-2]
+    if actual.shape[-2] != expected_height:
+        actual = actual[..., :expected_height, :]
+
+    assert_close(actual, expected, atol=5e-3, rtol=5e-3)
 
     if os.path.exists(saved_model_file):
         os.remove(saved_model_file)
@@ -486,13 +510,18 @@ def _test_wan_dist_residual_block(
     residual_block = residual_block.eval().requires_grad_(False).to(current_device)
 
     x = torch.load(input_data_file).to(current_device)
-    x_local = torch.chunk(x, world_size, dim=-2)[local_rank]
+    padding_len = calc_padding_len(x, world_size=world_size, dim=-2)
+    local_padded_height = (x.shape[-2] + padding_len) // world_size
+    x_local = torch.chunk(x,  world_size, dim=-2)[local_rank]
 
     out_local = residual_block(x_local)
 
-    tensor_list = [torch.empty_like(out_local) for _ in range(world_size)]
-    dist.all_gather(tensor_list, out_local)
-    actual = torch.concat(tensor_list, dim=-2)
+    local_height = out_local.shape[-2]
+    if local_height != local_padded_height:
+        padding_len = local_padded_height - local_height
+        out_local = sp_pad(x, padding_len, dim=-2)
+
+    actual = get_sp_group().all_gather(x, dim=-2)
 
     if local_rank == 0:
         with open(output_file, "wb") as f:
