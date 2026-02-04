@@ -91,8 +91,11 @@ class TestDeepEpAutoQwen3235B(CustomTestCase):
         )
         metrics = run_gsm8k(args)
         achieved_accuracy = metrics["accuracy"]
-        self.assertGreaterEqual(achieved_accuracy, expect_accuracy,
-                                f'Accuracy of {self.model} is {str(achieved_accuracy)}, is lower than {expect_accuracy}')
+        self.assertGreaterEqual(
+            achieved_accuracy,
+            expect_accuracy,
+            f"Accuracy of {self.model} is {str(achieved_accuracy)}, is lower than {expect_accuracy}",
+        )
         print(f"Model {self.model} achieved accuracy: {str(achieved_accuracy)}")
 
 
