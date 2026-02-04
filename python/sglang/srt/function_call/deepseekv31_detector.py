@@ -149,7 +149,10 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
+                
+                # Process arguments (whether first call or subsequent calls)
+                # If first call has arguments, they should also be processed in this call
+                if func_args_raw:
                     argument_diff = (
                         func_args_raw[len(self._last_arguments) :]
                         if func_args_raw.startswith(self._last_arguments)
