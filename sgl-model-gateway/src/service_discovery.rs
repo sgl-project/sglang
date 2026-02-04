@@ -145,7 +145,7 @@ impl PodInfo {
         let pod_status = status.phase.unwrap_or_else(|| "Unknown".to_string());
 
         let pod_type = if let Some(config) = config {
-            if config.pd_mode {
+            if config.pd_mode || config.epd_mode {
                 if Self::matches_selector(pod, &config.encode_selector) {
                     Some(PodType::Encode)
                 } else if Self::matches_selector(pod, &config.prefill_selector) {
@@ -378,7 +378,7 @@ pub async fn start_service_discovery(
                                     tracked_pods_inner,
                                     app_context_inner,
                                     port,
-                                    config_inner.pd_mode,
+                                    config_inner.pd_mode || config_inner.epd_mode,
                                 )
                                 .await;
                             }
@@ -419,7 +419,7 @@ async fn handle_pod_event(
     tracked_pods: Arc<Mutex<HashSet<PodInfo>>>,
     app_context: Arc<AppContext>,
     port: u16,
-    pd_mode: bool,
+    disaggregation_mode: bool,
 ) {
     let worker_url = pod_info.worker_url(port);
 
@@ -448,7 +448,7 @@ async fn handle_pod_event(
                 pod_info.name, pod_info.pod_type, worker_url
             );
 
-            let worker_type = if pd_mode {
+            let worker_type = if disaggregation_mode {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) => Some("prefill".to_string()),
                     Some(PodType::Decode) => Some("decode".to_string()),
@@ -459,7 +459,7 @@ async fn handle_pod_event(
                 None
             };
 
-            let bootstrap_port = if pd_mode {
+            let bootstrap_port = if disaggregation_mode {
                 match &pod_info.pod_type {
                     Some(PodType::Prefill) | Some(PodType::Encode) => pod_info.bootstrap_port,
                     _ => None,
@@ -908,6 +908,36 @@ mod tests {
         }
     }
 
+    fn create_epd_config() -> ServiceDiscoveryConfig {
+        let mut encode_selector = HashMap::new();
+        encode_selector.insert("app".to_string(), "sglang".to_string());
+        encode_selector.insert("component".to_string(), "encode".to_string());
+
+        let mut prefill_selector = HashMap::new();
+        prefill_selector.insert("app".to_string(), "sglang".to_string());
+        prefill_selector.insert("component".to_string(), "prefill".to_string());
+
+        let mut decode_selector = HashMap::new();
+        decode_selector.insert("app".to_string(), "sglang".to_string());
+        decode_selector.insert("component".to_string(), "decode".to_string());
+
+        ServiceDiscoveryConfig {
+            enabled: true,
+            selector: HashMap::new(),
+            check_interval: Duration::from_secs(60),
+            port: 8080,
+            namespace: None,
+            pd_mode: false,
+            epd_mode: true,
+            prefill_selector,
+            decode_selector,
+            encode_selector,
+            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_mesh_port_annotation: "sglang.ai/ha-port".to_string(),
+        }
+    }
+
     #[test]
     fn test_pod_info_should_include() {
         let config = create_pd_config();
@@ -932,6 +962,20 @@ mod tests {
     }
 
     #[test]
+    fn test_pod_info_should_include_epd() {
+        let config = create_epd_config();
+
+        let encode_pod = create_pd_k8s_pod("encode-pod", "10.0.0.1", "encode", Some(8081));
+        assert!(PodInfo::should_include(&encode_pod, &config));
+
+        let prefill_pod = create_pd_k8s_pod("prefill-pod", "10.0.0.2", "prefill", Some(8082));
+        assert!(PodInfo::should_include(&prefill_pod, &config));
+
+        let decode_pod = create_pd_k8s_pod("decode-pod", "10.0.0.3", "decode", None);
+        assert!(PodInfo::should_include(&decode_pod, &config));
+    }
+
+    #[test]
     fn test_service_discovery_config_default() {
         let config = ServiceDiscoveryConfig::default();
         assert!(!config.enabled);
@@ -940,6 +984,7 @@ mod tests {
         assert_eq!(config.port, 8000);
         assert!(config.namespace.is_none());
         assert!(!config.pd_mode);
+        assert!(!config.epd_mode);
         assert!(config.prefill_selector.is_empty());
         assert!(config.decode_selector.is_empty());
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
@@ -986,6 +1031,20 @@ mod tests {
         assert!(pod_info.is_ready);
         assert_eq!(pod_info.pod_type, Some(PodType::Prefill));
         assert_eq!(pod_info.bootstrap_port, Some(8081));
+    }
+
+    #[test]
+    fn test_pod_info_from_pod_with_epd_config_encode() {
+        let k8s_pod = create_pd_k8s_pod("encode-pod", "10.0.0.9", "encode", Some(8083));
+        let config = create_epd_config();
+
+        let pod_info = PodInfo::from_pod(&k8s_pod, Some(&config)).unwrap();
+        assert_eq!(pod_info.name, "encode-pod");
+        assert_eq!(pod_info.ip, "10.0.0.9");
+        assert_eq!(pod_info.status, "Running");
+        assert!(pod_info.is_ready);
+        assert_eq!(pod_info.pod_type, Some(PodType::Encode));
+        assert_eq!(pod_info.bootstrap_port, Some(8083));
     }
 
     #[test]
@@ -1196,7 +1255,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            false, // pd_mode = false
+            false, // disaggregation_mode = false
         )
         .await;
 
@@ -1251,7 +1310,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true for PD pod
+            true, // disaggregation_mode = true for PD pod
         )
         .await;
 
@@ -1284,7 +1343,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true for PD pod
+            true, // disaggregation_mode = true for PD pod
         )
         .await;
 
@@ -1294,6 +1353,34 @@ mod tests {
 
         // Note: In tests with uninitialized queue, background jobs don't process
         // Worker won't appear in registry until background job runs (in production)
+    }
+
+    #[tokio::test]
+    async fn test_handle_epd_pod_event_encode_pod() {
+        let app_context = create_test_app_context().await;
+        let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
+        let pod_info = PodInfo {
+            name: "encode-pod".into(),
+            ip: "1.2.3.6".into(),
+            status: "Running".into(),
+            is_ready: true,
+            pod_type: Some(PodType::Encode),
+            bootstrap_port: Some(8082),
+            is_router: false,
+            mesh_port: None,
+        };
+        let port = 8080u16;
+
+        handle_pod_event(
+            &pod_info,
+            Arc::clone(&tracked_pods),
+            Arc::clone(&app_context),
+            port,
+            true, // disaggregation_mode = true for EPD pod
+        )
+        .await;
+
+        assert!(tracked_pods.lock().unwrap().contains(&pod_info));
     }
 
     #[tokio::test]
@@ -1382,7 +1469,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            false, // pd_mode = false
+            false, // disaggregation_mode = false
         )
         .await;
 
@@ -1416,7 +1503,7 @@ mod tests {
             Arc::clone(&tracked_pods),
             Arc::clone(&app_context),
             port,
-            true, // pd_mode = true
+            true, // disaggregation_mode = true
         )
         .await;
 
