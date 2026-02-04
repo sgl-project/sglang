@@ -97,6 +97,14 @@ torch = [
   { index = "pypi", marker = "platform_machine == 'x86_64'"},
   { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
 ]
+torchaudio = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+]
+torchvision = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+]
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
