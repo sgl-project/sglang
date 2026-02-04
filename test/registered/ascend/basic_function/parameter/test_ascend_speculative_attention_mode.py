@@ -3,16 +3,19 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
-from sglang.test.ascend.test_ascend_utils import QWEN3_32B_EAGLE3_WEIGHTS_PATH, QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH, \
-    get_device_ids
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
+from sglang.test.ascend.test_ascend_utils import (
+    QWEN3_32B_EAGLE3_WEIGHTS_PATH,
+    QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
+    get_device_ids,
+)
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_pd_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
@@ -47,46 +50,44 @@ class TestAscendSpeculativeAttentionMode(TestDisaggregationBase):
 
     @classmethod
     def start_prefill(cls):
-        prefill_args = (
-            [
-                "--disaggregation-mode",
-                "prefill",
-                "--disaggregation-decode-tp",
-                "2",
-                "--disaggregation-transfer-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--trust-remote-code",
-                "--attention-backend",
-                "ascend",
-                "--device",
-                "npu",
-                "--quantization",
-                "modelslim",
-                "--disable-radix-cache",
-                "--speculative-draft-model-quantization",
-                "unquant",
-                "--speculative-algorithm",
-                "EAGLE3",
-                "--speculative-draft-model-path",
-                QWEN3_32B_EAGLE3_WEIGHTS_PATH,
-                "--speculative-num-steps",
-                "4",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "5",
-                "--speculative-attention-mode",
-                "decode",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.7",
-                "--disable-cuda-graph",
-                "--dtype",
-                "bfloat16",
-            ]
-        )
+        prefill_args = [
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-decode-tp",
+            "2",
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--trust-remote-code",
+            "--attention-backend",
+            "ascend",
+            "--device",
+            "npu",
+            "--quantization",
+            "modelslim",
+            "--disable-radix-cache",
+            "--speculative-draft-model-quantization",
+            "unquant",
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--speculative-draft-model-path",
+            QWEN3_32B_EAGLE3_WEIGHTS_PATH,
+            "--speculative-num-steps",
+            "4",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "5",
+            "--speculative-attention-mode",
+            "decode",
+            "--tp-size",
+            "4",
+            "--mem-fraction-static",
+            "0.7",
+            "--disable-cuda-graph",
+            "--dtype",
+            "bfloat16",
+        ]
         cls.extra_envs = {
             "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
             "SGLANG_ENABLE_SPEC_V2": "1",
@@ -101,49 +102,47 @@ class TestAscendSpeculativeAttentionMode(TestDisaggregationBase):
 
     @classmethod
     def start_decode(cls):
-        decode_args = (
-            [
-                "--disaggregation-mode",
-                "decode",
-                "--base-gpu-id",
-                get_device_ids(0),
-                "--disaggregation-transfer-backend",
-                "ascend",
-                "--num-reserved-decode-tokens",
-                128,
-                "--disaggregation-decode-polling-interval",
-                2,
-                "--trust-remote-code",
-                "--attention-backend",
-                "ascend",
-                "--device",
-                "npu",
-                "--quantization",
-                "modelslim",
-                "--disable-radix-cache",
-                "--speculative-draft-model-quantization",
-                "unquant",
-                "--speculative-algorithm",
-                "EAGLE3",
-                "--speculative-draft-model-path",
-                QWEN3_32B_EAGLE3_WEIGHTS_PATH,
-                "--speculative-num-steps",
-                "4",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "5",
-                "--speculative-attention-mode",
-                "prefill",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.7",
-                "--disable-cuda-graph",
-                "--dtype",
-                "bfloat16",
-            ]
-        )
+        decode_args = [
+            "--disaggregation-mode",
+            "decode",
+            "--base-gpu-id",
+            get_device_ids(0),
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--num-reserved-decode-tokens",
+            128,
+            "--disaggregation-decode-polling-interval",
+            2,
+            "--trust-remote-code",
+            "--attention-backend",
+            "ascend",
+            "--device",
+            "npu",
+            "--quantization",
+            "modelslim",
+            "--disable-radix-cache",
+            "--speculative-draft-model-quantization",
+            "unquant",
+            "--speculative-algorithm",
+            "EAGLE3",
+            "--speculative-draft-model-path",
+            QWEN3_32B_EAGLE3_WEIGHTS_PATH,
+            "--speculative-num-steps",
+            "4",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "5",
+            "--speculative-attention-mode",
+            "prefill",
+            "--tp-size",
+            "4",
+            "--mem-fraction-static",
+            "0.7",
+            "--disable-cuda-graph",
+            "--dtype",
+            "bfloat16",
+        ]
         cls.extra_envs = {
             "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
             "SGLANG_ENABLE_SPEC_V2": "1",

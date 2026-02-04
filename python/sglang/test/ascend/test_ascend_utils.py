@@ -1,9 +1,8 @@
 """Common utilities for testing and benchmarking on NPU"""
 
+import logging
 import os
 import subprocess
-
-import logging
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -207,6 +206,7 @@ QWEN2_5_MATH_RM_72B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen2.5-Math-RM-72B"
 )
 
+
 def run_command(cmd, shell=True):
     """Execute system command and return stdout
 
@@ -243,7 +243,7 @@ def get_device_ids(index=None):
 
     device_ids = []
     if output and output.strip():
-        lines = output.strip().split('\n')
+        lines = output.strip().split("\n")
         for line in lines:
             line = line.strip()
             if line and line.isdigit():
@@ -251,7 +251,9 @@ def get_device_ids(index=None):
                     device_id = int(line)
                     device_ids.append(device_id)
                 except ValueError:
-                    logging.warning(f"Device ID '{line}' cannot be converted to an integer and has been skipped")
+                    logging.warning(
+                        f"Device ID '{line}' cannot be converted to an integer and has been skipped"
+                    )
 
     if index is not None:
         if not isinstance(index, int):
@@ -260,7 +262,9 @@ def get_device_ids(index=None):
         if 0 <= index < len(device_ids):
             return device_ids[index]
         else:
-            logging.warning(f"Index {index} is invalid, the length of device ID list is {len(device_ids)}")
+            logging.warning(
+                f"Index {index} is invalid, the length of device ID list is {len(device_ids)}"
+            )
             return None
 
     return device_ids

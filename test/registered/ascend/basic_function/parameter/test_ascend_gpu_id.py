@@ -3,8 +3,12 @@ import unittest
 import requests
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import (
+    LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
+    get_device_ids,
+    run_command,
+)
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH, run_command, get_device_ids
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -21,23 +25,22 @@ class TestGpuId(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --base-gpu-id; --gpu-id-step
     """
+
     @classmethod
     def setUpClass(cls):
         cls.device_id = get_device_ids(0)
         cls.step = 2
-        other_args = (
-            [
-                "--base-gpu-id", # Starting device ID
-                cls.device_id,
-                "--tp-size",  # tp = 2 (2 devices required for occupation)
-                "2",
-                "--gpu-id-step", # Device ID step size = 2 (occupies the starting device ID and starting device ID + 2)
-                cls.step,
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-            ]
-        )
+        other_args = [
+            "--base-gpu-id", # Starting device ID
+            cls.device_id,
+            "--tp-size",  # tp = 2 (2 devices required for occupation)
+            "2",
+            "--gpu-id-step", # Device ID step size = 2 (occupies the starting device ID and starting device ID + 2)
+            cls.step,
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+        ]
 
         cls.process = popen_launch_server(
             LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
@@ -71,8 +74,8 @@ class TestGpuId(CustomTestCase):
         if raw_result is not None:
             result = [line.strip() for line in raw_result.split("\n") if line.strip()]
         else:
-            print(f"执行命令 '{cmd}' 失败，返回结果为None")
-        for i in range(len(result)-1):
+            print(f"Command '{cmd}' execution failed, returned None")
+        for i in range(len(result) - 1):
             # Occupied devices show high memory usage.
             if i in [self.device_id, self.device_id + self.step]:
                 self.assertGreater(int(result[i]), 10000)
