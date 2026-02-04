@@ -4,7 +4,6 @@ import tempfile
 import pytest
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.testing import assert_close
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
@@ -111,7 +110,7 @@ def test_wan_dist_conv_2d(
     )
 
     # verify the result
-    actual = torch.load(f)
+    actual = torch.load(actual_output_file)
 
     expected_height = expected.shape[-2]
     if actual.shape[-2] != expected_height:
@@ -321,8 +320,7 @@ def test_wan_dist_resample(
     )
 
     # verify the result
-    with open(actual_output_file, "rb") as f:
-        actual = torch.load(f)
+    actual = torch.load(actual_output_file)
 
     expected_height = expected.shape[-2]
     if actual.shape[-2] != expected_height:
@@ -458,8 +456,7 @@ def test_wan_dist_residual_block(
     )
 
     # verify the result
-    with open(actual_output_file, "rb") as f:
-        actual = torch.load(f)
+    actual = torch.load(actual_output_file)
 
     expected_height = expected.shape[-2]
     if actual.shape[-2] != expected_height:
@@ -589,8 +586,7 @@ def test_wan_dist_mid_block(
         join=True,
     )
 
-    with open(actual_output_file, "rb") as f:
-        actual = torch.load(f)
+    actual = torch.load(actual_output_file)
 
     expected_height = expected.shape[-2]
     if actual.shape[-2] != expected_height:
@@ -727,8 +723,7 @@ def test_wan_parallel_decoder(
         join=True,
     )
 
-    with open(actual_output_file, "rb") as f:
-        actual = torch.load(f)
+    actual = torch.load(actual_output_file)
 
     if dtype == torch.bfloat16 or dtype == torch.float16:
         atol, rtol = 5e-2, 5e-2
