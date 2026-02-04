@@ -31,6 +31,13 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     NSATokenToKVPoolHost,
 )
+from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_CPU_TIER1,
+    MEDIUM_GPU,
+    BlockRemoved,
+    BlockStored,
+)
+from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -609,6 +616,79 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def _record_tier_store_event(self, node: TreeNode, medium: str):
+        """Record BlockStored events for tier transition.
+
+        Args:
+            node: The TreeNode being stored
+            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU_TIER1, etc.)
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        # Compute hash_value lazily if not already set
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        # Get parent's last hash value for first page
+        parent_block_hash = None
+        if node.parent is not None and node.parent != self.root_node:
+            if (
+                node.parent.hash_value is not None
+                and len(node.parent.hash_value) > 0
+            ):
+                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                )
+            )
+
+            parent_block_hash = block_hash
+            page_index += 1
+
+    def _record_tier_remove_event(self, node: TreeNode, medium: str):
+        """Record BlockRemoved events for tier transition.
+
+        Args:
+            node: The TreeNode being removed
+            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU_TIER1, etc.)
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        # Compute hash_value lazily if not already set
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+
+            self.kv_event_queue.append(
+                BlockRemoved(block_hashes=[block_hash], medium=medium)
+            )
+
+            page_index += 1
+
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -627,6 +707,9 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
+            # Emit tier transition events: GPU -> CPU_TIER1
+            self._record_tier_remove_event(node, MEDIUM_GPU)
+            self._record_tier_store_event(node, MEDIUM_CPU_TIER1)
         else:
             return 0
 
@@ -855,6 +938,9 @@ class HiRadixCache(RadixCache):
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
+            # Emit BlockRemoved event for host memory (L2) eviction
+            self._record_tier_remove_event(x, MEDIUM_CPU_TIER1)
+
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
@@ -915,6 +1001,10 @@ class HiRadixCache(RadixCache):
             offset += len(node.host_value)
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        # Emit BlockStored events for nodes loaded back to GPU
+        for node in nodes_to_load:
+            self._record_tier_store_event(node, MEDIUM_GPU)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
