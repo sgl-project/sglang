@@ -41,9 +41,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-
 from sglang.srt.models.utils import AutoWeightsLoader
-from sglang.srt.utils import add_prefix, logger
 from sglang.srt.utils import add_prefix, is_npu, logger
 
 

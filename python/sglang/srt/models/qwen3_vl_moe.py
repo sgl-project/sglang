@@ -181,6 +181,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return bool(self._lora_pattern_moe.match(module_name))
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        loaded = set()
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -259,6 +260,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded.add(name)
                 break
             else:
                 # Track if this is an expert weight to enable early skipping
@@ -300,6 +302,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                                 shard_id,
                                 num_experts,
                             )
+                        loaded.add(name_mapped)
                     else:
                         # Skip loading extra parameters for GPTQ/modelopt models.
                         if (
@@ -319,6 +322,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             shard_id=shard_id,
                             expert_id=expert_id,
                         )
+                        loaded.add(name_mapped)
                     name = name_mapped
                     break
                 else:
@@ -346,6 +350,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                             param, "weight_loader", default_weight_loader
                         )
                         weight_loader(param, loaded_weight)
+                        loaded.add(name)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
@@ -357,6 +362,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         #         for layer_id in range(self.start_layer, self.end_layer)
         #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
+        return loaded
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

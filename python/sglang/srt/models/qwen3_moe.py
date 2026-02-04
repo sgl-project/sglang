@@ -61,10 +61,10 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
+    AutoWeightsLoader,
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -1036,44 +1036,51 @@ class Qwen3MoeForCausalLM(nn.Module):
         if not hasattr(self, "_cached_params_dict"):
             self._cached_params_dict = dict(self.named_parameters())
         params_dict = self._cached_params_dict
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
 
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
+        def stream():
+            for name, loaded_weight in weights:
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
                     continue
 
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
+                if "rotary_emb.inv_freq" in name:
+                    continue
+                handled = False
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    # Skip non-stacked layers and experts (experts handled below).
+                    if weight_name not in name:
+                        continue
+                    # We have mlp.experts[0].gate_proj in the checkpoint.
+                    # Since we handle the experts below in expert_params_mapping,
+                    # we need to skip here BEFORE we update the name, otherwise
+                    # name will be updated to mlp.experts[0].gate_up_proj, which
+                    # will then be updated below in expert_params_mapping
+                    # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                    if "mlp.experts" in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        handled = True
+                        break
+                    if name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    handled = True
+                    break
+                if handled:
+                    continue
+
                 # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
 
@@ -1099,26 +1106,28 @@ class Qwen3MoeForCausalLM(nn.Module):
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    handled = True
                     break
+                if handled:
+                    continue
+
+                if is_expert_weight:
+                    # This is an expert weight but not mapped to this rank, skip all remaining processing
+                    continue
+
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+
+                if name in params_dict.keys():
+                    yield name, loaded_weight
                 else:
-                    if is_expert_weight:
-                        # This is an expert weight but not mapped to this rank, skip all remaining processing
-                        continue
+                    logger.warning(f"Parameter {name} not found in params_dict")
 
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+        loader = AutoWeightsLoader(self)
+        loader.load_weights(stream())
 
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(
