@@ -772,6 +772,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 continue
             if "mtp" in name:
                 continue
+            if "visual" in name:
+                continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -781,7 +783,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
 
-                if "visual" in name or "mlp.experts" in name:
+                if "mlp.experts" in name:
                     continue
 
                 name = name.replace(weight_name, param_name)
@@ -798,12 +800,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if "visual" in name:
-                    # adapt to VisionAttention
-                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                    name = name.replace(r"model.visual.", r"visual.")
-
-                # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -896,6 +892,8 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 continue
             if "mtp" in name:
                 continue
+            if "visual" in name:
+                continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
@@ -908,8 +906,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
-                    continue
-                if "visual" in name:
                     continue
 
                 # We have mlp.experts[0].gate_proj in the checkpoint.
@@ -939,8 +935,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
-                        continue
-                    if "visual" in name or self.config.encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -996,11 +990,6 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     if is_expert_weight:
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
-                                        
-                    if "visual" in name:
-                        # adapt to VisionAttention
-                        name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                        name = name.replace(r"model.visual.", r"visual.")
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
