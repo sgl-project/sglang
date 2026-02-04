@@ -40,7 +40,7 @@ class TestL2CacheMutuallyExclusive(CustomTestCase):
         out_log_file = open("./cache_out_log.txt", "w+", encoding="utf-8")
         err_log_file = open("./cache_err_log.txt", "w+", encoding="utf-8")
         try:
-            process = popen_launch_server(
+            popen_launch_server(
                 QWEN3_32B_WEIGHTS_PATH,
                 DEFAULT_URL_FOR_TEST,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -48,7 +48,7 @@ class TestL2CacheMutuallyExclusive(CustomTestCase):
                 return_stdout_stderr=(out_log_file, err_log_file),
             )
         except Exception as e:
-            print(f"Server launch failed as expectes:{e}")
+            print(f"Server launch failed as expects:{e}")
         finally:
             err_log_file.seek(0)
             content = err_log_file.read()
