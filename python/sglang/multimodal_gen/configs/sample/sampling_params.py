@@ -153,6 +153,8 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
 
+    return_file_paths_only: bool = False
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -737,6 +739,12 @@ class SamplingParams:
                 "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
+        )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action="store_true",
+            default=SamplingParams.return_file_paths_only,
+            help="If set, only return the file paths instead of the tensors.",
         )
         return parser
 

@@ -6,10 +6,12 @@ import os
 import time
 from typing import List, Union
 
+import numpy as np
 import torch
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     maybe_init_distributed_environment_and_model_parallel,
@@ -18,6 +20,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -185,6 +188,45 @@ class GPUWorker:
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
 
+            # Save output to file and return file path only if requested. Avoid the serialization
+            # and deserialization overhead between scheduler_client and GPU worker.
+            if req.save_output and req.return_file_paths_only:
+                output_paths: list[str] = []
+                # Copied from DiffGenerator.generate()
+                audio_sample_rate = output_batch.audio_sample_rate
+                for output_idx, sample in enumerate(output_batch.output):
+                    num_outputs = len(output_batch.output)
+                    audio = output_batch.audio
+                    if req.data_type == DataType.VIDEO:
+                        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                            audio = (
+                                audio[output_idx]
+                                if audio.shape[0] > output_idx
+                                else None
+                            )
+                        elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
+                            audio = (
+                                audio[output_idx]
+                                if audio.shape[0] > output_idx
+                                else None
+                            )
+                        if audio is not None and not (
+                            isinstance(sample, (tuple, list)) and len(sample) == 2
+                        ):
+                            sample = (sample, audio)
+                    save_file_path = req.output_file_path(num_outputs, output_idx)
+                    post_process_sample(
+                        sample,
+                        fps=req.fps,
+                        save_output=True,
+                        save_file_path=save_file_path,
+                        data_type=req.data_type,
+                        audio_sample_rate=audio_sample_rate,
+                    )
+                    output_paths.append(save_file_path)
+                output_batch.output_file_paths = output_paths
+                output_batch.output = None
+
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
@@ -197,8 +239,7 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
-        finally:
-            return output_batch
+        return output_batch
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float

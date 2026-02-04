@@ -325,6 +325,7 @@ class OutputBatch:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    output_file_paths: list[str] | None = None
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None

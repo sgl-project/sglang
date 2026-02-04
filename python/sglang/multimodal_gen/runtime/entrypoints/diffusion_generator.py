@@ -236,6 +236,33 @@ class DiffGenerator:
                         )
                         continue
                     audio_sample_rate = output_batch.audio_sample_rate
+
+                    if req.save_output and req.return_file_paths_only:
+                        for output_idx, output_path in enumerate(
+                            output_batch.output_file_paths
+                        ):
+                            result_item: dict[str, Any] = {
+                                "samples": None,
+                                "frames": None,
+                                "audio": None,
+                                "prompts": req.prompt,
+                                "size": (req.height, req.width, req.num_frames),
+                                "generation_time": timer.duration,
+                                "peak_memory_mb": output_batch.peak_memory_mb,
+                                "timings": (
+                                    output_batch.timings.to_dict()
+                                    if output_batch.timings
+                                    else {}
+                                ),
+                                "trajectory": output_batch.trajectory_latents,
+                                "trajectory_timesteps": output_batch.trajectory_timesteps,
+                                "trajectory_decoded": output_batch.trajectory_decoded,
+                                "prompt_index": output_idx,
+                                "output_file_path": output_path,
+                            }
+                            results.append(result_item)
+                        continue
+
                     for output_idx, sample in enumerate(output_batch.output):
                         num_outputs = len(output_batch.output)
                         audio = output_batch.audio

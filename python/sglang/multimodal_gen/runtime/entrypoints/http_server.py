@@ -114,33 +114,36 @@ async def forward_to_scheduler(req_obj, sp):
     """Forwards request to scheduler and processes the result."""
     try:
         response = await async_scheduler_client.forward(req_obj)
-        if response.output is None:
+        if response.output is None and response.output_file_paths is None:
             raise RuntimeError("Model generation returned no output.")
 
         output_file_path = sp.output_file_path()
-        sample = response.output[0]
-        try:
-            audio = response.audio
-        except AttributeError:
-            audio = None
-        if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-            audio = audio[0]
-        if audio is not None and not (
-            isinstance(sample, (tuple, list)) and len(sample) == 2
-        ):
-            sample = (sample, audio)
-        post_process_sample(
-            sample=sample,
-            data_type=sp.data_type,
-            fps=sp.fps or 24,
-            save_output=True,
-            save_file_path=output_file_path,
-            audio_sample_rate=(
-                response.audio_sample_rate
-                if hasattr(response, "audio_sample_rate")
-                else None
-            ),
-        )
+        if response.output_file_paths:
+            output_file_path = response.output_file_paths[0]
+        else:
+            sample = response.output[0]
+            try:
+                audio = response.audio
+            except AttributeError:
+                audio = None
+            if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                audio = audio[0]
+            if audio is not None and not (
+                isinstance(sample, (tuple, list)) and len(sample) == 2
+            ):
+                sample = (sample, audio)
+            post_process_sample(
+                sample=sample,
+                data_type=sp.data_type,
+                fps=sp.fps or 24,
+                save_output=True,
+                save_file_path=output_file_path,
+                audio_sample_rate=(
+                    response.audio_sample_rate
+                    if hasattr(response, "audio_sample_rate")
+                    else None
+                ),
+            )
 
         if hasattr(response, "model_dump"):
             data = response.model_dump()
