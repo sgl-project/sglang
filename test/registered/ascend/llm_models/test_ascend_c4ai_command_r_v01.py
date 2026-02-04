@@ -17,7 +17,7 @@ class TestC4AI(GSM8KAscendMixin, CustomTestCase):
 
     model = C4AI_COMMAND_R_V01_WEIGHTS_PATH
     accuracy = 0.55
-    chat_template_path = "./tool_chat_template_c4ai_command_r_v01.jinja"
+    chat_template_path = "/__w/sglang/sglang/test/nightly/ascend/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
