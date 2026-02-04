@@ -832,7 +832,7 @@ class AscendAttnBackend(AttentionBackend):
                     layer.qk_head_dim <= 128
                     and causal
                     and forward_batch.encoder_lens is None
-                    and not self.is_dllm_model:
+                    and not self.is_dllm_model
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
