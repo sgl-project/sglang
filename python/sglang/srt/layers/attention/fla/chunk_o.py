@@ -10,24 +10,19 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
-from sglang.srt.layers.attention.fla.utils import check_shared_mem, is_nvidia_hopper, IS_GLUON_SUPPORTED
+from sglang.srt.layers.attention.fla.utils import (
+    IS_GLUON_SUPPORTED,
+    check_shared_mem,
+    is_nvidia_hopper,
+)
 
 if IS_GLUON_SUPPORTED:
-    try:
-        from triton.experimental.gluon import language as gl
-        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-        from sglang.srt.layers.attention.fla.gluon.chunk_o_gluon import chunk_fwd_kernel_o_gluon
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-    except ImportError as e:
-        raise ImportError(
-            f">>> Failed to import Gluon in current triton version {triton.__version__} and "
-            f">>> Platform {torch.cuda.get_device_capability()}.\n"
-            f">>> Gluon/Blackwell features require: \n"
-            f">>> 1. Triton >= 3.6.0\n"
-            f">>> 2. NVIDIA GPU (compute capability >= 10.0)\n"
-            f">>> Error: {e}\n"
-            f">>> Set FLA_USE_GLUON=0 to disable and continue."
-        ) from e
+    from sglang.srt.layers.attention.fla.gluon.chunk_o_gluon import (
+        chunk_fwd_kernel_o_gluon,
+    )
 
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -179,7 +174,9 @@ def chunk_fwd_o(
         h_desc = TensorDescriptor.from_tensor(h, [1, 1, 1, BK, BV], h_layout)
         if IS_VARLEN:
             o_layout = gl.NVMMASharedLayout.get_default_for([BT, BV], gl_dtype)
-            o_desc = TensorDescriptor.from_tensor(o.view(B * T, H * V), [1, BV], o_layout)
+            o_desc = TensorDescriptor.from_tensor(
+                o.view(B * T, H * V), [1, BV], o_layout
+            )
         else:
             o_desc = TensorDescriptor.from_tensor(o, [1, BT, 1, BV], vo_layout)
 

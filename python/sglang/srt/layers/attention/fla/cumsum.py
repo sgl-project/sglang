@@ -9,20 +9,16 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
-from sglang.srt.layers.attention.fla.utils import check_shared_mem, input_guard, FLA_CUMSUM_SCALAR_VECTORIZATION
+from sglang.srt.layers.attention.fla.utils import (
+    FLA_CUMSUM_SCALAR_VECTORIZATION,
+    check_shared_mem,
+    input_guard,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps)
-#         for num_warps in [1, 2, 4, 8]
-#     ],
-#     key=['B', 'H', 'BT', 'BH', 'IS_VARLEN', 'REVERSE'],
-#     **autotune_cache_kwargs
-# )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_vectorization_kernel(
     s,
     o,
@@ -43,20 +39,32 @@ def chunk_local_cumsum_scalar_vectorization_kernel(
     n_groups = tl.cdiv(H, BH)
     i_b, i_hg = i_bh // n_groups, i_bh % n_groups
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(tl.int32)
+        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+            cu_seqlens + i_n + 1
+        ).to(tl.int32)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
 
     if HEAD_FIRST:
-        p_s = tl.make_block_ptr(s + bos*H, (H,T), (T,1), (i_hg * BH, i_t * BT), (BH,BT), (1,0))
-        p_o = tl.make_block_ptr(o + bos*H, (H,T), (T,1), (i_hg * BH, i_t * BT), (BH,BT), (1,0))
+        p_s = tl.make_block_ptr(
+            s + bos * H, (H, T), (T, 1), (i_hg * BH, i_t * BT), (BH, BT), (1, 0)
+        )
+        p_o = tl.make_block_ptr(
+            o + bos * H, (H, T), (T, 1), (i_hg * BH, i_t * BT), (BH, BT), (1, 0)
+        )
     else:
-        p_s = tl.make_block_ptr(s + bos*H, (T,H), (H,1), (i_t * BT, i_hg * BH), (BT,BH), (1,0))
-        p_o = tl.make_block_ptr(o + bos*H, (T,H), (H,1), (i_t * BT, i_hg * BH), (BT,BH), (1,0))
+        p_s = tl.make_block_ptr(
+            s + bos * H, (T, H), (H, 1), (i_t * BT, i_hg * BH), (BT, BH), (1, 0)
+        )
+        p_o = tl.make_block_ptr(
+            o + bos * H, (T, H), (H, 1), (i_t * BT, i_hg * BH), (BT, BH), (1, 0)
+        )
     # [BT, BH]
-    b_s = tl.load(p_s, boundary_check=(0,1)).to(tl.float32)
+    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
     if HEAD_FIRST:
         b_o = tl.cumsum(b_s, axis=1)
         if REVERSE:
@@ -69,7 +77,7 @@ def chunk_local_cumsum_scalar_vectorization_kernel(
             b_o = -b_o + b_z[None, :] + b_s
     if HAS_SCALE:
         b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,1))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
 # @triton.autotune(

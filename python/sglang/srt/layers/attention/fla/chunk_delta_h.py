@@ -13,25 +13,15 @@ from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
-from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper, IS_GLUON_SUPPORTED
+from sglang.srt.layers.attention.fla.utils import IS_GLUON_SUPPORTED, is_nvidia_hopper
 
 if IS_GLUON_SUPPORTED:
-    try:
-        from triton.experimental.gluon import language as gl
-        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-        from sglang.srt.layers.attention.fla.gluon.chunk_delta_h_gluon import chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-    except ImportError as e:
-        raise ImportError(
-            f">>> Failed to import Gluon in current triton version {triton.__version__} and "
-            f">>> Platform {torch.cuda.get_device_capability()}.\n"
-            f">>> Gluon/Blackwell features require: \n"
-            f">>> 1. Triton >= 3.6.0\n"
-            f">>> 2. NVIDIA GPU (compute capability >= 10.0)\n"
-            f">>> Error: {e}\n"
-            f">>> Set FLA_USE_GLUON=0 to disable and continue."
-        ) from e
-
+    from sglang.srt.layers.attention.fla.gluon.chunk_delta_h_gluon import (
+        chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon,
+    )
 
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
@@ -122,7 +112,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # load initial state
     if USE_INITIAL_STATE:
         if not TRANSPOSE_STATE:
-            p_h0_1 = tl.make_block_ptr(h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+            p_h0_1 = tl.make_block_ptr(
+                h0, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+            )
             b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
             if K > 64:
                 p_h0_2 = tl.make_block_ptr(
@@ -141,16 +133,24 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
         else:
             # Column major: shape (K, V), stride (1, K)
-            p_h0_1 = tl.make_block_ptr(h0, (K, V), (1, K), (0, i_v * BV), (64, BV), (0, 1))
+            p_h0_1 = tl.make_block_ptr(
+                h0, (K, V), (1, K), (0, i_v * BV), (64, BV), (0, 1)
+            )
             b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
             if K > 64:
-                p_h0_2 = tl.make_block_ptr(h0, (K, V), (1, K), (64, i_v * BV), (64, BV), (0, 1))
+                p_h0_2 = tl.make_block_ptr(
+                    h0, (K, V), (1, K), (64, i_v * BV), (64, BV), (0, 1)
+                )
                 b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
             if K > 128:
-                p_h0_3 = tl.make_block_ptr(h0, (K, V), (1, K), (128, i_v * BV), (64, BV), (0, 1))
+                p_h0_3 = tl.make_block_ptr(
+                    h0, (K, V), (1, K), (128, i_v * BV), (64, BV), (0, 1)
+                )
                 b_h3 += tl.load(p_h0_3, boundary_check=(0, 1)).to(tl.float32)
             if K > 192:
-                p_h0_4 = tl.make_block_ptr(h0, (K, V), (1, K), (192, i_v * BV), (64, BV), (0, 1))
+                p_h0_4 = tl.make_block_ptr(
+                    h0, (K, V), (1, K), (192, i_v * BV), (64, BV), (0, 1)
+                )
                 b_h4 += tl.load(p_h0_4, boundary_check=(0, 1)).to(tl.float32)
 
     # main recurrence
@@ -287,7 +287,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     # epilogue
     if INPLACE_UPDATE:
         if not TRANSPOSE_STATE:
-            p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
+            p_ht = tl.make_block_ptr(
+                ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
+            )
             tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
             if K > 64:
                 p_ht = tl.make_block_ptr(
@@ -306,16 +308,24 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
         else:
             # Column major: shape (K, V), stride (1, K)
-            p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (0, i_v * BV), (64, BV), (0, 1))
+            p_ht = tl.make_block_ptr(
+                ht, (K, V), (1, K), (0, i_v * BV), (64, BV), (0, 1)
+            )
             tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
             if K > 64:
-                p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (64, i_v * BV), (64, BV), (0, 1))
+                p_ht = tl.make_block_ptr(
+                    ht, (K, V), (1, K), (64, i_v * BV), (64, BV), (0, 1)
+                )
                 tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
             if K > 128:
-                p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (128, i_v * BV), (64, BV), (0, 1))
+                p_ht = tl.make_block_ptr(
+                    ht, (K, V), (1, K), (128, i_v * BV), (64, BV), (0, 1)
+                )
                 tl.store(p_ht, b_h3.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
             if K > 192:
-                p_ht = tl.make_block_ptr(ht, (K, V), (1, K), (192, i_v * BV), (64, BV), (0, 1))
+                p_ht = tl.make_block_ptr(
+                    ht, (K, V), (1, K), (192, i_v * BV), (64, BV), (0, 1)
+                )
                 tl.store(p_ht, b_h4.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -378,25 +388,39 @@ def chunk_gated_delta_rule_fwd_h(
             if transpose_state:
                 # Create transposed view [N, H, V, K] to satisfy TMA alignment
                 h0_view = initial_state.transpose(-2, -1)
-                h0_layout = gl.NVMMASharedLayout.get_default_for([1, 1, BV, BK], gl.float32)
-                h0_desc = TensorDescriptor.from_tensor(h0_view, [1, 1, BV, BK], h0_layout)
+                h0_layout = gl.NVMMASharedLayout.get_default_for(
+                    [1, 1, BV, BK], gl.float32
+                )
+                h0_desc = TensorDescriptor.from_tensor(
+                    h0_view, [1, 1, BV, BK], h0_layout
+                )
             else:
-                h0_layout = gl.NVMMASharedLayout.get_default_for([1, 1, BK, BV], gl.float32)
-                h0_desc = TensorDescriptor.from_tensor(initial_state, [1, 1, BK, BV], h0_layout)
+                h0_layout = gl.NVMMASharedLayout.get_default_for(
+                    [1, 1, BK, BV], gl.float32
+                )
+                h0_desc = TensorDescriptor.from_tensor(
+                    initial_state, [1, 1, BK, BV], h0_layout
+                )
         else:
             h0_desc = None
 
         # For varlen, use scatter layout for v_new to handle boundary correctly
         if save_new_value:
             if IS_VARLEN:
-                v_new_scatter_layout = gl.NVMMASharedLayout.get_default_for([BT, BV], gl_dtype)
-                v_new_desc = TensorDescriptor.from_tensor(v_new.view(B * T, H * V), [1, BV], v_new_scatter_layout)
+                v_new_scatter_layout = gl.NVMMASharedLayout.get_default_for(
+                    [BT, BV], gl_dtype
+                )
+                v_new_desc = TensorDescriptor.from_tensor(
+                    v_new.view(B * T, H * V), [1, BV], v_new_scatter_layout
+                )
             else:
-                v_new_desc = TensorDescriptor.from_tensor(v_new, [1, BT, 1, BV], v_layout)
+                v_new_desc = TensorDescriptor.from_tensor(
+                    v_new, [1, BT, 1, BV], v_layout
+                )
         else:
             v_new_desc = None
 
-        grid = (triton.cdiv(V, BV), N*H)
+        grid = (triton.cdiv(V, BV), N * H)
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon[grid](
             k_desc=k_desc,
             v_desc=v_desc,

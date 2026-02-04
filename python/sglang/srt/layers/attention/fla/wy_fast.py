@@ -12,20 +12,13 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.utils import IS_GLUON_SUPPORTED
 
 if IS_GLUON_SUPPORTED:
-    try:
-        from triton.experimental.gluon import language as gl
-        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-        from sglang.srt.layers.attention.fla.gluon.wy_fast_gluon import recompute_w_u_fwd_kernel_gluon
-    except ImportError as e:
-        raise ImportError(
-            f">>> Failed to import Gluon in current triton version {triton.__version__} and "
-            f">>> Platform {torch.cuda.get_device_capability()}.\n"
-            f">>> Gluon/Blackwell features require: \n"
-            f">>> 1. Triton >= 3.6.0.\n"
-            f">>> 2. NVIDIA GPU (compute capability >= 10.0)\n"
-            f">>> Error: {e}\n"
-            f">>> Set FLA_USE_GLUON=0 to disable and continue."
-        ) from e
+    from triton.experimental.gluon import language as gl
+    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+
+    from sglang.srt.layers.attention.fla.gluon.wy_fast_gluon import (
+        recompute_w_u_fwd_kernel_gluon,
+    )
+
 
 # @triton.autotune(
 #     configs=[
@@ -149,20 +142,24 @@ def recompute_w_u_fwd(
         # tma desc init
         kw_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BK], gl.float16)
         vu_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BV], gl.float16)
-        A_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BT], gl.float16) 
+        A_layout = gl.NVMMASharedLayout.get_default_for([1, BT, 1, BT], gl.float16)
         k_desc = TensorDescriptor.from_tensor(k, [1, BT, 1, BK], kw_layout)
         v_desc = TensorDescriptor.from_tensor(v, [1, BT, 1, BV], vu_layout)
         A_desc = TensorDescriptor.from_tensor(A, [1, BT, 1, BT], A_layout)
         if cu_seqlens is not None:
             w_layout = gl.NVMMASharedLayout.get_default_for([BT, BK], gl.float16)
-            w_desc = TensorDescriptor.from_tensor(w.view(B*T, H*K), [1, BK], w_layout)
+            w_desc = TensorDescriptor.from_tensor(
+                w.view(B * T, H * K), [1, BK], w_layout
+            )
             u_layout = gl.NVMMASharedLayout.get_default_for([BT, BV], gl.float16)
-            u_desc = TensorDescriptor.from_tensor(u.view(B*T, H*V), [1, BV], u_layout)
+            u_desc = TensorDescriptor.from_tensor(
+                u.view(B * T, H * V), [1, BV], u_layout
+            )
         else:
             w_desc = TensorDescriptor.from_tensor(w, [1, BT, 1, BK], kw_layout)
             u_desc = TensorDescriptor.from_tensor(u, [1, BT, 1, BV], vu_layout)
-        
-        recompute_w_u_fwd_kernel_gluon[(NT, B*H)](
+
+        recompute_w_u_fwd_kernel_gluon[(NT, B * H)](
             k_desc=k_desc,
             v_desc=v_desc,
             w_desc=w_desc,

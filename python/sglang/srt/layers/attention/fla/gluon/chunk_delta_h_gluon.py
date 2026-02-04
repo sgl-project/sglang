@@ -7,33 +7,27 @@ try:
     from triton.experimental.gluon.language.nvidia.blackwell import (
         TensorMemoryLayout,
         allocate_tensor_memory,
-        get_tmem_reg_layout,
-        tma,
-        mbarrier,
-        tcgen05_mma,
-        tcgen05_commit,
         fence_async_shared,
+        get_tmem_reg_layout,
+        mbarrier,
+        tcgen05_commit,
+        tcgen05_mma,
+        tma,
     )
 except ImportError as e:
     raise ImportError(
         f">>> Failed to import Gluon in current triton version {triton.__version__} and "
         f">>> Platform {torch.cuda.get_device_capability()}.\n"
         f">>> Gluon/Blackwell features require: \n"
-        f">>> 1. Triton >= 3.6.0.\n"
-        f">>> 2. NVIDIA GPU (compute capability >= 10.0)\n"
+        f">>> 1. Triton >= 3.6.0 \n"
+        f">>> 2. NVIDIA GPU (compute capability == 10.0)\n"
+        f">>> 3. Pytorch >= 2.9.0 \n"
         f">>> Error: {e}\n"
         f">>> Set FLA_USE_GLUON=0 to disable and continue."
     ) from e
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps)
-#         for num_warps in [4, 8]
-#     ],
-#     key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'USE_GK'],
-# )
-@gluon.jit(do_not_specialize=['T'])
+@gluon.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
     k_desc,
     v_desc,
@@ -65,7 +59,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
     i_hk = i_h // (H // HK)
 
     if IS_VARLEN:
-        bos, eos = gl.load(cu_seqlens + i_n).to(gl.int32), gl.load(cu_seqlens + i_n + 1).to(gl.int32)
+        bos, eos = gl.load(cu_seqlens + i_n).to(gl.int32), gl.load(
+            cu_seqlens + i_n + 1
+        ).to(gl.int32)
         T = eos - bos
         NT = gl.cdiv(T, BT)
         boh = gl.load(chunk_offsets + i_n).to(gl.int32)
@@ -85,18 +81,30 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
     # v: [1, BT, 1, BV]
     v_smem = gl.allocate_shared_memory(dtype, v_desc.block_type.shape, v_desc.layout)
     # h0/ht: [1, 1, BK, BV] or [1, 1, BV, BK] if TRANSPOSE_STATE, dtype=fp32 (4D TMA)
-    h0_smem = gl.allocate_shared_memory(gl.float32, h0_desc.block_type.shape, h0_desc.layout) if USE_INITIAL_STATE else None
+    h0_smem = (
+        gl.allocate_shared_memory(gl.float32, h0_desc.block_type.shape, h0_desc.layout)
+        if USE_INITIAL_STATE
+        else None
+    )
     # h: [1, 1, 1, BK, BV], dtype=bf16/fp16 (5D TMA)
     h_smem = gl.allocate_shared_memory(dtype, h_desc.block_type.shape, h_desc.layout)
- 
+
     # For varlen: use scatter layout [BT, BV]; for non-varlen: use [1, BT, 1, BV]
     if SAVE_NEW_VALUE:
         if IS_VARLEN:
-            offsets_layout: gl.constexpr = gl.SliceLayout(0, gl.BlockedLayout([1, 4], [32, 1], [1, NUM_WARPS], [1, 0]))
-            v_new_scatter_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BT, BV], dtype)
-            v_new_smem = gl.allocate_shared_memory(dtype, [BT, BV], v_new_scatter_layout)
+            offsets_layout: gl.constexpr = gl.SliceLayout(
+                0, gl.BlockedLayout([1, 4], [32, 1], [1, NUM_WARPS], [1, 0])
+            )
+            v_new_scatter_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for(
+                [BT, BV], dtype
+            )
+            v_new_smem = gl.allocate_shared_memory(
+                dtype, [BT, BV], v_new_scatter_layout
+            )
         else:
-            v_new_smem = gl.allocate_shared_memory(dtype, v_new_desc.block_type.shape, v_new_desc.layout)
+            v_new_smem = gl.allocate_shared_memory(
+                dtype, v_new_desc.block_type.shape, v_new_desc.layout
+            )
     else:
         v_new_smem = None
 
@@ -117,14 +125,22 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
     # Tensor memory layout for accumulation
     v_tmem_layout: gl.constexpr = TensorMemoryLayout([BT, BV], col_stride=1)
     h_tmem_layout: gl.constexpr = TensorMemoryLayout([BK, BV], col_stride=1)
-    v_reg_layout: gl.constexpr = get_tmem_reg_layout(gl.float32, [BT, BV], v_tmem_layout, NUM_WARPS)
-    v_reg_layout_16: gl.constexpr = get_tmem_reg_layout(dtype, [BT, BV], v_tmem_layout, NUM_WARPS)
-    h_reg_layout: gl.constexpr = get_tmem_reg_layout(gl.float32, [BK, BV], h_tmem_layout, NUM_WARPS)
+    v_reg_layout: gl.constexpr = get_tmem_reg_layout(
+        gl.float32, [BT, BV], v_tmem_layout, NUM_WARPS
+    )
+    v_reg_layout_16: gl.constexpr = get_tmem_reg_layout(
+        dtype, [BT, BV], v_tmem_layout, NUM_WARPS
+    )
+    h_reg_layout: gl.constexpr = get_tmem_reg_layout(
+        gl.float32, [BK, BV], h_tmem_layout, NUM_WARPS
+    )
     g_layout_bt: gl.constexpr = gl.SliceLayout(dim=1, parent=v_reg_layout)
 
     if TRANSPOSE_STATE:
         h0_tmem_layout_t: gl.constexpr = TensorMemoryLayout([BV, BK], col_stride=1)
-        h0_reg_layout_t: gl.constexpr = get_tmem_reg_layout(gl.float32, [BV, BK], h0_tmem_layout_t, NUM_WARPS)
+        h0_reg_layout_t: gl.constexpr = get_tmem_reg_layout(
+            gl.float32, [BV, BK], h0_tmem_layout_t, NUM_WARPS
+        )
 
     # Allocate tensor memory for MMA operations
     v_tmem = allocate_tensor_memory(gl.float32, [BT, BV], v_tmem_layout)
@@ -140,9 +156,13 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
         tma_phase_h0 = 0
         mbarrier.expect(tma_bar_h0, h0_desc.block_type.nbytes)
         if TRANSPOSE_STATE:
-            tma.async_copy_global_to_shared(h0_desc, [index, i_h, i_v * BV, 0], tma_bar_h0, h0_smem)
+            tma.async_copy_global_to_shared(
+                h0_desc, [index, i_h, i_v * BV, 0], tma_bar_h0, h0_smem
+            )
         else:
-            tma.async_copy_global_to_shared(h0_desc, [index, i_h, 0, i_v * BV], tma_bar_h0, h0_smem)
+            tma.async_copy_global_to_shared(
+                h0_desc, [index, i_h, 0, i_v * BV], tma_bar_h0, h0_smem
+            )
         mbarrier.wait(tma_bar_h0, phase=tma_phase_h0)
         tma_phase_h0 ^= 1
         if TRANSPOSE_STATE:
@@ -165,7 +185,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
 
         # Prefetch w
         mbarrier.expect(tma_bar_w, w_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(w_desc, [i_b, i_t_kvw, i_h, 0], tma_bar_w, w_smem)
+        tma.async_copy_global_to_shared(
+            w_desc, [i_b, i_t_kvw, i_h, 0], tma_bar_w, w_smem
+        )
 
         # Apply gate: v_new *= exp(g_last - g), h *= exp(g_last)
         # TODO: i_t == NT -1 or no-check
@@ -177,7 +199,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
             g_mask = g_offset < T
             b_g = gl.load(g + (bos + g_offset) * H + i_h, mask=g_mask, other=0)
             bg_last_exp = gl.exp(bg_last)
-        
+
         if SAVE_NEW_VALUE and IS_VARLEN:
             # For varlen: use scatter to handle boundary correctly
             t_limit_right = gl.minimum(T - i_t * BT, BT)
@@ -191,11 +213,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
 
         # Prefetch v
         mbarrier.expect(tma_bar_v, v_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(v_desc, [i_b, i_t_kvw, i_h, i_v * BV], tma_bar_v, v_smem)
+        tma.async_copy_global_to_shared(
+            v_desc, [i_b, i_t_kvw, i_h, i_v * BV], tma_bar_v, v_smem
+        )
 
         # Prefetch k
         mbarrier.expect(tma_bar_k, k_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(k_desc, [i_b, i_t_kvw, i_hk, 0], tma_bar_k, k_smem)
+        tma.async_copy_global_to_shared(
+            k_desc, [i_b, i_t_kvw, i_hk, 0], tma_bar_k, k_smem
+        )
 
         # wait w
         mbarrier.wait(tma_bar_w, phase=tma_phase_w)
@@ -231,11 +257,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
                 v_new_smem_2d = v_new_smem.reshape([BT, BV])
                 v_new_smem_2d.store(v_new_reg.to(dtype))
                 fence_async_shared()
-                tma.async_copy_shared_to_global(v_new_desc, [i_b, i_t_kvw, i_h, i_v * BV], v_new_smem)
+                tma.async_copy_shared_to_global(
+                    v_new_desc, [i_b, i_t_kvw, i_h, i_v * BV], v_new_smem
+                )
 
         if USE_G:
             if i_t == NT - 1:
-                v_new_reg = v_new_reg * gl.where(g_mask, gl.exp(bg_last - b_g), 0)[:, None]
+                v_new_reg = (
+                    v_new_reg * gl.where(g_mask, gl.exp(bg_last - b_g), 0)[:, None]
+                )
             else:
                 v_new_reg = v_new_reg * gl.exp(bg_last - b_g)[:, None]
             b_h *= bg_last_exp

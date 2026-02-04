@@ -1,5 +1,5 @@
-import triton
 import torch
+import triton
 
 try:
     from triton.experimental import gluon
@@ -7,20 +7,21 @@ try:
     from triton.experimental.gluon.language.nvidia.blackwell import (
         TensorMemoryLayout,
         allocate_tensor_memory,
-        get_tmem_reg_layout,
-        tma,
-        mbarrier,
-        tcgen05_mma,
-        tcgen05_commit,
         fence_async_shared,
+        get_tmem_reg_layout,
+        mbarrier,
+        tcgen05_commit,
+        tcgen05_mma,
+        tma,
     )
 except ImportError as e:
     raise ImportError(
         f">>> Failed to import Gluon in current triton version {triton.__version__} and "
         f">>> Platform {torch.cuda.get_device_capability()}.\n"
         f">>> Gluon/Blackwell features require: \n"
-        f">>> 1. Triton >= 3.6.0.\n"
-        f">>> 2. NVIDIA GPU (compute capability >= 10.0)\n"
+        f">>> 1. Triton >= 3.6.0 \n"
+        f">>> 2. NVIDIA GPU (compute capability == 10.0)\n"
+        f">>> 3. Pytorch >= 2.9.0 \n"
         f">>> Error: {e}\n"
         f">>> Set FLA_USE_GLUON=0 to disable and continue."
     ) from e
@@ -34,18 +35,19 @@ def _mask_scalar(A, col_limit_right, s, i):
     mask_i_bit = (mask & (1 << i)) == 0
     return gl.where(mask_i_bit, A, 0.0)
 
+
 @gluon.jit
 def _apply_causal_mask(A, col_limit_right):
     # Apply causal mask via a bitmask calculated for each block of 16 elements.
     # This allows the efficient R2P (register to predicate) instruction to be used at the SASS level.
     # ref https://github.com/Dao-AILab/flash-attention/commit/bac1001e4f6caa09d70537495d6746a685a2fa78
     offs_n = gl.arange(0, A.shape[1])[None, :]
-    s = offs_n & ~0xf
-    i = offs_n & 0xf
+    s = offs_n & ~0xF
+    i = offs_n & 0xF
     return gl.map_elementwise(_mask_scalar, A, col_limit_right, s, i)
 
 
-@gluon.jit(do_not_specialize=['T'])
+@gluon.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o_gluon(
     q_desc,
     k_desc,
@@ -76,8 +78,12 @@ def chunk_fwd_kernel_o_gluon(
     if IS_VARLEN:
         # global chunk id
         # sequence id, chunk id of the current sequence
-        i_n, i_t = gl.load(chunk_indices + i_t * 2).to(gl.int32), gl.load(chunk_indices + i_t * 2 + 1).to(gl.int32)
-        bos, eos = gl.load(cu_seqlens + i_n).to(gl.int32), gl.load(cu_seqlens + i_n + 1).to(gl.int32)
+        i_n, i_t = gl.load(chunk_indices + i_t * 2).to(gl.int32), gl.load(
+            chunk_indices + i_t * 2 + 1
+        ).to(gl.int32)
+        bos, eos = gl.load(cu_seqlens + i_n).to(gl.int32), gl.load(
+            cu_seqlens + i_n + 1
+        ).to(gl.int32)
         T = eos - bos
         # TMA coordinate: qkvo=[0, bos+i_t*BT, ...], h=[0, i_tg, ...]
         i_b, i_t_start = 0, bos + i_t * BT
@@ -106,11 +112,17 @@ def chunk_fwd_kernel_o_gluon(
     for i_k in range(gl.cdiv(K, BK)):
         # Load q and h for o computation
         mbarrier.expect(tma_bar_qh, q_desc.block_type.nbytes + h_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(q_desc, [i_b, i_t_start, i_hk, i_k * BK], tma_bar_qh, q_smem)
-        tma.async_copy_global_to_shared(h_desc, [i_b, i_tg, i_h, i_k * BK, i_v * BV], tma_bar_qh, h_smem)
+        tma.async_copy_global_to_shared(
+            q_desc, [i_b, i_t_start, i_hk, i_k * BK], tma_bar_qh, q_smem
+        )
+        tma.async_copy_global_to_shared(
+            h_desc, [i_b, i_tg, i_h, i_k * BK, i_v * BV], tma_bar_qh, h_smem
+        )
         # Load k for A computation
         mbarrier.expect(tma_bar_kv, k_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(k_desc, [i_b, i_t_start, i_hk, i_k * BK], tma_bar_kv, k_smem)
+        tma.async_copy_global_to_shared(
+            k_desc, [i_b, i_t_start, i_hk, i_k * BK], tma_bar_kv, k_smem
+        )
         # wait qh, compute o = q @ h
         mbarrier.wait(tma_bar_qh, phase=tma_phase)
         q_smem_2d = q_smem.reshape([BT, BK])  # [1, BT, 1, BK] -> [BT, BK]
@@ -121,7 +133,9 @@ def chunk_fwd_kernel_o_gluon(
         # wait k, compute A = q @ k_t
         mbarrier.wait(tma_bar_kv, phase=tma_phase)
         tma_phase ^= 1
-        k_t = k_smem.reshape([BT, BK]).permute((1, 0))  # [1, BT, 1, BK] -> [BT, BK] -> [BK, BT]
+        k_t = k_smem.reshape([BT, BK]).permute(
+            (1, 0)
+        )  # [1, BT, 1, BK] -> [BT, BK] -> [BK, BT]
         mbarrier.wait(mma_bar, phase=mma_phase)
         mma_phase ^= 1
         # [BT, BK] @ [BK, BT] -> [BT, BT]
@@ -134,7 +148,9 @@ def chunk_fwd_kernel_o_gluon(
     # async load v
     v_smem = gl.allocate_shared_memory(dtype, v_desc.block_type.shape, v_desc.layout)
     mbarrier.expect(tma_bar_kv, v_desc.block_type.nbytes)
-    tma.async_copy_global_to_shared(v_desc, [i_b, i_t_start, i_h, i_v * BV], tma_bar_kv, v_smem)
+    tma.async_copy_global_to_shared(
+        v_desc, [i_b, i_t_start, i_h, i_v * BV], tma_bar_kv, v_smem
+    )
 
     o_reg_layout: gl.constexpr = get_tmem_reg_layout(
         gl.float32,
@@ -190,7 +206,9 @@ def chunk_fwd_kernel_o_gluon(
     if IS_VARLEN:
         # for example: T=126, BT=64, i_t=1 → t_limit_right = min(126-64, 64) = min(62, 64) = 62
         t_limit_right = gl.minimum(T - i_t * BT, BT)
-        offsets_layout: gl.constexpr = gl.SliceLayout(0, gl.BlockedLayout([1, 4], [32, 1], [1, gl.num_warps()], [1, 0]))
+        offsets_layout: gl.constexpr = gl.SliceLayout(
+            0, gl.BlockedLayout([1, 4], [32, 1], [1, gl.num_warps()], [1, 0])
+        )
         t_offsets = gl.arange(0, BT, layout=offsets_layout)  # [0, 1, 2, ..., 63]
         mask_o = t_offsets < t_limit_right  # [T, T, ..., T, F, F]
         # use 0x7FFFFFFF(Maximum value of a 32-bit, 2,147,483,647), when out of bounds o.view(T, H * V), TMA skips
@@ -200,7 +218,9 @@ def chunk_fwd_kernel_o_gluon(
         fence_async_shared()
         tma.async_scatter(o_desc, x_offsets, i_h * V + i_v * BV, o_smem_2d)
     else:
-        o_smem = gl.allocate_shared_memory(dtype, o_desc.block_type.shape, o_desc.layout)
+        o_smem = gl.allocate_shared_memory(
+            dtype, o_desc.block_type.shape, o_desc.layout
+        )
         o_smem_2d = o_smem.reshape([BT, BV])  # [1, BT, 1, BV] -> [BT, BV]
         o_smem_2d.store(o_reg.to(dtype))  # fp32 -> bf16/fp16
         fence_async_shared()
