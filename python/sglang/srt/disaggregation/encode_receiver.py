@@ -33,21 +33,6 @@ if TYPE_CHECKING:
 
 
 class EmbeddingData:
-    # Standard attributes that are default needed
-    _STANDARD_ATTRS = {
-        "req_id",
-        "num_parts",
-        "part_idx",
-        "grid_dim",
-        "modality",
-        "embedding",
-        "error_msg",
-        "error_code",
-        "send_time",
-        "dtype",
-        "shape",
-    }
-
     def __init__(
         self,
         req_id,
@@ -80,9 +65,7 @@ class EmbeddingData:
             setattr(self, key, value)
 
     def get_grid(self):
-        """
-        Get the grid dimension of the embedding, used for image/video/audio.
-        """
+        """Get the grid dimension of the embedding, used for image/video/audio."""
         return self.grid_dim
 
     def get_embedding(self):
@@ -92,28 +75,46 @@ class EmbeddingData:
         return f"EmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}) error_msg={self.error_msg}"
 
     def copy_without_embedding(self):
-        # collect additional kwargs attributes (e.g., video_timestamps, second_per_grid_ts)
-        kwargs = {
-            key: getattr(self, key)
-            for key in dir(self)
-            if not key.startswith("_")
-            and key not in self._STANDARD_ATTRS
-            and not callable(getattr(self, key, None))
-        }
+        """Return a copy with the same metadata but embedding=None (e.g. for serialization)."""
         new_data = EmbeddingData(
-            req_id=self.req_id,
-            num_parts=self.num_parts,
-            part_idx=self.part_idx,
-            grid_dim=self.grid_dim,
-            modality=self.modality,
+            self.req_id,
+            self.num_parts,
+            self.part_idx,
+            self.grid_dim,
+            self.modality,
+            embedding=None,
+            embedding_shape=self.shape,
             error_msg=self.error_msg,
             error_code=self.error_code,
-            **kwargs,
         )
-        new_data.send_time = self.send_time
-        new_data.dtype = self.dtype
-        new_data.shape = self.shape
+        for key in dir(self):
+            if (
+                key.startswith("_")
+                or key == "embedding"
+                or callable(getattr(self, key, None))
+            ):
+                continue
+            setattr(new_data, key, getattr(self, key, None))
         return new_data
+
+
+# Modality -> (list attr name, whether to flatten grid for that list)
+_MODALITY_GRID_ATTRS = {
+    Modality.IMAGE: ("img_grid_thw", False),
+    Modality.VIDEO: ("video_grid_thw", False),
+    Modality.AUDIO: ("audio_feature_lens", True),
+}
+_VIDEO_META_ATTRS = ("video_timestamps", "second_per_grid_ts")
+
+
+def _cat_grid(dims, flatten_items=False):
+    """Concatenate non-None tensors from a list; optionally flatten each before cat."""
+    valid = (
+        [g.flatten() for g in dims if g is not None]
+        if flatten_items
+        else [g for g in dims if g is not None]
+    )
+    return torch.cat(valid, dim=0) if valid else None
 
 
 class MultiModalEmbeddingData(EmbeddingData):
@@ -151,29 +152,42 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.embedding_shape_list = [
             embedding_shape if i == part_idx else None for i in range(num_parts)
         ]
-        # additional videometa attributes
         self.video_timestamps = [None] * num_parts
         self.second_per_grid_ts = [None] * num_parts
 
-        if modality == Modality.IMAGE:
-            self.img_grid_thw[part_idx] = self.get_grid()
-        elif modality == Modality.VIDEO:
-            self.video_grid_thw[part_idx] = self.get_grid()
-        elif modality == Modality.AUDIO:
-            # For audio, grid_dim represents audio_feature_lens; flatten for variable-length
-            self.audio_feature_lens[part_idx] = self.get_grid().flatten()
+        self._set_part_grid(part_idx, modality, self.get_grid())
+        if modality == Modality.VIDEO:
+            self._set_video_meta_for_part(part_idx, kwargs)
+
+    def _set_part_grid(self, part_idx, modality, grid):
+        """Set the grid for one part according to modality (IMAGE/VIDEO/AUDIO)."""
+        spec = _MODALITY_GRID_ATTRS.get(modality)
+        if spec is None:
+            raise ValueError(f"Invalid modality: {modality}")
+        attr_name, flatten = spec
+        value = grid.flatten() if flatten else grid
+        getattr(self, attr_name)[part_idx] = value
+
+    def _set_video_meta_for_part(self, part_idx, source):
+        """Copy video_timestamps and second_per_grid_ts from source (dict or object)."""
+        for attr_name in _VIDEO_META_ATTRS:
+            val = (
+                source.get(attr_name)
+                if isinstance(source, dict)
+                else getattr(source, attr_name, None)
+            )
+            if val is not None:
+                getattr(self, attr_name)[part_idx] = val
 
     @classmethod
     def from_embedding_data(cls, embedding_data: EmbeddingData):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
-        # Extract kwargs from embedding_data attributes (excluding standard attrs)
-        kwargs = {
-            key: getattr(embedding_data, key)
-            for key in dir(embedding_data)
-            if not key.startswith("_")
-            and key not in embedding_data._STANDARD_ATTRS
-            and not callable(getattr(embedding_data, key, None))
-        }
+        # Only forward known optional attrs (e.g. video metadata) so they land on the instance
+        extra = {}
+        for attr in _VIDEO_META_ATTRS:
+            val = getattr(embedding_data, attr, None)
+            if val is not None:
+                extra[attr] = val
         mm_data = cls(
             part_idx=embedding_data.part_idx,
             num_parts=embedding_data.num_parts,
@@ -182,68 +196,15 @@ class MultiModalEmbeddingData(EmbeddingData):
             modality=embedding_data.modality,
             embedding=embedding_data.embedding,
             embedding_shape=embedding_data.shape,
-            **kwargs,
+            **extra,
         )
-        # Set video_timestamps and second_per_grid_ts for the specific part_idx if available
         if embedding_data.modality == Modality.VIDEO:
-            for attr_name in ["video_timestamps", "second_per_grid_ts"]:
-                if attr_name in kwargs:
-                    getattr(mm_data, attr_name)[embedding_data.part_idx] = kwargs[
-                        attr_name
-                    ]
-
-        # Copy over additional attributes
+            mm_data._set_video_meta_for_part(embedding_data.part_idx, extra)
         mm_data.send_time = embedding_data.send_time
         return mm_data
 
     def __repr__(self):
         return f"MultiModalEmbeddingData(req_id={self.req_id}, num_parts={self.num_parts}, part_idx={self.part_idx}, modality={self.modality})"
-
-    def _get_mm_grid(self, modality):
-        if modality == Modality.IMAGE:
-            grid_dims = self.img_grid_thw
-        elif modality == Modality.VIDEO:
-            grid_dims = self.video_grid_thw
-        elif modality == Modality.AUDIO:
-            # flatten all parts into one 1D tensor
-            flat = [g.flatten() for g in self.audio_feature_lens if g is not None]
-            if flat:
-                return torch.cat(flat, dim=0)
-            else:
-                return None
-        else:
-            grid_dims = []
-
-        valid_grid_dims = []
-        for grid_dim in grid_dims:
-            if grid_dim is None:
-                continue
-            valid_grid_dims.append(grid_dim)
-        if len(valid_grid_dims) == 0:
-            return None
-        return torch.cat(valid_grid_dims, dim=0)
-
-    def get_attr_list(self, attr_name, flatten=False):
-        """
-        Get the attribute of the embedding data, mainly for video metadata now.
-        Args:
-            attr_name: The name of the attribute to get.
-            flatten: Whether to flatten the attribute.
-        Returns:
-            The attribute value, if flatten is True, return a list of all the attribute values.
-        """
-        _attr = getattr(self, attr_name)
-        if _attr is None:
-            return None
-        valid_attr = []
-        for attr in _attr:
-            if attr is not None:
-                valid_attr.append(attr)
-        if len(valid_attr) == 0:
-            return None
-        if flatten:
-            return list(itertools.chain(*valid_attr))
-        return valid_attr
 
     def get_embedding_offsets(self):
         embedding_offsets = {}
@@ -260,45 +221,44 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     def get_embedding(self, is_concat=False):
         if is_concat:
-            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
-        else:
-            return self.embedding_list
+            return torch.concat(
+                [e.cuda() for e in self.embedding_list if e is not None]
+            )
+        return self.embedding_list
 
     @property
     def ready(self):
         return sum(self.ready_list) == self.num_parts
 
-    def get_audio_feature_lens(self):
-        return self._get_mm_grid(Modality.AUDIO)
-
-    def get_img_grid(self):
-        return self._get_mm_grid(Modality.IMAGE)
-
-    def get_video_grid(self):
-        return self._get_mm_grid(Modality.VIDEO)
+    def get_mm_extra_meta(self):
+        """Build kwargs for mm_processor.get_mm_data() from grid and optional video meta."""
+        kwargs = {
+            "img_grid_thw": _cat_grid(self.img_grid_thw),
+            "video_grid_thw": _cat_grid(self.video_grid_thw),
+            "audio_feature_lens": _cat_grid(
+                self.audio_feature_lens, flatten_items=True
+            ),
+        }
+        for attr in _VIDEO_META_ATTRS:
+            lst = getattr(self, attr, None)
+            if not lst:
+                continue
+            valid = [a for a in lst if a is not None]
+            if valid:
+                kwargs[attr] = list(itertools.chain(*valid))
+        return kwargs
 
     def add(self, embedding_data: EmbeddingData):
         assert self.req_id == embedding_data.req_id
         assert not self.ready_list[embedding_data.part_idx]
-        self.ready_list[embedding_data.part_idx] = True
-        self.modality_list[embedding_data.part_idx] = embedding_data.modality
-        self.embedding_list[embedding_data.part_idx] = embedding_data.get_embedding()
-        self.embedding_shape_list[embedding_data.part_idx] = embedding_data.shape
-        if embedding_data.modality == Modality.IMAGE:
-            self.img_grid_thw[embedding_data.part_idx] = embedding_data.get_grid()
-        elif embedding_data.modality == Modality.VIDEO:
-            self.video_grid_thw[embedding_data.part_idx] = embedding_data.get_grid()
-            for attr_name in ["video_timestamps", "second_per_grid_ts"]:
-                if getattr(embedding_data, attr_name, None) is not None:
-                    getattr(self, attr_name)[embedding_data.part_idx] = getattr(
-                        embedding_data, attr_name
-                    )
-        elif embedding_data.modality == Modality.AUDIO:
-            self.audio_feature_lens[embedding_data.part_idx] = (
-                embedding_data.get_grid().flatten()
-            )
-        else:
-            raise ValueError(f"Invalid modality: {embedding_data.modality}")
+        pid = embedding_data.part_idx
+        self.ready_list[pid] = True
+        self.modality_list[pid] = embedding_data.modality
+        self.embedding_list[pid] = embedding_data.get_embedding()
+        self.embedding_shape_list[pid] = embedding_data.shape
+        self._set_part_grid(pid, embedding_data.modality, embedding_data.get_grid())
+        if embedding_data.modality == Modality.VIDEO:
+            self._set_video_meta_for_part(pid, embedding_data)
 
 
 class WaitingImageRequestStatus(IntEnum):
@@ -483,27 +443,11 @@ class WaitingImageRequest:
 
         recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         recv_embedding_offsets = self.recv_embedding_data.get_embedding_offsets()
-        img_grid_thw = self.recv_embedding_data.get_img_grid()
-        video_grid_thw = self.recv_embedding_data.get_video_grid()
-        audio_feature_lens = self.recv_embedding_data.get_audio_feature_lens()
-        kwargs = {
-            "img_grid_thw": img_grid_thw,
-            "video_grid_thw": video_grid_thw,
-            "audio_feature_lens": audio_feature_lens,
-        }
-        video_timestamps = self.recv_embedding_data.get_attr_list(
-            "video_timestamps", flatten=True
-        )
-        second_per_grid_ts = self.recv_embedding_data.get_attr_list(
-            "second_per_grid_ts", flatten=True
-        )
-        if video_timestamps is not None:
-            kwargs["video_timestamps"] = video_timestamps
-        if second_per_grid_ts is not None:
-            kwargs["second_per_grid_ts"] = second_per_grid_ts
-
         mm_inputs = self.mm_processor.get_mm_data(
-            self.recv_req.input_text, recv_embedding, recv_embedding_offsets, **kwargs
+            self.recv_req.input_text,
+            recv_embedding,
+            recv_embedding_offsets,
+            **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
@@ -1038,25 +982,10 @@ class MMReceiverHTTP(MMReceiverBase):
         recv_socket.close()
 
         recv_embedding_offsets = recv_embedding_data.get_embedding_offsets()
-        img_grid_thw = recv_embedding_data.get_img_grid()
-        video_grid_thw = recv_embedding_data.get_video_grid()
-        audio_feature_lens = recv_embedding_data.get_audio_feature_lens()
-        kwargs = {
-            "img_grid_thw": img_grid_thw,
-            "video_grid_thw": video_grid_thw,
-            "audio_feature_lens": audio_feature_lens,
-        }
-        video_timestamps = recv_embedding_data.get_attr_list(
-            "video_timestamps", flatten=True
-        )
-        second_per_grid_ts = recv_embedding_data.get_attr_list(
-            "second_per_grid_ts", flatten=True
-        )
-        if video_timestamps is not None:
-            kwargs["video_timestamps"] = video_timestamps
-        if second_per_grid_ts is not None:
-            kwargs["second_per_grid_ts"] = second_per_grid_ts
         mm_inputs = mm_processor.get_mm_data(
-            prompt, recv_embedding, recv_embedding_offsets, **kwargs
+            prompt,
+            recv_embedding,
+            recv_embedding_offsets,
+            **recv_embedding_data.get_mm_extra_meta(),
         )
         return mm_inputs
