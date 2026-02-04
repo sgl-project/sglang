@@ -28,7 +28,8 @@ class TestGpuId(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.device_id = get_device_ids(0)
+        # cls.device_id = get_device_ids(0)
+        cls.device_id = 0
         cls.step = 2
         other_args = [
             "--base-gpu-id",  # Starting device ID

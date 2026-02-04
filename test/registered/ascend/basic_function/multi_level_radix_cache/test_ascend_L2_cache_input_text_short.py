@@ -36,8 +36,6 @@ class TestL2Cache(CustomTestCase):
             "--tp-size",
             2,
             "--enable-hierarchical-cache",
-            "--base-gpu-id",
-            4,
         ]
         cls.process = popen_launch_server(
             cls.model,

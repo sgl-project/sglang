@@ -34,8 +34,6 @@ class TestL1Cache(CustomTestCase):
             0.8,
             "--tp-size",
             2,
-            "--base-gpu-id",
-            4,
         ]
         cls.process = popen_launch_server(
             cls.model,
