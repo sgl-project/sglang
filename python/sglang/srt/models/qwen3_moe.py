@@ -1032,10 +1032,9 @@ class Qwen3MoeForCausalLM(nn.Module):
             num_experts=self.config.num_experts,
         )
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
+        params_dict = dict(self.named_parameters())
+
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
