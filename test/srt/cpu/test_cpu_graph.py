@@ -12,7 +12,6 @@ from sglang.srt.utils import get_cpu_ids_by_node, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -36,10 +35,10 @@ class TestCPUGraph(CustomTestCase):
             "--cuda-graph-bs",
             "2",
         ],
-        min_throughput=40,
+        min_throughput=7,
     )
     def test_latency_torch_compile_cpu(self):
-        return DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        return DEFAULT_MLA_MODEL_NAME_FOR_TEST
 
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
