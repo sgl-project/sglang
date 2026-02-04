@@ -12,6 +12,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import infer_type_from_json_schema
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,14 @@ def get_argument_type(
 ) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions.
 
+    Supports complex JSON Schema definitions including:
+    - Direct type field (including type arrays)
+    - anyOf/oneOf: parameter can be any of multiple types
+    - enum: parameter must be one of enum values
+    - allOf: parameter must satisfy all type definitions
+    - properties: inferred as object type
+    - items: inferred as array type
+
     Args:
         func_name: Name of the function/tool
         arg_key: Name of the argument
@@ -48,7 +57,9 @@ def get_argument_type(
         properties = {}
     if arg_key not in properties:
         return None
-    return properties[arg_key].get("type", None)
+
+    # Use new type inference function for complex JSON Schema support
+    return infer_type_from_json_schema(properties[arg_key])
 
 
 def _convert_to_number(value: str) -> Any:
@@ -216,21 +227,48 @@ class Glm4MoeDetector(BaseFormatDetector):
             tools: List of available tools
 
         Returns:
-            Type string: 'string', 'number', or 'object'
+            Type string: 'string', 'number', 'object', 'array', or 'boolean'
         """
         arg_type = get_argument_type(func_name, key, tools)
         if arg_type:
             return arg_type
 
-        # Auto-detect type from value (best effort)
-        first_chars = self._current_value.strip()[:10] if self._current_value else ""
-        if first_chars:
-            first_char = first_chars[0]
+        # Improved auto-detection type from value (best effort)
+        value_content = self._current_value.strip() if self._current_value else ""
+
+        if not value_content:
+            return "string"
+
+        # Try to parse as valid JSON first
+        try:
+            parsed = json.loads(value_content)
+            if isinstance(parsed, dict):
+                return "object"
+            elif isinstance(parsed, list):
+                return "array"
+            elif isinstance(parsed, bool):
+                return "boolean"
+            elif isinstance(parsed, (int, float)):
+                return "number"
+            # For string values, check if they look like numbers
+            elif isinstance(parsed, str):
+                if parsed.isdigit() or (
+                    parsed.startswith("-") and parsed[1:].isdigit()
+                ):
+                    return "number"
+                return "string"
+        except json.JSONDecodeError:
+            # Not valid JSON, try heuristic detection
+            first_char = value_content[0] if value_content else ""
+
             if first_char.isdigit() or first_char in ["-", "."]:
                 return "number"
             elif first_char in ["{", "["]:
                 return "object"
+            elif first_char in ['"', "'"]:
+                return "string"
 
+        # Default to string (safest fallback)
         return "string"
 
     def _format_value_complete(self, value: str, value_type: str) -> str:

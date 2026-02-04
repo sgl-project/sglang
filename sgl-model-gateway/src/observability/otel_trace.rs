@@ -52,7 +52,7 @@ fn get_allowed_targets() -> &'static [&'static str; 3] {
 
 /// Filter that only allows specific module targets to be exported to OTEL.
 #[derive(Clone, Copy, Default)]
-pub struct CustomOtelFilter;
+pub(crate) struct CustomOtelFilter;
 
 impl CustomOtelFilter {
     #[inline]

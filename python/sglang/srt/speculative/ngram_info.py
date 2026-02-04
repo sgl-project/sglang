@@ -7,6 +7,7 @@ from typing import ClassVar, Optional, Tuple, Union
 import torch
 import triton
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         retrive_next_token: torch.Tensor = None,
         retrive_next_sibling: torch.Tensor = None,
         draft_token_num: int = -1,
+        grammar: BaseGrammarObject = None,
         future_indices: Optional[FutureIndices] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         verify_done: Optional[torch.cuda.Event] = None,
@@ -92,6 +94,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             if draft_token_num != -1
             else server_args.speculative_num_draft_tokens
         )
+        self.grammar = grammar
 
         # Inputs for V2 overlap worker
         self.future_indices = future_indices
