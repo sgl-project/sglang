@@ -9,7 +9,6 @@ from typing import Optional
 
 import filelock
 
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import hf_hub_download
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -44,6 +43,8 @@ def _maybe_download_model(
     Returns:
         Local directory path that contains the downloaded config file, or the original local directory.
     """
+
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import hf_hub_download
 
     if os.path.exists(model_name_or_path):
         logger.info("Model already exists locally")
