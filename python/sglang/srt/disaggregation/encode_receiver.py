@@ -408,7 +408,7 @@ class MMReceiverHTTP(MMReceiverBase):
         for waiting_req in self.waiting_list:
             waiting_req._try_recv_mm_data()
             if current_time - waiting_req.start_time > self.wait_timeout:
-                waiting_req.status = WaitingImageRequestStatus.FAIL
+                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
             local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
