@@ -34,6 +34,7 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
@@ -686,7 +687,7 @@ class DefaultModelLoader(BaseModelLoader):
             peak_memory = torch.cuda.max_memory_allocated()
             logger.debug(
                 "Peak GPU memory after loading weights: %s GiB",
-                f"{peak_memory / 1073741824:.3f}",
+                f"{peak_memory / GIB_BYTES:.3f}",
             )
 
         for _, module in model.named_modules():
