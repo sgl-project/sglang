@@ -866,6 +866,7 @@ impl CliArgs {
     ) -> ConfigResult<RouterConfig> {
         // Determine routing mode based on backend type and PD disaggregation flag
         // IGW mode doesn't change routing mode, only affects router initialization
+        info!("启动backend类型==>{:?}", self.backend);
         let mode = if matches!(self.backend, Backend::Openai) {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),

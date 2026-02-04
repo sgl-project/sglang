@@ -13,10 +13,14 @@
 ONLINE_GATEWAY_HOST="33.184.122.82"
 ONLINE_GATEWAY_PORT="30000"
 # 在这个环境中，Gateway 和 Worker 都在同一台机器上
-ONLINE_REGULAR_URL="http://${ONLINE_GATEWAY_HOST}:9201"
-ONLINE_PREFILL_URL="http://${ONLINE_GATEWAY_HOST}:9101"
-ONLINE_DECODE_URL="http://${ONLINE_GATEWAY_HOST}:9103"
-ONLINE_BOOTSTRAP_PORT=30001
+ONLINE_REGULAR_URL1="http://${ONLINE_GATEWAY_HOST}:9201"
+ONLINE_PREFILL_URL1="http://${ONLINE_GATEWAY_HOST}:9101"
+ONLINE_DECODE_URL1="http://${ONLINE_GATEWAY_HOST}:9103"
+ONLINE_BOOTSTRAP_PORT1=30001
+ONLINE_REGULAR_URL2="http://${ONLINE_GATEWAY_HOST}:9202"
+ONLINE_PREFILL_URL2="http://${ONLINE_GATEWAY_HOST}:9102"
+ONLINE_DECODE_URL2="http://${ONLINE_GATEWAY_HOST}:9104"
+ONLINE_BOOTSTRAP_PORT2=30002
 
 # 线下环境配置 (Offline)
 OFFLINE_GATEWAY_HOST="11.160.41.175"
@@ -110,9 +114,12 @@ case $environment in
     online)
         echo "🚀 Starting registration for ONLINE environment..."
         gateway="http://${ONLINE_GATEWAY_HOST}:${ONLINE_GATEWAY_PORT}"
-        register_worker "${gateway}" "${ONLINE_REGULAR_URL}" "regular"
-        register_worker "${gateway}" "${ONLINE_PREFILL_URL}" "prefill" "${ONLINE_BOOTSTRAP_PORT}"
-        register_worker "${gateway}" "${ONLINE_DECODE_URL}" "decode"
+        register_worker "${gateway}" "${ONLINE_REGULAR_URL1}" "regular"
+        register_worker "${gateway}" "${ONLINE_PREFILL_URL1}" "prefill" "${ONLINE_BOOTSTRAP_PORT1}"
+        register_worker "${gateway}" "${ONLINE_DECODE_URL1}" "decode"
+        register_worker "${gateway}" "${ONLINE_REGULAR_URL2}" "regular"
+        register_worker "${gateway}" "${ONLINE_PREFILL_URL2}" "prefill" "${ONLINE_BOOTSTRAP_PORT2}"
+        register_worker "${gateway}" "${ONLINE_DECODE_URL2}" "decode"
         echo "🎉 ONLINE environment registration finished."
         ;;
 

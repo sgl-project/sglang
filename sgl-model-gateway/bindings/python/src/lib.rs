@@ -499,6 +499,7 @@ impl Router {
         };
 
         let mode = if self.enable_igw {
+            // 这里需要加载pd策略 regular策略
             RoutingMode::Regular {
                 worker_urls: vec![],
             }

@@ -8,6 +8,7 @@ use super::{
     PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
+use tracing::info;
 
 /// Factory for creating policy instances
 pub struct PolicyFactory;
@@ -15,6 +16,7 @@ pub struct PolicyFactory;
 impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        info!("PolicyConfig ==> {:#?}", config);
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),

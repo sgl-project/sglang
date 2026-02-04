@@ -1332,7 +1332,7 @@ impl RouterTrait for PDRouter {
         let is_stream = body.stream;
         let return_logprob = body.logprobs.is_some();
 
-        // 这个策略在做决策时是否需要req——text
+        // 这个策略在做决策时是否需要req_text
         let request_text = if self.policies_need_request_text() {
             match &body.prompt {
                 StringOrArray::String(s) => Some(s.clone()),

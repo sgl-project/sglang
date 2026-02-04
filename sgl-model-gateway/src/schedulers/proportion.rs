@@ -74,7 +74,7 @@ pub struct ProportionScheduler {
 
 impl ProportionScheduler {
     pub fn new(config: ProportionSchedulerConfig, worker_registry: Arc<WorkerRegistry>) -> Self {
-        let crossover_point = Arc::new(RwLock::new(512));
+        let crossover_point = Arc::new(RwLock::new(0));
         let global_request_queue = Arc::new(RwLock::new(VecDeque::new()));
         let router_loads = Arc::new(RwLock::new(std::collections::HashMap::new()));
         let worker_counts = Arc::new(RwLock::new(std::collections::HashMap::new()));

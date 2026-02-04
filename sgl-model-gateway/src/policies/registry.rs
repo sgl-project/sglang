@@ -40,6 +40,7 @@ pub struct PolicyRegistry {
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
+        info!("进入PolicyRegistry new 方法");
         let default_policy = Self::create_policy_from_config(&default_policy_config);
 
         Self {
