@@ -83,7 +83,7 @@ elif _is_npu:
 
 # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion on bs >= 32
 # Ref: https://github.com/sgl-project/sglang/issues/17237
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 32
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 31
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
