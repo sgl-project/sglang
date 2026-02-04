@@ -403,7 +403,7 @@ def run_scheduler_process(
         )
         scheduler.event_loop()
     except torch.OutOfMemoryError as _e:
-        print(OOM_MSG)
+        logger.warning(OOM_MSG)
         raise
     finally:
         # Clean up resources to speed up shutdown
