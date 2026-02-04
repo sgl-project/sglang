@@ -298,7 +298,12 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm1 = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
         self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
         self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
         self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=False)
@@ -344,11 +349,9 @@ class WanTransformerBlock(nn.Module):
         self.tp_rmsnorm = qk_norm == "rms_norm_across_heads" and tp_size > 1
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 2. Cross-attention
@@ -372,11 +375,9 @@ class WanTransformerBlock(nn.Module):
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
@@ -418,8 +419,7 @@ class WanTransformerBlock(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm1 = self.norm1(hidden_states.float())
-        norm_hidden_states = (norm1 * (1 + scale_msa) + shift_msa).to(orig_dtype)
+        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -506,7 +506,12 @@ class WanTransformerBlock_VSA(nn.Module):
         super().__init__()
 
         # 1. Self-attention
-        self.norm1 = FP32LayerNorm(dim, eps, elementwise_affine=False)
+        self.norm1 = LayerNormScaleShift(
+            dim,
+            eps=eps,
+            elementwise_affine=False,
+            dtype=torch.float32,
+        )
         self.to_q = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
         self.to_k = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
         self.to_v = ColumnParallelLinear(dim, dim, bias=True, gather_output=True)
@@ -538,11 +543,9 @@ class WanTransformerBlock_VSA(nn.Module):
         assert cross_attn_norm is True
         self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
@@ -568,11 +571,9 @@ class WanTransformerBlock_VSA(nn.Module):
             )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim,
-            norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
@@ -600,9 +601,7 @@ class WanTransformerBlock_VSA(nn.Module):
         assert shift_msa.dtype == torch.float32
 
         # 1. Self-attention
-        norm_hidden_states = (
-            self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa
-        ).to(orig_dtype)
+        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
         query, _ = self.to_q(norm_hidden_states)
         key, _ = self.to_k(norm_hidden_states)
         value, _ = self.to_v(norm_hidden_states)
@@ -736,11 +735,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # 4. Output norm & projection
         self.norm_out = LayerNormScaleShift(
             inner_dim,
-            norm_type="layer",
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
         self.proj_out = nn.Linear(
             inner_dim, config.out_channels * math.prod(config.patch_size)

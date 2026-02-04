@@ -10,15 +10,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# TODO (will): remove this dependency
-from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
-if current_platform.is_cuda() or current_platform.is_hip():
+_is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
+_is_npu = current_platform.is_npu()
+if _is_cuda or _is_hip:
     from sgl_kernel import silu_and_mul
 
-if current_platform.is_npu():
+if _is_npu:
     import torch_npu
+# TODO (will): remove this dependency
+from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
 
 @CustomOp.register("silu_and_mul")
