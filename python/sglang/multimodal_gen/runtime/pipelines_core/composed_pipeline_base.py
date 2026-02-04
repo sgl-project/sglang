@@ -343,8 +343,6 @@ class ComposedPipelineBase(ABC):
                 "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
             )
 
-        batch.log(server_args=server_args)
-
         # Execute each stage
         if not batch.is_warmup and not batch.suppress_logs:
             logger.info(
