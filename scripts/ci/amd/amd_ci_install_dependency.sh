@@ -253,6 +253,8 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] Cherry-picking PR #1965 (jun/revert_rmsnorm)..."
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
+        git config user.email 'ci@sglang.local' && \
+        git config user.name 'CI Bot' && \
         git fetch origin jun/revert_rmsnorm && \
         git cherry-pick FETCH_HEAD
     "
