@@ -38,32 +38,6 @@ from sglang.srt.layers.moe.moe_runner.triton import (
 )
 from sglang.srt.utils import is_cuda, is_hip
 
-import sys
-import os
-# ==============================================================================
-# IMPORT PREBUILT MOE LORA KERNEL
-# IMPORT PREBUILT MOE LORA KERNEL
-# ==============================================================================
-# Define the full path to the shared object file
-so_file_path = "/my-sglang/sglang/moe_lora_ops_debug.cpython-312-x86_64-linux-gnu.so"
-
-# Extract the directory containing the .so file
-so_dir = os.path.dirname(so_file_path)
-
-# Add that DIRECTORY to sys.path
-if so_dir not in sys.path:
-    sys.path.append(so_dir)
-
-moe_lora_ops = None
-try:
-    # Python automatically handles the suffix (.cpython-312...)
-    import moe_lora_ops_debug as moe_lora_ops
-except ImportError as e:
-    print(f"WARNING: Could not import 'moe_lora_ops_debug' from {so_dir}.")
-    print(f"Detailed error: {e}")
-    print("LoRA MoE functionality will fail if requested.")
-# =============================================================================
-
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
