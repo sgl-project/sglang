@@ -2,7 +2,7 @@
 
 import fnmatch
 import logging
-from typing import Any, List, Optional, cast
+from typing import Any, List, Optional, Tuple, cast
 
 import torch
 
@@ -61,6 +61,15 @@ class QuarkConfig(QuantizationConfig):
         self.is_prequantized = is_prequantized
 
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
+        self._quantized_layers = set()
+
+    @property
+    def quantized_layers(self) -> Tuple[list[str], int]:
+        # Extract unique layer types (last part after ".")
+        layer_types = sorted(
+            set(name.split(".")[-1] for name in self._quantized_layers)
+        )
+        return layer_types, len(self._quantized_layers)
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)
@@ -81,6 +90,7 @@ class QuarkConfig(QuantizationConfig):
     ) -> Optional["QuantizeMethodBase"]:
         # Check if the layer is skipped for quantization.
         exclude_layers = cast(list[str], self.quant_config.get("exclude"))
+
         if should_ignore_layer(
             prefix, ignore=exclude_layers, fused_mapping=self.packed_modules_mapping
         ):
@@ -93,14 +103,17 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             scheme = self.get_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
+            self._quantized_layers.add(prefix)
             return QuarkLinearMethod(self)
 
         if isinstance(layer, RadixAttention):
+            self._quantized_layers.add(prefix)
             return QuarkKVCacheMethod(self)
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if isinstance(layer, FusedMoE):
+            self._quantized_layers.add(prefix)
             return QuarkMoEMethod.get_moe_method(self, module=layer, layer_name=prefix)
 
         return None
@@ -184,7 +197,9 @@ class QuarkConfig(QuantizationConfig):
         """
         return {
             "packed_modules_mapping": {},
-            "exclude": [],
+            # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
+            # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
+            "exclude": ["*gate", "*router", "*lm_head", "*embed_tokens"],
             "global_quant_config": {
                 "weight": {
                     "dtype": "fp4",
