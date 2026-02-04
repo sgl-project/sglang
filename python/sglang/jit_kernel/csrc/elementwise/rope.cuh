@@ -19,7 +19,6 @@
 
 #include <sgl_kernel/utils.cuh>
 
-#include <c10/cuda/CUDAStream.h>
 #include <flashinfer/pos_enc.cuh>  // upstream
 #include <tvm/ffi/container/tensor.h>
 
@@ -578,7 +577,7 @@ struct ApplyRopePosIdsCosSinCacheKernel {
     size_t k_rope_stride_h = k_rope.stride(1);
 
     auto query_dtype = q.dtype();
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    const cudaStream_t stream = LaunchKernel::resolve_device(device);
     DISPATCH_TVM_DTYPE_TO_CTYPE(query_dtype.code, query_dtype.bits, c_type, [&] {
       // TODO temporarily only use `BatchQKApplyRotaryPosIdsCosSinCacheEnhanced` when save_kv_cache
       // to avoid changing original code path; but this branch is feature-complete and should switch to this later

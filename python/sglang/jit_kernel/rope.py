@@ -23,14 +23,8 @@ def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
                 "ApplyRopePosIdsCosSinCacheKernel::run",
             )
         ],
-        extra_ldflags=[
-            "-L/usr/local/lib/python3.12/dist-packages/torch/lib",
-            "-lc10",
-            "-ltorch",
-        ],
         extra_include_paths=[
             "/usr/local/lib/python3.12/dist-packages/flashinfer/data/include",
-            "/usr/local/lib/python3.12/dist-packages/torch/include",
         ],
     )
 
