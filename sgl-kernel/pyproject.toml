@@ -8,7 +8,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
-version = "0.3.20"
+version = "0.3.21"
 authors = [
   { name="Yineng Zhang", email="me@zhyncs.com" },
 ]
