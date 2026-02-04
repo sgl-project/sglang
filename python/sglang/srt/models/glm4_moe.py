@@ -62,7 +62,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -397,6 +397,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
             fused_shared_experts_scaling_factor=1,
+            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
 
         # shared expert
