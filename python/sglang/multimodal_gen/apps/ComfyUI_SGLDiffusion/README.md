@@ -4,46 +4,56 @@ A ComfyUI plugin for integrating with SGLang Diffusion server, supporting image 
 
 ## Installation
 
-1. Copy this entire directory (`ComfyUI_SGLDiffusion`) to your ComfyUI `custom_nodes/` folder
-2. Restart ComfyUI to load the plugin
+1. **Install SGLang**: Follow the [Installation Guide](../../docs/install.md) to install `sglang[diffusion]`.
+2. **Install Plugin**: Copy this entire directory (`ComfyUI_SGLDiffusion`) to your ComfyUI `custom_nodes/` folder.
+3. **Restart ComfyUI**: Restart ComfyUI to load the plugin.
 
 ## Usage
 
-### Prerequisites
+The plugin supports two modes of operation: **Server Mode** (via HTTP API) and **Integrated Mode** (tight integration with ComfyUI).
 
-Before using this plugin, you need to start the SGLang Diffusion server. The plugin connects to the server via HTTP API calls.
+### Supported Models
+- **Z-Image**: High-speed image generation models (e.g., `Z-Image-Turbo`)
+- **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
+- **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
 
-### Basic Workflow
+### Mode 1: Server Mode (HTTP API)
+Connect to a standalone SGLang Diffusion server.
 
-1. **Start SGLang Diffusion Server**: Ensure the SGLang Diffusion server is running and accessible
-2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect to your server (default: `http://localhost:3000/v1`)
-3. **Generate Content**: Use the generation nodes to create images or videos:
-   - `SGLDiffusion Generate Image`: For text-to-image and image editing
-   - `SGLDiffusion Generate Video`: For text-to-video and image-to-video
-4. **Optional**: Use `SGLDiffusion Set LoRA` to load LoRA adapters for style customization, use `SGLDiffusion Unset LoRA` to remove LoRA
+1. **Start SGLang Diffusion Server**: Ensure the server is running and accessible.
+2. **Connect to Server**: Use the `SGLDiffusion Server Model` node to connect (default: `http://localhost:3000/v1`).
+3. **Generate Content**:
+   - `SGLDiffusion Generate Image`: For text-to-image and image editing.
+   - `SGLDiffusion Generate Video`: For text-to-video and image-to-video.
+4. **LoRA Support**: Use `SGLDiffusion Server Set LoRA` and `SGLDiffusion Server Unset LoRA`.
 
-### Example Workflows
+### Mode 2: Integrated Mode (Tight Integration)
+Leverage SGLang's high-performance sampling directly within ComfyUI while using ComfyUI's front-end nodes (CLIP, VAE, etc.).
+
+1. **Load Model**: Use the `SGLDiffusion UNET Loader` node to load your diffusion model.
+2. **Configure Options**: Use the `SGLDiffusion Options` node to set runtime parameters like `num_gpus`, `tp_size`, `model_type`, or `enable_torch_compile`.
+3. **Sample**: Connect the loaded model to standard ComfyUI samplers. SGLang will handle the sampling process efficiently.
+4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+
+## Example Workflows
 
 Reference workflow files are provided in the `workflows/` directory:
 
-- **`sgld_text2img.json`**: Text-to-image generation with LoRA support
-- **`sgld_image2video.json`**: Image-to-video generation
+- **`flux_sgld_sp.json`**: Multi-GPU (Sequence Parallelism) workflow for FLUX models. High-performance inference across multiple cards.
+- **`qwen_image_sgld.json`**: Qwen-Image generation with LoRA support. Optimized for multi-modal image tasks.
+- **`z-image_sgld.json`**: High-speed image generation using Z-Image.
+- **`sgld_text2img.json`**: Server-mode text-to-image generation with LoRA support.
+- **`sgld_image2video.json`**: Server-mode image-to-video generation.
+
+For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
 
 To use these workflows:
-1. Open ComfyUI
-2. Load the workflow JSON file from the `workflows/` directory
-3. Adjust the server URL and API key in the `SGLDiffusion Server Model` node if needed
-4. Modify prompts and parameters as desired
-5. Run the workflow
+1. Open ComfyUI.
+2. Load the workflow JSON file from the `workflows/` directory.
+3. Adjust the parameters and model paths as needed.
+4. Run the workflow.
+
 
 ## Current Implementation
 
-Currently, this plugin uses a server-based approach where it makes HTTP API calls to a running SGLang Diffusion server. This requires:
-
-- The SGLang Diffusion server to be running separately
-- Network connectivity between ComfyUI and the server
-- Proper server configuration and API key setup
-
-## Future Improvements
-
-Future versions will integrate more tightly with ComfyUI, utilizing ComfyUI's models and most of its nodes, while leveraging SGLD specifically for the computationally intensive sampling process. This will provide a more seamless and efficient workflow.
+This plugin provides a high-performance backend for diffusion models in ComfyUI. By leveraging SGLang's optimized kernels and parallelization techniques (Tensor Parallelism, TeaCache, etc.), it significantly accelerates the sampling process, especially for large models like FLUX.
