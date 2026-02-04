@@ -5,6 +5,7 @@ Do some monkey patch to make the documentation compilation faster and more relia
 - Reduce the server launch time
 """
 
+import os
 import weakref
 
 import nest_asyncio
@@ -16,6 +17,9 @@ from sglang.utils import execute_shell_command, reserve_port
 
 DEFAULT_MAX_RUNNING_REQUESTS = 128
 DEFAULT_MAX_TOTAL_TOKENS = 20480  # To allow multiple servers on the same machine
+
+# Allow draft models to override derived context length during docs builds.
+os.environ.setdefault("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "1")
 
 _original_post_init = server_args_mod.ServerArgs.__post_init__
 
