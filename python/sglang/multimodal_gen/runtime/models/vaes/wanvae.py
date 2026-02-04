@@ -17,27 +17,27 @@
 # limitations under the License.
 
 import contextvars
+import math
 from contextlib import contextmanager
 
-import math
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
     ParallelTiledVAE,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    get_sp_parallel_rank,
-    get_sp_world_size,
-    get_sp_group,
-)
 
 CACHE_T = 2
 
@@ -597,7 +597,7 @@ class WanResample(nn.Module):
 
     def forward(self, x):
         return resample_forward(self, x)
- 
+
 
 class WanDistResample(nn.Module):
     r"""
@@ -621,7 +621,7 @@ class WanDistResample(nn.Module):
         # default to dim //2
         if upsample_out_dim is None:
             upsample_out_dim = dim // 2
-        
+
         # layers
         # We only support parallel decoding for upsample2d and upsample3d now.
         if mode == "upsample2d":
@@ -1687,7 +1687,7 @@ class WanDecoder3d(nn.Module):
             padding_len = local_expected_height - x.shape[-2]
             if padding_len > 0:
                 x = F.pad(x, (0, 0, 0, padding_len, 0, 0))
-            
+
             x = get_sp_group().all_gather(x, dim=-2)
 
             if x.shape[-2] != expected_height:

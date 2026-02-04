@@ -3,29 +3,30 @@ import tempfile
 
 import pytest
 import torch
-import torch.nn as nn
 import torch.multiprocessing as mp
+import torch.nn as nn
 from torch.testing import assert_close
+
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
-    sp_pad,
-    calc_padding_len,
-    WanResample,
-    WanDistResample,
-    WanDecoder3d,
-    WanCausalConv3d,
-    WanDistCausalConv3d,
-    WanDistConv2d,
-    WanResidualBlock,
-    WanDistResidualBlock,
-    WanMidBlock,
-    WanDistMidBlock,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    init_distributed_environment,
-    initialize_model_parallel,
     destroy_distributed_environment,
     get_sp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import (
+    WanCausalConv3d,
+    WanDecoder3d,
+    WanDistCausalConv3d,
+    WanDistConv2d,
+    WanDistMidBlock,
+    WanDistResample,
+    WanDistResidualBlock,
+    WanMidBlock,
+    WanResample,
+    WanResidualBlock,
+    calc_padding_len,
+    sp_pad,
 )
 
 backend = "nccl" if torch.cuda.is_available() else "gloo"
