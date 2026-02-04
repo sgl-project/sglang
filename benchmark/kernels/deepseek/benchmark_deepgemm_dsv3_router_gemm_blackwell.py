@@ -1,4 +1,5 @@
 import argparse
+import os
 from typing import List
 
 import torch
@@ -12,28 +13,25 @@ K = 7168
 
 def create_benchmark_configs(tp_sizes: List[int]):
     configs = []
-    for launch_with_pdl in [False, True]:
-        for tp_size in tp_sizes:
-            for m in range(1, 17):
-                configs.append((m, N, K, tp_size, launch_with_pdl))
+    for tp_size in tp_sizes:
+        for m in range(1, 17):
+            configs.append((m, N, K, tp_size))
     return configs
 
 
 def dsv3_router_gemm_flashinfer(
     hidden_states: torch.Tensor,
     router_weights: torch.Tensor,
-    launch_with_pdl: bool,
 ):
     """Flashinfer implementation of dsv3 router gemm"""
-    output = torch.randn(
+    output = torch.empty(
         hidden_states.shape[0],
         router_weights.shape[0],
         device="cuda",
         dtype=torch.float32,
-    ).contiguous()
-
+    )
     mm_M1_16_K7168_N256(
-        hidden_states, router_weights.t(), output, launch_with_pdl=launch_with_pdl
+        hidden_states, router_weights.t(), output, launch_with_pdl=args.use_pdl
     )
     return output
 
@@ -75,14 +73,13 @@ def check_accuracy(a, b, atol, rtol, percent):
         return False
 
 
-def calculate_diff(m: int, n: int, k: int, launch_with_pdl: bool):
+def calculate_diff(m: int, n: int, k: int):
     hidden_states = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     router_weights = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
 
     out_flashinfer = dsv3_router_gemm_flashinfer(
         hidden_states.clone(memory_format=torch.contiguous_format),
         router_weights.clone(memory_format=torch.contiguous_format),
-        launch_with_pdl,
     )
 
     out_sgl = dsv3_router_gemm_sgl(
@@ -91,7 +88,7 @@ def calculate_diff(m: int, n: int, k: int, launch_with_pdl: bool):
     )
 
     print(f"Shape m={m}, n={n}, k={k}:")
-    print(f"Using launch_with_pdl={launch_with_pdl} for flashinfer")
+    print(f"Using PDL={args.use_pdl}")
     print(f"Flashinfer output: {out_flashinfer[0, 0:5]}")
     print(f"SGLang output: {out_sgl[0, 0:5]}")
 
@@ -100,10 +97,8 @@ def calculate_diff(m: int, n: int, k: int, launch_with_pdl: bool):
     print(f"  - Flashinfer vs SGLang: {'✅' if flashinfer_sgl_match else '❌'}")
 
 
-def _benchmark(m, n, k, tp_size, launch_with_pdl, provider):
-    print(
-        f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), launch_with_pdl={launch_with_pdl}, Provider: {provider}"
-    )
+def _benchmark(m, n, k, tp_size, provider):
+    print(f"Shape (m={m}, n={n}, k={k}, tp={tp_size}), Provider: {provider}")
     hidden_states = torch.randn(
         (m, k), device="cuda", dtype=torch.bfloat16
     ).contiguous()
@@ -126,7 +121,6 @@ def _benchmark(m, n, k, tp_size, launch_with_pdl, provider):
             lambda: dsv3_router_gemm_flashinfer(
                 hidden_states.clone(memory_format=torch.contiguous_format),
                 router_weights.clone(memory_format=torch.contiguous_format),
-                launch_with_pdl,
             ),
             quantiles=quantiles,
         )
@@ -158,8 +152,8 @@ def get_benchmark_plot_friendly(tp_sizes):
         )
     )
     def benchmark(cfg_id, provider):
-        m, n, k, tp_size, launch_with_pdl = all_configs[cfg_id]
-        ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, launch_with_pdl, provider)
+        m, n, k, tp_size = all_configs[cfg_id]
+        ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, provider)
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark
@@ -175,7 +169,6 @@ def get_benchmark(tp_sizes):
                 "n",
                 "k",
                 "tp_size",
-                "launch_with_pdl",
             ],
             x_vals=[list(config) for config in all_configs],
             line_arg="provider",
@@ -187,8 +180,8 @@ def get_benchmark(tp_sizes):
             args={},
         )
     )
-    def benchmark(m, n, k, tp_size, launch_with_pdl, provider):
-        ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, launch_with_pdl, provider)
+    def benchmark(m, n, k, tp_size, provider):
+        ms, min_ms, max_ms = _benchmark(m, n, k, tp_size, provider)
         return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
 
     return benchmark
@@ -225,17 +218,26 @@ if __name__ == "__main__":
         default=False,
         help="Plot x axis as the config index instead of the m",
     )
+    parser.add_argument(
+        "--use-pdl",
+        action="store_true",
+        default=False,
+        help="Use PDL if true.",
+    )
     args = parser.parse_args()
 
     # Set random seed for reproducibility
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
 
+    if args.use_pdl:
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
+
     # Run correctness tests on a few examples
     if args.run_correctness:
         print("Running correctness tests...")
-        for m, n, k, _, launch_with_pdl in create_benchmark_configs(args.tp_sizes):
-            calculate_diff(m, n, k, launch_with_pdl)
+        for m, n, k, _ in create_benchmark_configs(args.tp_sizes):
+            calculate_diff(m, n, k)
 
     # Get the benchmark function with the specified tp_size
     benchmark = (
