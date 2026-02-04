@@ -332,10 +332,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
+                images_kwargs=self.image_config,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output,
+                self.mm_tokens,
+                images_kwargs=self.image_config,
             )
 
         audio_feature_lengths = None
