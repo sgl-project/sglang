@@ -45,6 +45,10 @@ else:
         apply_token_bitmask_inplace_triton,
     )
 
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
+from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
@@ -208,6 +212,36 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+
+    @property
+    def is_support_token_filter(self):
+        return True
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask: torch.Tensor,
+        token_ids: List[int],
+        batch_idx: int,
+        is_allowed: bool = True,
+        reset_vocab_mask: bool = True,
+    ):
+        # The Xgrammar vocab_mask use CPU tensor by default
+        if _is_hip or (vocab_mask.device.type != "cuda"):
+            set_token_filter_torch(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
+        else:
+            set_token_filter_triton(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
 
     @staticmethod
     def _sanitize_structural_format(structural_format):
