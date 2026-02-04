@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_sp_world_size,
     get_tp_world_size,
+    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
