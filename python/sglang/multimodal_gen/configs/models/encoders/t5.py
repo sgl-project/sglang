@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import argparse
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -8,6 +9,7 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
+from sglang.multimodal_gen.utils import StoreBoolean
 
 
 def _is_transformer_layer(n: str, m) -> bool:
@@ -89,3 +91,23 @@ class T5Config(TextEncoderConfig):
     parallel_folding: bool = False
     # "sp" or "ulysses" or "ring"
     parallel_folding_mode: Literal["sp", "ulysses", "ring"] = "sp"
+
+    @staticmethod
+    def add_cli_args(
+        parser: argparse.ArgumentParser, prefix: str = "t5-config"
+    ) -> argparse.ArgumentParser:
+        parser.add_argument(
+            f"--{prefix}.parallel-folding",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.parallel_folding",
+            default=T5Config.parallel_folding,
+            help="Whether to use parallel folding for T5",
+        )
+        parser.add_argument(
+            f"--{prefix}.parallel-folding-mode",
+            type=Literal["sp", "ulysses", "ring"],
+            dest=f"{prefix.replace('-', '_')}.parallel_folding_mode",
+            default=T5Config.parallel_folding_mode,
+            help="Parallel folding mode for T5",
+        )
+        return parser
