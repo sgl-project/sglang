@@ -262,16 +262,18 @@ def halo_exchange(x: torch.Tensor, height_halo_size: int = 1) -> torch.Tensor:
     recv_top_buf = torch.empty_like(top_row)
     recv_bottom_buf = torch.empty_like(bottom_row)
 
-    reqs = []
+    ops = []
 
     if rank > 0:
         # has previous neighbor, recv previous rank's data to recv_top_buf and send top_row to it.
-        reqs.append(dist.irecv(recv_top_buf, src=rank-1))
-        reqs.append(dist.isend(top_row, dst=rank-1))
+        ops.append(dist.P2POp(dist.irecv, recv_top_buf, rank-1))
+        ops.append(dist.P2POp(dist.isend, top_row, rank-1))
     if rank < world_size - 1:
         # has next neighbor, send bottom_row to next rank and recv next rank's data to recv_bottom_buf.
-        reqs.append(dist.isend(bottom_row, dst=rank+1))
-        reqs.append(dist.irecv(recv_bottom_buf, src=rank+1))
+        ops.append(dist.P2POp(dist.isend, bottom_row, rank+1))
+        ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, rank+1))
+
+    reqs = dist.batch_isend_irecv(ops)
 
     if rank == 0:
         recv_top_buf.zero_()
