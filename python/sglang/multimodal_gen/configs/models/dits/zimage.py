@@ -13,7 +13,9 @@ def is_zimage_layer(n: str, m) -> bool:
     if "layers" in n and str.isdigit(n.split(".")[-1]):
         return True
     # noise_refiner and context_refiner layers
-    if ("noise_refiner" in n or "context_refiner" in n) and str.isdigit(n.split(".")[-1]):
+    if ("noise_refiner" in n or "context_refiner" in n) and str.isdigit(
+        n.split(".")[-1]
+    ):
         return True
     return False
 
