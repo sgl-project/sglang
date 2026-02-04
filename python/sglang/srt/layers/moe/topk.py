@@ -766,12 +766,6 @@ def biased_grouped_topk_gpu(
             True,
         )
 
-        if (expert_location_dispatch_info is not None) or (
-            num_token_non_padded is not None
-        ):
-            topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded
-            )
         return topk_weights, topk_ids
 
     elif (
@@ -880,7 +874,7 @@ else:
     fused_topk_native = fused_topk_torch_native
 
 
-def _post_prepare_topk_ids(
+def _post_process_topk_ids(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_config: TopKConfig,
@@ -1027,7 +1021,7 @@ def select_experts(
             renormalize=renormalize,
         )
 
-    topk_ids, topk_weights = _post_prepare_topk_ids(
+    topk_ids, topk_weights = _post_process_topk_ids(
         topk_ids=topk_ids,
         topk_weights=topk_weights,
         topk_config=topk_config,
