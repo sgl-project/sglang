@@ -3,7 +3,6 @@
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <vector>
