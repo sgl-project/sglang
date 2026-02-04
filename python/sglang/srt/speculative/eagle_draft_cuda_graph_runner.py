@@ -296,7 +296,12 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            if self.enable_spec_overlap_reflow:
+                assert hasattr(self.eagle_worker, "draft_forward_v2"), \
+                    "Overlap reflow just support when enable overlap scheduler"
+                ret = self.eagle_worker.draft_forward_v2(forward_batch)
+            else:
+                ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
