@@ -660,6 +660,8 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        # Tokens loaded from storage backend (L3) during prefetch for this request
+        self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
@@ -749,6 +751,14 @@ class Req:
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+
+        # Detailed breakdown of cached tokens by source (for HiCache)
+        self.cached_tokens_device = 0  # Tokens from device cache (GPU)
+        self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
+        self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self._cache_breakdown_computed = (
+            False  # Track if breakdown was already computed
+        )
 
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
@@ -1097,7 +1107,6 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
-        self.customized_info = None
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1115,6 +1124,9 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1574,7 +1586,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
             # flag will always True
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                new_cached = pre_len - req.already_computed
+                req.cached_tokens += new_cached
+
+                # Calculate detailed breakdown of cached tokens by source (for HiCache)
+                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
+                # would incorrectly count previously computed tokens as cache hits.
+                if not req._cache_breakdown_computed:
+                    # At this point, prefix_indices has been extended with host data
+                    # via init_load_back in schedule_policy, so:
+                    # - len(prefix_indices) = device_original + host_loaded
+                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
+                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
+                    # - device_portion = len(prefix_indices) - host_hit_length
+                    #
+                    # Storage hits are now tracked via scheduler after prefetch completes.
+                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
+                    host_total = req.host_hit_length
+                    # Clamp storage to host_total to handle edge cases
+                    storage_portion = min(host_total, req.storage_hit_length)
+                    host_portion = host_total - storage_portion
+                    device_portion = max(0, len(req.prefix_indices) - host_total)
+
+                    req.cached_tokens_device = device_portion
+                    req.cached_tokens_host = host_portion
+                    req.cached_tokens_storage = storage_portion
+                    req._cache_breakdown_computed = True
+
                 req.already_computed = seq_len
             req.is_retracted = False
 
@@ -2283,6 +2321,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            server_args = get_global_server_args()
+
+            if (
+                self.forward_mode.is_decode()
+                and server_args.enable_piecewise_cuda_graph
+                and not self.tree_cache.is_chunk_cache()
+            ):
+                return
+
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -2297,7 +2344,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            server_args = get_global_server_args()
                             pre_len = (
                                 pre_len - server_args.chunked_prefill_size
                                 if server_args.chunked_prefill_size > 0
