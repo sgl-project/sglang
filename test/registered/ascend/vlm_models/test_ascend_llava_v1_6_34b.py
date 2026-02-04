@@ -1,6 +1,9 @@
 import unittest
 
-from sglang.test.ascend.test_ascend_utils import LLAVA_V1_6_34B_WEIGHTS_PATH, LLAVA_V1_6_34B_TOKENIZER_PATH
+from sglang.test.ascend.test_ascend_utils import (
+    LLAVA_V1_6_34B_TOKENIZER_PATH,
+    LLAVA_V1_6_34B_WEIGHTS_PATH,
+)
 from sglang.test.ascend.vlm_utils import TestVLMModels
 from sglang.test.ci.ci_register import register_npu_ci
 

@@ -7,10 +7,7 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.ascend.test_ascend_utils import E5_MISTRAL_7B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import (
-    CustomTestCase,
-    get_similarities,
-)
+from sglang.test.test_utils import CustomTestCase, get_similarities
 
 register_npu_ci(
     est_time=400,

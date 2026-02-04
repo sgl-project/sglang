@@ -7,10 +7,7 @@ from transformers import AutoConfig, AutoTokenizer
 from sglang.test.ascend.test_ascend_utils import CLIP_VIT_LARGE_PATCH14_336_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
-from sglang.test.test_utils import (
-    CustomTestCase,
-    get_similarities,
-)
+from sglang.test.test_utils import CustomTestCase, get_similarities
 
 register_npu_ci(
     est_time=400,
@@ -19,7 +16,7 @@ register_npu_ci(
 )
 
 MODELS = [
-    (CLIP_VIT_LARGE_PATCH14_336_WEIGHTS_PATH, 1, 0.22)
+    (CLIP_VIT_LARGE_PATCH14_336_WEIGHTS_PATH, 1, 0.22),
 ]
 TORCH_DTYPES = [torch.float16]
 

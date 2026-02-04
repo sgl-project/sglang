@@ -50,7 +50,7 @@ class TestInternlm2(CustomTestCase):
             prompts = srt_runner.tokenizer.apply_chat_template(CONVS, tokenize=False)
             srt_outputs = srt_runner.forward(prompts)
         srt_scores = torch.tensor(srt_outputs.scores)
-        print(f'accuracy: {srt_scores}')
+        print(f"accuracy: {srt_scores}")
         self.assertIsInstance(srt_scores, torch.Tensor)
 
 

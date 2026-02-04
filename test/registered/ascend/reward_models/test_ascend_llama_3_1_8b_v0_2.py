@@ -3,7 +3,9 @@ import unittest
 
 import torch
 
-from sglang.test.ascend.test_ascend_utils import SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH
+from sglang.test.ascend.test_ascend_utils import (
+    SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
