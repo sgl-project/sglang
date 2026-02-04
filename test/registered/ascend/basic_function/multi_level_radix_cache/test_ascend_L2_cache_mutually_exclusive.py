@@ -24,7 +24,8 @@ class TestL2CacheMutuallyExclusive(CustomTestCase):
     def test_L2_cache_mutually_exclusive(self):
         error_message = (
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive and "
-            "cannot be used at the same time. Please use only one of them.")
+            "cannot be used at the same time. Please use only one of them."
+        )
         other_args = [
             "--attention-backend",
             "ascend",
