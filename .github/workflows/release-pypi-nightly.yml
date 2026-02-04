@@ -62,7 +62,7 @@ jobs:
           # If building at exact tag (distance=0), force dev0 version for unique wheel names
           if [ "$DIST" = "0" ]; then
             TAG=$(echo "$DESC" | cut -d- -f1)
-            HASH=$(echo "$DESC" | cut -d- -f3-)
+            HASH="g$(git rev-parse --short HEAD)"
             FORCE_VERSION="${TAG#v}.dev0+${HASH}"
             echo "Building at exact tag, forcing version to: $FORCE_VERSION"
             export SETUPTOOLS_SCM_PRETEND_VERSION="$FORCE_VERSION"
