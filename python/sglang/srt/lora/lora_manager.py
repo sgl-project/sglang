@@ -283,6 +283,9 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
         )
 
+        # Attach max_lora_rank to batch_info for MoE usage
+        self.lora_backend.batch_info.max_lora_rank = max(lora_ranks) if lora_ranks else 0
+
         # Populate per-token LoRA indices from segment information
         batch_info = self.lora_backend.batch_info
         num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass

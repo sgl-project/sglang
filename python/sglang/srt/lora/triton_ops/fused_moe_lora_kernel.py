@@ -94,6 +94,8 @@ def _fused_moe_lora_kernel(
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
 ):
+    # TODO (Jonahcb): investigate why GDC is not working
+    USE_GDC = False
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
     lora_idx = tl.program_id(axis=2)

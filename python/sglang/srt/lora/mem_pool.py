@@ -628,7 +628,12 @@ class LoRAMemoryPool:
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, intermediate_dim, max_rank]
                         buffer_view = target_buffer[buffer_id, expert_id, :, :lora_rank]
-                        load_lora_weight_tensor(buffer_view, expert_weight)
+
+                        weight_to_load = expert_weight
+                        if weight_to_load is not None:
+                            weight_to_load = weight_to_load * lora_adapter.scaling
+
+                        load_lora_weight_tensor(buffer_view, weight_to_load)
                 else:
                     # Standard: single tensor per module
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
