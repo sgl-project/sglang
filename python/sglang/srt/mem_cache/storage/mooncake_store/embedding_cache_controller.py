@@ -107,8 +107,7 @@ class EmbeddingCacheController:
         self.element_size = torch.float32.itemsize
 
         # 1. Mooncake Backend & Pinned Buffer
-        mooncake_config = MooncakeStoreConfig.load_from_env()
-        self.mooncake_store = MooncakeEmbeddingStore(mooncake_config, tp_rank, tp_size)
+        self.mooncake_store = MooncakeEmbeddingStore()
         self.total_pool_size_bytes = int(max_pool_size_gb * 1024**3)
         self.cpu_pool = torch.empty(
             self.total_pool_size_bytes, dtype=torch.uint8, pin_memory=True

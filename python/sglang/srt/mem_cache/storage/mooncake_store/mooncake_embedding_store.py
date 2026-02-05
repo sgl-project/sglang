@@ -1,31 +1,26 @@
 import logging
 from typing import Any, List
 
-import torch
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeBaseStore
 
 logger = logging.getLogger(__name__)
 
 
-class MooncakeEmbeddingStore:
+class MooncakeEmbeddingStore(MooncakeBaseStore):
     def __init__(
         self,
-        mooncake_config: Any,
-        tp_rank,
-        tp_size,
+        storage_config: Any = None,
     ):
-        try:
-            from mooncake.store import MooncakeDistributedStore
-        except ImportError:
-            raise ImportError("Mooncake library not found. Please install Mooncake.")
+        super().__init__()
 
+        MooncakeDistributedStore = self._import_mooncake_store()
         self.store = MooncakeDistributedStore()
-        self.config = mooncake_config
-        self.tp_rank = tp_rank
-
+        self.config = self._load_config(storage_config)
+        self.store = MooncakeDistributedStore()
         ret_code = self.store.setup(
             self.config.local_hostname,
             self.config.metadata_server,
-            self.config.global_segment_size // tp_size,
+            self.config.global_segment_size,
             16 * 1024 * 1024,  # Internal local buffer size
             self.config.protocol,
             self.config.device_name,
@@ -35,12 +30,6 @@ class MooncakeEmbeddingStore:
             raise RuntimeError(f"Failed to setup Mooncake Embedding Store: {ret_code}")
 
         logger.info("Mooncake Embedding Store initialized successfully.")
-
-    def register_buffer(self, tensor: torch.Tensor):
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        if self.store.register_buffer(ptr, size) != 0:
-            raise RuntimeError("Mooncake buffer registration failed.")
 
     def get_key(self, image_hash: str) -> str:
         return f"emb_{image_hash}"

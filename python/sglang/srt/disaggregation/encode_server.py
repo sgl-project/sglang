@@ -214,7 +214,7 @@ class MMEncoder:
                     ib_device=server_args.disaggregation_ib_device,
                 )
             if getattr(self.server_args, "enable_mm_global_cache", False):
-                from sglang.srt.managers.embedding_cache_controller import (
+                from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
                     EmbeddingCacheController,
                 )
 
@@ -472,7 +472,13 @@ class MMEncoder:
                 req_id, num_parts, part_idx, grid_thw, mm_embedding
             )
 
-        return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
+        return (
+            mm_embedding.nbytes,
+            mm_embedding.shape[0],
+            mm_embedding.shape[1],
+            None,
+            None,
+        )
 
     async def _encode(self, mm_items) -> torch.Tensor:
         try:
@@ -848,7 +854,7 @@ async def handle_encode_request(request: dict):
         for socket in send_sockets:
             socket.send_pyobj(request)
         if encoder.mm_global_cache is not None:
-            nbytes, embedding_len, embedding_dim = (
+            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                 await encoder.encode_with_global_cache(
                     mm_items=request["mm_items"],
                     req_id=request["req_id"],
