@@ -1845,6 +1845,7 @@ def launch_server(
         template_manager,
         scheduler_infos,
         port_args,
+        _,  # scheduler_result not needed here, cleanup handled by process termination
     ) = _launch_workers(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,

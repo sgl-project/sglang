@@ -28,7 +28,6 @@ class RayNodeInfo:
 
     node_id: str
     gpu_count: int
-    # Note: IP is discovered inside actors, not from control plane
 
 
 @dataclasses.dataclass
@@ -115,7 +114,7 @@ def create_per_node_placement_groups(
     from ray.util.placement_group import placement_group
 
     placement_groups = []
-    for i in range(topology.nnodes):
+    for _ in range(topology.nnodes):
         bundles = [{"GPU": 1} for _ in range(topology.gpus_per_node)]
         pg = placement_group(bundles, strategy="STRICT_PACK")
         placement_groups.append(pg)

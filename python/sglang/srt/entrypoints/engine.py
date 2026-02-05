@@ -105,6 +105,7 @@ class SchedulerLaunchResult:
     # Ray mode fields
     _actors: Optional[List] = None
     _event_loop_refs: Optional[List] = None
+    _placement_groups: Optional[List] = None
 
     # mp mode fields
     _procs: Optional[List] = None
@@ -147,6 +148,28 @@ class SchedulerLaunchResult:
                 logger.error(
                     f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
                 )
+
+    def cleanup(self) -> None:
+        """Clean up Ray actors and placement groups."""
+        if self._actors is not None:
+            import ray
+
+            for actor in self._actors:
+                try:
+                    ray.kill(actor)
+                except Exception:
+                    pass
+            self._actors = None
+
+        if self._placement_groups is not None:
+            import ray
+
+            for pg in self._placement_groups:
+                try:
+                    ray.util.remove_placement_group(pg)
+                except Exception:
+                    pass
+            self._placement_groups = None
 
 
 def init_tokenizer_manager(
@@ -222,6 +245,7 @@ class Engine(EngineBase):
             template_manager,
             scheduler_infos,
             port_args,
+            scheduler_result,
         ) = _launch_workers(
             server_args=server_args,
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
@@ -232,6 +256,7 @@ class Engine(EngineBase):
         self.template_manager = template_manager
         self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
+        self._scheduler_result = scheduler_result
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
                 scheduler_infos
@@ -498,12 +523,15 @@ class Engine(EngineBase):
         return ret
 
     def _atexit_shutdown(self):
-        """Atexit handler - skips Ray actor killing to avoid C++ crashes."""
+        """Atexit handler - cleans up Ray actors and child processes."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
 
-        # Just clean up other processes; Ray will handle its own actor cleanup.
+        if hasattr(self, "_scheduler_result") and self._scheduler_result is not None:
+            self._scheduler_result.cleanup()
+
+        # Clean up other child processes
         kill_process_tree(os.getpid(), include_parent=False)
 
     def shutdown(self):
@@ -517,6 +545,10 @@ class Engine(EngineBase):
             atexit.unregister(self._atexit_handler)
         except Exception:
             pass
+
+        # Clean up Ray actors and placement groups
+        if hasattr(self, "_scheduler_result") and self._scheduler_result is not None:
+            self._scheduler_result.cleanup()
 
         # Kill all other child processes
         kill_process_tree(os.getpid(), include_parent=False)
@@ -1216,6 +1248,7 @@ def _launch_scheduler_ray_actors(
         scheduler_infos=scheduler_infos,
         _actors=scheduler_actors,
         _event_loop_refs=event_loop_refs,
+        _placement_groups=placement_groups,
     )
 
 
@@ -1230,13 +1263,14 @@ def _launch_workers(
     TemplateManager,
     Tuple[Dict],
     PortArgs,
+    SchedulerLaunchResult,
 ]:
     """
     Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
     or Ray actors), and the DetokenizerManager in another subprocess.
 
     Returns:
-        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args).
+        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args, scheduler_result).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -1278,6 +1312,7 @@ def _launch_workers(
                 None,
                 scheduler_result.scheduler_infos,
                 port_args,
+                scheduler_result,
             )
 
         launch_dummy_health_check_server(
@@ -1291,6 +1326,7 @@ def _launch_workers(
             None,
             scheduler_result.scheduler_infos,
             port_args,
+            scheduler_result,
         )
 
     # Launch detokenizer process
@@ -1326,4 +1362,5 @@ def _launch_workers(
         template_manager,
         scheduler_result.scheduler_infos,
         port_args,
+        scheduler_result,
     )
