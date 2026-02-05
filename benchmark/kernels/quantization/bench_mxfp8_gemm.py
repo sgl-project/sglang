@@ -51,13 +51,19 @@ def get_mxfp8_functions():
         mxfp8_block_scaled_matmul_triton,
     )
     from sglang.srt.layers.quantization.fp8_utils import (
+        _interleave_mxfp8_scales_for_cublas,
         _pack_mxfp8_scales,
+        cublas_mxfp8_blockscaled_linear,
         mxfp8_group_quantize,
+        prepare_mxfp8_weight_for_cublas,
     )
     return (
         mxfp8_block_scaled_matmul_triton,
         _pack_mxfp8_scales,
         mxfp8_group_quantize,
+        _interleave_mxfp8_scales_for_cublas,
+        cublas_mxfp8_blockscaled_linear,
+        prepare_mxfp8_weight_for_cublas,
     )
 
 
@@ -216,7 +222,7 @@ def mxfp8_matmul_splitk(
 # ---------------------------------------------------------------------------
 
 def prepare_mxfp8_inputs(M, N, K):
-    (_, _pack_mxfp8_scales, mxfp8_group_quantize) = get_mxfp8_functions()
+    (_, _pack_mxfp8_scales, mxfp8_group_quantize, _, _, _) = get_mxfp8_functions()
     x = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
     w = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
     x_fp8, x_scale = mxfp8_group_quantize(x)
@@ -273,7 +279,7 @@ def bench_bf16(M, N, K):
 
 def bench_torch_scaled_mm(M, N, K):
     """Benchmark torch._scaled_mm with MXFP8 (cuBLAS path)."""
-    (_, _pack_mxfp8_scales, mxfp8_group_quantize) = get_mxfp8_functions()
+    (_, _pack_mxfp8_scales, mxfp8_group_quantize, _, _, _) = get_mxfp8_functions()
     x = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
     w = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
     x_fp8, x_scale = mxfp8_group_quantize(x)
@@ -295,6 +301,123 @@ def bench_torch_scaled_mm(M, N, K):
     ms = np.median(measurements)
     tflops = 2 * M * N * K * 1e-9 / ms
     return ms, tflops
+
+
+def bench_cublas_fused(M, N, K):
+    """Benchmark the full fused cuBLAS MXFP8 pipeline.
+
+    Simulates production: weight pre-computed at load time, input quantized
+    + scale-interleaved at runtime, then torch._scaled_mm.
+    """
+    (_, _, mxfp8_group_quantize, _interleave_mxfp8_scales_for_cublas,
+     _, prepare_mxfp8_weight_for_cublas) = get_mxfp8_functions()
+
+    x = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    w = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    w_fp8, w_scale = mxfp8_group_quantize(w)
+
+    # Pre-compute weight data (simulates model load time)
+    from sglang.srt.layers.quantization.fp8_utils import _pack_mxfp8_scales
+    weight_t, weight_scale_cublas = prepare_mxfp8_weight_for_cublas(w_fp8, w_scale)
+
+    # Pre-quantize input (this would happen at runtime)
+    x_fp8, x_scale = mxfp8_group_quantize(x)
+    m_padded = ceil_div(M, 128) * 128
+    if M % 128 != 0:
+        pad_rows = m_padded - M
+        x_fp8 = torch.cat(
+            [x_fp8, torch.zeros((pad_rows, K), device="cuda", dtype=x_fp8.dtype)],
+            dim=0,
+        )
+        x_scale = torch.cat(
+            [x_scale, torch.full((pad_rows, K // 32), 127, device="cuda", dtype=x_scale.dtype)],
+            dim=0,
+        )
+    sa = _interleave_mxfp8_scales_for_cublas(x_scale, m_padded, K)
+
+    def run(x_fp8, weight_t, sa, weight_scale_cublas):
+        return torch._scaled_mm(
+            x_fp8, weight_t, scale_a=sa, scale_b=weight_scale_cublas,
+            out_dtype=torch.bfloat16,
+        )
+
+    measurements = bench_gpu_time(
+        run, input_args=(x_fp8, weight_t, sa, weight_scale_cublas),
+        use_cuda_graph=True,
+    )
+    ms = np.median(measurements)
+    tflops = 2 * M * N * K * 1e-9 / ms
+    return ms, tflops
+
+
+def test_accuracy_cublas_fused():
+    """Test accuracy of cuBLAS fused MXFP8 path vs Triton baseline."""
+    (mxfp8_block_scaled_matmul_triton, _pack_mxfp8_scales, mxfp8_group_quantize,
+     _, cublas_mxfp8_blockscaled_linear, prepare_mxfp8_weight_for_cublas,
+     ) = get_mxfp8_functions()
+
+    shapes = [
+        (1, 256, 512), (127, 256, 512), (128, 128, 4096),
+        (128, 4096, 4096), (129, 384, 1024), (255, 512, 2048),
+        (256, 4096, 8192), (512, 8192, 8192),
+    ]
+    print("Running cuBLAS fused MXFP8 accuracy tests...", file=sys.stderr)
+    for M, N, K in shapes:
+        x = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+        w = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+        w_fp8, w_scale = mxfp8_group_quantize(w)
+
+        # Triton baseline
+        x_fp8, x_scale = mxfp8_group_quantize(x)
+        block_m = 128
+        m_padded = ceil_div(M, block_m) * block_m
+        if M % block_m != 0:
+            pad_rows = m_padded - M
+            x_fp8_pad = torch.cat(
+                [x_fp8, torch.zeros((pad_rows, K), device="cuda", dtype=x_fp8.dtype)],
+                dim=0,
+            )
+            x_scale_pad = torch.cat(
+                [x_scale, torch.full((pad_rows, K // 32), 127, device="cuda", dtype=x_scale.dtype)],
+                dim=0,
+            )
+        else:
+            x_fp8_pad, x_scale_pad = x_fp8, x_scale
+        block_n = 256 if N % 256 == 0 else 128
+        a_scale_packed = _pack_mxfp8_scales(x_scale_pad)
+        b_scale_packed = _pack_mxfp8_scales(w_scale)
+        out_triton = mxfp8_block_scaled_matmul_triton(
+            x_fp8_pad, a_scale_packed, w_fp8.contiguous(), b_scale_packed,
+            output_dtype=torch.bfloat16, block_m=128, block_n=block_n, block_k=128,
+        )[:M, :]
+
+        # cuBLAS fused (using the production function)
+        weight_t, weight_scale_cublas = prepare_mxfp8_weight_for_cublas(w_fp8, w_scale)
+        out_cublas = cublas_mxfp8_blockscaled_linear(
+            input=x,
+            weight_t=weight_t,
+            weight_scale_cublas=weight_scale_cublas,
+            input_scale=None,
+        )
+
+        # Also test pre-quantized input path
+        out_cublas_prequant = cublas_mxfp8_blockscaled_linear(
+            input=x_fp8,
+            weight_t=weight_t,
+            weight_scale_cublas=weight_scale_cublas,
+            input_scale=x_scale,
+            output_dtype=torch.bfloat16,
+        )
+
+        for label, out_test in [("dynamic", out_cublas), ("prequant", out_cublas_prequant)]:
+            abs_diff = (out_triton.float() - out_test.float()).abs()
+            max_val = out_triton.float().abs().max().item()
+            rel_diff = abs_diff.max().item() / max(max_val, 1e-6)
+            assert rel_diff < 0.02, \
+                f"cuBLAS {label} mismatch M={M},N={N},K={K}: rel={rel_diff:.4f}"
+
+        print(f"  M={M},N={N},K={K}: OK", file=sys.stderr)
+    print("All cuBLAS fused accuracy tests passed!\n", file=sys.stderr)
 
 
 def valid_split_k_values(K, block_k=128, max_split_k=16):
@@ -327,9 +450,8 @@ def pick_split_k(M, N, K, block_m=128, block_n=256, block_k=128,
 
 
 def test_accuracy_splitk():
-    (mxfp8_block_scaled_matmul_triton, _pack_mxfp8_scales, mxfp8_group_quantize) = (
-        get_mxfp8_functions()
-    )
+    (mxfp8_block_scaled_matmul_triton, _pack_mxfp8_scales, mxfp8_group_quantize,
+     _, _, _) = get_mxfp8_functions()
 
     shapes = [
         (128, 128, 4096), (128, 4096, 4096),
@@ -384,6 +506,38 @@ if __name__ == "__main__":
         exit(0)
 
     torch_only = "--torch-only" in sys.argv
+    cublas_fused = "--cublas-fused" in sys.argv
+
+    if cublas_fused:
+        # Benchmark cuBLAS fused MXFP8 (pre-computed weights) vs Triton baseline vs BF16
+        test_accuracy_cublas_fused()
+        print("# cuBLAS fused MXFP8 benchmark", file=sys.stderr)
+        print(
+            "M,N,K,triton_us,cublas_us,bf16_us,"
+            "triton_tflops,cublas_tflops,bf16_tflops,"
+            "cublas_vs_triton,cublas_vs_bf16"
+        )
+        for K in Ks:
+            for N in Ns:
+                for M in Ms:
+                    block_n = 256 if N % 256 == 0 else 128
+                    ms_triton, tflops_triton = bench_kernel(
+                        M, N, K,
+                        get_mxfp8_functions()[0],  # mxfp8_block_scaled_matmul_triton
+                        block_m=128, block_n=block_n, block_k=128,
+                    )
+                    ms_cublas, tflops_cublas = bench_cublas_fused(M, N, K)
+                    ms_bf16, tflops_bf16 = bench_bf16(M, N, K)
+                    cublas_vs_triton = ms_triton / ms_cublas
+                    cublas_vs_bf16 = ms_bf16 / ms_cublas
+                    print(
+                        f"{M},{N},{K},"
+                        f"{ms_triton*1000:.2f},{ms_cublas*1000:.2f},{ms_bf16*1000:.2f},"
+                        f"{tflops_triton:.2f},{tflops_cublas:.2f},{tflops_bf16:.2f},"
+                        f"{cublas_vs_triton:.3f},{cublas_vs_bf16:.3f}"
+                    )
+                print(f"  K={K},N={N} done", file=sys.stderr)
+        exit(0)
 
     if torch_only:
         # Only benchmark torch._scaled_mm (cuBLAS MXFP8 path)
@@ -409,7 +563,7 @@ if __name__ == "__main__":
 
     test_accuracy_splitk()
 
-    (mxfp8_block_scaled_matmul_triton, _, _) = get_mxfp8_functions()
+    (mxfp8_block_scaled_matmul_triton, _, _, _, _, _) = get_mxfp8_functions()
 
     # Phase 1: Split-K + swap_ab sweep on representative shapes
     print("# Phase 1: Split-K + swap_ab sweep", file=sys.stderr)
