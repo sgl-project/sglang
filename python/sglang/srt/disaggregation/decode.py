@@ -330,7 +330,120 @@ class DecodePreallocQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+
+        # Initialize scatter manager if scatter mode is enabled
+        # This is for Diff TP optimization (e.g., TP2 Prefill -> TP1 Decode)
+        if (
+            hasattr(kv_manager, "scatter_mode_enabled")
+            and kv_manager.scatter_mode_enabled
+        ):
+            self._init_scatter_manager(kv_manager, kv_args, attn_tp_size)
+
         return kv_manager
+
+    def _init_scatter_manager(
+        self, kv_manager: BaseKVManager, kv_args, decode_tp_size: int
+    ):
+        """
+        Initialize the paged scatter manager for Diff TP optimization.
+
+        This is called when SGLANG_DISAGGREGATION_PAGED_SCATTER_KV=1 is enabled.
+        Allocates a paged scatter buffer on the decode side to receive KV data
+        from multiple prefill TP ranks before scattering to the correct head positions.
+        """
+        from sglang.srt.environ import envs
+
+        try:
+            # Get buffer size configuration
+            scatter_buffer_size_gb = (
+                envs.SGLANG_DISAGGREGATION_PAGED_SCATTER_KV_PER_D_RANK_SIZE.get()
+            )
+            prefill_tp_size = (
+                envs.SGLANG_DISAGGREGATION_PAGED_SCATTER_KV_P_TP_SIZE.get()
+            )
+
+            # Get KV cache parameters
+            page_size = kv_args.page_size
+
+            # Estimate prefill TP size if not explicitly configured
+            # For TP4 prefill -> TP2 decode, each decode rank receives from 2 prefill ranks
+            assert (
+                prefill_tp_size > 1
+            ), f"Prefill TP size must be greater than 1. {prefill_tp_size=}"
+
+            # Calculate how many prefill ranks send to this decode rank
+            p_d_tp_size_ratio = prefill_tp_size / decode_tp_size
+            assert (
+                p_d_tp_size_ratio.is_integer() and p_d_tp_size_ratio > 1
+            ), f"Prefill TP size must be a multiple of decode TP size. {prefill_tp_size=} / {decode_tp_size=} = {p_d_tp_size_ratio=}"
+            p_d_tp_size_ratio = int(p_d_tp_size_ratio)
+
+            # Get head info from token_to_kv_pool
+            kv_pool = self.token_to_kv_pool
+            assert hasattr(kv_pool, "head_num") and hasattr(kv_pool, "head_dim")
+            dst_num_heads = kv_pool.head_num
+            head_dim = kv_pool.head_dim
+
+            # src_num_heads is the heads per prefill rank
+            # dst_num_heads is the heads per decode rank
+            src_num_heads = dst_num_heads // p_d_tp_size_ratio
+
+            # Get dtype from KV pool
+            if hasattr(kv_pool, "dtype"):
+                dtype = kv_pool.dtype
+            else:
+                dtype = self.scheduler.server_args.kv_cache_dtype
+
+            # Get number of layers
+            if hasattr(kv_pool, "layer_num"):
+                num_layers = kv_pool.layer_num
+            else:
+                num_layers = len(kv_args.kv_data_ptrs) // 2  # k and v per layer
+
+            # Calculate scatter buffer size in pages
+            bytes_per_page = page_size * src_num_heads * head_dim * dtype.itemsize
+            # Buffer per TP rank
+            bytes_per_tp_rank = (
+                int(scatter_buffer_size_gb * 1024**3) // p_d_tp_size_ratio
+            )
+            # Total pages per TP rank across all layers (k + v)
+            num_scatter_pages = bytes_per_tp_rank // (bytes_per_page * num_layers * 2)
+
+            if num_scatter_pages < 512:
+                logger.warning(
+                    f"Scatter buffer too small: {num_scatter_pages} pages. "
+                    f"Please increase SGLANG_DISAGGREGATION_PAGED_SCATTER_KV_PER_D_RANK_SIZE (current: {scatter_buffer_size_gb}GB)"
+                )
+                kv_manager.scatter_mode_enabled = False
+                return
+
+            logger.info(
+                f"Paged scatter KV: buffer_size={scatter_buffer_size_gb:.1f}GB, "
+                f"num_pages={num_scatter_pages}, prefill_tp={prefill_tp_size}, decode_tp={decode_tp_size}"
+            )
+
+            kv_manager.init_paged_scatter_manager(
+                num_scatter_pages=num_scatter_pages,
+                page_size=page_size,
+                src_num_heads=src_num_heads,
+                dst_num_heads=dst_num_heads,
+                head_dim=head_dim,
+                num_layers=num_layers,
+                dtype=dtype,
+                p_d_tp_size_ratio=p_d_tp_size_ratio,
+            )
+
+            logger.info(
+                f"Paged scatter mode enabled: num_pages={num_scatter_pages}, "
+                f"src_heads={src_num_heads}, dst_heads={dst_num_heads}, "
+                f"p_d_tp_size_ratio={p_d_tp_size_ratio}, head_dim={head_dim}, layers={num_layers}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize paged scatter manager: {e}")
+            import traceback
+
+            traceback.print_exc()
+            kv_manager.scatter_mode_enabled = False
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
@@ -354,11 +467,24 @@ class DecodePreallocQueue:
                     self.transfer_backend, KVClassType.RECEIVER
                 )
 
+            # Calculate estimated pages for scatter buffer allocation
+            estimated_num_pages = None
+            if hasattr(self, "token_to_kv_pool") and hasattr(
+                self.token_to_kv_pool, "page_size"
+            ):
+                page_size = self.token_to_kv_pool.page_size
+                num_tokens = len(req.origin_input_ids)
+                # Add 1 extra page as buffer to handle edge cases where actual
+                # allocation may be slightly larger than estimated
+                estimated_num_pages = (num_tokens + page_size - 1) // page_size + 1
+
             kv_receiver = kv_receiver_class(
                 mgr=self.kv_manager,
                 bootstrap_addr=f"{req.bootstrap_host}:{req.bootstrap_port}",
                 bootstrap_room=req.bootstrap_room,
                 prefill_dp_rank=req.data_parallel_rank,
+                estimated_num_pages=estimated_num_pages,
+                request_id=req.rid,
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
@@ -729,6 +855,105 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
+    def _maybe_execute_scatter(self, decode_req: DecodeRequest) -> None:
+        """
+        Execute scatter operation if scatter mode is enabled for this request.
+
+        This is called after KV transfer is complete but before committing
+        the transfer to the request. The scatter operation moves data from
+        the scatter buffer to the correct positions in KV cache.
+
+        For Diff TP scenarios (Prefill TP > Decode TP), multiple prefill TP ranks
+        send data to different regions of the scatter buffer. We scatter each
+        region to the corresponding head offset in the KV cache.
+        """
+        # Access kv_manager through scheduler -> disagg_decode_prealloc_queue
+        if not hasattr(self.scheduler, "disagg_decode_prealloc_queue"):
+            logger.debug("_maybe_execute_scatter: no disagg_decode_prealloc_queue")
+            return
+
+        prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+        if not hasattr(prealloc_queue, "kv_manager"):
+            logger.debug("_maybe_execute_scatter: no kv_manager")
+            return
+
+        kv_manager = prealloc_queue.kv_manager
+        if (
+            not hasattr(kv_manager, "scatter_mode_enabled")
+            or not kv_manager.scatter_mode_enabled
+        ):
+            logger.debug(
+                f"_maybe_execute_scatter: scatter_mode_enabled={getattr(kv_manager, 'scatter_mode_enabled', False)}"
+            )
+            return
+
+        if kv_manager.paged_scatter_manager is None:
+            logger.debug("_maybe_execute_scatter: paged_scatter_manager is None")
+            return
+
+        self._execute_paged_scatter(decode_req, kv_manager, prealloc_queue)
+
+    def _execute_paged_scatter(
+        self, decode_req: DecodeRequest, kv_manager, prealloc_queue
+    ) -> None:
+        """Execute paged scatter operation for Diff TP.
+
+        New design: scatter buffer has same layout as KV cache.
+        - Prefill sends to scatter_page_indices using _send_kvcache_generic
+        - Scatter copies from scatter pages to kv_page_indices with head offset
+        """
+        req = decode_req.req
+        paged_scatter_mgr = kv_manager.paged_scatter_manager
+        kv_pool = prealloc_queue.token_to_kv_pool
+
+        # Check if this request has paged scatter allocation
+        # Returns: (scatter_page_indices, kv_page_indices, num_pages)
+        info = paged_scatter_mgr.get_request_info(req.rid)
+        logger.debug(
+            f"Paged scatter get_request_info: rid={req.rid}, info_exists={info is not None}"
+        )
+        if info is None:
+            logger.debug(f"Paged scatter: request {req.rid} not found in allocations")
+            return
+
+        scatter_page_indices, kv_page_indices, num_pages = info
+
+        if kv_page_indices is None:
+            logger.warning(f"Paged scatter: request {req.rid} has no kv_page_indices")
+            return
+
+        prefill_tp_size = paged_scatter_mgr.prefill_tp_size
+
+        logger.debug(
+            f"Paged scatter EXEC: rid={req.rid}, pages={num_pages}, tp_size={prefill_tp_size}"
+        )
+
+        try:
+            # Scatter all TP ranks' data to KV cache
+            success = paged_scatter_mgr.scatter_all_tp_ranks(
+                request_id=req.rid,
+                dst_k_buffers=kv_pool.k_buffer,
+                dst_v_buffers=kv_pool.v_buffer,
+                sync=True,
+            )
+
+            if success:
+                logger.debug(
+                    f"Paged scatter DONE: rid={req.rid}, pages={num_pages}, tp_ranks={prefill_tp_size}"
+                )
+            else:
+                logger.error(f"Paged scatter failed for request {req.rid}")
+
+        except Exception as e:
+            logger.error(f"Paged scatter failed for request {req.rid}: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+        # NOTE: We do not release the scatter buffer here.
+        # It will be released in _commit_transfer_to_req or pop_transferred (on failure)
+        # via decode_req.kv_receiver.clear()
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
         Returns:
@@ -853,6 +1078,8 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                # Execute scatter if scatter mode is enabled
+                self._maybe_execute_scatter(decode_req)
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)

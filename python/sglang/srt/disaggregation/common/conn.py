@@ -249,6 +249,8 @@ class CommonKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        estimated_num_pages: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.bootstrap_room = bootstrap_room
         self.bootstrap_addr = bootstrap_addr
@@ -415,6 +417,7 @@ class CommonKVReceiver(BaseKVReceiver):
                         else:
                             # For non-MLA: all target_tp_ranks are selected real ranks
                             bootstrap_info["is_dummy"] = False
+                        bootstrap_info["target_tp_rank"] = target_tp_rank
                         logger.debug(
                             f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank} PP {target_pp_rank}"
                         )

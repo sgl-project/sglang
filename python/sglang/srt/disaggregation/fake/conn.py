@@ -66,6 +66,8 @@ class FakeKVReceiver(BaseKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        estimated_num_pages: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.has_init = False
 

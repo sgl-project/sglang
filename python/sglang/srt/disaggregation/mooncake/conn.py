@@ -36,6 +36,21 @@ from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
 
+# Import scatter kernel (lazy import to avoid circular dependencies)
+_paged_scatter_kv_manager_class = None
+
+
+def _get_paged_scatter_kv_manager_class():
+    global _paged_scatter_kv_manager_class
+    if _paged_scatter_kv_manager_class is None:
+        from sglang.srt.disaggregation.mooncake.paged_scatter_kv import (
+            PagedScatterKVManager,
+        )
+
+        _paged_scatter_kv_manager_class = PagedScatterKVManager
+    return _paged_scatter_kv_manager_class
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +87,10 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    # Scatter mode fields (per-request, for Diff TP)
+    scatter_page_indices: List[int] = (
+        None  # Scatter buffer page indices for this request
+    )
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -88,6 +107,26 @@ class TransferInfo:
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
             is_dummy = False
+
+        # Parse scatter_page_indices if present
+        # Adaptive parsing: check if msg[8] is scatter indices or something else (e.g. group_id)
+        scatter_page_indices = None
+        scatter_idx = 8
+
+        # If len(msg) > 9, likely a field was inserted.
+        if len(msg) >= 10:
+            scatter_idx = 9
+
+        if len(msg) >= scatter_idx + 1 and msg[scatter_idx] != b"":
+            # Verify it looks like int32 array (length multiple of 4)
+            if len(msg[scatter_idx]) % 4 == 0:
+                try:
+                    scatter_page_indices = list(
+                        np.frombuffer(msg[scatter_idx], dtype=np.int32)
+                    )
+                except Exception:
+                    pass
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -98,6 +137,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            scatter_page_indices=scatter_page_indices,
         )
 
 
@@ -117,10 +157,35 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: list[int]
     dst_state_dim_per_tensor: list[int]
+    # Scatter mode fields (optional, for Diff TP optimization)
+    scatter_mode_enabled: bool = False
+    # New paged scatter fields
+    scatter_kv_ptrs: list[int] = None  # Scatter buffer kv_data_ptrs
+    scatter_kv_item_len: int = 0  # Scatter buffer item length
+    scatter_page_indices: list[int] = None  # Allocated scatter page indices
+
+    def __post_init__(self):
+        if self.scatter_kv_ptrs is None:
+            self.scatter_kv_ptrs = []
+        if self.scatter_page_indices is None:
+            self.scatter_page_indices = []
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
-        return cls(
+        # Handle both old format (12 fields) and new format (16 fields with paged scatter info)
+        # Adaptive parsing to handle potential field shifts from upstream changes
+
+        # Base fields are 0-9. Check if index 9 is integer (dst_kv_item_len)
+        base_offset = 0
+        if len(msg) > 9 and not msg[9].isdigit():
+            # If msg[9] is not digit, maybe a field was inserted. Try index 10.
+            if len(msg) > 10 and msg[10].isdigit():
+                base_offset = 1
+                logger.debug(
+                    f"KVArgsRegisterInfo: detected field shift, base_offset={base_offset}"
+                )
+
+        base_info = cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
             dst_port=int(msg[2].decode("ascii")),
@@ -128,20 +193,70 @@ class KVArgsRegisterInfo:
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
             dst_state_data_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
-            dst_tp_rank=int(msg[7].decode("ascii")),
-            dst_attn_tp_size=int(msg[8].decode("ascii")),
-            dst_kv_item_len=int(msg[9].decode("ascii")),
+            dst_tp_rank=int(msg[7 + base_offset].decode("ascii")),
+            dst_attn_tp_size=int(msg[8 + base_offset].decode("ascii")),
+            dst_kv_item_len=int(msg[9 + base_offset].decode("ascii")),
             dst_state_item_lens=(
-                list(struct.unpack(f"{len(msg[10])//4}I", msg[10]))
-                if len(msg) > 10 and len(msg[10]) > 0
+                list(
+                    struct.unpack(
+                        f"{len(msg[10 + base_offset])//4}I", msg[10 + base_offset]
+                    )
+                )
+                if len(msg) > 10 + base_offset and len(msg[10 + base_offset]) > 0
                 else []
             ),
             dst_state_dim_per_tensor=(
-                list(struct.unpack(f"{len(msg[11])//4}I", msg[11]))
-                if len(msg) > 11 and len(msg[11]) > 0
+                list(
+                    struct.unpack(
+                        f"{len(msg[11 + base_offset])//4}I", msg[11 + base_offset]
+                    )
+                )
+                if len(msg) > 11 + base_offset and len(msg[11 + base_offset]) > 0
                 else []
             ),
         )
+
+        # Parse paged scatter fields if present
+        # Look for scatter_mode_enabled flag ("0" or "1")
+        # Expected index: 12 + base_offset
+        scatter_idx = 12 + base_offset
+
+        # Double check if scatter_idx points to a bool flag
+        if len(msg) > scatter_idx and msg[scatter_idx] not in (b"0", b"1"):
+            # Try next index
+            if len(msg) > scatter_idx + 1 and msg[scatter_idx + 1] in (b"0", b"1"):
+                scatter_idx += 1
+                logger.debug(
+                    f"KVArgsRegisterInfo: detected scatter field shift, scatter_idx={scatter_idx}"
+                )
+
+        if len(msg) >= scatter_idx + 4:
+            base_info.scatter_mode_enabled = msg[scatter_idx].decode("ascii") == "1"
+            if base_info.scatter_mode_enabled:
+                # msg[scatter_idx + 1]: packed scatter kv_data_ptrs
+                if len(msg[scatter_idx + 1]) >= 8:
+                    base_info.scatter_kv_ptrs = list(
+                        struct.unpack(
+                            f"{len(msg[scatter_idx + 1])//8}Q", msg[scatter_idx + 1]
+                        )
+                    )
+                # msg[scatter_idx + 2]: scatter_kv_item_len
+                base_info.scatter_kv_item_len = int(
+                    msg[scatter_idx + 2].decode("ascii")
+                )
+                # msg[scatter_idx + 3]: packed scatter_page_indices (int32)
+                if len(msg[scatter_idx + 3]) >= 4:
+                    base_info.scatter_page_indices = list(
+                        struct.unpack(
+                            f"{len(msg[scatter_idx + 3])//4}i", msg[scatter_idx + 3]
+                        )
+                    )
+                logger.debug(
+                    f"KVArgsRegisterInfo.from_zmq: scatter_enabled={base_info.scatter_mode_enabled}, "
+                    f"num_ptrs={len(base_info.scatter_kv_ptrs)}, item_len={base_info.scatter_kv_item_len}, "
+                    f"num_pages={len(base_info.scatter_page_indices)}"
+                )
+        return base_info
 
 
 class AuxDataCodec:
@@ -235,6 +350,18 @@ class MooncakeKVManager(CommonKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
 
+            # Scatter mode for Diff TP optimization (Prefill TP > Decode TP)
+            self.scatter_mode_enabled = (
+                envs.SGLANG_DISAGGREGATION_PAGED_SCATTER_KV.get()
+            )
+            self.paged_scatter_manager = (
+                None  # Will be initialized by DecodePreallocQueue
+            )
+            if self.scatter_mode_enabled:
+                logger.info(
+                    f"MooncakeKVManager: Scatter mode enabled for Diff TP optimization"
+                )
+
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -263,6 +390,64 @@ class MooncakeKVManager(CommonKVManager):
             self.engine.batch_register(
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
+
+    def init_paged_scatter_manager(
+        self,
+        num_scatter_pages: int,
+        page_size: int,
+        src_num_heads: int,
+        dst_num_heads: int,
+        head_dim: int,
+        num_layers: int,
+        dtype,
+        p_d_tp_size_ratio: int,
+    ):
+        """
+        Initialize the paged scatter manager for Diff TP optimization.
+
+        This creates a PagedScatterKVManager that allocates scatter buffers
+        mimicking the KV cache structure for efficient RDMA transfer.
+
+        Args:
+            num_scatter_pages: Number of pages in the scatter buffer pool.
+            page_size: Number of tokens per page.
+            src_num_heads: Number of KV heads per prefill TP rank.
+            dst_num_heads: Total number of KV heads on decode side per rank.
+            head_dim: Dimension per attention head.
+            num_layers: Number of transformer layers.
+            dtype: Data type for KV cache.
+            prefill_tp_size: Number of prefill TP ranks sending to this decode rank.
+        """
+        PagedScatterKVManager = _get_paged_scatter_kv_manager_class()
+
+        self.paged_scatter_manager = PagedScatterKVManager(
+            num_scatter_pages=num_scatter_pages,
+            page_size=page_size,
+            src_num_heads=src_num_heads,
+            dst_num_heads=dst_num_heads,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            dtype=dtype,
+            device=f"cuda:{self.kv_args.gpu_id}",
+            p_d_tp_size_ratio=p_d_tp_size_ratio,
+        )
+
+        # Register scatter buffers with Mooncake engine
+        # Each TP rank's k_buffer and v_buffer tensors need to be registered
+        registered_buffers = 0
+        for tp_rank in range(p_d_tp_size_ratio):
+            for layer_idx in range(num_layers):
+                k_tensor = self.paged_scatter_manager.k_buffers[tp_rank][layer_idx]
+                v_tensor = self.paged_scatter_manager.v_buffers[tp_rank][layer_idx]
+                k_len = k_tensor.numel() * k_tensor.element_size()
+                v_len = v_tensor.numel() * v_tensor.element_size()
+                self.engine.register(k_tensor.data_ptr(), k_len)
+                self.engine.register(v_tensor.data_ptr(), v_len)
+                registered_buffers += 2
+
+        logger.info(
+            f"Paged scatter manager initialized: registered {registered_buffers} buffers"
+        )
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
@@ -408,6 +593,11 @@ class MooncakeKVManager(CommonKVManager):
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        scatter_mode_enabled: bool = False,
+        scatter_kv_ptrs: list[int] = None,
+        scatter_kv_item_len: int = 0,
+        scatter_page_indices: list[int] = None,
+        chunk_start_page_idx: int = 0,
     ):
         """
         Sends KV cache slices from this Prefill rank to a target Decode rank,
@@ -416,7 +606,44 @@ class MooncakeKVManager(CommonKVManager):
         NOTE: This implementation calls the transfer engine for each token slot within
         each page to ensure correctness for any page_size and head-slicing configuration.
         This may introduce performance overhead (increased TTFT) for long sequences.
+
+        If scatter_mode_enabled is True, uses _send_kvcache_generic to send to
+        scatter buffer (same layout as KV cache, uses scatter_page_indices as dst).
+
+        Args:
+            scatter_kv_ptrs: Scatter buffer's kv_data_ptrs (for paged scatter mode)
+            scatter_kv_item_len: Scatter buffer's item length per page
+            scatter_page_indices: Allocated scatter page indices in scatter buffer
+            chunk_start_page_idx: Starting page index of this chunk (for chunked transfer)
         """
+        # Check if paged scatter mode should be used
+        # If scatter buffer doesn't have enough pages, fallback to strided transfer
+        num_pages = len(prefill_kv_indices)
+        chunk_end_idx = chunk_start_page_idx + num_pages
+        can_use_scatter = (
+            scatter_mode_enabled
+            and scatter_kv_ptrs
+            and len(scatter_kv_ptrs) > 0
+            and scatter_page_indices
+            and chunk_end_idx <= len(scatter_page_indices)
+        )
+
+        if can_use_scatter:
+            ret = self._send_kvcache_to_scatter_buffer(
+                mooncake_session_id=mooncake_session_id,
+                prefill_kv_indices=prefill_kv_indices,
+                scatter_kv_ptrs=scatter_kv_ptrs,
+                scatter_kv_item_len=scatter_kv_item_len,
+                scatter_page_indices=scatter_page_indices,
+                executor=executor,
+                chunk_start_page_idx=chunk_start_page_idx,
+            )
+            if ret == 0:
+                return ret
+            # If scatter failed, fallback to strided transfer
+            logger.debug(
+                f"Scatter transfer failed, falling back to strided transfer, ret={ret}"
+            )
         # Extract configuration
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         src_kv_item_len = self.kv_args.kv_item_lens[0]
@@ -464,87 +691,164 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        layers_params = [
-            (
-                src_k_ptrs[layer_id],
-                dst_k_ptrs[layer_id],
-                src_kv_item_len,
-                dst_kv_item_len,
-                src_head_slice_offset,
-                dst_head_slice_offset,
-                heads_bytes_per_token_to_send,
+        # Optimization V3: Batch all layers into a single RDMA call
+        # The key insight is that RDMA call overhead dominates, not address computation.
+        # By merging all layers' transfer lists into one batch_transfer_sync call,
+        # we reduce the number of RDMA calls from O(num_layers * 2) to O(1).
+
+        use_numpy_opt = (
+            envs.SGLANG_DISAGGREGATION_DIFF_TP_NUMPY.get()
+        )  # Use NumPy vectorized per-layer optimization (best performance)
+
+        if use_numpy_opt:
+            # 1. Precompute indices and offsets
+            prefill_kv_indices_reshaped = prefill_kv_indices.astype(np.int64).reshape(
+                -1, 1
             )
-            for layer_id in range(layers_current_pp_stage)
-        ] + [
-            (
-                src_v_ptrs[layer_id],
-                dst_v_ptrs[layer_id],
-                src_kv_item_len,
-                dst_kv_item_len,
-                src_head_slice_offset,
-                dst_head_slice_offset,
-                heads_bytes_per_token_to_send,
+            dst_kv_indices_reshaped = dst_kv_indices.astype(np.int64).reshape(-1, 1)
+
+            token_offsets = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+
+            bytes_per_token_on_prefill = src_kv_item_len // page_size
+            bytes_per_token_on_decode = dst_kv_item_len // page_size
+
+            # Token offsets (constant across layers)
+            src_token_offsets_base = (
+                token_offsets * bytes_per_token_on_prefill + src_head_slice_offset
             )
-            for layer_id in range(layers_current_pp_stage)
-        ]
+            dst_token_offsets_base = (
+                token_offsets * bytes_per_token_on_decode + dst_head_slice_offset
+            )
 
-        def process_layer_tp_aware(layer_params):
-            (
-                src_ptr,
-                dst_ptr,
-                src_item_len,
-                dst_item_len,
-                src_head_slice_offset,
-                dst_head_slice_offset,
-                heads_bytes_per_token_to_send,
-            ) = layer_params
-            src_addr_list = []
-            dst_addr_list = []
-            length_list = []
+            # 2. Define worker function
+            def process_layer_tp_aware(ptrs):
+                src_ptr, dst_ptr = ptrs
 
-            # Calculate strides for a single token slot
-            bytes_per_token_on_prefill = src_item_len // page_size
-            bytes_per_token_on_decode = dst_item_len // page_size
+                # Calculate page start addresses
+                # Shape: (num_pages, 1)
+                src_page_starts = (
+                    src_ptr + prefill_kv_indices_reshaped * src_kv_item_len
+                )
+                dst_page_starts = dst_ptr + dst_kv_indices_reshaped * dst_kv_item_len
 
-            for i in range(len(prefill_kv_indices)):
-                prefill_page_idx = int(prefill_kv_indices[i])
-                decode_page_idx = int(dst_kv_indices[i])
+                # Broadcast to get all token addresses
+                # Shape: (num_pages, page_size)
+                src_addrs = src_page_starts + src_token_offsets_base
+                dst_addrs = dst_page_starts + dst_token_offsets_base
 
-                # Get the starting addresses for the current src and dst pages
-                src_page_start_addr = src_ptr + prefill_page_idx * src_item_len
-                dst_page_start_addr = dst_ptr + decode_page_idx * dst_item_len
+                # Flatten to list
+                src_addr_list = src_addrs.reshape(-1).tolist()
+                if not src_addr_list:
+                    return 0
+                dst_addr_list = dst_addrs.reshape(-1).tolist()
 
-                # Iterate through each valid token slot within the current page
-                for token_slot_in_page in range(page_size):
-                    # Calculate the start address of the current token slot
-                    src_token_slot_start_addr = (
-                        src_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_prefill
+                total_chunks = len(src_addr_list)
+                length_list = [heads_bytes_per_token_to_send] * total_chunks
+
+                return self.engine.batch_transfer_sync(
+                    mooncake_session_id, src_addr_list, dst_addr_list, length_list
+                )
+
+            # 3. Submit tasks
+            futures = []
+            for i in range(layers_current_pp_stage):
+                futures.append(
+                    executor.submit(
+                        process_layer_tp_aware, (src_k_ptrs[i], dst_k_ptrs[i])
                     )
-                    dst_token_slot_start_addr = (
-                        dst_page_start_addr
-                        + token_slot_in_page * bytes_per_token_on_decode
+                )
+            for i in range(layers_current_pp_stage):
+                futures.append(
+                    executor.submit(
+                        process_layer_tp_aware, (src_v_ptrs[i], dst_v_ptrs[i])
                     )
+                )
+        else:
+            layers_params = [
+                (
+                    src_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id],
+                    src_kv_item_len,
+                    dst_kv_item_len,
+                    src_head_slice_offset,
+                    dst_head_slice_offset,
+                    heads_bytes_per_token_to_send,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ] + [
+                (
+                    src_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id],
+                    src_kv_item_len,
+                    dst_kv_item_len,
+                    src_head_slice_offset,
+                    dst_head_slice_offset,
+                    heads_bytes_per_token_to_send,
+                )
+                for layer_id in range(layers_current_pp_stage)
+            ]
 
-                    # Calculate final src and dst addresses by applying head-slice offsets
-                    src_slice_addr = src_token_slot_start_addr + src_head_slice_offset
-                    dst_slice_addr = dst_token_slot_start_addr + dst_head_slice_offset
+            def process_layer_tp_aware(layer_params):
+                (
+                    src_ptr,
+                    dst_ptr,
+                    src_item_len,
+                    dst_item_len,
+                    src_head_slice_offset,
+                    dst_head_slice_offset,
+                    heads_bytes_per_token_to_send,
+                ) = layer_params
+                src_addr_list = []
+                dst_addr_list = []
+                length_list = []
 
-                    src_addr_list.append(src_slice_addr)
-                    dst_addr_list.append(dst_slice_addr)
-                    length_list.append(heads_bytes_per_token_to_send)
+                # Calculate strides for a single token slot
+                bytes_per_token_on_prefill = src_item_len // page_size
+                bytes_per_token_on_decode = dst_item_len // page_size
 
-            return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
-            )
+                for i in range(len(prefill_kv_indices)):
+                    prefill_page_idx = int(prefill_kv_indices[i])
+                    decode_page_idx = int(dst_kv_indices[i])
 
-        futures = [
-            executor.submit(
-                process_layer_tp_aware,
-                layer_params,
-            )
-            for layer_params in layers_params
-        ]
+                    # Get the starting addresses for the current src and dst pages
+                    src_page_start_addr = src_ptr + prefill_page_idx * src_item_len
+                    dst_page_start_addr = dst_ptr + decode_page_idx * dst_item_len
+
+                    # Iterate through each valid token slot within the current page
+                    for token_slot_in_page in range(page_size):
+                        # Calculate the start address of the current token slot
+                        src_token_slot_start_addr = (
+                            src_page_start_addr
+                            + token_slot_in_page * bytes_per_token_on_prefill
+                        )
+                        dst_token_slot_start_addr = (
+                            dst_page_start_addr
+                            + token_slot_in_page * bytes_per_token_on_decode
+                        )
+
+                        # Calculate final src and dst addresses by applying head-slice offsets
+                        src_slice_addr = (
+                            src_token_slot_start_addr + src_head_slice_offset
+                        )
+                        dst_slice_addr = (
+                            dst_token_slot_start_addr + dst_head_slice_offset
+                        )
+
+                        src_addr_list.append(src_slice_addr)
+                        dst_addr_list.append(dst_slice_addr)
+                        length_list.append(heads_bytes_per_token_to_send)
+
+                return self.engine.batch_transfer_sync(
+                    mooncake_session_id, src_addr_list, dst_addr_list, length_list
+                )
+
+            futures = [
+                executor.submit(
+                    process_layer_tp_aware,
+                    layer_params,
+                )
+                for layer_params in layers_params
+            ]
 
         for future in concurrent.futures.as_completed(futures):
             status = future.result()
@@ -647,6 +951,86 @@ class MooncakeKVManager(CommonKVManager):
         logger.debug(
             f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
         )
+
+    def _send_kvcache_to_scatter_buffer(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int64],
+        scatter_kv_ptrs: list[int],
+        scatter_kv_item_len: int,
+        scatter_page_indices: list[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
+        chunk_start_page_idx: int = 0,
+    ) -> int:
+        """
+        Send KV cache to scatter buffer using same layout as regular KV transfer.
+
+        This is the new paged scatter mode that mimics KV cache structure:
+        - scatter_kv_ptrs: [k0, k1, ..., kN, v0, v1, ..., vN] (same as kv_data_ptrs)
+        - scatter_page_indices: allocated scatter buffer page indices
+
+        The transfer uses _send_kvcache_generic, which handles paged transfer
+        correctly (scatter_page_indices may be non-contiguous like KV cache).
+
+        For chunked transfers:
+        - chunk_start_page_idx indicates where this chunk starts in prefill's sequence
+        - We use the corresponding slice of scatter_page_indices as dst_indices
+
+        Args:
+            scatter_kv_ptrs: Scatter buffer's kv_data_ptrs
+            scatter_kv_item_len: Bytes per page in scatter buffer
+            scatter_page_indices: Full list of allocated scatter page indices
+            chunk_start_page_idx: Starting page index of this chunk
+        """
+        num_pages = len(prefill_kv_indices)
+
+        if num_pages == 0:
+            return 0
+
+        if not scatter_kv_ptrs or len(scatter_kv_ptrs) == 0:
+            logger.warning("_send_kvcache_to_scatter_buffer: scatter_kv_ptrs is empty")
+            return -1
+
+        if not scatter_page_indices or len(scatter_page_indices) == 0:
+            logger.warning(
+                "_send_kvcache_to_scatter_buffer: scatter_page_indices is empty"
+            )
+            return -1
+
+        # Get the slice of scatter_page_indices for this chunk
+        chunk_end_idx = chunk_start_page_idx + num_pages
+        if chunk_end_idx > len(scatter_page_indices):
+            # This shouldn't happen as we check in send_kvcache_slice
+            return -1
+
+        dst_scatter_indices = np.array(
+            scatter_page_indices[chunk_start_page_idx:chunk_end_idx], dtype=np.int32
+        )
+
+        # Build item_lens list: all layers have the same scatter_kv_item_len
+        num_layers = len(scatter_kv_ptrs) // 2
+        item_lens = [scatter_kv_item_len] * len(scatter_kv_ptrs)
+
+        logger.debug(
+            f"Scatter transfer (paged): pages={num_pages}, layers={num_layers}, "
+            f"chunk_start={chunk_start_page_idx}, item_len={scatter_kv_item_len}, "
+            f"src_indices={prefill_kv_indices[:3].tolist() if len(prefill_kv_indices) >= 3 else prefill_kv_indices.tolist()}, "
+            f"dst_indices={dst_scatter_indices[:3].tolist() if len(dst_scatter_indices) >= 3 else dst_scatter_indices.tolist()}"
+        )
+
+        # Reuse _send_kvcache_generic for the actual transfer
+        # This handles paged transfer correctly (non-contiguous pages)
+        result = self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=scatter_kv_ptrs,
+            item_lens=item_lens,
+            prefill_data_indices=prefill_kv_indices.astype(np.int32),
+            dst_data_indices=dst_scatter_indices,
+            executor=executor,
+        )
+
+        return result
 
     def maybe_send_extra(
         self,
@@ -885,6 +1269,34 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                             )
                         else:
+                            # Get the chunk's starting page index for scatter mode
+                            chunk_start_page_idx = (
+                                kv_chunk.index_slice.start
+                                if kv_chunk.index_slice
+                                else 0
+                            )
+
+                            # Use per-request scatter_page_indices from TransferInfo
+                            # This is the correct design: each request has its own scatter pages
+                            scatter_page_indices = req.scatter_page_indices
+                            scatter_kv_ptrs = (
+                                target_rank_registration_info.scatter_kv_ptrs
+                            )
+                            scatter_kv_item_len = (
+                                target_rank_registration_info.scatter_kv_item_len
+                            )
+                            scatter_mode_enabled = (
+                                scatter_page_indices is not None
+                                and len(scatter_page_indices) > 0
+                                and target_rank_registration_info.scatter_mode_enabled
+                            )
+
+                            logger.debug(
+                                f"send_kvcache_slice: room={kv_chunk.room}, scatter_enabled={scatter_mode_enabled}, "
+                                f"scatter_pages={len(scatter_page_indices) if scatter_page_indices else 0}, "
+                                f"scatter_indices[:3]={scatter_page_indices[:3] if scatter_page_indices else []}, "
+                                f"chunk_start={chunk_start_page_idx}"
+                            )
                             ret = self.send_kvcache_slice(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -894,6 +1306,11 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size,
                                 target_rank_registration_info.dst_kv_item_len,
                                 executor,
+                                scatter_mode_enabled=scatter_mode_enabled,
+                                scatter_kv_ptrs=scatter_kv_ptrs,
+                                scatter_kv_item_len=scatter_kv_item_len,
+                                scatter_page_indices=scatter_page_indices,
+                                chunk_start_page_idx=chunk_start_page_idx,
                             )
                         if ret != 0:
                             with self.session_lock:
@@ -1063,7 +1480,7 @@ class MooncakeKVManager(CommonKVManager):
                                         bootstrap_room
                                     )
                         else:
-                            logger.info(
+                            logger.debug(
                                 f"Attempting to reconnect to {bootstrap_addr}..."
                             )
                             self.heartbeat_failures[bootstrap_addr] = (
@@ -1073,7 +1490,7 @@ class MooncakeKVManager(CommonKVManager):
                                 if bootstrap_addr in self.session_pool:
                                     del self.session_pool[bootstrap_addr]
                     except Exception:
-                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        logger.debug(f"Attempting to reconnect to {bootstrap_addr}...")
                         self.heartbeat_failures[bootstrap_addr] = (
                             self.heartbeat_failures.get(bootstrap_addr, 0) + 1
                         )
@@ -1299,16 +1716,178 @@ class MooncakeKVReceiver(CommonKVReceiver):
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
         prefill_dp_rank: Optional[int] = None,
+        estimated_num_pages: Optional[int] = None,
+        request_id: Optional[str] = None,
     ):
         self.session_id = mgr.get_session_id()
         self.conclude_state = None
         self.init_time = None
+
+        # Track scatter buffer allocation for this request
+        self._scatter_allocated = False
+        self._scatter_request_id = request_id or str(bootstrap_room)
+        self._estimated_num_pages = estimated_num_pages or 0
+
+        # Initialize scatter mode flags (will be set after super().__init__)
+        self._use_scatter_for_request = False
+        self._scatter_buffer_offset = 0
+        self._scatter_buffer_len = 0
+
+        # Paged scatter mode flags
+        self._paged_scatter_mgr = None
+        self._paged_scatter_pages = None  # List of allocated scatter page indices
+        self._paged_scatter_kv_indices = None  # Corresponding KV page indices
+
+        # Store mgr reference for use in _register_kv_args override
+        self._pending_mgr = mgr
+
+        # Track if _register_kv_args was called during super().__init__
+        self._register_kv_args_called = False
+
+        logger.debug(
+            f"MooncakeKVReceiver BEFORE super().__init__: request_id={self._scatter_request_id}, "
+            f"estimated_pages={self._estimated_num_pages}"
+        )
+
+        # Call parent init (which may call _register_kv_args if connection not in pool)
         super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
+        # For scatter mode: Each request needs its own scatter buffer allocation AND
+        # must send the scatter info to prefill. When connection is reused, _register_kv_args
+        # is not called, so we need to call it here for scatter mode.
+        #
+        # This is necessary because scatter buffer offset is PER-REQUEST, not per-connection.
+        # Without this, subsequent requests would use the first request's scatter buffer info.
+        logger.debug(
+            f"MooncakeKVReceiver init: request_id={self._scatter_request_id}, "
+            f"pending_mgr={self._pending_mgr is not None}, scatter_allocated={self._scatter_allocated}, "
+            f"register_kv_args_called={self._register_kv_args_called}"
+        )
+        if self._pending_mgr is not None and not self._scatter_allocated:
+            logger.debug(
+                f"MooncakeKVReceiver post-init: calling _try_allocate_scatter_buffer, "
+                f"register_kv_args_called={self._register_kv_args_called}"
+            )
+            self._try_allocate_scatter_buffer(self._pending_mgr)
+
+            # If scatter buffer was allocated AND _register_kv_args wasn't called (connection reused),
+            # we need to send the scatter info to prefill now
+            if (
+                self._use_scatter_for_request
+                and self.bootstrap_infos is not None
+                and not self._register_kv_args_called
+            ):
+                # Call _register_kv_args to send scatter buffer info for this request
+                logger.debug(
+                    f"MooncakeKVReceiver post-init: calling _register_kv_args for connection reuse"
+                )
+                self._register_kv_args()
+
+        # Clear pending mgr reference
+        self._pending_mgr = None
+
+    def __del__(self):
+        """Ensure resources are released when object is garbage collected."""
+        try:
+            if hasattr(self, "_scatter_allocated") and self._scatter_allocated:
+                logger.warning(
+                    f"MooncakeKVReceiver.__del__: request {self._scatter_request_id} "
+                    f"was NOT cleared properly. Releasing scatter buffer now."
+                )
+                self.clear()
+        except Exception:
+            pass
+
+    def _try_allocate_scatter_buffer(self, mgr: MooncakeKVManager) -> None:
+        """
+        Try to allocate scatter buffer for this request.
+
+        New design uses paged allocation mimicking KV cache:
+        1. Allocates scatter_page_indices from free_pages pool
+        2. Prefill sends using _send_kvcache_generic with scatter_page_indices as dst_indices
+        3. Scatter copies from scatter pages to KV cache pages with head offset
+
+        Scatter mode is enabled when:
+        1. SGLANG_DISAGGREGATION_PAGED_SCATTER_KV=1 is set
+        2. paged_scatter_manager is initialized
+        3. Request has estimated pages > 0
+        4. Buffer has enough free pages for this request
+        """
+        logger.debug(
+            f"_try_allocate_scatter_buffer: request_id={self._scatter_request_id}, "
+            f"scatter_mode_enabled={getattr(mgr, 'scatter_mode_enabled', False)}, "
+            f"has_paged_scatter={getattr(mgr, 'paged_scatter_manager', None) is not None}, "
+            f"estimated_num_pages={self._estimated_num_pages}"
+        )
+
+        if not getattr(mgr, "scatter_mode_enabled", False):
+            logger.debug(
+                f"Request {self._scatter_request_id}: scatter_mode not enabled"
+            )
+            return
+
+        if getattr(mgr, "paged_scatter_manager", None) is None:
+            logger.debug(
+                f"Request {self._scatter_request_id}: no paged scatter manager"
+            )
+            return
+
+        if self._estimated_num_pages <= 0:
+            logger.info(f"Request {self._scatter_request_id}: estimated_num_pages <= 0")
+            return
+
+        # Check if bootstrap_infos is available (set by parent __init__)
+        if not hasattr(self, "bootstrap_infos") or self.bootstrap_infos is None:
+            logger.info(
+                f"Request {self._scatter_request_id}: bootstrap_infos not available"
+            )
+            return
+
+        self._paged_scatter_mgr = mgr.paged_scatter_manager
+
+        # Allocate scatter pages from free pool
+        # kv_page_indices will be set later in init()
+        success, scatter_page_indices = mgr.paged_scatter_manager.try_allocate(
+            self._scatter_request_id,
+            self._estimated_num_pages,
+            kv_page_indices=None,  # Will be set in init()
+        )
+
+        if success and scatter_page_indices is not None:
+            self._use_scatter_for_request = True
+            self._scatter_allocated = True
+            self._scatter_page_indices = scatter_page_indices  # List[int]
+            logger.debug(
+                f"Paged scatter ALLOC OK: request_id={self._scatter_request_id}, "
+                f"pages={self._estimated_num_pages}, "
+                f"scatter_indices={scatter_page_indices[:5]}..."
+            )
+        else:
+            self._paged_scatter_mgr = None
+            self._use_scatter_for_request = False
+            logger.info(
+                f"Paged scatter ALLOC FAIL: request_id={self._scatter_request_id}, "
+                f"pages={self._estimated_num_pages}, fallback to all-to-all"
+            )
+
     def _register_kv_args(self):
+        # Mark that _register_kv_args has been called
+        self._register_kv_args_called = True
+
+        # Allocate scatter buffer BEFORE sending kv_args to prefill
+        # This must happen here because this method is called during super().__init__
+        # and we now have access to prefill_attn_tp_size
+        # Only allocate if not already allocated
+        if (
+            hasattr(self, "_pending_mgr")
+            and self._pending_mgr is not None
+            and not self._scatter_allocated
+        ):
+            self._try_allocate_scatter_buffer(self._pending_mgr)
+
         for bootstrap_info in self.bootstrap_infos:
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
@@ -1338,6 +1917,66 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_kv_item_len = str(kv_item_len).encode("ascii")
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+
+            # Prepare scatter mode fields (msg[12]~msg[15])
+            # New design: send scatter buffer kv_data_ptrs and scatter_page_indices
+            # Prefill will use _send_kvcache_generic with these as dst
+            scatter_enabled = b"0"
+            packed_scatter_kv_ptrs = b""
+            scatter_kv_item_len = b"0"
+            packed_scatter_page_indices = b""
+
+            if (
+                getattr(self.kv_mgr, "scatter_mode_enabled", False)
+                and self._use_scatter_for_request
+            ):
+                if self._paged_scatter_mgr is not None:
+                    scatter_enabled = b"1"
+
+                    # Get the global prefill TP rank from bootstrap_info
+                    global_prefill_tp_rank = bootstrap_info.get("target_tp_rank", 0)
+
+                    # Convert global prefill TP rank to local rank for this decode rank
+                    decode_rank = (
+                        self.kv_mgr.kv_args.engine_rank % self.kv_mgr.attn_tp_size
+                    )
+                    prefill_ranks_per_decode = (
+                        self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
+                    )
+                    if prefill_ranks_per_decode > 0:
+                        base_prefill_rank = decode_rank * prefill_ranks_per_decode
+                        local_prefill_tp_rank = (
+                            global_prefill_tp_rank - base_prefill_rank
+                        )
+                    else:
+                        local_prefill_tp_rank = global_prefill_tp_rank
+
+                    # Get scatter buffer kv_data_ptrs for this local TP rank
+                    scatter_kv_ptrs = self._paged_scatter_mgr.get_kv_data_ptrs(
+                        local_prefill_tp_rank
+                    )
+                    packed_scatter_kv_ptrs = b"".join(
+                        struct.pack("Q", ptr) for ptr in scatter_kv_ptrs
+                    )
+
+                    # Get scatter kv_item_len (bytes per page)
+                    scatter_item_len = self._paged_scatter_mgr.get_kv_item_len()
+                    scatter_kv_item_len = str(scatter_item_len).encode("ascii")
+
+                    # Get scatter page indices for this request
+                    scatter_indices = getattr(self, "_scatter_page_indices", [])
+                    packed_scatter_page_indices = np.array(
+                        scatter_indices, dtype=np.int32
+                    ).tobytes()
+
+                    logger.debug(
+                        f"Scatter registration (paged): "
+                        f"prefill_tp global={global_prefill_tp_rank}, local={local_prefill_tp_rank}, "
+                        f"num_ptrs={len(scatter_kv_ptrs)}, item_len={scatter_item_len}, "
+                        f"num_scatter_pages={len(scatter_indices)}, "
+                        f"scatter_indices[:5]={scatter_indices[:5]}"
+                    )
+
             with lock:
                 sock.send_multipart(
                     [
@@ -1351,8 +1990,12 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_tp_rank,
                         dst_attn_tp_size,
                         dst_kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
+                        packed_state_item_lens,  # msg[10]
+                        packed_state_dim_per_tensor,  # msg[11]
+                        scatter_enabled,  # msg[12]
+                        packed_scatter_kv_ptrs,  # msg[13]
+                        scatter_kv_item_len,  # msg[14]
+                        packed_scatter_page_indices,  # msg[15]
                     ]
                 )
 
@@ -1370,11 +2013,48 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
+        # For paged scatter mode, update allocation with actual KV indices
+        # (Scatter pages were pre-allocated, but kv_page_indices were not known)
+        if self._paged_scatter_mgr is not None and self._scatter_allocated:
+            import torch
+
+            kv_page_indices = torch.tensor(kv_indices, dtype=torch.int64, device="cuda")
+
+            # Update the stored KV indices in the allocation
+            success = self._paged_scatter_mgr.update_kv_indices(
+                self._scatter_request_id, kv_page_indices
+            )
+            if success:
+                logger.debug(
+                    f"Paged scatter UPDATE: request_id={self._scatter_request_id}, "
+                    f"kv_indices={kv_page_indices[:3].tolist() if len(kv_page_indices) >= 3 else kv_page_indices.tolist()}..."
+                )
+            else:
+                logger.warning(
+                    f"Paged scatter UPDATE FAILED: request_id={self._scatter_request_id}"
+                )
+
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
 
+            # Prepare scatter_page_indices for this request (per-request, not per-session)
+            scatter_indices_bytes = b""
+            if (
+                self._use_scatter_for_request
+                and hasattr(self, "_scatter_page_indices")
+                and self._scatter_page_indices
+            ):
+                scatter_indices_bytes = np.array(
+                    self._scatter_page_indices, dtype=np.int32
+                ).tobytes()
+
             with lock:
+                # Use adaptive sending: if we detect we need to send extra fields?
+                # For now, we stick to our format. The receiver's adaptive parsing should handle it.
+                # But if receiver expects 10 fields and we send 9, receiver might read garbage from index 9?
+                # No, receiver checks len(msg).
+
                 sock.send_multipart(
                     [
                         str(self.bootstrap_room).encode("ascii"),
@@ -1392,6 +2072,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
+                        scatter_indices_bytes,  # Field 8: per-request scatter_page_indices
                     ]
                 )
         self.init_time = time.time()
@@ -1415,6 +2096,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
                         )
                         self.conclude_state = KVPoll.Failed
+                        # Force release resources on timeout
+                        self.clear()
                         return KVPoll.Failed
 
             return status
@@ -1431,6 +2114,25 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
             self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
+
+        # Release scatter buffer allocation if it was used for this request
+        # NOTE: This must be safe to call multiple times (idempotent)
+        if self._scatter_allocated and self._paged_scatter_mgr is not None:
+            try:
+                success = self._paged_scatter_mgr.release(self._scatter_request_id)
+                if success:
+                    logger.debug(
+                        f"Request {self._scatter_request_id}: released paged scatter buffer"
+                    )
+                else:
+                    # This is fine, might have been released already
+                    pass
+            except Exception as e:
+                logger.error(
+                    f"Error releasing scatter buffer for {self._scatter_request_id}: {e}"
+                )
+            finally:
+                self._scatter_allocated = False
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
@@ -1452,6 +2154,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
         )
         # Explicitly set the status to failure since this request has been aborted
         self.conclude_state = KVPoll.Failed
+
+        # Release scatter buffer allocation if it was used for this request
+        if self._scatter_allocated and self._paged_scatter_mgr is not None:
+            self._paged_scatter_mgr.release(self._scatter_request_id)
+            self._scatter_allocated = False
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
