@@ -409,10 +409,6 @@ class EAGLEWorker(TpModelWorker):
         if self.pending_transition_to_sd:
             return False
 
-        # If already permanently enabled, keep it enabled
-        if self.adaptive_spec_enabled:
-            return True
-
         # Check batch size
         batch_size = batch.batch_size()
 
@@ -423,26 +419,27 @@ class EAGLEWorker(TpModelWorker):
         # For DECODE batches, check threshold with warmup
         current_enable_sd = False
         if batch_size <= self.adaptive_spec_threshold:
+            # If SD is already enabled and batch size is within threshold, stay enabled
+            if self.adaptive_spec_enabled:
+                return True
+
             self.adaptive_spec_consecutive_checks += 1
 
             if (
                 self.adaptive_spec_consecutive_checks
                 >= self.adaptive_spec_warmup_checks
             ):
-                if not self.adaptive_spec_enabled:
-                    print(
-                        f"ENABLING SD AFTER {self.adaptive_spec_consecutive_checks} CHECKS ★★★"
-                    )
-                    logger.debug(
-                        f"[AdaptiveSpec] ENABLING speculation after "
-                        f"{self.adaptive_spec_consecutive_checks} checks (batch_size={batch_size}). "
-                        f"Will requeue requests for EXTEND. Running this batch as non-SD."
-                    )
-                    self.adaptive_spec_enabled = True
-                    self.pending_transition_to_sd = True
-                    return False
-                else:
-                    return True
+                print(
+                    f"ENABLING SD AFTER {self.adaptive_spec_consecutive_checks} CHECKS ★★★"
+                )
+                logger.debug(
+                    f"[AdaptiveSpec] ENABLING speculation after "
+                    f"{self.adaptive_spec_consecutive_checks} checks (batch_size={batch_size}). "
+                    f"Will requeue requests for EXTEND. Running this batch as non-SD."
+                )
+                self.adaptive_spec_enabled = True
+                self.pending_transition_to_sd = True
+                return False
         else:
             # Reset counter if batch size exceeds threshold
             if self.adaptive_spec_consecutive_checks > 0:
@@ -451,6 +448,12 @@ class EAGLEWorker(TpModelWorker):
                     f"resetting counter (was {self.adaptive_spec_consecutive_checks})."
                 )
             self.adaptive_spec_consecutive_checks = 0
+            # Also reset adaptive_spec_enabled so we need to warm up again
+            if self.adaptive_spec_enabled:
+                logger.info(
+                    f"[AdaptiveSpec] DISABLING speculation - batch_size {batch_size} > threshold {self.adaptive_spec_threshold}"
+                )
+                self.adaptive_spec_enabled = False
             current_enable_sd = False
 
         return current_enable_sd
