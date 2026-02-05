@@ -35,6 +35,9 @@ class DllmConfig:
         if model_config.hf_config.architectures[0] == "LLaDA2MoeModelLM":
             block_size = 32
             mask_id = 156895
+        elif model_config.hf_config.architectures[0] == "SDARForCausalLM":
+            block_size = 4
+            mask_id = 151669
         else:
             raise RuntimeError(
                 f"Unknown diffusion LLM: {model_config.hf_config.architectures[0]}"
