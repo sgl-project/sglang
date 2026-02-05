@@ -62,6 +62,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
 # Models
 from sglang.srt.models.qwen3_next import gdn_with_output
@@ -547,8 +548,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply Q/K normalization with optional alt_stream overlap."""
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-        
         if self.alt_stream is not None and get_is_capture_mode():
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
