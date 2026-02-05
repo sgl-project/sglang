@@ -26,6 +26,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import (
     retrieve_timesteps,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -579,30 +585,40 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
     This stage uses the HunyuanPaint model to generate textures
     for multiple views based on the reference image and rendered maps.
+
+    Inherits core denoising functionality and gains access to SGLang optimizations
+    like Cache-DIT, Torch Compile, and Attention Backend optimizations.
     """
 
-    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
+    def __init__(
+        self,
+        config: Hunyuan3D2PipelineConfig,
+        transformer: Any = None,
+        scheduler: Any = None,
+        vae: Any = None,
+        vae_scale_factor: int = 8,
+        image_processor: Any = None,
+        solver: Any = None,
+        is_turbo: bool = False,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.paint_vae = None
-        self.paint_text_encoder = None
-        self.paint_tokenizer = None
-        self.paint_unet = None
-        self.paint_scheduler = None
-        self.paint_feature_extractor = None
-        self.paint_image_processor = None
-        self.paint_solver = None
-        self.paint_vae_scale_factor = None
-        self.paint_is_turbo = False
-        self._paint_loaded = False
+        self.transformer = transformer
+        self.scheduler = scheduler
+        self.vae = vae
+        self.vae_scale_factor = vae_scale_factor
+        self.image_processor = image_processor
+        self.solver = solver
+        self.is_turbo = is_turbo
+        self._models_loaded = transformer is not None
 
     @property
     def parallelism_type(self) -> StageParallelismType:
         return StageParallelismType.MAIN_RANK_ONLY
 
-    def _load_paint_pipeline(self, server_args: ServerArgs):
-        """Lazy load paint diffusion components."""
-        if self._paint_loaded:
+    def _load_paint_models(self, server_args: ServerArgs) -> None:
+        """Load paint models if not already loaded via pipeline."""
+        if self._models_loaded:
             return
 
         from huggingface_hub import snapshot_download
@@ -612,22 +628,12 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
             self.config, "paint_subfolder", "hunyuan3d-paint-v2-0"
         )
 
-        print(f"[DEBUG SGLANG _load_paint] model_path={model_path}")
-        print(f"[DEBUG SGLANG _load_paint] paint_subfolder={paint_subfolder}")
-        print(
-            f"[DEBUG SGLANG _load_paint] paint_turbo_mode config={getattr(self.config, 'paint_turbo_mode', False)}"
-        )
-
-        # Determine local path
         base_dir = os.environ.get("HY3DGEN_MODELS", "~/.cache/hy3dgen")
         local_path = os.path.expanduser(
             os.path.join(base_dir, model_path, paint_subfolder)
         )
-        print(f"[DEBUG SGLANG _load_paint] local_path={local_path}")
 
-        # Download if not exists
         if not os.path.exists(local_path):
-            print(f"[DEBUG SGLANG _load_paint] local_path not exists, downloading...")
             try:
                 logger.info(
                     f"Downloading paint model from {model_path}/{paint_subfolder}..."
@@ -640,16 +646,12 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 local_path = os.path.join(path, paint_subfolder)
             except Exception as e:
                 logger.warning(f"Could not download paint model: {e}")
-                self._paint_loaded = True
+                self._models_loaded = True
                 return
-        else:
-            print(f"[DEBUG SGLANG _load_paint] local_path exists")
 
-        # Load paint pipeline components
         try:
             from diffusers import AutoencoderKL, LCMScheduler
             from diffusers.image_processor import VaeImageProcessor
-            from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
             from sglang.multimodal_gen.runtime.models.dits.hunyuan3d import (
                 UNet2p5DConditionModel,
@@ -657,105 +659,57 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
             logger.info(f"Loading paint model from {local_path}")
 
-            # Load components
-            self.paint_vae = AutoencoderKL.from_pretrained(
+            self.vae = AutoencoderKL.from_pretrained(
                 os.path.join(local_path, "vae"),
                 torch_dtype=torch.float16,
             ).to("cuda")
-            print(
-                f"[DEBUG SGLANG _load_paint] VAE loaded, scaling_factor={self.paint_vae.config.scaling_factor}"
-            )
 
-            self.paint_text_encoder = CLIPTextModel.from_pretrained(
-                os.path.join(local_path, "text_encoder"),
-                torch_dtype=torch.float16,
-            ).to("cuda")
-            print(f"[DEBUG SGLANG _load_paint] text_encoder loaded")
-
-            self.paint_tokenizer = CLIPTokenizer.from_pretrained(
-                os.path.join(local_path, "tokenizer"),
-            )
-            print(f"[DEBUG SGLANG _load_paint] tokenizer loaded")
-
-            self.paint_unet = UNet2p5DConditionModel.from_pretrained(
+            self.transformer = UNet2p5DConditionModel.from_pretrained(
                 os.path.join(local_path, "unet"),
                 torch_dtype=torch.float16,
             ).to("cuda")
-            print(
-                f"[DEBUG SGLANG _load_paint] unet loaded, in_channels={self.paint_unet.config.in_channels}"
-            )
 
-            # Determine turbo mode
-            self.paint_is_turbo = bool(getattr(self.config, "paint_turbo_mode", False))
-            print(f"[DEBUG SGLANG _load_paint] is_turbo={self.paint_is_turbo}")
+            self.is_turbo = bool(getattr(self.config, "paint_turbo_mode", False))
 
-            # Load scheduler - use LCMScheduler for turbo mode (matches original)
             scheduler_path = os.path.join(local_path, "scheduler")
-            if self.paint_is_turbo:
-                print(f"[DEBUG SGLANG _load_paint] Loading LCMScheduler for turbo mode")
-                self.paint_scheduler = LCMScheduler.from_pretrained(scheduler_path)
+            if self.is_turbo:
+                self.scheduler = LCMScheduler.from_pretrained(scheduler_path)
             else:
                 from diffusers import EulerAncestralDiscreteScheduler
 
-                print(
-                    f"[DEBUG SGLANG _load_paint] Loading EulerAncestralDiscreteScheduler for non-turbo mode"
-                )
-                self.paint_scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
+                self.scheduler = EulerAncestralDiscreteScheduler.from_pretrained(
                     scheduler_path
                 )
-                self.paint_scheduler = EulerAncestralDiscreteScheduler.from_config(
-                    self.paint_scheduler.config,
+                self.scheduler = EulerAncestralDiscreteScheduler.from_config(
+                    self.scheduler.config,
                     timestep_spacing="trailing",
                 )
 
-            print(
-                f"[DEBUG SGLANG _load_paint] scheduler type={type(self.paint_scheduler).__name__}"
-            )
-            print(
-                f"[DEBUG SGLANG _load_paint] scheduler num_train_timesteps={self.paint_scheduler.config.num_train_timesteps}"
+            self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+            self.image_processor = VaeImageProcessor(
+                vae_scale_factor=self.vae_scale_factor
             )
 
-            self.paint_feature_extractor = CLIPImageProcessor.from_pretrained(
-                os.path.join(local_path, "feature_extractor"),
-            )
-            self.paint_vae_scale_factor = 2 ** (
-                len(self.paint_vae.config.block_out_channels) - 1
-            )
-            self.paint_image_processor = VaeImageProcessor(
-                vae_scale_factor=self.paint_vae_scale_factor
-            )
-            print(
-                f"[DEBUG SGLANG _load_paint] vae_scale_factor={self.paint_vae_scale_factor}"
-            )
-
-            self.paint_solver = DDIMSolver(
-                self.paint_scheduler.alphas_cumprod.cpu().numpy(),
-                timesteps=self.paint_scheduler.config.num_train_timesteps,
+            self.solver = DDIMSolver(
+                self.scheduler.alphas_cumprod.cpu().numpy(),
+                timesteps=self.scheduler.config.num_train_timesteps,
                 ddim_timesteps=30,
             ).to(torch.device("cuda"))
-            print(
-                f"[DEBUG SGLANG _load_paint] DDIMSolver initialized with ddim_timesteps=30"
-            )
 
             logger.info("Paint pipeline loaded successfully")
 
         except Exception as e:
             logger.warning(f"Failed to load paint pipeline: {e}")
-            logger.warning("Will use fallback texture generation (reference image)")
-            self.paint_vae = None
-            self.paint_text_encoder = None
-            self.paint_tokenizer = None
-            self.paint_unet = None
-            self.paint_scheduler = None
-            self.paint_feature_extractor = None
-            self.paint_image_processor = None
-            self.paint_solver = None
-            self.paint_vae_scale_factor = None
-            self.paint_is_turbo = False
+            self.vae = None
+            self.transformer = None
+            self.scheduler = None
 
-        self._paint_loaded = True
+        self._models_loaded = True
 
-    def _convert_pil_list_to_tensor(self, images, device: torch.device) -> torch.Tensor:
+    def _convert_pil_list_to_tensor(
+        self, images: list, device: torch.device
+    ) -> torch.Tensor:
+        """Convert list of PIL images to tensor."""
         bg_c = [1.0, 1.0, 1.0]
         images_tensor = []
         for batch_imgs in images:
@@ -774,131 +728,91 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                     .permute(2, 0, 1)
                     .unsqueeze(0)
                     .contiguous()
-                    .to(device=device, dtype=self.paint_vae.dtype)
+                    .to(device=device, dtype=self.vae.dtype)
                 )
                 view_imgs.append(img)
             view_imgs = torch.cat(view_imgs, dim=0)
             images_tensor.append(view_imgs.unsqueeze(0))
-
-        images_tensor = torch.cat(images_tensor, dim=0)
-        return images_tensor
+        return torch.cat(images_tensor, dim=0)
 
     @torch.no_grad()
     def _encode_images(self, images: torch.Tensor) -> torch.Tensor:
+        """Encode images to latent space using VAE."""
         batch_size = images.shape[0]
         images = rearrange(images, "b n c h w -> (b n) c h w")
-
-        dtype = next(self.paint_vae.parameters()).dtype
+        dtype = next(self.vae.parameters()).dtype
         images = (images - 0.5) * 2.0
-        posterior = self.paint_vae.encode(images.to(dtype)).latent_dist
-        latents = posterior.sample() * self.paint_vae.config.scaling_factor
-
-        latents = rearrange(latents, "(b n) c h w -> b n c h w", b=batch_size)
-        return latents
+        posterior = self.vae.encode(images.to(dtype)).latent_dist
+        latents = posterior.sample() * self.vae.config.scaling_factor
+        return rearrange(latents, "(b n) c h w -> b n c h w", b=batch_size)
 
     @staticmethod
     def _compute_camera_index(azim: float, elev: float) -> int:
-        # Original formula from Hunyuan3D (texgen/pipelines.py):
-        # camera_info = [(((azim // 30) + 9) % 12) // {-20: 1, 0: 1, 20: 1, -90: 3, 90: 3}[
-        #     elev] + {-20: 0, 0: 12, 20: 24, -90: 36, 90: 40}[elev] for azim, elev in ...]
-        # The division is by 1 for elev in [-20, 0, 20], and by 3 for elev in [-90, 90]
+        """Compute camera index from azimuth and elevation angles."""
         base_idx = int(((azim // 30) + 9) % 12)
-
         if elev == 0:
-            base = 12
-            divisor = 1
+            base, divisor = 12, 1
         elif elev == 20:
-            base = 24
-            divisor = 1
+            base, divisor = 24, 1
         elif elev == -20:
-            base = 0
-            divisor = 1
+            base, divisor = 0, 1
         elif elev == 90:
-            base = 40
-            divisor = 3
+            base, divisor = 40, 3
         elif elev == -90:
-            base = 36
-            divisor = 3
+            base, divisor = 36, 3
         else:
-            base = 12
-            divisor = 1
+            base, divisor = 12, 1
+        return base + (base_idx // divisor)
 
-        idx = base_idx // divisor
-        result = base + idx
-        print(
-            f"[DEBUG SGLANG pipelines]   azim={azim}, elev={elev} -> base_idx={base_idx}, divisor={divisor}, idx={idx}, result={result}"
-        )
-        return result
-
-    @torch.no_grad()
-    def _prepare_conditions(
+    def _prepare_denoising_inputs(
         self,
         batch: Req,
-        device: torch.device,
-        guidance_scale: float,
-    ) -> None:
-        image = batch.extra["delighted_image"]
+        server_args: ServerArgs,
+    ) -> dict[str, Any]:
+        """Prepare all inputs needed for the denoising loop."""
+        import random
+
+        from diffusers.utils.torch_utils import randn_tensor
+
+        device = self.device
         normal_maps = batch.extra["normal_maps"]
         position_maps = batch.extra["position_maps"]
         camera_azims = batch.extra["camera_azims"]
         camera_elevs = batch.extra["camera_elevs"]
 
-        print(f"[DEBUG SGLANG pipeline.__call__] guidance_scale={guidance_scale}")
-        print(f"[DEBUG SGLANG pipeline.__call__] is_turbo={self.paint_is_turbo}")
-        print(f"[DEBUG SGLANG pipelines] camera_elevs={camera_elevs}")
-        print(f"[DEBUG SGLANG pipelines] camera_azims={camera_azims}")
+        num_steps = (
+            getattr(batch, "paint_num_inference_steps", None)
+            or self.config.paint_num_inference_steps
+        )
+        guidance_scale = (
+            getattr(batch, "paint_guidance_scale", None)
+            or self.config.paint_guidance_scale
+        )
+        render_size = self.config.paint_resolution
+        num_in_batch = len(normal_maps)
 
+        seed = batch.seed if batch.seed is not None else 0
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        generator = torch.Generator(device=device).manual_seed(seed)
+
+        image = batch.extra["delighted_image"]
         if not isinstance(image, list):
             image = [image]
         image = [to_rgb_image(img) for img in image]
-        print(f"[DEBUG SGLANG pipeline.__call__] ref image count={len(image)}")
-        print(
-            f"[DEBUG SGLANG pipeline.__call__] ref image[0] size={image[0].size if image else 'None'}"
-        )
 
         image_vae = [
             torch.tensor(np.array(img, dtype=np.float32) / 255.0) for img in image
         ]
         image_vae = [
-            img_vae.unsqueeze(0).permute(0, 3, 1, 2).unsqueeze(0)
-            for img_vae in image_vae
+            iv.unsqueeze(0).permute(0, 3, 1, 2).unsqueeze(0) for iv in image_vae
         ]
-        image_vae = torch.cat(image_vae, dim=1).to(
-            device=device, dtype=self.paint_vae.dtype
-        )
-        print(f"[DEBUG SGLANG pipeline.__call__] image_vae shape={image_vae.shape}")
+        image_vae = torch.cat(image_vae, dim=1).to(device=device, dtype=self.vae.dtype)
+        ref_latents = self._encode_images(image_vae)
 
-        batch_size, _ = image_vae.shape[0], image_vae.shape[1]
-        assert batch_size == 1
-
-        batch.extra["paint_ref_latents"] = self._encode_images(image_vae)
-        print(
-            f"[DEBUG SGLANG pipeline.__call__] ref_latents shape={batch.extra['paint_ref_latents'].shape}"
-        )
-        print(
-            f"[DEBUG SGLANG pipeline.__call__] ref_latents mean={batch.extra['paint_ref_latents'].mean().item():.4f}, std={batch.extra['paint_ref_latents'].std().item():.4f}"
-        )
-        print(
-            f"[DEBUG SGLANG pipeline.__call__] ref_latents[0,0,0,:5,:5]={batch.extra['paint_ref_latents'][0,0,0,:5,:5].tolist()}"
-        )
-
-        # Resize normal/position maps to paint_resolution before encoding
-        target_size = self.config.paint_resolution
-        print(
-            f"[DEBUG SGLANG pipeline.__call__] width={target_size}, height={target_size}"
-        )
-        print(
-            f"[DEBUG SGLANG pipelines] normal_maps count={len(normal_maps) if isinstance(normal_maps, list) else 'tensor'}"
-        )
-        print(
-            f"[DEBUG SGLANG pipelines] position_maps count={len(position_maps) if isinstance(position_maps, list) else 'tensor'}"
-        )
-
+        target_size = render_size
         if isinstance(normal_maps, list):
-            if normal_maps:
-                print(
-                    f"[DEBUG SGLANG pipelines] normal_maps[0] BEFORE resize size={normal_maps[0].size if hasattr(normal_maps[0], 'size') else 'N/A'}"
-                )
             normal_maps = [
                 (
                     img.resize((target_size, target_size))
@@ -907,25 +821,8 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 )
                 for img in normal_maps
             ]
-            if normal_maps:
-                print(
-                    f"[DEBUG SGLANG pipelines] normal_maps[0] AFTER resize size={normal_maps[0].size if hasattr(normal_maps[0], 'size') else 'N/A'}"
-                )
             normal_maps = self._convert_pil_list_to_tensor([normal_maps], device)
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] normal_imgs tensor shape={normal_maps.shape}"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] normal_imgs BEFORE VAE mean={normal_maps.mean().item():.6f}, std={normal_maps.std().item():.6f}"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] normal_imgs BEFORE VAE [0,0,0,:5,:5]={normal_maps[0,0,0,:5,:5].tolist()}"
-            )
         if isinstance(position_maps, list):
-            if position_maps:
-                print(
-                    f"[DEBUG SGLANG pipelines] position_maps[0] BEFORE resize size={position_maps[0].size if hasattr(position_maps[0], 'size') else 'N/A'}"
-                )
             position_maps = [
                 (
                     img.resize((target_size, target_size))
@@ -934,334 +831,150 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 )
                 for img in position_maps
             ]
-            if position_maps:
-                print(
-                    f"[DEBUG SGLANG pipelines] position_maps[0] AFTER resize size={position_maps[0].size if hasattr(position_maps[0], 'size') else 'N/A'}"
-                )
             position_maps = self._convert_pil_list_to_tensor([position_maps], device)
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_imgs tensor shape={position_maps.shape}"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_imgs BEFORE VAE mean={position_maps.mean().item():.6f}, std={position_maps.std().item():.6f}"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_imgs BEFORE VAE [0,0,0,:5,:5]={position_maps[0,0,0,:5,:5].tolist()}"
-            )
 
-        if normal_maps is not None:
-            batch.extra["paint_normal_imgs"] = self._encode_images(normal_maps)
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] normal_imgs encoded shape={batch.extra['paint_normal_imgs'].shape}"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] normal_imgs mean={batch.extra['paint_normal_imgs'].mean().item():.4f}"
-            )
-        if position_maps is not None:
-            batch.extra["paint_position_maps"] = position_maps
-            batch.extra["paint_position_imgs"] = self._encode_images(position_maps)
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_imgs encoded shape={batch.extra['paint_position_imgs'].shape}"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_imgs mean={batch.extra['paint_position_imgs'].mean().item():.4f}"
-            )
+        normal_imgs = (
+            self._encode_images(normal_maps) if normal_maps is not None else None
+        )
+        position_imgs = (
+            self._encode_images(position_maps) if position_maps is not None else None
+        )
 
         camera_info = [
             self._compute_camera_index(azim, elev)
             for azim, elev in zip(camera_azims, camera_elevs)
         ]
-        print(f"[DEBUG SGLANG pipelines] camera_info={camera_info}")
-        batch.extra["paint_camera_info_gen"] = torch.tensor(
-            [camera_info], device=device, dtype=torch.int64
-        )
-        batch.extra["paint_camera_info_ref"] = torch.tensor(
-            [[0]], device=device, dtype=torch.int64
-        )
+        camera_info_gen = torch.tensor([camera_info], device=device, dtype=torch.int64)
+        camera_info_ref = torch.tensor([[0]], device=device, dtype=torch.int64)
 
-        if self.paint_is_turbo and "paint_position_maps" in batch.extra:
+        do_cfg = guidance_scale > 1 and not self.is_turbo
+
+        if self.is_turbo and position_maps is not None:
             from sglang.multimodal_gen.runtime.models.dits.hunyuan3d import (
                 compute_multi_resolution_discrete_voxel_indice,
                 compute_multi_resolution_mask,
             )
 
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] Computing turbo position_attn_mask and position_voxel_indices..."
-            )
-            position_maps = batch.extra["paint_position_maps"]
-            batch.extra["paint_position_attn_mask"] = compute_multi_resolution_mask(
+            position_attn_mask = compute_multi_resolution_mask(position_maps)
+            position_voxel_indices = compute_multi_resolution_discrete_voxel_indice(
                 position_maps
             )
-            batch.extra["paint_position_voxel_indices"] = (
-                compute_multi_resolution_discrete_voxel_indice(position_maps)
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_attn_mask computed (dict with keys: {list(batch.extra['paint_position_attn_mask'].keys()) if isinstance(batch.extra['paint_position_attn_mask'], dict) else 'not dict'})"
-            )
-            print(
-                f"[DEBUG SGLANG pipeline.__call__] position_voxel_indices computed (dict with keys: {list(batch.extra['paint_position_voxel_indices'].keys()) if isinstance(batch.extra['paint_position_voxel_indices'], dict) else 'not dict'})"
-            )
+        else:
+            position_attn_mask = None
+            position_voxel_indices = None
 
-        if guidance_scale > 1 and not self.paint_is_turbo:
-            ref_latents = batch.extra["paint_ref_latents"]
+        if do_cfg:
             negative_ref_latents = torch.zeros_like(ref_latents)
-            batch.extra["paint_ref_latents"] = torch.cat(
-                [negative_ref_latents, ref_latents]
-            )
-            batch.extra["paint_ref_scale"] = torch.as_tensor([0.0, 1.0]).to(
-                batch.extra["paint_ref_latents"]
-            )
-
-            if "paint_normal_imgs" in batch.extra:
-                batch.extra["paint_normal_imgs"] = torch.cat(
-                    (batch.extra["paint_normal_imgs"], batch.extra["paint_normal_imgs"])
-                )
-
-            if "paint_position_imgs" in batch.extra:
-                batch.extra["paint_position_imgs"] = torch.cat(
-                    (
-                        batch.extra["paint_position_imgs"],
-                        batch.extra["paint_position_imgs"],
-                    )
-                )
-
-            if "paint_position_maps" in batch.extra:
-                batch.extra["paint_position_maps"] = torch.cat(
-                    (
-                        batch.extra["paint_position_maps"],
-                        batch.extra["paint_position_maps"],
-                    )
-                )
-
-            if "paint_camera_info_gen" in batch.extra:
-                batch.extra["paint_camera_info_gen"] = torch.cat(
-                    (
-                        batch.extra["paint_camera_info_gen"],
-                        batch.extra["paint_camera_info_gen"],
-                    )
-                )
-            if "paint_camera_info_ref" in batch.extra:
-                batch.extra["paint_camera_info_ref"] = torch.cat(
-                    (
-                        batch.extra["paint_camera_info_ref"],
-                        batch.extra["paint_camera_info_ref"],
-                    )
-                )
+            ref_latents = torch.cat([negative_ref_latents, ref_latents])
+            ref_scale = torch.as_tensor([0.0, 1.0]).to(ref_latents)
+            if normal_imgs is not None:
+                normal_imgs = torch.cat((normal_imgs, normal_imgs))
+            if position_imgs is not None:
+                position_imgs = torch.cat((position_imgs, position_imgs))
+            if position_maps is not None:
+                position_maps = torch.cat((position_maps, position_maps))
+            camera_info_gen = torch.cat((camera_info_gen, camera_info_gen))
+            camera_info_ref = torch.cat((camera_info_ref, camera_info_ref))
+        else:
+            ref_scale = None
 
         model_kwargs = {
-            "ref_latents": batch.extra["paint_ref_latents"],
-            "num_in_batch": batch.extra["paint_num_in_batch"],
+            "ref_latents": ref_latents,
+            "num_in_batch": num_in_batch,
         }
-        if "paint_ref_scale" in batch.extra:
-            model_kwargs["ref_scale"] = batch.extra["paint_ref_scale"]
-        if "paint_normal_imgs" in batch.extra:
-            model_kwargs["normal_imgs"] = batch.extra["paint_normal_imgs"]
-        if "paint_position_imgs" in batch.extra:
-            model_kwargs["position_imgs"] = batch.extra["paint_position_imgs"]
-        if "paint_position_maps" in batch.extra:
-            model_kwargs["position_maps"] = batch.extra["paint_position_maps"]
-        if "paint_camera_info_gen" in batch.extra:
-            model_kwargs["camera_info_gen"] = batch.extra["paint_camera_info_gen"]
-        if "paint_camera_info_ref" in batch.extra:
-            model_kwargs["camera_info_ref"] = batch.extra["paint_camera_info_ref"]
-        if "paint_position_attn_mask" in batch.extra:
-            model_kwargs["position_attn_mask"] = batch.extra["paint_position_attn_mask"]
-        if "paint_position_voxel_indices" in batch.extra:
-            model_kwargs["position_voxel_indices"] = batch.extra[
-                "paint_position_voxel_indices"
-            ]
-        batch.extra["paint_model_kwargs"] = model_kwargs
+        if ref_scale is not None:
+            model_kwargs["ref_scale"] = ref_scale
+        if normal_imgs is not None:
+            model_kwargs["normal_imgs"] = normal_imgs
+        if position_imgs is not None:
+            model_kwargs["position_imgs"] = position_imgs
+        if position_maps is not None:
+            model_kwargs["position_maps"] = position_maps
+        model_kwargs["camera_info_gen"] = camera_info_gen
+        model_kwargs["camera_info_ref"] = camera_info_ref
+        if position_attn_mask is not None:
+            model_kwargs["position_attn_mask"] = position_attn_mask
+        if position_voxel_indices is not None:
+            model_kwargs["position_voxel_indices"] = position_voxel_indices
 
-    def _prepare_prompt_embeds(self, batch: Req) -> None:
-        prompt_embeds = self.paint_unet.learned_text_clip_gen.repeat(1, 1, 1)
+        prompt_embeds = self.transformer.learned_text_clip_gen.repeat(1, 1, 1)
         negative_prompt_embeds = torch.zeros_like(prompt_embeds)
-        batch.extra["paint_prompt_embeds"] = prompt_embeds
-        batch.extra["paint_negative_prompt_embeds"] = negative_prompt_embeds
 
-    def _prepare_timesteps(
-        self,
-        batch: Req,
-        device: torch.device,
-        num_inference_steps: int,
-        timesteps: list[int] | None = None,
-        sigmas: list[float] | None = None,
-    ) -> None:
-        print(
-            f"[DEBUG SGLANG _prepare_timesteps] num_inference_steps={num_inference_steps}"
-        )
-        print(f"[DEBUG SGLANG _prepare_timesteps] is_turbo={self.paint_is_turbo}")
-        print(
-            f"[DEBUG SGLANG _prepare_timesteps] scheduler type={type(self.paint_scheduler).__name__}"
-        )
-
-        if self.paint_is_turbo:
-            # Match original Hunyuan3D turbo mode timestep generation
-            # Original: index = torch.range(29, 0, -bsz, device='cuda').long()
-            # This generates indices: [29, 26, 23, 20, 17, 14, 11, 8, 5, 2] (10 steps with bsz=3)
+        if self.is_turbo:
             bsz = 3
             index = torch.arange(29, -1, -bsz, device=device).long()
-            print(f"[DEBUG SGLANG _prepare_timesteps] turbo index={index.tolist()}")
-            timesteps = self.paint_solver.ddim_timesteps[index]
-            print(
-                f"[DEBUG SGLANG _prepare_timesteps] turbo timesteps from solver={timesteps.tolist()}"
-            )
-            self.paint_scheduler.set_timesteps(timesteps=timesteps.cpu(), device=device)
-            timesteps = self.paint_scheduler.timesteps
+            timesteps = self.solver.ddim_timesteps[index]
+            self.scheduler.set_timesteps(timesteps=timesteps.cpu(), device=device)
+            timesteps = self.scheduler.timesteps
         else:
-            timesteps, num_inference_steps = retrieve_timesteps(
-                self.paint_scheduler, num_inference_steps, device, timesteps, sigmas
+            timesteps, num_steps = retrieve_timesteps(
+                self.scheduler, num_steps, device, None, None
             )
 
-        print(
-            f"[DEBUG SGLANG denoise] scheduler type={type(self.paint_scheduler).__name__}"
+        num_channels_latents = self.transformer.config.in_channels
+        latent_shape = (
+            num_in_batch,
+            num_channels_latents,
+            render_size // self.vae_scale_factor,
+            render_size // self.vae_scale_factor,
         )
-        print(f"[DEBUG SGLANG denoise] timesteps count={len(timesteps)}")
-        print(f"[DEBUG SGLANG denoise] timesteps={timesteps.tolist()}...")
-        batch.extra["paint_timesteps"] = timesteps
-        batch.extra["paint_num_inference_steps"] = num_inference_steps
-
-    def _prepare_latents(
-        self,
-        batch: Req,
-        device: torch.device,
-        height: int,
-        width: int,
-        generator: torch.Generator | None,
-        latents: torch.Tensor | None = None,
-    ) -> None:
-        from diffusers.utils.torch_utils import randn_tensor
-
-        if latents is None:
-            num_channels_latents = self.paint_unet.config.in_channels
-            shape = (
-                batch.extra["paint_num_in_batch"],
-                num_channels_latents,
-                height // self.paint_vae_scale_factor,
-                width // self.paint_vae_scale_factor,
-            )
-            print(f"[DEBUG SGLANG denoise] latents shape={shape}")
-            latents = randn_tensor(
-                shape,
-                generator=generator,
-                device=device,
-                dtype=batch.extra["paint_prompt_embeds"].dtype,
-            )
-        else:
-            latents = latents.to(device)
-
-        # Scale initial noise by scheduler's init_noise_sigma (matching diffusers prepare_latents)
-        latents = latents * self.paint_scheduler.init_noise_sigma
-        print(
-            f"[DEBUG SGLANG denoise] init_noise_sigma={self.paint_scheduler.init_noise_sigma}"
+        latents = randn_tensor(
+            latent_shape, generator=generator, device=device, dtype=prompt_embeds.dtype
         )
+        latents = latents * self.scheduler.init_noise_sigma
 
-        print(f"[DEBUG SGLANG denoise] initial latents shape={latents.shape}")
-        print(
-            f"[DEBUG SGLANG denoise] latents mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
-        )
-        print(
-            f"[DEBUG SGLANG denoise] latents[0,0,:5,:5]={latents[0,0,:5,:5].tolist()}"
-        )
-        batch.extra["paint_latents"] = latents
-
-    def _prepare_extra_step_kwargs(
-        self, generator: torch.Generator | None, eta: float
-    ) -> dict[str, Any]:
-        import inspect
-
-        extra_step_kwargs = {}
-        accepts_eta = "eta" in set(
-            inspect.signature(self.paint_scheduler.step).parameters.keys()
-        )
-        if accepts_eta:
-            extra_step_kwargs["eta"] = eta
-
-        accepts_generator = "generator" in set(
-            inspect.signature(self.paint_scheduler.step).parameters.keys()
-        )
-        if accepts_generator:
-            extra_step_kwargs["generator"] = generator
-        return extra_step_kwargs
+        return {
+            "timesteps": timesteps,
+            "latents": latents,
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "model_kwargs": model_kwargs,
+            "num_in_batch": num_in_batch,
+            "num_inference_steps": num_steps,
+            "guidance_scale": guidance_scale,
+            "do_cfg": do_cfg,
+            "generator": generator,
+            "num_channels_latents": num_channels_latents,
+        }
 
     @torch.no_grad()
     def _denoise_loop(
         self,
-        batch: Req,
+        timesteps: torch.Tensor,
+        latents: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        model_kwargs: dict[str, Any],
+        num_in_batch: int,
         guidance_scale: float,
-        guidance_rescale: float = 0.0,
-        eta: float = 0.0,
-        generator: torch.Generator | None = None,
-    ) -> None:
-        from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
-            rescale_noise_cfg,
-        )
-
-        timesteps = batch.extra["paint_timesteps"]
-        latents = batch.extra["paint_latents"]
-        num_in_batch = batch.extra["paint_num_in_batch"]
-
-        prompt_embeds = batch.extra["paint_prompt_embeds"]
-        negative_prompt_embeds = batch.extra["paint_negative_prompt_embeds"]
-
-        num_channels_latents = self.paint_unet.config.in_channels
-        do_cfg = guidance_scale > 1 and not self.paint_is_turbo
-
-        print(f"[DEBUG SGLANG denoise] num_channels_latents={num_channels_latents}")
-        print(f"[DEBUG SGLANG denoise] num_in_batch={num_in_batch}")
-        print(f"[DEBUG SGLANG denoise] latents shape={latents.shape}")
-        print(
-            f"[DEBUG SGLANG denoise] latents mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
-        )
-        print(f"[DEBUG SGLANG denoise] do_cfg={do_cfg}")
-        print(f"[DEBUG SGLANG denoise] prompt_embeds shape={prompt_embeds.shape}")
-
-        # Log model_kwargs (matching native format)
-        model_kwargs = batch.extra["paint_model_kwargs"]
-        print(f"[DEBUG SGLANG denoise] kwargs keys={list(model_kwargs.keys())}")
-        for k, v in model_kwargs.items():
-            if isinstance(v, torch.Tensor):
-                print(f"[DEBUG SGLANG denoise]   {k}: shape={v.shape}, dtype={v.dtype}")
-            elif isinstance(v, dict):
-                print(f"[DEBUG SGLANG denoise]   {k}: dict")
-            else:
-                print(f"[DEBUG SGLANG denoise]   {k}: {type(v).__name__}")
+        do_cfg: bool,
+        generator: torch.Generator,
+        num_channels_latents: int,
+    ) -> torch.Tensor:
+        """Run the denoising loop."""
+        import inspect
 
         if do_cfg:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-            print(
-                f"[DEBUG SGLANG denoise] after CFG concat prompt_embeds shape={prompt_embeds.shape}"
-            )
 
-        extra_step_kwargs = self._prepare_extra_step_kwargs(generator, eta)
+        extra_step_kwargs = {}
+        if "eta" in inspect.signature(self.scheduler.step).parameters:
+            extra_step_kwargs["eta"] = 0.0
+        if "generator" in inspect.signature(self.scheduler.step).parameters:
+            extra_step_kwargs["generator"] = generator
 
-        step_idx = 0
         for t in timesteps:
-            if step_idx < 2:
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx}] t={t.item() if hasattr(t, 'item') else t}"
-                )
-
             latents = rearrange(latents, "(b n) c h w -> b n c h w", n=num_in_batch)
             latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
             latent_model_input = rearrange(
                 latent_model_input, "b n c h w -> (b n) c h w"
             )
-            latent_model_input = self.paint_scheduler.scale_model_input(
-                latent_model_input, t
-            )
+            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
             latent_model_input = rearrange(
                 latent_model_input, "(b n) c h w -> b n c h w", n=num_in_batch
             )
 
-            if step_idx < 2:
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx}] latent_model_input shape={latent_model_input.shape}"
-                )
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx}] latent_model_input mean={latent_model_input.mean().item():.4f}, std={latent_model_input.std().item():.4f}"
-                )
-
-            noise_pred = self.paint_unet(
+            noise_pred = self.transformer(
                 latent_model_input,
                 t,
                 encoder_hidden_states=prompt_embeds,
@@ -1269,19 +982,8 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 cross_attention_kwargs=None,
                 added_cond_kwargs=None,
                 return_dict=False,
-                **batch.extra["paint_model_kwargs"],
+                **model_kwargs,
             )[0]
-
-            if step_idx < 2:
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx}] noise_pred shape={noise_pred.shape}"
-                )
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx}] noise_pred mean={noise_pred.mean().item():.4f}, std={noise_pred.std().item():.4f}"
-                )
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx}] noise_pred[0,0,:3,:3]={noise_pred[0,0,:3,:3].tolist()}"
-                )
 
             latents = rearrange(latents, "b n c h w -> (b n) c h w")
 
@@ -1290,19 +992,8 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 noise_pred = noise_pred_uncond + guidance_scale * (
                     noise_pred_text - noise_pred_uncond
                 )
-                if step_idx < 2:
-                    print(
-                        f"[DEBUG SGLANG denoise step {step_idx}] after CFG noise_pred mean={noise_pred.mean().item():.4f}"
-                    )
 
-            step_idx += 1
-
-            if do_cfg and guidance_rescale > 0.0:
-                noise_pred = rescale_noise_cfg(
-                    noise_pred, noise_pred_text, guidance_rescale=guidance_rescale
-                )
-
-            latents = self.paint_scheduler.step(
+            latents = self.scheduler.step(
                 noise_pred,
                 t,
                 latents[:, :num_channels_latents, :, :],
@@ -1310,146 +1001,56 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 return_dict=False,
             )[0]
 
-            if step_idx <= 2:
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx-1}] after scheduler.step latents mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
-                )
-                print(
-                    f"[DEBUG SGLANG denoise step {step_idx-1}] latents[0,0,:3,:3]={latents[0,0,:3,:3].tolist()}"
-                )
-
-        # Log final latents
-        print(f"[DEBUG SGLANG denoise] final latents shape={latents.shape}")
-        print(
-            f"[DEBUG SGLANG denoise] final latents mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
-        )
-        batch.extra["paint_latents"] = latents
+        return latents
 
     @torch.no_grad()
-    def _decode_images(self, batch: Req, output_type: str) -> list:
-        latents = batch.extra["paint_latents"]
-
-        print(
-            f"[DEBUG SGLANG denoise] vae scaling_factor={self.paint_vae.config.scaling_factor}"
-        )
-        print(f"[DEBUG SGLANG denoise] output_type={output_type}")
-
-        if output_type != "latent":
-            image = self.paint_vae.decode(
-                latents / self.paint_vae.config.scaling_factor, return_dict=False
-            )[0]
-            print(f"[DEBUG SGLANG denoise] decoded image shape={image.shape}")
-            print(
-                f"[DEBUG SGLANG denoise] decoded image mean={image.mean().item():.4f}"
-            )
-        else:
-            image = latents
-
-        image = self.paint_image_processor.postprocess(image, output_type=output_type)
-        print(f"[DEBUG SGLANG denoise] postprocessed images count={len(image)}")
-        if image and hasattr(image[0], "size"):
-            print(f"[DEBUG SGLANG denoise] first image size={image[0].size}")
-        batch.extra["paint_images"] = image
-        return image
+    def _decode_latents(self, latents: torch.Tensor) -> list:
+        """Decode latents to PIL images."""
+        image = self.vae.decode(
+            latents / self.vae.config.scaling_factor, return_dict=False
+        )[0]
+        return self.image_processor.postprocess(image, output_type="pil")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        self._load_paint_pipeline(server_args)
+        """Execute the paint diffusion stage."""
+        self._load_paint_models(server_args)
 
         delighted_image = batch.extra["delighted_image"]
         normal_maps = batch.extra["normal_maps"]
 
-        if self.paint_unet is not None:
+        if self.transformer is not None:
             try:
-                # Get parameters from batch (SamplingParams) or fallback to config
-                num_steps = (
-                    getattr(batch, "paint_num_inference_steps", None)
-                    or self.config.paint_num_inference_steps
-                )
-                guidance_scale = (
-                    getattr(batch, "paint_guidance_scale", None)
-                    or self.config.paint_guidance_scale
-                )
-                render_size = self.config.paint_resolution
-                device = self.device
+                prepared = self._prepare_denoising_inputs(batch, server_args)
 
-                print(
-                    f"[DEBUG SGLANG pipeline.__call__] num_inference_steps={num_steps}"
-                )
-                print(
-                    f"[DEBUG SGLANG pipeline.__call__] guidance_scale={guidance_scale}"
-                )
-                print(
-                    f"[DEBUG SGLANG pipeline.__call__] is_turbo={self.paint_is_turbo}"
-                )
-                print(
-                    f"[DEBUG SGLANG pipeline.__call__] width={render_size}, height={render_size}"
-                )
-                print(f"[DEBUG SGLANG multiview_utils] num_view={len(normal_maps)}")
-                print(f"[DEBUG SGLANG DiffusionStage] seed={batch.seed}")
-
-                # Match native seed_everything() - set global random state
-                import random
-
-                import numpy as np
-
-                seed = batch.seed if batch.seed is not None else 0
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                print(f"[DEBUG SGLANG DiffusionStage] seed_everything({seed})")
-
-                generator = torch.Generator(device=device).manual_seed(seed)
-                print(
-                    f"[DEBUG SGLANG DiffusionStage] generator created with seed={seed}"
+                latents = self._denoise_loop(
+                    timesteps=prepared["timesteps"],
+                    latents=prepared["latents"],
+                    prompt_embeds=prepared["prompt_embeds"],
+                    negative_prompt_embeds=prepared["negative_prompt_embeds"],
+                    model_kwargs=prepared["model_kwargs"],
+                    num_in_batch=prepared["num_in_batch"],
+                    guidance_scale=prepared["guidance_scale"],
+                    do_cfg=prepared["do_cfg"],
+                    generator=prepared["generator"],
+                    num_channels_latents=prepared["num_channels_latents"],
                 )
 
-                batch.extra["paint_num_in_batch"] = len(normal_maps)
-                self._prepare_conditions(batch, device, guidance_scale)
-                self._prepare_prompt_embeds(batch)
-                self._prepare_timesteps(batch, device, num_steps)
-
-                self._prepare_latents(
-                    batch,
-                    device,
-                    render_size,
-                    render_size,
-                    generator,
-                )
-                self._denoise_loop(batch, guidance_scale, generator=generator)
-                multiview_textures = self._decode_images(batch, output_type="pil")
+                multiview_textures = self._decode_latents(latents)
                 logger.info(
                     "Paint pipeline generated %d textures", len(multiview_textures)
                 )
 
-                print(
-                    f"[DEBUG SGLANG multiview_utils] output images count={len(multiview_textures)}"
-                )
-                if multiview_textures:
-                    print(
-                        f"[DEBUG SGLANG multiview_utils] output images[0] size={multiview_textures[0].size}"
-                    )
-
-                # DEBUG: Save intermediate multiview textures
-                try:
-                    debug_dir = "/root/sglang/outputs/debug_textures"
-                    os.makedirs(debug_dir, exist_ok=True)
-                    for i, tex in enumerate(multiview_textures):
-                        tex.save(f"{debug_dir}/sglang_view_{i}.png")
-                    print(f"[DEBUG SGLANG pipelines] Saved multiviews to {debug_dir}")
-                except Exception as e:
-                    logger.warning(
-                        f"[DEBUG SGLANG pipelines] Failed to save debug textures: {e}"
-                    )
             except Exception as e:
                 logger.error(f"Paint pipeline execution failed: {e}")
-                # Fallback
+                import traceback
+
+                traceback.print_exc()
                 render_size = self.config.paint_resolution
                 multiview_textures = [
                     delighted_image.resize((render_size, render_size))
                     for _ in range(len(normal_maps))
                 ]
         else:
-            # Fallback: use delighted image for all views
             logger.warning(
                 "Paint pipeline not available, using reference image for all views"
             )
@@ -1462,6 +1063,26 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         batch.extra["multiview_textures"] = multiview_textures
         logger.info(f"Generated {len(multiview_textures)} texture views")
         return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify paint diffusion stage inputs."""
+        result = VerificationResult()
+        result.add_check(
+            "delighted_image", batch.extra.get("delighted_image"), V.not_none
+        )
+        result.add_check("normal_maps", batch.extra.get("normal_maps"), V.is_list)
+        result.add_check("position_maps", batch.extra.get("position_maps"), V.is_list)
+        result.add_check("camera_azims", batch.extra.get("camera_azims"), V.is_list)
+        result.add_check("camera_elevs", batch.extra.get("camera_elevs"), V.is_list)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        """Verify paint diffusion stage outputs."""
+        result = VerificationResult()
+        result.add_check(
+            "multiview_textures", batch.extra.get("multiview_textures"), V.is_list
+        )
+        return result
 
 
 class Hunyuan3DPaintPostprocessStage(PipelineStage):
