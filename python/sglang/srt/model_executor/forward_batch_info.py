@@ -527,6 +527,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init lora information
         if model_runner.server_args.enable_lora:
+            # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
+            # as a batch, right before running the batch
+            if not model_runner.server_args.enable_lora_overlap_loading:
+                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
@@ -864,7 +869,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         if self.mrope_positions is not None:
-            self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
+            self.mrope_positions = torch.cat(
+                [
+                    self.mrope_positions,
+                    self.mrope_positions.new_zeros(
+                        3, num_tokens - self.mrope_positions.shape[1]
+                    ),
+                ],
+                dim=1,
+            )
 
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:

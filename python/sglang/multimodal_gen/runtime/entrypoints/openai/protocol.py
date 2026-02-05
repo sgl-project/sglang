@@ -71,6 +71,7 @@ class VideoResponse(BaseModel):
 class VideoGenerationsRequest(BaseModel):
     prompt: str
     input_reference: Optional[str] = None
+    reference_url: Optional[str] = None
     model: Optional[str] = None
     seconds: Optional[int] = 4
     size: Optional[str] = ""
@@ -80,7 +81,7 @@ class VideoGenerationsRequest(BaseModel):
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
     num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = 1.0
+    guidance_scale: Optional[float] = None
     guidance_scale_2: Optional[float] = None
     true_cfg_scale: Optional[float] = (
         None  # for CFG vs guidance distillation (e.g., QwenImage)
