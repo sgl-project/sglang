@@ -12,7 +12,11 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
+from sglang.srt.speculative.spec_utils import (
+    _SPEC_MAX_NUM_LOOPS,
+    _SPEC_STEP_SIZE,
+    generate_draft_decode_kv_indices,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
@@ -1098,9 +1102,11 @@ class TritonMultiStepDraftBackend:
             self.pool_len,
             kv_indices_buffer.shape[1],
             self.kv_indptr.shape[1],
-            next_power_of_2(num_seqs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             next_power_of_2(self.speculative_num_steps),
-            next_power_of_2(bs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             self.page_size,
         )
 

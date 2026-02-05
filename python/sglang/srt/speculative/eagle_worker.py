@@ -48,6 +48,8 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    _SPEC_MAX_NUM_LOOPS,
+    _SPEC_STEP_SIZE,
     assign_draft_cache_locs,
     detect_nan,
     draft_tp_context,
@@ -491,7 +493,8 @@ class EAGLEWorker(TpModelWorker):
             self.topk,
             self.speculative_num_steps,
             self.page_size,
-            next_power_of_2(num_seqs),
+            _SPEC_STEP_SIZE,
+            _SPEC_MAX_NUM_LOOPS,
             next_power_of_2(self.speculative_num_steps + self.page_size),
         )
 

@@ -37,6 +37,8 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
+    _FILL_ACCEPTED_CACHE_LOC_MAX_NUM_LOOPS,
+    _FILL_ACCEPTED_CACHE_LOC_STEP_SIZE,
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
@@ -837,7 +839,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
             batch.out_cache_loc,
             accepted_out_cache_loc,
-            next_power_of_2(size),
+            _FILL_ACCEPTED_CACHE_LOC_STEP_SIZE,
+            _FILL_ACCEPTED_CACHE_LOC_MAX_NUM_LOOPS,
         )
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
