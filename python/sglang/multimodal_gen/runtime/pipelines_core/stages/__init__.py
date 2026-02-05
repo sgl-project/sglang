@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_paint import 
     Hunyuan3DPaintDelightStage,
     Hunyuan3DPaintDiffusionStage,
     Hunyuan3DPaintPostprocessStage,
+    Hunyuan3DPaintPreprocessStage,
     Hunyuan3DPaintRenderStage,
     Hunyuan3DPaintStage,
     Hunyuan3DPaintUVUnwrapStage,
@@ -106,5 +107,6 @@ __all__ = [
     "Hunyuan3DPaintRenderStage",
     "Hunyuan3DPaintDiffusionStage",
     "Hunyuan3DPaintPostprocessStage",
+    "Hunyuan3DPaintPreprocessStage",
     "Hunyuan3DPaintStage",
 ]

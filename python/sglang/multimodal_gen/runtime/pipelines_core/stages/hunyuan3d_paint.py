@@ -279,6 +279,16 @@ class Hunyuan3DPaintUVUnwrapStage(PipelineStage):
         batch.extra["paint_mesh"] = mesh
         return batch
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
+        return result
+
 
 class Hunyuan3DPaintDelightStage(PipelineStage):
     """Stage 1b: Image delight preprocessing.
@@ -375,21 +385,6 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
 
         image = image.convert("RGB")
 
-        print(f"[DEBUG SGLANG delight] prompt={self.config.delight_prompt}")
-        print(
-            f"[DEBUG SGLANG delight] negative_prompt={self.config.delight_negative_prompt}"
-        )
-        print(
-            f"[DEBUG SGLANG delight] guidance_scale={self.config.delight_guidance_scale}"
-        )
-        print(
-            f"[DEBUG SGLANG delight] image_guidance_scale={self.config.delight_cfg_image}"
-        )
-        print(
-            f"[DEBUG SGLANG delight] num_inference_steps={self.config.delight_num_inference_steps}"
-        )
-        print(f"[DEBUG SGLANG delight] strength={self.config.delight_strength}")
-
         image = self.pipeline(
             prompt=self.config.delight_prompt,
             image=image,
@@ -478,27 +473,23 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
             try:
                 image = self._run_delight(image)
                 logger.info("Image delight completed")
-                print(f"[DEBUG SGLANG pipelines] delighted image count=1")
-                print(f"[DEBUG SGLANG pipelines] delighted image[0] size={image.size}")
-                print(f"[DEBUG SGLANG pipelines] delighted image[0] mode={image.mode}")
-
-                # DEBUG: Save delighted image
-                try:
-                    debug_dir = "/root/sglang/outputs/debug_textures"
-                    os.makedirs(debug_dir, exist_ok=True)
-                    image.save(f"{debug_dir}/sglang_delighted.png")
-                    print(
-                        f"[DEBUG SGLANG pipelines] Saved delighted image to {debug_dir}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[DEBUG SGLANG pipelines] Failed to save delighted image: {e}"
-                    )
             except Exception as e:
                 logger.warning(f"Image delight failed: {e}")
 
         batch.extra["delighted_image"] = image
         return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("image_path", batch.image_path, V.not_none)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check(
+            "delighted_image", batch.extra.get("delighted_image"), V.not_none
+        )
+        return result
 
 
 class Hunyuan3DPaintRenderStage(PipelineStage):
@@ -517,10 +508,11 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
         super().__init__()
         self.config = config
         self.renderer = None
+        self._loaded = False
 
     def _init_renderer(self):
         """Initialize the mesh renderer."""
-        if self.renderer is not None:
+        if self._loaded:
             return
 
         from sglang.multimodal_gen.runtime.models.mesh3d_utils import MeshRender
@@ -529,6 +521,7 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
             default_resolution=self.config.paint_render_size,
             texture_size=self.config.paint_texture_size,
         )
+        self._loaded = True
         logger.info("Mesh renderer initialized")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
@@ -538,9 +531,6 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
 
         # Load mesh into renderer
         self.renderer.load_mesh(mesh)
-
-        print(f"[DEBUG SGLANG pipelines] camera_elevs={self.CAMERA_ELEVS}")
-        print(f"[DEBUG SGLANG pipelines] camera_azims={self.CAMERA_AZIMS}")
 
         # Render normal maps
         normal_maps = self.renderer.render_normal_multiview(
@@ -552,23 +542,6 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
             self.CAMERA_ELEVS, self.CAMERA_AZIMS
         )
 
-        print(f"[DEBUG SGLANG pipelines] normal_maps count={len(normal_maps)}")
-        print(f"[DEBUG SGLANG pipelines] normal_maps[0] size={normal_maps[0].size}")
-        print(f"[DEBUG SGLANG pipelines] position_maps count={len(position_maps)}")
-        print(f"[DEBUG SGLANG pipelines] position_maps[0] size={position_maps[0].size}")
-
-        # DEBUG: Save normal and position maps
-        try:
-            debug_dir = "/root/sglang/outputs/debug_textures"
-            os.makedirs(debug_dir, exist_ok=True)
-            for i, nm in enumerate(normal_maps):
-                nm.save(f"{debug_dir}/sglang_normal_{i}.png")
-            for i, pm in enumerate(position_maps):
-                pm.save(f"{debug_dir}/sglang_position_{i}.png")
-            print(f"[DEBUG SGLANG pipelines] Saved normal/position maps to {debug_dir}")
-        except Exception as e:
-            logger.warning(f"[DEBUG SGLANG pipelines] Failed to save maps: {e}")
-
         batch.extra["normal_maps"] = normal_maps
         batch.extra["position_maps"] = position_maps
         batch.extra["camera_azims"] = self.CAMERA_AZIMS
@@ -578,6 +551,18 @@ class Hunyuan3DPaintRenderStage(PipelineStage):
 
         logger.info(f"Rendered {len(normal_maps)} views for texture generation")
         return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("normal_maps", batch.extra.get("normal_maps"), V.is_list)
+        result.add_check("position_maps", batch.extra.get("position_maps"), V.is_list)
+        result.add_check("renderer", batch.extra.get("renderer"), V.not_none)
+        return result
 
 
 class Hunyuan3DPaintDiffusionStage(PipelineStage):
@@ -610,7 +595,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         self.image_processor = image_processor
         self.solver = solver
         self.is_turbo = is_turbo
-        self._models_loaded = transformer is not None
+        self._loaded = transformer is not None
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -618,7 +603,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
     def _load_paint_models(self, server_args: ServerArgs) -> None:
         """Load paint models if not already loaded via pipeline."""
-        if self._models_loaded:
+        if self._loaded:
             return
 
         from huggingface_hub import snapshot_download
@@ -646,7 +631,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 local_path = os.path.join(path, paint_subfolder)
             except Exception as e:
                 logger.warning(f"Could not download paint model: {e}")
-                self._models_loaded = True
+                self._loaded = True
                 return
 
         try:
@@ -704,7 +689,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
             self.transformer = None
             self.scheduler = None
 
-        self._models_loaded = True
+        self._loaded = True
 
     def _convert_pil_list_to_tensor(
         self, images: list, device: torch.device
@@ -1097,15 +1082,11 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         self.config = config
 
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        import time
-
         renderer = batch.extra["renderer"]
         multiview_textures = batch.extra["multiview_textures"]
         camera_elevs = batch.extra["camera_elevs"]
         camera_azims = batch.extra["camera_azims"]
         view_weights = batch.extra["view_weights"]
-
-        print(f"[DEBUG Postprocess] Starting with {len(multiview_textures)} textures")
 
         # Resize textures if needed
         render_size = getattr(self.config, "paint_render_size", 2048)
@@ -1115,14 +1096,9 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
                 resized_textures.append(tex.resize((render_size, render_size)))
             else:
                 resized_textures.append(tex)
-        print(
-            f"[DEBUG Postprocess] Resized {len(resized_textures)} textures to {render_size}x{render_size}"
-        )
 
         # Bake textures from multiple views
         try:
-            print("[DEBUG Postprocess] Starting bake_from_multiview()...")
-            start_time = time.time()
             texture, mask = renderer.bake_from_multiview(
                 resized_textures,
                 camera_elevs,
@@ -1130,71 +1106,44 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
                 view_weights,
                 method="fast",
             )
-            elapsed = time.time() - start_time
-            print(
-                f"[DEBUG Postprocess] bake_from_multiview() completed in {elapsed:.2f} seconds"
-            )
-            print(
-                f"[DEBUG Postprocess] texture shape: {texture.shape if hasattr(texture, 'shape') else 'N/A'}"
-            )
 
             # Inpaint missing regions
-            print("[DEBUG Postprocess] Starting texture_inpaint()...")
-            start_time = time.time()
             mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype("uint8")
             texture = renderer.texture_inpaint(texture, mask_np)
-            elapsed = time.time() - start_time
-            print(
-                f"[DEBUG Postprocess] texture_inpaint() completed in {elapsed:.2f} seconds"
-            )
 
             # Apply texture to mesh
-            print("[DEBUG Postprocess] Setting texture...")
-            start_time = time.time()
             renderer.set_texture(texture)
-            elapsed = time.time() - start_time
-            print(
-                f"[DEBUG Postprocess] set_texture() completed in {elapsed:.2f} seconds"
-            )
-
-            print("[DEBUG Postprocess] Saving mesh...")
-            start_time = time.time()
             textured_mesh = renderer.save_mesh()
-            elapsed = time.time() - start_time
-            print(f"[DEBUG Postprocess] save_mesh() completed in {elapsed:.2f} seconds")
             logger.info("Texture baking completed")
         except Exception as e:
-            print(f"[DEBUG Postprocess] Texture baking failed: {e}")
             logger.error(f"Texture baking failed: {e}")
-            # Fallback to untextured mesh
             textured_mesh = batch.extra["paint_mesh"]
 
         # Export mesh
         obj_path = batch.extra["shape_obj_path"]
         return_path = batch.extra["shape_return_path"]
-        print(f"[DEBUG Postprocess] Exporting mesh to {obj_path}")
 
-        # Save textured mesh
         try:
-            print("[DEBUG Postprocess] Starting mesh export...")
-            start_time = time.time()
             textured_mesh.export(obj_path)
-            elapsed = time.time() - start_time
-            print(f"[DEBUG Postprocess] Mesh exported in {elapsed:.2f} seconds")
-
             if self.config.paint_save_glb:
-                print("[DEBUG Postprocess] Exporting GLB...")
-                start_time = time.time()
                 glb_path = obj_path[:-4] + ".glb"
                 textured_mesh.export(glb_path)
-                elapsed = time.time() - start_time
-                print(f"[DEBUG Postprocess] GLB exported in {elapsed:.2f} seconds")
                 return_path = glb_path
         except Exception as e:
-            print(f"[DEBUG Postprocess] Mesh export failed: {e}")
             logger.error(f"Mesh export failed: {e}")
 
         return OutputBatch(output=[return_path], timings=batch.timings)
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("renderer", batch.extra.get("renderer"), V.not_none)
+        result.add_check(
+            "multiview_textures", batch.extra.get("multiview_textures"), V.is_list
+        )
+        result.add_check("camera_elevs", batch.extra.get("camera_elevs"), V.is_list)
+        result.add_check("camera_azims", batch.extra.get("camera_azims"), V.is_list)
+        result.add_check("view_weights", batch.extra.get("view_weights"), V.is_list)
+        return result
 
 
 # Legacy PaintStage kept for backward compatibility
@@ -1231,11 +1180,64 @@ class Hunyuan3DPaintStage(PipelineStage):
         return OutputBatch(output=[return_path], timings=batch.timings)
 
 
+class Hunyuan3DPaintPreprocessStage(PipelineStage):
+    """Combined preprocessing stage that runs UV unwrap (CPU) and delight (GPU) in parallel.
+
+    This stage improves performance by executing CPU-bound UV unwrapping
+    concurrently with GPU-bound image delight processing.
+    """
+
+    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.uv_stage = Hunyuan3DPaintUVUnwrapStage(config)
+        self.delight_stage = Hunyuan3DPaintDelightStage(config)
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        import concurrent.futures
+        import copy
+
+        batch_for_uv = batch
+        batch_for_delight = copy.copy(batch)
+        batch_for_delight.extra = batch.extra.copy()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            uv_future = executor.submit(
+                self.uv_stage.forward, batch_for_uv, server_args
+            )
+            delight_future = executor.submit(
+                self.delight_stage.forward, batch_for_delight, server_args
+            )
+
+            uv_future.result()
+            delight_future.result()
+
+        batch.extra["paint_mesh"] = batch_for_uv.extra.get("paint_mesh")
+        batch.extra["delighted_image"] = batch_for_delight.extra.get("delighted_image")
+
+        return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
+        result.add_check("image_path", batch.image_path, V.not_none)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
+        result.add_check(
+            "delighted_image", batch.extra.get("delighted_image"), V.not_none
+        )
+        return result
+
+
 __all__ = [
     "Hunyuan3DPaintUVUnwrapStage",
     "Hunyuan3DPaintDelightStage",
     "Hunyuan3DPaintRenderStage",
     "Hunyuan3DPaintDiffusionStage",
     "Hunyuan3DPaintPostprocessStage",
+    "Hunyuan3DPaintPreprocessStage",
     "Hunyuan3DPaintStage",
 ]
