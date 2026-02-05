@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -18,80 +19,53 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
 
-# Lazy import for K-last GDN verify kernel (CuTe DSL)
-_cutedsl_gdn_verify_available = None
-_cutedsl_gdn_verify_k_last = None
-
-
-def _get_cutedsl_gdn_verify():
-    """Lazy import for CuTe DSL GDN verify kernel."""
-    global _cutedsl_gdn_verify_available, _cutedsl_gdn_verify_k_last
-    if _cutedsl_gdn_verify_available is None:
-        try:
-            from sglang.jit_kernel.cutedsl_gdn_verify import (
-                cutedsl_gdn_verify_k_last,
-                is_cutedsl_gdn_verify_available,
-            )
-            _cutedsl_gdn_verify_available = is_cutedsl_gdn_verify_available()
-            if _cutedsl_gdn_verify_available:
-                _cutedsl_gdn_verify_k_last = cutedsl_gdn_verify_k_last
-        except ImportError:
-            _cutedsl_gdn_verify_available = False
-    return _cutedsl_gdn_verify_available, _cutedsl_gdn_verify_k_last
-
-
-def _precompile_cutedsl_kernels(
-    max_batch_size: int = 64,
-    T: int = 4,
-    H: int = 8,
-    HV: int = 16,
-    K: int = 128,
-    V: int = 128,
-    cache_steps: int = 4,
-):
-    """Pre-compile CuTe DSL GDN Verify kernels for common batch sizes.
-    
-    Note: pool_size is not needed - kernels are pool_size-agnostic.
-    """
-    try:
-        from sglang.jit_kernel.cutedsl_gdn_verify import precompile_cutedsl_gdn_verify_kernels
-        # Pre-compile for batch sizes 1 to max_batch_size
-        batch_sizes = list(range(1, max_batch_size + 1))
-        precompile_cutedsl_gdn_verify_kernels(
-            batch_sizes=batch_sizes,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            cache_steps=cache_steps,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to pre-compile CuTe DSL kernels: {e}")
-
-
-# Lazy import for FlashInfer GDN prefill kernel
-_flashinfer_gdn_prefill_available = None
+# Lazy import for FlashInfer GDN kernels (prefill and verify/MTP)
+_flashinfer_gdn_available = None
 _flashinfer_chunk_gated_delta_rule = None
+_flashinfer_gated_delta_rule_mtp = None
+
+# Path to the custom FlashInfer repo with GDN kernels
+_FLASHINFER_GDN_REPO_PATH = "/lustre/raplab/client/xutingz/workspace/gitsrc/flashinfer"
 
 
-def _get_flashinfer_gdn_prefill():
-    """Lazy import for FlashInfer GDN prefill kernel."""
-    global _flashinfer_gdn_prefill_available, _flashinfer_chunk_gated_delta_rule
-    if _flashinfer_gdn_prefill_available is None:
+def _get_flashinfer_gdn_kernels():
+    """Lazy import for FlashInfer GDN prefill and verify (MTP) kernels.
+    
+    Uses the custom FlashInfer repo at _FLASHINFER_GDN_REPO_PATH for GDN kernels.
+    """
+    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp
+    if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+            
+            # Add custom FlashInfer repo to sys.path to ensure we use the correct version
+            if _FLASHINFER_GDN_REPO_PATH not in sys.path:
+                sys.path.insert(0, _FLASHINFER_GDN_REPO_PATH)
+                logger.info(f"Using FlashInfer GDN kernels from: {_FLASHINFER_GDN_REPO_PATH}")
+            
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
+            from flashinfer.gdn_decode import gated_delta_rule_mtp
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
-            # Check if SM90+ (required for FlashInfer prefill)
-            _flashinfer_gdn_prefill_available = (
+            _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
+            # Check if SM90+ (required for FlashInfer GDN kernels)
+            _flashinfer_gdn_available = (
                 torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] >= 9
             )
-        except (ImportError, RuntimeError):
-            _flashinfer_gdn_prefill_available = False
-    return _flashinfer_gdn_prefill_available, _flashinfer_chunk_gated_delta_rule
+            if _flashinfer_gdn_available:
+                logger.info("FlashInfer GDN kernels (prefill + MTP) loaded successfully")
+        except (ImportError, RuntimeError) as e:
+            logger.warning(f"FlashInfer GDN kernels not available: {e}")
+            _flashinfer_gdn_available = False
+    return _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp
+
+
+# Legacy alias for backward compatibility
+def _get_flashinfer_gdn_prefill():
+    """Lazy import for FlashInfer GDN prefill kernel (legacy alias)."""
+    available, prefill_fn, _ = _get_flashinfer_gdn_kernels()
+    return available, prefill_fn
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -959,52 +933,25 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         # Cache kernel handles in K-last mode to avoid per-layer checks.
         self._flashinfer_chunk_gated_delta_rule = None
-        self._cutedsl_gdn_verify_k_last = None
+        self._flashinfer_gated_delta_rule_mtp = None
         if self.ssm_k_last:
-            flashinfer_available, flashinfer_chunk_gdr = _get_flashinfer_gdn_prefill()
-            cutedsl_available, cutedsl_gdn_verify_k_last = _get_cutedsl_gdn_verify()
-            if not flashinfer_available or flashinfer_chunk_gdr is None:
+            flashinfer_available, flashinfer_prefill, flashinfer_mtp = _get_flashinfer_gdn_kernels()
+            if not flashinfer_available:
                 raise RuntimeError(
-                    "K-last SSM layout is enabled but FlashInfer GDN prefill is unavailable. "
+                    "K-last SSM layout is enabled but FlashInfer GDN kernels are unavailable. "
                     "Disable --mamba-ssm-k-last or ensure FlashInfer (SM90+) is available."
                 )
-            if not cutedsl_available or cutedsl_gdn_verify_k_last is None:
+            if flashinfer_prefill is None:
                 raise RuntimeError(
-                    "K-last SSM layout is enabled but CuTe DSL GDN verify kernel is unavailable. "
-                    "Disable --mamba-ssm-k-last or ensure cutlass/cute is available."
+                    "K-last SSM layout is enabled but FlashInfer GDN prefill kernel is unavailable."
                 )
-            self._flashinfer_chunk_gated_delta_rule = flashinfer_chunk_gdr
-            self._cutedsl_gdn_verify_k_last = cutedsl_gdn_verify_k_last
-            
-            # Pre-compile CuTe DSL kernels for common batch sizes during initialization
-            # This avoids JIT compilation overhead during inference
-            server_args = get_global_server_args()
-            if server_args.speculative_algorithm is not None:
-                # Get model config for kernel parameters
-                hf_config = getattr(model_runner, "model_config", None)
-                if hf_config is not None:
-                    hf_config = getattr(hf_config, "hf_config", hf_config)
-                    H = getattr(hf_config, "linear_num_key_heads", 8) // model_runner.tp_size
-                    HV = getattr(hf_config, "linear_num_value_heads", 16) // model_runner.tp_size
-                    K = getattr(hf_config, "linear_key_head_dim", 128)
-                    V = getattr(hf_config, "linear_value_head_dim", 128)
-                else:
-                    H, HV, K, V = 8, 16, 128, 128
-                
-                # Pre-compile for batch sizes 1-64
-                max_bs = min(64, server_args.max_running_requests or 64)
-                draft_token_num = server_args.speculative_num_steps + 1  # T parameter
-                
-                logger.info(f"Pre-compiling CuTe DSL GDN Verify kernels (B=1..{max_bs}, T={draft_token_num})")
-                _precompile_cutedsl_kernels(
-                    max_batch_size=max_bs,
-                    T=draft_token_num,
-                    H=H,
-                    HV=HV,
-                    K=K,
-                    V=V,
-                    cache_steps=draft_token_num,
+            if flashinfer_mtp is None:
+                raise RuntimeError(
+                    "K-last SSM layout is enabled but FlashInfer GDN MTP (verify) kernel is unavailable."
                 )
+            self._flashinfer_chunk_gated_delta_rule = flashinfer_prefill
+            self._flashinfer_gated_delta_rule_mtp = flashinfer_mtp
+            logger.info("K-last mode: Using FlashInfer GDN prefill and MTP (verify) kernels")
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
@@ -1248,7 +1195,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             if self.ssm_k_last:
-                # Use K-last CuTe DSL GDN verify kernel (no transpose needed)
+                # Use FlashInfer GDN MTP (verify) kernel for K-last layout
                 if retrieve_parent_token is not None:
                     raise RuntimeError(
                         "K-last GDN verify kernel only supports topk=1 (retrieve_parent_token=None)."
@@ -1261,21 +1208,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
                 b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
 
-                core_attn_out = self._cutedsl_gdn_verify_k_last(
-                    A_log=A_log,
-                    a=a_mtp,
-                    dt_bias=dt_bias,
+                # FlashInfer MTP kernel expects state in K-last layout [pool_size, HV, V, K]
+                # which matches our ssm_states layout
+                # Note: detach A_log and dt_bias to avoid gradient tracking issues with dlpack
+                core_attn_out, _ = self._flashinfer_gated_delta_rule_mtp(
                     q=query_mtp,
                     k=key_mtp,
                     v=value_mtp,
-                    b=b_mtp,
-                    initial_state_source=ssm_states,
+                    initial_state=ssm_states,
                     initial_state_indices=cache_indices,
+                    A_log=A_log.detach(),
+                    a=a_mtp,
+                    dt_bias=dt_bias.detach(),
+                    b=b_mtp,
+                    scale=None,
+                    output=None,
                     intermediate_states_buffer=intermediate_state_cache,
-                    use_qk_l2norm_in_kernel=True,
                     disable_state_update=True,
-                    cu_seqlens=query_start_loc,
-                    cache_steps=draft_token_num,
+                    use_qk_l2norm=True,
                 )
                 # Reshape output: [B, T, HV, V] -> [1, seq_len, HV, V]
                 core_attn_out = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
@@ -1305,7 +1255,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
 
             if self.ssm_k_last:
-                # Use FlashInfer prefill kernel (K-last layout, no transpose needed)
+                # Use FlashInfer GDN prefill kernel for K-last layout
+                # The FlashInfer kernel natively supports K-last state layout [N, H, V, K]
                 total_seq_len = query.shape[1]
                 
                 # Format conversion: [1, seq, H, K] -> [seq, H, K]
@@ -1313,25 +1264,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 k_fi = key[0].contiguous()
                 v_fi = value[0].contiguous()
 
-                # L2-normalize q and k
+                # L2-normalize q and k (FlashInfer kernel expects normalized inputs)
                 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
                 q_fi = l2norm_fwd(q_fi)
                 k_fi = l2norm_fwd(k_fi)
                 
-                # g (alpha) and beta: [1, seq, HV] -> [seq, HV]
-                alpha_fi = torch.exp(g[0])
-                beta_fi = beta[0]
+                # g (alpha) and beta: [1, seq, HV] -> [seq, HV], must be float32 for FlashInfer
+                alpha_fi = torch.exp(g[0]).to(torch.float32)
+                beta_fi = beta[0].to(torch.float32)
                 
                 # cu_seqlens: int32 -> int64
                 cu_seqlens_fi = query_start_loc.to(torch.int64)
 
-                # Prepare initial_state (FlashInfer requires float32)
+                # Prepare initial_state (FlashInfer requires float32, K-last layout [B, HV, V, K])
                 initial_state_fi = ssm_states[cache_indices].to(torch.float32)
-                output_state_fi = initial_state_fi
                 
                 # Call FlashInfer prefill kernel
                 # Note: q and k are already L2-normalized above, so use_qk_l2norm_in_kernel=False
-                output_fi, output_state_fi_result = self._flashinfer_chunk_gated_delta_rule(
+                output_fi, output_state_fi = self._flashinfer_chunk_gated_delta_rule(
                     q=q_fi,
                     k=k_fi,
                     v=v_fi,
@@ -1342,14 +1292,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     output_final_state=True,
                     cu_seqlens=cu_seqlens_fi,
                     use_qk_l2norm_in_kernel=False,
-                    output_state=output_state_fi,
                 )
 
                 # Output: [seq, HV, V] -> [1, seq, HV, V]
                 core_attn_out = output_fi.view(1, total_seq_len, num_value_heads, head_v_dim)
 
-                # Write back state
-                ssm_states.index_copy_(0, cache_indices.to(torch.int64), output_state_fi_result.to(ssm_states.dtype))
+                # Write back state to pool (K-last layout)
+                ssm_states.index_copy_(0, cache_indices.to(torch.int64), output_state_fi.to(ssm_states.dtype))
+
+                # Note: _track_mamba_state_extend needs h tensor from Triton kernel
+                # FlashInfer doesn't provide intermediate states, so we skip tracking for K-last prefill
+                # This may need adjustment if prefix caching is needed with K-last prefill
 
                 return core_attn_out
 
