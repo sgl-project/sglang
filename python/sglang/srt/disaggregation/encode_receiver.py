@@ -7,6 +7,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from enum import IntEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
@@ -441,8 +442,8 @@ class MMReceiverHTTP(MMReceiverBase):
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
-                        f"Timeout waiting for image embedding after {self.wait_timeout}s",  # error_msg
-                        408,  # error_code
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
             else:  # status_value == WaitingImageRequestStatus.PENDING
