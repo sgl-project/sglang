@@ -1241,8 +1241,6 @@ class FlashInferIndicesUpdaterPrefill:
         multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         if use_ragged:
-            # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
-            # and forward_batch.extend_seq_lens_cpu
             paged_kernel_lens = prefix_lens
             if prefix_lens_cpu is not None:
                 # Avoid CUDA sync from .item() by using CPU lengths when available.
