@@ -64,14 +64,14 @@ class ModelRunnerKVCacheMixin:
         # Get attention parameters
         num_head = self.model_config.num_attention_heads // get_attention_tp_size()
         head_dim = self.model_config.head_dim
-        max_context_len = self.model_config.context_len
+        context_len = self.model_config.context_len
         use_mla = self.model_config.attention_arch == AttentionArch.MLA
 
         # For MLA, workspace is allocated dynamically, not during init
         if use_mla:
             return rest_memory_bytes // cell_size
 
-        max_num_partitions = AiterAttnBackend.get_max_num_partitions(max_context_len)
+        max_num_partitions = AiterAttnBackend.get_max_num_partitions(context_len)
 
         # Resolve `max_total_num_tokens` based on the `workspace_size` required by aiter_backend.py:
         # workspace_size = (max_num_reqs * num_head * max_num_partitions * head_dim) * 4
@@ -79,8 +79,6 @@ class ModelRunnerKVCacheMixin:
 
         # i.e. `workspace_size = max_num_reqs * W` introducing the known constant W.
         W = num_head * max_num_partitions * (head_dim * 4 + 8)
-
-        context_len = self.model_config.context_len
 
         # We then have from `ModelRunnerKVCacheMixin.init_memory_pool`:
         #           max_num_reqs = clamp(max_total_num_tokens / context_len * 512, 2048, 4096)
