@@ -7,7 +7,6 @@ from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_32B_EAGLE3_WEIGHTS_PATH,
     QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH,
-    get_device_ids,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -106,7 +105,7 @@ class TestAscendSpeculativeAttentionMode(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--base-gpu-id",
-            get_device_ids(0),
+            4,
             "--disaggregation-transfer-backend",
             "ascend",
             "--num-reserved-decode-tokens",
