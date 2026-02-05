@@ -19,15 +19,14 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
 ) -> Module:
-    args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla
-    )
+    template_args = make_cpp_args(block_size, num_top_k, hot_buffer_size, is_mla)
+    cache_args = make_cpp_args(item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla)
     return load_jit(
         "sparse_cache",
-        *args,
+        *cache_args,
         cuda_files=["sparse.cuh"],
         cuda_wrappers=[
-            ("load_cache_to_device_buffer", f"load_cache_to_device_buffer<{args}>")
+            ("load_cache_to_device_buffer", f"load_cache_to_device_buffer<{template_args}>")
         ],
     )
 
@@ -43,7 +42,6 @@ def load_cache_to_device_buffer_mla(
     page_table: torch.Tensor,
     diff_map: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
     lru_slots: torch.Tensor,
     transfer_tasks_src: torch.Tensor,
@@ -87,7 +85,6 @@ def load_cache_to_device_buffer_mla(
         page_table,
         diff_map,
         req_pool_indices,
-        sparse_mask,
         seq_lens,
         lru_slots,
         transfer_tasks_src,
@@ -111,7 +108,6 @@ def load_cache_to_device_buffer(
     page_table: torch.Tensor,
     diff_map: torch.Tensor,
     req_pool_indices: torch.Tensor,
-    sparse_mask: torch.Tensor,
     seq_lens: torch.Tensor,
     lru_slots: torch.Tensor,
     transfer_tasks_src: torch.Tensor,
@@ -152,7 +148,6 @@ def load_cache_to_device_buffer(
         page_table,
         diff_map,
         req_pool_indices,
-        sparse_mask,
         seq_lens,
         lru_slots,
         transfer_tasks_src,

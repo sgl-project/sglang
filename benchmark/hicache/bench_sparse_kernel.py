@@ -13,7 +13,8 @@ def _expected_lru(
     hot_buffer_size: int,
     newest_token: int,
 ) -> torch.Tensor:
-    lru_size = hot_buffer_size - 1
+    # LRU uses all HOT_BUFFER_SIZE slots (newest_slot is now at HOT_BUFFER_SIZE, outside)
+    lru_size = hot_buffer_size
     top_k_set = set(top_k_tokens.tolist())
 
     hit_slots: list[int] = []
@@ -99,8 +100,9 @@ def test_sparse_lru_end_to_end(
     rounds: int = 6,
     warmup: int = 4,
     block_size: int = 512,
+    kv_lora_rank: int = 512,
 ) -> None:
-    device = "cuda" 
+    device = "cuda"
     torch.manual_seed(0)
     diff_target = int(num_top_k * diff_ratio)
     assert diff_target > 0, "diff_ratio too small for current top_k"
@@ -112,12 +114,13 @@ def test_sparse_lru_end_to_end(
         num_top_k + hot_buffer_size + diff_target + 1024,
     )
 
-    kv_lora_rank = 512
     qk_rope_head_dim = 64
-    use_nsa = True
     dtype = torch.float16
 
-    device_pool_size = batch_size * hot_buffer_size * page_size
+    # Device pool needs extra page_size slots for newest token position (at HOT_BUFFER_SIZE)
+    # Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
+    total_buffer_slots = hot_buffer_size + page_size
+    device_pool_size = batch_size * total_buffer_slots * page_size
     mem_pool_device = MLATokenToKVPool(
         size=device_pool_size,
         page_size=page_size,
@@ -145,11 +148,13 @@ def test_sparse_lru_end_to_end(
     host_cache_locs = torch.empty(
         (batch_size, host_token_count), dtype=torch.int64, device=device
     )
+    # device_buffer_locs includes extra slot for newest token at HOT_BUFFER_SIZE
     device_buffer_locs = torch.empty(
-        (batch_size, 1, hot_buffer_size), dtype=torch.int32, device=device
+        (batch_size, 1, total_buffer_slots), dtype=torch.int32, device=device
     )
+    # LRU uses all HOT_BUFFER_SIZE slots (newest_slot is outside at HOT_BUFFER_SIZE)
     lru_slots = (
-        torch.arange(hot_buffer_size - 1, dtype=torch.int16, device=device)
+        torch.arange(hot_buffer_size, dtype=torch.int16, device=device)
         .reshape(1, 1, -1)
         .repeat(batch_size, 1, 1)
     )
@@ -159,21 +164,26 @@ def test_sparse_lru_end_to_end(
     token_ids = token_ids.view(-1, 1).repeat(1, feature_dim)
     mem_pool_host.kv_buffer[layer_id][: mem_pool_host.size, 0].copy_(token_ids)
 
+    # device_buffer_tokens includes extra slot for newest token
     device_buffer_tokens = torch.empty(
-        (batch_size, 1, hot_buffer_size), dtype=torch.int32, device=device
+        (batch_size, 1, total_buffer_slots), dtype=torch.int32, device=device
     )
     for b in range(batch_size):
         host_base = b * host_token_count
         host_cache_locs[b] = torch.arange(
             host_base, host_base + host_token_count, dtype=torch.int64, device=device
         )
-        device_base = b * hot_buffer_size
+        device_base = b * total_buffer_slots
         device_buffer_locs[b, 0] = torch.arange(
-            device_base, device_base + hot_buffer_size, dtype=torch.int32, device=device
+            device_base, device_base + total_buffer_slots, dtype=torch.int32, device=device
         )
-        device_buffer_tokens[b, 0] = torch.arange(
+        # Initialize LRU region (first hot_buffer_size slots)
+        device_buffer_tokens[b, 0, :hot_buffer_size] = torch.arange(
             hot_buffer_size, dtype=torch.int32, device=device
         )
+        # Initialize newest slot (at HOT_BUFFER_SIZE) with -1
+        device_buffer_tokens[b, 0, hot_buffer_size:] = -1
+        # Copy data for LRU region
         for slot in range(hot_buffer_size):
             token_id = int(device_buffer_tokens[b, 0, slot].item())
             host_loc = int(host_cache_locs[b, token_id].item())
@@ -192,7 +202,6 @@ def test_sparse_lru_end_to_end(
     diff_map = torch.full(
         (batch_size, host_token_count), -1, dtype=torch.int16, device=device
     )
-    sparse_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
     req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
     transfer_tasks_src, transfer_tasks_dst = _build_transfer_tasks(
         batch_size, num_top_k, page_size
@@ -224,7 +233,7 @@ def test_sparse_lru_end_to_end(
                 min_seq_len = max(min_seq_len, max(prev_top_k_cpu[b]) + 2)
             max_seq_len = host_token_count - 1
             # Ensure enough candidate tokens for diff generation.
-            required_seq_len = num_top_k + (hot_buffer_size - 1) + diff_target + 1
+            required_seq_len = num_top_k + hot_buffer_size + diff_target + 1
             desired_min = max(min_seq_len, required_seq_len)
             if desired_min >= max_seq_len:
                 seq_len = max_seq_len
@@ -264,7 +273,7 @@ def test_sparse_lru_end_to_end(
                     include_newest_in_new = True
 
                 forbidden = set(
-                    device_buffer_tokens[b, 0, : hot_buffer_size - 1].tolist()
+                    device_buffer_tokens[b, 0, :hot_buffer_size].tolist()
                 )
                 candidates = [
                     t
@@ -299,7 +308,8 @@ def test_sparse_lru_end_to_end(
 
             top_k_tokens[b] = curr_tokens
 
-            newest_slot = hot_buffer_size - 1
+            # newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
+            newest_slot = hot_buffer_size
             device_buffer_tokens[b, 0, newest_slot] = newest_token
             host_loc = int(host_cache_locs[b, newest_token].item())
             device_loc = int(device_buffer_locs[b, 0, newest_slot].item())
@@ -307,8 +317,8 @@ def test_sparse_lru_end_to_end(
                 mem_pool_host.kv_buffer[layer_id][host_loc, 0]
             )
 
-            # Ensure newest_token is not duplicated in the LRU region.
-            lru_region = device_buffer_tokens[b, 0, :newest_slot]
+            # Ensure newest_token is not duplicated in the LRU region (first hot_buffer_size slots)
+            lru_region = device_buffer_tokens[b, 0, :hot_buffer_size]
             dup_mask = lru_region == newest_token
             if dup_mask.any():
                 lru_tokens = set(lru_region.tolist())
@@ -330,7 +340,8 @@ def test_sparse_lru_end_to_end(
                     )
 
             pre_lru = lru_slots[b, 0].detach().clone()
-            pre_tokens = device_buffer_tokens[b, 0].detach().clone()
+            # Only pass LRU region tokens (first hot_buffer_size slots) for expected calculation
+            pre_tokens = device_buffer_tokens[b, 0, :hot_buffer_size].detach().clone()
             expected_lru = _expected_lru(
                 pre_lru,
                 pre_tokens,
@@ -360,7 +371,6 @@ def test_sparse_lru_end_to_end(
                     page_table,
                     diff_map,
                     req_pool_indices,
-                    sparse_mask,
                     seq_lens,
                     lru_slots,
                     transfer_tasks_src,
@@ -400,7 +410,7 @@ def test_sparse_lru_end_to_end(
 
                 token_to_slot = {
                     int(device_buffer_tokens[b, 0, i].item()): i
-                    for i in range(hot_buffer_size)
+                    for i in range(total_buffer_slots)
                 }
                 for i in range(num_top_k):
                     token_id = int(top_k_tokens[b, i].item())
@@ -478,6 +488,202 @@ def test_sparse_lru_end_to_end(
     print(f"[timing] per_round_ms={per_round_ms}")
 
 
+def test_fast_path(
+    *,
+    batch_size: int = 1,
+    hot_buffer_size: int = 1024,
+    block_size: int = 512,
+    kv_lora_rank: int = 512,
+) -> None:
+    """
+    Test fast path: seq_len <= HOT_BUFFER_SIZE
+    In this case:
+    - tokens 0 to seq_len-2: read from page_table
+    - token seq_len-1 (newest): fixed at HOT_BUFFER_SIZE position
+    - No host->device transfer needed (transfer count should be 0)
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+
+    page_size = 1
+    layer_id = 0
+
+    qk_rope_head_dim = 64
+    dtype = torch.float16
+
+    # Test with seq_len values smaller than hot_buffer_size
+    test_seq_lens = [10, 50, 100, hot_buffer_size // 2, hot_buffer_size]
+
+    total_buffer_slots = hot_buffer_size + page_size
+    device_pool_size = batch_size * total_buffer_slots * page_size
+    mem_pool_device = MLATokenToKVPool(
+        size=device_pool_size,
+        page_size=page_size,
+        dtype=dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        layer_num=1,
+        device=device,
+        enable_memory_saver=False,
+    )
+
+    # Host pool needs to be large enough
+    max_test_seq_len = max(test_seq_lens) + 100
+    host_pool_size = batch_size * max_test_seq_len * 2
+    mem_pool_host = MLATokenToKVPoolHost(
+        device_pool=mem_pool_device,
+        host_to_device_ratio=10.0,
+        host_size=0,
+        page_size=page_size,
+        layout="layer_first",
+        pin_memory=True,
+        device="cpu",
+    )
+
+    feature_dim = mem_pool_host.kv_buffer[layer_id].shape[-1]
+    item_size_bytes = feature_dim * mem_pool_host.dtype.itemsize
+
+    # Initialize host cache with token ids
+    token_ids = torch.arange(mem_pool_host.size, dtype=dtype, device="cpu")
+    token_ids = token_ids.view(-1, 1).repeat(1, feature_dim)
+    mem_pool_host.kv_buffer[layer_id][: mem_pool_host.size, 0].copy_(token_ids)
+
+    print(f"\n{'='*60}")
+    print(f"Testing Fast Path (seq_len <= HOT_BUFFER_SIZE)")
+    print(f"hot_buffer_size={hot_buffer_size}, batch_size={batch_size}")
+    print(f"{'='*60}")
+
+    for test_seq_len in test_seq_lens:
+        print(f"\n[Test] seq_len={test_seq_len}")
+
+        # Use seq_len as num_top_k for fast path test (all tokens are "top-k")
+        num_top_k = test_seq_len
+
+        host_cache_locs = torch.empty(
+            (batch_size, max_test_seq_len), dtype=torch.int64, device=device
+        )
+        device_buffer_locs = torch.empty(
+            (batch_size, 1, total_buffer_slots), dtype=torch.int32, device=device
+        )
+        device_buffer_tokens = torch.empty(
+            (batch_size, 1, total_buffer_slots), dtype=torch.int32, device=device
+        )
+        lru_slots = (
+            torch.arange(hot_buffer_size, dtype=torch.int16, device=device)
+            .reshape(1, 1, -1)
+            .repeat(batch_size, 1, 1)
+        )
+
+        # Initialize page_table: token i -> page i (sequential)
+        page_table = torch.arange(
+            max_test_seq_len, dtype=torch.int32, device=device
+        ).unsqueeze(0).repeat(batch_size, 1)
+
+        for b in range(batch_size):
+            host_base = b * max_test_seq_len
+            host_cache_locs[b] = torch.arange(
+                host_base, host_base + max_test_seq_len, dtype=torch.int64, device=device
+            )
+            device_base = b * total_buffer_slots
+            device_buffer_locs[b, 0] = torch.arange(
+                device_base, device_base + total_buffer_slots, dtype=torch.int32, device=device
+            )
+            device_buffer_tokens[b, 0].fill_(-1)
+
+        top_k_tokens = torch.empty(
+            (batch_size, num_top_k), dtype=torch.int32, device=device
+        )
+        top_k_device_locs = torch.full(
+            (batch_size, num_top_k), -1, dtype=torch.int32, device=device
+        )
+        diff_map = torch.full(
+            (batch_size, max_test_seq_len), -1, dtype=torch.int16, device=device
+        )
+        req_pool_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
+        seq_lens = torch.full((batch_size,), test_seq_len, dtype=torch.int64, device=device)
+
+        transfer_tasks_src, transfer_tasks_dst = _build_transfer_tasks(
+            batch_size, num_top_k, page_size
+        )
+
+        # Set top_k_tokens to all tokens from 0 to seq_len-1
+        for b in range(batch_size):
+            top_k_tokens[b] = torch.arange(test_seq_len, dtype=torch.int32, device=device)
+
+        # JIT compile
+        _jit_sparse_module(
+            item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla=True
+        )
+
+        # Run kernel
+        load_cache_to_device_buffer_mla(
+            top_k_tokens,
+            device_buffer_tokens,
+            host_cache_locs,
+            device_buffer_locs,
+            mem_pool_host.kv_buffer[layer_id],
+            mem_pool_device.kv_buffer[layer_id],
+            top_k_device_locs,
+            page_table,
+            diff_map,
+            req_pool_indices,
+            seq_lens,
+            lru_slots,
+            transfer_tasks_src,
+            transfer_tasks_dst,
+            page_size,
+            layer_id,
+            item_size_bytes,
+            block_size=block_size,
+            num_top_k=num_top_k,
+            hot_buffer_size=hot_buffer_size,
+        )
+        torch.cuda.synchronize()
+
+        # Verify results
+        tasks_per_block = num_top_k * page_size
+        stride_per_block = tasks_per_block + 1
+
+        all_passed = True
+        for b in range(batch_size):
+            # Check transfer count is 0 (fast path should not transfer)
+            count_idx = b * stride_per_block + tasks_per_block
+            transfer_count = int(transfer_tasks_src[count_idx].item())
+            if transfer_count != 0:
+                print(f"  [FAIL] batch {b}: transfer_count={transfer_count}, expected 0")
+                all_passed = False
+
+            # Check top_k_device_locs
+            newest_idx = test_seq_len - 1
+            for i in range(test_seq_len):
+                token_id = int(top_k_tokens[b, i].item())
+                device_loc = int(top_k_device_locs[b, i].item())
+
+                if token_id == newest_idx:
+                    # Newest token should be at HOT_BUFFER_SIZE position
+                    expected_loc = int(device_buffer_locs[b, 0, hot_buffer_size].item())
+                    if device_loc != expected_loc:
+                        print(f"  [FAIL] batch {b}, token {token_id} (newest): "
+                              f"device_loc={device_loc}, expected={expected_loc}")
+                        all_passed = False
+                else:
+                    # Non-newest tokens should come from page_table
+                    expected_loc = int(page_table[b, token_id].item())
+                    if device_loc != expected_loc:
+                        print(f"  [FAIL] batch {b}, token {token_id}: "
+                              f"device_loc={device_loc}, expected={expected_loc}")
+                        all_passed = False
+
+        if all_passed:
+            print(f"  [PASS] All checks passed!")
+        else:
+            print(f"  [FAIL] Some checks failed!")
+
+    print(f"\n{'='*60}")
+    print("Fast Path Test Complete")
+    print(f"{'='*60}\n")
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -489,14 +695,26 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--block_size", type=int, default=512)
+    parser.add_argument("--kv_lora_rank", type=int, default=512)
+    parser.add_argument("--test_fast_path", action="store_true",
+                        help="Run fast path test (seq_len <= hot_buffer_size)")
     args = parser.parse_args()
 
-    test_sparse_lru_end_to_end(
-        batch_size=args.batch_size,
-        diff_ratio=args.diff_ratio,
-        num_top_k=args.num_top_k,
-        hot_buffer_size=args.hot_buffer_size,
-        rounds=args.rounds,
-        warmup=args.warmup,
-        block_size=args.block_size,
-    )
+    if args.test_fast_path:
+        test_fast_path(
+            batch_size=args.batch_size,
+            hot_buffer_size=args.hot_buffer_size,
+            block_size=args.block_size,
+            kv_lora_rank=args.kv_lora_rank,
+        )
+    else:
+        test_sparse_lru_end_to_end(
+            batch_size=args.batch_size,
+            diff_ratio=args.diff_ratio,
+            num_top_k=args.num_top_k,
+            hot_buffer_size=args.hot_buffer_size,
+            rounds=args.rounds,
+            warmup=args.warmup,
+            block_size=args.block_size,
+            kv_lora_rank=args.kv_lora_rank,
+        )
