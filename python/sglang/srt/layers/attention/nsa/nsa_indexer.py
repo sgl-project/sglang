@@ -145,6 +145,7 @@ class Indexer(MultiPlatformOp):
         scale_fmt: Optional[str],
         block_size: int = 128,
         rope_scaling: Optional[Dict[str, Any]] = None,
+        is_neox_style: bool = True,
         prefix: str = "",
         quant_config: Optional[QuantizationConfig] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
@@ -202,7 +203,7 @@ class Indexer(MultiPlatformOp):
             max_position=max_position_embeddings,
             base=rope_theta,  # type: ignore
             rope_scaling=rope_scaling,
-            is_neox_style=True,
+            is_neox_style=is_neox_style,
             device=get_global_server_args().device,
         )
         self.block_size = block_size
