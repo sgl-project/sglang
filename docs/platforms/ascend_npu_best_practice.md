@@ -1,6 +1,6 @@
 # Best Practice on Ascend NPU
 
-This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend Npu. If
+This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend NPU. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## DeepSeek Series Models

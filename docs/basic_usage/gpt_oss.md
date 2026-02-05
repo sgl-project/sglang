@@ -105,7 +105,7 @@ print(response.output_text)
 # Test python tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helfpul assistant, you could use python tool to execute code.",
+    instructions="You are a helpful assistant, you could use python tool to execute code.",
     input="Use python tool to calculate the sum of 29138749187 and 29138749187", # 58,277,498,374
     tools=tools
 )
@@ -115,7 +115,7 @@ print(response.output_text)
 # Test browser tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helfpul assistant, you could use browser to search the web",
+    instructions="You are a helpful assistant, you could use browser to search the web",
     input="Search the web for the latest news about Nvidia stock price",
     tools=tools
 )

@@ -32,9 +32,9 @@ pip install -e .
 
 Current SGLang-MindSpore supports Qwen3 and DeepSeek V3/R1 models. This doc uses Qwen3-8B as an example.
 
-### Offline infer
+### Offline inference
 
-Use the following script for offline infer:
+Use the following script for offline inference:
 
 ```python
 import sglang as sgl
