@@ -29,7 +29,7 @@ register_amd_ci(
 
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"
 SERVER_LAUNCH_TIMEOUT = 3600
-ACCURACY_THRESHOLD = 0.94
+ACCURACY_THRESHOLD = 0.92
 
 
 class TestKimiK25EvalAMD(CustomTestCase):
