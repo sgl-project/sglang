@@ -27,8 +27,7 @@ if is_flashinfer_available():
 
 class FlashInferWorkspaceManager:
     def __init__(self):
-        self.workspace_tensor = None
-        self.ipc_handles = None
+        self.workspace = None
         self.world_size = None
         self.rank = None
         self.initialized = False
@@ -54,15 +53,13 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
 
-        self.ipc_handles, self.workspace_tensor = (
-            comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                rank,
-                world_size,
-                max_token_num,
-                hidden_dim,
-                group=group,
-                use_fp32_lamport=use_fp32_lamport,
-            )
+        self.workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=torch.float32 if use_fp32_lamport else torch.bfloat16,
         )
 
         self.world_size = world_size
@@ -76,16 +73,13 @@ class FlashInferWorkspaceManager:
 
     def cleanup(self):
         """Clean up workspace"""
-        if self.initialized and self.ipc_handles is not None:
+        if self.initialized and self.workspace is not None:
             try:
-                _flashinfer_comm.trtllm_destroy_ipc_workspace_for_all_reduce(
-                    self.ipc_handles, group=dist.group.WORLD
-                )
+                self.workspace.destroy()
             except Exception as e:
                 logger.warning(f"Failed to cleanup FlashInfer workspace: {e}")
             finally:
-                self.workspace_tensor = None
-                self.ipc_handles = None
+                self.workspace = None
                 self.initialized = False
 
 
@@ -186,33 +180,21 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("FlashInfer workspace not available")
         return None, None
 
-    token_num, hidden_dim = input_tensor.shape
-
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
-    _flashinfer_comm.trtllm_allreduce_fusion(
-        allreduce_in=input_tensor,
-        world_size=world_size,
-        world_rank=dist.get_rank(),
-        token_num=token_num,
-        hidden_dim=hidden_dim,
-        workspace_ptrs=_workspace_manager.workspace_tensor,
+    _flashinfer_comm.allreduce_fusion(
+        input=input_tensor,
+        workspace=_workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
         launch_with_pdl=True,
-        use_oneshot=use_oneshot,
-        trigger_completion_at_end=trigger_completion_at_end,
-        fp32_acc=fp32_acc,
-        pattern_code=(_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm),
-        allreduce_out=None,
-        residual_in=residual,
         residual_out=residual_out,
         norm_out=norm_out,
-        quant_out=None,
-        scale_out=None,
+        residual_in=residual,
         rms_gamma=weight,
         rms_eps=eps,
-        scale_factor=None,
-        layout_code=None,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
     )
 
     return norm_out, residual_out
