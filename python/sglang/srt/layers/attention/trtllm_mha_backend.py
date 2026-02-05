@@ -21,7 +21,11 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm90_supported, is_sm100_supported, is_sm120_supported
+from sglang.srt.utils.common import (
+    is_sm90_supported,
+    is_sm100_supported,
+    is_sm120_supported,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -551,29 +555,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_size=self.page_size,
         )
 
-    def _prepare_nvfp4_metadata_for_extend(
-        self, forward_mode: ForwardMode, req_pool_indices: torch.Tensor
-    ):
-        """This must be called after init_forward_metadata/capture_cuda_graph/replay_cuda_graph"""
-        # construct nvfp4 kv cache dequant page table for extend stage
-        metadata = self.forward_metadata
-
-        if self.is_nvfp4_kvcache and forward_mode.is_extend_without_speculative():
-            num_pages_per_req = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-
-            row_offsets = torch.arange(
-                0, num_pages_per_req, device=self.device, dtype=torch.int32
-            ).unsqueeze(0)
-            batch_offsets = (
-                metadata.cu_seqlens_k + self.page_size - 1
-            ) // self.page_size
-            batch_offsets = batch_offsets.unsqueeze(1)
-            self.dq_page_table = row_offsets + batch_offsets + 1
-            self.dq_page_table = self.dq_page_table.to(torch.int32)
-            self.cpu_req_pool_indices = req_pool_indices.to("cpu", non_blocking=True)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
 
@@ -673,24 +654,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.extend_lengths_kv_cpu = forward_batch.extend_seq_lens_cpu
                 self.prefix_lengths_kv_cpu = forward_batch.extend_prefix_lens_cpu
 
-            # if self.is_nvfp4_kvcache:
-            #     num_pages_per_req = (
-            #         metadata.max_seq_len_k + self.page_size - 1
-            #     ) // self.page_size
-
-            #     row_offsets = torch.arange(
-            #         0, num_pages_per_req, device=self.device, dtype=torch.int32
-            #     ).unsqueeze(0)
-            #     batch_offsets = (
-            #         metadata.cu_seqlens_k + self.page_size - 1
-            #     ) // self.page_size
-            #     batch_offsets = batch_offsets.unsqueeze(1)
-            #     self.dq_page_table = row_offsets + batch_offsets + 1
-            #     self.dq_page_table = self.dq_page_table.to(torch.int32)
-            #     self.cpu_req_pool_indices = forward_batch.req_pool_indices.to(
-            #         "cpu", non_blocking=True
-            #     )
-
         # Convert the page table to a strided format
         if self.page_size > 1:
             self.strided_indices = torch.arange(
@@ -702,9 +665,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self.forward_metadata = metadata
 
-        self._prepare_nvfp4_metadata_for_extend(
-            forward_batch.forward_mode, forward_batch.req_pool_indices
-        )
+        self._prepare_nvfp4_metadata_for_extend(forward_batch)
 
     def forward_decode(
         self,
@@ -772,7 +733,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # prepare query
         # For XQA, q_dtype should be bf16
-        if (self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache) and (not self.is_xqa_impl):
+        if (self.data_type == torch.float8_e4m3fn or self.is_nvfp4_kvcache) and (
+            not self.is_xqa_impl
+        ):
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
 
@@ -836,6 +799,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
+        # FIXME(Sam): Here XQA only support fp16 input for now, we will add bf16 support when flashinfer release.
+        if self.is_xqa_impl and self.is_nvfp4_kvcache:
+            q = q.to(torch.float16)
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
@@ -849,12 +815,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # TODO: add attention_sink operation if needed
             sinks=attention_sink,
             out_dtype=q.dtype,  # model_runner.dtype
-            # out_dtype=self.q_data_type,  # model_runner.dtype
-            # kv_block_scales=kv_cache_block_scales,
+            kv_cache_sf=kv_cache_block_scales,
         )
         o = o.to(self.q_data_type)
-        # import sys
-        # sys.stdout.flush()
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_extend(

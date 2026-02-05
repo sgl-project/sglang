@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
-    MHATokenToKVPoolFP4,
+    MHATokenToKVPoolNVFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
@@ -552,7 +552,9 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    self.token_to_kv_pool = MHATokenToKVPoolFP4(
+                    # TODO(Sam): Add a env flag to choose between NVFP4 and other FP4
+                    # self.token_to_kv_pool = MHATokenToKVPoolFP4(
+                    self.token_to_kv_pool = MHATokenToKVPoolNVFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,

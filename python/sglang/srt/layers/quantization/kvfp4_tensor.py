@@ -14,7 +14,6 @@
 
 # Define a enum class for FP4 formats, including MXFP4, NVFP4 and future formats
 from enum import Enum
-from typing import Union
 
 import torch
 
@@ -260,7 +259,7 @@ class NVFP4QuantizeUtil:
         return output
 
     @staticmethod
-    def cuda_nvfp4_quantize_sm100(
+    def cuda_nvfp4_quantize_blackwell(
         tensor: torch.Tensor,
         global_scale: torch.Tensor,
         dtype: torch.dtype = torch.bfloat16,
@@ -377,7 +376,7 @@ class NVFP4QuantizeUtil:
 
         # Step 2: Scale x_bf16 to FP4 range [-6, 6]
         # First, reshape to blocks [B, M*N/16, 16]
-        reshaped = tensor.float().view(b, m * n // 16, 16)
+        reshaped = tensor.float().view(b, m, n // 16, 16)
         block_max = reshaped.abs().amax(dim=-1, keepdim=True)
         block_scales = block_max.squeeze(-1) / (E2M1_MAX * global_scale)
         block_scales = torch.clamp(block_scales, 0.0, MAX_BLOCK_SCALE_FP8)
@@ -770,7 +769,6 @@ inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4])
         "f"(array[3].x), "f"(array[3].y));
     return val;
 #else
-    // Fallback for non-SM100
     return 0;
 #endif
 }
@@ -1104,6 +1102,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                     "-DENABLE_BF16",
                     "--expt-relaxed-constexpr",
                     "-gencode=arch=compute_100a,code=sm_100a",
+                    "-gencode=arch=compute_120a,code=sm_120a",
                 ],
                 verbose=False,
                 with_cuda=True,

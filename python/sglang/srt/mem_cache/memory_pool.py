@@ -45,6 +45,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
 )
+from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -52,7 +53,14 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2, is_float4_e2m1fn_x2
+from sglang.srt.utils import (
+    is_cuda,
+    is_float4_e2m1fn_x2,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+)
+from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -1020,83 +1028,7 @@ class MHATokenToKVPool(KVCache):
             )
 
 
-class FP8TemporaryBufferPool:
-    """Temporary FP8 buffer pool for prefill attention computation."""
-
-    def __init__(
-        self,
-        max_buffer_size: int,
-        num_layers: int,
-        num_kv_heads: int,
-        head_dim: int,
-        device: str,
-    ):
-        self.max_buffer_size = max_buffer_size
-        self.num_layers = num_layers
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-        self.device = device
-
-        # shape: [num_layers, max_seq_len, num_kv_heads, head_dim]
-        self.k_fp8_buffer = torch.empty(
-            (num_layers, max_buffer_size, num_kv_heads, head_dim),
-            dtype=torch.float8_e4m3fn,
-            device=device,
-        )
-        self.v_fp8_buffer = torch.empty(
-            (num_layers, max_buffer_size, num_kv_heads, head_dim),
-            dtype=torch.float8_e4m3fn,
-            device=device,
-        )
-
-    def get_buffer_slice(self, layer_id: int, seq_len: int):
-        """Get FP8 buffer slice for current sequence length."""
-        return (
-            self.k_fp8_buffer[layer_id, :seq_len],
-            self.v_fp8_buffer[layer_id, :seq_len],
-        )
-
-
 class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
-
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-        enable_alt_stream: bool = True,
-        enable_kv_cache_copy: bool = False,
-    ):
-        super().__init__(
-            size,
-            page_size,
-            dtype,
-            head_num,
-            head_dim,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
-            enable_alt_stream,
-            enable_kv_cache_copy,
-        )
-
-        # FP4 recipe from environment variable
-        # from sglang.srt.layers.quantization.fp4_utils import FP4KVCacheRecipe
-        # recipe_str = envs.SGLANG_FP4_KVCACHE_RECIPE.get()
-        # self.fp4_recipe = FP4KVCacheRecipe[recipe_str]
-
-        from sglang.srt.layers.quantization.kvfp4_tensor import NVFP4QuantizeUtil
-
-        self.fp4_quant_util = NVFP4QuantizeUtil
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -1179,6 +1111,12 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer].view(torch.float8_e4m3fn),
         )
 
+    def get_fp4_value_buffer(self, layer_id: int):
+        return self._get_value_nvfp4_from_nvfp4_buffer(layer_id)
+
+    def get_fp4_key_buffer(self, layer_id: int):
+        return self._get_key_nvfp4_from_nvfp4_buffer(layer_id)
+
     def _get_key_buffer(self, layer_id: int, k_global_scale: float):
         # for internal use of referencing
         cache_k_nope_fp4 = self.k_buffer[layer_id - self.start_layer].view(torch.uint8)
@@ -1186,7 +1124,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
             torch.float8_e4m3fn
         )
 
-        cache_k_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
+        cache_k_nope_fp4_dequant = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
             cache_k_nope_fp4, cache_k_nope_fp4_sf, k_global_scale
         )
         return cache_k_nope_fp4_dequant
@@ -1198,7 +1136,7 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
             torch.float8_e4m3fn
         )
 
-        cache_v_nope_fp4_dequant = self.fp4_quant_util.cuda_nvfp4_dequantize(
+        cache_v_nope_fp4_dequant = NVFP4QuantizeUtil.cuda_nvfp4_dequantize(
             cache_v_nope_fp4, cache_v_nope_fp4_sf, v_global_scale
         )
         return cache_v_nope_fp4_dequant
@@ -1226,12 +1164,20 @@ class MHATokenToKVPoolNVFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
 
-        cache_k, cache_k_fp4_sf, _ = self.fp4_quant_util.cuda_nvfp4_quantize_sm100(
-            cache_k, k_scale
-        )
-        cache_v, cache_v_fp4_sf, _ = self.fp4_quant_util.cuda_nvfp4_quantize_sm100(
-            cache_v, v_scale
-        )
+        if is_sm100_supported() or is_sm120_supported():
+            cache_k, cache_k_fp4_sf, _ = (
+                NVFP4QuantizeUtil.cuda_nvfp4_quantize_blackwell(cache_k, k_scale)
+            )
+            cache_v, cache_v_fp4_sf, _ = (
+                NVFP4QuantizeUtil.cuda_nvfp4_quantize_blackwell(cache_v, v_scale)
+            )
+        else:
+            cache_k, cache_k_fp4_sf, _ = NVFP4QuantizeUtil.batched_quantize(
+                cache_k, k_scale
+            )
+            cache_v, cache_v_fp4_sf, _ = NVFP4QuantizeUtil.batched_quantize(
+                cache_v, v_scale
+            )
 
         cache_k = cache_k.view(torch.uint8)
         cache_v = cache_v.view(torch.uint8)
@@ -1440,6 +1386,7 @@ class HybridLinearKVPool(KVCache):
         if not use_mla:
 
             if is_float4_e2m1fn_x2(dtype):
+                # TODO(Sam): Add a env flag to choose between NVFP4 and other FP4
                 # TokenToKVPoolClass = MHATokenToKVPoolFP4
                 TokenToKVPoolClass = MHATokenToKVPoolNVFP4
             else:
@@ -1945,7 +1892,9 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
             if cache_k_nope.dtype != self.dtype:
-                from sglang.srt.layers.quantization.kvfp4_tensor import KVFP4QuantizeUtil
+                from sglang.srt.layers.quantization.kvfp4_tensor import (
+                    KVFP4QuantizeUtil,
+                )
 
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = (
                     KVFP4QuantizeUtil.batched_quantize(cache_k_nope)
