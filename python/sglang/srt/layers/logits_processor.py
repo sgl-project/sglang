@@ -346,6 +346,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                target_extend_input_embeds=logits_metadata.target_extend_input_embeds,
             )
 
         # Start to process input logprobs
@@ -391,6 +392,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+            target_extend_input_embeds=logits_metadata.target_extend_input_embeds,
         )
 
     def _get_pruned_states(
@@ -1072,6 +1074,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=input_top_logprobs_idx,
             input_token_ids_logprobs_val=input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            target_extend_input_embeds=logits_metadata.target_extend_input_embeds,
         )
 
 
