@@ -98,6 +98,9 @@ class GPUWorker:
                 [
                     self.pipeline.get_module("transformer"),
                     self.pipeline.get_module("transformer_2"),
+                    self.pipeline.get_module("video_dit"),
+                    self.pipeline.get_module("video_dit_2"),
+                    self.pipeline.get_module("audio_dit"),
                 ],
             ):
                 if isinstance(dit, OffloadableDiTMixin):
@@ -159,11 +162,14 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            req.log(server_args=self.server_args)
             result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):
                 output_batch = OutputBatch(
                     output=result.output,
+                    audio=getattr(result, "audio", None),
+                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
@@ -181,7 +187,9 @@ class GPUWorker:
 
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                PerformanceLogger.log_request_summary(timings=output_batch.timings)
+                # Avoid logging warmup perf records that share the same request_id.
+                if not req.is_warmup:
+                    PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True
