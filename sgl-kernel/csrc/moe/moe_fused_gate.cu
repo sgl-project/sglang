@@ -155,7 +155,7 @@ __device__ void moe_fused_gate_impl(
 
       if (thread_group_idx == thread_to_clear_in_group) {
         // only clear the first element will be used later
-          bias_chunk[0] = static_cast<T>(FLT_MAX);
+        bias_chunk[0] = static_cast<T>(FLT_MAX);
       }
     }
   }
