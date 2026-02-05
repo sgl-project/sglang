@@ -43,7 +43,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -485,7 +485,12 @@ class Scheduler(
             )[0]
 
     def init_moe_gemm_config(self):
-        if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
+        # For the MM models, check the text_config for MoE settings
+        config_to_check = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
+
+        if hasattr(config_to_check, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
@@ -949,7 +954,7 @@ class Scheduler(
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
-            self.mm_receiver = MMReceiver(
+            self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
                 hf_config=self.model_config.hf_config,
                 pp_rank=self.pp_rank,
@@ -1415,6 +1420,10 @@ class Scheduler(
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
+            # For session requests, keep mm_inputs for the next request
+            if req.session_id:
+                continue
+            # For non-session requests, clear features and mm_inputs
             for item in mm_inputs.mm_items:
                 item.feature = None
             req.multimodal_inputs = None
@@ -1508,6 +1517,19 @@ class Scheduler(
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
+            # For session requests, adjust mm_inputs offsets by the prefix length.
+            # Session.create_req prepends previous context to origin_input_ids,
+            # so offsets from the new prompt need to be shifted.
+            if len(recv_req.input_ids) < len(req.origin_input_ids):
+                assert recv_req.session_params.id in self.sessions
+                prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+                for mm_item in image_inputs.mm_items:
+                    if mm_item.offsets:
+                        mm_item.offsets = [
+                            (start + prefix_len, end + prefix_len)
+                            for start, end in mm_item.offsets
+                        ]
+
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
@@ -1545,13 +1567,14 @@ class Scheduler(
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
-            if req.is_prefill_only:
+            if recv_req.return_logprob and recv_req.token_ids_logprob is None:
+                # If logprob is required but neither token_ids_logprob nor logprob_start_len is
+                # set, return the logprobs for output tokens by default
+                req.logprob_start_len = len(req.origin_input_ids) - 1
+            elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
                 req.logprob_start_len = len(req.origin_input_ids)
-            elif recv_req.return_logprob:
-                # If return_logprob is True, return the logprobs for output tokens by default
-                req.logprob_start_len = len(req.origin_input_ids) - 1
             else:
                 # If return_logprob is False, only the last token requires logprob computation
                 req.logprob_start_len = -1
@@ -1676,7 +1699,10 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hierarchical_cache:
+                if self.enable_hicache_storage:
+                    # Release prefetch events associated with the request
+                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
@@ -1704,6 +1730,9 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
+                if self.enable_hicache_storage:
+                    # Release prefetch events associated with the request
+                    self.tree_cache.release_aborted_request(req.rid)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -1791,11 +1820,6 @@ class Scheduler(
 
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
-        # Chunked request keeps its rid but will get a new req_pool_idx
-        if self.tp_worker.model_runner.mambaish_config is not None:
-            self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=False)
-        else:
-            self.req_to_token_pool.free(req.req_pool_idx)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()
@@ -2028,6 +2052,10 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+                # Pop the number of tokens loaded from storage (L3 hits)
+                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                    req.rid
+                )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
@@ -2088,14 +2116,10 @@ class Scheduler(
         if self.dllm_staging_reqs.non_empty():
             self.dllm_staging_reqs.update_chunked_status()
 
-        # Print stats
-        if self.current_scheduler_metrics_enabled:
-            self.log_prefill_stats(
-                adder,
-                can_run_list,
-                running_bs=len(self.running_batch.reqs),
-                running_bs_offline_batch=0,
-            )
+        # Record for logging prefill stats after forward
+        self.adder = adder
+        self.can_run_list = can_run_list
+        self.running_bs = len(self.running_batch.reqs)
 
         # Record metrics
         for req in can_run_list:

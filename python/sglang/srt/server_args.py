@@ -62,6 +62,7 @@ from sglang.srt.utils.common import (
     json_list_type,
     nullable_str,
     parse_connector_type,
+    torch_release,
     wait_port_available,
     xpu_has_xmx_support,
 )
@@ -93,6 +94,7 @@ LOAD_FORMAT_CHOICES = [
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",
+    "mxfp8",
     "gptq",
     "marlin",
     "gptq_marlin",
@@ -196,6 +198,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
     "flashinfer_trtllm",
+    "flashinfer_deepgemm",
     "cutlass",
     "triton",
     "aiter",
@@ -377,6 +380,7 @@ class ServerArgs:
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
+    extra_metric_labels: Optional[Dict[str, str]] = None
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
@@ -848,9 +852,14 @@ class ServerArgs:
             if not os.path.exists(self.model_path):
                 from modelscope import snapshot_download
 
-                self.model_path = snapshot_download(self.model_path)
+                self.model_path = snapshot_download(
+                    self.model_path, cache_dir=self.download_dir, revision=self.revision
+                )
                 self.tokenizer_path = snapshot_download(
-                    self.tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
+                    self.tokenizer_path,
+                    cache_dir=self.download_dir,
+                    revision=self.revision,
+                    ignore_patterns=["*.bin", "*.safetensors"],
                 )
 
         # Mamba scheduler strategy
@@ -1048,7 +1057,7 @@ class ServerArgs:
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
-            if model_config.is_multimodal:
+            if model_config.is_multimodal and not self.language_only:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
             # If symm mem is enabled and prealloc size is not set, set it to 4GB
@@ -1101,7 +1110,7 @@ class ServerArgs:
             list(range(4, 33, 4))
             + list(range(48, 257, 16))
             + list(range(288, 513, 32))
-            + list(range(640, 1024 + 1, 64))
+            + list(range(576, 1024 + 1, 64))
             + list(range(1280, 4096 + 1, 256))
             + list(range(4608, self.piecewise_cuda_graph_max_tokens + 1, 512))
         )
@@ -1397,6 +1406,26 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
                 )
+        elif "Step3p5ForCausalLM" in model_arch:
+            if self.speculative_algorithm == "EAGLE":
+                self.enable_multi_layer_eagle = True
+                logger.info(
+                    "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
+                )
+                if not envs.SGLANG_ENABLE_SPEC_V2.get():
+                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
+                    logger.warning(
+                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
+                    )
+            if self.enable_hierarchical_cache:
+                self.swa_full_tokens_ratio = 1.0
+                logger.warning(
+                    "Reset swa_full_tokens_ratio to 1.0 for Step3p5ForCausalLM model with hierarchical cache"
+                )
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
+                )
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
@@ -1439,15 +1468,17 @@ class ServerArgs:
                 f"Disable hybrid SWA memory for {model_arch} as it is not yet supported."
             )
             self.disable_hybrid_swa_memory = True
-        elif model_arch in ["Exaone4ForCausalLM"]:
+        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
-                # https://docs.sglang.ai/advanced_features/attention_backend.html
-                assert self.attention_backend in {
-                    "fa3",
-                    "triton",
-                    "trtllm_mha",
-                }, "fa3, triton, or trtllm_mla is required for Exaone4ForCausalLM-32B"
+                logger.warning(
+                    f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
+                )
                 self.disable_hybrid_swa_memory = True
+                # https://docs.sglang.ai/advanced_features/attention_backend.html
+                accepted_backends = ["fa3", "triton", "trtllm_mha"]
+                assert (
+                    self.attention_backend in accepted_backends
+                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
@@ -2013,6 +2044,14 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.quantization == "mxfp8":
+            if self.moe_runner_backend not in ["auto", "cutlass"]:
+                logger.warning(
+                    "mxfp8 quantization forces --moe-runner-backend=cutlass. "
+                    f"Overriding {self.moe_runner_backend!r}."
+                )
+            self.moe_runner_backend = "cutlass"
+
         if self.moe_runner_backend == "flashinfer_cutlass":
             assert self.quantization in [
                 "modelopt_fp4",
@@ -2041,14 +2080,18 @@ class ServerArgs:
             logger.warning(
                 "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
             )
-            assert (
-                self.quantization == "fp8"
-            ), "cutlass MoE is only supported with fp8 quantization"
+            assert self.quantization in [
+                "fp8",
+                "mxfp8",
+            ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
             self.moe_runner_backend = "cutlass"
-        if self.moe_runner_backend == "cutlass" and self.quantization == "fp8":
+        if self.moe_runner_backend == "cutlass" and self.quantization in [
+            "fp8",
+            "mxfp8",
+        ]:
             assert (
                 self.ep_size == 1
-            ), "FP8 Cutlass MoE is only supported with ep_size == 1"
+            ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
@@ -2126,6 +2169,11 @@ class ServerArgs:
                 assert (
                     self.eplb_algorithm == "elasticity_aware"
                 ), "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware'."
+
+            if self.elastic_ep_backend == "mooncake":
+                self.mooncake_ib_device = self._validate_ib_devices(
+                    self.mooncake_ib_device
+                )
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -2455,6 +2503,62 @@ class ServerArgs:
             raise ValueError(
                 "requires at least one encoder urls to be set via --encoder-urls"
             )
+
+        # Validate IB devices when mooncake backend is used
+        if (
+            self.disaggregation_transfer_backend == "mooncake"
+            and self.disaggregation_mode in ("prefill", "decode")
+        ) or self.encoder_transfer_backend == "mooncake":
+            self.disaggregation_ib_device = self._validate_ib_devices(
+                self.disaggregation_ib_device
+            )
+
+    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+        """
+        Validate IB devices before passing to mooncake.
+
+        Args:
+            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+
+        Returns:
+            Normalized comma-separated string of validated device names, or None if input is None.
+        """
+        if device_str is None:
+            logger.warning(
+                "No IB devices specified for Mooncake backend, falling back to auto discovery."
+            )
+            return None
+
+        # Strip whitespace from device names
+        devices = [d.strip() for d in device_str.split(",") if d.strip()]
+        if len(devices) == 0:
+            raise ValueError("No valid IB devices specified")
+
+        # Check for duplicates
+        if len(devices) != len(set(devices)):
+            raise ValueError(f"Duplicate IB devices specified: {device_str}")
+
+        # Get available IB devices from sysfs
+        ib_sysfs_path = "/sys/class/infiniband"
+        if not os.path.isdir(ib_sysfs_path):
+            raise RuntimeError(
+                f"InfiniBand sysfs path not found: {ib_sysfs_path}. "
+                "Please ensure InfiniBand drivers are installed."
+            )
+
+        available_devices = set(os.listdir(ib_sysfs_path))
+        if len(available_devices) == 0:
+            raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
+
+        # Check for invalid devices
+        invalid_devices = [d for d in devices if d not in available_devices]
+        if len(invalid_devices) != 0:
+            raise ValueError(
+                f"Invalid IB devices specified: {invalid_devices}. "
+                f"Available devices: {sorted(available_devices)}"
+            )
+
+        return ",".join(devices)
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
@@ -3287,6 +3391,13 @@ class ServerArgs:
             "'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set.",
         )
         parser.add_argument(
+            "--extra-metric-labels",
+            type=json.loads,
+            default=ServerArgs.extra_metric_labels,
+            help="The custom labels for metrics. "
+            'e.g. \'{"label1": "value1", "label2": "value2"}\'',
+        )
+        parser.add_argument(
             "--bucket-time-to-first-token",
             type=float,
             nargs="+",
@@ -3664,6 +3775,7 @@ class ServerArgs:
             "Options: 'auto' (default, auto-selects based on hardware), "
             "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
             "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), "
             "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
             "'triton' (fallback, widely compatible), "
             "'aiter' (ROCm only). "
@@ -4965,10 +5077,7 @@ class ServerArgs:
             # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
             import torch
 
-            parts = torch.__version__.split("+", 1)[0].split(".")
-            major = int(parts[0]) if len(parts) > 0 and parts[0].isdigit() else 0
-            minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
-            if (major, minor) > (2, 6):
+            if torch_release >= (2, 7):
                 logger.warning(
                     "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
                     f"  Current torch version is {torch.__version__}.\n"
@@ -5036,8 +5145,7 @@ class ServerArgs:
         if self.get_model_config().is_multimodal:
             import torch
 
-            torch_version = torch.__version__.split("+", 1)[0]
-            if torch_version == "2.9.1":
+            if torch_release[:3] == (2, 9, 1):
                 cudnn_version = None
                 try:
                     cudnn_version = torch.backends.cudnn.version()
