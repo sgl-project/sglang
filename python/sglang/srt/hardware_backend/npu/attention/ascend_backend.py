@@ -1125,6 +1125,12 @@ class AscendAttnBackend(AttentionBackend):
                     self.speculative_num_draft_tokens + query.shape[0],
                     self.speculative_num_draft_tokens,
                 )
+            if layer.attn_type == AttentionType.ENCODER_ONLY:
+                mask = None
+                sparse_mode = 0
+            else:
+                mask = self.mtp_mask
+                sparse_mode = 3
 
             attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 query,
@@ -1135,15 +1141,16 @@ class AscendAttnBackend(AttentionBackend):
                 num_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
-                atten_mask=self.mtp_mask,
+                atten_mask=mask,
                 scale=layer.scaling,
                 actual_seq_lengths=actual_seq_lengths,
                 actual_seq_lengths_kv=actual_seq_lengths_kv,
-                sparse_mode=3,
+                sparse_mode=sparse_mode,
             )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
                 not self.graph_mode
+                and forward_batch.num_token_non_padded_cpu is not None
                 and forward_batch.num_token_non_padded_cpu != num_token_padding
             ):
                 attn_output = torch.cat(
