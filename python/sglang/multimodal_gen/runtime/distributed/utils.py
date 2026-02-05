@@ -12,7 +12,6 @@ import pickle
 import time
 from collections import deque
 from collections.abc import Sequence
-from functools import lru_cache
 from typing import Any
 
 import torch
@@ -21,8 +20,6 @@ from torch.distributed import TCPStore
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
 
 
 def ensure_divisibility(numerator, denominator) -> None:

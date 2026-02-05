@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
-from sglang.multimodal_gen.runtime.distributed.utils import _get_folding_tp_group
+from sglang.multimodal_gen.runtime.distributed import _get_folding_tp_group
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
