@@ -284,6 +284,7 @@ import os
 
 models_to_cache = [
     'openbmb/MiniCPM-V-4',
+    'openbmb/MiniCPM-o-2_6',
 ]
 
 for model in models_to_cache:
