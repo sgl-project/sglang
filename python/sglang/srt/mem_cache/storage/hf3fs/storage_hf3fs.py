@@ -341,6 +341,7 @@ class HiCacheHF3FS(HiCacheStorage):
             is_mla_model=is_mla_model,
             is_page_first_layout=is_page_first_layout,
             use_mock_client=use_mock_client,
+            enable_storage_metrics=storage_config.enable_storage_metrics,
         )
 
     def _batch_get(
