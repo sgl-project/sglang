@@ -3,9 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
-from sglang.test.ascend.test_ascend_utils import (
-    LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH,
-)
+from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
