@@ -236,7 +236,7 @@ def load_model_from_full_model_state_dict(
         hasattr(p, "device_mesh") for p in meta_sd.values()
     )
 
-    # sSort parameter names to ensure all ranks process parameters in the same order
+    # sort parameter names to ensure all ranks process parameters in the same order
     sorted_param_names = sorted(custom_param_sd.keys())
 
     for target_param_name in sorted_param_names:
