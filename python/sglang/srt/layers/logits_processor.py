@@ -384,7 +384,6 @@ class LogitsProcessor(nn.Module):
             )
 
         return LogitsProcessorOutput(
-<<<<<<< HEAD
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
@@ -392,15 +391,6 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
-=======
-            next_token_logits=None,  # Multi-item scoring doesn't need next token logits
-            input_token_logprobs=input_token_logprobs,
-            input_top_logprobs_val=input_top_logprobs_val,
-            input_top_logprobs_idx=input_top_logprobs_idx,
-            input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-            target_extend_input_embeds=logits_metadata.target_extend_input_embeds,
->>>>>>> 7a8906f71950def58125e935f0c801f8944c674e
         )
 
     def _get_pruned_states(
@@ -594,22 +584,9 @@ class LogitsProcessor(nn.Module):
 
         return hidden_states_to_store
 
-<<<<<<< HEAD
     def _expand_metadata_for_logprobs(
         self, logits_metadata: LogitsMetadata, device: torch.device
     ):
-=======
-            # Decode mode or extend mode without return_logprob.
-            return LogitsProcessorOutput(
-                full_logits=full_logits,
-                next_token_logits=sampled_logits,
-                hidden_states=hidden_states_to_store,
-                target_extend_input_embeds=logits_metadata.target_extend_input_embeds,
-            )
-
-        # Start to process input logprobs
-        # Normalize the logprob w/o temperature, top-p
->>>>>>> 7a8906f71950def58125e935f0c801f8944c674e
         pruned_lens = torch.tensor(
             logits_metadata.extend_logprob_pruned_lens_cpu,
             device=device,
@@ -625,53 +602,6 @@ class LogitsProcessor(nn.Module):
                 pruned_lens,
             )
 
-<<<<<<< HEAD
-=======
-        # Determine whether to use chunked or non-chunked logits processing.
-        # Skip chunking if:
-        # 1. Chunking is disabled
-        # 2. Total count is below chunk size threshold
-        # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
-        should_skip_chunking = (
-            not self.enable_logprobs_chunk
-            or pruned_states.shape[0] <= self.logprobs_chunk_size
-            or self.do_tensor_parallel_all_gather_dp_attn
-        )
-
-        if should_skip_chunking:
-            # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-            sampled_logits = (
-                logits[sample_indices] if sample_indices is not None else logits
-            )
-
-            input_logits = logits[input_logprob_indices]
-            del logits
-
-            logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
-        else:
-            (logprobs_result, sampled_logits) = self.process_input_logprobs_by_chunk(
-                pruned_states,
-                sample_indices,
-                input_logprob_indices,
-                token_to_seq_idx,
-                lm_head,
-                logits_metadata,
-            )
-
-        return LogitsProcessorOutput(
-            full_logits=full_logits,
-            next_token_logits=sampled_logits,
-            hidden_states=hidden_states_to_store,
-            input_token_logprobs=logprobs_result.input_token_logprobs,
-            input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
-            input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
-            input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
-            input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
-            target_extend_input_embeds=logits_metadata.target_extend_input_embeds,
-        )
-
->>>>>>> [qwen3_next vl] support mtp model
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
         input_logprobs = compute_temp_top_p_normalized_logprobs(
             input_logits, logits_metadata
