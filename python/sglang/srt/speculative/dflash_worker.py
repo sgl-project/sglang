@@ -15,7 +15,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
-from sglang.srt.speculative.dflash_utils import resolve_dflash_mask_token
+from sglang.srt.speculative.dflash_utils import (
+    resolve_dflash_mask_token,
+    resolve_dflash_mask_token_id,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -118,7 +121,13 @@ class DFlashWorker:
         self._mask_token = resolve_dflash_mask_token(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
-        self._mask_token_id = self._resolve_mask_token_id(mask_token=self._mask_token)
+        self._mask_token_id_override = resolve_dflash_mask_token_id(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
+        self._mask_token_id = self._resolve_mask_token_id(
+            mask_token=self._mask_token,
+            mask_token_id=self._mask_token_id_override,
+        )
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s",
@@ -127,9 +136,10 @@ class DFlashWorker:
                 self.block_size,
             )
             logger.info(
-                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s",
+                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
                 self._mask_token,
                 self._mask_token_id,
+                self._mask_token_id_override,
             )
 
         self._block_pos_offsets = torch.arange(
@@ -201,60 +211,87 @@ class DFlashWorker:
         if hasattr(req, "dflash_draft_seq_len"):
             req.dflash_draft_seq_len = 0
 
-    def _resolve_mask_token_id(self, *, mask_token: str) -> int:
+    def _resolve_mask_token_id(
+        self, *, mask_token: str, mask_token_id: Optional[int] = None
+    ) -> int:
         if not isinstance(mask_token, str) or not mask_token:
             raise ValueError(
                 f"DFLASH mask_token must be a non-empty string, got {mask_token!r}."
             )
 
+        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
+        if mask_token_id is not None:
+            resolved_id = int(mask_token_id)
+            if resolved_id >= vocab_size:
+                raise ValueError(
+                    "DFLASH mask_token_id is outside the target vocab size. "
+                    f"mask_token_id={resolved_id}, vocab_size={vocab_size}. "
+                    f"This likely means mask_token={mask_token!r} requires vocab expansion beyond the model's embedding size. "
+                    "SGLang does not support resizing target embeddings for DFLASH yet."
+                )
+
+            tokenizer = getattr(self.target_worker, "tokenizer", None)
+            if tokenizer is not None:
+                token_id_from_vocab = tokenizer.get_vocab().get(mask_token, None)
+                if (
+                    token_id_from_vocab is not None
+                    and int(token_id_from_vocab) != resolved_id
+                ):
+                    raise ValueError(
+                        "DFLASH config mismatch: dflash_config.mask_token_id conflicts with tokenizer vocab id "
+                        f"for dflash_config.mask_token. mask_token={mask_token!r}, "
+                        f"mask_token_id={resolved_id}, tokenizer_vocab_id={int(token_id_from_vocab)}."
+                    )
+            return resolved_id
+
         tokenizer = getattr(self.target_worker, "tokenizer", None)
         if tokenizer is None:
             raise RuntimeError(
-                "DFLASH requires tokenizer initialization (skip_tokenizer_init is not supported)."
+                "DFLASH requires tokenizer initialization when dflash_config.mask_token_id is not set "
+                "(skip_tokenizer_init is not supported in this mode)."
             )
 
-        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
-        mask_token_id = None
+        resolved_id = None
         if getattr(tokenizer, "mask_token", None) == mask_token:
-            mask_token_id = getattr(tokenizer, "mask_token_id", None)
+            resolved_id = getattr(tokenizer, "mask_token_id", None)
 
-        if mask_token_id is None:
+        if resolved_id is None:
             # Prefer checking the explicit vocab mapping first.
             vocab = tokenizer.get_vocab()
-            mask_token_id = vocab.get(mask_token, None)
+            resolved_id = vocab.get(mask_token, None)
 
-        if mask_token_id is None:
+        if resolved_id is None:
             # Mirror the reference DFlash HF demo by adding the mask token to the tokenizer.
             # This is safe only when the resulting id stays within the target model vocab size.
             added = tokenizer.add_special_tokens({"mask_token": mask_token})
-            mask_token_id = getattr(tokenizer, "mask_token_id", None)
-            if mask_token_id is None:
-                mask_token_id = tokenizer.convert_tokens_to_ids(mask_token)
+            resolved_id = getattr(tokenizer, "mask_token_id", None)
+            if resolved_id is None:
+                resolved_id = tokenizer.convert_tokens_to_ids(mask_token)
 
             if added and self.tp_rank == 0:
                 logger.info(
                     "Added DFLASH mask token to tokenizer. token=%s, mask_token_id=%s, tokenizer_len=%s, model_vocab_size=%s",
                     mask_token,
-                    mask_token_id,
+                    resolved_id,
                     len(tokenizer),
                     vocab_size,
                 )
 
-        if mask_token_id is None or int(mask_token_id) < 0:
+        if resolved_id is None or int(resolved_id) < 0:
             raise ValueError(
                 "DFLASH requires resolving a mask token id, but it could not be resolved. "
                 f"mask_token={mask_token!r}."
             )
 
-        if mask_token_id >= vocab_size:
+        if resolved_id >= vocab_size:
             raise ValueError(
                 "DFLASH mask_token_id is outside the target vocab size. "
-                f"mask_token_id={mask_token_id}, vocab_size={vocab_size}. "
+                f"mask_token_id={resolved_id}, vocab_size={vocab_size}. "
                 f"This likely means mask_token={mask_token!r} requires vocab expansion beyond the model's embedding size. "
                 "SGLang does not support resizing target embeddings for DFLASH yet."
             )
 
-        return int(mask_token_id)
+        return int(resolved_id)
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput

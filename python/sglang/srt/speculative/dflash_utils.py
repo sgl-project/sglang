@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, List, Tuple
+from numbers import Integral
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -122,6 +123,25 @@ def resolve_dflash_mask_token(*, draft_hf_config: Any) -> str:
             f"got {mask_token!r}."
         )
     return mask_token
+
+
+def resolve_dflash_mask_token_id(*, draft_hf_config: Any) -> Optional[int]:
+    cfg = get_dflash_config(draft_hf_config)
+    mask_token_id = cfg.get("mask_token_id", None)
+    if mask_token_id is None:
+        return None
+    if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
+        raise ValueError(
+            "DFLASH dflash_config.mask_token_id must be an integer, "
+            f"got {mask_token_id!r} (type={type(mask_token_id).__name__})."
+        )
+    mask_token_id = int(mask_token_id)
+    if mask_token_id < 0:
+        raise ValueError(
+            "DFLASH dflash_config.mask_token_id must be non-negative, "
+            f"got {mask_token_id}."
+        )
+    return mask_token_id
 
 
 def compute_dflash_accept_len_and_bonus(
