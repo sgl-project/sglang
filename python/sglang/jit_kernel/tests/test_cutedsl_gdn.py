@@ -18,7 +18,9 @@ _results = {
 }
 
 from sglang.srt.utils.common import is_sm100_supported
+
 SM100_SUPPORTED = is_sm100_supported()
+
 
 def print_summary_tables():
     """Print summary table at the end of test session."""
@@ -324,7 +326,7 @@ def test_cutedsl_gdn_precision(B: int, state_dtype: torch.dtype):
     out_triton = run_triton_kernel(
         A_log, dt_bias, q, k, v, a, b, state_triton, indices, scale
     )
-    
+
     if SM100_SUPPORTED:
         out_cutedsl_fused_recurrent = run_fused_recurrent_gdn_transpose_kernel(
             A_log,
@@ -363,7 +365,9 @@ def test_cutedsl_gdn_precision(B: int, state_dtype: torch.dtype):
 
     # Check precision for fused_recurrent kernel: diff > 0.1 must be < 1% of elements
     if SM100_SUPPORTED:
-        abs_diff_fused = (out_triton.float() - out_cutedsl_fused_recurrent.float()).abs()
+        abs_diff_fused = (
+            out_triton.float() - out_cutedsl_fused_recurrent.float()
+        ).abs()
         max_diff_fused = abs_diff_fused.max().item()
         mean_diff_fused = abs_diff_fused.mean().item()
         fail_rate_fused = (abs_diff_fused > 0.1).float().mean().item() * 100
@@ -545,7 +549,7 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
         torch.cuda.synchronize()
     run_triton()
     torch.cuda.synchronize()
-    
+
     if SM100_SUPPORTED:
         with torch.cuda.stream(torch_stream_fused_recurrent):
             run_fused_recurrent()
@@ -644,7 +648,7 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
 
     triton_mean = np.mean(triton_times) / run_iters * 1000
     triton_std = np.std(triton_times) / run_iters * 1000
-    
+
     if SM100_SUPPORTED:
         cutedsl_fused_recurrent_mean = (
             np.mean(cutedsl_fused_recurrent_times) / run_iters * 1000
@@ -670,7 +674,7 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
     cutedsl_mean_val = cutedsl_mean if state_dtype == torch.float32 else None
     cutedsl_std_val = cutedsl_std if state_dtype == torch.float32 else None
     speedup_val = speedup if state_dtype == torch.float32 else None
-    
+
     _results["performance"].append(
         (
             B,

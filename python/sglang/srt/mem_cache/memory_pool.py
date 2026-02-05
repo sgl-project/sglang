@@ -60,9 +60,9 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import is_sm100_supported
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.common import is_sm100_supported
 
 store_cache = register_custom_op(store_cache, mutates_args=["k_cache", "v_cache"])
 
