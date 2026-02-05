@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.io_struct import UpdateWeightsFromDiskReq
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
@@ -89,6 +90,7 @@ class Scheduler:
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            UpdateWeightsFromDiskReq: self._handle_update_weights_from_disk,
         }
 
         # FIFO, new reqs are appended
@@ -128,6 +130,19 @@ class Scheduler:
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
         self._running = False
         return OutputBatch()
+    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
+        """Handle update_weights_from_disk request for RL workflows."""
+        req = reqs[0]
+        success, message = self.worker.update_weights_from_disk(
+            model_path=req.model_path,
+            load_format=req.load_format or "auto",
+            flush_cache=req.flush_cache,
+            target_modules=req.target_modules,
+        )
+        return OutputBatch(
+            output={"success": success, "message": message},
+            error=None if success else message,
+        )
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
