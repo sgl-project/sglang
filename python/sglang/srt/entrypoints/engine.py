@@ -1064,23 +1064,67 @@ def _launch_scheduler_processes_mp(
     )
 
 
+def _get_rank0_node_ip(placement_group) -> str:
+    """Get the IP address of the node where rank 0 will run.
+
+    Uses a probe actor to discover the IP of the first placement group's node.
+    This is needed because rank 0 starts the TCPStore server for torch.distributed,
+    so dist_init_addr must be the IP of the node where rank 0 runs, not the driver node.
+    """
+    import ray
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    @ray.remote(num_cpus=0, num_gpus=0)
+    class IPProbe:
+        def get_ip(self):
+            return ray.util.get_node_ip_address()
+
+    probe = IPProbe.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=placement_group,
+            placement_group_bundle_index=0,
+        ),
+    ).remote()
+
+    try:
+        ip = ray.get(probe.get_ip.remote(), timeout=30)
+    finally:
+        ray.kill(probe)
+
+    return ip
+
+
 def _launch_scheduler_ray_actors(
     server_args: ServerArgs,
     port_args: PortArgs,
 ) -> SchedulerLaunchResult:
-    """Launch scheduler processes as Ray actors.
+    """
+    Launch scheduler actors using Ray (unified single/multi-node).
 
-    Returns:
-        SchedulerLaunchResult with scheduler_infos already populated (Ray actors
-        are ready once __init__ completes, so no separate wait_for_ready needed).
+    Works for both single-node and multi-node:
+    - Single-node: 1 placement group with all GPUs
+    - Multi-node: N placement groups, one per GPU worker node
+
+    Steps:
+    1. Discover GPU nodes in Ray cluster
+    2. Create cluster topology based on world_size
+    3. Create per-node placement groups
+    4. Get dist_init_addr from rank 0's node (using probe actor)
+    5. Create scheduler actors with proper node/GPU assignment
+    6. Wait for initialization
     """
     import uuid
 
     import ray
-    from ray.util.placement_group import placement_group
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
     from sglang.srt.managers.scheduler_actor import create_scheduler_actor_class
+    from sglang.srt.utils.ray_cluster_utils import (
+        compute_rank_to_node_assignment,
+        create_cluster_topology,
+        create_per_node_placement_groups,
+        discover_gpu_nodes,
+    )
 
     # TODO(xyuzh): Implement Ray support for dp_size > 1
     if server_args.dp_size > 1:
@@ -1089,98 +1133,83 @@ def _launch_scheduler_ray_actors(
             "Set dp_size=1 or use_ray=False."
         )
 
-    # Set RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 BEFORE Ray initialization
-    # This prevents Ray from overwriting CUDA_VISIBLE_DEVICES when actors are created.
+    # Prevent Ray from overwriting CUDA_VISIBLE_DEVICES
     os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-    # Initialize Ray if needed
+
     if not ray.is_initialized():
         ray.init()
 
-    # Get the actor class
-    SchedulerActor = create_scheduler_actor_class()
+    # Step 1: Discover GPU nodes
+    gpu_nodes = discover_gpu_nodes()
+    if len(gpu_nodes) == 0:
+        raise RuntimeError("No GPU nodes found in Ray cluster")
 
-    # Generate unique instance ID to prevent actor name collisions
-    instance_id = uuid.uuid4().hex[:8]
+    world_size = server_args.tp_size * server_args.pp_size
 
-    # Calculate rank ranges (shared logic with mp version)
-    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-        _calculate_rank_ranges(server_args)
+    # Step 2: Create cluster topology (works for single or multi-node)
+    topology = create_cluster_topology(gpu_nodes, world_size)
+    logger.info(
+        f"Ray cluster topology: {topology.nnodes} nodes, "
+        f"{topology.gpus_per_node} GPUs/node, world_size={world_size}"
     )
 
-    # Calculate total number of GPUs needed for this node
-    num_gpus_needed = len(pp_rank_range) * len(tp_rank_range)
+    # Step 3: Create placement groups (one per node, STRICT_PACK)
+    placement_groups = create_per_node_placement_groups(topology)
 
-    # Create a placement group to ensure all actors are co-located on the same node
-    bundles = [{"GPU": 1} for _ in range(num_gpus_needed)]
-    pg = placement_group(bundles, strategy="STRICT_PACK")
+    # Step 4: Get dist_init_addr from the node where rank 0 will run
+    # Rank 0 starts the TCPStore server for torch.distributed, so dist_init_addr
+    # must be the IP of the node where rank 0 runs, not the driver/head node.
+    rank0_node_ip = _get_rank0_node_ip(placement_groups[0])
+    dist_init_addr = f"{rank0_node_ip}:{server_args.port + 233}"
+    logger.info(f"dist_init_addr: {dist_init_addr} (rank 0 node IP)")
 
-    # Wait for placement group to be ready
-    ray.get(pg.ready())
+    # Step 5: Compute rank-to-node assignment and create actors
+    assignment = compute_rank_to_node_assignment(
+        server_args.tp_size, server_args.pp_size, topology
+    )
 
-    # Calculate visible GPUs string for all actors
-    # All actors need to see all GPUs for NCCL to work properly
-    tp_size = server_args.tp_size
-    pp_size = server_args.pp_size
-    base_gpu = server_args.base_gpu_id
-    total_gpus = tp_size * pp_size
-    visible_gpus = ",".join(str(base_gpu + i) for i in range(total_gpus))
-
+    SchedulerActor = create_scheduler_actor_class()
+    instance_id = uuid.uuid4().hex[:8]
     scheduler_actors = []
-    bundle_idx = 0
 
-    for pp_rank in pp_rank_range:
-        for tp_rank in tp_rank_range:
-            gpu_id = (
-                server_args.base_gpu_id
-                + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
-            )
-            moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+    for (pp_rank, tp_rank), (node_idx, local_gpu_idx) in assignment.items():
+        moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+        pg = placement_groups[node_idx]
 
-            # Create Ray actor with placement group scheduling.
-            # The placement group ensures:
-            # 1. All actors are on the same node (STRICT_PACK)
-            # 2. Each actor gets exclusive access to one GPU
-            #
-            # We use num_gpus=1 to reserve the GPU resource, but set CUDA_VISIBLE_DEVICES
-            # to all GPUs so NCCL can communicate across all of them.
-            # We set num_cpus=0 because placement group bundles only have GPU resources.
-            actor = SchedulerActor.options(
-                num_cpus=0,  # Don't request CPU; bundles only have GPU
-                num_gpus=1,  # Reserve 1 GPU per actor via placement group
-                name=f"sglang_scheduler_{instance_id}_pp{pp_rank}_tp{tp_rank}",
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=pg,
-                    placement_group_bundle_index=bundle_idx,
-                ),
-                runtime_env={
-                    "env_vars": {
-                        "CUDA_VISIBLE_DEVICES": visible_gpus,
-                    }
-                },
-            ).remote(
-                server_args=server_args,
-                port_args=port_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                pp_rank=pp_rank,
-                dp_rank=0,  # dp_rank=0 when dp_size=1 for consistency with mp mode
-            )
-            scheduler_actors.append(actor)
-            bundle_idx += 1
+        actor = SchedulerActor.options(
+            num_cpus=0,
+            num_gpus=1,
+            name=f"sglang_scheduler_{instance_id}_pp{pp_rank}_tp{tp_rank}",
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=local_gpu_idx,
+            ),
+        ).remote(
+            server_args=server_args,
+            port_args=port_args,
+            gpu_id=local_gpu_idx,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=pp_rank,
+            dp_rank=0,
+            dist_init_addr=dist_init_addr,
+        )
+        scheduler_actors.append(actor)
 
-    # Wait for all schedulers to initialize
-    # If initialization fails, ray.get() raises RayActorError.
+    # Step 6: Wait for initialization
     try:
         scheduler_infos = ray.get(
             [actor.get_info.remote() for actor in scheduler_actors]
         )
     except ray.exceptions.RayActorError as e:
+        for actor in scheduler_actors:
+            try:
+                ray.kill(actor)
+            except Exception:
+                pass
         raise RuntimeError(f"Scheduler actor failed to initialize: {e}")
 
-    # Start event loops (non-blocking - returns immediately)
-    # Keep refs to detect when actors terminate
+    # Start event loops (non-blocking)
     event_loop_refs = [actor.run_event_loop.remote() for actor in scheduler_actors]
 
     return SchedulerLaunchResult(
@@ -1215,8 +1244,17 @@ def _launch_workers(
     server_args.check_server_args()
 
     # Allocate ports for inter-process communications
+    driver_ip = None
     if port_args is None:
-        port_args = PortArgs.init_new(server_args)
+        if server_args.use_ray:
+            # Ray mode: use TCP for ZMQ communication (works across nodes)
+            import socket
+
+            driver_ip = socket.gethostbyname(socket.gethostname())
+            port_args = PortArgs.init_for_ray_multinode(server_args, driver_ip)
+            logger.info(f"Ray mode: using TCP-based ZMQ with driver IP {driver_ip}")
+        else:
+            port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
 
     # Launch schedulers (unified interface for both mp and Ray modes)

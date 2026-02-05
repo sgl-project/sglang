@@ -45,11 +45,36 @@ def create_scheduler_actor_class():
             moe_ep_rank: int,
             pp_rank: int,
             dp_rank: Optional[int],
+            dist_init_addr: Optional[str] = None,
         ):
+            import dataclasses
+
             from sglang.srt.managers.scheduler import (
                 Scheduler,
                 configure_scheduler,
             )
+
+            # Override dist_init_addr if provided (for multi-node)
+            if dist_init_addr:
+                server_args = dataclasses.replace(
+                    server_args, dist_init_addr=dist_init_addr
+                )
+
+            # Get actual GPU IDs from Ray runtime context
+            accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+            assigned_gpus = accelerator_ids.get("GPU", [])
+
+            if assigned_gpus:
+                # Ray assigned specific GPU(s), use the first one
+                actual_gpu_id = int(assigned_gpus[0])
+                logger.info(f"[TP{tp_rank}] Ray assigned GPU: {actual_gpu_id}")
+            else:
+                # Fallback to passed gpu_id
+                actual_gpu_id = gpu_id
+                logger.info(f"[TP{tp_rank}] Using passed gpu_id: {gpu_id}")
+
+            # Store node info for debugging
+            self._node_id = ray.get_runtime_context().get_node_id()
 
             # Configure worker (logging, process title, etc.)
             dp_rank = configure_scheduler(
@@ -60,7 +85,7 @@ def create_scheduler_actor_class():
             self.scheduler = Scheduler(
                 server_args,
                 port_args,
-                gpu_id,
+                actual_gpu_id,  # Use discovered GPU ID
                 tp_rank,
                 moe_ep_rank,
                 pp_rank,
@@ -76,6 +101,20 @@ def create_scheduler_actor_class():
                 "status": "ready",
                 "max_total_num_tokens": self.scheduler.max_total_num_tokens,
                 "max_req_input_len": self.scheduler.max_req_input_len,
+            }
+
+        def get_node_info(self) -> Dict[str, Any]:
+            """Return node-specific information for coordination."""
+            import ray
+
+            return {
+                "node_id": ray.get_runtime_context().get_node_id(),
+                "node_ip": ray.util.get_node_ip_address(),
+                "tp_rank": self._tp_rank,
+                "pp_rank": self._pp_rank,
+                "gpu_ids": ray.get_runtime_context().get_accelerator_ids().get(
+                    "GPU", []
+                ),
             }
 
         def run_event_loop(self) -> None:

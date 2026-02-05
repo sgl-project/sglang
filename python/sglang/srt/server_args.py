@@ -5503,11 +5503,57 @@ class PortArgs:
     tokenizer_worker_ipc_name: Optional[str]
 
     @staticmethod
+    def init_for_ray_multinode(
+        server_args: ServerArgs,
+        driver_ip: str,
+    ) -> "PortArgs":
+        """Create PortArgs for Ray multi-node deployment using TCP.
+
+        In Ray multi-node, schedulers run on different machines than the driver.
+        IPC doesn't work across nodes, so we use TCP with the driver's IP.
+
+        Args:
+            server_args: Server configuration
+            driver_ip: IP address of the driver node (where TokenizerManager runs)
+        """
+        import random
+
+        if server_args.nccl_port is None:
+            nccl_port = server_args.port + random.randint(100, 1000)
+            while True:
+                if is_port_available(nccl_port):
+                    break
+                if nccl_port < 60000:
+                    nccl_port += 42
+                else:
+                    nccl_port -= 43
+        else:
+            nccl_port = server_args.nccl_port
+
+        # Use TCP ports based on server_args.port
+        port_base = server_args.port + ZMQ_TCP_PORT_DELTA
+        tokenizer_port = port_base + 1
+        scheduler_input_port = port_base + 2
+        detokenizer_port = port_base + 3
+        rpc_port = port_base + 4
+        metrics_port = port_base + 5
+
+        return PortArgs(
+            tokenizer_ipc_name=f"tcp://{driver_ip}:{tokenizer_port}",
+            scheduler_input_ipc_name=f"tcp://{driver_ip}:{scheduler_input_port}",
+            detokenizer_ipc_name=f"tcp://{driver_ip}:{detokenizer_port}",
+            nccl_port=nccl_port,
+            rpc_ipc_name=f"tcp://{driver_ip}:{rpc_port}",
+            metrics_ipc_name=f"tcp://{driver_ip}:{metrics_port}",
+            tokenizer_worker_ipc_name=None,  # Not supported in Ray multi-node
+        )
+
+    @staticmethod
     def init_new(
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
-    ) -> PortArgs:
+    ) -> "PortArgs":
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:
