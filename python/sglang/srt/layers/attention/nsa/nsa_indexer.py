@@ -86,6 +86,11 @@ class BaseIndexerMetadata(ABC):
         Return: seq lens for each batch.
         """
 
+    def get_indexer_seq_len(self) -> torch.Tensor:
+        """
+        Return: seq lens for each batch.
+        """
+
     def get_nsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
@@ -516,11 +521,12 @@ class Indexer(MultiPlatformOp):
 
         ks, ke = metadata.get_indexer_kvcache_range()
 
-        seq_len_sum = forward_batch.seq_lens_sum
-        max_seq_len = torch.max(forward_batch.seq_lens_cpu).item()
+        indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
+        seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
+        max_seq_len = torch.max(indexer_seq_lens_cpu).item()
         k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
             layer_id,
-            forward_batch.seq_lens,
+            metadata.get_indexer_seq_len(),
             block_tables,
             seq_len_sum,
             max_seq_len,
