@@ -2048,6 +2048,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.disable_piecewise_cuda_graph:
             return
 
+        if not hasattr(self.model, "model"):
+            return
+
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)

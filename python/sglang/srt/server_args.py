@@ -925,7 +925,11 @@ class ServerArgs:
         # if any("ForSequenceClassification" in a for a in model_archs):
         #     self.disable_piecewise_cuda_graph = True
         # 11. GGUF quantized models (custom dequant ops unsupported by torch.compile)
-        if self.load_format == "gguf" or self.quantization == "gguf":
+        if (
+            self.load_format == "gguf"
+            or self.quantization == "gguf"
+            or check_gguf_file(self.model_path)
+        ):
             self.disable_piecewise_cuda_graph = True
         # 12. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
         if self.dllm_algorithm is not None:
