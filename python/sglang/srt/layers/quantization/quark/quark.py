@@ -66,6 +66,9 @@ class QuarkConfig(QuantizationConfig):
         self.packed_modules_mapping = self.quant_config["packed_modules_mapping"]
         self._quantized_layers = set()
 
+        if isinstance(self.dequantization_config, Fp8Config):
+            self.weight_block_size = self.dequantization_config.weight_block_size
+
     @property
     def quantized_layers(self) -> Tuple[list[str], int]:
         # Extract unique layer types (last part after ".")
@@ -73,9 +76,6 @@ class QuarkConfig(QuantizationConfig):
             set(name.split(".")[-1] for name in self._quantized_layers)
         )
         return layer_types, len(self._quantized_layers)
-
-        if isinstance(self.dequantization_config, Fp8Config):
-            self.weight_block_size = self.dequantization_config.weight_block_size
 
     def get_linear_method(self) -> "QuarkLinearMethod":
         return QuarkLinearMethod(self)

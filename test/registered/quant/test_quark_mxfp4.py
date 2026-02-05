@@ -1,6 +1,6 @@
 import io
 import re
-
+import unittest
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
@@ -15,6 +15,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    is_in_ci,
 )
 
 
@@ -39,9 +40,32 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 cls.tp if hasattr(cls, "tp") else "1",
                 "--log-level",
                 "debug",
+                "--trust-remote-code",  # For MiniMaxAI/MiniMax-M2.1
+                "--dtype", "bfloat16"
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
+        # cls.wait_server_ready(
+        #     cls.base_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        # )
+        import time
+        import requests
+        url = cls.base_url + "/health"
+        timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        start_time = time.perf_counter()
+        while True:
+            try:
+                print("SEND REQUEST")
+                response = requests.get(url)
+                if response.status_code == 200:
+                    print(f"Server {url} is ready")
+                    break
+            except Exception:
+                pass
+
+            if time.perf_counter() - start_time > timeout:
+                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
+            time.sleep(1)
 
         # # Extract and display peak GPU memory from logs
         combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
@@ -140,7 +164,7 @@ class TestFP8ToMXFP4DenseTP2(TestFP8ToMXFP4Dense):
 
 
 class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
-    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
+    model = "/mnt/fxmarty/Qwen_Qwen3-30B-A3B-Instruct-2507-FP8"  # FP8 model
     tp = 1
 
     def test_peak_memory(self):
@@ -149,4 +173,37 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
+        self._test_gsm8k(accuracy_threshold=0.92)
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
+    tp = 8
+
+    def test_gsm8k(self):
+        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: TODO
+        self._test_gsm8k(accuracy_threshold=0.92)
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    model = "moonshotai/Kimi-K2-Instruct-0905"  # FP8 model
+    tp = 8
+
+    def test_gsm8k(self):
+        # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: TODO
+        self._test_gsm8k(accuracy_threshold=0.92)
+
+@unittest.skipIf(is_in_ci(), "local test only")
+class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
+    #model = "/shareddata/MiniMaxAI/MiniMax-M2.1"  # FP8 model
+    model = "/felmarty/shrink/MiniMaxAI_MiniMax-M2.1-3-layers"  # FP8 model
+    tp = 2
+    # NOTE: this test requires the following fix in AITER to pass: TODO
+
+    def test_peak_memory(self):
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: TODO (TP=2)
+        self._test_peak_memory(threshold=92)  # TP=2
+
+    def test_gsm8k(self):
+        # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: TODO
         self._test_gsm8k(accuracy_threshold=0.92)
