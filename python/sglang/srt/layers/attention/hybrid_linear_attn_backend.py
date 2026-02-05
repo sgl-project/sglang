@@ -33,7 +33,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.common import rank0_log, is_sm100_supported
 
 if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
@@ -824,6 +824,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        if not is_sm100_supported():
+            Envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.set(False)
         self.use_cutedsl_transpose = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get()
         rank0_log(
             f"CuTe DSL GDN decode enabled: use_cutedsl: {use_cutedsl}, use_cutedsl_transpose: {self.use_cutedsl_transpose}"

@@ -17,6 +17,8 @@ _results = {
     "mtp_performance": [],
 }
 
+from sglang.srt.utils.common import is_sm100_supported
+SM100_SUPPORTED = is_sm100_supported()
 
 def print_summary_tables():
     """Print summary table at the end of test session."""
@@ -189,7 +191,7 @@ def run_triton_mtp_kernel(
     )
 
 
-def run_fused_recurrent_kernel(
+def run_fused_recurrent_gdn_transpose_kernel(
     A_log,
     dt_bias,
     q,
@@ -224,7 +226,7 @@ def run_fused_recurrent_kernel(
     )
 
 
-def run_fused_recurrent_mtp_kernel(
+def run_fused_recurrent_gdn_transpose_mtp_kernel(
     q,
     k,
     v,
@@ -290,19 +292,20 @@ def test_cutedsl_gdn_precision(B: int, state_dtype: torch.dtype):
         )
         torch.cuda.synchronize()
 
-    _ = run_fused_recurrent_kernel(
-        A_log,
-        dt_bias,
-        q,
-        k,
-        v,
-        a,
-        b,
-        state_cutedsl_fused_recurrent.clone(),
-        indices,
-        scale=scale,
-    )
-    torch.cuda.synchronize()
+    if SM100_SUPPORTED:
+        _ = run_fused_recurrent_gdn_transpose_kernel(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            state_cutedsl_fused_recurrent.clone(),
+            indices,
+            scale=scale,
+        )
+        torch.cuda.synchronize()
 
     # Fresh state for actual test
     state_cutedsl = torch.randn(B, HV, K, V, dtype=state_dtype, device="cuda")
@@ -321,18 +324,20 @@ def test_cutedsl_gdn_precision(B: int, state_dtype: torch.dtype):
     out_triton = run_triton_kernel(
         A_log, dt_bias, q, k, v, a, b, state_triton, indices, scale
     )
-    out_cutedsl_fused_recurrent = run_fused_recurrent_kernel(
-        A_log,
-        dt_bias,
-        q,
-        k,
-        v,
-        a,
-        b,
-        state_cutedsl_fused_recurrent,
-        indices,
-        scale=scale,
-    )
+    
+    if SM100_SUPPORTED:
+        out_cutedsl_fused_recurrent = run_fused_recurrent_gdn_transpose_kernel(
+            A_log,
+            dt_bias,
+            q,
+            k,
+            v,
+            a,
+            b,
+            state_cutedsl_fused_recurrent,
+            indices,
+            scale=scale,
+        )
 
     # Check precision: diff > 0.1 must be < 1% of elements
     if state_dtype == torch.float32:
@@ -357,35 +362,36 @@ def test_cutedsl_gdn_precision(B: int, state_dtype: torch.dtype):
         assert fail_rate < 1.0, f"Fail rate {fail_rate:.2f}% >= 1%"
 
     # Check precision for fused_recurrent kernel: diff > 0.1 must be < 1% of elements
-    abs_diff_fused = (out_triton.float() - out_cutedsl_fused_recurrent.float()).abs()
-    max_diff_fused = abs_diff_fused.max().item()
-    mean_diff_fused = abs_diff_fused.mean().item()
-    fail_rate_fused = (abs_diff_fused > 0.1).float().mean().item() * 100
-    has_nan_fused = (
-        torch.isnan(out_cutedsl_fused_recurrent).any()
-        or torch.isinf(out_cutedsl_fused_recurrent).any()
-    )
-
-    kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
-    dtype_str = "f32" if state_dtype == torch.float32 else "bf16"
-
-    # Collect results for summary table (cutedsl_fused_recurrent)
-    _results["precision"].append(
-        (
-            B,
-            "cutedsl_gdn_transpose",
-            dtype_str,
-            max_diff_fused,
-            mean_diff_fused,
-            fail_rate_fused,
-            has_nan_fused,
+    if SM100_SUPPORTED:
+        abs_diff_fused = (out_triton.float() - out_cutedsl_fused_recurrent.float()).abs()
+        max_diff_fused = abs_diff_fused.max().item()
+        mean_diff_fused = abs_diff_fused.mean().item()
+        fail_rate_fused = (abs_diff_fused > 0.1).float().mean().item() * 100
+        has_nan_fused = (
+            torch.isnan(out_cutedsl_fused_recurrent).any()
+            or torch.isinf(out_cutedsl_fused_recurrent).any()
         )
-    )
 
-    assert not has_nan_fused, "Fused recurrent output contains NaN/Inf"
-    assert (
-        fail_rate_fused < 1.0
-    ), f"Fused recurrent fail rate {fail_rate_fused:.2f}% >= 1%"
+        kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
+        dtype_str = "f32" if state_dtype == torch.float32 else "bf16"
+
+        # Collect results for summary table (cutedsl_fused_recurrent)
+        _results["precision"].append(
+            (
+                B,
+                "cutedsl_gdn_transpose",
+                dtype_str,
+                max_diff_fused,
+                mean_diff_fused,
+                fail_rate_fused,
+                has_nan_fused,
+            )
+        )
+
+        assert not has_nan_fused, "Fused recurrent output contains NaN/Inf"
+        assert (
+            fail_rate_fused < 1.0
+        ), f"Fused recurrent fail rate {fail_rate_fused:.2f}% >= 1%"
 
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
@@ -518,7 +524,7 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
 
     def run_fused_recurrent():
         for ri in range(run_iters):
-            _ = run_fused_recurrent_kernel(
+            _ = run_fused_recurrent_gdn_transpose_kernel(
                 A_log,
                 dt_bias,
                 q_triton[ri],
@@ -539,9 +545,11 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
         torch.cuda.synchronize()
     run_triton()
     torch.cuda.synchronize()
-    with torch.cuda.stream(torch_stream_fused_recurrent):
-        run_fused_recurrent()
-    torch.cuda.synchronize()
+    
+    if SM100_SUPPORTED:
+        with torch.cuda.stream(torch_stream_fused_recurrent):
+            run_fused_recurrent()
+        torch.cuda.synchronize()
 
     # Capture CUDA graphs
     graph_triton = torch.cuda.CUDAGraph()
@@ -550,17 +558,18 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
         if state_dtype in [torch.bfloat16, torch.float16]
         else torch.cuda.CUDAGraph()
     )
-    graph_cutedsl_fused_recurrent = torch.cuda.CUDAGraph()
+    graph_cutedsl_fused_recurrent = torch.cuda.CUDAGraph() if SM100_SUPPORTED else None
     try:
         with torch.cuda.graph(graph_triton):
             run_triton()
         if state_dtype == torch.float32:
             with torch.cuda.graph(graph_cutedsl, stream=torch_stream):
                 run_cutedsl()
-        with torch.cuda.graph(
-            graph_cutedsl_fused_recurrent, stream=torch_stream_fused_recurrent
-        ):
-            run_fused_recurrent()
+        if SM100_SUPPORTED:
+            with torch.cuda.graph(
+                graph_cutedsl_fused_recurrent, stream=torch_stream_fused_recurrent
+            ):
+                run_fused_recurrent()
         torch.cuda.synchronize()
     except Exception:
         graph_triton = graph_cutedsl = graph_cutedsl_fused_recurrent = None
@@ -581,12 +590,14 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
             run_triton()
         torch.cuda.synchronize()
 
-        if graph_cutedsl_fused_recurrent:
-            graph_cutedsl_fused_recurrent.replay()
-        else:
-            with torch.cuda.stream(torch_stream_fused_recurrent):
-                run_fused_recurrent()
-        torch.cuda.synchronize()
+        # Only test cutedsl_gdn_transpose on SM100
+        if SM100_SUPPORTED:
+            if graph_cutedsl_fused_recurrent:
+                graph_cutedsl_fused_recurrent.replay()
+            else:
+                with torch.cuda.stream(torch_stream_fused_recurrent):
+                    run_fused_recurrent()
+            torch.cuda.synchronize()
 
     # Benchmark
     triton_times, cutedsl_times, cutedsl_fused_recurrent_times = [], [], []
@@ -617,28 +628,35 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
             torch.cuda.synchronize()
             cutedsl_times.append(start.elapsed_time(end))
 
-        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-            enable_timing=True
-        )
-        with torch.cuda.stream(torch_stream_fused_recurrent):
-            start.record()
-            if graph_cutedsl_fused_recurrent:
-                graph_cutedsl_fused_recurrent.replay()
-            else:
-                run_fused_recurrent()
-            end.record()
-        torch.cuda.synchronize()
-        cutedsl_fused_recurrent_times.append(start.elapsed_time(end))
+        if SM100_SUPPORTED:
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                enable_timing=True
+            )
+            with torch.cuda.stream(torch_stream_fused_recurrent):
+                start.record()
+                if graph_cutedsl_fused_recurrent:
+                    graph_cutedsl_fused_recurrent.replay()
+                else:
+                    run_fused_recurrent()
+                end.record()
+            torch.cuda.synchronize()
+            cutedsl_fused_recurrent_times.append(start.elapsed_time(end))
 
     triton_mean = np.mean(triton_times) / run_iters * 1000
     triton_std = np.std(triton_times) / run_iters * 1000
-    cutedsl_fused_recurrent_mean = (
-        np.mean(cutedsl_fused_recurrent_times) / run_iters * 1000
-    )
-    cutedsl_fused_recurrent_std = (
-        np.std(cutedsl_fused_recurrent_times) / run_iters * 1000
-    )
-    speedup_fused_recurrent = triton_mean / cutedsl_fused_recurrent_mean
+    
+    if SM100_SUPPORTED:
+        cutedsl_fused_recurrent_mean = (
+            np.mean(cutedsl_fused_recurrent_times) / run_iters * 1000
+        )
+        cutedsl_fused_recurrent_std = (
+            np.std(cutedsl_fused_recurrent_times) / run_iters * 1000
+        )
+        speedup_fused_recurrent = triton_mean / cutedsl_fused_recurrent_mean
+    else:
+        cutedsl_fused_recurrent_mean = None
+        cutedsl_fused_recurrent_std = None
+        speedup_fused_recurrent = None
 
     if state_dtype == torch.float32:
         cutedsl_mean = np.mean(cutedsl_times) / run_iters * 1000
@@ -648,10 +666,11 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
     kernel_type = "SmallBatch" if B < 32 else "LargeBatch"
     dtype_str = "f32" if state_dtype == torch.float32 else "bf16"
 
-    # Collect results for summary table
+    # Collect results for summary table (only if SM100 supported for transpose results)
     cutedsl_mean_val = cutedsl_mean if state_dtype == torch.float32 else None
     cutedsl_std_val = cutedsl_std if state_dtype == torch.float32 else None
     speedup_val = speedup if state_dtype == torch.float32 else None
+    
     _results["performance"].append(
         (
             B,
@@ -676,10 +695,11 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton kernel not available")
+@pytest.mark.skipif(not SM100_SUPPORTED, reason="cutedsl_gdn_transpose requires SM100")
 @pytest.mark.parametrize("T", [4, 8, 16, 32, 48])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 def test_cutedsl_gdn_mtp_precision(T: int, state_dtype: torch.dtype):
-    """Test precision of CuTe DSL GDN kernel against Triton reference."""
+    """Test precision of CuTe DSL GDN kernel against Triton reference (SM100 only)."""
     torch.manual_seed(2025)
     NUM_DRAFT_TOKENS = 3
     B, H, K, V, HV = 1, 16, 128, 128, 32
@@ -722,7 +742,7 @@ def test_cutedsl_gdn_mtp_precision(T: int, state_dtype: torch.dtype):
         intermediate_state.clone().transpose(-2, -1).contiguous().transpose(-2, -1)
     )
 
-    _ = run_fused_recurrent_mtp_kernel(
+    _ = run_fused_recurrent_gdn_transpose_mtp_kernel(
         q,
         k,
         v,
@@ -776,7 +796,7 @@ def test_cutedsl_gdn_mtp_precision(T: int, state_dtype: torch.dtype):
         cu_seqlens=cu_seqlens,
         NUM_DRAFT_TOKENS=NUM_DRAFT_TOKENS,
     )
-    out_cutedsl_fused_recurrent = run_fused_recurrent_mtp_kernel(
+    out_cutedsl_fused_recurrent = run_fused_recurrent_gdn_transpose_mtp_kernel(
         q,
         k,
         v,
@@ -817,10 +837,11 @@ def test_cutedsl_gdn_mtp_precision(T: int, state_dtype: torch.dtype):
 
 @pytest.mark.skipif(not CUTEDSL_AVAILABLE, reason="CuTe DSL not available")
 @pytest.mark.skipif(not TRITON_AVAILABLE, reason="Triton kernel not available")
+@pytest.mark.skipif(not SM100_SUPPORTED, reason="cutedsl_gdn_transpose requires SM100")
 @pytest.mark.parametrize("T", [4, 8, 16, 32, 48])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.float16])
 def test_cutedsl_gdn_mtp_performance(T: int, state_dtype: torch.dtype):
-    """Benchmark CuTe DSL fused recurrent kernel against Triton reference for MTP (Multi-Token Prediction) scenario."""
+    """Benchmark CuTe DSL fused recurrent kernel against Triton reference for MTP (SM100 only)."""
     torch.manual_seed(2025)
     NUM_DRAFT_TOKENS = 3
     B, H, K, V, HV = 1, 16, 128, 128, 16
@@ -913,7 +934,7 @@ def test_cutedsl_gdn_mtp_performance(T: int, state_dtype: torch.dtype):
     )
     torch.cuda.synchronize()
 
-    _ = run_fused_recurrent_mtp_kernel(
+    _ = run_fused_recurrent_gdn_transpose_mtp_kernel(
         q_list[0],
         k_list[0],
         v_list[0],
@@ -949,7 +970,7 @@ def test_cutedsl_gdn_mtp_performance(T: int, state_dtype: torch.dtype):
 
     def run_fused_recurrent():
         for ri in range(run_iters):
-            _ = run_fused_recurrent_mtp_kernel(
+            _ = run_fused_recurrent_gdn_transpose_mtp_kernel(
                 q_list[ri],
                 k_list[ri],
                 v_list[ri],
