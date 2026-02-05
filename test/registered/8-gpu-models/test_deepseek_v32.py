@@ -96,7 +96,9 @@ class TestDeepseekV32(unittest.TestCase):
                 batch_sizes=[1, 8, 16, 64],
                 profile_dir="performance_profiles_deepseek_v32",
             ),
-            tool_call_params=ToolCallTestParams(test_thinking=True),
+            tool_call_params=ToolCallTestParams(
+                test_thinking=True, test_reasoning_usage=True
+            ),
         )
 
     @unittest.skipIf(is_blackwell_system(), "Requires H200 system")

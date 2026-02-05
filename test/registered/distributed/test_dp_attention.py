@@ -187,8 +187,6 @@ class TestDPAttentionDP2TP2DeepseekV3MTP(
 class TestDPAttentionDP2TP2VLM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        # TODO(FlamingoPg): Use Kimi-VL-A3B-Instruct temporarily
-        # cauz Qwen3-VL use mrope which has bug in DP attention mode
         cls.model = "moonshotai/Kimi-VL-A3B-Instruct"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.image_url = DEFAULT_IMAGE_URL
