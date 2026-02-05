@@ -175,12 +175,26 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
-        residual = None
-        for layer in self.midlayers:
+        hidden_states, residual = self.midlayers[0](
+          positions,
+          embeds,
+          hidden_states,
+          forward_batch,
+          None,
+        )
+
+        for layer in self.midlayers[1:]:
+          # The residual connections here are only internal to the 
+          # draft model's multi decoder layers and has nothing to do with Eagle3 architecture
+          # 
+          # The complication is that the LlamaDecoderLayer for Eagle3 in SGLang derives from that of a 
+          # target model, which requires interpolating intermediate states without residuals.
+          # However, the residuals are always added in LlamaDecoderLayer of SpecForge. Therefore, 
+          # the special handling of `hidden_states + residual` is necessary.
             hidden_states, residual = layer(
                 positions,
                 embeds,
-                hidden_states,
+                hidden_states + residual, # compatible with LlamaDecoderLayer in SpecForge
                 forward_batch,
                 residual,
             )
