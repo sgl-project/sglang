@@ -4,6 +4,7 @@ import pathlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import flashinfer
 import torch
 
 from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl, load_jit
@@ -15,10 +16,12 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
-    import flashinfer
-
     flashinfer_dir = pathlib.Path(flashinfer.__file__).parent.resolve()
-    assert (flashinfer_dir / "data" / "include").exists()
+    assert (
+        flashinfer_dir / "data" / "include"
+    ).exists(), (
+        f"flashinfer headers are missing {str(flashinfer_dir / 'data' / 'include')}"
+    )
     flashinfer_include_path = (flashinfer_dir / "data" / "include").resolve()
     return load_jit(
         "apply_rope_pos_ids_cos_sin_cache",
