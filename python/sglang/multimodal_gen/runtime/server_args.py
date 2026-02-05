@@ -1005,7 +1005,7 @@ class ServerArgs:
                 and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
             ):
                 logger.info(
-                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} for low memory and performace balance"
+                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} for low memory and performance balance"
                 )
                 self.dit_layerwise_offload = True
 
