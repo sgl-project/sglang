@@ -309,6 +309,14 @@ class DefaultModelLoader(BaseModelLoader):
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 
+    # Mapping of fused parameter names to their constituent parts
+    # Used for tracking weight loading when checkpoints have separate parameters
+    # (e.g., q_proj, k_proj, v_proj) but the model fuses them (e.g., qkv_proj)
+    FUSED_PARAMS_MAPPING = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
@@ -681,7 +689,45 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        from sglang.srt.model_loader.weight_utils import validate_loaded_weights
+
+        # Track which parameters get loaded by wrapping the iterator
+        loaded_param_names = set()
+
+        def tracking_iterator(weights_iter):
+            """Wrapper that tracks weight names from the checkpoint."""
+            params_dict = dict(model.named_parameters())
+
+            # Build mapping from checkpoint names to model parameter names
+            # using the shared FUSED_PARAMS_MAPPING constant.
+            fused_mapping = {}
+            for param_name in params_dict:
+                for fused_part, shard_parts in DefaultModelLoader.FUSED_PARAMS_MAPPING.items():
+                    # Check if fused_part appears as a complete component in the dotted path
+                    # This avoids false matches like "my_qkv_proj_extra" matching "qkv_proj"
+                    if f".{fused_part}." in f".{param_name}.":
+                        for shard_part in shard_parts:
+                            # Replace only first occurrence to avoid edge cases
+                            sharded_name = param_name.replace(fused_part, shard_part, 1)
+                            fused_mapping[sharded_name] = param_name
+                        break
+
+            for name, tensor in weights_iter:
+                # Track which model parameters get loaded
+                if name in params_dict:
+                    loaded_param_names.add(name)
+                elif name in fused_mapping:
+                    loaded_param_names.add(fused_mapping[name])
+
+                yield name, tensor
+
+        # Load weights with tracking
+        model.load_weights(tracking_iterator(weights))
+
+        # Validate that all required parameters were loaded
+        # Check environment variable for strict mode
+        strict_mode = os.getenv("SGLANG_STRICT_WEIGHT_LOADING", "0") == "1"
+        validate_loaded_weights(model, loaded_param_names, logger, strict=strict_mode)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
