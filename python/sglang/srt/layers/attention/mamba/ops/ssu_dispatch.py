@@ -117,36 +117,34 @@ def selective_state_update(
         _mamba_selective_state_fn is not None
     ), "Mamba selective_state_update function not initialized. Call initialize_mamba_selective_state_update_backend() first."
 
+    
+    # TODO smor before merger- fix the kwargs so you won't need this call duplication
     if (
         _mamba_selective_state_update_backend
         == MambaSelectiveStateUpdateBackend.FLASHINFER
     ):
-        assert (
-            _is_specdec_call(
-                disable_state_update,
-                intermediate_states_buffer,
-                cache_steps,
-                retrieve_parent_token,
-                intermediate_state_indices,
-            )
-            is False
-        ), "Speculative decoding is not supported by FlashInfer selective_state_update. Use the mamba triton backend instead."
-
+        print(f"SMOR: FLASHINFER selective_state_update")
+        cache_steps = 0 if cache_steps is None else cache_steps
         _mamba_selective_state_fn(
-            state=state,
-            x=x,
-            dt=dt,
-            A=A,
-            B=B,
-            C=C,
+            state,
+            x,
+            dt,
+            A,
+            B,
+            C,
             D=D,
             z=z,
             dt_bias=dt_bias,
             dt_softplus=dt_softplus,
             state_batch_indices=state_batch_indices,
             out=out,
+            disable_state_update=disable_state_update,
+            intermediate_states_buffer=intermediate_states_buffer,
+            cache_steps=cache_steps,
+            intermediate_state_indices=intermediate_state_indices,
         )
     else:
+        print(f"SMOR: TRITON selective_state_update")
         _mamba_selective_state_fn(
             state,
             x,
@@ -166,7 +164,6 @@ def selective_state_update(
             retrieve_parent_token=retrieve_parent_token,
             intermediate_state_indices=intermediate_state_indices,
         )
-
 
 def _is_specdec_call(
     disable_state_update=False,
