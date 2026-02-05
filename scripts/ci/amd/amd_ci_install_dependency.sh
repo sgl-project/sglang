@@ -230,15 +230,6 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         git submodule update --init --recursive
     "
 
-    # Revert commit ca7948e (mla ps support paged64 and 3buffer for ds3.2 #1950)
-    echo "[CI-AITER-CHECK] Reverting commit ca7948e14759446142dc792375e46ef9bec3fee1..."
-    docker exec ci_sglang bash -c "
-        cd /sgl-workspace/aiter && \
-        git config user.email 'ci@sglang.local' && \
-        git config user.name 'CI Bot' && \
-        git revert --no-edit ca7948e14759446142dc792375e46ef9bec3fee1
-    "
-
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
         GPU_ARCH_LIST="gfx950"
     else
