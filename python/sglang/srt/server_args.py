@@ -922,6 +922,9 @@ class ServerArgs:
         # 10. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
         if self.dllm_algorithm is not None:
             self.disable_piecewise_cuda_graph = True
+        # 11. CPU offload (state_dict() in forward path breaks dynamo)
+        if self.cpu_offload_gb > 0:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
