@@ -170,6 +170,7 @@ class HiCacheHF3FS(HiCacheStorage):
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
+        enable_storage_metrics: bool = False
     ):
         self.rank = rank
         self.file_path = file_path
@@ -183,6 +184,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.metadata_client = metadata_client
         self.is_mla_model = is_mla_model
         self.is_page_first_layout = is_page_first_layout
+        self.enable_storage_metrics = enable_storage_metrics
         self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
@@ -376,10 +378,12 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
-        self.prefetch_pgs.append(ionum)
-        self.prefetch_bandwidth.append(
-            ionum / (end_time - start_time) * self.gb_per_page
-        )
+
+        if self.enable_storage_metrics:
+            self.prefetch_pgs.append(ionum)
+            self.prefetch_bandwidth.append(
+                ionum / (end_time - start_time) * self.gb_per_page
+            )
 
         results = [False] * len(keys)
         for batch_index, read_result in zip(batch_indices, read_results):
@@ -446,8 +450,10 @@ class HiCacheHF3FS(HiCacheStorage):
 
         end_time = time.perf_counter()
         ionum = len(batch_indices)
-        self.backup_pgs.append(ionum)
-        self.backup_bandwidth.append(ionum / (end_time - start_time) * self.gb_per_page)
+
+        if self.enable_storage_metrics:
+            self.backup_pgs.append(ionum)
+            self.backup_bandwidth.append(ionum / (end_time - start_time) * self.gb_per_page)
 
         written_keys_to_confirm = []
         results = [index[0] for index in indices]

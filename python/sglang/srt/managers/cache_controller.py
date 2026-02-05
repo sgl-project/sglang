@@ -261,6 +261,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        enable_storage_metrics: bool = False
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -274,6 +275,7 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.enable_storage_metrics = enable_storage_metrics
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -590,6 +592,7 @@ class HiCacheController:
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             is_mla_model=is_mla_backend,
+            enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             extra_config=storage_backend_extra_config,
