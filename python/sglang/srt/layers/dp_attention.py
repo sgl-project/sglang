@@ -21,6 +21,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
+from torch.library import triton_op, wrap_triton
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -428,8 +429,15 @@ def memcpy_triton_kernel(
 def prod(x):
     return functools.reduce(lambda a, b: a * b, x, 1)
 
-
-def memcpy_triton(dst, src, dim, offset, sz, offset_src):
+@triton_op("sgl_kernel::memcpy_triton", mutates_args={})
+def memcpy_triton(
+        dst: torch.Tensor,
+        src: torch.Tensor, 
+        dim: int, 
+        offset: torch.Tensor, 
+        sz: torch.Tensor, 
+        offset_src: bool,
+    )-> None:
     max_size = min(src.numel(), dst.numel())
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
