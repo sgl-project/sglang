@@ -67,7 +67,7 @@ from sglang.srt.utils.common import (
     xpu_has_xmx_support,
 )
 from sglang.srt.utils.hf_transformers_utils import check_gguf_file
-from sglang.utils import is_in_ci
+from sglang.utils import is_in_amd_ci, is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -2782,6 +2782,11 @@ class ServerArgs:
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
             self.soft_watchdog_timeout = 300
+        if is_in_amd_ci():
+            # Disable hard watchdog in AMD CI by setting a very large timeout
+            # Let soft watchdog handle timeout detection and dump debug info
+            self.soft_watchdog_timeout = 3000
+            self.watchdog_timeout = 3600
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
