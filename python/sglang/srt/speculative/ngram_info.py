@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import ClassVar, Optional, Tuple, Union
+from typing import ClassVar, Optional, Tuple
 
 import torch
 import triton
@@ -21,11 +21,7 @@ from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_trito
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import (
-    ForwardMode,
-    ModelWorkerBatch,
-    ScheduleBatch,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -76,7 +72,7 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         future_indices: Optional[FutureIndices] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         verify_done: Optional[torch.cuda.Event] = None,
-        next_token_ids: Optional[torch.Tensor] = None,
+        verified_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
         accept_indices: Optional[torch.Tensor] = None,
         is_spec_v2: Optional[bool] = False,
@@ -100,31 +96,13 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.future_indices = future_indices
         self.new_seq_lens = new_seq_lens
         self.verify_done = verify_done
-        self.next_token_ids = next_token_ids
+        self.verified_tokens = verified_tokens
         self.accept_lens = accept_lens
         self.accept_indices = accept_indices
         self.is_spec_v2 = is_spec_v2
 
         self.device = (
             custom_mask.device if custom_mask is not None else new_seq_lens.device
-        )
-
-    def copy(self):
-        return NgramVerifyInput(
-            draft_token=self.draft_token,
-            custom_mask=self.custom_mask,
-            positions=self.positions,
-            retrive_index=self.retrive_index,
-            retrive_next_token=self.retrive_next_token,
-            retrive_next_sibling=self.retrive_next_sibling,
-            draft_token_num=self.draft_token_num,
-            future_indices=self.future_indices,
-            new_seq_lens=self.new_seq_lens,
-            verify_done=self.verify_done,
-            next_token_ids=self.next_token_ids.clone(),
-            accept_lens=self.accept_lens.clone(),
-            accept_indices=self.accept_indices.clone(),
-            is_spec_v2=self.is_spec_v2,
         )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
@@ -260,53 +238,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
                 self.accepted_indices
             ]
         self.verified_id = self.predict[self.accepted_indices]
-
-    # def filter_invalid_predict(
-    #     self, logits_output: LogitsProcessorOutput, predict, accepted_indices
-    # ):
-    #     self.accepted_indices = accepted_indices[accepted_indices != -1]
-    #     # device synchronization happens here
-    #     logits_output.next_token_logits = logits_output.next_token_logits[
-    #         self.accepted_indices
-    #     ]
-    #     if logits_output.hidden_states:
-    #         logits_output.hidden_states = logits_output.hidden_states[
-    #             self.accepted_indices
-    #         ]
-    #     self.verified_id = predict[self.accepted_indices]
-    #     return self.verified_id, self.accepted_indices
-
-    def process_predict_spec_v2(self, batch: Union[ScheduleBatch, ModelWorkerBatch]):
-        # select predict using accept_indices. predict can be [100, 0, 0, 200, 0, 0, ...], and draft_input_tokens is always [[100,200,0,0,...], ...]
-        # will be called at process_batch_result and schedule of next batch, when spec v2 enabled
-        if not self.is_spec_v2 or batch.forward_mode not in [
-            ForwardMode.DECODE,
-            ForwardMode.TARGET_VERIFY,
-        ]:
-            return None
-
-        bs = len(batch.reqs)
-        # when calling process_predict_spec_v2, the target verify must have been done. So here can directly copy to cpu without introducing performance loss.
-        predict, accepted_indices, accept_lens = (
-            self.next_token_ids,
-            self.accept_indices,
-            self.accept_lens,
-        )
-        # use accept_index to get valid predict
-        accepted_indices = accepted_indices[accepted_indices != -1]
-        predict = predict[accepted_indices]
-        # pad predict to [bs, num_draft_token]
-        draft_input_tokens = torch.zeros(
-            bs, self.draft_token_num, dtype=torch.int32
-        ).to(device=self.device, non_blocking=True)
-        end = torch.tensor([0]).to(device=self.device, non_blocking=True)
-        for i in range(len(batch.reqs)):
-            acc_len = accept_lens[i]
-            start = end
-            end = start + acc_len
-            draft_input_tokens[i, :acc_len] = predict[start:end]
-        draft_input_tokens = draft_input_tokens.flatten()
-        return draft_input_tokens
 
     def _free_cache(
         self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
@@ -550,18 +481,18 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.is_spec_v2:
-            self.next_token_ids = self.next_token_ids.reshape(-1, self.draft_token_num)[
-                new_indices, :
-            ]
-            self.next_token_ids = self.next_token_ids.flatten()
+            self.verified_tokens = self.verified_tokens.reshape(
+                -1, self.draft_token_num
+            )[new_indices, :]
+            self.verified_tokens = self.verified_tokens.flatten()
             self.accept_lens = self.accept_lens[new_indices]
             # no need to implement filter for accept_indices because in scheduler before batch.filter_batch, we have generated the correct draft input tokens
             self.accept_indices = self.accept_indices[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         if self.is_spec_v2:
-            self.next_token_ids = torch.cat(
-                (self.next_token_ids, spec_info.next_token_ids), dim=0
+            self.verified_tokens = torch.cat(
+                (self.verified_tokens, spec_info.verified_tokens), dim=0
             )
             self.accept_lens = torch.cat(
                 (self.accept_lens, spec_info.accept_lens), dim=0

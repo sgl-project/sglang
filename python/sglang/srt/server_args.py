@@ -2390,6 +2390,9 @@ class ServerArgs:
             self.disable_overlap_schedule = (
                 False if envs.SGLANG_ENABLE_SPEC_V2.get() else True
             )
+            if not self.disable_overlap_schedule:
+                logger.warning("The page size is set to 1 for ngram spec v2.")
+                self.page_size = 1
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
@@ -2401,7 +2404,7 @@ class ServerArgs:
                     self.speculative_num_draft_tokens // self.speculative_eagle_topk
                 )
             logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
+                "The mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
             )
 

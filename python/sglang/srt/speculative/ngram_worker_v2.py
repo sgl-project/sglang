@@ -91,7 +91,7 @@ class NGRAMWorkerV2(NGRAMWorker):
         batch_tokens = []
         if batch.forward_mode != ForwardMode.EXTEND:
             prev_token_ids, prev_accept_lens = (
-                batch.spec_info.next_token_ids,
+                batch.spec_info.verified_tokens,
                 batch.spec_info.accept_lens,
             )
             if not prev_token_ids.is_cpu:
@@ -220,31 +220,9 @@ class NGRAMWorkerV2(NGRAMWorker):
                     verify_input.retrive_next_token.shape
                 ).cpu()
 
-            # if self.count == 0:
-            #     prompt_len = len(model_worker_batch.reqs[0].origin_input_ids)
-            #     cache_loc = self.req_to_token_pool.req_to_token[
-            #         model_worker_batch.req_pool_indices[0]
-            #     ][: (prompt_len + self.draft_token_num)]
-            #     k, v = self.token_to_kv_pool.get_kv_buffer(layer_id=0)
-            #     k, v = k[cache_loc], v[cache_loc]
-            #     torch.save(
-            #         {"k": k, "v": v, "prompt_len": prompt_len},
-            #         "ngram-v2-before-verify-kv.pt",
-            #     )
-
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
-
-            # if self.count == 0:
-            #     prompt_len = len(model_worker_batch.reqs[0].origin_input_ids)
-            #     cache_loc = self.req_to_token_pool.req_to_token[
-            #         model_worker_batch.req_pool_indices[0]
-            #     ][: (prompt_len + self.draft_token_num)]
-            #     k, v = self.token_to_kv_pool.get_kv_buffer(layer_id=0)
-            #     k, v = k[cache_loc], v[cache_loc]
-            #     torch.save({"k": k, "v": v, "prompt_len": prompt_len}, "ngram-v2-kv.pt")
-            #     self.count += 1
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -280,9 +258,10 @@ class NGRAMWorkerV2(NGRAMWorker):
                 accept_index,
             ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
             new_seq_lens = model_worker_batch.seq_lens + accept_length
-            draft_input_tokens = predict
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
+
+            verified_tokens = predict[accept_index].flatten()
 
             # copy kvcache will not use the new_seq_lens
             move_accepted_tokens_to_target_kvcache(
@@ -305,11 +284,11 @@ class NGRAMWorkerV2(NGRAMWorker):
             )
             new_seq_lens = model_worker_batch.seq_lens
 
-            draft_input_tokens = torch.zeros(
+            verified_tokens = torch.zeros(
                 bs, self.draft_token_num, dtype=torch.int32
             ).to(device=self.device, non_blocking=True)
-            draft_input_tokens[:, 0] = predict
-            draft_input_tokens = draft_input_tokens.flatten()
+            verified_tokens[:, 0] = predict
+            verified_tokens = verified_tokens.flatten()
             accept_index = torch.full(
                 (bs, self.draft_token_num), -1, dtype=torch.int32
             ).to(device=self.device, non_blocking=True)
@@ -326,14 +305,14 @@ class NGRAMWorkerV2(NGRAMWorker):
             draft_token_num=self.draft_token_num,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
-            next_token_ids=draft_input_tokens,
+            verified_tokens=verified_tokens,
             accept_lens=accept_length,
             accept_indices=accept_index,
             is_spec_v2=True,
         )
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=verified_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_length,
             next_draft_input=next_draft_input,

@@ -357,11 +357,7 @@ class SchedulerOutputProcessorMixin:
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
-        if batch.spec_algorithm.is_ngram():
-            next_token_ids = batch.spec_info.process_predict_spec_v2(batch)
-            next_token_ids = next_token_ids.cpu().tolist()
-        else:
-            next_token_ids = result.next_token_ids.tolist()
+        next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
@@ -507,6 +503,7 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                 else:
                     release_kv_cache(req, self.tree_cache)
+
                 req.time_stats.completion_time = time.perf_counter()
 
             self.maybe_collect_customized_info(i, req, logits_output)
