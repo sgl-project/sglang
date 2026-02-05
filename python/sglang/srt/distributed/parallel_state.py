@@ -586,6 +586,14 @@ class GroupCoordinator:
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
+        # IMPORTANT:
+        # Never allow Dynamo/Inductor to trace the out-of-place all-reduce path.
+        # If it gets traced, it will appear in compiled code and break CUDA graph replay.
+        # Reference: https://github.com/sgl-project/sglang/issues/16102
+        if hasattr(torch, "_dynamo") and torch._dynamo.is_compiling():
+            torch.ops.sglang.inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
+
         outplace_all_reduce_method = None
         if (
             self.ca_comm is not None
