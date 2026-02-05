@@ -855,6 +855,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             )
             hidden_states = hidden_states[:, sp_rank, :, :]
 
+            # a temporary fix to compatible with torch compile
+            @torch.compiler.disable
             def _compute_rope_for_sequence_shard(
                 local_len: int,
                 rank: int,
