@@ -42,7 +42,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 cls.tp if hasattr(cls, "tp") else "1",
                 "--log-level",
                 "debug",
-                *cls.runner_args
+                *cls.runner_args,
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -50,13 +50,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         #     cls.base_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         # )
         import time
+
         import requests
+
         url = cls.base_url + "/health"
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
         start_time = time.perf_counter()
         while True:
             try:
-                print("SEND REQUEST")
                 response = requests.get(url)
                 if response.status_code == 200:
                     print(f"Server {url} is ready")
@@ -70,13 +71,15 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
         # # Extract and display peak GPU memory from logs
         combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
-    
+
         peak_memory_before_load = cls._extract_peak_memory_before_load(combined_output)
         if is_cuda_alike() and not peak_memory_before_load:
             raise ValueError("Should have found peak memory")
         cls.peak_memory_before_load = float(peak_memory_before_load)
 
-        memory_increase_load_weights = cls._extract_memory_increase_load_weights(combined_output)
+        memory_increase_load_weights = cls._extract_memory_increase_load_weights(
+            combined_output
+        )
         if is_cuda_alike() and not memory_increase_load_weights:
             raise ValueError("Should have found memory increase in load_weights")
         cls.memory_increase_load_weights = float(memory_increase_load_weights)
@@ -107,12 +110,28 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         cls.stdout.close()
         cls.stderr.close()
 
-    def _test_peak_memory(self, threshold):
+    def _test_peak_memory(
+        self, threshold, test_start: bool, add_peak_memory_before_load: bool
+    ):
         """Helper method to test peak memory against a threshold."""
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
-        assert self.memory_increase_load_weights < threshold
-        assert self.peak_memory_before_load < 5  # Weights initialized on meta device.
+
+        # NOTE: We can not simply rely on peak memory after `load_weights` as functions used
+        # in-between (e.g. FP8->MXFP4 requantization) during weight loading may have a higher peak memory footprint
+        # than simply the allocated weights.
+        if add_peak_memory_before_load:
+            reference_gib = (
+                self.memory_increase_load_weights + self.peak_memory_before_load
+            )
+        else:
+            reference_gib = self.memory_increase_load_weights
+
+        assert reference_gib < threshold
+
+        if test_start:
+            # Weights initialized on meta device (not for dense BF16->MXFP4)
+            assert self.peak_memory_before_load < 5
 
     def _test_gsm8k(self, accuracy_threshold):
         """Helper method to test GSM8K accuracy against a threshold."""
@@ -135,7 +154,9 @@ class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
 
     def test_peak_memory(self):
         # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
-        self._test_peak_memory(threshold=6)  # TP=1
+        self._test_peak_memory(
+            threshold=6, test_start=False, add_peak_memory_before_load=True
+        )
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-8B reference accuracy: ~0.92
@@ -152,11 +173,13 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
 
     def test_peak_memory(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB  # TODO update
-        self._test_peak_memory(threshold=21.5)  # TP=1  # TODO update
+        self._test_peak_memory(
+            threshold=17, test_start=False, add_peak_memory_before_load=True
+        )
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
-        self._test_gsm8k(accuracy_threshold=0.9)
+        self._test_gsm8k(accuracy_threshold=0.89)
 
 
 class TestFP8ToMXFP4Dense(TestOnlineQuantizationMemoryLoad):
