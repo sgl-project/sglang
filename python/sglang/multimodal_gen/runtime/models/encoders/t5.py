@@ -63,9 +63,6 @@ class AttentionType:
     ENCODER_DECODER = "encoder_decoder"
 
 
-_seen_keys = set()  # 用集合记录已经出现过的 key
-
-
 @dataclass
 class AttentionMetadata:
     attn_bias: torch.Tensor
