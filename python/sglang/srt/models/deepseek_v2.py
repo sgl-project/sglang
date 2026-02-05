@@ -567,7 +567,6 @@ class DeepseekV2MoE(nn.Module):
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
-                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -575,7 +574,6 @@ class DeepseekV2MoE(nn.Module):
             else:
                 return self.forward_normal(
                     hidden_states,
-                    forward_batch,
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
@@ -586,19 +584,16 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
-
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(
             hidden_states, gemm_output_zero_allocator
         )
         server_args = get_global_server_args()
-        should_mask_padding = server_args.ep_size > 1
         dispatch_info = None
         if getattr(server_args, "enable_eplb", False):
             dispatch_info = ExpertLocationDispatchInfo.init_new(
@@ -610,9 +605,6 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.num_token_non_padded if should_mask_padding else None
-                ),
                 expert_location_dispatch_info=dispatch_info,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
@@ -633,7 +625,6 @@ class DeepseekV2MoE(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
@@ -643,7 +634,6 @@ class DeepseekV2MoE(nn.Module):
         ):
             return self.forward_cpu(hidden_states, should_allreduce_fusion)
         server_args = get_global_server_args()
-        should_mask_padding = server_args.ep_size > 1
         dispatch_info = None
         if getattr(server_args, "enable_eplb", False):
             dispatch_info = ExpertLocationDispatchInfo.init_new(
@@ -661,9 +651,6 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=(
-                    forward_batch.num_token_non_padded if should_mask_padding else None
-                ),
                 expert_location_dispatch_info=dispatch_info,
             )
         else:
