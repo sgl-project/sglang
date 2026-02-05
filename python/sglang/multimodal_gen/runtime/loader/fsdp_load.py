@@ -231,10 +231,55 @@ def load_model_from_full_model_state_dict(
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
-    for target_param_name, full_tensor in custom_param_sd.items():
+    
+    # Check if model is using FSDP
+    is_fsdp_model = isinstance(model, FSDPModule) or any(
+        hasattr(p, "device_mesh") for p in meta_sd.values()
+    )
+    
+    # CRITICAL: Sort parameter names to ensure all ranks process parameters in the same order.
+    # This is essential for FSDP because distribute_tensor is a collective operation that
+    # requires all ranks to call it for the same parameter at the same time.
+    # Without sorting, different ranks may iterate in different orders due to:
+    # 1. Non-deterministic dict iteration order across processes
+    # 2. Different timing in parameter merging logic in hf_to_custom_state_dict
+    # 3. Race conditions in file I/O
+    sorted_param_names = sorted(custom_param_sd.keys())
+    
+    # For FSDP models, verify that all ranks have the same set of parameters
+    # to prevent deadlocks in collective operations
+    if is_fsdp_model and torch.distributed.is_initialized():
+        import torch.distributed as dist
+        # Convert to sorted list for consistent serialization
+        local_param_list = sorted_param_names
+        local_param_count = len(local_param_list)
+        
+        # Gather parameter counts from all ranks
+        world_size = dist.get_world_size()
+        all_counts = [torch.tensor(0, dtype=torch.long, device=device) for _ in range(world_size)]
+        dist.all_gather(all_counts, torch.tensor(local_param_count, dtype=torch.long, device=device))
+        
+        # Check if all ranks have the same number of parameters
+        counts_list = [c.item() for c in all_counts]
+        if len(set(counts_list)) > 1:
+            rank = dist.get_rank()
+            logger.error(
+                f"Rank {rank}: Parameter count mismatch across ranks: {counts_list}. "
+                f"This rank has {local_param_count} parameters: {local_param_list[:5]}..."
+            )
+            raise RuntimeError(
+                f"FSDP parameter loading failed: Ranks have different numbers of parameters {counts_list}. "
+                "This usually indicates inconsistent checkpoint files or parameter merging issues."
+            )
+    
+    for target_param_name in sorted_param_names:
+        full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
-            if strict:
+            # For FSDP models, we need to ensure all ranks process parameters consistently
+            # to avoid deadlocks in collective operations like distribute_tensor.
+            # Therefore, we always raise an error for missing parameters in FSDP mode.
+            if strict or is_fsdp_model:
                 raise ValueError(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
