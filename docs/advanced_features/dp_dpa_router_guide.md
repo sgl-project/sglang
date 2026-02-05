@@ -12,11 +12,8 @@ This guide explains Data Parallelism Attention (DPA), a parallelism strategy opt
 - No inter-worker communication during inference (for simple DP)
 - Linear throughput scaling with the number of workers
 
----
 
-## Understanding DPA (Data Parallelism Attention)
-
-### What is DPA?
+## Data Parallelism Attention (DPA)
 
 **Data Parallelism Attention (DPA)**, also known as DP Attention, is an advanced parallelism strategy specifically designed for models with **Multi-Head Latent Attention (MLA)** architecture, such as DeepSeek models.
 
