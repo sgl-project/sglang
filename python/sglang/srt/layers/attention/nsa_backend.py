@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 
 if _is_hip:
@@ -595,7 +596,7 @@ class NativeSparseAttnBackend(
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
+        if _is_cuda and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -878,7 +879,7 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
-        if is_cuda() and (
+        if _is_cuda and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
@@ -1047,7 +1048,7 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        if _is_cuda and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
