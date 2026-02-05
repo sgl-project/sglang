@@ -961,6 +961,11 @@ def get_w8a8_block_fp8_configs(
     be picked and the associated configuration chosen to invoke the kernel.
     """
 
+    # Skip config lookup during torch.compile to avoid non-Tensor ops (e.g., device name).
+    # Returning None forces the caller to use the default config path during compile.
+    if torch._dynamo.is_compiling():
+        return None
+
     # First look up if an optimized configuration is available in the configs
     # directory
     device_name = get_device_name().replace(" ", "_")
