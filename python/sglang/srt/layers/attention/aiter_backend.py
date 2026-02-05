@@ -113,7 +113,6 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -122,6 +121,21 @@ class AiterAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+
+        # Get v_head_dim based on model type
+        if self.use_mla:
+            # For MLA models, get v_head_dim from model config
+            self.v_head_dim = model_runner.model_config.v_head_dim
+        elif (
+            model_runner.hybrid_gdn_config is not None
+            or model_runner.kimi_linear_config is not None
+        ):
+            # For hybrid linear models, layer_id = 0 may not be full attention
+            self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
+        else:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
+                -1
+            ]
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
