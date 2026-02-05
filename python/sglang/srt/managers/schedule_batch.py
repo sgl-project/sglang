@@ -65,7 +65,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.marconi_config import DEFAULT_MARCONI_TRACK_MAX_POINTS
+from sglang.srt.mem_cache.marconi_config import DEFAULT_MAMBA_TRACK_MAX_POINTS
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -593,7 +593,7 @@ class Req:
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
-        self.marconi_track_entries: Optional[List[Tuple[int, int]]] = None
+        self.mamba_track_entries: Optional[List[Tuple[int, int]]] = None
 
         # Check finish
         self.tokenizer = None
@@ -1754,7 +1754,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
             else:
                 buffer_size = 0
-            max_points = DEFAULT_MARCONI_TRACK_MAX_POINTS
+            max_points = DEFAULT_MAMBA_TRACK_MAX_POINTS
             if max_points is None:
                 max_points = buffer_size if buffer_size > 0 else 1
             if req.mamba_branching_seqlen is not None and max_points > len(
@@ -1787,11 +1787,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask_cpu.append(False)
             mamba_track_indices_cpu.append(0)
             mamba_track_seqlens_cpu.append(-1)
-            req.marconi_track_entries = None
+            req.mamba_track_entries = None
             return
 
         buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
-        max_points = DEFAULT_MARCONI_TRACK_MAX_POINTS
+        max_points = DEFAULT_MAMBA_TRACK_MAX_POINTS
         if max_points is None:
             max_points = buffer_size
         max_points = max(1, min(max_points, buffer_size))
@@ -1805,14 +1805,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
         req.mamba_next_track_idx = (start_idx + len(track_points)) % buffer_size
 
-        req.marconi_track_entries = list(zip(track_points, slots))
-        for seqlen, slot in req.marconi_track_entries:
+        req.mamba_track_entries = list(zip(track_points, slots))
+        for seqlen, slot in req.mamba_track_entries:
             mamba_track_entry_req_indices_cpu.append(req_batch_idx)
             mamba_track_entry_indices_cpu.append(slot)
             mamba_track_entry_seqlens_cpu.append(seqlen)
 
         # Keep a primary track entry for backward-compatible paths.
-        primary_seqlen, primary_slot = req.marconi_track_entries[-1]
+        primary_seqlen, primary_slot = req.mamba_track_entries[-1]
         mamba_track_mask_cpu.append(True)
         mamba_track_indices_cpu.append(primary_slot)
         mamba_track_seqlens_cpu.append(primary_seqlen)

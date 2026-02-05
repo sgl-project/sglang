@@ -830,7 +830,7 @@ class MambaRadixCache(BasePrefixCache):
         primary_entry = None
         secondary_entries = None
         if self.marconi_enabled:
-            track_entries = getattr(req, "marconi_track_entries", None)
+            track_entries = getattr(req, "mamba_track_entries", None)
             if track_entries:
                 entries = sorted(track_entries, key=lambda x: x[0])
                 primary_entry = entries[-1]
@@ -1029,7 +1029,7 @@ class MambaRadixCache(BasePrefixCache):
                         self.req_to_token_pool.mamba_pool.free(secondary_forked)
 
             if track_entries:
-                req.marconi_track_entries = None
+                req.mamba_track_entries = None
             if self.marconi_enabled:
                 req.kv_cache_protected_len = max(kv_cache_protected_len, new_prefix_len)
         else:
@@ -1086,7 +1086,7 @@ class MambaRadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        track_entries = getattr(req, "marconi_track_entries", None)
+        track_entries = getattr(req, "mamba_track_entries", None)
         if self.marconi_enabled and track_entries:
             self._marconi_cache_track_entries(
                 req,
@@ -1095,7 +1095,7 @@ class MambaRadixCache(BasePrefixCache):
                 kv_indices_orig,
                 token_ids,
             )
-            req.marconi_track_entries = None
+            req.mamba_track_entries = None
             return
         # kv_indices is the kv indices to be cached
         kv_indices = kv_indices_orig[:cache_len]
