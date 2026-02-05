@@ -1353,6 +1353,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         s = self.forward_prepare(
@@ -1360,6 +1361,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=layer_scatter_modes,
             llama_4_scaling=llama_4_scaling,
         )
         return self.forward_core(s)
@@ -1370,6 +1372,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        layer_scatter_modes: LayerScatterModes,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
@@ -1430,7 +1433,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
-                self, positions, hidden_states, forward_batch, zero_allocator
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
             )
         else:
             raise NotImplementedError
@@ -2377,6 +2385,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            layer_scatter_modes=self.layer_scatter_modes,
             llama_4_scaling=llama_4_scaling,
         )
 

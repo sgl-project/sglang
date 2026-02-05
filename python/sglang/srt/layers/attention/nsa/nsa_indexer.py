@@ -28,11 +28,20 @@ if is_npu():
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
+    scattered_to_tp_attn_full,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
+)
+from sglang.srt.layers.communicator import (
+    ScatterMode,
+    delay_gather_for_dsa,
+    get_attn_tp_context,
+    scattered_to_tp_attn_full,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -1137,6 +1146,7 @@ class Indexer(MultiPlatformOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        layer_scatter_modes,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
@@ -1157,7 +1167,7 @@ class Indexer(MultiPlatformOp):
         cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
 
-        bs = x.shape[0]
+        bs = q_lora.shape[0]
         if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
@@ -1206,6 +1216,13 @@ class Indexer(MultiPlatformOp):
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
+        if (
+            delay_gather_for_dsa()
+            and get_attn_tp_context().input_scattered
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            k = scattered_to_tp_attn_full(k, forward_batch)
         k_pe, k_nope = torch.split(
             k,
             [self.rope_head_dim, self.head_dim - self.rope_head_dim],
@@ -1251,7 +1268,9 @@ class Indexer(MultiPlatformOp):
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
-                actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
+                actual_seq_lengths_q = (
+                    forward_batch.attn_backend.forward_metadata.seq_lens_cum_sum
+                )
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -1285,7 +1304,13 @@ class Indexer(MultiPlatformOp):
         if self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
         torch.npu.current_stream().wait_event(weights_event)
-
+        if (
+            delay_gather_for_dsa()
+            and get_attn_tp_context().input_scattered
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            weights = scattered_to_tp_attn_full(weights, forward_batch)
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill

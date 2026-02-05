@@ -13,7 +13,12 @@ from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.communicator import (
+    ScatterMode,
+    delay_gather_for_dsa,
+    get_attn_tp_context,
+    scattered_to_tp_attn_full,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -285,6 +290,7 @@ def forward_dsa_prepare_npu(
     hidden_states: torch.Tensor,
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
 ):
     dynamic_scale = None
     if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
@@ -306,13 +312,25 @@ def forward_dsa_prepare_npu(
             zero_allocator,
         )
     else:
-        fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        if delay_gather_for_dsa():
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+        else:
+            fused_qkv_a_proj_out = get_attn_tp_context().fetch_qkv_latent()
         q, latent_cache = fused_qkv_a_proj_out.split(
             [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
         )
 
         # overlap qk norm
         q = m.q_a_layernorm(q)
+
+        if (
+            delay_gather_for_dsa()
+            and get_attn_tp_context().input_scattered
+            and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
+            and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            q = scattered_to_tp_attn_full(q, forward_batch)
+            latent_cache = scattered_to_tp_attn_full(latent_cache, forward_batch)
 
         q_lora = q.clone()  # required for topk_indices
 
@@ -353,7 +371,13 @@ def forward_dsa_prepare_npu(
             )
 
     topk_indices = m.indexer(
-        hidden_states, q_lora, positions, forward_batch, m.layer_id, dynamic_scale
+        hidden_states,
+        q_lora,
+        positions,
+        forward_batch,
+        m.layer_id,
+        dynamic_scale,
+        layer_scatter_modes,
     )
 
     return (
