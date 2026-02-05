@@ -1,6 +1,6 @@
 import io
 import re
-
+import unittest
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
@@ -15,10 +15,13 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    is_in_ci,
 )
 
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
+    runner_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -36,27 +39,63 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 "--context-length",
                 "3000",
                 "--tensor-parallel-size",
-                "1",
+                cls.tp if hasattr(cls, "tp") else "1",
                 "--log-level",
                 "debug",
+                *cls.runner_args
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
+        # cls.wait_server_ready(
+        #     cls.base_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        # )
+        import time
+        import requests
+        url = cls.base_url + "/health"
+        timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        start_time = time.perf_counter()
+        while True:
+            try:
+                print("SEND REQUEST")
+                response = requests.get(url)
+                if response.status_code == 200:
+                    print(f"Server {url} is ready")
+                    break
+            except Exception:
+                pass
+
+            if time.perf_counter() - start_time > timeout:
+                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
+            time.sleep(1)
 
         # # Extract and display peak GPU memory from logs
         combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
-        peak_memory = cls._extract_peak_memory(combined_output)
-
-        if is_cuda_alike() and not peak_memory:
+    
+        peak_memory_before_load = cls._extract_peak_memory_before_load(combined_output)
+        if is_cuda_alike() and not peak_memory_before_load:
             raise ValueError("Should have found peak memory")
+        cls.peak_memory_before_load = float(peak_memory_before_load)
 
-        cls.peak_memory = float(peak_memory)
+        memory_increase_load_weights = cls._extract_memory_increase_load_weights(combined_output)
+        if is_cuda_alike() and not memory_increase_load_weights:
+            raise ValueError("Should have found memory increase in load_weights")
+        cls.memory_increase_load_weights = float(memory_increase_load_weights)
 
     @classmethod
-    def _extract_peak_memory(cls, log_output):
+    def _extract_peak_memory_before_load(cls, log_output):
         """Extract peak GPU memory value from log output."""
         # Search for the log message pattern
-        pattern = r"Peak GPU memory after loading weights:\s+([\d.]+)\s+GiB"
+        pattern = r"Peak GPU memory before loading weights:\s+([\d.]+)\s+GiB"
+        match = re.search(pattern, log_output)
+        if match:
+            return match.group(1)
+        return None
+
+    @classmethod
+    def _extract_memory_increase_load_weights(cls, log_output):
+        """Extract memory increase during load_weights call."""
+        # Search for the log message pattern
+        pattern = r"Memory increase during load_weights:\s+([\d.]+)\s+GiB"
         match = re.search(pattern, log_output)
         if match:
             return match.group(1)
@@ -72,7 +111,8 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         """Helper method to test peak memory against a threshold."""
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
-        assert self.peak_memory < threshold
+        assert self.memory_increase_load_weights < threshold
+        assert self.peak_memory_before_load < 5  # Weights initialized on meta device.
 
     def _test_gsm8k(self, accuracy_threshold):
         """Helper method to test GSM8K accuracy against a threshold."""
@@ -111,8 +151,8 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
-        self._test_peak_memory(threshold=21.5)  # TP=1
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB  # TODO update
+        self._test_peak_memory(threshold=21.5)  # TP=1  # TODO update
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
