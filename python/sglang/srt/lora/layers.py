@@ -604,6 +604,12 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = None
 
         # initialize triton_lora moe runner for batches with lora enabled
+        if lora_backend.name != "triton":
+            raise ValueError(
+                "FusedMoEWithLoRA only supports 'triton' backend. "
+                "Please set --lora-backend triton when using LoRA on MoE models."
+            )
+
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
         self._lora_runner = MoeRunner(

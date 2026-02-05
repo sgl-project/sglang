@@ -291,7 +291,7 @@ class LoRAManager:
         num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass
 
         # Create tensor and fill with adapter indices from segments
-        token_lora_indices_reordered = torch.empty(
+        token_lora_indices = torch.empty(
             num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device
         )
         seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
@@ -299,20 +299,7 @@ class LoRAManager:
             start_token = seg_indptr[seg_idx]
             end_token = seg_indptr[seg_idx + 1]
             lora_adapter = batch_info.weight_indices[seg_idx]
-            token_lora_indices_reordered[start_token:end_token] = lora_adapter
-
-        if batch_info.permutation is None:
-            # No reordering (e.g., triton backend): segments are in original order
-            token_lora_indices = token_lora_indices_reordered
-        else:
-            # Tokens are reordered (chunked backend): need to convert back to original order
-            inverse_permutation = torch.empty_like(batch_info.permutation)
-            inverse_permutation[batch_info.permutation] = torch.arange(
-                num_tokens,
-                dtype=batch_info.permutation.dtype,
-                device=batch_info.permutation.device,
-            )
-            token_lora_indices = token_lora_indices_reordered[inverse_permutation]
+            token_lora_indices[start_token:end_token] = lora_adapter
 
         forward_batch.token_lora_indices = token_lora_indices
 
