@@ -22,11 +22,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import (
-    LayerNormScaleShift,
-    RMSNorm,
-    apply_qk_norm,
-)
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
@@ -397,12 +393,7 @@ class Flux2SingleTransformerBlock(nn.Module):
     ):
         super().__init__()
 
-        self.norm = LayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         # Note that the MLP in/out linear layers are fused with the attention QKV/out projections, respectively; this
         # is often called a "parallel" transformer block. See the [ViT-22B paper](https://arxiv.org/abs/2302.05442)
@@ -437,7 +428,8 @@ class Flux2SingleTransformerBlock(nn.Module):
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
-        norm_hidden_states = self.norm(hidden_states, mod_shift, mod_scale)
+        norm_hidden_states = self.norm(hidden_states)
+        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
@@ -473,18 +465,8 @@ class Flux2TransformerBlock(nn.Module):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm1 = LayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
-        self.norm1_context = LayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.norm1_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
 
         self.attn = Flux2Attention(
             query_dim=dim,
@@ -498,20 +480,10 @@ class Flux2TransformerBlock(nn.Module):
             eps=eps,
         )
 
-        self.norm2 = LayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
 
-        self.norm2_context = LayerNormScaleShift(
-            dim,
-            eps=eps,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
+        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.ff_context = Flux2FeedForward(
             dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias
         )
@@ -542,12 +514,14 @@ class Flux2TransformerBlock(nn.Module):
         ) = temb_mod_params_txt
 
         # Img stream
-        norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
+        norm_hidden_states = self.norm1(hidden_states)
+        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
 
         # Conditioning txt stream
-        norm_encoder_hidden_states = self.norm1_context(
-            encoder_hidden_states, c_shift_msa, c_scale_msa
-        )
+        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
+        norm_encoder_hidden_states = (
+            1 + c_scale_msa
+        ) * norm_encoder_hidden_states + c_shift_msa
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
@@ -563,7 +537,8 @@ class Flux2TransformerBlock(nn.Module):
         attn_output = gate_msa * attn_output
         hidden_states = hidden_states + attn_output
 
-        norm_hidden_states = self.norm2(hidden_states, shift_mlp, scale_mlp)
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
         ff_output = self.ff(norm_hidden_states)
         hidden_states = hidden_states + gate_mlp * ff_output
@@ -572,8 +547,9 @@ class Flux2TransformerBlock(nn.Module):
         context_attn_output = c_gate_msa * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-        norm_encoder_hidden_states = self.norm2_context(
-            encoder_hidden_states, c_shift_mlp, c_scale_mlp
+        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)

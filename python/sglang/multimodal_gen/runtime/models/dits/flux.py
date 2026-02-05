@@ -31,11 +31,7 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
-from sglang.multimodal_gen.runtime.layers.layernorm import (
-    LayerNormScaleShift,
-    RMSNorm,
-    apply_qk_norm,
-)
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -324,23 +320,13 @@ class FluxTransformerBlock(nn.Module):
             eps=eps,
         )
 
-        self.norm2 = LayerNormScaleShift(
-            dim,
-            eps=1e-6,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
+        self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.ff = MLP(
             input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
         )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-        self.norm2_context = LayerNormScaleShift(
-            dim,
-            eps=1e-6,
-            elementwise_affine=False,
-            dtype=torch.float32,
-        )
+        self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
         self.ff_context = MLP(
             input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
         )
@@ -382,8 +368,9 @@ class FluxTransformerBlock(nn.Module):
         # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
-        norm_hidden_states = self.norm2(
-            hidden_states, shift_mlp[:, None], scale_mlp[:, None]
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = (
+            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         )
 
         ff_output = self.ff(norm_hidden_states)
@@ -397,8 +384,10 @@ class FluxTransformerBlock(nn.Module):
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-        norm_encoder_hidden_states = self.norm2_context(
-            encoder_hidden_states, c_shift_mlp[:, None], c_scale_mlp[:, None]
+        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+        norm_encoder_hidden_states = (
+            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
+            + c_shift_mlp[:, None]
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
