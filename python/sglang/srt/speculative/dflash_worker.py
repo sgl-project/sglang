@@ -342,9 +342,8 @@ class DFlashWorker:
                 if page_size == 1:
                     block_cache_loc = alloc_token_slots(
                         batch.tree_cache,
-                        self.block_size,
+                        self.block_size * bs,
                     )
-                    end_offset = batch.seq_lens + self.block_size
                 else:
                     prefix_lens = batch.seq_lens
                     prefix_lens_cpu = batch.seq_lens_cpu
@@ -362,7 +361,7 @@ class DFlashWorker:
                         end_offset,
                         end_offset_cpu,
                         last_loc,
-                        self.block_size,
+                        self.block_size * bs,
                     )
 
             else:
