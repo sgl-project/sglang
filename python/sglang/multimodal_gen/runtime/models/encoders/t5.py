@@ -26,12 +26,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
-from sglang.multimodal_gen.runtime.distributed import get_sp_group, get_tp_group
+from sglang.multimodal_gen.runtime.distributed.utils import _get_folding_tp_group
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -68,17 +67,6 @@ class AttentionType:
 @dataclass
 class AttentionMetadata:
     attn_bias: torch.Tensor
-
-
-def _get_folding_tp_group(config: T5Config) -> dist.ProcessGroup | None:
-    if config.parallel_folding:
-        if config.parallel_folding_mode == "sp":
-            return get_sp_group()
-        elif config.parallel_folding_mode == "ulysses":
-            return get_sp_group().ulysses_group
-        elif config.parallel_folding_mode == "ring":
-            return get_sp_group().ring_group
-    return get_tp_group()
 
 
 class T5DenseActDense(nn.Module):
