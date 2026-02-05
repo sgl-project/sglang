@@ -37,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
@@ -197,6 +198,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        # RadixLinearAttention layer
+        self.attn = RadixLinearAttention(
+            layer_id=layer_id,
+            num_q_heads=self.num_k_heads // self.attn_tp_size,
+            num_k_heads=self.num_k_heads // self.attn_tp_size,
+            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            head_q_dim=self.head_k_dim,
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+            conv_weights=None,  # Will be set dynamically in forward
+            bias=None,  # Will be set dynamically in forward
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+        )
+
         # Normalization layer
         self.norm = RMSNormGated(
             self.head_v_dim,
@@ -273,36 +290,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         # ============================================================
-        # Part 2: Core Attention (Custom Op)
+        # Part 2: Core Attention (Custom Op via RadixLinearAttention)
         # ============================================================
-        kwargs = {
-            "mixed_qkv": mixed_qkv,
-            "conv_weights": conv_weights,
-            "bias": self.conv1d.bias,
-            "activation": self.activation,
-            "key_dim": self.key_dim,
-            "value_dim": self.value_dim,
-            "attention_tp_size": self.attn_tp_size,
-            "head_k_dim": self.head_k_dim,
-            "head_v_dim": self.head_v_dim,
-            "a": a,
-            "b": b,
-            "A_log": self.A_log,
-            "dt_bias": self.dt_bias,
-            "layer_id": self.layer_id,
-            "seq_len": seq_len,
-            "num_k_heads": self.num_k_heads,
-            "num_v_heads": self.num_v_heads,
-            "z": z,
-        }
+        # Update dynamic weights in the attention layer
+        self.attn.conv_weights = conv_weights
+        self.attn.bias = self.conv1d.bias
+        # Store additional attributes needed by attn_backend
+        self.attn.key_dim = self.key_dim // self.attn_tp_size
+        self.attn.value_dim = self.value_dim // self.attn_tp_size
+        self.attn.attention_tp_size = self.attn_tp_size
+        self.attn.seq_len = seq_len
+        self.attn.z = z
 
-        core_attn_out = forward_batch.attn_backend.forward(
-            q=None,
-            k=None,
-            v=None,
-            layer=None,
+        core_attn_out = self.attn.forward(
             forward_batch=forward_batch,
-            **kwargs,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
         )
 
         # ============================================================
