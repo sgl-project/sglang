@@ -10,7 +10,6 @@ Run this after clearing pre-built AITER kernels from the Docker image.
 """
 
 import os
-import sys
 import time
 
 # Ensure AITER is enabled
@@ -32,49 +31,87 @@ def warmup_aiter_kernels():
     device = torch.device("cuda:0")
     start_time = time.time()
 
-    # Warmup RMSNorm kernel (module_rmsnorm) - most commonly used
-    # SGLang uses rmsnorm2d_fwd and rmsnorm2d_fwd_with_add from aiter
+    # Warmup RMSNorm kernels - AITER has two separate modules:
+    # - module_rmsnorm_quant: used when hidden_size <= 8192 (via rmsnorm function)
+    # - module_rmsnorm: used when hidden_size > 8192 (via rmsnorm2d_fwd_ck function)
+    # We need to trigger both modules for complete warmup.
+    eps = 1e-6
+    batch_size = 512  # Use larger batch to match CUDA graph capture
+
+    # First, warmup module_rmsnorm_quant (for hidden_size <= 8192)
     try:
-        print("\n[1/4] Warming up RMSNorm kernel (rmsnorm2d_fwd)...")
-        from aiter import rmsnorm2d_fwd
+        print("\n[1/5] Warming up RMSNorm kernel (module_rmsnorm_quant)...")
+        from aiter.ops.rmsnorm import rmsnorm
 
-        hidden_size = 4096
-        batch_size = 512  # Use larger batch to match CUDA graph capture
-        x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
-        weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
-        eps = 1e-6
+        for hidden_size in [4096, 5120, 7168, 8192]:
+            x = torch.randn(
+                batch_size, hidden_size, dtype=torch.bfloat16, device=device
+            )
+            out = torch.empty_like(x)
+            weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
 
-        # This triggers JIT compilation
-        _ = rmsnorm2d_fwd(x, weight, eps)
-        torch.cuda.synchronize()
-        print(f"   RMSNorm kernel (rmsnorm2d_fwd) compiled successfully")
+            # This triggers module_rmsnorm_quant JIT compilation
+            rmsnorm(out, x, weight, eps)
+            torch.cuda.synchronize()
+            print(
+                f"   rmsnorm (module_rmsnorm_quant, hidden_size={hidden_size}) compiled"
+            )
     except Exception as e:
-        print(f"   RMSNorm warmup failed (may not be available): {e}")
+        print(f"   module_rmsnorm_quant warmup failed: {e}")
 
-    # Warmup fused add RMSNorm kernel
+    # Second, warmup module_rmsnorm (CK version, for hidden_size > 8192 or explicit call)
+    # Note: rmsnorm2d_fwd_ck signature: (input, weight, epsilon, use_model_sensitive_rmsnorm=0) -> Tensor
     try:
-        print("\n[2/4] Warming up fused add RMSNorm kernel (rmsnorm2d_fwd_with_add)...")
-        from aiter import rmsnorm2d_fwd_with_add
+        print("\n[2/5] Warming up RMSNorm kernel (module_rmsnorm - CK version)...")
+        from aiter.ops.rmsnorm import rmsnorm2d_fwd_ck
 
-        hidden_size = 4096
-        batch_size = 512
-        x = torch.randn(batch_size, hidden_size, dtype=torch.bfloat16, device=device)
-        residual = torch.randn(
-            batch_size, hidden_size, dtype=torch.bfloat16, device=device
+        # Use hidden_size > 8192 to trigger module_rmsnorm CK kernel
+        for hidden_size in [14336, 16384]:
+            x = torch.randn(
+                batch_size, hidden_size, dtype=torch.bfloat16, device=device
+            )
+            weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+
+            # This triggers module_rmsnorm JIT compilation (CK version)
+            # Signature: rmsnorm2d_fwd_ck(input, weight, epsilon, use_model_sensitive_rmsnorm=0) -> Tensor
+            _ = rmsnorm2d_fwd_ck(x, weight, eps)
+            torch.cuda.synchronize()
+            print(
+                f"   rmsnorm2d_fwd_ck (module_rmsnorm, hidden_size={hidden_size}) compiled"
+            )
+    except Exception as e:
+        print(f"   module_rmsnorm CK warmup failed: {e}")
+
+    # Third, warmup fused add RMSNorm CK kernel (module_rmsnorm)
+    try:
+        print(
+            "\n[3/5] Warming up fused add RMSNorm kernel (module_rmsnorm - CK version)..."
         )
-        weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
-        eps = 1e-6
+        from aiter.ops.rmsnorm import rmsnorm2d_fwd_with_add_ck
 
-        # This triggers JIT compilation
-        _ = rmsnorm2d_fwd_with_add(x, residual, weight, eps)
-        torch.cuda.synchronize()
-        print(f"   Fused add RMSNorm kernel compiled successfully")
+        for hidden_size in [4096, 5120, 7168, 8192, 14336]:
+            x = torch.randn(
+                batch_size, hidden_size, dtype=torch.bfloat16, device=device
+            )
+            residual = torch.randn(
+                batch_size, hidden_size, dtype=torch.bfloat16, device=device
+            )
+            output = torch.empty_like(x)
+            residual_out = torch.empty_like(x)
+            weight = torch.ones(hidden_size, dtype=torch.bfloat16, device=device)
+
+            # rmsnorm2d_fwd_with_add_ck(out, input, residual_in, residual_out, weight, epsilon, use_model_sensitive_rmsnorm)
+            rmsnorm2d_fwd_with_add_ck(output, x, residual, residual_out, weight, eps, 0)
+            torch.cuda.synchronize()
+            print(
+                f"   rmsnorm2d_fwd_with_add_ck (module_rmsnorm, hidden_size={hidden_size}) compiled"
+            )
     except Exception as e:
-        print(f"   Fused add RMSNorm warmup failed (may not be available): {e}")
+        print(f"   Fused add RMSNorm CK warmup failed: {e}")
 
     # Warmup rotary embedding kernel if available
     try:
-        print("\n[3/4] Warming up rotary embedding kernel...")
+        print("\n[4/5] Warming up rotary embedding kernel...")
         from aiter import rotary_embedding
 
         head_size = 128
@@ -92,13 +129,13 @@ def warmup_aiter_kernels():
 
         _ = rotary_embedding(positions, query, key, head_size, cos, sin, True)
         torch.cuda.synchronize()
-        print(f"   Rotary embedding kernel compiled successfully")
+        print("   Rotary embedding kernel compiled successfully")
     except Exception as e:
         print(f"   Rotary embedding warmup skipped (may not be available): {e}")
 
     # Warmup activation kernels if available
     try:
-        print("\n[4/4] Warming up activation kernels...")
+        print("\n[5/5] Warming up activation kernels...")
         from aiter import silu_and_mul
 
         hidden_size = 4096
@@ -110,7 +147,7 @@ def warmup_aiter_kernels():
 
         silu_and_mul(out, x)
         torch.cuda.synchronize()
-        print(f"   Activation kernel compiled successfully")
+        print("   Activation kernel compiled successfully")
     except Exception as e:
         print(f"   Activation warmup skipped (may not be available): {e}")
 
