@@ -40,6 +40,7 @@ class FlashInferWorkspaceManager:
         hidden_dim: int,
         group=None,
         use_fp32_lamport: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
     ):
         """Initialize workspace"""
         if self.initialized and self.world_size == world_size:
@@ -59,7 +60,7 @@ class FlashInferWorkspaceManager:
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            dtype=torch.float32 if use_fp32_lamport else torch.bfloat16,
+            dtype=dtype,
         )
 
         self.world_size = world_size
@@ -87,7 +88,9 @@ _workspace_manager = FlashInferWorkspaceManager()
 
 
 def ensure_workspace_initialized(
-    max_token_num: int = 2048, hidden_dim: int = 4096, use_fp32_lamport: bool = False
+    max_token_num: int = 2048,
+    hidden_dim: int = 4096,
+    dtype: torch.dtype = torch.bfloat16,
 ):
     """Ensure workspace is initialized"""
     if not is_flashinfer_available() or _flashinfer_comm is None:
@@ -108,7 +111,7 @@ def ensure_workspace_initialized(
             rank=rank,
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
-            use_fp32_lamport=use_fp32_lamport,
+            dtype=dtype,
         )
 
     return _workspace_manager.initialized
@@ -175,7 +178,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
-        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
     ):
         logger.debug("FlashInfer workspace not available")
         return None, None
