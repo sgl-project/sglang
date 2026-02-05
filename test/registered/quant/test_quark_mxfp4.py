@@ -31,8 +31,10 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             other_args=[
                 "--quantization",
                 "quark_mxfp4",
+                # `context-length` limitation required for Qwen MOE model
+                # TODO: Remove once https://github.com/sgl-project/sglang/pull/18255 and https://github.com/sgl-project/sglang/pull/18263 are merged.
                 "--context-length",
-                "3000",  # Required for Qwen MOE model.
+                "3000",
                 "--tensor-parallel-size",
                 cls.tp if hasattr(cls, "tp") else "1",
                 "--log-level",
