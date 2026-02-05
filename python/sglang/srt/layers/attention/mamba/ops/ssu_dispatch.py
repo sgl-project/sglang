@@ -119,6 +119,7 @@ def selective_state_update(
 
     
     # TODO smor before merger- fix the kwargs so you won't need this call duplication
+    # TODO smor before merger- add assert for retrieve_parent_token, if FI then it must be one, otherwise fail. Do it in server_args!!
     if (
         _mamba_selective_state_update_backend
         == MambaSelectiveStateUpdateBackend.FLASHINFER
