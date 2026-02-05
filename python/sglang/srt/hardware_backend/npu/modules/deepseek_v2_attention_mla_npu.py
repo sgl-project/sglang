@@ -371,13 +371,13 @@ def forward_dsa_prepare_npu(
             )
 
     topk_indices = m.indexer(
-        hidden_states,
-        q_lora,
-        positions,
-        forward_batch,
-        m.layer_id,
-        dynamic_scale,
-        layer_scatter_modes,
+        x=hidden_states,
+        q_lora=q_lora,
+        positions=positions,
+        forward_batch=forward_batch,
+        layer_id=m.layer_id,
+        layer_scatter_modes=layer_scatter_modes,
+        dynamic_scale=dynamic_scale,
     )
 
     return (
