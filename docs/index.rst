@@ -94,7 +94,6 @@ Its core features include:
    diffusion/contributing
    diffusion/ci_perf
    diffusion/environment_variables
-   diffusion/language_models/index
 
 .. toctree::
    :maxdepth: 1

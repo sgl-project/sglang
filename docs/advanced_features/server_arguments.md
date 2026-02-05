@@ -374,8 +374,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 
 ## Diffusion LLM
 
-For detailed documentation on diffusion language models (LLaDA), see [SGLang Diffusion Language Models](../diffusion/language_models/index.md).
-
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |

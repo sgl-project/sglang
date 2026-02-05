@@ -34,7 +34,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--seed {SEED}`: Random seed for reproducible generation
 
 
-#### Image/Video Configuration
+**Image/Video Configuration**
 
 - `--height {HEIGHT}`: Height of the generated output
 - `--width {WIDTH}`: Width of the generated output
@@ -42,7 +42,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
 
-#### Output Options
+**Output Options**
 
 - `--output-path {PATH}`: Directory to save the generated video
 - `--save-output`: Whether to save the image/video to disk
@@ -167,7 +167,7 @@ When enabled, the server follows a **Generate -> Upload -> Delete** workflow:
 3. Upon successful upload, the local file is deleted.
 4. The API response returns the public URL of the uploaded object.
 
-#### Configuration
+**Configuration**
 
 Cloud storage is enabled via environment variables. Note that `boto3` must be installed separately (`pip install boto3`) to use this feature.
 

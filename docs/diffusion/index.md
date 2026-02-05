@@ -65,10 +65,6 @@ sglang serve --model-path Qwen/Qwen-Image --port 30010
 - **[Contributing](contributing.md)** - Contribution guidelines and commit message conventions
 - **[CI Performance](ci_perf.md)** - Performance baseline generation script
 
-### Diffusion Language Models
-
-- **[Language Models](language_models/)** - Documentation for diffusion language models (LLaDA)
-
 ---
 
 ## CLI Quick Reference

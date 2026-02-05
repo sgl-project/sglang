@@ -132,7 +132,7 @@ sglang generate --model-path black-forest-labs/FLUX.1-dev \
 SCM provides step-level caching control for additional speedup. It decides which denoising steps to compute fully and
 which to use cached results.
 
-#### SCM Presets
+**SCM Presets**
 
 SCM is configured with presets:
 
@@ -144,7 +144,7 @@ SCM is configured with presets:
 | `fast`   | ~35%          | ~3x      | Acceptable |
 | `ultra`  | ~25%          | ~4x      | Lower      |
 
-##### Usage
+**Usage**
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -153,7 +153,7 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A futuristic cityscape at sunset"
 ```
 
-#### Custom SCM Bins
+**Custom SCM Bins**
 
 For fine-grained control over which steps to compute vs cache:
 
@@ -165,7 +165,7 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A futuristic cityscape at sunset"
 ```
 
-#### SCM Policy
+**SCM Policy**
 
 | Policy    | Env Variable                          | Description                                 |
 |-----------|---------------------------------------|---------------------------------------------|
