@@ -658,9 +658,9 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
         )
         speedup_fused_recurrent = triton_mean / cutedsl_fused_recurrent_mean
     else:
-        cutedsl_fused_recurrent_mean = None
-        cutedsl_fused_recurrent_std = None
-        speedup_fused_recurrent = None
+        cutedsl_fused_recurrent_mean = 0.0
+        cutedsl_fused_recurrent_std = 0.0
+        speedup_fused_recurrent = 0.0
 
     if state_dtype == torch.float32:
         cutedsl_mean = np.mean(cutedsl_times) / run_iters * 1000
@@ -671,9 +671,9 @@ def test_cutedsl_gdn_performance(B: int, state_dtype: torch.dtype):
     dtype_str = "f32" if state_dtype == torch.float32 else "bf16"
 
     # Collect results for summary table (only if SM100 supported for transpose results)
-    cutedsl_mean_val = cutedsl_mean if state_dtype == torch.float32 else None
-    cutedsl_std_val = cutedsl_std if state_dtype == torch.float32 else None
-    speedup_val = speedup if state_dtype == torch.float32 else None
+    cutedsl_mean_val = cutedsl_mean if state_dtype == torch.float32 else 0.0
+    cutedsl_std_val = cutedsl_std if state_dtype == torch.float32 else 0.0
+    speedup_val = speedup if state_dtype == torch.float32 else 0.0
 
     _results["performance"].append(
         (
