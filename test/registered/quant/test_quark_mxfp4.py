@@ -20,6 +20,8 @@ from sglang.test.test_utils import (
 
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
+    runner_args = []
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -40,8 +42,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
                 cls.tp if hasattr(cls, "tp") else "1",
                 "--log-level",
                 "debug",
-                "--trust-remote-code",  # For MiniMaxAI/MiniMax-M2.1
-                "--dtype", "bfloat16"
+                *cls.runner_args
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -69,18 +70,32 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
         # # Extract and display peak GPU memory from logs
         combined_output = cls.stdout.getvalue() + cls.stderr.getvalue()
-        peak_memory = cls._extract_peak_memory(combined_output)
-
-        if is_cuda_alike() and not peak_memory:
+    
+        peak_memory_before_load = cls._extract_peak_memory_before_load(combined_output)
+        if is_cuda_alike() and not peak_memory_before_load:
             raise ValueError("Should have found peak memory")
+        cls.peak_memory_before_load = float(peak_memory_before_load)
 
-        cls.peak_memory = float(peak_memory)
+        memory_increase_load_weights = cls._extract_memory_increase_load_weights(combined_output)
+        if is_cuda_alike() and not memory_increase_load_weights:
+            raise ValueError("Should have found memory increase in load_weights")
+        cls.memory_increase_load_weights = float(memory_increase_load_weights)
 
     @classmethod
-    def _extract_peak_memory(cls, log_output):
+    def _extract_peak_memory_before_load(cls, log_output):
         """Extract peak GPU memory value from log output."""
         # Search for the log message pattern
-        pattern = r"Peak GPU memory after loading weights:\s+([\d.]+)\s+GiB"
+        pattern = r"Peak GPU memory before loading weights:\s+([\d.]+)\s+GiB"
+        match = re.search(pattern, log_output)
+        if match:
+            return match.group(1)
+        return None
+
+    @classmethod
+    def _extract_memory_increase_load_weights(cls, log_output):
+        """Extract memory increase during load_weights call."""
+        # Search for the log message pattern
+        pattern = r"Memory increase during load_weights:\s+([\d.]+)\s+GiB"
         match = re.search(pattern, log_output)
         if match:
             return match.group(1)
@@ -96,7 +111,8 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
         """Helper method to test peak memory against a threshold."""
         if not is_cuda_alike():
             self.skipTest("not is_cuda_alike")
-        assert self.peak_memory < threshold
+        assert self.memory_increase_load_weights < threshold
+        assert self.peak_memory_before_load < 5  # Weights initialized on meta device.
 
     def _test_gsm8k(self, accuracy_threshold):
         """Helper method to test GSM8K accuracy against a threshold."""
@@ -135,8 +151,8 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB
-        self._test_peak_memory(threshold=21.5)  # TP=1
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507 BF16 model: 56.940 GiB  # TODO update
+        self._test_peak_memory(threshold=21.5)  # TP=1  # TODO update
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
@@ -147,8 +163,8 @@ class TestFP8ToMXFP4Dense(TestOnlineQuantizationMemoryLoad):
     model = "Qwen/Qwen3-8B-FP8"
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1)
-        self._test_peak_memory(threshold=7)  # TP=1
+        # Original Qwen/Qwen3-8B-FP8 model: TODO update GiB (TP=1, peak_memory_before_load)
+        self._test_peak_memory(threshold=7)  # TP=1 TODO update
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
@@ -164,12 +180,12 @@ class TestFP8ToMXFP4DenseTP2(TestFP8ToMXFP4Dense):
 
 
 class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
-    model = "/mnt/fxmarty/Qwen_Qwen3-30B-A3B-Instruct-2507-FP8"  # FP8 model
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"  # FP8 model
     tp = 1
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: 29.103 GiB (TP=1)
-        self._test_peak_memory(threshold=21)  # TP=1
+        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: TODO update GiB (TP=1, peak_memory_before_load)
+        self._test_peak_memory(threshold=21)  # TP=1 TODO update
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
@@ -181,8 +197,8 @@ class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
     tp = 8
 
     def test_gsm8k(self):
-        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: TODO
-        self._test_gsm8k(accuracy_threshold=0.92)
+        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: TODO update
+        self._test_gsm8k(accuracy_threshold=0.92) # TODO
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
@@ -191,19 +207,22 @@ class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: TODO
-        self._test_gsm8k(accuracy_threshold=0.92)
+        self._test_gsm8k(accuracy_threshold=0.92) # TODO
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    #model = "/shareddata/MiniMaxAI/MiniMax-M2.1"  # FP8 model
-    model = "/felmarty/shrink/MiniMaxAI_MiniMax-M2.1-3-layers"  # FP8 model
+    model = "MiniMaxAI/MiniMax-M2.1"  # FP8 model
+
     tp = 2
-    # NOTE: this test requires the following fix in AITER to pass: TODO
+    # NOTE: this test is failing in FP16 (default dtype of the original MiniMax-M2.1 model).
+    # Hence the usage of `--dtype bfloat16`
+    # NOTE: this test requires the following fix for TP>1: https://github.com/sgl-project/sglang/pull/18310
+    runner_args = ["--trust-remote-code", "--dtype", "bfloat16"]
 
     def test_peak_memory(self):
-        # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 model: TODO (TP=2)
-        self._test_peak_memory(threshold=92)  # TP=2
+        # Original MiniMaxAI/MiniMax-M2.1 model: 107.375 GiB (TP=2, peak_memory_before_load)
+        self._test_peak_memory(threshold=65)  # TP=2
 
     def test_gsm8k(self):
-        # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: TODO
+        # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: 0.954
         self._test_gsm8k(accuracy_threshold=0.92)

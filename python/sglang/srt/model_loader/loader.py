@@ -34,6 +34,7 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -680,14 +681,23 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
-
-        # Used in test_online_quantization.py to verify memory savings when using online quantization.
+        # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
-            logger.debug(
-                "Peak GPU memory after loading weights: %s GiB",
-                f"{peak_memory / GIB_BYTES:.3f}",
+            logger.info(
+                "Peak GPU memory before loading weights: %s GiB",
+                f"{peak_memory / GIB_BYTES:.3f}"
+            )
+            memory_start = get_available_gpu_memory(target_device.type, gpu_id=torch.cuda.current_device())
+
+        model.load_weights(weights)
+
+        # Used in tests to verify memory savings when using online quantization.
+        if is_cuda_alike():
+            memory_end = get_available_gpu_memory(target_device.type, gpu_id=torch.cuda.current_device())
+            logger.info(
+                "Memory increase during load_weights: %s GiB",
+                f"{memory_start - memory_end:.3f}",
             )
 
         for _, module in model.named_modules():
