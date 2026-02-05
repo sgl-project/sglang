@@ -128,6 +128,11 @@ echo "Installing python extras: [${EXTRAS}]"
 
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
+# Force reinstall torch packages from pytorch.org to ensure matching CUDA versions
+# PyPI has mismatched CUDA versions (torch cu128, torchaudio cu129)
+echo "Reinstalling torch packages from pytorch.org for consistent CUDA versions..."
+$PIP_CMD install torch==2.9.1 torchaudio==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/${CU_VERSION} --force-reinstall $PIP_INSTALL_SUFFIX
+
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
