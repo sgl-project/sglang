@@ -119,6 +119,7 @@ void extend_attention_kernel_impl(
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+      // stage 1: compute scores with prefix
       int kv_start = 0;
       int kv_end = is_cross_attn ? encoder_lens[bs] : seq_len_prefix;
       for (int n = kv_start; n < kv_end; n += BLOCK_N) {
@@ -175,7 +176,7 @@ void extend_attention_kernel_impl(
             /* A     */ s_delta,
             /* B     */ Btmp,
             /* C     */ v_prime);
-      }
+      }  // loop with seq_len_prefix
       if (!is_cross_attn) {
         // stage 2: compute the triangle part
         int num_keys = std::min(seq_len_extend, m + BLOCK_M);
@@ -207,7 +208,6 @@ void extend_attention_kernel_impl(
               /* B     */ Btmp,
               /* C     */ s_i);
 
-
           // apply causal mask
           if (num_keys - n <= BLOCK_N) {
             for (int row = 0; row < m_size; ++row) {
@@ -219,7 +219,7 @@ void extend_attention_kernel_impl(
           }
 
           flash_attn_softmax<scalar_t, BLOCK_M, BLOCK_N>::apply(
-            s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
+              s_i, s_delta, v_prime, s_prime, m_prime, m_size, n_size, padded_n_size, head_size_v, sm_scale);
 
           // get value and pack
           pack_vnni2<scalar_t>(
