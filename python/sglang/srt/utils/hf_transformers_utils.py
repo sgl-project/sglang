@@ -64,8 +64,6 @@ from sglang.srt.configs import (
     Olmo3Config,
     Qwen3NextConfig,
     Step3p5Config,
-    Qwen3NextVLConfig,
-    Qwen3NextVLMoEConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Step3VLConfig,
