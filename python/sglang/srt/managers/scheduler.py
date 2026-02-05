@@ -136,6 +136,7 @@ from sglang.srt.managers.prefill_delayer import (
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    FINISH_LENGTH,
     ModelWorkerBatch,
     MultimodalInputs,
     Req,
@@ -1838,6 +1839,30 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
+
+        # Filter requests in last_batch that have reached or will reach max_new_tokens
+        # In overlap mode, process_batch_result hasn't been called yet, so output_ids hasn't been updated
+        # We check if current output length + 1 (the token to be generated) will reach the limit
+        # Mark them with to_finish and filter them out to prevent redundant decode iterations
+        # This optimization is controlled by SGLANG_ENABLE_OVERLAP_EARLY_FINISH_CHECK (default: False)
+        if self.last_batch and envs.SGLANG_ENABLE_OVERLAP_EARLY_FINISH_CHECK.get():
+            finishing_req_indices = []
+            for i, req in enumerate(self.last_batch.reqs):
+                max_new_tokens = req.sampling_params.max_new_tokens
+                if max_new_tokens is not None and max_new_tokens > 0:
+                    current_output_len = len(req.output_ids)
+                    if current_output_len + 1 >= max_new_tokens:
+                        req.to_finish = FINISH_LENGTH(length=max_new_tokens)
+                        finishing_req_indices.append(i)
+
+            if finishing_req_indices:
+                finishing_req_indices_set = set(finishing_req_indices)
+                keep_indices = [
+                    i
+                    for i in range(len(self.last_batch.reqs))
+                    if i not in finishing_req_indices_set
+                ]
+                self.last_batch.filter_batch(keep_indices=keep_indices)
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req is not None:
