@@ -18,25 +18,11 @@ from typing import Any
 import torch
 from torch.distributed import TCPStore
 
-from sglang.multimodal_gen.configs.models.encoders import TextEncoderConfig
-from sglang.multimodal_gen.runtime.distributed import get_sp_group, get_tp_group
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
-@lru_cache(maxsize=1)
-def _get_folding_tp_group(
-    config: TextEncoderConfig,
-) -> torch.distributed.ProcessGroup | None:
-    if config.parallel_folding:
-        if config.parallel_folding_mode == "sp":
-            return get_sp_group()
-        elif config.parallel_folding_mode == "ulysses":
-            return get_sp_group().ulysses_group
-        elif config.parallel_folding_mode == "ring":
-            return get_sp_group().ring_group
-    return get_tp_group()
 
 
 def ensure_divisibility(numerator, denominator) -> None:
