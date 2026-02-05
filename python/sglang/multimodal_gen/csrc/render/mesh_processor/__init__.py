@@ -31,7 +31,7 @@ def _load_mesh_processor():
         sources=[
             f"{_abs_path}/mesh_processor.cpp",
         ],
-        extra_cflags=["-O3", "-std=c++14"],
+        extra_cflags=["-O3"],
         verbose=False,
     )
     return _mesh_processor_kernel

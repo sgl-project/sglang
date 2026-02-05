@@ -1330,13 +1330,13 @@ def get_generate_fn(
         url = f"{base_url}/v1/images/edits"
 
         # Prepare multipart form data with identical parameters as reference script
-        # Reference: seed=42, guidance_scale=5.0, num_inference_steps=50
+        # Reference: seed=0 (native default), guidance_scale=5.0, num_inference_steps=50
         with open(image_path, "rb") as img_file:
             files = {"image": (Path(image_path).name, img_file, "image/png")}
             data = {
                 "prompt": "generate 3d mesh",  # Required field, content not used for I2M
                 "model": model_path,
-                "seed": "42",
+                "seed": "0",
                 "guidance_scale": "5.0",
                 "num_inference_steps": "50",
                 "response_format": "url",  # Get file path in response

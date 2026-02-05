@@ -16,7 +16,8 @@ class Hunyuan3DSamplingParams(SamplingParams):
 
     # Paint/texture generation parameters
     paint_num_inference_steps: int = 30
-    paint_guidance_scale: float = 3.0
+    paint_guidance_scale: float = 2.0
+    seed: int = 0
 
     def __post_init__(self):
         """Validate parameters after initialization."""

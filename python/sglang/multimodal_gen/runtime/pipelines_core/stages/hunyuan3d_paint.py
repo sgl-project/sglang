@@ -386,12 +386,10 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
 
         image = self.pipeline(
             prompt=self.config.delight_prompt,
-            negative_prompt=self.config.delight_negative_prompt,
             image=image,
             generator=torch.manual_seed(42),
             height=512,
             width=512,
-            strength=self.config.delight_strength,
             num_inference_steps=self.config.delight_num_inference_steps,
             image_guidance_scale=self.config.delight_cfg_image,
             guidance_scale=self.config.delight_guidance_scale,
@@ -409,11 +407,58 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
 
         return image
 
+    def _recenter_image(self, image, border_ratio=0.2):
+        """Recenter an RGBA image by cropping to non-transparent region and adding border.
+
+        This matches the native Hunyuan3D-2 implementation.
+        """
+        from PIL import Image as PILImage
+
+        if image.mode == "RGB":
+            return image
+        elif image.mode == "L":
+            image = image.convert("RGB")
+            return image
+
+        # For RGBA images, crop to non-transparent bounding box
+        alpha_channel = np.array(image)[:, :, 3]
+        non_zero_indices = np.argwhere(alpha_channel > 0)
+        if non_zero_indices.size == 0:
+            raise ValueError("Image is fully transparent")
+
+        min_row, min_col = non_zero_indices.min(axis=0)
+        max_row, max_col = non_zero_indices.max(axis=0)
+
+        cropped_image = image.crop((min_col, min_row, max_col + 1, max_row + 1))
+
+        width, height = cropped_image.size
+        border_width = int(width * border_ratio)
+        border_height = int(height * border_ratio)
+
+        new_width = width + 2 * border_width
+        new_height = height + 2 * border_height
+
+        square_size = max(new_width, new_height)
+
+        new_image = PILImage.new("RGBA", (square_size, square_size), (255, 255, 255, 0))
+
+        paste_x = (square_size - new_width) // 2 + border_width
+        paste_y = (square_size - new_height) // 2 + border_height
+
+        new_image.paste(cropped_image, (paste_x, paste_y))
+        return new_image
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from PIL import Image
 
         # Load reference image
         image = Image.open(batch.image_path)
+
+        # Recenter image (matches native Hunyuan3D-2 preprocessing)
+        image = self._recenter_image(image)
+        print(
+            f"[DEBUG SGLANG delight] after recenter_image: size={image.size}, mode={image.mode}"
+        )
 
         # Check if delight is enabled
         if not self.config.delight_enable:
@@ -716,6 +761,10 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         for batch_imgs in images:
             view_imgs = []
             for pil_img in batch_imgs:
+                if pil_img.mode == "L":
+                    pil_img = pil_img.point(
+                        lambda x: 255 if x > 1 else 0, mode="1"
+                    ).convert("RGB")
                 img = np.asarray(pil_img, dtype=np.float32) / 255.0
                 if img.shape[2] > 3:
                     alpha = img[:, :, 3:]
@@ -826,6 +875,12 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         print(
             f"[DEBUG SGLANG pipeline.__call__] ref_latents shape={batch.extra['paint_ref_latents'].shape}"
         )
+        print(
+            f"[DEBUG SGLANG pipeline.__call__] ref_latents mean={batch.extra['paint_ref_latents'].mean().item():.4f}, std={batch.extra['paint_ref_latents'].std().item():.4f}"
+        )
+        print(
+            f"[DEBUG SGLANG pipeline.__call__] ref_latents[0,0,0,:5,:5]={batch.extra['paint_ref_latents'][0,0,0,:5,:5].tolist()}"
+        )
 
         # Resize normal/position maps to paint_resolution before encoding
         target_size = self.config.paint_resolution
@@ -842,7 +897,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         if isinstance(normal_maps, list):
             if normal_maps:
                 print(
-                    f"[DEBUG SGLANG pipelines] normal_maps[0] size={normal_maps[0].size if hasattr(normal_maps[0], 'size') else 'N/A'}"
+                    f"[DEBUG SGLANG pipelines] normal_maps[0] BEFORE resize size={normal_maps[0].size if hasattr(normal_maps[0], 'size') else 'N/A'}"
                 )
             normal_maps = [
                 (
@@ -852,14 +907,24 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 )
                 for img in normal_maps
             ]
+            if normal_maps:
+                print(
+                    f"[DEBUG SGLANG pipelines] normal_maps[0] AFTER resize size={normal_maps[0].size if hasattr(normal_maps[0], 'size') else 'N/A'}"
+                )
             normal_maps = self._convert_pil_list_to_tensor([normal_maps], device)
             print(
                 f"[DEBUG SGLANG pipeline.__call__] normal_imgs tensor shape={normal_maps.shape}"
             )
+            print(
+                f"[DEBUG SGLANG pipeline.__call__] normal_imgs BEFORE VAE mean={normal_maps.mean().item():.6f}, std={normal_maps.std().item():.6f}"
+            )
+            print(
+                f"[DEBUG SGLANG pipeline.__call__] normal_imgs BEFORE VAE [0,0,0,:5,:5]={normal_maps[0,0,0,:5,:5].tolist()}"
+            )
         if isinstance(position_maps, list):
             if position_maps:
                 print(
-                    f"[DEBUG SGLANG pipelines] position_maps[0] size={position_maps[0].size if hasattr(position_maps[0], 'size') else 'N/A'}"
+                    f"[DEBUG SGLANG pipelines] position_maps[0] BEFORE resize size={position_maps[0].size if hasattr(position_maps[0], 'size') else 'N/A'}"
                 )
             position_maps = [
                 (
@@ -869,9 +934,19 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 )
                 for img in position_maps
             ]
+            if position_maps:
+                print(
+                    f"[DEBUG SGLANG pipelines] position_maps[0] AFTER resize size={position_maps[0].size if hasattr(position_maps[0], 'size') else 'N/A'}"
+                )
             position_maps = self._convert_pil_list_to_tensor([position_maps], device)
             print(
                 f"[DEBUG SGLANG pipeline.__call__] position_imgs tensor shape={position_maps.shape}"
+            )
+            print(
+                f"[DEBUG SGLANG pipeline.__call__] position_imgs BEFORE VAE mean={position_maps.mean().item():.6f}, std={position_maps.std().item():.6f}"
+            )
+            print(
+                f"[DEBUG SGLANG pipeline.__call__] position_imgs BEFORE VAE [0,0,0,:5,:5]={position_maps[0,0,0,:5,:5].tolist()}"
             )
 
         if normal_maps is not None:
@@ -879,11 +954,17 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
             print(
                 f"[DEBUG SGLANG pipeline.__call__] normal_imgs encoded shape={batch.extra['paint_normal_imgs'].shape}"
             )
+            print(
+                f"[DEBUG SGLANG pipeline.__call__] normal_imgs mean={batch.extra['paint_normal_imgs'].mean().item():.4f}"
+            )
         if position_maps is not None:
             batch.extra["paint_position_maps"] = position_maps
             batch.extra["paint_position_imgs"] = self._encode_images(position_maps)
             print(
                 f"[DEBUG SGLANG pipeline.__call__] position_imgs encoded shape={batch.extra['paint_position_imgs'].shape}"
+            )
+            print(
+                f"[DEBUG SGLANG pipeline.__call__] position_imgs mean={batch.extra['paint_position_imgs'].mean().item():.4f}"
             )
 
         camera_info = [
@@ -1068,8 +1149,18 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         else:
             latents = latents.to(device)
 
+        # Scale initial noise by scheduler's init_noise_sigma (matching diffusers prepare_latents)
+        latents = latents * self.paint_scheduler.init_noise_sigma
+        print(
+            f"[DEBUG SGLANG denoise] init_noise_sigma={self.paint_scheduler.init_noise_sigma}"
+        )
+
+        print(f"[DEBUG SGLANG denoise] initial latents shape={latents.shape}")
         print(
             f"[DEBUG SGLANG denoise] latents mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
+        )
+        print(
+            f"[DEBUG SGLANG denoise] latents[0,0,:5,:5]={latents[0,0,:5,:5].tolist()}"
         )
         batch.extra["paint_latents"] = latents
 
@@ -1188,6 +1279,9 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 print(
                     f"[DEBUG SGLANG denoise step {step_idx}] noise_pred mean={noise_pred.mean().item():.4f}, std={noise_pred.std().item():.4f}"
                 )
+                print(
+                    f"[DEBUG SGLANG denoise step {step_idx}] noise_pred[0,0,:3,:3]={noise_pred[0,0,:3,:3].tolist()}"
+                )
 
             latents = rearrange(latents, "b n c h w -> (b n) c h w")
 
@@ -1215,6 +1309,14 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 **extra_step_kwargs,
                 return_dict=False,
             )[0]
+
+            if step_idx <= 2:
+                print(
+                    f"[DEBUG SGLANG denoise step {step_idx-1}] after scheduler.step latents mean={latents.mean().item():.4f}, std={latents.std().item():.4f}"
+                )
+                print(
+                    f"[DEBUG SGLANG denoise step {step_idx-1}] latents[0,0,:3,:3]={latents[0,0,:3,:3].tolist()}"
+                )
 
         # Log final latents
         print(f"[DEBUG SGLANG denoise] final latents shape={latents.shape}")
@@ -1285,17 +1387,26 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 print(f"[DEBUG SGLANG multiview_utils] num_view={len(normal_maps)}")
                 print(f"[DEBUG SGLANG DiffusionStage] seed={batch.seed}")
 
+                # Match native seed_everything() - set global random state
+                import random
+
+                import numpy as np
+
+                seed = batch.seed if batch.seed is not None else 0
+                random.seed(seed)
+                np.random.seed(seed)
+                torch.manual_seed(seed)
+                print(f"[DEBUG SGLANG DiffusionStage] seed_everything({seed})")
+
+                generator = torch.Generator(device=device).manual_seed(seed)
+                print(
+                    f"[DEBUG SGLANG DiffusionStage] generator created with seed={seed}"
+                )
+
                 batch.extra["paint_num_in_batch"] = len(normal_maps)
                 self._prepare_conditions(batch, device, guidance_scale)
                 self._prepare_prompt_embeds(batch)
                 self._prepare_timesteps(batch, device, num_steps)
-
-                generator = batch.generator
-                if generator is None and batch.seed is not None:
-                    generator = torch.Generator(device=device).manual_seed(batch.seed)
-                print(
-                    f"[DEBUG DiffusionStage.forward] generator set with seed={batch.seed}"
-                )
 
                 self._prepare_latents(
                     batch,
@@ -1376,7 +1487,7 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         print(f"[DEBUG Postprocess] Starting with {len(multiview_textures)} textures")
 
         # Resize textures if needed
-        render_size = getattr(self.config, "paint_resolution", 512)
+        render_size = getattr(self.config, "paint_render_size", 2048)
         resized_textures = []
         for tex in multiview_textures:
             if hasattr(tex, "resize"):
@@ -1450,7 +1561,7 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
             elapsed = time.time() - start_time
             print(f"[DEBUG Postprocess] Mesh exported in {elapsed:.2f} seconds")
 
-            if return_path.endswith(".glb") and self.config.paint_save_glb:
+            if self.config.paint_save_glb:
                 print("[DEBUG Postprocess] Exporting GLB...")
                 start_time = time.time()
                 glb_path = obj_path[:-4] + ".glb"
@@ -1491,11 +1602,10 @@ class Hunyuan3DPaintStage(PipelineStage):
                 save_glb=self.config.paint_save_glb,
             )
 
-        if return_path.endswith(".glb"):
-            if self.config.paint_save_glb:
-                return_path = obj_path[:-4] + ".glb"
-            else:
-                return_path = obj_path
+        if self.config.paint_save_glb:
+            return_path = obj_path[:-4] + ".glb"
+        elif return_path.endswith(".glb"):
+            return_path = obj_path
 
         return OutputBatch(output=[return_path], timings=batch.timings)
 
