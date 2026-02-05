@@ -913,15 +913,17 @@ class ServerArgs:
         if self.get_model_config().is_multimodal:
             self.disable_piecewise_cuda_graph = True
         # 9. Encoder-only / non-generation models (e.g., BERT cross-encoders)
-        hf_config = self.get_model_config().hf_config
-        is_decoder = getattr(hf_config, "is_decoder", True)
-        is_encoder_decoder = getattr(hf_config, "is_encoder_decoder", False)
-        if (not is_decoder) or is_encoder_decoder:
-            self.disable_piecewise_cuda_graph = True
+        # hf_config = self.get_model_config().hf_config
+        # is_decoder = getattr(hf_config, "is_decoder", True)
+        # is_encoder_decoder = getattr(hf_config, "is_encoder_decoder", False)
+        # print(f"hf_config: {hf_config}")
+        # print(f"is_decoder: {is_decoder}, is_encoder_decoder: {is_encoder_decoder}")
+        # if (not is_decoder) or is_encoder_decoder:
+        #     self.disable_piecewise_cuda_graph = True
         # 10. Keep the arch-name heuristic as an additional safeguard
-        model_archs = getattr(hf_config, "architectures", None) or []
-        if any("ForSequenceClassification" in a for a in model_archs):
-            self.disable_piecewise_cuda_graph = True
+        # model_archs = getattr(hf_config, "architectures", None) or []
+        # if any("ForSequenceClassification" in a for a in model_archs):
+        #     self.disable_piecewise_cuda_graph = True
         # 11. GGUF quantized models (custom dequant ops unsupported by torch.compile)
         if self.load_format == "gguf" or self.quantization == "gguf":
             self.disable_piecewise_cuda_graph = True
