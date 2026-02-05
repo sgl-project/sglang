@@ -51,7 +51,7 @@ class RMSNorm(CustomOp):
         var_hidden_size: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
