@@ -218,18 +218,41 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
+    # Loading should take ~51.65 seconds on TP=8 on MI355X.
+    # model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
+    model = "/shareddata/deepseek-ai/DeepSeek-V3.2"
     tp = 8
 
+    # Default nsa-prefill-backend / nsa-decode-backend is incorrect, see https://github.com/sgl-project/sglang/pull/18319
+    # `--attention-backend aiter` is also loadable, but accuracy is very low! Probably bugged.
+    runner_args = [
+        "--nsa-prefill-backend",
+        "tilelang",
+        "--nsa-decode-backend",
+        "tilelang",
+    ]
+
+    def test_peak_memory(self):
+        # Original deepseek-ai/DeepSeek-V3.2 model: 80.366 GiB (TP=8, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=70, test_start=True, add_peak_memory_before_load=False
+        )  # TP=8
+
     def test_gsm8k(self):
-        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: TODO update
-        self._test_gsm8k(accuracy_threshold=0.92)  # TODO
+        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: ~0.948
+        self._test_gsm8k(accuracy_threshold=0.94)
 
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
     model = "moonshotai/Kimi-K2-Instruct-0905"  # FP8 model
     tp = 8
+
+    def test_peak_memory(self):
+        # Original moonshotai/Kimi-K2-Instruct-0905 model: TODO GiB (TP=8, peak_memory_before_load)
+        self._test_peak_memory(
+            threshold=66, test_start=True, add_peak_memory_before_load=False
+        )  # TP=8
 
     def test_gsm8k(self):
         # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: TODO

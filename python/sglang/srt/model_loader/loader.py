@@ -684,7 +684,7 @@ class DefaultModelLoader(BaseModelLoader):
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
-            logger.info(
+            logger.debug(
                 "Peak GPU memory before loading weights: %s GiB",
                 f"{peak_memory / GIB_BYTES:.3f}",
             )
@@ -699,7 +699,7 @@ class DefaultModelLoader(BaseModelLoader):
             memory_end = get_available_gpu_memory(
                 target_device.type, gpu_id=torch.cuda.current_device()
             )
-            logger.info(
+            logger.debug(
                 "Memory increase during load_weights: %s GiB",
                 f"{memory_start - memory_end:.3f}",
             )

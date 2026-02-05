@@ -979,7 +979,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.quant_config.quantized_layers
             )
             logger.info(
-                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
+                f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers in total, of types: {layer_types}."
             )
 
         if self.server_args.debug_tensor_dump_output_folder is not None:

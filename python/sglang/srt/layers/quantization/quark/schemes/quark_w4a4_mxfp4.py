@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 import torch
@@ -100,6 +101,8 @@ class QuarkW4A4MXFP4(QuarkScheme):
 
             layer._fp8_weight_loaded_numel = 0
             layer._load_device = torch.get_default_device()
+            layer._fp8_weight_loading_lock = threading.Lock()
+            layer._fp8_weight_materialized = False
 
             # Wrap the weight loader to handle FP8->MXFP4 conversion
             fp8_to_mxfp4_weight_loader = self.get_online_fp8_to_mxfp4_weight_loader(
@@ -223,40 +226,49 @@ class QuarkW4A4MXFP4(QuarkScheme):
             is_weight = param_name == "weight"
             is_weight_scale_inv = param_name == "weight_scale_inv"
 
-            # Materialize FP8 parameters on first load on device (there may be several shards for a single layer parameter, e.g. q_proj, k_proj, v_proj).
-            if is_weight_or_weight_scale and layer._fp8_weight_loaded_numel == 0:
-                # weight
-                assert layer.weight.device.type == "meta"  # Sanity check.
+            # Sanity multi-threaded load check.
+            assert torch.cuda.current_device() == layer._load_device.index
 
-                materialized_tensor = layer.weight.__class__(
-                    data=torch.empty_like(layer.weight.data, device=layer._load_device),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=layer.weight._weight_loader,
-                )
-                copy_missing_attrs(layer.weight, materialized_tensor)
-                layer.weight = materialized_tensor
+            with layer._fp8_weight_loading_lock:
+                # Materialize FP8 parameters on first load on device (there may be several shards for a single layer parameter, e.g. q_proj, k_proj, v_proj).
 
-                # weight_scale_inv
-                assert layer.weight_scale_inv.device.type == "meta"  # Sanity check.
+                if is_weight_or_weight_scale and not layer._fp8_weight_materialized:
 
-                materialized_tensor = layer.weight_scale_inv.__class__(
-                    data=torch.empty_like(
-                        layer.weight_scale_inv.data, device=layer._load_device
-                    ),
-                    input_dim=1,
-                    output_dim=0,
-                    weight_loader=layer.weight_scale_inv._weight_loader,
-                )
-                copy_missing_attrs(layer.weight_scale_inv, materialized_tensor)
-                layer.weight_scale_inv = materialized_tensor
+                    # Sanity check.
+                    assert layer.weight.device.type == "meta"
 
-            if is_weight:
-                param = layer.weight
-            elif is_weight_scale_inv:
-                param = layer.weight_scale_inv
+                    materialized_tensor = layer.weight.__class__(
+                        data=torch.empty_like(
+                            layer.weight.data, device=layer._load_device
+                        ),
+                        input_dim=1,
+                        output_dim=0,
+                        weight_loader=layer.weight._weight_loader,
+                    )
+                    copy_missing_attrs(layer.weight, materialized_tensor)
+                    layer.weight = materialized_tensor
 
-            loaded_weight = loaded_weight.to(layer._load_device)
+                    # Sanity check.
+                    assert layer.weight_scale_inv.device.type == "meta"  # Sanity check.
+
+                    materialized_tensor = layer.weight_scale_inv.__class__(
+                        data=torch.empty_like(
+                            layer.weight_scale_inv.data, device=layer._load_device
+                        ),
+                        input_dim=1,
+                        output_dim=0,
+                        weight_loader=layer.weight_scale_inv._weight_loader,
+                    )
+                    copy_missing_attrs(layer.weight_scale_inv, materialized_tensor)
+                    layer.weight_scale_inv = materialized_tensor
+
+                    # Mark as materialized to prevent other threads from doing it again.
+                    layer._fp8_weight_materialized = True
+
+                if is_weight:
+                    param = layer.weight
+                elif is_weight_scale_inv:
+                    param = layer.weight_scale_inv
 
             kwargs = {}
             if shard_id is not None:
@@ -267,35 +279,37 @@ class QuarkW4A4MXFP4(QuarkScheme):
             with copy_numel_counter:
                 original_weight_loader(param, loaded_weight, **kwargs)
 
-            if is_weight_or_weight_scale:
-                layer._fp8_weight_loaded_numel += copy_numel_counter.copied_numel
+            with layer._fp8_weight_loading_lock:
+                if is_weight_or_weight_scale:
+                    layer._fp8_weight_loaded_numel += copy_numel_counter.copied_numel
 
-            # Perform dequantization and requantization only when both `layer.weight` and `layer.weight_scale_inv` are fully loaded.
-            if (
-                layer._fp8_weight_loaded_numel
-                == layer.weight.numel() + layer.weight_scale_inv.numel()
-                and hasattr(layer, "weight_scale_inv")
-            ):
-                # FP8 -> BF16 dequantization.
-                weight_bf16 = dequantize_fp8(
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    block_size=self.weight_block_size,
-                )
+                target_numel = layer.weight.numel() + layer.weight_scale_inv.numel()
 
-                # BF16 -> MXFP4 requantization.
-                weight_mxfp4, weight_mxfp4_scale = dynamic_mxfp4_quant(weight_bf16)
+                # Perform requantization outside the lock (but only if we're the chosen thread)
+                if layer._fp8_weight_loaded_numel == target_numel and hasattr(
+                    layer, "weight_scale_inv"
+                ):
+                    assert layer.weight.device.type != "meta"
 
-                layer.weight = torch.nn.Parameter(weight_mxfp4, requires_grad=False)
-                layer.weight_scale = torch.nn.Parameter(
-                    weight_mxfp4_scale, requires_grad=False
-                )
+                    # FP8 -> BF16 dequantization.
+                    weight_bf16 = dequantize_fp8(
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        block_size=self.weight_block_size,
+                    )
 
-                # Clean up FP8 parameters and tracking attributes
-                del layer.weight_scale_inv
-                del layer._fp8_weight_loaded_numel
-                del layer._load_device
-                del weight_bf16
+                    # BF16 -> MXFP4 requantization.
+                    weight_mxfp4, weight_mxfp4_scale = dynamic_mxfp4_quant(weight_bf16)
+
+                    layer.weight = torch.nn.Parameter(weight_mxfp4, requires_grad=False)
+                    layer.weight_scale = torch.nn.Parameter(
+                        weight_mxfp4_scale, requires_grad=False
+                    )
+
+                    # Clean up FP8 parameters and tracking attributes
+                    del layer.weight_scale_inv
+                    del layer._load_device
+                    del weight_bf16
 
         return online_fp8_to_mxfp4_weight_loader
 

@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.quark_moe import QuarkMoEMethod
 from sglang.srt.layers.quantization.quark.schemes import (
@@ -40,7 +40,7 @@ class QuarkConfig(QuantizationConfig):
         pack_method: str = "reorder",
         is_prequantized: bool = False,
         online_scheme: Optional[str] = None,
-        dequantization_config: Optional[dict[str, Any]] = None,
+        dequantization_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         if kv_cache_group is None:
@@ -101,7 +101,12 @@ class QuarkConfig(QuantizationConfig):
             prefix, ignore=exclude_layers, fused_mapping=self.packed_modules_mapping
         ):
             if isinstance(layer, LinearBase):
-                return UnquantizedLinearMethod()
+                if self.dequantization_config is not None:
+                    # In case of online requantization, "exclude" means keeping the original precision.
+                    # NOTE: Only FP8 supported for now.
+                    return Fp8LinearMethod(quant_config=self.dequantization_config)
+                else:
+                    return UnquantizedLinearMethod()
             elif isinstance(layer, RadixAttention):
                 return QuarkKVCacheMethod(self)
             return None
@@ -227,7 +232,16 @@ class QuarkConfig(QuantizationConfig):
             "packed_modules_mapping": {},
             # MOE gate/router is typically implemented as a ReplicatedLinear, and skipped for quantization for accuracy reasons.
             # lm_head/embed_tokens is also skipped for accuracy reasons, normally not handled by `QuarkConfig` in any case, but adding them here for safety.
-            "exclude": ["*gate", "*router", "*lm_head", "*embed_tokens"],
+            "exclude": [
+                "re:.*gate",
+                "re:.*router",
+                "re:.*lm_head",
+                "re:.*embed_tokens",
+                # TODO: verify if we keep these here.
+                "re:.*model.layers.61.*",  # DeepSeek 3.2
+                "re:.*self_attn.*",  # DeepSeek 3.2
+                "re:.*mlp.gate$",  # DeepSeek 3.2
+            ],
             "global_quant_config": {
                 "weight": {
                     "dtype": "fp4",
