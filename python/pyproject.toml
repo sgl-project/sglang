@@ -93,17 +93,16 @@ url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
 [tool.uv.sources]
+# Use pytorch.org wheel index for all torch packages to ensure matching CUDA versions
+# PyPI has mismatched CUDA versions (torch cu128, torchaudio cu129)
 torch = [
-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+  { index = "torch-cu129" },
 ]
 torchaudio = [
-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+  { index = "torch-cu129" },
 ]
 torchvision = [
-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+  { index = "torch-cu129" },
 ]
 
 [project.optional-dependencies]
