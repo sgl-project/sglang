@@ -244,20 +244,19 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
-        residual = None
         hidden_states, residual = self.midlayer(
             positions,
             embeds,
             hidden_states,
             forward_batch,
-            residual,
+            None,
         )
 
         if self.num_hidden_layers > 1:
             for layer in self.additional_layers:
                 hidden_states, residual = layer(
                     positions,
-                    hidden_states,
+                    hidden_states + residual, # compatible with SpecForge
                     forward_batch,
                     residual,
                 )
