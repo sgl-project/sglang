@@ -58,7 +58,6 @@ __all__ = [
 ]
 
 
-@lru_cache(maxsize=1)
 def _get_folding_tp_group(
     config: TextEncoderConfig,
 ) -> torch.distributed.ProcessGroup | None:
