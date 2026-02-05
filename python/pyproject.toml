@@ -65,11 +65,11 @@ dependencies = [
   "tiktoken",
   "timm==1.0.16",
   "torch_memory_saver==0.0.9",
-  "torch==2.9.1",
+  "torch==2.9.1+cu129",
   "torchao==0.9.0",
-  "torchaudio==2.9.1",
+  "torchaudio==2.9.1+cu129",
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
-  "torchvision",
+  "torchvision==0.24.1+cu129",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
@@ -95,15 +95,9 @@ explicit = true
 [tool.uv.sources]
 # Use pytorch.org wheel index for all torch packages to ensure matching CUDA versions
 # PyPI has mismatched CUDA versions (torch cu128, torchaudio cu129)
-torch = [
-  { index = "torch-cu129" },
-]
-torchaudio = [
-  { index = "torch-cu129" },
-]
-torchvision = [
-  { index = "torch-cu129" },
-]
+torch = { index = "torch-cu129" }
+torchaudio = { index = "torch-cu129" }
+torchvision = { index = "torch-cu129" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
