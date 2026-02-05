@@ -58,10 +58,6 @@ def create_cos_sin_cache(rotary_dim, max_position_embeddings, base, dtype):
     return cache
 
 
-def _view_3d(x, head_size):
-    return x.view(x.shape[0], -1, head_size)
-
-
 @pytest.mark.parametrize("bs", [1, 8])
 @pytest.mark.parametrize("seq_len", [1, 512])
 @pytest.mark.parametrize("num_qo_heads", [1, 16])

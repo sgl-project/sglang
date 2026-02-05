@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import functools
 import pathlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.jit_kernel.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -33,19 +33,25 @@ def _jit_apply_rope_pos_ids_cos_sin_cache_module() -> Module:
     )
 
 
-def apply_rope_pos_ids_cos_sin_cache(
+# Split the ops because k_buffer/v_buffer are mutated only when provided,
+# and torch.custom_op cannot express optional mutates_args reliably
+@register_custom_op(
+    op_name="apply_rope_pos_ids_cos_sin_cache_with_kv_cache",
+    mutates_args=["q", "k", "q_rope", "k_rope", "k_buffer", "v_buffer"],
+)
+def apply_rope_pos_ids_cos_sin_cache_with_kv_cache(
     q: torch.Tensor,
     k: torch.Tensor,
     q_rope: torch.Tensor,
     k_rope: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     pos_ids: torch.Tensor,
+    v: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    kv_cache_loc: torch.Tensor,
     interleave: bool = False,
     enable_pdl: bool = False,
-    v: Optional[torch.Tensor] = None,
-    k_buffer: Optional[torch.Tensor] = None,
-    v_buffer: Optional[torch.Tensor] = None,
-    kv_cache_loc: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Apply RoPE (Rotary Positional Embedding) with position IDs and cos/sin cache.
@@ -82,6 +88,38 @@ def apply_rope_pos_ids_cos_sin_cache(
     )
 
 
+@register_custom_op(
+    op_name="apply_rope_pos_ids_cos_sin_cache_without_kv_cache",
+    mutates_args=["q", "k", "q_rope", "k_rope"],
+)
+def apply_rope_pos_ids_cos_sin_cache_without_kv_cache(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_rope: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    pos_ids: torch.Tensor,
+    interleave: bool = False,
+    enable_pdl: bool = False,
+) -> None:
+    module = _jit_apply_rope_pos_ids_cos_sin_cache_module()
+
+    module.apply_rope_pos_ids_cos_sin_cache(
+        q,
+        k,
+        q_rope,
+        k_rope,
+        cos_sin_cache,
+        pos_ids,
+        interleave,
+        enable_pdl,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
 # Adepted from
 @dataclass
 class FusedSetKVBufferArg:
@@ -106,14 +144,6 @@ class FusedSetKVBufferArg:
     k_scale: Optional[float]
     v_scale: Optional[float]
     cache_loc: torch.Tensor
-
-
-@functools.lru_cache(maxsize=1)
-def is_arch_support_pdl() -> bool:
-    # Hopper arch's compute capability == 9.0
-    device = torch.cuda.current_device()
-    major, minor = torch.cuda.get_device_capability(device)
-    return major >= 9
 
 
 def _view_3d(x, head_size):
@@ -174,33 +204,30 @@ def apply_rope_with_cos_sin_cache_inplace(
         assert a.v_scale is None, "v_scale is not yet supported"
         assert a.cache_loc.dtype == torch.int64, f"{a.cache_loc.dtype=}"
 
-    apply_rope_pos_ids_cos_sin_cache(
-        _view_3d(query, head_size),
-        _view_3d(key, head_size),
-        _view_3d(query, head_size),
-        _view_3d(key, head_size),
-        cos_sin_cache,
-        positions.long(),
-        (not is_neox),
-        enable_pdl,
-        (
-            _view_3d(fused_set_kv_buffer_arg.value, head_size)
-            if fused_set_kv_buffer_arg is not None
-            else None
-        ),
-        (
-            _view_3d(fused_set_kv_buffer_arg.k_buffer, head_size)
-            if fused_set_kv_buffer_arg is not None
-            else None
-        ),
-        (
-            _view_3d(fused_set_kv_buffer_arg.v_buffer, head_size)
-            if fused_set_kv_buffer_arg is not None
-            else None
-        ),
-        (
-            fused_set_kv_buffer_arg.cache_loc
-            if fused_set_kv_buffer_arg is not None
-            else None
-        ),
-    )
+    save_kv_cache = fused_set_kv_buffer_arg is not None
+    if save_kv_cache:
+        apply_rope_pos_ids_cos_sin_cache_with_kv_cache(
+            _view_3d(query, head_size),
+            _view_3d(key, head_size),
+            _view_3d(query, head_size),
+            _view_3d(key, head_size),
+            cos_sin_cache,
+            positions.long(),
+            _view_3d(fused_set_kv_buffer_arg.value, head_size),
+            _view_3d(fused_set_kv_buffer_arg.k_buffer, head_size),
+            _view_3d(fused_set_kv_buffer_arg.v_buffer, head_size),
+            (fused_set_kv_buffer_arg.cache_loc),
+            (not is_neox),
+            enable_pdl,
+        )
+    else:
+        apply_rope_pos_ids_cos_sin_cache_without_kv_cache(
+            _view_3d(query, head_size),
+            _view_3d(key, head_size),
+            _view_3d(query, head_size),
+            _view_3d(key, head_size),
+            cos_sin_cache,
+            positions.long(),
+            (not is_neox),
+            enable_pdl,
+        )
