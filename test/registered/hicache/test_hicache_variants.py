@@ -110,7 +110,7 @@ class TestHiCacheMLA(HiCacheBaseServer, HiCacheEvalMixin, HiCacheMGSMEvalMixin):
     hicache_args = [
         "--trust-remote-code",
         "--enable-hierarchical-cache",
-    ] + (["--hicache-size", 200] if _is_hip else ["--hicache-ratio", 2])
+    ] + (["--hicache-size", 250] if _is_hip else ["--hicache-ratio", 2])
     expected_mmlu_score = 0.5
 
 
