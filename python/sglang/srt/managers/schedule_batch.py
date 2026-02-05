@@ -4,6 +4,7 @@ import enum
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import ceil_align
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,6 +43,7 @@ import logging
 import re
 import time
 from enum import Enum, auto
+from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
@@ -94,8 +96,26 @@ if TYPE_CHECKING:
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
+# Constant used as the base offset for MM (multimodal) pad values.
+# This ensures pad_values don't overlap with valid text token IDs.
+MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
+    if vocab_size > MM_PAD_SHIFT_VALUE:
+        raise ValueError(
+            f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
+            f"MM pad_values may overlap with valid token IDs. "
+            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+        )
+
+
+def _compute_pad_value(hash: int) -> int:
+    """Compute pad value from hash."""
+    return MM_PAD_SHIFT_VALUE + (hash % (1 << 30))
 
 
 class BaseFinishReason:
@@ -261,7 +281,7 @@ class MultimodalDataItem:
             import uuid
 
             self.hash = uuid.uuid4().int
-            self.pad_value = self.hash % (1 << 30)
+            self.pad_value = _compute_pad_value(self.hash)
             return
         if self.hash is None:
             if self.feature is not None:
@@ -270,7 +290,7 @@ class MultimodalDataItem:
                 hashed_feature = self.precomputed_embeddings
             self.hash = hash_feature(hashed_feature)
         assert self.hash is not None
-        self.pad_value = self.hash % (1 << 30)
+        self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
         return self.modality == modality
@@ -640,6 +660,8 @@ class Req:
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.host_hit_length = 0
+        # Tokens loaded from storage backend (L3) during prefetch for this request
+        self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
@@ -729,6 +751,14 @@ class Req:
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.already_computed = 0
+
+        # Detailed breakdown of cached tokens by source (for HiCache)
+        self.cached_tokens_device = 0  # Tokens from device cache (GPU)
+        self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
+        self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self._cache_breakdown_computed = (
+            False  # Track if breakdown was already computed
+        )
 
         # The number of verification forward passes in the speculative decoding.
         # This is used to compute the average acceptance length per request.
@@ -1077,7 +1107,6 @@ class Req:
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
-        self.customized_info = None
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None
@@ -1095,6 +1124,9 @@ class Req:
         self.kv_committed_len = 0
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
+        self.swa_evicted_seqlen = 0
+        self.extend_batch_idx = 0
+        self.decode_batch_idx = 0
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1554,7 +1586,33 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
             # flag will always True
             if not req.retracted_stain:
-                req.cached_tokens += pre_len - req.already_computed
+                new_cached = pre_len - req.already_computed
+                req.cached_tokens += new_cached
+
+                # Calculate detailed breakdown of cached tokens by source (for HiCache)
+                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
+                # would incorrectly count previously computed tokens as cache hits.
+                if not req._cache_breakdown_computed:
+                    # At this point, prefix_indices has been extended with host data
+                    # via init_load_back in schedule_policy, so:
+                    # - len(prefix_indices) = device_original + host_loaded
+                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
+                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
+                    # - device_portion = len(prefix_indices) - host_hit_length
+                    #
+                    # Storage hits are now tracked via scheduler after prefetch completes.
+                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
+                    host_total = req.host_hit_length
+                    # Clamp storage to host_total to handle edge cases
+                    storage_portion = min(host_total, req.storage_hit_length)
+                    host_portion = host_total - storage_portion
+                    device_portion = max(0, len(req.prefix_indices) - host_total)
+
+                    req.cached_tokens_device = device_portion
+                    req.cached_tokens_host = host_portion
+                    req.cached_tokens_storage = storage_portion
+                    req._cache_breakdown_computed = True
+
                 req.already_computed = seq_len
             req.is_retracted = False
 
@@ -1794,46 +1852,43 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False
 
-    def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
+    def new_tokens_required_next_decode(
+        self, selected_indices: Optional[List[int]] = None
+    ):
         page_size = self.token_to_kv_pool_allocator.page_size
         requests = (
             self.reqs
             if selected_indices is None
             else [self.reqs[i] for i in selected_indices]
         )
-        if page_size == 1:
-            return len(requests)
 
-        if not self.spec_algorithm.is_none():
-            # A loose bound that err towards safety
-            server_args = get_global_server_args()
-            thresh = server_args.speculative_num_draft_tokens + (
-                (server_args.speculative_eagle_topk or 1)
-                * (server_args.speculative_num_steps or 1)
-            )
-            return sum(
-                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
-            )
+        if self.spec_algorithm.is_none():
+            new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
+            return new_pages * page_size
 
-        # In the decoding phase, the length of a request's KV cache should be
-        # the total length of the request minus 1
-        return (
-            sum(1 for req in requests if req.seqlen % page_size == 0)
-            if self.enable_overlap
-            else sum(1 for req in requests if (req.seqlen - 1) % page_size == 0)
-        )
+        server_args = get_global_server_args()
+        len_per_topk = server_args.speculative_num_steps or 1
+        spec_topk = server_args.speculative_eagle_topk or 1
+        spec_tokens = server_args.speculative_num_draft_tokens
 
-    def check_decode_mem(
-        self, buf_multiplier=1, selected_indices: Optional[List[int]] = None
-    ):
-        num_tokens = (
-            self.new_page_count_next_decode(selected_indices)
-            * buf_multiplier
-            * self.token_to_kv_pool_allocator.page_size
-        )
+        if page_size > 1 and spec_topk > 1:
+            # last partial page and ceil alignment
+            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
+        elif page_size > 1:
+            # only page alignment
+            len_per_topk = ceil_align(len_per_topk, page_size)
+            spec_tokens = ceil_align(spec_tokens, page_size)
 
+        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+
+        # v2 eagle has over-allocation
+        return num_tokens * (1 + self.is_spec_v2)
+
+    def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
+        num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self._is_available_size_sufficient(num_tokens)
+        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs
@@ -1844,9 +1899,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs
 
     def retract_decode(
-        self,
-        server_args: ServerArgs,
-        buf_multiplier: int = 1,
+        self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1868,9 +1921,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         retracted_reqs = []
         first_iter = True
         while first_iter or (
-            not self.check_decode_mem(
-                selected_indices=sorted_indices, buf_multiplier=buf_multiplier
-            )
+            not self.check_decode_mem(selected_indices=sorted_indices)
         ):
             if len(sorted_indices) == 1:
                 # Always keep at least one request
@@ -1884,7 +1935,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.release_req(idx, len(sorted_indices), server_args)
 
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices, buf_multiplier=buf_multiplier
+            selected_indices=sorted_indices
         ):
             # Retracting loops ends and still not enough memory
             raise ValueError(
@@ -2270,6 +2321,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            server_args = get_global_server_args()
+
+            if (
+                self.forward_mode.is_decode()
+                and server_args.enable_piecewise_cuda_graph
+                and not self.tree_cache.is_chunk_cache()
+            ):
+                return
+
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -2284,7 +2344,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            server_args = get_global_server_args()
                             pre_len = (
                                 pre_len - server_args.chunked_prefill_size
                                 if server_args.chunked_prefill_size > 0
@@ -2319,15 +2378,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ]
             self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
-
-    def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid_swa:
-            return (
-                self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
-                and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
-            )
-        else:
-            return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def __str__(self):
         return (

@@ -1,6 +1,6 @@
 # Best Practice on Ascend NPU
 
-This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend Npu. If
+This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend NPU. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## DeepSeek Series Models
@@ -936,8 +936,7 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://PIP1:8000 8998 \
-    --prefill http://PIP2:8000 8999 \
+    --prefill http://PIP1:8000 8995 \
     --decode http://DIP1:8001 \
     --host 127.0.0.1 \
     --port 6688 \

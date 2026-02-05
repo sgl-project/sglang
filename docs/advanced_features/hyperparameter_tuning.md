@@ -67,7 +67,7 @@ Note that CUDA graph consumes more memory, so you may need to reduce `--mem-frac
 
 ### Tune `--dp-size` and `--tp-size`
 
-Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [sglang router](../advanced_features/router.md) for a better data parallelism rather than using `dp_size` parameter.
+Data parallelism is better for throughput. When there is enough GPU memory, always favor data parallelism for throughput. Refer to [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md) for a better data parallelism rather than using `dp_size` parameter.
 
 ### Try other options
 
