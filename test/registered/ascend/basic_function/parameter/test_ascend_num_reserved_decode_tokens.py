@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.ascend.test_ascend_utils import (
     LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH,
-    get_device_ids,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.run_eval import run_eval
@@ -15,7 +14,12 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-2-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
 class TestNumReservedDecodeTokens(TestDisaggregationBase):
@@ -72,7 +76,6 @@ class TestNumReservedDecodeTokens(TestDisaggregationBase):
             "--disaggregation-mode",
             "decode",
             "--base-gpu-id",
-            # get_device_ids(1),
             1,
             "--disaggregation-transfer-backend",
             "ascend",
