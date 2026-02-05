@@ -43,10 +43,6 @@ from sglang.multimodal_gen.test.server.accuracy_adapters import (
     get_adapter,
 )
 from sglang.multimodal_gen.test.server.accuracy_config import ComponentType
-from sglang.multimodal_gen.test.server.accuracy_utils import (
-    log_inputs,
-    seed_and_broadcast,
-)
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 logger = init_logger(__name__)
@@ -807,55 +803,3 @@ class AccuracyEngine:
             )
 
         return sgl_component.eval(), ref_component.eval(), str(device), adapter
-
-    @staticmethod
-    def get_forward_inputs(
-        case: DiffusionTestCase, model: nn.Module, device: str
-    ) -> Dict[str, Any]:
-        torch.manual_seed(42)
-        cls_name, cid = str(model.__class__).lower(), str(case.id).lower()
-        if any(
-            k in cls_name for k in ["t5", "umt5", "clip", "mistral", "qwen", "llama"]
-        ):
-            vsize = getattr(model.config, "vocab_size", 32000)
-            if hasattr(model.config, "text_config"):
-                vsize = getattr(model.config.text_config, "vocab_size", vsize)
-            input_ids = torch.randint(
-                100, min(vsize, 30000), (1, 32), device="cpu", dtype=torch.long
-            ).to(device)
-            seed_and_broadcast(42, input_ids)
-            return {"input_ids": input_ids}
-
-        arch = getattr(model.config, "arch_config", model.config)
-        in_c = getattr(arch, "in_channels", 4)
-        joint_c = getattr(arch, "joint_attention_dim", 4096)
-        if "wan" in cls_name or "wan" in cid:
-            h = torch.randn(
-                (1, 1, in_c, 32, 32), dtype=torch.bfloat16, device="cpu"
-            ).to(device)
-        else:
-            h = torch.randn((1, 128, in_c), dtype=torch.bfloat16, device="cpu").to(
-                device
-            )
-        ctx = torch.randn((1, 64, joint_c), dtype=torch.bfloat16, device="cpu").to(
-            device
-        )
-
-        seed_and_broadcast(42, h)
-        seed_and_broadcast(42, ctx)
-
-        inputs = {
-            "hidden_states": h,
-            "timestep": torch.tensor(
-                [DEFAULT_TIMESTEP], dtype=torch.bfloat16, device=device
-            ),
-            "encoder_hidden_states": ctx,
-        }
-        if "layered" in cid or getattr(model.config, "additional_t_cond", False):
-            t_cond = torch.randn((1, 1280), dtype=torch.bfloat16, device="cpu").to(
-                device
-            )
-            seed_and_broadcast(42, t_cond)
-            inputs["addition_t_cond"] = t_cond
-        log_inputs("fallback", inputs)
-        return inputs

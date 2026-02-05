@@ -50,20 +50,12 @@ class TestAccuracy2GPU_A:
         )
 
         with torch.no_grad():
-            if adapter:
-                inputs = adapter.generate_inputs(case, sgl, device, ref)
-                sgl_out = adapter.run_sglang(sgl, inputs)
-                ref_out = adapter.run_reference(ref, inputs)
-            else:
-                # Fallback for models without specialized adapters
-                torch.manual_seed(42)
-                kwargs = AccuracyEngine.get_forward_inputs(case, ref, device)
-                ref_out = ref(**kwargs)
-                if not isinstance(ref_out, torch.Tensor):
-                    ref_out = ref_out.sample
-                sgl_out = sgl(**kwargs)
-                if not isinstance(sgl_out, torch.Tensor):
-                    sgl_out = sgl_out.sample
+            assert (
+                adapter is not None
+            ), "Transformer test requires an adapter for reliable inputs"
+            inputs = adapter.generate_inputs(case, sgl, device, ref)
+            sgl_out = adapter.run_sglang(sgl, inputs)
+            ref_out = adapter.run_reference(ref, inputs)
 
         AccuracyEngine.check_accuracy(
             sgl_out,
