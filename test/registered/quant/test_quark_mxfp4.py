@@ -1,6 +1,7 @@
 import io
 import re
 import unittest
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
@@ -14,8 +15,8 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server,
     is_in_ci,
+    popen_launch_server,
 )
 
 
@@ -214,6 +215,7 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
         self._test_gsm8k(accuracy_threshold=0.92)
 
+
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
     model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
@@ -221,7 +223,8 @@ class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: TODO update
-        self._test_gsm8k(accuracy_threshold=0.92) # TODO
+        self._test_gsm8k(accuracy_threshold=0.92)  # TODO
+
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
@@ -230,11 +233,12 @@ class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: TODO
-        self._test_gsm8k(accuracy_threshold=0.92) # TODO
+        self._test_gsm8k(accuracy_threshold=0.92)  # TODO
+
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    model = "MiniMaxAI/MiniMax-M2.1"  # FP8 model
+    model = "/MiniMaxAI/MiniMax-M2.1"  # FP8 model
 
     tp = 2
     # NOTE: this test is failing in FP16 (default dtype of the original MiniMax-M2.1 model).
@@ -244,7 +248,9 @@ class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
 
     def test_peak_memory(self):
         # Original MiniMaxAI/MiniMax-M2.1 model: 107.375 GiB (TP=2, peak_memory_before_load)
-        self._test_peak_memory(threshold=65)  # TP=2
+        self._test_peak_memory(
+            threshold=72, test_start=True, add_peak_memory_before_load=False
+        )  # TP=2
 
     def test_gsm8k(self):
         # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: 0.954
