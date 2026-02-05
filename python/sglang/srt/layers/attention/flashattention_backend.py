@@ -879,7 +879,9 @@ class FlashAttentionBackend(AttentionBackend):
                 window_size = (-1, -1)
 
             result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                q=q.contiguous()
+                .view(-1, layer.tp_q_head_num, layer.head_dim)
+                .to(key_cache.dtype),
                 k_cache=key_cache,
                 v_cache=value_cache,
                 page_table=page_table,
@@ -901,7 +903,9 @@ class FlashAttentionBackend(AttentionBackend):
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .to(key_cache.dtype),
                     # Here metadata_expand.page_table is not divided with page_size.
                     # This is because we loose the fine control of  what token to attend,
                     # but has to attend to some block completely.
@@ -1021,7 +1025,7 @@ class FlashAttentionBackend(AttentionBackend):
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
                 result = flash_attn_with_kvcache(
-                    q=q_rope,
+                    q=q_rope.to(k_rope_cache.dtype),
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,
                     qv=q_nope,
@@ -1164,7 +1168,9 @@ class FlashAttentionBackend(AttentionBackend):
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
                 o = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .to(key_cache.dtype),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=metadata.encoder_page_table,
@@ -1184,7 +1190,9 @@ class FlashAttentionBackend(AttentionBackend):
             elif use_local_attn:
                 # Use chunked (local) attention batching for self-attention
                 o = flash_attn_with_kvcache(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    q=q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .to(key_cache.dtype),
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=local_attn_metadata.local_block_table,
@@ -1215,8 +1223,10 @@ class FlashAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
                 max_seqlen_q = metadata.max_seq_len_q
-                q_reshaped = q.contiguous().view(
-                    -1, layer.tp_q_head_num, layer.head_dim
+                q_reshaped = (
+                    q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .to(key_cache.dtype)
                 )
 
                 # Default: single-token self-attention
@@ -1292,7 +1302,11 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
                 )
             else:
-                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                q_all = (
+                    q.contiguous()
+                    .view(-1, layer.tp_q_head_num, layer.head_dim)
+                    .to(k_rope_cache.dtype)
+                )
                 q_nope = q_all[:, :, : layer.v_head_dim]
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
