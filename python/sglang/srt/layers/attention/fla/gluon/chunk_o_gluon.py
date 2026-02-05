@@ -188,10 +188,10 @@ def chunk_fwd_kernel_o_gluon(
     A_smem_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BT, BT], dtype)
     A_smem = gl.allocate_shared_memory(dtype, [BT, BT], A_smem_layout)
     A_smem.store(A_reg.to(dtype))
-    # fench A_smem
+    # fence A_smem
     fence_async_shared()
     acc_tmem = allocate_tensor_memory(gl.float32, [BT, BV], o_tmem_layout)
-    # wait v_sem
+    # wait v_smem
     mbarrier.wait(tma_bar_kv, phase=tma_phase)
     mbarrier.invalidate(tma_bar_kv)
     # intra chunk A @ v

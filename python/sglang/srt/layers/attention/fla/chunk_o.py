@@ -205,6 +205,7 @@ def chunk_fwd_o(
             num_warps=num_warps,
         )
     else:
+
         def grid(meta):
             return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
