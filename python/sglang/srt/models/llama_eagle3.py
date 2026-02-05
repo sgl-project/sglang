@@ -67,7 +67,6 @@ class BasicDecoderLayer(LlamaDecoderLayer):
             config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
         )
 
-        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_layernorm = None  # not needed for decoder
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
