@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.common import (
     evict_from_tree_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.marconi_config import DEFAULT_MARCONI_TRACK_MAX_POINTS
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -1753,7 +1754,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
             else:
                 buffer_size = 0
-            max_points = server_args.marconi_track_max_points
+            max_points = DEFAULT_MARCONI_TRACK_MAX_POINTS
             if max_points is None:
                 max_points = buffer_size if buffer_size > 0 else 1
             if req.mamba_branching_seqlen is not None and max_points > len(
@@ -1790,7 +1791,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         buffer_size = int(req.mamba_ping_pong_track_buffer.numel())
-        max_points = server_args.marconi_track_max_points
+        max_points = DEFAULT_MARCONI_TRACK_MAX_POINTS
         if max_points is None:
             max_points = buffer_size
         max_points = max(1, min(max_points, buffer_size))

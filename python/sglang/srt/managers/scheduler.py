@@ -2151,27 +2151,7 @@ class Scheduler(
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
 
-        if (
-            self.server_args.enable_marconi
-            and self.server_args.marconi_prefill_hint_window > 0
-            and self.waiting_queue
-        ):
-            window = min(
-                len(self.waiting_queue), self.server_args.marconi_prefill_hint_window
-            )
-            candidates = list(self.waiting_queue[:window])
-            for cand in candidates:
-                if not getattr(cand, "_prefill_matched_this_round", False):
-                    cand.init_next_round_input(self.tree_cache)
-                    cand._prefill_matched_this_round = True
-            candidates.sort(
-                key=lambda r: (
-                    -(r.marconi_cache_len or 0),
-                    -len(r.prefix_indices),
-                    -len(r.origin_input_ids),
-                )
-            )
-            self.waiting_queue = candidates + self.waiting_queue[window:]
+        # No marconi-specific prefill reordering.
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
