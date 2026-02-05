@@ -19,7 +19,7 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -28,8 +28,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.1", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.1",
+  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.2",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -82,6 +82,22 @@ dependencies = [
   "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
 ]
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+]
+
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
@@ -93,10 +109,11 @@ diffusion = [
   "moviepy>=2.0.0",
   "opencv-python-headless==4.10.0.84",
   "remote-pdb",
-  "st_attn==0.0.7",
-  "vsa==0.0.4",
-  "runai_model_streamer",
-  "cache-dit==1.2.0"
+  "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "runai_model_streamer>=0.15.5",
+  "cache-dit==1.2.0",
+  "addict"
 ]
 
 tracing = [
@@ -121,6 +138,11 @@ test = [
 ]
 
 dev = ["sglang[test]"]
+
+all = [
+  "sglang[diffusion]",
+  "sglang[tracing]",
+]
 
 [tool.uv.extra-build-dependencies]
 st-attn = ["torch", "setuptools"]
