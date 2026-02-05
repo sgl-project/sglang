@@ -34,7 +34,6 @@ import huggingface_hub
 import numpy as np
 import torch
 
-from sglang.srt.utils import get_available_gpu_memory
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -42,6 +41,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_available_gpu_memory
 
 # Try to import accelerate (optional dependency)
 try:
@@ -686,15 +686,19 @@ class DefaultModelLoader(BaseModelLoader):
             peak_memory = torch.cuda.max_memory_allocated()
             logger.info(
                 "Peak GPU memory before loading weights: %s GiB",
-                f"{peak_memory / GIB_BYTES:.3f}"
+                f"{peak_memory / GIB_BYTES:.3f}",
             )
-            memory_start = get_available_gpu_memory(target_device.type, gpu_id=torch.cuda.current_device())
+            memory_start = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
 
         model.load_weights(weights)
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
-            memory_end = get_available_gpu_memory(target_device.type, gpu_id=torch.cuda.current_device())
+            memory_end = get_available_gpu_memory(
+                target_device.type, gpu_id=torch.cuda.current_device()
+            )
             logger.info(
                 "Memory increase during load_weights: %s GiB",
                 f"{memory_start - memory_end:.3f}",
