@@ -2,9 +2,9 @@
 
 This guide explains Data Parallelism Attention (DPA), a parallelism strategy optimized for MLA-based models like DeepSeek, and how to deploy it with SGLang Model Gateway (SMG) for production.
 
-## Understanding Data Parallelism (DP)
+## Data Parallelism (DP)
 
-**Data Parallelism (DP)** is a parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests, effectively multiplying the throughput of your serving system.
+**Data Parallelism (DP)** is the most common parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests, effectively multiplying the throughput of your serving system.
 
 **Key characteristics:**
 - Each worker has a full copy of the model
