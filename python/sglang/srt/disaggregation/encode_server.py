@@ -114,7 +114,7 @@ def _convert(data):
         return data
 
 
-_image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
+_image_grid_attrs = ["image_grid_thw", "image_grid_hws", "image_sizes"]
 
 
 def _get_image_grid_dim(images_input):

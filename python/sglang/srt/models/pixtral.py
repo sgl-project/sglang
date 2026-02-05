@@ -86,10 +86,14 @@ class PixtralForConditionalGeneration(nn.Module):
 
         self.vision_args = VisionEncoderArgs(**vision_args)
 
-        self.language_model = MistralLarge3ForCausalLM(
-            config=self.config.text_config,
-            quant_config=kwargs.get("quant_config"),
-        )
+        # skip loading language model in encoder_only(run as encode server)
+        if not self.config.encoder_only:
+            self.language_model = MistralLarge3ForCausalLM(
+                config=self.config.text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
+        else:
+            self.language_model = None
 
         self.vision_encoder = VisionTransformer(self.vision_args)
 
@@ -175,8 +179,10 @@ class PixtralForConditionalGeneration(nn.Module):
                     # by language_model.load_weights
                     yield (name, w)
 
-        # Now we call the language model load with the generator
-        self.language_model.load_weights(llm_weights_generator())
+        # only load language model weights if not run as encode server
+        if not self.config.encoder_only:
+            # Now we call the language model load with the generator
+            self.language_model.load_weights(llm_weights_generator())
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
@@ -377,7 +383,12 @@ class VisionTransformer(nn.Module):
             image_features: tensor of token features for
                 all tokens of all images of shape (N_toks, D)
         """
-        patch_embeds_list = [self.patch_conv(img.to(self.dtype)) for img in images]
+        # must on the same device for the opersion
+        conv_device = next(self.patch_conv.parameters()).device
+        patch_embeds_list = [
+            self.patch_conv(img.to(device=conv_device, dtype=self.dtype))
+            for img in images
+        ]
 
         patch_embeds = [p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list]
 
