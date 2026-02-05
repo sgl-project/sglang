@@ -149,7 +149,7 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
 
 class TestOnlineQuantizationMemoryLoadDense(TestOnlineQuantizationMemoryLoad):
-    model = "/mnt/fxmarty/Qwen_Qwen3-8B"
+    model = "Qwen/Qwen3-8B"
 
     def test_peak_memory(self):
         # Original Qwen/Qwen3-8B BF16 model: 15.268 GiB
@@ -167,7 +167,7 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     # - Qwen/Qwen1.5-MoE-A2.7B => K // 2 = 704 as intermediate size, not multiple of 128.
     # - ibm-granite/granite-3.0-3b-a800m-base: dtype issue with fp16 in AITER MOE MLP activation
     # so using a large model here.
-    model = "/mnt/fxmarty/Qwen_Qwen3-30B-A3B-Instruct-2507"
+    model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
     # TODO: test TP>=2 with an other model (Qwen/Qwen3-30B-A3B-Instruct-2507 crashes in this case as 768/2 = 384, and 384/32 = 12 not divisible by BLOCK_SIZE_N=8. in fused_dynamic_mxfp4_quant_moe_sort.
 
     def test_peak_memory(self):
