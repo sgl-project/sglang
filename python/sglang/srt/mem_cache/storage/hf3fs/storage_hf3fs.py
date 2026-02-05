@@ -170,7 +170,7 @@ class HiCacheHF3FS(HiCacheStorage):
         is_mla_model: bool = False,
         is_page_first_layout: bool = False,
         use_mock_client: bool = False,
-        enable_storage_metrics: bool = False
+        enable_storage_metrics: bool = False,
     ):
         self.rank = rank
         self.file_path = file_path
@@ -453,7 +453,9 @@ class HiCacheHF3FS(HiCacheStorage):
 
         if self.enable_storage_metrics:
             self.backup_pgs.append(ionum)
-            self.backup_bandwidth.append(ionum / (end_time - start_time) * self.gb_per_page)
+            self.backup_bandwidth.append(
+                ionum / (end_time - start_time) * self.gb_per_page
+            )
 
         written_keys_to_confirm = []
         results = [index[0] for index in indices]

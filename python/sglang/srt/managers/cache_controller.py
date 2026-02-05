@@ -261,7 +261,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
-        enable_storage_metrics: bool = False
+        enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
