@@ -275,12 +275,17 @@ fi
 $PIP_CMD list
 python3 -c "import torch; print(torch.version.cuda)"
 
+# Clean up stale HuggingFace cache artifacts BEFORE pre-caching
+# This ensures corrupted caches are removed before we try to use them
+python3 "${SCRIPT_DIR}/../utils/cleanup_hf_cache.py"
+
 # Pre-cache HuggingFace models that are needed by CI tests
 # This avoids transient network issues during test execution
 echo "Pre-caching HuggingFace models..."
 python3 -c "
 from huggingface_hub import snapshot_download
 import os
+import shutil
 
 models_to_cache = [
     'openbmb/MiniCPM-V-4',
@@ -288,14 +293,30 @@ models_to_cache = [
     'Qwen/Qwen3-VL-30B-A3B-Instruct',
 ]
 
+hf_home = os.environ.get('HF_HOME', os.path.expanduser('~/.cache/huggingface'))
+hub_dir = os.path.join(hf_home, 'hub')
+
 for model in models_to_cache:
     print(f'Pre-caching {model}...')
     try:
-        snapshot_download(model, local_files_only=False)
+        # First try normal download
+        path = snapshot_download(model, local_files_only=False)
+
+        # Verify key files exist, if not force re-download
+        config_path = os.path.join(path, 'config.json')
+        if not os.path.exists(config_path):
+            print(f'  Cache incomplete, forcing re-download...')
+            # Remove the corrupted cache
+            model_dir = os.path.join(hub_dir, 'models--' + model.replace('/', '--'))
+            if os.path.exists(model_dir):
+                shutil.rmtree(model_dir)
+            # Re-download
+            path = snapshot_download(model, local_files_only=False)
+
         print(f'  Successfully cached {model}')
     except Exception as e:
         print(f'  Warning: Failed to cache {model}: {e}')
 "
 
-# Prepare the CI runner (cleanup HuggingFace cache, etc.)
+# Prepare the CI runner (validation only, cleanup already done above)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
