@@ -30,6 +30,7 @@ register_amd_ci(
 KIMI_K25_MODEL_PATH = "moonshotai/Kimi-K2.5"
 SERVER_LAUNCH_TIMEOUT = 3600
 ACCURACY_THRESHOLD = 0.92
+TP_SIZE = 8
 
 
 class TestKimiK25EvalMI35x(CustomTestCase):
@@ -43,7 +44,7 @@ class TestKimiK25EvalMI35x(CustomTestCase):
         """Test Kimi-K2.5 with GSM8K few-shot completion benchmark."""
         other_args = [
             "--tp",
-            "8",
+            str(TP_SIZE),
             "--decode-attention-backend",
             "triton",
             "--prefill-attention-backend",
@@ -89,7 +90,7 @@ class TestKimiK25EvalMI35x(CustomTestCase):
                 summary = "### Kimi-K2.5 Model (MI35x)\n\n"
                 summary += "| Model | TP | Accuracy | Threshold | Status |\n"
                 summary += "| ----- | -- | -------- | --------- | ------ |\n"
-                summary += f"| {KIMI_K25_MODEL_PATH} | 8 | {acc:.3f} | {ACCURACY_THRESHOLD} | {status} |\n"
+                summary += f"| {KIMI_K25_MODEL_PATH} | {TP_SIZE} | {acc:.3f} | {ACCURACY_THRESHOLD} | {status} |\n"
                 write_github_step_summary(summary)
 
             self.assertGreaterEqual(
