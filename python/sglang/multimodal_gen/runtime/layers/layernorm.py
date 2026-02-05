@@ -451,6 +451,146 @@ class RMSNormScaleShift(_NormScaleShift):
     norm_type = "rms"
 
 
+################################################################################
+# NormTanhMulAdd
+# y = norm(x) * tanh(scale) + shift (where norm is layernorm or rmsnorm)
+# See details in norm_tanh_mul_add_norm_scale.py
+################################################################################
+class _NormTanhMulAdd(CustomOp):
+    norm_type: str
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        affine: bool = False,
+        dtype: torch.dtype = torch.float32,
+    ):
+        super().__init__()
+        self.eps = eps
+        if self.norm_type == "rms":
+            self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
+        elif self.norm_type == "layer":
+            self.norm = FP32LayerNorm(
+                hidden_size, elementwise_affine=affine, eps=eps, dtype=dtype
+            )
+        else:
+            raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
+
+    def forward_cuda(
+        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    ) -> torch.Tensor:
+        if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+            import warnings
+
+            warnings.warn(
+                "FusedNormScaleShift cuda not available, using native fallback",
+                stacklevel=2,
+            )
+            return self.forward_native(x, scale, shift)
+
+        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+            fused_norm_tanh_mul_add,
+        )
+
+        x, scale, shift = x.contiguous(), scale.contiguous(), shift.contiguous()
+        weight = _ensure_contiguous(getattr(self.norm, "weight", None))
+        bias = _ensure_contiguous(getattr(self.norm, "bias", None))
+        return fused_norm_tanh_mul_add(
+            x, weight, bias, scale, shift, self.norm_type, self.eps,
+        )
+
+    def forward_hip(self, *args, **kwargs):
+        # Fallback to native because ROCm does not support CuTeDSL.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_native(
+        self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+    ) -> torch.Tensor:
+        y = self.norm(x) * torch.tanh(scale) + shift
+        return y.to(x.dtype)
+
+
+class LayerNormTanhMulAdd(_NormTanhMulAdd):
+    norm_type = "layer"
+
+
+class RMSNormTanhMulAdd(_NormTanhMulAdd):
+    norm_type = "rms"
+
+
+################################################################################
+# NormTanhMulAddNormScale
+# y = norm(x) * tanh(scale) + shift (where norm is layernorm or rmsnorm)
+# y2 = norm(y) * (1 + scale2)
+# See details in norm_tanh_mul_add_norm_scale.py
+################################################################################
+# class _NormTanhMulAddNormScale(CustomOp):
+#     norm_type: str
+
+#     def __init__(
+#         self,
+#         hidden_size: int,
+#         eps: float = 1e-6,
+#         elementwise_affine: bool = False,
+#         dtype: torch.dtype = torch.float32,
+#     ):
+#         super().__init__()
+#         self.eps = eps
+#         if self.norm_type == "rms":
+#             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
+#         elif self.norm_type == "layer":
+#             self.norm = FP32LayerNorm(
+#                 hidden_size, elementwise_affine=elementwise_affine, eps=eps, dtype=dtype
+#             )
+#         else:
+#             raise NotImplementedError(f"Norm type {self.norm_type} not implemented")
+
+#     def forward_cuda(
+#         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+#     ) -> torch.Tensor:
+#         if x.shape[-1] % 256 != 0 and x.shape[-1] <= 8192:
+#             import warnings
+
+#             warnings.warn(
+#                 "FusedNormScaleShift cuda not available, using native fallback",
+#                 stacklevel=2,
+#             )
+#             return self.forward_native(x, scale, shift)
+
+#         from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+#             fused_norm_scale_shift,
+#         )
+
+#         return fused_norm_scale_shift(
+#             x.contiguous(),
+#             _ensure_contiguous(getattr(self.norm, "weight", None)),
+#             _ensure_contiguous(getattr(self.norm, "bias", None)),
+#             scale.contiguous(),
+#             shift.contiguous(),
+#             self.norm_type,
+#             self.eps,
+#         )
+
+#     def forward_hip(self, *args, **kwargs):
+#         # Fallback to native because ROCm does not support CuTeDSL.
+#         return self.forward_native(*args, **kwargs)
+
+#     def forward_native(
+#         self, x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
+#     ) -> torch.Tensor:
+#         y = self.norm(x) * torch.tanh(scale) + shift
+#         return y.to(x.dtype)
+
+
+# class LayerNormTanhMulAddNormScale(_NormTanhMulAddNormScale):
+#     norm_type = "layer"
+
+
+# class RMSNormTanhMulAddNormScale(_NormTanhMulAddNormScale):
+#     norm_type = "rms"
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
