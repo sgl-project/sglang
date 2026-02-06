@@ -384,8 +384,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         num_layers = config.num_layers
         has_image_pos_emb = config.has_image_pos_emb
         has_ref_conv = config.has_ref_conv
-        add_control_adapter = config.add_control_adapter
-        in_dim_control_adapter = config.in_dim_control_adapter
         seperated_timestep = config.seperated_timestep
         require_vae_embedding = config.require_vae_embedding
         require_clip_embedding = config.require_clip_embedding
@@ -439,17 +437,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         self.accumulated_rel_l1_distance_even = 0
         self.accumulated_rel_l1_distance_odd = 0
         self.__post_init__()
-        if add_control_adapter:
-            from .wan_video_camera_controller import SimpleAdapter
-
-            self.control_adapter = SimpleAdapter(
-                in_dim_control_adapter,
-                dim,
-                kernel_size=patch_size[1:],
-                stride=patch_size[1:],
-            )
-        else:
-            self.control_adapter = None
 
     def _init_freqs(self):
         if self.freqs is not None:
@@ -463,20 +450,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         # NOTE(dhyu): avoid slow_conv
         x = x.contiguous(memory_format=torch.channels_last_3d)
         x = self.patch_embedding(x)
-        if (
-            self.control_adapter is not None
-            and control_camera_latents_input is not None
-        ):
-            y_camera = self.control_adapter(control_camera_latents_input)
-            if isinstance(x, list):
-                x = [u + v for u, v in zip(x, y_camera)]
-                x = x[0].unsqueeze(0)
-            else:
-                # Some adapters may return a list even when x is a Tensor.
-                if isinstance(y_camera, list):
-                    x = x + y_camera[0]
-                else:
-                    x = x + y_camera
         grid_size = x.shape[2:]
         x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
         return x, grid_size  # x, grid_size: (f, h, w)
@@ -498,12 +471,6 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | list[torch.Tensor],
         timestep: torch.LongTensor,
-        encoder_hidden_states_image: torch.Tensor | list[torch.Tensor],
-        y: torch.Tensor,
-        guidance=None,
-        use_gradient_checkpointing: bool = False,
-        use_gradient_checkpointing_offload: bool = False,
-        **kwargs,
     ) -> torch.Tensor:
         # MOVA code historically uses x/context/y/clip_feature naming.
         x = hidden_states
@@ -532,35 +499,8 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             .to(x.device)
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
-
-            return custom_forward
-
         for block in self.blocks:
-            if self.training and use_gradient_checkpointing:
-                if use_gradient_checkpointing_offload:
-                    with torch.autograd.graph.save_on_cpu():
-                        x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x,
-                            context,
-                            t_mod,
-                            freqs,
-                            use_reentrant=False,
-                        )
-                else:
-                    x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x,
-                        context,
-                        t_mod,
-                        freqs,
-                        use_reentrant=False,
-                    )
-            else:
-                x = block(x, context, t_mod, freqs)
+            x = block(x, context, t_mod, freqs)
 
         x = self.head(x, t)
         x = self.unpatchify(x, (f, h, w))
