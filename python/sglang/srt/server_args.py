@@ -617,6 +617,7 @@ class ServerArgs:
     nsa_prefill_cp_mode: str = "in-seq-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
+    enable_sp_prefill: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -2352,6 +2353,14 @@ class ServerArgs:
 
         if self.custom_weight_loader is None:
             self.custom_weight_loader = []
+
+        if self.tp_size == 1 and self.enable_sp_prefill:
+            logger.warning("enable_sp_prefill is adjust tp False when tp_size=1")
+            self.enable_sp_prefill = False
+        if self.enable_sp_prefill and self.disaggregation_mode == "null":
+            raise ValueError(
+                "The argument enable_sp_prefill and self.disaggregation_mode(null) are mutuially exclusive"
+            )
 
         if self.load_format == "remote_instance":
             if (
@@ -4810,6 +4819,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        # For sp
+        parser.add_argument(
+            "--enable-sp-prefill",
+            action="store_true",
+            help="Use sp in pd-disaggregation (only prefill) with set --disable-radix-cache and --attention-backend ascend and MLA,sp_size equal tp_size",
         )
 
     @classmethod

@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.managers.utils import recalculate_sp_max_len
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -715,7 +716,8 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        rem_total_tokens = recalculate_sp_max_len(self.rem_total_tokens)
+        if total_tokens >= rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
@@ -723,7 +725,8 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            rem_total_tokens = recalculate_sp_max_len(self.rem_total_tokens)
+            if total_tokens >= rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
