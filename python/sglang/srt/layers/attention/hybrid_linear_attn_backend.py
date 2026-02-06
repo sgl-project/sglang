@@ -952,6 +952,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._flashinfer_chunk_gated_delta_rule = flashinfer_prefill
             self._flashinfer_gated_delta_rule_mtp = flashinfer_mtp
             logger.info("K-last mode: Using FlashInfer GDN prefill and MTP (verify) kernels")
+            
+            # Warmup MTP kernel to avoid JIT compilation overhead during serving
+            # The MTP kernel has ~4s JIT compilation on first call
+            self._warmup_mtp_kernel()
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
@@ -963,6 +967,71 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "the V-last Triton decode kernel will be used with extra transpose overhead."
                 )
                 GDNAttnBackend._k_last_decode_warning_shown = True
+
+    def _warmup_mtp_kernel(self):
+        """Warmup FlashInfer MTP kernel to avoid JIT compilation overhead during serving.
+        
+        The MTP kernel has ~4s JIT compilation on first call. This warmup runs the kernel
+        once with dummy tensors to trigger compilation before serving begins.
+        """
+        if self._flashinfer_gated_delta_rule_mtp is None:
+            return
+        
+        import time
+        logger.info("Warming up FlashInfer GDN MTP kernel (may take a few seconds)...")
+        start_time = time.perf_counter()
+        
+        # Get model config from the mamba pool
+        # Use small but representative sizes for warmup
+        # The kernel config is: batch_size, seq_len=4 (draft_token_num), num_heads, head_dim=128
+        batch_size = 4
+        seq_len = 4  # draft_token_num for speculative decoding
+        num_heads = 4  # typical per-GPU head count
+        head_dim = 128  # ssm_state_size
+        
+        device = "cuda"
+        dtype = torch.bfloat16
+        
+        try:
+            # Create dummy tensors
+            q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+            k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+            v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+            A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
+            dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
+            a = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
+            b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
+            
+            pool_size = batch_size + 16
+            initial_state = torch.randn(pool_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+            cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
+            intermediate_state_cache = torch.zeros(
+                pool_size, seq_len, num_heads, head_dim, head_dim,
+                device=device, dtype=torch.float32
+            )
+            
+            # Run warmup call
+            self._flashinfer_gated_delta_rule_mtp(
+                q=q, k=k, v=v,
+                initial_state=initial_state,
+                initial_state_indices=cache_indices,
+                A_log=A_log, a=a, dt_bias=dt_bias, b=b,
+                scale=None, output=None,
+                intermediate_states_buffer=intermediate_state_cache,
+                disable_state_update=True,
+                use_qk_l2norm=True,
+            )
+            torch.cuda.synchronize()
+            
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"FlashInfer GDN MTP kernel warmup completed in {elapsed:.2f}s")
+            
+            # Clean up
+            del q, k, v, A_log, dt_bias, a, b, initial_state, cache_indices, intermediate_state_cache
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
 
     def forward_decode(
         self,
