@@ -3,10 +3,11 @@
 Pre-download missing HuggingFace models before CI tests start.
 
 This script runs once during CI initialization (in prepare_runner.sh) to:
-1. Extract all model names from DEFAULT_*MODEL* constants in test_utils.py
-2. Check which models are NOT yet cached (no snapshot with config.json)
-3. Download missing models via snapshot_download(max_workers=1)
-4. Use fcntl-based locking (same lock paths as ci_download_with_validation_and_retry)
+1. Extract model names from DEFAULT_*MODEL* constants in test_utils.py
+2. Scan test/registered/ for hardcoded model references (model = "org/repo")
+3. Check which models are NOT yet cached (no snapshot with config.json)
+4. Download missing models via snapshot_download(max_workers=1)
+5. Use fcntl-based locking (same lock paths as ci_download_with_validation_and_retry)
    with LOCK_NB (non-blocking — skip if locked by another process)
 
 This is best-effort: exits 0 on all failures. Pre-caching is an optimization,
@@ -19,6 +20,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -46,6 +48,48 @@ def get_all_default_models():
 
     models_json = _get_default_models()
     return set(json.loads(models_json))
+
+
+# Matches model references like: model = "org/repo" or model_path = "org/repo"
+# Captures org/repo format (at least one slash, no spaces)
+_MODEL_PATTERN = re.compile(
+    r"""(?:model|model_path)\s*=\s*["']([a-zA-Z][a-zA-Z0-9_-]*/[a-zA-Z0-9._-]+)"""
+)
+
+
+def get_models_from_test_files():
+    """
+    Scan test/registered/ for hardcoded model references.
+
+    Extracts model names from patterns like:
+        model = "org/repo"
+        model_path = "org/repo"
+
+    Strips LoRA adapter suffixes (e.g., "org/repo:adapter" -> "org/repo").
+
+    Returns:
+        Set of model name strings
+    """
+    models = set()
+    test_dir = REPO_ROOT / "test" / "registered"
+
+    if not test_dir.is_dir():
+        print(f"  Warning: {test_dir} not found, skipping test file scan")
+        return models
+
+    for py_file in test_dir.rglob("*.py"):
+        try:
+            content = py_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+
+        for match in _MODEL_PATTERN.finditer(content):
+            model_name = match.group(1)
+            # Strip LoRA adapter suffix (e.g., "meta-llama/Llama-3.1-8B:sql-expert")
+            model_name = model_name.split(":")[0]
+            models.add(model_name)
+
+    return models
 
 
 def is_model_cached(model_name):
@@ -178,16 +222,33 @@ def main():
     print(f"Per-model timeout: {PER_MODEL_TIMEOUT_SECONDS}s")
     print()
 
-    # Get all model names from test constants
+    # Get model names from DEFAULT_*MODEL* constants
+    all_models = set()
     print("Extracting model names from test_utils.py constants...")
     try:
-        all_models = get_all_default_models()
+        constant_models = get_all_default_models()
+        all_models.update(constant_models)
+        print(f"  Found {len(constant_models)} from constants")
     except Exception as e:
-        print(f"Failed to extract model names: {e}")
-        print("Skipping pre-cache step")
+        print(f"  Failed: {e}")
+
+    # Get model names from test/registered/ files
+    print("Scanning test/registered/ for hardcoded model references...")
+    try:
+        test_file_models = get_models_from_test_files()
+        new_models = test_file_models - all_models
+        all_models.update(test_file_models)
+        print(
+            f"  Found {len(test_file_models)} from test files ({len(new_models)} new)"
+        )
+    except Exception as e:
+        print(f"  Failed: {e}")
+
+    if not all_models:
+        print("No models found, skipping pre-cache step")
         return
 
-    print(f"Found {len(all_models)} unique model name(s)")
+    print(f"Total unique models: {len(all_models)}")
     print()
 
     # Classify models as cached or missing
