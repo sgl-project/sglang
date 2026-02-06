@@ -50,13 +50,18 @@ class BaseReasoningFormatDetector:
 
         if self.think_end_token not in processed_text:
             # Check for tool_start_token interruption
-            if self._in_reasoning and self.tool_start_token is not None and self.tool_start_token in processed_text:
-                # Find the last occurrence of tool_start_token and split there
+            if (
+                self.tool_start_token is not None
+                and self.tool_start_token in processed_text
+            ):
+                # Find the first occurrence of tool_start_token and split there
                 tool_idx = processed_text.find(self.tool_start_token)
                 reasoning_text = processed_text[:tool_idx].strip()
                 # Preserve tool_start_token in normal text
                 normal_text = processed_text[tool_idx:]
-                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
             # Assume reasoning was truncated before end token
             return StreamingParseResult(reasoning_text=processed_text)
 
@@ -65,7 +70,9 @@ class BaseReasoningFormatDetector:
         reasoning_text = splits[0]
         normal_text = splits[1].strip()
 
-        return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+        return StreamingParseResult(
+            normal_text=normal_text, reasoning_text=reasoning_text
+        )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -84,7 +91,10 @@ class BaseReasoningFormatDetector:
         tokens_to_check = [self.think_start_token, self.think_end_token]
         if self.tool_start_token:
             tokens_to_check.append(self.tool_start_token)
-        if any(token.startswith(current_text) and token != current_text for token in tokens_to_check):
+        if any(
+            token.startswith(current_text) and token != current_text
+            for token in tokens_to_check
+        ):
             return StreamingParseResult()
 
         # Strip `<think>` token if present
@@ -103,7 +113,9 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
-            return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text.rstrip())
+            return StreamingParseResult(
+                normal_text=normal_text, reasoning_text=reasoning_text.rstrip()
+            )
 
         # Continue with reasoning content
         if self._in_reasoning:
@@ -115,7 +127,9 @@ class BaseReasoningFormatDetector:
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
-                return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
+                return StreamingParseResult(
+                    normal_text=normal_text, reasoning_text=reasoning_text
+                )
             if self.stream_reasoning:
                 # Stream the content immediately
                 self._buffer = ""
@@ -248,7 +262,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
         # Flush the buffer for one-shot parsing
         events += self.parser.parse("")
 
-        reasoning_text = "".join([e.content for e in events if e.event_type == "reasoning"])
+        reasoning_text = "".join(
+            [e.content for e in events if e.event_type == "reasoning"]
+        )
         normal_parts = []
         for e in events:
             if e.event_type == "normal":
@@ -267,7 +283,9 @@ class GptOssDetector(BaseReasoningFormatDetector):
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         events = self.parser.parse(new_text)
 
-        reasoning_text = "".join([e.content for e in events if e.event_type == "reasoning"])
+        reasoning_text = "".join(
+            [e.content for e in events if e.event_type == "reasoning"]
+        )
         normal_parts = []
         for e in events:
             if e.event_type == "normal":
@@ -380,7 +398,9 @@ class ReasoningParser:
         ret = self.detector.detect_and_parse(full_text)
         return ret.reasoning_text, ret.normal_text
 
-    def parse_stream_chunk(self, chunk_text: str) -> Tuple[Optional[str], Optional[str]]:
+    def parse_stream_chunk(
+        self, chunk_text: str
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Streaming call: incremental parsing"""
         ret = self.detector.parse_streaming_increment(chunk_text)
         return ret.reasoning_text, ret.normal_text
