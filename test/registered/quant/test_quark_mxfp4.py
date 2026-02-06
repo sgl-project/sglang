@@ -6,7 +6,11 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=103, suite="stage-b-test-small-1-gpu")
 register_amd_ci(est_time=106, suite="stage-b-test-small-1-gpu-amd")
+import os
+import time
 from types import SimpleNamespace
+
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike
@@ -22,6 +26,7 @@ from sglang.test.test_utils import (
 
 class TestOnlineQuantizationMemoryLoad(CustomTestCase):
     runner_args = []
+    environment = {}
 
     @classmethod
     def setUpClass(cls):
@@ -47,12 +52,14 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
             ],
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
-        # cls.wait_server_ready(
-        #     cls.base_url + "/health", timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-        # )
-        import time
 
-        import requests
+        cls.original_envs = {}
+        for env_name, env_value in cls.environment.items():
+            original_env = os.environ.get(env_name, None)
+            if original_env is not None:
+                cls.original_envs[env_name] = os.environ.get(env_name, None)
+
+            os.environ[env_name] = env_value
 
         url = cls.base_url + "/health"
         timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
@@ -107,6 +114,9 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        for env_name, env_value in cls.original_envs.items():
+            os.environ[env_name] = env_value
+
         kill_process_tree(cls.process.pid)
         cls.stdout.close()
         cls.stderr.close()
@@ -220,7 +230,7 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
 class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
     # Loading should take ~51.65 seconds on TP=8 on MI355X.
     # model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
-    model = "/shareddata/deepseek-ai/DeepSeek-V3.2"
+    model = "deepseek-ai/DeepSeek-V3.2"
     tp = 8
 
     # Default nsa-prefill-backend / nsa-decode-backend is incorrect, see https://github.com/sgl-project/sglang/pull/18319
@@ -248,20 +258,32 @@ class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
     model = "moonshotai/Kimi-K2-Instruct-0905"  # FP8 model
     tp = 8
 
+    # Same as in test/registered/amd/test_kimi_k2_instruct.py
+    runner_args = [
+        "--decode-attention-backend",
+        "triton",
+        "--prefill-attention-backend",
+        "aiter",
+        "--trust-remote-code",
+    ]
+
+    # Same as in test/registered/amd/test_kimi_k2_instruct.py, getting an error otherwise.
+    environment = {"SGLANG_ROCM_FUSED_DECODE_MLA": "0"}
+
     def test_peak_memory(self):
-        # Original moonshotai/Kimi-K2-Instruct-0905 model: TODO GiB (TP=8, peak_memory_before_load)
+        # Original moonshotai/Kimi-K2-Instruct-0905 model: 121.020 GiB (TP=8, peak_memory_before_load)
         self._test_peak_memory(
-            threshold=66, test_start=True, add_peak_memory_before_load=False
+            threshold=82, test_start=True, add_peak_memory_before_load=False
         )  # TP=8
 
     def test_gsm8k(self):
-        # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: TODO
-        self._test_gsm8k(accuracy_threshold=0.92)  # TODO
+        # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: ~0.962
+        self._test_gsm8k(accuracy_threshold=0.96)
 
 
 @unittest.skipIf(is_in_ci(), "local test only")
 class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    model = "/MiniMaxAI/MiniMax-M2.1"  # FP8 model
+    model = "MiniMaxAI/MiniMax-M2.1"  # FP8 model
 
     tp = 2
     # NOTE: this test is failing in FP16 (default dtype of the original MiniMax-M2.1 model).
