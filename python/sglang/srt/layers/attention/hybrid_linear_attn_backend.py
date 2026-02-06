@@ -19,21 +19,22 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
 
-# Lazy import for FlashInfer GDN kernels (prefill and verify/MTP)
+# Lazy import for FlashInfer GDN kernels (prefill, decode and verify/MTP)
 _flashinfer_gdn_available = None
 _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
+_flashinfer_gated_delta_rule_decode = None
 
 # Path to the custom FlashInfer repo with GDN kernels
 _FLASHINFER_GDN_REPO_PATH = "/lustre/raplab/client/xutingz/workspace/gitsrc/flashinfer"
 
 
 def _get_flashinfer_gdn_kernels():
-    """Lazy import for FlashInfer GDN prefill and verify (MTP) kernels.
+    """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
     
     Uses the custom FlashInfer repo at _FLASHINFER_GDN_REPO_PATH for GDN kernels.
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp
+    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -44,27 +45,29 @@ def _get_flashinfer_gdn_kernels():
                 logger.info(f"Using FlashInfer GDN kernels from: {_FLASHINFER_GDN_REPO_PATH}")
             
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
-            from flashinfer.gdn_decode import gated_delta_rule_mtp
+            from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
+            _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode
             # Check if SM90+ (required for FlashInfer GDN kernels)
             _flashinfer_gdn_available = (
                 torch.cuda.is_available()
                 and torch.cuda.get_device_capability()[0] >= 9
             )
             if _flashinfer_gdn_available:
-                logger.info("FlashInfer GDN kernels (prefill + MTP) loaded successfully")
+                logger.info("FlashInfer GDN kernels (prefill + decode + MTP) loaded successfully")
         except (ImportError, RuntimeError) as e:
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
-    return _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp
+            _flashinfer_gated_delta_rule_decode = None
+    return _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
 
 
 # Legacy alias for backward compatibility
 def _get_flashinfer_gdn_prefill():
     """Lazy import for FlashInfer GDN prefill kernel (legacy alias)."""
-    available, prefill_fn, _ = _get_flashinfer_gdn_kernels()
+    available, prefill_fn, _, _ = _get_flashinfer_gdn_kernels()
     return available, prefill_fn
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -935,7 +938,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_chunk_gated_delta_rule = None
         self._flashinfer_gated_delta_rule_mtp = None
         if self.ssm_k_last:
-            flashinfer_available, flashinfer_prefill, flashinfer_mtp = _get_flashinfer_gdn_kernels()
+            flashinfer_available, flashinfer_prefill, flashinfer_mtp, flashinfer_decode = _get_flashinfer_gdn_kernels()
             if not flashinfer_available:
                 raise RuntimeError(
                     "K-last SSM layout is enabled but FlashInfer GDN kernels are unavailable. "
@@ -949,22 +952,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 raise RuntimeError(
                     "K-last SSM layout is enabled but FlashInfer GDN MTP (verify) kernel is unavailable."
                 )
+            if flashinfer_decode is None:
+                raise RuntimeError(
+                    "K-last SSM layout is enabled but FlashInfer GDN decode kernel is unavailable."
+                )
             self._flashinfer_chunk_gated_delta_rule = flashinfer_prefill
             self._flashinfer_gated_delta_rule_mtp = flashinfer_mtp
-            logger.info("K-last mode: Using FlashInfer GDN prefill and MTP (verify) kernels")
+            self._flashinfer_gated_delta_rule_decode = flashinfer_decode
+            logger.info("K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels")
             
             # Warmup MTP kernel to avoid JIT compilation overhead during serving
             # The MTP kernel has ~4s JIT compilation on first call
             self._warmup_mtp_kernel()
+            self._warmup_decode_kernel()
         
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
             server_args = get_global_server_args()
             if server_args.speculative_algorithm is None:
-                logger.warning(
+                logger.info(
                     "K-last SSM layout (--mamba-ssm-k-last) is enabled without speculative decoding. "
-                    "This is NOT recommended as there is no K-last decode kernel yet - "
-                    "the V-last Triton decode kernel will be used with extra transpose overhead."
+                    "Using FlashInfer GDN decode kernel for K-last decode."
                 )
                 GDNAttnBackend._k_last_decode_warning_shown = True
 
@@ -1033,6 +1041,64 @@ class GDNAttnBackend(MambaAttnBackendBase):
         except Exception as e:
             logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
 
+    def _warmup_decode_kernel(self):
+        """Warmup FlashInfer decode kernel to avoid JIT compilation overhead during serving.
+        
+        The decode kernel has JIT compilation on first call. This warmup runs the kernel
+        once with dummy tensors to trigger compilation before serving begins.
+        """
+        if self._flashinfer_gated_delta_rule_decode is None:
+            return
+        
+        import time
+        logger.info("Warming up FlashInfer GDN decode kernel (may take a few seconds)...")
+        start_time = time.perf_counter()
+        
+        # Use representative sizes for warmup
+        batch_size = 4
+        num_heads = 4  # typical per-GPU head count
+        head_dim = 128  # ssm_state_size
+        
+        device = "cuda"
+        dtype = torch.bfloat16
+        
+        try:
+            # Create dummy tensors matching decode kernel expectations
+            q = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=dtype)
+            k = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=dtype)
+            v = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=dtype)
+            A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
+            dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
+            a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
+            b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
+            
+            # State in K-last layout: [B, HV, K, V]
+            state = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+            
+            # Run warmup call
+            self._flashinfer_gated_delta_rule_decode(
+                q=q, k=k, v=v,
+                state=state,
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                b=b,
+                scale=None,
+                output=None,
+                use_qk_l2norm=True,
+            )
+            torch.cuda.synchronize()
+            
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"FlashInfer GDN decode kernel warmup completed in {elapsed:.2f}s")
+            
+            # Clean up
+            del q, k, v, A_log, dt_bias, a, b, state
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1090,30 +1156,48 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         if self.ssm_k_last:
-            # K-last decode uses V-last Triton kernel with in-place transpose.
-            # Requires K==V (always true for Qwen3-Next) for in-place transpose.
-            assert head_k_dim == head_v_dim, "K-last decode requires K==V for in-place transpose"
-            assert ssm_states.is_contiguous(), "K-last decode requires contiguous ssm_states"
+            # K-last decode uses FlashInfer GDN decode kernel directly.
+            # State layout: [pool_size, HV, K, V] (K-last)
+            # FlashInfer expects [B, HV, K, V] so we gather the states
+            num_value_heads = value.shape[2]
             
-            # K-last -> V-last in-place for the kernel
-            in_place_transpose_indexed(ssm_states, cache_indices)
-            core_attn_out = fused_sigmoid_gating_delta_rule_update(
-                A_log=A_log,
-                dt_bias=dt_bias,
-                q=query,
-                k=key,
-                v=value,
-                a=a,
-                b=b,
-                initial_state_source=ssm_states,
-                initial_state_indices=cache_indices,
-                cu_seqlens=query_start_loc,
-                use_qk_l2norm_in_kernel=True,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
+            # Gather states for this batch: [pool_size, HV, K, V] -> [B, HV, K, V]
+            # cache_indices shape: [B]
+            batch_size = cache_indices.shape[0]
+            gathered_state = ssm_states[cache_indices]  # [B, HV, K, V]
+            
+            # FlashInfer decode expects:
+            # q, k: [B, 1, H, K], v: [B, 1, HV, V], state: [B, HV, K, V]
+            # a, b: [B, 1, HV]
+            # Current shapes: query [1, seq_len, H, K] needs to be [B, 1, H, K]
+            # seq_len == batch_size for decode
+            query_fi = query.view(batch_size, 1, num_heads, head_k_dim)
+            key_fi = key.view(batch_size, 1, num_heads, head_k_dim)
+            value_fi = value.view(batch_size, 1, num_value_heads, head_v_dim)
+            a_fi = a.view(batch_size, 1, num_value_heads)
+            b_fi = b.view(batch_size, 1, num_value_heads)
+            
+            # Call FlashInfer GDN decode kernel
+            output_fi, updated_state = self._flashinfer_gated_delta_rule_decode(
+                q=query_fi,
+                k=key_fi,
+                v=value_fi,
+                state=gathered_state,
+                A_log=A_log.detach(),
+                a=a_fi,
+                dt_bias=dt_bias.detach(),
+                b=b_fi,
+                scale=None,
+                output=None,
+                use_qk_l2norm=True,
             )
-            # V-last -> K-last: transpose back to pool layout
-            in_place_transpose_indexed(ssm_states, cache_indices)
+            
+            # Write updated state back to pool
+            # updated_state: [B, HV, K, V]
+            ssm_states.index_copy_(0, cache_indices.to(torch.int64), updated_state.to(ssm_states.dtype))
+            
+            # Reshape output: [B, 1, HV, V] -> [1, B, HV, V]
+            core_attn_out = output_fi.view(1, batch_size, num_value_heads, head_v_dim)
         else:
             # V-last mode: ssm_states shape is (pool_size+1, HV, K, V)
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
