@@ -531,9 +531,13 @@ def _get_default_models():
             isinstance(name, str)
             and "DEFAULT_" in name
             and "MODEL_" in name
-            and isinstance(value, str)
+            and isinstance(value, (str, tuple))
         ):
-            if "," in value:
+            if isinstance(value, tuple):
+                for item in value:
+                    if isinstance(item, str):
+                        default_models.add(item.strip())
+            elif "," in value:
                 parts = [part.strip() for part in value.split(",")]
                 default_models.update(parts)
             else:
