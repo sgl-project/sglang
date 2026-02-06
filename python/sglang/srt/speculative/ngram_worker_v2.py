@@ -99,41 +99,6 @@ class NGRAMWorkerV2(NGRAMWorker):
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _update_ngram_cache_v2(self, batch: ModelWorkerBatch):
-        batch_tokens = []
-        if batch.forward_mode != ForwardMode.EXTEND:
-            prev_token_ids, prev_accept_lens = (
-                batch.spec_info.verified_tokens,
-                batch.spec_info.accept_lens,
-            )
-            if not prev_token_ids.is_cpu:
-                prev_token_ids = prev_token_ids.cpu()
-                prev_accept_lens = prev_accept_lens.cpu()
-            self.prev_token_ids = prev_token_ids.tolist()
-            self.prev_accept_lens = prev_accept_lens.tolist()
-
-        stride = self.draft_token_num
-        i = 0
-        for req in batch.reqs:
-            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
-            # there is not much difference, so we will not insert it for now.
-            # if batch.forward_mode.is_extend():
-            #     put_ids = req.origin_input_ids + req.output_ids
-            # else:
-            # TODO deal with grammar, where output_id is complete
-            if batch.forward_mode != ForwardMode.EXTEND:
-                prev_tokens = self.prev_token_ids[
-                    i * stride : i * stride + self.prev_accept_lens[i]
-                ]
-            else:
-                prev_tokens = []
-            put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids + prev_tokens, self.branch_length
-            )
-            batch_tokens.append(put_ids)
-            i += 1
-        self.ngram_cache.batch_put(batch_tokens)
-
     def _prepare_for_speculative_decoding_v2(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_extend():
             return
@@ -215,8 +180,6 @@ class NGRAMWorkerV2(NGRAMWorker):
         model_worker_batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
-        # # update cache using req.output_ids (round 1 to N-2) and prev_token_ids (round N-1) before draft
-        # self._update_ngram_cache_v2(model_worker_batch)
         bs = len(model_worker_batch.seq_lens)
         self._prepare_for_speculative_decoding_v2(model_worker_batch)
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
