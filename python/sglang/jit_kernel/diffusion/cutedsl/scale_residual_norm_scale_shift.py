@@ -344,14 +344,14 @@ def fused_norm_scale_shift(
 
 
 @fused_norm_scale_shift.register_fake
-def _fused_norm_scale_shift_fake(
-    x, weight, bias, scale, shift, norm_type, eps
-):
+def _fused_norm_scale_shift_fake(x, weight, bias, scale, shift, norm_type, eps):
     y = x.new_empty(x.shape)
     return y
 
 
-@torch.library.custom_op("sglang::fused_scale_residual_norm_scale_shift", mutates_args=())
+@torch.library.custom_op(
+    "sglang::fused_scale_residual_norm_scale_shift", mutates_args=()
+)
 def fused_scale_residual_norm_scale_shift(
     residual: torch.Tensor,
     x: torch.Tensor,
