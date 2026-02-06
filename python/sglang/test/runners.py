@@ -551,14 +551,14 @@ class HFRunner:
         # subsequent PeftModel.from_pretrained() calls.
         if peft_model is not None:
             peft_model.unload()
-            for attr in [
-                "peft_config",
-                "peft_type",
-                "active_adapter",
-                "active_adapters",
-            ]:
-                if hasattr(base_model, attr):
+            # Clean up leftover peft metadata. Use try/except because some
+            # attributes (e.g. active_adapters) are class properties that
+            # hasattr detects but delattr can't remove.
+            for attr in ["peft_config", "peft_type", "active_adapter"]:
+                try:
                     delattr(base_model, attr)
+                except AttributeError:
+                    pass
 
         # Assemble results in original order
         output_strs = []
