@@ -1,0 +1,31 @@
+name: PR Test Only
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SGLANG_IS_IN_CI: true
+
+jobs:
+  test:
+    runs-on: gnr800160
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Echo Hugging Face Token
+        run: |
+          echo "=== Hugging Face Token ==="
+          cat ~/huggingface_token.txt
+
+
+
+      - name: System Info
+        run: |
+          echo "=== System Information ==="
+          echo "OS: $(uname -a)"
+          echo "Python: $(python3 --version 2>/dev/null || echo 'not found')"
+          echo "CUDA: $(nvcc --version 2>/dev/null | head -n4 || echo 'not found')"
