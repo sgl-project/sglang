@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -104,22 +103,7 @@ if _use_aiter or _use_hip_int4:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
-try:
-    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-except ImportError:
-    flashinfer_cutlass_fused_moe = None
-
-    class ActivationType(IntEnum):
-        Swiglu = 3
-        Relu2 = 6
-
-
 ACTIVATION_SCHEMES = ["static", "dynamic"]
-ACT_STR_TO_TYPE_MAP = {
-    "silu": ActivationType.Swiglu,
-    "relu2": ActivationType.Relu2,
-}
 
 logger = logging.getLogger(__name__)
 
@@ -1403,14 +1387,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        moe_runner_backend = get_moe_runner_backend()
+        if get_moe_runner_backend().is_flashinfer_cutlass():
+            from flashinfer.fused_moe import (
+                cutlass_fused_moe as flashinfer_cutlass_fused_moe,
+            )
+            from flashinfer.fused_moe.core import ActivationType
 
-        if moe_runner_backend.is_flashinfer_cutlass():
             topk_weights, topk_ids, _ = dispatch_output.topk_output
-            if flashinfer_cutlass_fused_moe is None:
-                raise RuntimeError(
-                    "flashinfer_cutlass backend requires flashinfer.fused_moe.cutlass_fused_moe"
-                )
 
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
@@ -1442,9 +1425,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 use_deepseek_fp8_block_scale = False
 
             activation = self.moe_runner_config.activation
-            assert (
-                activation in ACT_STR_TO_TYPE_MAP
-            ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
+            activation_type = {
+                "silu": ActivationType.Swiglu,
+                "relu2": ActivationType.Relu2,
+            }[activation]
 
             output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
@@ -1460,18 +1444,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=ACT_STR_TO_TYPE_MAP[activation],
+                activation_type=activation_type,
                 use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             )[0]
             return StandardCombineInput(hidden_states=output)
 
-        if moe_runner_backend.is_cutlass():
+        if get_moe_runner_backend().is_cutlass():
             return self._apply_cutlass_fp8(layer, x, dispatch_output.topk_output)
-
-        if not hasattr(self, "runner"):
-            raise RuntimeError(
-                f"Fp8MoEMethod runner is not initialized for backend {moe_runner_backend}"
-            )
 
         if self.runner.runner_backend.is_deep_gemm():
 
