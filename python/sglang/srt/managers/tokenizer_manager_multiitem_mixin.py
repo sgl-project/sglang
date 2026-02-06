@@ -243,6 +243,9 @@ class TokenizerManagerMultiItemMixin:
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
 
+        if not items:
+            return [], 0
+
         if self.tokenizer is not None:
             vocab_size = self.tokenizer.vocab_size
             for token_id in label_token_ids:
