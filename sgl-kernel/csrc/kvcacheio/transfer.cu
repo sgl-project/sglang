@@ -32,7 +32,7 @@ static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
 #if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   static cudaMemcpyBatchAsync_t fn = []() -> cudaMemcpyBatchAsync_t {
     void* symbol = nullptr;
-    CUresult res = cuGetProcAddress("cudaMemcpyBatchAsync", &symbol, CUDART_VERSION, 0);
+    CUresult res = cuGetProcAddress("cudaMemcpyBatchAsync", &symbol, CUDART_VERSION, 0, nullptr);
     if (res == CUDA_SUCCESS && symbol != nullptr) {
       return reinterpret_cast<cudaMemcpyBatchAsync_t>(symbol);
     }
