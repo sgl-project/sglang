@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 
@@ -108,7 +108,7 @@ class TokenizerManagerMultiItemMixin:
         label_token_ids: List[int],
         apply_softmax: bool,
         batch_request=None,
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], int]:
         """
         Process results from multi-item scoring request.
         Extracts logprobs at delimiter positions from input_token_ids_logprobs.
@@ -123,14 +123,17 @@ class TokenizerManagerMultiItemMixin:
         Returns:
             List of score lists, one for each item
         """
-        single_result = results[0] if isinstance(results, list) else results
+        result = results[0] if isinstance(results, list) else results
+        meta_info = result.get("meta_info", {})
 
         # For multi-item scoring, logprobs are in input_token_ids_logprobs
-        input_logprobs = single_result["meta_info"].get("input_token_ids_logprobs", [])
+        input_logprobs = meta_info.get("input_token_ids_logprobs", [])
+        prompt_tokens = meta_info.get("prompt_tokens", 0)
+        request_id = meta_info.get("id", "<unknown>")
 
         if not input_logprobs:
             raise RuntimeError(
-                f"input_token_ids_logprobs is empty for multi-item scoring request {single_result['meta_info'].get('id', '<unknown>')}. "
+                f"input_token_ids_logprobs is empty for multi-item scoring request {request_id}. "
                 "This indicates token_ids_logprobs were not computed properly for Mutil Item Scoring."
             )
 
@@ -143,7 +146,7 @@ class TokenizerManagerMultiItemMixin:
             raise RuntimeError(
                 f"Expected {expected_logprobs_count} input_token_ids_logprobs for multi-item scoring "
                 f"with {num_items} items, but got {len(input_logprobs)}. "
-                f"Request ID: {single_result['meta_info'].get('id', '<unknown>')}"
+                f"Request ID: {request_id}"
             )
 
         # Skip the first delimiter (between query and first item) and process remaining delimiter positions
@@ -162,11 +165,11 @@ class TokenizerManagerMultiItemMixin:
             )
             scores.append(score_list)
 
-        return scores
+        return scores, prompt_tokens
 
     def _process_single_item_scoring_results(
         self, results: Any, label_token_ids: List[int], apply_softmax: bool
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], int]:
         """
         Process results from single-item scoring request.
         Single-item scoring results are stored in output_token_ids_logprobs.
@@ -180,10 +183,12 @@ class TokenizerManagerMultiItemMixin:
             List of score lists, one for each result
         """
         scores = []
+        prompt_tokens = 0
 
         for result in results:
             # For single-item scoring, logprobs are in output_token_ids_logprobs
             output_logprobs = result["meta_info"].get("output_token_ids_logprobs", [])
+            prompt_tokens += result["meta_info"].get("prompt_tokens", 0)
 
             if not output_logprobs or len(output_logprobs) == 0:
                 raise RuntimeError(
@@ -199,7 +204,7 @@ class TokenizerManagerMultiItemMixin:
             )
             scores.append(score_list)
 
-        return scores
+        return scores, prompt_tokens
 
     async def score_request(
         self,
@@ -209,7 +214,7 @@ class TokenizerManagerMultiItemMixin:
         apply_softmax: bool = False,
         item_first: bool = False,
         request: Optional[Any] = None,
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], int]:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
 

@@ -158,7 +158,7 @@ class TestScoreAPI(CustomTestCase):
         # Run each test case
         for case in test_cases:
             # Get scores from SGLang
-            sglang_scores = self.engine.score(
+            sglang_scores, _ = self.engine.score(
                 query=case["query"],
                 items=case["items"],
                 label_token_ids=label_token_ids,
@@ -188,7 +188,7 @@ class TestScoreAPI(CustomTestCase):
 
         for batch_size in batch_sizes:
             texts = [f"test {i}" for i in range(batch_size)]
-            scores = self.engine.score(
+            scores, _ = self.engine.score(
                 query="The test was",
                 items=texts,
                 label_token_ids=label_token_ids,
@@ -240,7 +240,7 @@ class TestScoreAPI(CustomTestCase):
             items = ["France", "Germany"]
             label_token_ids = [1, 2, 3]
 
-            scores = self.engine.score(
+            scores, _ = self.engine.score(
                 query=query,
                 items=items,
                 label_token_ids=label_token_ids,
@@ -306,7 +306,7 @@ class TestScoreAPI(CustomTestCase):
         label_token_ids = [9454, 2753]  # "Yes" and "No" tokens
 
         # Get scores using SGLang
-        scores = self.engine.score(
+        scores, prompt_tokens = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
@@ -315,6 +315,7 @@ class TestScoreAPI(CustomTestCase):
 
         # Verify we get the expected number of scores
         self.assertEqual(len(scores), len(items), "Should get one score list per item")
+        self.assertEqual(prompt_tokens, 63, "Should have correct prompt_tokens")
 
         # Verify each score list has the correct length
         for i, score_list in enumerate(scores):
@@ -343,14 +344,14 @@ class TestScoreAPI(CustomTestCase):
         label_token_ids = [1, 2, 3]
 
         # Run the same test multiple times
-        scores1 = self.engine.score(
+        scores1, _ = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
             apply_softmax=True,
         )
 
-        scores2 = self.engine.score(
+        scores2, _ = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
@@ -386,7 +387,7 @@ class TestScoreAPI(CustomTestCase):
 
         for items in test_cases:
             with self.subTest(items=items):
-                scores = self.engine.score(
+                scores, prompt_tokens = self.engine.score(
                     query=query,
                     items=items,
                     label_token_ids=label_token_ids,
@@ -411,7 +412,7 @@ class TestScoreAPI(CustomTestCase):
         items = []
         label_token_ids = [1, 2]
 
-        scores = self.engine.score(
+        scores, prompt_tokens = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
@@ -419,6 +420,7 @@ class TestScoreAPI(CustomTestCase):
         )
 
         self.assertEqual(len(scores), 0, "Should return empty list for empty items")
+        self.assertEqual(prompt_tokens, 0, "Should return 0 for empty items")
 
     def test_multi_item_scoring_single_item(self):
         """Test multi-item scoring with single item (should work like regular scoring)."""
@@ -426,7 +428,7 @@ class TestScoreAPI(CustomTestCase):
         items = ["Paris"]
         label_token_ids = [1, 2, 3]
 
-        scores = self.engine.score(
+        scores, prompt_tokens = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
@@ -438,6 +440,7 @@ class TestScoreAPI(CustomTestCase):
             len(scores[0]), len(label_token_ids), "Should have correct number of scores"
         )
         self.assertAlmostEqual(sum(scores[0]), 1.0, places=6)
+        self.assertEqual(prompt_tokens, 11, "Should have correct prompt_tokens")
 
     def test_multi_item_scoring_different_queries(self):
         """Test multi-item scoring with different types of queries."""
@@ -454,7 +457,7 @@ class TestScoreAPI(CustomTestCase):
 
         for query in test_queries:
             with self.subTest(query=query):
-                scores = self.engine.score(
+                scores, _ = self.engine.score(
                     query=query,
                     items=items,
                     label_token_ids=label_token_ids,
@@ -485,7 +488,7 @@ class TestScoreAPI(CustomTestCase):
 
         for label_token_ids in test_label_tokens:
             with self.subTest(label_tokens=label_token_ids):
-                scores = self.engine.score(
+                scores, _ = self.engine.score(
                     query=query,
                     items=items,
                     label_token_ids=label_token_ids,
@@ -508,7 +511,7 @@ class TestScoreAPI(CustomTestCase):
         items = ["Good", "Bad", "Neutral"]
         label_token_ids = [1, 2, 3]
 
-        scores = self.engine.score(
+        scores, _ = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
@@ -532,7 +535,7 @@ class TestScoreAPI(CustomTestCase):
         items = [f"Item {i}" for i in range(20)]  # 20 items
         label_token_ids = [1, 2, 3]
 
-        scores = self.engine.score(
+        scores, _ = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,
@@ -551,7 +554,7 @@ class TestScoreAPI(CustomTestCase):
         items = ["选项A", "选项B", "选项C"]
         label_token_ids = [1, 2, 3]
 
-        scores = self.engine.score(
+        scores, _ = self.engine.score(
             query=query,
             items=items,
             label_token_ids=label_token_ids,

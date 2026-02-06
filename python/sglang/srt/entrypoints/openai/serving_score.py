@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
     ScoringRequest,
     ScoringResponse,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 
@@ -42,7 +43,7 @@ class OpenAIServingScore(OpenAIServingBase):
         """Handle the scoring request"""
         try:
             # Use tokenizer_manager's score_request method directly
-            scores = await self.tokenizer_manager.score_request(
+            scores, prompt_tokens = await self.tokenizer_manager.score_request(
                 query=request.query,
                 items=request.items,
                 label_token_ids=request.label_token_ids,
@@ -55,6 +56,10 @@ class OpenAIServingScore(OpenAIServingBase):
             response = ScoringResponse(
                 scores=scores,
                 model=request.model,
+                usage=UsageInfo(
+                    prompt_tokens=prompt_tokens,
+                    total_tokens=prompt_tokens,
+                ),
             )
             return response
 
