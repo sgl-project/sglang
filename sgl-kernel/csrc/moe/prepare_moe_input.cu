@@ -29,11 +29,11 @@ __global__ void compute_problem_sizes(
 
   if (threadIdx.x == 0) {
     int final_occurrences = atomic_buffer[expert_id];
-    problem_sizes1[expert_id * 3] = final_occurrences;
-    problem_sizes1[expert_id * 3 + 1] = static_cast<int32_t>(2 * n);
+    problem_sizes1[expert_id * 3] = static_cast<int32_t>(2 * n);
+    problem_sizes1[expert_id * 3 + 1] = final_occurrences;
     problem_sizes1[expert_id * 3 + 2] = static_cast<int32_t>(k);
-    problem_sizes2[expert_id * 3] = final_occurrences;
-    problem_sizes2[expert_id * 3 + 1] = static_cast<int32_t>(k);
+    problem_sizes2[expert_id * 3] = static_cast<int32_t>(k);
+    problem_sizes2[expert_id * 3 + 1] = final_occurrences;
     problem_sizes2[expert_id * 3 + 2] = static_cast<int32_t>(n);
   }
 }
@@ -47,7 +47,7 @@ __global__ void compute_expert_offsets(
   expert_offsets[0] = 0;
   for (int i = 0; i < num_experts; ++i) {
     atomic_buffer[i] = tot_offset;
-    tot_offset += problem_sizes1[i * 3];
+    tot_offset += problem_sizes1[i * 3 + 1];
     expert_offsets[i + 1] = tot_offset;
   }
 }
@@ -64,7 +64,7 @@ __global__ void compute_expert_blockscale_offsets(
   blockscale_offsets[0] = 0;
   for (int i = 0; i < num_experts; ++i) {
     atomic_buffer[i] = tot_offset;
-    int num_tokens = problem_sizes1[i * 3];
+    int num_tokens = problem_sizes1[i * 3 + 1];
     int rounded_num_tokens = (num_tokens + (128 - 1)) / 128 * 128;
     tot_offset += num_tokens;
     tot_rounded_offset += rounded_num_tokens;

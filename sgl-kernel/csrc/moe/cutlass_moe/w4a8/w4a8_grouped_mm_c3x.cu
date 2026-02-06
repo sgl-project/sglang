@@ -103,9 +103,15 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& sb_strides,
     int64_t chunk_size,
     int64_t topk) {
-  uint32_t const m = a_tensors.size(0) / topk;
+  uint32_t m = a_tensors.size(-2);
+  if(a_tensors.dim() == 3){ // low-latency 3d input
+    m = 32;
+  }else{
+    m = m / a_tensors.size(0); // for 2d input, m is the per-expert m
+  }
+
   uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+  uint32_t const k = a_tensors.size(-1);
 
   if (n == 4096 && k == 7168) {
     // group gemm 1

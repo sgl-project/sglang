@@ -180,7 +180,7 @@ void cutlass_w4a8_group_gemm_caller(
   // Check inputs
   TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
   TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
-  TORCH_CHECK(a_scales.dim() == 2, "A Scale tensor must be 2D");
+  TORCH_CHECK(a_scales.dim()  == 2 or a_tensors.dim() == 3, "A Scale tensor must be 2D/3D");
   TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
   TORCH_CHECK(expert_offsets.dim() == 1, "expert_offsets must be a 1D tensor");
   TORCH_CHECK(problem_sizes.dim() == 2, "problem_sizes must be 2D tensor");
