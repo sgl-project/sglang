@@ -923,7 +923,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.pyt_hooks = PytHooks()
             self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+        if self.server_args.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
                     self.model.load_kv_cache_scales(
