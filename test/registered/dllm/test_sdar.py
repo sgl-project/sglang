@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestLLaDA2Mini(CustomTestCase):
+class TestSDARMini(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "JetLM/SDAR-8B-Chat"
@@ -29,7 +29,7 @@ class TestLLaDA2Mini(CustomTestCase):
         other_args = [
             "--trust-remote-code",
             "--mem-fraction-static",
-            "0.7",
+            "0.6",
             "--max-running-requests",
             "128",
             "--attention-backend",
