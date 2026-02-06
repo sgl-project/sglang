@@ -14,7 +14,7 @@
 """Ray cluster discovery and placement group utilities for multi-node deployment."""
 
 import dataclasses
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import ray
 
@@ -38,6 +38,19 @@ class RayClusterTopology:
     total_gpus: int
     nnodes: int
     gpus_per_node: int  # Assumes homogeneous
+
+
+@dataclasses.dataclass
+class RayClusterInfo:
+    """Pre-computed Ray cluster info passed through the launch chain.
+
+    Bundles topology, placement groups, and rank 0's IP so they travel
+    as a single optional object instead of three separate parameters.
+    """
+
+    topology: Optional[RayClusterTopology] = None
+    placement_groups: Optional[List] = None
+    rank0_node_ip: Optional[str] = None
 
 
 def discover_gpu_nodes() -> List[RayNodeInfo]:

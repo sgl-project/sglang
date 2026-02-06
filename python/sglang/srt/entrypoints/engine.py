@@ -220,6 +220,9 @@ class Engine(EngineBase):
         Please refer to `ServerArgs` for the documentation.
         """
 
+        # Extract Ray-specific cluster info before passing to ServerArgs
+        ray_cluster_info = kwargs.pop("ray_cluster_info", None)
+
         # Parse server_args
         if "server_args" in kwargs:
             # Directly load server_args
@@ -251,6 +254,7 @@ class Engine(EngineBase):
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
             run_detokenizer_process_func=self.run_detokenizer_process_func,
+            ray_cluster_info=ray_cluster_info,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -980,6 +984,7 @@ def _launch_schedulers(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
+    ray_cluster_info=None,
 ) -> SchedulerLaunchResult:
     """Launch schedulers using Ray actors or mp.Process.
 
@@ -989,7 +994,9 @@ def _launch_schedulers(
         For mp mode, call result.wait_for_ready() to populate scheduler_infos.
     """
     if server_args.use_ray:
-        return _launch_scheduler_ray_actors(server_args, port_args)
+        return _launch_scheduler_ray_actors(
+            server_args, port_args, ray_cluster_info=ray_cluster_info,
+        )
     else:
         return _launch_scheduler_processes_mp(
             server_args, port_args, run_scheduler_process_func
@@ -1129,6 +1136,7 @@ def _get_rank0_node_ip(placement_group) -> str:
 def _launch_scheduler_ray_actors(
     server_args: ServerArgs,
     port_args: PortArgs,
+    ray_cluster_info=None,
 ) -> SchedulerLaunchResult:
     """
     Launch scheduler actors using Ray (unified single/multi-node).
@@ -1138,10 +1146,10 @@ def _launch_scheduler_ray_actors(
     - Multi-node: N placement groups, one per GPU worker node
 
     Steps:
-    1. Discover GPU nodes in Ray cluster
+    1. Discover GPU nodes in Ray cluster (or use pre-computed topology)
     2. Create cluster topology based on world_size
     3. Create per-node placement groups
-    4. Get dist_init_addr from rank 0's node (using probe actor)
+    4. Get dist_init_addr from rank 0's node
     5. Create scheduler actors with proper node/GPU assignment
     6. Wait for initialization
     """
@@ -1152,6 +1160,7 @@ def _launch_scheduler_ray_actors(
 
     from sglang.srt.managers.scheduler_actor import create_scheduler_actor_class
     from sglang.srt.utils.ray_cluster_utils import (
+        RayClusterInfo,
         compute_rank_to_node_assignment,
         create_cluster_topology,
         create_per_node_placement_groups,
@@ -1165,35 +1174,43 @@ def _launch_scheduler_ray_actors(
             "Set dp_size=1 or use_ray=False."
         )
 
-    # Prevent Ray from overwriting CUDA_VISIBLE_DEVICES
-    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+    if ray_cluster_info is None:
+        ray_cluster_info = RayClusterInfo()
 
-    if not ray.is_initialized():
-        ray.init()
+    topology = ray_cluster_info.topology
+    placement_groups = ray_cluster_info.placement_groups
+    rank0_node_ip = ray_cluster_info.rank0_node_ip
 
-    # Step 1: Discover GPU nodes
-    gpu_nodes = discover_gpu_nodes()
-    if len(gpu_nodes) == 0:
-        raise RuntimeError("No GPU nodes found in Ray cluster")
+    # Use pre-computed topology/PGs or create them (fallback)
+    if topology is None or placement_groups is None:
+        os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+        if not ray.is_initialized():
+            ray.init()
+
+        gpu_nodes = discover_gpu_nodes()
+        if len(gpu_nodes) == 0:
+            raise RuntimeError("No GPU nodes found in Ray cluster")
+
+        world_size = server_args.tp_size * server_args.pp_size
+        topology = create_cluster_topology(gpu_nodes, world_size)
+        placement_groups = create_per_node_placement_groups(topology)
 
     world_size = server_args.tp_size * server_args.pp_size
-
-    # Step 2: Create cluster topology (works for single or multi-node)
-    topology = create_cluster_topology(gpu_nodes, world_size)
     logger.info(
         f"Ray cluster topology: {topology.nnodes} nodes, "
         f"{topology.gpus_per_node} GPUs/node, world_size={world_size}"
     )
 
-    # Step 3: Create placement groups (one per node, STRICT_PACK)
-    placement_groups = create_per_node_placement_groups(topology)
-
-    # Step 4: Get dist_init_addr from the node where rank 0 will run
+    # Get dist_init_addr from the node where rank 0 will run.
     # Rank 0 starts the TCPStore server for torch.distributed, so dist_init_addr
     # must be the IP of the node where rank 0 runs, not the driver/head node.
-    rank0_node_ip = _get_rank0_node_ip(placement_groups[0])
+    if rank0_node_ip is None:
+        # Fallback: use probe actor to discover rank 0's IP (adds ~100-500ms)
+        rank0_node_ip = _get_rank0_node_ip(placement_groups[0])
+        logger.info(f"dist_init_addr: {rank0_node_ip} (discovered via probe actor)")
+    else:
+        logger.info(f"dist_init_addr: {rank0_node_ip} (pre-computed, skipped probe)")
     dist_init_addr = f"{rank0_node_ip}:{server_args.port + 233}"
-    logger.info(f"dist_init_addr: {dist_init_addr} (rank 0 node IP)")
 
     # Step 5: Compute rank-to-node assignment and create actors
     assignment = compute_rank_to_node_assignment(
@@ -1258,6 +1275,7 @@ def _launch_workers(
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
+    ray_cluster_info=None,
 ) -> Tuple[
     TokenizerManager,
     TemplateManager,
@@ -1269,6 +1287,9 @@ def _launch_workers(
     Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
     or Ray actors), and the DetokenizerManager in another subprocess.
 
+    Args:
+        ray_cluster_info: Pre-computed RayClusterInfo (from create_and_launch_engine_actor).
+
     Returns:
         Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args, scheduler_result).
     """
@@ -1278,15 +1299,34 @@ def _launch_workers(
     server_args.check_server_args()
 
     # Allocate ports for inter-process communications
-    driver_ip = None
     if port_args is None:
         if server_args.use_ray:
-            # Ray mode: use TCP for ZMQ communication (works across nodes)
-            import socket
+            if ray_cluster_info is None or ray_cluster_info.topology is None:
+                # Fallback: discover topology if not pre-computed
+                import ray
+                from sglang.srt.utils.ray_cluster_utils import (
+                    RayClusterInfo,
+                    create_cluster_topology,
+                    create_per_node_placement_groups,
+                    discover_gpu_nodes,
+                )
 
-            driver_ip = socket.gethostbyname(socket.gethostname())
-            port_args = PortArgs.init_for_ray_multinode(server_args, driver_ip)
-            logger.info(f"Ray mode: using TCP-based ZMQ with driver IP {driver_ip}")
+                os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+                if not ray.is_initialized():
+                    ray.init()
+
+                gpu_nodes = discover_gpu_nodes()
+                world_size = server_args.tp_size * server_args.pp_size
+                topology = create_cluster_topology(gpu_nodes, world_size)
+                placement_groups = create_per_node_placement_groups(topology)
+                ray_cluster_info = RayClusterInfo(
+                    topology=topology,
+                    placement_groups=placement_groups,
+                )
+
+            # Engine MUST be on rank 0's node → always use IPC
+            port_args = PortArgs.init_new(server_args)
+            logger.info("Ray mode: IPC (rank 0 co-located)")
         else:
             port_args = PortArgs.init_new(server_args)
     logger.info(f"{server_args=}")
@@ -1296,6 +1336,7 @@ def _launch_workers(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
+        ray_cluster_info=ray_cluster_info if server_args.use_ray else None,
     )
 
     if server_args.node_rank >= 1:
