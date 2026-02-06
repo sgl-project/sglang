@@ -18,6 +18,7 @@ from einops import rearrange
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -681,6 +682,15 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 ddim_timesteps=30,
             ).to(torch.device("cuda"))
 
+            if server_args.enable_torch_compile:
+                compile_mode = os.environ.get(
+                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
+                )
+                logger.info("Compiling paint transformer with mode: %s", compile_mode)
+                self.transformer.compile(
+                    mode=compile_mode, fullgraph=False, dynamic=None
+                )
+
             logger.info("Paint pipeline loaded successfully")
 
         except Exception as e:
@@ -948,7 +958,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         if "generator" in inspect.signature(self.scheduler.step).parameters:
             extra_step_kwargs["generator"] = generator
 
-        for t in timesteps:
+        for step_idx, t in enumerate(timesteps):
             latents = rearrange(latents, "(b n) c h w -> b n c h w", n=num_in_batch)
             latent_model_input = torch.cat([latents] * 2) if do_cfg else latents
             latent_model_input = rearrange(
@@ -959,16 +969,20 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
                 latent_model_input, "(b n) c h w -> b n c h w", n=num_in_batch
             )
 
-            noise_pred = self.transformer(
-                latent_model_input,
-                t,
-                encoder_hidden_states=prompt_embeds,
-                timestep_cond=None,
-                cross_attention_kwargs=None,
-                added_cond_kwargs=None,
-                return_dict=False,
-                **model_kwargs,
-            )[0]
+            with set_forward_context(
+                current_timestep=step_idx,
+                attn_metadata=None,
+            ):
+                noise_pred = self.transformer(
+                    latent_model_input,
+                    t,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep_cond=None,
+                    cross_attention_kwargs=None,
+                    added_cond_kwargs=None,
+                    return_dict=False,
+                    **model_kwargs,
+                )[0]
 
             latents = rearrange(latents, "b n c h w -> (b n) c h w")
 

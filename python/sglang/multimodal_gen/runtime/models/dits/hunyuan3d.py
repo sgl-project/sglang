@@ -1387,15 +1387,84 @@ def _chunked_feed_forward(
     return ff_output
 
 
+class SGLangAttentionWrapper(torch.nn.Module):
+    """Drop-in replacement for DiffusersAttention that uses sglang's attention backend."""
+
+    _SUPPORTED_BACKENDS = {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA}
+
+    def __init__(
+        self,
+        query_dim: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        bias: bool = False,
+        cross_attention_dim: int | None = None,
+        out_bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.inner_dim = dim_head * heads
+        self.heads = heads
+        self.dim_head = dim_head
+        self.query_dim = query_dim
+        cross_attention_dim = cross_attention_dim or query_dim
+
+        self.to_q = nn.Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_k = nn.Linear(cross_attention_dim, self.inner_dim, bias=bias)
+        self.to_v = nn.Linear(cross_attention_dim, self.inner_dim, bias=bias)
+        self.to_out = nn.ModuleList(
+            [nn.Linear(self.inner_dim, query_dim, bias=out_bias), nn.Dropout(dropout)]
+        )
+
+        from sglang.multimodal_gen.runtime.layers.attention.selector import (
+            get_attn_backend,
+        )
+
+        attn_backend = get_attn_backend(
+            dim_head, torch.float16, self._SUPPORTED_BACKENDS
+        )
+        impl_cls = attn_backend.get_impl_cls()
+        self.attn_impl = impl_cls(
+            num_heads=heads,
+            head_size=dim_head,
+            softmax_scale=dim_head**-0.5,
+            num_kv_heads=heads,
+            causal=False,
+        )
+        self._attn_backend_name = attn_backend.get_enum().name
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        B, N_q, _ = hidden_states.shape
+        _, N_kv, _ = encoder_hidden_states.shape
+
+        q = self.to_q(hidden_states).view(B, N_q, self.heads, self.dim_head)
+        k = self.to_k(encoder_hidden_states).view(B, N_kv, self.heads, self.dim_head)
+        v = self.to_v(encoder_hidden_states).view(B, N_kv, self.heads, self.dim_head)
+
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        ctx = get_forward_context()
+        out = self.attn_impl.forward(q, k, v, attn_metadata=ctx.attn_metadata)
+        out = out.reshape(B, N_q, self.inner_dim)
+
+        out = self.to_out[0](out)
+        out = self.to_out[1](out)
+        return out
+
+
 class Basic2p5DTransformerBlock(torch.nn.Module):
-    """2.5D Transformer block with Multiview Attention (MVA) and Reference View Attention (RVA).
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/unet/modules.py
-
-    This block extends BasicTransformerBlock with:
-    - Multiview Attention (MVA): Cross-view consistency for multi-view generation
-    - Reference View Attention (RVA): Conditioning on reference images
-    """
+    """2.5D Transformer block with Multiview Attention (MVA) and Reference View Attention (RVA)."""
 
     def __init__(
         self,
@@ -1404,6 +1473,7 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         use_ma: bool = True,
         use_ra: bool = True,
         is_turbo: bool = False,
+        use_sglang_attn: bool = True,
     ) -> None:
         super().__init__()
         self.transformer = transformer
@@ -1411,32 +1481,29 @@ class Basic2p5DTransformerBlock(torch.nn.Module):
         self.use_ma = use_ma
         self.use_ra = use_ra
         self.is_turbo = is_turbo
+        self.use_sglang_attn = use_sglang_attn and not is_turbo
 
-        # Multiview attention
+        attn_cls = (
+            SGLangAttentionWrapper if self.use_sglang_attn else DiffusersAttention
+        )
+        attn_kwargs = dict(
+            query_dim=self.dim,
+            heads=self.num_attention_heads,
+            dim_head=self.attention_head_dim,
+            dropout=self.dropout,
+            bias=self.attention_bias,
+            cross_attention_dim=None,
+            upcast_attention=self.attn1.upcast_attention,
+            out_bias=True,
+        )
+        if self.use_sglang_attn:
+            attn_kwargs.pop("upcast_attention")
+
         if self.use_ma:
-            self.attn_multiview = DiffusersAttention(
-                query_dim=self.dim,
-                heads=self.num_attention_heads,
-                dim_head=self.attention_head_dim,
-                dropout=self.dropout,
-                bias=self.attention_bias,
-                cross_attention_dim=None,
-                upcast_attention=self.attn1.upcast_attention,
-                out_bias=True,
-            )
+            self.attn_multiview = attn_cls(**attn_kwargs)
 
-        # Reference view attention
         if self.use_ra:
-            self.attn_refview = DiffusersAttention(
-                query_dim=self.dim,
-                heads=self.num_attention_heads,
-                dim_head=self.attention_head_dim,
-                dropout=self.dropout,
-                bias=self.attention_bias,
-                cross_attention_dim=None,
-                upcast_attention=self.attn1.upcast_attention,
-                out_bias=True,
-            )
+            self.attn_refview = attn_cls(**attn_kwargs)
 
         if self.is_turbo:
             self._initialize_attn_weights()
@@ -1912,8 +1979,16 @@ class UNet2p5DConditionModel(torch.nn.Module):
         use_ma: bool = False,
         use_ra: bool = False,
         is_turbo: bool = False,
+        use_sglang_attn: bool = True,
     ):
         """Initialize attention blocks with MVA and RVA support."""
+        block_kwargs = dict(
+            use_ma=use_ma,
+            use_ra=use_ra,
+            is_turbo=is_turbo,
+            use_sglang_attn=use_sglang_attn,
+        )
+
         # Down blocks
         for down_block_i, down_block in enumerate(unet.down_blocks):
             if (
@@ -1929,9 +2004,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
                                 Basic2p5DTransformerBlock(
                                     transformer,
                                     f"down_{down_block_i}_{attn_i}_{transformer_i}",
-                                    use_ma,
-                                    use_ra,
-                                    is_turbo,
+                                    **block_kwargs,
                                 )
                             )
 
@@ -1947,9 +2020,7 @@ class UNet2p5DConditionModel(torch.nn.Module):
                             Basic2p5DTransformerBlock(
                                 transformer,
                                 f"mid_{attn_i}_{transformer_i}",
-                                use_ma,
-                                use_ra,
-                                is_turbo,
+                                **block_kwargs,
                             )
                         )
 
@@ -1968,11 +2039,38 @@ class UNet2p5DConditionModel(torch.nn.Module):
                                 Basic2p5DTransformerBlock(
                                     transformer,
                                     f"up_{up_block_i}_{attn_i}_{transformer_i}",
-                                    use_ma,
-                                    use_ra,
-                                    is_turbo,
+                                    **block_kwargs,
                                 )
                             )
+
+        if use_sglang_attn and (use_ma or use_ra):
+            backend = "unknown"
+            for block in self._iter_2p5d_blocks(unet):
+                for attr in ("attn_multiview", "attn_refview"):
+                    wrapper = getattr(block, attr, None)
+                    if isinstance(wrapper, SGLangAttentionWrapper):
+                        backend = wrapper._attn_backend_name
+                        break
+                if backend != "unknown":
+                    break
+            count = sum(1 for _ in self._iter_2p5d_blocks(unet))
+            logger.info(
+                "Initialized %d Basic2p5DTransformerBlocks with sglang %s attention",
+                count,
+                backend,
+            )
+
+    @staticmethod
+    def _iter_2p5d_blocks(unet):
+        """Yield all Basic2p5DTransformerBlock instances in a UNet."""
+        for block_group in (unet.down_blocks, [unet.mid_block], unet.up_blocks):
+            for block in block_group:
+                if not hasattr(block, "attentions"):
+                    continue
+                for attn in block.attentions:
+                    for tb in attn.transformer_blocks:
+                        if isinstance(tb, Basic2p5DTransformerBlock):
+                            yield tb
 
     def __getattr__(self, name: str):
         try:
