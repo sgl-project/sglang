@@ -11,7 +11,6 @@ import triton.language as tl
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.in_place_transpose import in_place_transpose_indexed
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
