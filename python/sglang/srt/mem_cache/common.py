@@ -157,7 +157,6 @@ def write_cache_indices(
                 sp_seq_lens_tensor
             )
         else:
-            # TODO: some tensors can be reused for ForwardBatchInfo (e.g., extend_lens, cumsum_start)
             write_req_to_token_pool_triton[(req_pool_indices_tensor.shape[0],)](
                 req_to_token_pool.req_to_token,
                 req_pool_indices_tensor,
