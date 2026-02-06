@@ -1389,6 +1389,7 @@ class MLATokenToKVPool(KVCache):
         end_layer: Optional[int] = None,
         use_nsa: bool = False,
         override_kv_cache_dim: Optional[int] = None,
+        should_quantize_k_cache_separate: bool = True,
     ):
         super().__init__(
             size,
@@ -1405,6 +1406,7 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = use_nsa and dtype == torch.float8_e4m3fn
+        self.should_quantize_k_cache_separate = should_quantize_k_cache_separate
         assert not (
             self.nsa_kv_cache_store_fp8 and override_kv_cache_dim is None
         ), "override_kv_cache_dim must be provided when using NSA with FP8 kv cache storage"
@@ -1512,7 +1514,7 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if self.use_nsa and self.nsa_kv_cache_store_fp8:
+        if self.use_nsa and self.nsa_kv_cache_store_fp8 and self.should_quantize_k_cache_separate:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1742,6 +1744,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        prefill_attention_backend: Optional[str] = None,
+        decode_attention_backend: Optional[str] = None,
     ):
         assert (
             kv_lora_rank % self.quant_block_size == 0
@@ -1756,6 +1760,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
             + qk_rope_head_dim * self.rope_storage_dtype.itemsize
         )
 
+        should_quantize_k_cache_separate = True
+        if prefill_attention_backend == "trtllm" and decode_attention_backend == "trtllm":
+            override_dim = kv_lora_rank + qk_rope_head_dim
+            should_quantize_k_cache_separate = False
+
         super().__init__(
             size,
             page_size,
@@ -1769,6 +1778,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
             end_layer,
             use_nsa=True,
             override_kv_cache_dim=override_dim,
+            should_quantize_k_cache_separate=should_quantize_k_cache_separate,
         )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32

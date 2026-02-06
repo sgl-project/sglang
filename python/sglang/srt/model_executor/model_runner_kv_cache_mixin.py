@@ -495,6 +495,8 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                prefill_attention_backend=self.server_args.nsa_prefill_backend,
+                decode_attention_backend=self.server_args.nsa_decode_backend,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
