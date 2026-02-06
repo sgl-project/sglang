@@ -435,7 +435,9 @@ class ModelConfig:
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
             # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
             rope_scaling = self.hf_text_config.rope_scaling
-            if rope_scaling.get("rope_type") or rope_scaling.get("type") != "default":
+            if rope_scaling and (
+                rope_scaling.get("rope_type") or rope_scaling.get("type") != "default"
+            ):
                 mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
                 scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
