@@ -9,9 +9,6 @@ import torch
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
     MooncakeEmbeddingStore,
 )
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-    MooncakeStoreConfig,
-)
 
 logger = logging.getLogger(__name__)
 
