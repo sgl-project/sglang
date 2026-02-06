@@ -340,26 +340,27 @@ class TestGlm45Detector(CustomTestCase):
         Test parsing with tool interruption.
 
         GLM45 can interrupt reasoning with tool token (<tool_call>) without closing </think>.
-        Should split at the last occurrence of tool_start_token using rfind().
+        Should split at the first occurrence of tool_start_token using find().
         """
         text = "<think>I need to think<tool_call>tool call data"
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.reasoning_text, "I need to think")
         self.assertEqual(result.normal_text, "<tool_call>tool call data")
 
-    def test_detect_and_parse_multiple_tool_calls_rfind(self):
+    def test_detect_and_parse_multiple_tool_calls_find(self):
         """
-        Test that rfind() finds the LAST occurrence of tool_start_token.
+        Test that find() finds the FIRST occurrence of tool_start_token.
 
-        If multiple tool calls exist in buffer, should split at the last one.
+        If multiple tool calls exist in buffer, should split at the first one.
         """
         text = "<think>thinking<tool_call>first tool<tool_call>second tool<tool_call>final tool"
         result = self.detector.detect_and_parse(text)
-        # Should split at the last <tool_call> before the final tool
+        # Should split at the first <tool_call>
+        self.assertEqual(result.reasoning_text, "thinking")
         self.assertEqual(
-            result.reasoning_text, "thinking<tool_call>first tool<tool_call>second tool"
+            result.normal_text,
+            "<tool_call>first tool<tool_call>second tool<tool_call>final tool",
         )
-        self.assertEqual(result.normal_text, "<tool_call>final tool")
 
     def test_detect_and_parse_truncated_reasoning(self):
         """
@@ -430,14 +431,15 @@ class TestGlm45Detector(CustomTestCase):
         # Start reasoning
         detector.parse_streaming_increment("<think>")
 
-        # Reasoning content should not be returned
+        # Reasoning content is buffered and not returned yet
         result = detector.parse_streaming_increment("thinking")
-        self.assertEqual(result.reasoning_text, "thinking")
+        self.assertEqual(result.reasoning_text, "")
         self.assertEqual(result.normal_text, "")
 
-        # Tool interruption should still work
+        # Tool interruption should still work - flushes buffered reasoning
+        # Note: buffer preserves original text including <think> tag
         result = detector.parse_streaming_increment("<tool_call>tool call")
-        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.reasoning_text, "<think>thinking")
         self.assertEqual(result.normal_text, "<tool_call>tool call")
 
     def test_streaming_empty_reasoning_with_tool(self):

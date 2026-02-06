@@ -51,7 +51,8 @@ class BaseReasoningFormatDetector:
         if self.think_end_token not in processed_text:
             # Check for tool_start_token interruption
             if (
-                self.tool_start_token is not None
+                in_reasoning
+                and self.tool_start_token is not None
                 and self.tool_start_token in processed_text
             ):
                 # Find the first occurrence of tool_start_token and split there
