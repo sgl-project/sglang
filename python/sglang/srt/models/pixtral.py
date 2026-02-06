@@ -16,10 +16,12 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.modeling_pixtral import PixtralRotaryEmbedding
 from transformers.models.pixtral.modeling_pixtral import (
@@ -32,9 +34,398 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
+
+USE_XFORMERS_OPS = False
+PATCH_MERGE = "patch_merge"
+
+
+# Vision encoder
+@dataclass
+class VisionEncoderArgs:
+    hidden_size: int
+    num_channels: int
+    image_size: int
+    patch_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    rope_theta: float  # for rope-2D
+    image_token_id: int
+    adapter_bias: bool = True
+    spatial_merge_size: int = 1
+    add_pre_mm_projector_layer_norm: bool = False
+    mm_projector_id: str = ""
+
+
+class PixtralForConditionalGeneration(nn.Module):
+    merge_by_field_config = True
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return None
+
+        raise ValueError("Only image modality is supported")
+
+    def __init__(self, *, config, prefix: str = "", **kwargs):
+        super().__init__()
+        self.config = config
+        dataclass_fields = {field.name for field in fields(VisionEncoderArgs)}
+        vision_args = {
+            key: value
+            for key, value in self.config.vision_config.to_dict().items()
+            if key in dataclass_fields
+        }
+
+        self.vision_args = VisionEncoderArgs(**vision_args)
+
+        self.language_model = MistralLarge3ForCausalLM(
+            config=self.config.text_config,
+            quant_config=kwargs.get("quant_config"),
+        )
+
+        self.vision_encoder = VisionTransformer(self.vision_args)
+
+        if self.vision_args.add_pre_mm_projector_layer_norm:
+            self.pre_mm_projector_norm = RMSNorm(self.vision_args.hidden_size, eps=1e-5)
+
+        if self.vision_args.mm_projector_id == PATCH_MERGE:
+            self.patch_merger = PatchMerger(
+                vision_encoder_dim=self.vision_args.hidden_size,
+                spatial_merge_size=self.vision_args.spatial_merge_size,
+                use_mlp_bias=False,
+            )
+
+        self.vision_language_adapter = VisionLanguageAdapter(
+            self.vision_args, dim=self.config.text_config.hidden_size
+        )
+
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
+            return weight[0].startswith("vision_encoder")
+
+        def is_vision_lang_adapter_weights(weight: tuple[str, torch.Tensor]):
+            return weight[0].startswith("vision_language_adapter")
+
+        def is_patch_merger(weight: tuple[str, torch.Tensor]):
+            return weight[0].startswith("patch_merger")
+
+        def is_pre_mm_projector_norm(weight: tuple[str, torch.Tensor]):
+            return weight[0].startswith("pre_mm_projector_norm")
+
+        # Get references to parameters for direct loading
+        vision_encoder_dict = dict(self.vision_encoder.named_parameters())
+        patch_merger_dict = (
+            dict(self.patch_merger.named_parameters())
+            if self.vision_args.mm_projector_id == PATCH_MERGE
+            else dict()
+        )
+        pre_mm_projector_norm_dict = (
+            dict(self.pre_mm_projector_norm.named_parameters())
+            if self.vision_args.add_pre_mm_projector_layer_norm
+            else dict()
+        )
+        vision_lang_adapter_dict = dict(self.vision_language_adapter.named_parameters())
+
+        def llm_weights_generator():
+            # Single pass over weights
+            for name, w in weights:
+                if is_vision_encoder_weights((name, w)):
+                    # Load vision encoder weights directly
+                    trimmed_name = ".".join(name.split(".")[1:])
+                    # NOTE: The current nvfp4 model has extra weights that we need to ignore, called
+                    # vision_encoder.transformer.layers.*.attention.{k,v}_fake_quantizer.qscale_act
+                    # TODO: Remove this if condition once the model is fixed
+                    if "fake_quantizer.qscale_act" in trimmed_name:
+                        continue
+                    param = vision_encoder_dict[trimmed_name]
+                    with torch.no_grad():
+                        default_weight_loader(param, w)
+                elif is_patch_merger((name, w)):
+                    # Load vision patch merger weights directly
+                    trimmed_name = ".".join(name.split(".")[1:])
+                    param = patch_merger_dict[trimmed_name]
+                    with torch.no_grad():
+                        default_weight_loader(param, w)
+                elif is_pre_mm_projector_norm((name, w)):
+                    # Load vision pre_mm_projector_norm weights directly
+                    trimmed_name = ".".join(name.split(".")[1:])
+                    param = pre_mm_projector_norm_dict[trimmed_name]
+                    with torch.no_grad():
+                        default_weight_loader(param, w)
+                elif is_vision_lang_adapter_weights((name, w)):
+                    # Load vision-language adapter weights directly
+                    trimmed_name = ".".join(name.split(".")[1:])
+                    param = vision_lang_adapter_dict[trimmed_name]
+                    with torch.no_grad():
+                        default_weight_loader(param, w)
+                else:
+                    # LLM weights: yield them to be loaded
+                    # by language_model.load_weights
+                    yield (name, w)
+
+        # Now we call the language model load with the generator
+        self.language_model.load_weights(llm_weights_generator())
+
+    def get_language_model(self) -> torch.nn.Module:
+        return self.language_model
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        images = [item.feature for item in items]
+        # Process images through vision encoder
+        image_features = self.vision_encoder(images)
+        if self.vision_args.add_pre_mm_projector_layer_norm:
+            image_features = image_features.view(-1, image_features.shape[-1])
+            image_features = self.pre_mm_projector_norm(image_features)
+        if self.vision_args.mm_projector_id == PATCH_MERGE:
+            patch_size = self.vision_args.patch_size
+            img_patch_dims = [
+                (img.shape[-2] // patch_size, img.shape[-1] // patch_size)
+                for img in images
+                for _ in range(img.shape[0])
+            ]
+            image_features = self.patch_merger(
+                image_features, image_sizes=img_patch_dims
+            )
+        image_embeds = self.vision_language_adapter(image_features)
+        return image_embeds
+
+    def forward(self, input_ids, positions, forward_batch):
+        return general_mm_embed_routine(
+            input_ids=input_ids,
+            forward_batch=forward_batch,
+            language_model=self.language_model,
+            multimodal_model=self,
+            positions=positions,
+        )
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        return self.language_model.compute_logits(hidden_states)
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+
+class PatchMerger(nn.Module):
+    """
+    Learned merging of spatial_merge_size ** 2 patches
+    """
+
+    def __init__(
+        self,
+        vision_encoder_dim: int,
+        spatial_merge_size: int,
+        use_mlp_bias: bool = False,
+    ) -> None:
+        super().__init__()
+
+        mlp_input_dim = vision_encoder_dim * (spatial_merge_size**2)
+
+        self.spatial_merge_size = spatial_merge_size
+        self.mlp_input_dim = mlp_input_dim
+
+        self.merging_layer = nn.Linear(
+            mlp_input_dim,
+            vision_encoder_dim,
+            bias=use_mlp_bias,
+        )
+
+    def forward(
+        self, x: torch.Tensor, image_sizes: list[tuple[int, int]]
+    ) -> torch.Tensor:
+        # image_sizes specified in tokens
+        assert sum([h * w for h, w in image_sizes]) == x.shape[-2]
+
+        # x is (N, vision_encoder_dim)
+        x = self.permute(x, image_sizes)
+
+        # x is (N / spatial_merge_size ** 2,
+        #       vision_encoder_dim * spatial_merge_size ** 2)
+        x = self.merging_layer(x)
+
+        # x is (N / spatial_merge_size ** 2, vision_encoder_dim)
+        return x
+
+    def permute(
+        self,
+        x: torch.Tensor,
+        image_sizes: list[tuple[int, int]],
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: (N, D) where N is flattened and concatenated patch tokens
+                for all images
+            image_sizes: list of tuple of (height, width) in tokens for
+                each image
+        Returns:
+            image_features: reorders patch tokens so each grid of
+                (spatial_merge_size, spatial_merge_size) is contiguous.
+                now (N / spatial_merge_size ** 2, D * spatial_merge_size ** 2)
+        """
+
+        sub_grids = get_sub_grids(
+            x=x, image_sizes=image_sizes, spatial_merge_size=self.spatial_merge_size
+        )  # list of [d x sub_grid_size x sub_grid_size x n_patches]
+        permuted_tensor: list[torch.Tensor] = []
+        for grid in sub_grids:
+            n_patches = grid.shape[-1]
+            permuted_tensor.append(
+                grid.view(-1, n_patches).t()
+            )  # n_patches x d * sub_grid_size * sub_grid_size
+        return torch.cat(
+            permuted_tensor, dim=0
+        )  # (N / spatial_merge_size ** 2, d * spatial_merge_size ** 2)
+
+
+def get_sub_grids(
+    x: torch.Tensor,
+    image_sizes: list[tuple[int, int]],
+    spatial_merge_size: int,
+) -> list[torch.Tensor]:
+    # image_sizes specified in tokens
+    tokens_per_image = [h * w for h, w in image_sizes]
+    d = x.shape[-1]
+    all_img_sub_grids: list[torch.Tensor] = []
+    sub_grid_size = spatial_merge_size
+
+    for image_index, image_tokens in enumerate(x.split(tokens_per_image)):
+        # Reshape image_tokens into a 2D grid
+        h, w = image_sizes[image_index]
+        image_grid = image_tokens.view(h, w, d).permute(2, 0, 1)[
+            None, :, :, :
+        ]  # 1 x d x h x w
+        sub_grids = torch.nn.functional.unfold(
+            image_grid, kernel_size=sub_grid_size, stride=sub_grid_size
+        )
+        sub_grids = sub_grids.view(
+            1, d, sub_grid_size, sub_grid_size, -1
+        )  # 1 x d x sub_grid_size x sub_grid_size x n_patches
+
+        all_img_sub_grids.append(sub_grids[0])
+
+    return all_img_sub_grids
+
+
+class VisionTransformer(nn.Module):
+    def __init__(self, args: VisionEncoderArgs):
+        super().__init__()
+        self.args = args
+        self.patch_conv = nn.Conv2d(
+            in_channels=args.num_channels,
+            out_channels=args.hidden_size,
+            kernel_size=args.patch_size,
+            stride=args.patch_size,
+            bias=False,
+        )
+        self.ln_pre = RMSNorm(args.hidden_size, eps=1e-5)
+        self.transformer = Transformer(args)
+
+        head_dim = self.args.hidden_size // self.args.num_attention_heads
+        assert head_dim % 2 == 0, "ROPE requires even head_dim"
+        self._freqs_cis: torch.Tensor | None = None
+
+    @property
+    def max_patches_per_side(self) -> int:
+        return self.args.image_size // self.args.patch_size
+
+    @property
+    def device(self) -> torch.types.Device:
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
+    @property
+    def freqs_cis(self) -> torch.Tensor:
+        if self._freqs_cis is None:
+            self._freqs_cis = precompute_freqs_cis_2d(
+                dim=self.args.hidden_size // self.args.num_attention_heads,
+                height=self.max_patches_per_side,
+                width=self.max_patches_per_side,
+                theta=self.args.rope_theta,
+            )
+
+        if self._freqs_cis.device != self.device:
+            self._freqs_cis = self._freqs_cis.to(device=self.device)
+
+        return self._freqs_cis
+
+    def forward(
+        self,
+        images: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            images: list of N_img images of variable sizes,
+                each of shape (B, C, H, W)
+        Returns:
+            image_features: tensor of token features for
+                all tokens of all images of shape (N_toks, D)
+        """
+        patch_embeds_list = [self.patch_conv(img.to(self.dtype)) for img in images]
+
+        patch_embeds = [p.flatten(2).permute(0, 2, 1) for p in patch_embeds_list]
+
+        patch_embeds = torch.cat(patch_embeds, dim=1)
+        patch_embeds_shape = patch_embeds.shape
+        patch_embeds = patch_embeds.view(-1, patch_embeds_shape[-1])
+        patch_embeds = self.ln_pre(patch_embeds)
+        patch_embeds = patch_embeds.view(patch_embeds_shape)
+
+        # positional embeddings
+        positions = position_meshgrid(patch_embeds_list).to(self.device)
+        freqs_cis = self.freqs_cis[positions[:, 0], positions[:, 1]]
+
+        # pass through Transformer with a block diagonal mask delimiting images
+        if USE_XFORMERS_OPS:
+            from xformers import ops as xops
+
+            mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
+                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list],
+            )
+        else:
+            from transformers.models.pixtral.modeling_pixtral import (
+                generate_block_attention_mask,
+            )
+
+            mask = generate_block_attention_mask(
+                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
+            )
+        return self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
+
+
+def position_meshgrid(
+    patch_embeds_list: list[torch.Tensor],
+) -> torch.Tensor:
+    positions = torch.cat(
+        [
+            torch.stack(
+                torch.meshgrid(
+                    torch.arange(p.shape[-2]),
+                    torch.arange(p.shape[-1]),
+                    indexing="ij",
+                ),
+                dim=-1,
+            ).reshape(-1, 2)
+            for p in patch_embeds_list
+        ]
+    )
+    return positions
 
 
 class PixtralHFMLP(nn.Module):
@@ -81,6 +472,22 @@ class PixtralHFMLP(nn.Module):
         return out
 
 
+class VisionLanguageAdapter(nn.Module):
+    def __init__(self, args: VisionEncoderArgs, dim: int):
+        super().__init__()
+        assert isinstance(args, VisionEncoderArgs)
+        self.w_in = nn.Linear(
+            args.hidden_size,
+            dim,
+            bias=args.adapter_bias,
+        )
+        self.gelu = nn.GELU()
+        self.w_out = nn.Linear(dim, dim, bias=args.adapter_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w_out(self.gelu(self.w_in(x)))
+
+
 class PixtralHFTransformerBlock(nn.Module):
     """Transformer block for PixtralHFVisionModel using SGLang components."""
 
@@ -107,6 +514,8 @@ class PixtralHFTransformerBlock(nn.Module):
             dropout=0.0,
             use_context_forward=False,
             flatten_batch=False,
+            qkv_bias=False,
+            proj_bias=False,
             prefix=f"{prefix}.attention",
         )
 
@@ -154,6 +563,161 @@ class PixtralHFTransformerBlock(nn.Module):
         output = hidden_states + ffn_output
 
         return output
+
+
+def _reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """
+    freqs_cis: complex - (seq_len, head_dim / 2)
+    x: complex - (bsz, seq_len, head_dim / 2)
+    """
+    ndim = x.ndim
+    assert ndim > 1
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1]), (
+        freqs_cis.shape,
+        (x.shape[1], x.shape[-1]),
+    )
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+
+def precompute_freqs_cis_2d(
+    dim: int,
+    height: int,
+    width: int,
+    theta: float,
+) -> torch.Tensor:
+    """
+    freqs_cis: 2D complex tensor of shape (height, width, dim // 2)
+        to be indexed by (height, width) position tuples
+    """
+    # (dim / 2) frequency bases
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+
+    h = torch.arange(height, device=freqs.device)
+    w = torch.arange(width, device=freqs.device)
+
+    freqs_h = torch.outer(h, freqs[::2]).float()
+    freqs_w = torch.outer(w, freqs[1::2]).float()
+    freqs_2d = torch.cat(
+        [
+            freqs_h[:, None, :].repeat(1, width, 1),
+            freqs_w[None, :, :].repeat(height, 1, 1),
+        ],
+        dim=-1,
+    )
+    return torch.polar(torch.ones_like(freqs_2d), freqs_2d)
+
+
+def apply_rotary_emb_vit(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    assert freqs_cis.dtype == torch.complex64
+    freqs_cis = _reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, args: VisionEncoderArgs):
+        super().__init__()
+        assert args.intermediate_size is not None
+        self.w1 = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.w2 = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.w3 = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class Attention(nn.Module):
+    def __init__(self, args: VisionEncoderArgs):
+        super().__init__()
+        self.args = args
+        assert not args.hidden_size % args.num_attention_heads
+        self.n_heads = args.num_attention_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.wq = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        self.wk = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        self.wv = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+        self.wo = nn.Linear(args.hidden_size, args.hidden_size, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        batch, patches, _ = x.shape
+
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
+        q = q.reshape(batch, patches, self.n_heads, self.head_dim)
+        k = k.reshape(batch, patches, self.n_heads, self.head_dim)
+        v = v.reshape(batch, patches, self.n_heads, self.head_dim)
+
+        q, k = apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
+
+        if USE_XFORMERS_OPS:
+            from xformers import ops as xops
+
+            out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)
+        else:
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            out = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            out = out.transpose(1, 2)
+
+        out = out.reshape(batch, patches, self.n_heads * self.head_dim)
+        return self.wo(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, args: VisionEncoderArgs):
+        super().__init__()
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(args)
+        self.attention_norm = RMSNorm(args.hidden_size, eps=1e-5)
+        self.ffn_norm = RMSNorm(args.hidden_size, eps=1e-5)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        attention_norm_x = self.attention_norm(x.view(-1, x.shape[-1]))
+        attention_norm_x = attention_norm_x.view(x.shape)
+        r = self.attention.forward(attention_norm_x, mask=mask, freqs_cis=freqs_cis)
+        h = x + r
+        ffn_norm_h = self.ffn_norm(h.view(-1, h.shape[-1]))
+        ffn_norm_h = ffn_norm_h.view(h.shape)
+        r = self.feed_forward.forward(ffn_norm_h)
+        out = h + r
+        return out
+
+
+class Transformer(nn.Module):
+    def __init__(self, args: VisionEncoderArgs):
+        super().__init__()
+        self.layers = torch.nn.ModuleList()
+        for _ in range(args.num_hidden_layers):
+            self.layers.append(TransformerBlock(args))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        freqs_cis: torch.Tensor | None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, mask=mask, freqs_cis=freqs_cis)
+        return x
 
 
 class PixtralHFTransformer(nn.Module):
@@ -456,4 +1020,4 @@ class PixtralVisionModel(PixtralHFVisionModel):
 
 
 # Register the model classes for external access
-EntryClass = [PixtralVisionModel]
+EntryClass = [PixtralForConditionalGeneration, PixtralVisionModel]

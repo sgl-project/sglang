@@ -1,4 +1,5 @@
 import logging
+from typing import Type
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 
@@ -36,6 +37,13 @@ def create_ascend_backend():
     return AscendLoRABackend
 
 
+@register_lora_backend("torch_native")
+def create_torch_native_backend():
+    from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
+
+    return TorchNativeLoRABackend
+
+
 @register_lora_backend("flashinfer")
 def create_flashinfer_backend():
     raise ValueError(
@@ -43,7 +51,7 @@ def create_flashinfer_backend():
     )
 
 
-def get_backend_from_name(name: str) -> BaseLoRABackend:
+def get_backend_from_name(name: str) -> Type[BaseLoRABackend]:
     """
     Get corresponding backend class from backend's name
     """

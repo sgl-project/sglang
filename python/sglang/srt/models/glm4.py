@@ -220,7 +220,9 @@ class Glm4DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+        partial_rotary_factor = getattr(
+            getattr(config, "rope_parameters", None), "partial_rotary_factor", None
+        ) or getattr(config, "partial_rotary_factor", 0.5)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
@@ -305,7 +307,7 @@ class Glm4Model(nn.Module):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:

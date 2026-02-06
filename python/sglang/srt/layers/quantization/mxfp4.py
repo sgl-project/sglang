@@ -38,20 +38,23 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    direct_register_custom_op,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_sm90_supported,
     is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
+    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_sm100_supported = is_cuda() and is_sm100_supported()
+_is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
@@ -107,6 +110,11 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             "epilogue_subtile": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
+    elif _is_sm90_supported:
+        constraints = {
+            "split_k": 1,
+        }
+        opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -117,7 +125,16 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     return quant_tensor, InFlexData(), scale
 
 
-def _dequant_mxfp4(
+def _dequant_mxfp4_fake(
+    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
+) -> torch.Tensor:
+    return torch.empty(
+        (*x.shape[:-1], x.shape[-1] * 2), dtype=float_dtype, device=x.device
+    )
+
+
+@register_custom_op(fake_impl=_dequant_mxfp4_fake)
+def dequant_mxfp4(
     x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
 ) -> torch.Tensor:
     try:
@@ -132,15 +149,8 @@ def _dequant_mxfp4(
     return mx.dq_mxfp4(x, scale, float_dtype)
 
 
-def _dequant_mxfp4_fake(
-    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
-) -> torch.Tensor:
-    return torch.empty(
-        (*x.shape[:-1], x.shape[-1] * 2), dtype=float_dtype, device=x.device
-    )
-
-
-def _quant_dequant_mxfp4(
+@register_custom_op(out_shape="x")
+def quant_dequant_mxfp4(
     x: torch.Tensor, scale_calculation_mode: str = "even"
 ) -> torch.Tensor:
     try:
@@ -153,29 +163,6 @@ def _quant_dequant_mxfp4(
         ) from err
 
     return mx.qdq_mxfp4(x, scale_calculation_mode)
-
-
-def _quant_dequant_mxfp4_fake(
-    x: torch.Tensor, scale_calculation_mode: str = "even"
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-direct_register_custom_op(
-    op_name="dequant_mxfp4",
-    op_func=_dequant_mxfp4,
-    mutates_args=[],
-    fake_impl=_dequant_mxfp4_fake,
-)
-dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
-
-direct_register_custom_op(
-    op_name="quant_dequant_mxfp4",
-    op_func=_quant_dequant_mxfp4,
-    mutates_args=[],
-    fake_impl=_quant_dequant_mxfp4_fake,
-)
-quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -578,10 +565,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
             w13_weight = upcast_from_mxfp(
-                layer.w13_weight, layer.w13_weight_scale, dtype=torch.bfloat16, axis=-1
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                target_dtype=torch.bfloat16,
+                axis=-1,
             )
             w2_weight = upcast_from_mxfp(
-                layer.w2_weight, layer.w2_weight_scale, dtype=torch.bfloat16, axis=-1
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                target_dtype=torch.bfloat16,
+                axis=-1,
             )
             del layer.w13_weight
             del layer.w2_weight
@@ -634,7 +627,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
                 x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
             else:
                 raise NotImplementedError()
 
@@ -681,9 +674,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
                 None,
-                None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
+                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
@@ -864,5 +857,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,
+            expert_mask=layer.expert_mask_gpu,
         )
         return StandardCombineInput(hidden_states=output)

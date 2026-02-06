@@ -3,7 +3,6 @@ import tempfile
 from contextlib import nullcontext
 
 import torch
-import torch.utils.cpp_extension
 from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
@@ -35,10 +34,20 @@ ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, n
 
 ncclResult_t  ncclMemAlloc(void** ptr, size_t size);
 ncclResult_t  ncclMemFree(void *ptr);
+const char*  ncclGetErrorString(ncclResult_t result);
+
+#define NCCLCHECK(cmd) do {                                               \
+  ncclResult_t res = cmd;                                                 \
+  if (res != ncclSuccess) {                                               \
+    fprintf(stderr, "ERROR: NCCL symmetric memory allocation failed. Most likely out of device memory. '%s'\\n", \
+           ncclGetErrorString(res));                       \
+    return NULL;                                                        \
+  }                                                                       \
+} while(0)
 
 void* nccl_alloc_plug(size_t size, int device, void* stream) {
   void* ptr;
-  ncclResult_t err = ncclMemAlloc(&ptr, size);
+  NCCLCHECK(ncclMemAlloc(&ptr, size));
 
   const char *str_val = getenv("SGLANG_TMP_NCCL_COMM_VALUE");
   char *endptr;
@@ -46,7 +55,7 @@ void* nccl_alloc_plug(size_t size, int device, void* stream) {
 
   ncclComm_t comm = (ncclComm_t)(int_val);
   ncclWindow_t win;
-  ncclResult_t err2 = ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC);
+  NCCLCHECK(ncclCommWindowRegister(comm, ptr, size, &win, NCCL_WIN_COLL_SYMMETRIC));
 
   return ptr;
 }
@@ -66,7 +75,10 @@ _active_symmetric_memory_context = None
 
 
 def is_symmetric_memory_enabled():
-    return get_global_server_args().enable_symm_mem
+    try:
+        return get_global_server_args().enable_symm_mem
+    except ValueError:
+        return False
 
 
 def set_graph_pool_id(graph_pool_id):
@@ -90,6 +102,8 @@ def restore_symmetric_memory_context(saved_context):
 def get_nccl_mem_pool():
     global _allocator, _mem_pool, _cur_device
     if _mem_pool is None:
+        import torch.utils.cpp_extension
+
         out_dir = tempfile.gettempdir()
         nccl_allocator_libname = "nccl_allocator"
         torch.utils.cpp_extension.load_inline(

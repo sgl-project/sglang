@@ -28,8 +28,8 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
         *args,
         cuda_files=["hicache.cuh"],
         cuda_wrappers=[
-            ("launch_one", f"HiCacheKernel<{args}>::run_one"),
-            ("launch_all", f"HiCacheKernel<{args}>::run_all"),
+            ("launch_one", f"&HiCacheKernel<{args}>::run_one"),
+            ("launch_all", f"&HiCacheKernel<{args}>::run_all"),
         ],
     )
 

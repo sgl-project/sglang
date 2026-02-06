@@ -1,11 +1,13 @@
 name: Release Docker Images (AMD)
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "python/sglang/version.py"
+    tags:
+      - 'v[0-9]+.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (without v prefix, e.g., 0.5.7)'
+        required: true
 
 jobs:
   publish:
@@ -26,9 +28,31 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
       - name: Build and Push
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          version=${{ steps.version.outputs.version }}
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
@@ -44,5 +68,6 @@ jobs:
 
           tag=v${version}-${rocm_tag}
 
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t lmsysorg/sglang:${tag} --no-cache
+          # rocm.Dockerfile expects SGL_BRANCH with 'v' prefix for git tag checkout
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg SGL_BRANCH=v${version} -t lmsysorg/sglang:${tag} --no-cache
           docker push lmsysorg/sglang:${tag}

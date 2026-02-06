@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -29,8 +30,8 @@ class VMOBAAttentionBackend(AttentionBackend):
     accept_output_buffer: bool = True
 
     @staticmethod
-    def get_name() -> str:
-        return "VMOBA_ATTN"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.VMOBA_ATTN
 
     @staticmethod
     def get_impl_cls() -> type["VMOBAAttentionImpl"]:
