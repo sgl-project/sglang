@@ -128,12 +128,18 @@ echo "Installing python extras: [${EXTRAS}]"
 
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
-# Force reinstall torch packages from pytorch.org to ensure matching CUDA versions.
-# PyPI's torch 2.9.1 bundles cu128 while torchaudio from pytorch.org uses cu129,
-# causing "partially initialized module 'torchaudio' has no attribute 'lib'" errors.
-# uv pip install does NOT respect [tool.uv.sources] in pyproject.toml, so we must
-# explicitly reinstall from the cu129 index.
-$PIP_CMD install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/${CU_VERSION} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+# Fix CUDA version mismatch between torch and torchaudio.
+# PyPI's torch 2.9.1 bundles cu128 but torchaudio from pytorch.org/cu129 uses cu129.
+# This mismatch causes torchaudio's C extension to fail loading, producing:
+#   "partially initialized module 'torchaudio' has no attribute 'lib'"
+# We cannot replace torch with cu129 (breaks sgl_kernel ABI), so instead we reinstall
+# torchaudio/torchvision from an index matching torch's CUDA version.
+TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
+echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
+if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
+    echo "Reinstalling torchaudio/torchvision from ${TORCH_CUDA_VER} index to match torch..."
+    $PIP_CMD install torchaudio torchvision --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+fi
 
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
