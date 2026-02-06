@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -78,6 +79,7 @@ from sglang.srt.utils import (
     is_sm90_supported,
     is_sm100_supported,
     log_info_on_rank0,
+    next_power_of_2,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -102,8 +104,22 @@ if _use_aiter or _use_hip_int4:
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
+try:
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+except ImportError:
+    flashinfer_cutlass_fused_moe = None
+
+    class ActivationType(IntEnum):
+        Swiglu = 3
+        Relu2 = 6
+
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+ACT_STR_TO_TYPE_MAP = {
+    "silu": ActivationType.Swiglu,
+    "relu2": ActivationType.Relu2,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -674,10 +690,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        if (
-            get_moe_runner_backend().is_cutlass()
-            or get_moe_runner_backend().is_flashinfer_cutlass()
-        ):
+        if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -810,10 +823,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if (
-                get_moe_runner_backend().is_cutlass()
-                or get_moe_runner_backend().is_flashinfer_cutlass()
-            ):
+            if get_moe_runner_backend().is_cutlass():
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
@@ -1062,10 +1072,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return qweight, scale
 
         if quantize:
-            if (
-                get_moe_runner_backend().is_cutlass()
-                or get_moe_runner_backend().is_flashinfer_cutlass()
-            ):
+            if get_moe_runner_backend().is_cutlass():
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w13_weight.data
                 )
@@ -1341,6 +1348,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # TODO(cwan): refactor other backends
             pass
 
+    @property
+    def load_up_proj_weight_first(self) -> bool:
+        # FlashInfer CUTLASS kernel assumes [Up, Gate] projection order in w13.
+        return (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+            and self.moe_runner_config.is_gated
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -1388,46 +1403,75 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if (
-            get_moe_runner_backend().is_cutlass()
-            or get_moe_runner_backend().is_flashinfer_cutlass()
-        ):
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+        moe_runner_backend = get_moe_runner_backend()
 
-            with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                symm_output = torch.empty_like(x)
-
+        if moe_runner_backend.is_flashinfer_cutlass():
             topk_weights, topk_ids, _ = dispatch_output.topk_output
-            use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
-            output = cutlass_fused_experts_fp8(
-                x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale_inv.transpose(1, 2),
-                layer.w2_weight_scale_inv.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                self.ab_strides1,
-                self.c_strides1,
-                self.ab_strides2,
-                self.c_strides2,
-                self.workspace,
-                self.a_ptr,
-                self.b_ptr,
-                self.out_ptr,
-                self.a_scales_ptr,
-                self.b_scales_ptr,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                use_fp8_blockscale=True,
-                use_mxfp8=use_mxfp8,
+            if flashinfer_cutlass_fused_moe is None:
+                raise RuntimeError(
+                    "flashinfer_cutlass backend requires flashinfer.fused_moe.cutlass_fused_moe"
+                )
+
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
+                symm_output = dispatch_output.moe_output
+            else:
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not is_allocation_symmetric()
+                ):
+                    symm_output = torch.empty_like(x)
+
+            if self.block_quant:
+                quant_scales = [
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                ]
+                use_deepseek_fp8_block_scale = True
+            else:
+                w13_input_scale = layer.w13_input_scale.to(torch.float32)
+                w2_input_scale = layer.w2_input_scale.to(torch.float32)
+                w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
+                w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
+                quant_scales = [
+                    w13_weight_scale * w13_input_scale,
+                    w2_input_scale.reciprocal(),
+                    w2_input_scale * w2_weight_scale,
+                    w13_input_scale,
+                ]
+                use_deepseek_fp8_block_scale = False
+
+            activation = self.moe_runner_config.activation
+            assert (
+                activation in ACT_STR_TO_TYPE_MAP
+            ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
+
+            output = flashinfer_cutlass_fused_moe(
                 output=symm_output,
-                enable_es=(use_mxfp8, use_mxfp8),
-            )
+                input=x,
+                token_selected_experts=topk_ids.to(torch.int),
+                token_final_scales=topk_weights,
+                fc1_expert_weights=layer.w13_weight,
+                fc2_expert_weights=layer.w2_weight,
+                output_dtype=x.dtype,
+                quant_scales=quant_scales,
+                ep_size=layer.moe_ep_size,
+                ep_rank=layer.moe_ep_rank,
+                tp_size=layer.moe_tp_size,
+                tp_rank=layer.moe_tp_rank,
+                tune_max_num_tokens=next_power_of_2(x.shape[0]),
+                activation_type=ACT_STR_TO_TYPE_MAP[activation],
+                use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            )[0]
             return StandardCombineInput(hidden_states=output)
+
+        if moe_runner_backend.is_cutlass():
+            return self._apply_cutlass_fp8(layer, x, dispatch_output.topk_output)
+
+        if not hasattr(self, "runner"):
+            raise RuntimeError(
+                f"Fp8MoEMethod runner is not initialized for backend {moe_runner_backend}"
+            )
 
         if self.runner.runner_backend.is_deep_gemm():
 
@@ -1537,6 +1581,48 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
         return self.runner.run(dispatch_output, quant_info)
+
+    def _apply_cutlass_fp8(
+        self, layer: Module, x: torch.Tensor, topk_output: TopKOutput
+    ):
+        from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            symm_output = torch.empty_like(x)
+
+        topk_weights, topk_ids, _ = topk_output
+        use_mxfp8 = getattr(self.quant_config, "use_mxfp8", False)
+        output = cutlass_fused_experts_fp8(
+            x,
+            layer.w13_weight.transpose(1, 2),
+            layer.w2_weight.transpose(1, 2),
+            layer.w13_weight_scale_inv.transpose(1, 2),
+            layer.w2_weight_scale_inv.transpose(1, 2),
+            topk_weights,
+            topk_ids,
+            self.ab_strides1,
+            self.c_strides1,
+            self.ab_strides2,
+            self.c_strides2,
+            self.workspace,
+            self.a_ptr,
+            self.b_ptr,
+            self.out_ptr,
+            self.a_scales_ptr,
+            self.b_scales_ptr,
+            self.expert_offsets,
+            self.problem_sizes1,
+            self.problem_sizes2,
+            use_fp8_blockscale=True,
+            use_mxfp8=use_mxfp8,
+            output=symm_output,
+            enable_es=(use_mxfp8, use_mxfp8),
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        return StandardCombineInput(hidden_states=output)
 
     def _ensure_cutlass_buffers_initialized(self, layer: Module) -> None:
         if getattr(self, "_cutlass_buffers_ready", False):
