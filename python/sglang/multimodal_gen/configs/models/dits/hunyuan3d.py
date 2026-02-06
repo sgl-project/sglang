@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
+from typing import Optional
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
@@ -19,6 +20,12 @@ class Hunyuan3DDiTArchConfig(DiTArchConfig):
     theta: int = 10000
     qkv_bias: bool = True
     guidance_embed: bool = False
+    time_factor: float = 1000.0
+
+    def __post_init__(self) -> None:
+        if self.num_channels_latents == 0:
+            self.num_channels_latents = self.in_channels
+        super().__post_init__()
 
 
 @dataclass
@@ -44,6 +51,22 @@ class Hunyuan3DPlainDiTArchConfig(DiTArchConfig):
     num_moe_layers: int = 6
     num_experts: int = 8
     moe_top_k: int = 2
+    norm_type: str = "layer"
+    qk_norm_type: str = "rms"
+    qk_norm: bool = False
+    qkv_bias: bool = True
+    with_decoupled_ca: bool = False
+    additional_cond_hidden_state: int = 768
+    decoupled_ca_dim: int = 16
+    decoupled_ca_weight: float = 1.0
+    use_pos_emb: bool = False
+    use_attention_pooling: bool = True
+    guidance_cond_proj_dim: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.num_channels_latents == 0:
+            self.num_channels_latents = self.in_channels
+        super().__post_init__()
 
 
 @dataclass

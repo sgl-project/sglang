@@ -68,6 +68,25 @@ class Hunyuan3DShapeLoader(ComponentLoader):
         kwargs.update(params)
         return target_cls(**kwargs)
 
+    @classmethod
+    def _instantiate_model(cls, config: Dict[str, Any]) -> Any:
+        """Instantiate a DiT model with config-driven initialization.
+
+        If the resolved target class provides ``build_config_from_params``,
+        a proper ``DiTConfig`` is constructed from the YAML params and passed
+        to the constructor.  Otherwise falls back to keyword-arg instantiation.
+        """
+        if "target" not in config:
+            raise KeyError("Expected key 'target' to instantiate.")
+        target_cls = cls.get_obj_from_str(config["target"])
+        params = config.get("params", {})
+
+        if hasattr(target_cls, "build_config_from_params"):
+            dit_config = target_cls.build_config_from_params(params)
+            return target_cls(config=dit_config, hf_config={})
+
+        return target_cls(**params)
+
     def load_customized(self, component_model_path: str, server_args, module_name: str):
         """Load Hunyuan3D shape components."""
         import yaml
@@ -126,7 +145,7 @@ class Hunyuan3DShapeLoader(ComponentLoader):
             # Instantiate and load models with correct dtype for attention backend selection
             device = get_local_torch_device()
             with set_default_dtype(dtype):
-                model = self.instantiate_from_config(model_config["model"])
+                model = self._instantiate_model(model_config["model"])
                 model.load_state_dict(ckpt["model"], strict=False)
 
                 vae = self.instantiate_from_config(model_config["vae"])

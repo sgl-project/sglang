@@ -33,8 +33,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
+    Hunyuan3DDiTArchConfig,
+    Hunyuan3DDiTConfig,
+    Hunyuan3DPlainDiTArchConfig,
+    Hunyuan3DPlainDiTConfig,
+)
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -638,27 +646,11 @@ class FinalLayer(nn.Module):
         return x
 
 
-class HunYuanDiTPlain(nn.Module):
+class HunYuanDiTPlain(CachableDiT, OffloadableDiTMixin):
     """HunYuan DiT Plain model with optional MoE layers.
 
     This model uses a standard DiT architecture with self-attention,
     cross-attention, and optional MoE MLP layers.
-
-    Args:
-        input_size: Number of input latent tokens.
-        in_channels: Number of input channels per token.
-        hidden_size: Hidden dimension of transformer.
-        context_dim: Dimension of conditioning context.
-        depth: Number of transformer blocks.
-        num_heads: Number of attention heads.
-        mlp_ratio: MLP expansion ratio.
-        qkv_bias: Whether to use bias in QKV projections.
-        qk_norm: Whether to use QK normalization.
-        qk_norm_type: Type of QK normalization ('rms' or 'layer').
-        text_len: Length of text conditioning.
-        num_moe_layers: Number of MoE layers (from the end).
-        num_experts: Number of experts in MoE layers.
-        moe_top_k: Top-k routing for MoE.
     """
 
     # External module path aliases for compatibility with Hunyuan3D configs
@@ -667,34 +659,55 @@ class HunYuanDiTPlain(nn.Module):
         "hy3dshape.models.denoisers.hunyuan3ddit.HunYuanDiTPlain",
     ]
 
+    param_names_mapping = {}
+
+    @classmethod
+    def build_config_from_params(cls, params: dict) -> Hunyuan3DPlainDiTConfig:
+        """Build a DiTConfig from YAML-style parameter dict."""
+        field_mapping = {"num_heads": "num_attention_heads", "depth": "num_layers"}
+        arch_kwargs = {}
+        for k, v in params.items():
+            if k in ("supported_attention_backends",):
+                continue
+            mapped = field_mapping.get(k, k)
+            arch_kwargs[mapped] = v
+        return Hunyuan3DPlainDiTConfig(
+            arch_config=Hunyuan3DPlainDiTArchConfig(**arch_kwargs)
+        )
+
     def __init__(
         self,
-        input_size=1024,
-        in_channels=4,
-        hidden_size=1024,
-        context_dim=1024,
-        depth=24,
-        num_heads=16,
-        mlp_ratio=4.0,
-        norm_type="layer",
-        qk_norm_type="rms",
-        qk_norm=False,
-        text_len=257,
-        with_decoupled_ca=False,
-        additional_cond_hidden_state=768,
-        decoupled_ca_dim=16,
-        decoupled_ca_weight=1.0,
-        use_pos_emb=False,
-        use_attention_pooling=True,
-        guidance_cond_proj_dim=None,
-        qkv_bias=True,
-        num_moe_layers: int = 6,
-        num_experts: int = 8,
-        moe_top_k: int = 2,
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        config: Hunyuan3DPlainDiTConfig,
+        hf_config: dict | None = None,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(config=config, hf_config=hf_config or {}, **kwargs)
+        arch = config.arch_config
+
+        input_size = arch.input_size
+        in_channels = arch.in_channels
+        hidden_size = arch.hidden_size
+        depth = arch.num_layers
+        num_heads = arch.num_attention_heads
+        context_dim = arch.context_dim
+        mlp_ratio = arch.mlp_ratio
+        norm_type = arch.norm_type
+        qk_norm_type = arch.qk_norm_type
+        qk_norm = arch.qk_norm
+        text_len = arch.text_len
+        with_decoupled_ca = arch.with_decoupled_ca
+        additional_cond_hidden_state = arch.additional_cond_hidden_state
+        decoupled_ca_dim = arch.decoupled_ca_dim
+        decoupled_ca_weight = arch.decoupled_ca_weight
+        use_pos_emb = arch.use_pos_emb
+        use_attention_pooling = arch.use_attention_pooling
+        guidance_cond_proj_dim = arch.guidance_cond_proj_dim
+        qkv_bias = arch.qkv_bias
+        num_moe_layers = arch.num_moe_layers
+        num_experts = arch.num_experts
+        moe_top_k = arch.moe_top_k
+        supported_attention_backends = arch._supported_attention_backends
+
         self.input_size = input_size
         self.depth = depth
         self.in_channels = in_channels
@@ -702,6 +715,8 @@ class HunYuanDiTPlain(nn.Module):
         self.num_heads = num_heads
 
         self.hidden_size = hidden_size
+        self.num_attention_heads = num_heads
+        self.num_channels_latents = in_channels
         self.norm = nn.LayerNorm if norm_type == "layer" else nn.RMSNorm
         self.qk_norm = nn.RMSNorm if qk_norm_type == "rms" else nn.LayerNorm
         self.context_dim = context_dim
@@ -731,7 +746,6 @@ class HunYuanDiTPlain(nn.Module):
             self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Attention pooling (optional)
-        self.use_attention_pooling = use_attention_pooling
         if use_attention_pooling:
             self.pooler = AttentionPool(
                 self.text_len, context_dim, num_heads=8, output_dim=1024
@@ -779,6 +793,9 @@ class HunYuanDiTPlain(nn.Module):
 
         # Final layer
         self.final_layer = FinalLayer(hidden_size, self.out_channels)
+
+        # OffloadableDiTMixin
+        self.layer_names = ["blocks"]
 
     def forward(self, x, t, contexts, **kwargs):
         """Forward pass for denoising.
@@ -1196,35 +1213,60 @@ class _FluxLastLayer(nn.Module):
         return x
 
 
-class Hunyuan3D2DiT(nn.Module):
+class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
     """Hunyuan3D DiT model (Flux-style architecture for Hunyuan3D-2.0)."""
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
 
+    param_names_mapping = {}
+
+    @classmethod
+    def build_config_from_params(cls, params: dict) -> Hunyuan3DDiTConfig:
+        """Build a DiTConfig from YAML-style parameter dict."""
+        field_mapping = {
+            "num_heads": "num_attention_heads",
+            "depth": "num_layers",
+            "depth_single_blocks": "num_single_layers",
+        }
+        arch_kwargs = {}
+        for k, v in params.items():
+            if k in ("ckpt_path", "supported_attention_backends"):
+                continue
+            mapped = field_mapping.get(k, k)
+            if k == "axes_dim" and isinstance(v, list):
+                v = tuple(v)
+            arch_kwargs[mapped] = v
+        return Hunyuan3DDiTConfig(arch_config=Hunyuan3DDiTArchConfig(**arch_kwargs))
+
     def __init__(
         self,
-        in_channels: int = 64,
-        context_in_dim: int = 1536,
-        hidden_size: int = 1024,
-        mlp_ratio: float = 4.0,
-        num_heads: int = 16,
-        depth: int = 16,
-        depth_single_blocks: int = 32,
-        axes_dim: List[int] = [64],
-        theta: int = 10_000,
-        qkv_bias: bool = True,
-        time_factor: float = 1000,
-        guidance_embed: bool = False,
-        ckpt_path: Optional[str] = None,
-        supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        config: Hunyuan3DDiTConfig,
+        hf_config: dict | None = None,
         **kwargs,
     ):
-        super().__init__()
+        super().__init__(config=config, hf_config=hf_config or {}, **kwargs)
+        arch = config.arch_config
+
+        in_channels = arch.in_channels
+        context_in_dim = arch.context_in_dim
+        hidden_size = arch.hidden_size
+        mlp_ratio = arch.mlp_ratio
+        num_heads = arch.num_attention_heads
+        depth = arch.num_layers
+        depth_single_blocks = arch.num_single_layers
+        axes_dim = list(arch.axes_dim)
+        theta = arch.theta
+        qkv_bias = arch.qkv_bias
+        time_factor = arch.time_factor
+        guidance_embed = arch.guidance_embed
+        supported_attention_backends = arch._supported_attention_backends
+
         self.in_channels = in_channels
         self.context_in_dim = context_in_dim
         self.hidden_size = hidden_size
         self.mlp_ratio = mlp_ratio
         self.num_heads = num_heads
+        self.num_attention_heads = num_heads
         self.depth = depth
         self.depth_single_blocks = depth_single_blocks
         self.axes_dim = axes_dim
@@ -1232,6 +1274,7 @@ class Hunyuan3D2DiT(nn.Module):
         self.qkv_bias = qkv_bias
         self.time_factor = time_factor
         self.out_channels = self.in_channels
+        self.num_channels_latents = self.in_channels
         self.guidance_embed = guidance_embed
 
         if hidden_size % num_heads != 0:
@@ -1241,8 +1284,6 @@ class Hunyuan3D2DiT(nn.Module):
         pe_dim = hidden_size // num_heads
         if sum(axes_dim) != pe_dim:
             raise ValueError(f"Got {axes_dim} but expected positional dim {pe_dim}")
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
         self.latent_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
         self.time_in = _FluxMLPEmbedder(in_dim=256, hidden_dim=self.hidden_size)
         self.cond_in = nn.Linear(context_in_dim, self.hidden_size)
@@ -1279,30 +1320,8 @@ class Hunyuan3D2DiT(nn.Module):
 
         self.final_layer = _FluxLastLayer(self.hidden_size, 1, self.out_channels)
 
-        if ckpt_path is not None:
-            logger.info(f"Loading Hunyuan3D2DiT checkpoint from {ckpt_path}")
-
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-            if "state_dict" not in ckpt:
-                # deepspeed ckpt
-                state_dict = {}
-                for k in ckpt.keys():
-                    new_k = k.replace("_forward_module.", "")
-                    state_dict[new_k] = ckpt[k]
-            else:
-                state_dict = ckpt["state_dict"]
-
-            final_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith("model."):
-                    final_state_dict[k.replace("model.", "")] = v
-                else:
-                    final_state_dict[k] = v
-            missing, unexpected = self.load_state_dict(final_state_dict, strict=False)
-            if unexpected:
-                logger.warning(f"Unexpected keys: {unexpected}")
-            if missing:
-                logger.warning(f"Missing keys: {missing}")
+        # OffloadableDiTMixin
+        self.layer_names = ["double_blocks", "single_blocks"]
 
     def forward(
         self,
