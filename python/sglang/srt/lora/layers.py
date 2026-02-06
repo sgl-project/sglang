@@ -738,8 +738,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
 ) -> BaseLayerWithLoRA:
-    # FusedMoE is now imported at the top of the file
-    # FusedMoEWithLoRA is now defined in this file
 
     supported_layer_types = {
         # the order matters
