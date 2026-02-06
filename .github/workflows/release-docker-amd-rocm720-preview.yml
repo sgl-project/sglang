@@ -1,11 +1,11 @@
 name: Release Docker Images ROCm 7.2.0 Preview (AMD)
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "docker/rocm720.Dockerfile"
-      - ".github/workflows/release-docker-amd-rocm720-preview.yml"
+  # pull_request:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - "docker/rocm720.Dockerfile"
+  #     - ".github/workflows/release-docker-amd-rocm720-preview.yml"
   push:
     tags:
       - 'v[0-9]+.*'
