@@ -1537,27 +1537,27 @@ class FlashAttentionBackend(AttentionBackend):
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
             }
-        if self.use_sliding_window_kv_pool:
-            self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
-                torch.zeros(
+            if self.use_sliding_window_kv_pool:
+                self.decode_cuda_graph_metadata["swa_page_table_draft_decode"] = (
+                    torch.zeros(
+                        max_bs,
+                        max_num_pages,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                )
+                self.target_verify_metadata["swa_page_table"] = torch.zeros(
                     max_bs,
                     max_num_pages,
                     dtype=torch.int32,
                     device=self.device,
                 )
-            )
-            self.target_verify_metadata["swa_page_table"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            self.draft_extend_metadata["swa_page_table"] = torch.zeros(
-                max_bs,
-                max_num_pages,
-                dtype=torch.int32,
-                device=self.device,
-            )
+                self.draft_extend_metadata["swa_page_table"] = torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         if self.topk > 1:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
