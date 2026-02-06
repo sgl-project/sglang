@@ -31,17 +31,21 @@ jobs:
           pip install tomli
 
       - name: Configure Git and branch
+        env:
+          NEW_VERSION: ${{ github.event.inputs.new_version }}
         run: |
           git config user.name "sglang-bot"
           git config user.email "sglang-bot@users.noreply.github.com"
           RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
-          BRANCH_NAME="bot/bump-kernel-version-${{ github.event.inputs.new_version }}-${RANDOM_SUFFIX}"
+          BRANCH_NAME="bot/bump-kernel-version-${NEW_VERSION}-${RANDOM_SUFFIX}"
           git checkout -b "$BRANCH_NAME"
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
 
       - name: Run kernel version bump script
+        env:
+          NEW_VERSION: ${{ github.event.inputs.new_version }}
         run: |
-          python scripts/release/bump_kernel_version.py "${{ github.event.inputs.new_version }}"
+          python scripts/release/bump_kernel_version.py "$NEW_VERSION"
 
       - name: Commit and create PR
         env:
