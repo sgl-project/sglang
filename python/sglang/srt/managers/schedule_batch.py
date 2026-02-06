@@ -1292,6 +1292,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
     decoding_reqs: List[Req] = None
+    num_decoding_reqs: Optional[int] = None
     extend_logprob_start_lens: List[int] = None
     # It comes empty list if logprob is not required.
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
@@ -1475,7 +1476,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.is_dllm():
             # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
-
+        self.num_decoding_reqs = 0
         # Init tensors
         reqs = self.reqs
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
@@ -1795,6 +1796,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False
 
+        self.num_decoding_reqs = running_bs
+        logger.info(
+            f"Mixed batch scheduling, perfill batch:{self.extend_num_tokens - running_bs}, decode batch:{running_bs}"
+        )
+
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
@@ -1930,6 +1936,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
+        self.num_decoding_reqs = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,
@@ -1944,6 +1951,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
+        self.num_decoding_reqs = 0
         bs = len(self.reqs)
 
         if self.is_spec_v2:
@@ -2234,6 +2242,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            num_decoding_reqs=self.num_decoding_reqs or 0,
         )
 
     def copy(self):
@@ -2412,3 +2421,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For POD mode
+    num_decoding_reqs: Optional[int] = None

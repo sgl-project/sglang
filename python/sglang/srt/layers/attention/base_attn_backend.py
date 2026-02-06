@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
@@ -99,7 +98,7 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
-        elif forward_batch.forward_mode.is_mixed() and is_npu():
+        elif forward_batch.forward_mode.is_mixed():
             return self.forward_mixed(
                 q,
                 k,
@@ -153,8 +152,15 @@ class AttentionBackend(ABC):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        """Run a forward for mix."""
-        raise NotImplementedError()
+        """Run a forward for mix. Defaults to extend path."""
+        return self.forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+        )
 
     def support_triton(self):
         """Check if the current backend supports triton."""

@@ -444,6 +444,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    enable_flashinfer_pod_attention: bool = False
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -3669,6 +3670,12 @@ class ServerArgs:
             action="store_true",
             help="Disable FlashInfer autotuning.",
         )
+        parser.add_argument(
+            "--enable-flashinfer-pod-attention",
+            action="store_true",
+            default=ServerArgs.enable_flashinfer_pod_attention,
+            help="Enable FlashInfer POD mode.",
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -4877,6 +4884,11 @@ class ServerArgs:
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        if self.enable_flashinfer_pod_attention:
+            assert (
+                self.enable_mixed_chunk
+            ), "enable_flashinfer_pod_attention requires enable_mixed_chunk"
 
         if self.pp_size > 1:
             assert (
