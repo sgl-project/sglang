@@ -18,9 +18,6 @@ sglang to be imported INSIDE the actor (on GPU worker nodes) rather than
 on the head node which may not have GPU access.
 
 Usage:
-    import ray
-    ray.init()
-
     from sglang.srt.entrypoints.engine_actor import create_and_launch_engine_actor
 
     engine_actor = create_and_launch_engine_actor(
@@ -70,10 +67,6 @@ def create_and_launch_engine_actor(**engine_kwargs):
         create_per_node_placement_groups,
         discover_gpu_nodes,
     )
-
-    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-    if not ray.is_initialized():
-        ray.init()
 
     tp_size = engine_kwargs.get("tp_size", 1)
     pp_size = engine_kwargs.get("pp_size", 1)

@@ -97,10 +97,6 @@ def create_and_launch_http_server_actor(**server_kwargs):
         discover_gpu_nodes,
     )
 
-    os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-    if not ray.is_initialized():
-        ray.init()
-
     tp_size = server_kwargs.get("tp_size", 1)
     pp_size = server_kwargs.get("pp_size", 1)
     world_size = tp_size * pp_size
