@@ -5,15 +5,74 @@
 
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <vector>
 
 #ifndef USE_ROCM
+#include <cuda.h>
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
 #include "pytorch_extension_utils_rocm.h"
 #include "utils.h"  // WARP_SIZE
 #endif
+
+using cudaMemcpyBatchAsync_t = cudaError_t (*)(
+    void** dsts,
+    void** srcs,
+    size_t* sizes,
+    size_t count,
+    cudaMemcpyAttributes* attrs,
+    size_t* attrsIdxs,
+    size_t numAttrs,
+    size_t* failIdx,
+    cudaStream_t stream);
+
+static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+  static cudaMemcpyBatchAsync_t fn = []() -> cudaMemcpyBatchAsync_t {
+    void* symbol = nullptr;
+    CUresult res = cuGetProcAddress("cudaMemcpyBatchAsync", &symbol, CUDART_VERSION, 0);
+    if (res == CUDA_SUCCESS && symbol != nullptr) {
+      return reinterpret_cast<cudaMemcpyBatchAsync_t>(symbol);
+    }
+    return nullptr;
+  }();
+  return fn;
+#else
+  return nullptr;
+#endif
+}
+
+static inline void dispatch_memcpy_batch(
+    void** dsts,
+    void** srcs,
+    size_t* sizes,
+    size_t count,
+    cudaMemcpyAttributes* attrs,
+    size_t* attrsIdxs,
+    size_t numAttrs,
+    cudaStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+  auto memcpy_batch_async = get_cudaMemcpyBatchAsync();
+  if (memcpy_batch_async != nullptr) {
+    size_t fail_idx = std::numeric_limits<size_t>::max();
+    cudaError_t err =
+        memcpy_batch_async(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, &fail_idx, stream);
+    if (err != cudaSuccess) {
+      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+    }
+  } else {
+    for (size_t i = 0; i < count; ++i) {
+      cudaError_t err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream);
+      if (err != cudaSuccess) {
+        TORCH_CHECK(false, "cudaMemcpyAsync failed. error=", cudaGetErrorString(err));
+      }
+    }
+  }
+}
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
@@ -850,22 +909,15 @@ inline void transfer_kv_page_first_direct_impl(
   }
 
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
-  if (num_copies > 0) {
-    size_t fail_idx = std::numeric_limits<size_t>::max();
-    cudaError_t err = cudaMemcpyBatchAsync(
-        batch_dsts.data(),
-        batch_srcs.data(),
-        batch_sizes.data(),
-        num_copies,
-        &attrs,
-        attrs_idxs.data(),
-        1,
-        &fail_idx,
-        stream);
-    if (err != cudaSuccess) {
-      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
-    }
-  }
+  dispatch_memcpy_batch(
+      batch_dsts.data(),
+      batch_srcs.data(),
+      batch_sizes.data(),
+      num_copies,
+      &attrs,
+      attrs_idxs.data(),
+      1,
+      stream);
 }
 
 void transfer_kv_per_layer_direct_pf_lf(
