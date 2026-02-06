@@ -1,6 +1,6 @@
 //! Model discovery step for external API endpoints.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
@@ -13,8 +13,8 @@ use crate::{
     core::{
         model_card::{ModelCard, ProviderType},
         model_type::ModelType,
+        steps::workflow_data::ExternalWorkerWorkflowData,
     },
-    protocols::worker_spec::WorkerConfigRequest,
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
@@ -225,9 +225,12 @@ async fn fetch_models(url: &str, api_key: Option<&str>) -> Result<Vec<ModelCard>
 pub struct DiscoverModelsStep;
 
 #[async_trait]
-impl StepExecutor for DiscoverModelsStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+impl StepExecutor<ExternalWorkerWorkflowData> for DiscoverModelsStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<ExternalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
 
         // If no API key is provided, skip model discovery and use wildcard mode.
         if config.api_key.as_ref().is_none_or(|k| k.is_empty()) {
@@ -236,7 +239,7 @@ impl StepExecutor for DiscoverModelsStep {
                  User's Authorization header will be forwarded to backend.",
                 config.url
             );
-            context.set::<Vec<ModelCard>>("model_cards", vec![]);
+            // Leave model_cards empty for wildcard mode
             return Ok(StepResult::Success);
         }
 
@@ -263,7 +266,7 @@ impl StepExecutor for DiscoverModelsStep {
             model_cards.iter().map(|c| &c.id).collect::<Vec<_>>()
         );
 
-        context.set("model_cards", model_cards);
+        context.data.model_cards = model_cards;
         Ok(StepResult::Success)
     }
 

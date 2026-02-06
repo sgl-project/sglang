@@ -54,6 +54,8 @@ class PipelineStage(ABC):
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
+        if self.server_args.comfyui_mode:
+            return
         logger.info(f"[{self.__class__.__name__}] {msg}", *args)
 
     def log_warning(self, msg, *args):
@@ -81,13 +83,6 @@ class PipelineStage(ABC):
                 result.add_check("width", batch.width, V.positive_int_divisible(8))
                 result.add_check("image_latent", batch.image_latent, V.is_tensor)
                 return result
-
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            A VerificationResult containing the verification status.
 
         """
         # Default implementation - no verification
@@ -119,9 +114,7 @@ class PipelineStage(ABC):
         """
         Verify the output for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             A VerificationResult containing the verification status.
@@ -182,9 +175,7 @@ class PipelineStage(ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.
@@ -206,7 +197,8 @@ class PipelineStage(ABC):
             logger=logger,
             timings=batch.timings,
             perf_dump_path_provided=batch.perf_dump_path is not None,
-            log_stage_start_end=not batch.is_warmup,
+            log_stage_start_end=not batch.is_warmup
+            and not (self.server_args and self.server_args.comfyui_mode),
         ):
             result = self.forward(batch, server_args)
 
@@ -232,9 +224,7 @@ class PipelineStage(ABC):
         This method should be implemented by subclasses to provide the forward
         processing logic for the stage.
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
+
 
         Returns:
             The updated batch information after this stage's processing.

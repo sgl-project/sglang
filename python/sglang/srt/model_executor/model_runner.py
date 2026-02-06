@@ -35,6 +35,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    Lfm2Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
@@ -56,6 +57,9 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
+)
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -102,6 +106,7 @@ from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -148,6 +153,7 @@ from sglang.srt.utils import (
     get_local_ip_auto,
     init_custom_process_group,
     is_hip,
+    is_host_cpu_arm64,
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
@@ -178,6 +184,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu_arm64 = is_host_cpu_arm64()
 
 if _is_npu:
     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
@@ -362,6 +369,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get memory before model loading
         min_per_gpu_memory = self.init_torch_distributed()
 
+        # Init forward stream for overlap schedule
+        self.forward_stream = torch.get_device_module(self.device).Stream()
+
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
@@ -380,6 +390,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
+
+        if self.is_multimodal:
+            sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
         # Temporary cached values
         self.support_pp = (
@@ -480,9 +493,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
+        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
+            model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
+
+        # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
+        loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
+        if loop_num > 1:
+            self.num_effective_layers = self.num_effective_layers * loop_num
+
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
@@ -560,7 +581,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
-        if self.device == "cuda":
+        if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
@@ -583,6 +604,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
+
+        self.prealloc_symmetric_memory_pool()
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -683,6 +706,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def init_torch_distributed(self):
+        tic = time.perf_counter()
         logger.info("Init torch distributed begin.")
 
         try:
@@ -714,6 +738,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             backend = "gloo"
         elif self.device == "npu":
             backend = "hccl"
+        elif self.device == "musa":
+            backend = "mccl"
 
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
@@ -729,7 +755,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available:
+                if _is_cpu_amx_available or _is_cpu_arm64:
                     # Bind OpenMP threads to CPU cores
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
@@ -743,7 +769,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
                 else:
                     logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled since intel amx backend is not available"
+                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
                     )
 
             # Only initialize the distributed environment on the target model worker.
@@ -760,7 +786,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
-                torch_compile=self.server_args.enable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -791,11 +816,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     logger.warning(msg)
 
         logger.info(
-            f"Init torch distributed ends. mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
+            f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
+            f"mem usage={(before_avail_memory - local_gpu_memory):.2f} GB"
         )
         return min_per_gpu_memory
 
     def load_model(self):
+        tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
@@ -941,6 +968,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
         logger.info(
             f"Load weight end. "
+            f"elapsed={time.perf_counter() - tic_total:.2f} s, "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
             f"avail mem={after_avail_memory:.2f} GB, "
@@ -1070,7 +1098,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args.load_format = load_format
         self.load_config = load_config
 
-        if recapture_cuda_graph and self.device == "cuda":
+        if recapture_cuda_graph and (self.device == "cuda" or self.device == "musa"):
             self.init_device_graphs()
 
         logger.info("Update weights end.")
@@ -1408,13 +1436,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             max_loras_per_batch=self.server_args.max_loras_per_batch,
             load_config=self.load_config,
             dtype=self.dtype,
+            server_args=self.server_args,
             lora_backend=self.server_args.lora_backend,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             max_lora_rank=self.server_args.max_lora_rank,
             target_modules=self.server_args.lora_target_modules,
             lora_paths=self.server_args.lora_paths,
-            server_args=self.server_args,
         )
 
     def load_lora_adapter(self, lora_ref: LoRARef):
@@ -1432,6 +1460,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
+        return result
+
+    def load_lora_adapter_from_tensors(
+        self, lora_ref: LoRARef, tensors, config_dict, added_tokens_config=None
+    ):
+        logger.info(f"LoRA adapter loading from tensors starts: {lora_ref}.")
+        result = self.lora_manager.load_lora_adapter_from_tensors(
+            lora_ref, tensors, config_dict, added_tokens_config
+        )
+        logger.info(f"LoRA adapter loading from tensors completes: {lora_ref}.")
         return result
 
     def unload_lora_adapter(self, lora_ref: LoRARef):
@@ -1468,7 +1506,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def mamba2_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, FalconH1Config | NemotronHConfig):
+        if isinstance(config, NemotronHConfig) and self.is_draft_worker:
+            # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
+            # so they shouldn't use HybridLinearAttnBackend
+            pattern = getattr(config, "mtp_hybrid_override_pattern", None)
+            if pattern is not None and "M" not in pattern:
+                return None
+        if isinstance(config, FalconH1Config | NemotronHConfig | Lfm2Config):
             return config
         if isinstance(config, NemotronH_Nano_VL_V2_Config):
             return config.llm_config
@@ -1494,6 +1538,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return self.mamba2_config or self.hybrid_gdn_config or self.kimi_linear_config
 
     def can_run_piecewise_cuda_graph(self):
+        if self.is_draft_worker:
+            return False
+
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,
@@ -1569,6 +1616,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        tic = time.perf_counter()
+        logger.info("Init attention backend begin.")
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -1579,6 +1628,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
+        logger.info(
+            f"Init attention backend end. elapsed={time.perf_counter() - tic:.2f} s"
+        )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
@@ -1970,8 +2022,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        graph_backend = defaultdict(
+            lambda: "cuda graph",
+            {
+                "cpu": "cpu graph",
+                "npu": "npu graph",
+            },
+        )
         logger.info(
-            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         graph_runners = defaultdict(
             lambda: CudaGraphRunner,
@@ -1985,7 +2044,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
@@ -2001,9 +2060,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Collect attention layers and moe layers from the model
         self.model.model = resolve_language_model(self.model)
+        language_model = getattr(self.model, "language_model", self.model)
         self.attention_layers = []
         self.moe_layers = []
-        for layer in self.model.model.layers:
+        for layer in language_model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     self.attention_layers.append(layer.self_attn.attn)
@@ -2126,7 +2186,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
+    ) -> Tuple[
+        Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
+    ]:
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2135,25 +2197,39 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
-        if (
+        can_run_graph = (
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
-        ):
-            return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+        )
+
+        if can_run_graph:
+            return (
+                self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),
+                can_run_graph,
+            )
 
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+        return (
+            self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            ),
+            can_run_graph,
         )
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
+        # in this case, we need to reinit the forward metadata, otherwise the stale
+        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        if forward_batch.batch_size > 0:
+            self.attn_backend.init_forward_metadata(forward_batch)
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2206,6 +2282,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
+            elastic_ep_state = ElasticEPStateManager.instance()
+            if (
+                elastic_ep_state is not None
+                and not elastic_ep_state.is_active_equal_last()
+            ):
+                elastic_ep_state.snapshot_active_to_last()
+                elastic_ep_state.sync_active_to_cpu()
+                logging.info("EPLB due to rank faults")
+                gen = self.eplb_manager.rebalance()
+                while True:
+                    try:
+                        next(gen)
+                    except StopIteration:
+                        break
+                output = self._forward_raw(
+                    forward_batch,
+                    skip_attn_backend_init,
+                    pp_proxy_tensors,
+                    reinit_attn_backend,
+                    split_forward_count,
+                )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
@@ -2277,7 +2374,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            ret = self.forward_extend(
+            ret, can_run_graph = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -2300,19 +2397,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
         #       was executed after we processed last batch's results.
-        has_grammar = sampling_info.grammars is not None
-        # Avoid compiling grammar masks on every TP rank; only the first rank applies them.
-        apply_vocab_mask = has_grammar and self.sampler.tp_rank == 0
+
         # Calculate logits bias and apply it to next_token_logits.
-        if apply_vocab_mask:
-            sampling_info.update_regex_vocab_mask()
-        else:
-            sampling_info.vocab_mask = None
-            sampling_info.apply_mask_func = None
-        sampling_info.apply_logits_bias(
-            logits_output.next_token_logits,
-            apply_vocab_mask=apply_vocab_mask,
-        )
+        sampling_info.update_regex_vocab_mask()
+        sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
     def sample(
         self,
@@ -2429,6 +2517,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
+
+    def prealloc_symmetric_memory_pool(self):
+        # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
+        if (
+            self.is_draft_worker
+            or not self.server_args.enable_symm_mem
+            or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
+        ):
+            return
+
+        # Memory allocation is tied to a cuda stream, use the forward stream
+        with torch.get_device_module(self.device).stream(self.forward_stream):
+            logger.info(
+                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
+            )
+            with use_symmetric_memory(get_tp_group()):
+                torch.empty(
+                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
