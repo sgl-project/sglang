@@ -353,6 +353,7 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+    SGLANG_NSA_FORCE_MLA = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
