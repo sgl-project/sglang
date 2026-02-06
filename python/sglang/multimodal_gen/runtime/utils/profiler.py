@@ -103,10 +103,6 @@ class SGLDiffusionProfiler:
     ) -> list[torch.profiler.ProfilerActivity]:
         """
         Resolve user-provided activity strings to torch profiler activities.
-
-        Supported values (case-insensitive):
-        - "CPU"
-        - "GPU" / "CUDA"
         """
 
         def _default() -> list[torch.profiler.ProfilerActivity]:
