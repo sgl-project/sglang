@@ -201,8 +201,6 @@ class ScaleResidualNormScaleShift:
         value = tXrX.load()
         if cutlass.const_expr(isinstance(tGrG, cute.Tensor)):
             value = tGrG.load() * value
-        elif cutlass.const_expr(isinstance(tGrG, cutlass.Int32)):
-            value = tGrG * value
         # Compute: value = value + <residual>
         if cutlass.const_expr(isinstance(tRrR, cute.Tensor)):
             value = value + tRrR.load()
@@ -319,9 +317,8 @@ def fused_norm_scale_shift(
         scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
         shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
         # Use scalar placeholders for None tensors as a workaround, since the CuTe DSL
-        # TVM-FFI backend does not support None parameters. Unless explicitly handled
-        # (e.g., for gate), scalar values do not result in code generation and have no
-        # impact on runtime performance.
+        # TVM-FFI backend does not support None parameters. scalar values do not result
+        # in code generation and have no impact on runtime performance.
         weight = 1 if weight is None else weight
         bias = 0 if bias is None else bias
         ResOut, Residual, Gate = 0, 0, 1
@@ -369,7 +366,7 @@ def fused_scale_residual_norm_scale_shift(
 
     Expects:
       - residual, x: [B, S, D]
-      - gate: None, 1, [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
+      - gate: None, [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - weight/bias: None, [D]
       - scale/shift: [1], [D], [1/B, D], [1/B, 1/S, D] or [B, F, 1, D]
       - norm_type: str, "layer" or "rms"
@@ -402,9 +399,8 @@ def fused_scale_residual_norm_scale_shift(
         scale = broadcast_tensor_for_bsfd(scale, *x.shape)  # handle various shapes
         shift = broadcast_tensor_for_bsfd(shift, *x.shape)  # handle various shapes
         # Use scalar placeholders for None tensors as a workaround, since the CuTe DSL
-        # TVM-FFI backend does not support None parameters. Unless explicitly handled
-        # (e.g., for gate), scalar values do not result in code generation and have no
-        # impact on runtime performance.
+        # TVM-FFI backend does not support None parameters. scalar values do not result
+        # in code generation and have no impact on runtime performance.
         gate = 1 if gate is None else gate
         weight = 1 if weight is None else weight
         bias = 0 if bias is None else bias
