@@ -675,6 +675,7 @@ class PiecewiseCudaGraphRunner:
             temperature=forward_batch.temperature,
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
+            dimensions=forward_batch.dimensions,
         )
 
         return static_forward_batch
