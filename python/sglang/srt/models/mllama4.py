@@ -383,6 +383,10 @@ class Llama4VisionModel(nn.Module):
     ) -> torch.Tensor:
         # Patch embedding
         hidden_state = self.patch_embedding(pixel_values)
+        # If padded in patch embedding linear part, only retrieve valid slice
+        if hasattr(self.config, "padded_num_attention_heads"):
+            hidden_state = hidden_state[:, :, : self.config.hidden_size]
+
         num_tiles, num_patches, hidden_dim = hidden_state.shape
 
         # Add cls token
