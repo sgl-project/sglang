@@ -374,9 +374,7 @@ class SchedulerOutputProcessorMixin:
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
             req.spec_accepted_tokens += accepted_draft_tokens
-            while len(req.spec_acceptance_histogram) <= accepted_draft_tokens:
-                req.spec_acceptance_histogram.append(0)
-            req.spec_acceptance_histogram[accepted_draft_tokens] += 1
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
 
