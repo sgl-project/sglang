@@ -74,7 +74,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         verify_done: Optional[torch.cuda.Event] = None,
         verified_tokens: Optional[torch.Tensor] = None,
         accept_lens: Optional[torch.Tensor] = None,
-        accept_indices: Optional[torch.Tensor] = None,
         is_spec_v2: Optional[bool] = False,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
@@ -98,7 +97,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
         self.verify_done = verify_done
         self.verified_tokens = verified_tokens
         self.accept_lens = accept_lens
-        self.accept_indices = accept_indices
         self.is_spec_v2 = is_spec_v2
 
         self.device = (
@@ -486,8 +484,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             )[new_indices, :]
             self.verified_tokens = self.verified_tokens.flatten()
             self.accept_lens = self.accept_lens[new_indices]
-            # no need to implement filter for accept_indices because in scheduler before batch.filter_batch, we have generated the correct draft input tokens
-            self.accept_indices = self.accept_indices[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         if self.is_spec_v2:
@@ -496,8 +492,4 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixi
             )
             self.accept_lens = torch.cat(
                 (self.accept_lens, spec_info.accept_lens), dim=0
-            )
-            start_ind = self.accept_indices[self.accept_indices != -1][-1] + 1
-            self.accept_indices = torch.cat(
-                (self.accept_indices, spec_info.accept_indices + start_ind), dim=0
             )

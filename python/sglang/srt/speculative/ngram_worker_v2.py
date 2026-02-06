@@ -63,10 +63,21 @@ class NGRAMWorkerV2(NGRAMWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
+        prev_token_ids, prev_accept_lens = (
+            batch.spec_info.verified_tokens,
+            batch.spec_info.accept_lens,
+        )
+        if not prev_token_ids.is_cpu:
+            prev_token_ids = prev_token_ids.cpu()
+            prev_accept_lens = prev_accept_lens.cpu()
+        self.prev_token_ids = prev_token_ids.tolist()
+        self.prev_accept_lens = prev_accept_lens.tolist()
+
         self.ngram_cache.synchronize()
         batch_tokens = []
         assert len(batch.reqs) == len(self.prev_accept_lens)
-        for i, req in enumerate(batch.reqs):
+        i = 0
+        for req in batch.reqs:
             # TODO grammar doesn't overlap, output_ids will be normal, deal with it!
             # prev_token_id and prev_accept_lens are filtered and merged, so here should not encounter index out of bound
             prev_tokens = self.prev_token_ids[
@@ -78,6 +89,7 @@ class NGRAMWorkerV2(NGRAMWorker):
                 self.max_match_window_size,
             )
             batch_tokens.append(check_token)
+            i += 1
         req_drafts, mask = self.ngram_cache.batch_get(batch_tokens)
         total_draft_token_num = len(req_drafts)
 
@@ -101,7 +113,8 @@ class NGRAMWorkerV2(NGRAMWorker):
             self.prev_accept_lens = prev_accept_lens.tolist()
 
         stride = self.draft_token_num
-        for i, req in enumerate(batch.reqs):
+        i = 0
+        for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
             # if batch.forward_mode.is_extend():
@@ -118,6 +131,7 @@ class NGRAMWorkerV2(NGRAMWorker):
                 req.origin_input_ids, req.output_ids + prev_tokens, self.branch_length
             )
             batch_tokens.append(put_ids)
+            i += 1
         self.ngram_cache.batch_put(batch_tokens)
 
     def _prepare_for_speculative_decoding_v2(self, batch: ModelWorkerBatch):
@@ -201,15 +215,14 @@ class NGRAMWorkerV2(NGRAMWorker):
         model_worker_batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
-        # update cache using req.output_ids (round 1 to N-2) and prev_token_ids (round N-1) before draft
-        self._update_ngram_cache_v2(model_worker_batch)
+        # # update cache using req.output_ids (round 1 to N-2) and prev_token_ids (round N-1) before draft
+        # self._update_ngram_cache_v2(model_worker_batch)
         bs = len(model_worker_batch.seq_lens)
         self._prepare_for_speculative_decoding_v2(model_worker_batch)
         verify_input: NgramVerifyInput = model_worker_batch.spec_info
         accept_length = torch.tensor([1] * bs, dtype=torch.int32).to(
             device=self.device, non_blocking=True
         )
-        accept_index = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             # Prepare grammar data on CPU if needed
@@ -271,6 +284,7 @@ class NGRAMWorkerV2(NGRAMWorker):
                 self.token_to_kv_pool_allocator,
                 self.draft_token_num,
             )
+            self._update_ngram_cache(model_worker_batch)
             model_worker_batch.forward_mode = ForwardMode.DECODE
 
         else:
@@ -289,13 +303,6 @@ class NGRAMWorkerV2(NGRAMWorker):
             ).to(device=self.device, non_blocking=True)
             verified_tokens[:, 0] = predict
             verified_tokens = verified_tokens.flatten()
-            accept_index = torch.full(
-                (bs, self.draft_token_num), -1, dtype=torch.int32
-            ).to(device=self.device, non_blocking=True)
-            accept_index[:, 0] = torch.arange(
-                0, bs * self.draft_token_num, self.draft_token_num, dtype=torch.int32
-            ).to(device=self.device, non_blocking=True)
-
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
@@ -307,7 +314,6 @@ class NGRAMWorkerV2(NGRAMWorker):
             verify_done=verify_done,
             verified_tokens=verified_tokens,
             accept_lens=accept_length,
-            accept_indices=accept_index,
             is_spec_v2=True,
         )
         return GenerationBatchResult(

@@ -9,7 +9,7 @@ from sglang.srt.speculative.spec_utils import spec_need_hidden_states
 from sglang.srt.utils import get_compiler_backend
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -115,18 +115,15 @@ class FutureMap:
         indices = torch.arange(start, end, dtype=torch.int64, device=self.device)
         return FutureIndices(indices=indices, interval=slice(start, end))
 
-    def resolve_future(
-        self, model_worker_batch: ModelWorkerBatch, batch: ScheduleBatch
-    ):
-        ngram_v2 = batch.is_spec_v2 and self.spec_algo.is_ngram()
-        if ngram_v2:
+    def resolve_future(self, model_worker_batch: ModelWorkerBatch):
+        if self.spec_algo.is_ngram():
             return
         if self.spec_algo.is_none():
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            if draft_input is None or self.spec_algo.is_ngram():
+            if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
@@ -148,11 +145,8 @@ class FutureMap:
         self,
         future_indices: FutureIndices,
         batch_result: GenerationBatchResult,
-        batch: ScheduleBatch,
     ):
-        # ngram decode return, prefill behaves like normal overlap
-        ngram_v2 = batch.is_spec_v2 and self.spec_algo.is_ngram()
-        if ngram_v2:
+        if self.spec_algo.is_ngram():
             return
         if self.spec_algo.is_none():
             intv = future_indices.interval
