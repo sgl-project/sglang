@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
@@ -81,15 +82,6 @@ class BaseTpWorker(ABC):
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
-
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
-    def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
-
-    def get_attention_tp_cpu_group(self):
-        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
 
     def get_memory_pool(self):
         return (
@@ -189,9 +181,19 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
-    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
-        lora_ids_set = set(lora_ids) if isinstance(lora_ids, list) else lora_ids
-        return self.model_runner.lora_manager.validate_lora_batch(lora_ids_set)
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ):
+        # The LoRA code handles TP sharding internally using slice_lora_a_weights
+        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        result = self.model_runner.load_lora_adapter_from_tensors(
+            recv_req.to_ref(),
+            tensors,
+            recv_req.config_dict,
+            recv_req.added_tokens_config,
+        )
+        return result
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
@@ -394,6 +396,7 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.model_runner.forward_stream,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,

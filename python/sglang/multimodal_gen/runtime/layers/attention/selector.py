@@ -108,10 +108,7 @@ def _cached_get_attn_backend(
     supported_attention_backends: tuple[AttentionBackendEnum],
 ) -> type[AttentionBackend]:
     # Check whether a particular choice of backend was
-    # previously forced.
-    #
-    # THIS SELECTION OVERRIDES THE SGLANG_DIFFUSION_ATTENTION_BACKEND
-    # ENVIRONMENT VARIABLE.
+    # previously forced via global_force_attn_backend() or --attention-backend CLI arg.
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     supported_attention_backends = set(supported_attention_backends)
@@ -173,7 +170,6 @@ def global_force_attn_backend_context_manager(
     manager.
 
     Arguments:
-
     * attn_backend: attention backend to force
 
     Returns:

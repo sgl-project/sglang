@@ -174,5 +174,5 @@ class GuidanceBackend(BaseGrammarBackend):
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:
-            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ

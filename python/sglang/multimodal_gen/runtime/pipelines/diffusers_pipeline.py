@@ -21,6 +21,7 @@ from diffusers import DiffusionPipeline
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -32,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -134,7 +136,7 @@ class DiffusersExecutionStage(PipelineStage):
 
             result = self._convert_to_tensor(data)
             if result is not None:
-                logger.info(
+                logger.debug(
                     "Extracted output from '%s': shape=%s, dtype=%s",
                     attr,
                     result.shape,
@@ -223,7 +225,7 @@ class DiffusersExecutionStage(PipelineStage):
         # Ensure correct shape for downstream processing
         output = self._fix_output_shape(output)
 
-        logger.info("Final output tensor shape: %s", output.shape)
+        logger.debug("Final output tensor shape: %s", output.shape)
         return output
 
     def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
@@ -331,6 +333,9 @@ class DiffusersExecutionStage(PipelineStage):
         if not batch.image_path:
             return None
 
+        if isinstance(batch.image_path, list):
+            batch.image_path = batch.image_path[0]
+
         try:
             if batch.image_path.startswith(("http://", "https://")):
                 response = requests.get(batch.image_path, timeout=30)
@@ -390,12 +395,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.model_path = model_path
 
         dtype = self._get_dtype(server_args)
-        device_map = self._get_device_map(server_args)
-        logger.info(
-            "Loading diffusers pipeline with dtype=%s, device_map=%s",
-            dtype,
-            device_map,
-        )
+        logger.info("Loading diffusers pipeline with dtype=%s", dtype)
 
         # Build common kwargs for from_pretrained
         load_kwargs = {
@@ -404,13 +404,8 @@ class DiffusersPipeline(ComposedPipelineBase):
             "revision": server_args.revision,
         }
 
-        # Add device_map for direct GPU loading and parallel shard loading
-        # This warms up CUDA caching allocator and enables parallel loading via accelerate
-        if device_map is not None:
-            load_kwargs["device_map"] = device_map
-
         # Add quantization config if provided (e.g., BitsAndBytesConfig for 4/8-bit)
-        config = getattr(server_args, "pipeline_config", None)
+        config = server_args.pipeline_config
         if config is not None:
             quant_config = getattr(config, "quantization_config", None)
             if quant_config is not None:
@@ -457,25 +452,19 @@ class DiffusersPipeline(ComposedPipelineBase):
             else:
                 raise
 
-        # Only move to device if device_map wasn't used (already on device)
-        if device_map is None:
-            if torch.cuda.is_available():
-                pipe = pipe.to("cuda")
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                pipe = pipe.to("mps")
-
+        pipe = pipe.to(get_local_torch_device())
         # Apply VAE memory optimizations from pipeline config
         self._apply_vae_optimizations(pipe, server_args)
-
         # Apply attention backend if specified
         self._apply_attention_backend(pipe, server_args)
-
+        # Apply cache-dit acceleration if configured
+        pipe = self._apply_cache_dit(pipe, server_args)
         logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
         return pipe
 
     def _apply_vae_optimizations(self, pipe: Any, server_args: ServerArgs) -> None:
         """Apply VAE memory optimizations (tiling, slicing) from pipeline config."""
-        config = getattr(server_args, "pipeline_config", None)
+        config = server_args.pipeline_config
         if config is None:
             return
 
@@ -499,14 +488,28 @@ class DiffusersPipeline(ComposedPipelineBase):
         See: https://huggingface.co/docs/diffusers/main/en/optimization/attention_backends
         Available backends: flash, _flash_3_hub, sage, xformers, native, etc.
         """
-        backend = getattr(server_args, "diffusers_attention_backend", None)
+        backend = server_args.attention_backend
 
         if backend is None:
-            config = getattr(server_args, "pipeline_config", None)
+            config = server_args.pipeline_config
             if config is not None:
                 backend = getattr(config, "diffusers_attention_backend", None)
 
         if backend is None:
+            return
+
+        backend = backend.lower()
+        sglang_backends = {e.name.lower() for e in AttentionBackendEnum} | {
+            "fa3",
+            "fa4",
+        }
+        if backend in sglang_backends:
+            logger.debug(
+                "Skipping diffusers attention backend '%s' because it matches a "
+                "SGLang backend name. Use diffusers backend names when running "
+                "the diffusers backend.",
+                backend,
+            )
             return
 
         for component_name in ["transformer", "unet"]:
@@ -525,13 +528,43 @@ class DiffusersPipeline(ComposedPipelineBase):
                         e,
                     )
 
-    def _get_device_map(self, server_args: ServerArgs) -> str | None:
-        """
-        Determine device_map for pipeline loading.
-        """
-        if not torch.cuda.is_available():
-            return None
-        return "cuda"
+    def _apply_cache_dit(self, pipe: Any, server_args: ServerArgs) -> Any:
+        """Enable cache-dit for diffusers pipeline if configured."""
+        cache_dit_config = server_args.cache_dit_config
+        if not cache_dit_config:
+            return pipe
+
+        try:
+            import cache_dit
+        except ImportError as e:
+            raise RuntimeError(
+                "cache-dit is required for --cache-dit-config. "
+                "Install it with `pip install cache-dit`."
+            ) from e
+
+        if not hasattr(cache_dit, "load_configs"):
+            raise RuntimeError(
+                "cache-dit>=1.2.0 is required for --cache-dit-config. "
+                "Please upgrade cache-dit."
+            )
+
+        try:
+            cache_options = cache_dit.load_configs(cache_dit_config)
+        except Exception as e:
+            raise ValueError(
+                "Failed to load cache-dit config. Provide a YAML/JSON path (or a dict "
+                "supported by cache-dit>=1.2.0)."
+            ) from e
+
+        try:
+            pipe = cache_dit.enable_cache(pipe, **cache_options)
+        except Exception:
+            # cache-dit is an external integration and can raise a variety of errors.
+            logger.exception("Failed to enable cache-dit for diffusers pipeline")
+            raise
+
+        logger.info("Enabled cache-dit for diffusers pipeline")
+        return pipe
 
     def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
         """
@@ -540,7 +573,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
-            dit_precision = getattr(server_args.pipeline_config, "dit_precision", None)
+            dit_precision = server_args.pipeline_config.dit_precision
             if dit_precision == "fp16":
                 dtype = torch.float16
             elif dit_precision == "bf16":
@@ -555,7 +588,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
         video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
         self.is_video_pipeline = any(ind in pipe_class_name for ind in video_indicators)
-        logger.info(
+        logger.debug(
             "Detected pipeline type: %s",
             "video" if self.is_video_pipeline else "image",
         )
