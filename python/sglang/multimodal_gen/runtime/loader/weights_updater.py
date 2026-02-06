@@ -158,7 +158,8 @@ class WeightsUpdater:
         available = self.pipeline.modules.keys()
         if target_modules is None or target_modules == ["all"]:
             names = [
-                n for n in available
+                n
+                for n in available
                 if isinstance(self.pipeline.get_module(n), torch.nn.Module)
             ]
         else:
@@ -224,9 +225,7 @@ class WeightsUpdater:
             if weights_dir is None:
                 continue
             weights_iter = _get_weights_iter(weights_dir)
-            load_weights_into_model(
-                weights_iter, dict(module.named_parameters())
-            )
+            load_weights_into_model(weights_iter, dict(module.named_parameters()))
 
 
 # ---------------------------------------------------------------------------
@@ -289,15 +288,16 @@ def _disable_offload(
     """
     disabled: list[torch.nn.Module] = []
     for _, module in modules_to_update:
-        if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+        if (
+            isinstance(module, OffloadableDiTMixin)
+            and module.layerwise_offload_managers
+        ):
             module.disable_offload()
             disabled.append(module)
     return disabled
 
 
-def load_weights_into_model(
-    weights_iter, model_params: dict
-) -> None:
+def load_weights_into_model(weights_iter, model_params: dict) -> None:
     """Copy weights from *weights_iter* into *model_params* in-place.
 
     Handles ``DTensor`` parameters by re-distributing the loaded weight

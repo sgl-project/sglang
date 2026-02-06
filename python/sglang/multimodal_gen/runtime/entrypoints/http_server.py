@@ -92,6 +92,7 @@ async def health_generate():
     # TODO : health generate endpoint
     return {"status": "ok"}
 
+
 @health_router.post("/update_weights_from_disk")
 async def update_weights_from_disk(request: Request):
     """Update model weights from disk inplace without restarting the server."""
