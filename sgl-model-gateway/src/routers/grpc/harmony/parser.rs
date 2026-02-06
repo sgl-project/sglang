@@ -11,9 +11,8 @@ use crate::protocols::common::{FunctionCallResponse, ToolCall};
 /// Get the global Harmony encoding
 ///
 /// References the same encoding used by the builder for consistency
-fn get_harmony_encoding() -> &'static HarmonyEncoding {
-    use super::builder::get_harmony_encoding;
-    get_harmony_encoding()
+fn try_get_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
+    super::builder::try_get_harmony_encoding()
 }
 
 /// Harmony parser adapter
@@ -29,7 +28,7 @@ pub(crate) struct HarmonyParserAdapter {
 impl HarmonyParserAdapter {
     /// Create a new Harmony parser
     pub fn new() -> Result<Self, String> {
-        let encoding = get_harmony_encoding();
+        let encoding = try_get_harmony_encoding()?;
         let parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to create StreamableParser: {}", e))?;
 
@@ -520,7 +519,7 @@ impl HarmonyParserAdapter {
     #[allow(dead_code)]
     pub fn reset(&mut self) -> Result<(), String> {
         // Create a new parser instance (StreamableParser doesn't have a reset method)
-        let encoding = get_harmony_encoding();
+        let encoding = try_get_harmony_encoding()?;
         self.parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to reset parser: {}", e))?;
         self.prev_recipient = None;
