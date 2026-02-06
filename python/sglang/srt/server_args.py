@@ -695,6 +695,10 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+    
+    # For MindStudio-probe tool
+    enable_msprobe: bool = False
+    msprobe_config_path: Optional[str] = None
 
     def __post_init__(self):
         """
@@ -2751,6 +2755,13 @@ class ServerArgs:
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(
                 "Cuda graph and server warmup are disabled because of using tensor dump mode"
+            )
+            self.disable_cuda_graph = True
+            self.skip_server_warmup = True
+            
+        if self.enable_msprobe:
+            logger.warning(
+                "Cuda graph and server warmup are disabled because of using the msprobe tool for tensor data dump"
             )
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
@@ -4943,6 +4954,20 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+        
+        # For MindStudio-probe tool
+        parser.add_argument(
+            "--enable-msprobe",
+            action="store_true",
+            default=ServerArgs.enable_msprobe,
+            help="Enable msprobe dump.",
+        )
+        parser.add_argument(
+            "--msprobe-config-path",
+            type=str,
+            default=ServerArgs.msprobe_config_path,
+            help="The path of the msprobe config file.",
         )
 
     @classmethod
