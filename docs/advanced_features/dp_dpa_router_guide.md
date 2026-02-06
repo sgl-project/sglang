@@ -11,6 +11,8 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 - Requests are distributed across replicas
 - No inter-replica communication during one request's inference (for simple DP)
 
+> **Note for MLA models (e.g., DeepSeek)**: Standard DP works for MLA models too. If you want independent replicas with duplicated KV cache (simpler setup), just use `--dp-size` without `--enable-dp-attention`. DPA is only needed when you want to eliminate KV cache duplication for better memory efficiency.
+
 
 ## Data Parallelism Attention (DPA)
 
