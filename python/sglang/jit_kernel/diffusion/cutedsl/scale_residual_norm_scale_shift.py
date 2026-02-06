@@ -276,7 +276,7 @@ def validate_gate(t: Union[torch.Tensor, int], B: int, S: int, D: int):
     validate_scale_shift(t, B, S, D)
 
 
-@torch._dynamo.disable  # Disable Dynamo tracing
+@torch.library.custom_op("sglang::fused_norm_scale_shift", mutates_args=())
 def fused_norm_scale_shift(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -285,8 +285,7 @@ def fused_norm_scale_shift(
     shift: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
-    stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Fuse: norm(x) * (1 + scale) + shift
       where norm is either layernorm or rmsnorm.
@@ -301,6 +300,7 @@ def fused_norm_scale_shift(
     D must be a multiple of 256 and <= 8192 to enable LDG.128 vectorized loads per
     thread and avoid predicated loads (e.g., bounds checks such as `index < D`).
     """
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     # Tensor Validation
     BSD = x.shape
     validate_x(x, *BSD)
@@ -326,7 +326,6 @@ def fused_norm_scale_shift(
         bias = 0 if bias is None else bias
         ResOut, Residual, Gate = 0, 0, 1
         torch_tensors = [y, ResOut, Residual, x, Gate, weight, bias, scale, shift]
-        cute_tensor_args = [to_cute_arg(t) for t in torch_tensors]
         # Compile cache
         hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
         compiled_fn = _COMPILE_CACHE.get(hash_key)
@@ -338,24 +337,31 @@ def fused_norm_scale_shift(
             )
             _COMPILE_CACHE[hash_key] = compiled_fn
         # Execute
-        compiled_fn(*cute_tensor_args, eps, stream)
+        compiled_fn(*torch_tensors, eps, stream)
         return y
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
 
 
-@torch._dynamo.disable  # Disable Dynamo tracing
+@fused_norm_scale_shift.register_fake
+def _fused_norm_scale_shift_fake(
+    x, weight, bias, scale, shift, norm_type, eps
+):
+    y = x.new_empty(x.shape)
+    return y
+
+
+@torch.library.custom_op("sglang::fused_scale_residual_norm_scale_shift", mutates_args=())
 def fused_scale_residual_norm_scale_shift(
     residual: torch.Tensor,
     x: torch.Tensor,
-    gate: Union[Optional[torch.Tensor], int],
+    gate: Optional[torch.Tensor],  # Union[Optional[torch.Tensor], int] indeed
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     scale: torch.Tensor,
     shift: torch.Tensor,
     norm_type: str,
     eps: float = 1e-5,
-    stream: cuda.CUstream = cuda.CUstream(cuda.CUstream_flags.CU_STREAM_DEFAULT),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fuse: norm(residual + gate * x) * (1 + scale) + shift
@@ -381,8 +387,10 @@ def fused_scale_residual_norm_scale_shift(
     validate_weight_bias(bias, *BSD)
     validate_scale_shift(scale, *BSD)
     validate_scale_shift(shift, *BSD)
-
     if norm_type == "layer" or norm_type == "rms":
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        # if norm_type == "layer" or norm_type == "rms":
         D = x.shape[-1]
         if D % 256 != 0 or D > 8192:
             raise ValueError(
@@ -401,7 +409,6 @@ def fused_scale_residual_norm_scale_shift(
         weight = 1 if weight is None else weight
         bias = 0 if bias is None else bias
         torch_tensors = [y, resi_out, residual, x, gate, weight, bias, scale, shift]
-        cute_tensor_args = [to_cute_arg(t) for t in torch_tensors]
         # Compile cache
         hash_key = ScaleResidualNormScaleShift.make_hash_key(norm_type, *torch_tensors)
         compiled_fn = _COMPILE_CACHE.get(hash_key)
@@ -413,7 +420,16 @@ def fused_scale_residual_norm_scale_shift(
             )
             _COMPILE_CACHE[hash_key] = compiled_fn
         # Execute
-        compiled_fn(*cute_tensor_args, eps, stream)
+        compiled_fn(*torch_tensors, eps, stream)
         return y, resi_out
     else:
         raise ValueError(f'norm_type must be one of "layer" and "rms"')
+
+
+@fused_scale_residual_norm_scale_shift.register_fake
+def _fused_scale_residual_norm_scale_shift_fake(
+    residual, x, gate, weight, bias, scale, shift, norm_type, eps
+):
+    y = x.new_empty(x.shape)
+    residual_out = x.new_empty(x.shape)
+    return y, residual_out
