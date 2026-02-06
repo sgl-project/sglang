@@ -1156,26 +1156,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if self.ssm_k_last:
             # K-last decode uses FlashInfer GDN decode kernel directly.
-            # State layout: [pool_size, HV, K, V] (K-last)
+            # State layout: [pool_size+1, HV, K, V] (K-last)
             # FlashInfer expects [B, HV, K, V] so we gather the states
             num_value_heads = value.shape[2]
-            
-            # Gather states for this batch: [pool_size, HV, K, V] -> [B, HV, K, V]
-            # cache_indices shape: [B]
             batch_size = cache_indices.shape[0]
-            gathered_state = ssm_states[cache_indices]  # [B, HV, K, V]
-            
+
+            # Remap padding slots (PAD_SLOT_ID = -1) to the sentinel slot at
+            # the end of the pool.  CUDA graph replay may set padding entries to
+            # -1 when the real batch is smaller than the captured batch size.
+            # index_copy_ does not support negative indices, so we redirect them
+            # to the sentinel slot (pool_size, the extra +1 entry, always zeros).
+            # This is safe: the sentinel is never allocated to real requests, so
+            # reading/writing it is a no-op from a correctness standpoint.
+            ssm_cache_indices = torch.where(
+                cache_indices >= 0,
+                cache_indices,
+                ssm_states.shape[0] - 1,
+            )
+
+            # Gather states for this batch: [pool_size+1, HV, K, V] -> [B, HV, K, V]
+            gathered_state = ssm_states[ssm_cache_indices]
+
             # FlashInfer decode expects:
             # q, k: [B, 1, H, K], v: [B, 1, HV, V], state: [B, HV, K, V]
             # a, b: [B, 1, HV]
-            # Current shapes: query [1, seq_len, H, K] needs to be [B, 1, H, K]
-            # seq_len == batch_size for decode
             query_fi = query.view(batch_size, 1, num_heads, head_k_dim)
             key_fi = key.view(batch_size, 1, num_heads, head_k_dim)
             value_fi = value.view(batch_size, 1, num_value_heads, head_v_dim)
             a_fi = a.view(batch_size, 1, num_value_heads)
             b_fi = b.view(batch_size, 1, num_value_heads)
-            
+
             # Call FlashInfer GDN decode kernel
             output_fi, updated_state = self._flashinfer_gated_delta_rule_decode(
                 q=query_fi,
@@ -1190,11 +1200,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-            
+
             # Write updated state back to pool
-            # updated_state: [B, HV, K, V]
-            ssm_states.index_copy_(0, cache_indices.to(torch.int64), updated_state.to(ssm_states.dtype))
-            
+            ssm_states.index_copy_(0, ssm_cache_indices.to(torch.int64), updated_state.to(ssm_states.dtype))
+
             # Reshape output: [B, 1, HV, V] -> [1, B, HV, V]
             core_attn_out = output_fi.view(1, batch_size, num_value_heads, head_v_dim)
         else:
@@ -1428,8 +1437,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # cu_seqlens: int32 -> int64
                 cu_seqlens_fi = query_start_loc.to(torch.int64)
 
+                # Remap negative padding indices to the sentinel slot (see decode path).
+                ssm_cache_indices = torch.where(
+                    cache_indices >= 0,
+                    cache_indices,
+                    ssm_states.shape[0] - 1,
+                )
+
                 # Prepare initial_state (FlashInfer requires float32, K-last layout [B, HV, V, K])
-                initial_state_fi = ssm_states[cache_indices].to(torch.float32)
+                initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
                 
                 # Call FlashInfer prefill kernel
                 # Note: q and k are already L2-normalized above, so use_qk_l2norm_in_kernel=False
@@ -1450,7 +1466,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 core_attn_out = output_fi.view(1, total_seq_len, num_value_heads, head_v_dim)
 
                 # Write back state to pool (K-last layout)
-                ssm_states.index_copy_(0, cache_indices.to(torch.int64), output_state_fi.to(ssm_states.dtype))
+                ssm_states.index_copy_(0, ssm_cache_indices.to(torch.int64), output_state_fi.to(ssm_states.dtype))
 
                 # Note: _track_mamba_state_extend needs h tensor from Triton kernel
                 # FlashInfer doesn't provide intermediate states, so we skip tracking for K-last prefill
