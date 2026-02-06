@@ -29,7 +29,7 @@ using cudaMemcpyBatchAsync_t = cudaError_t (*)(
     cudaStream_t stream);
 
 static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
-#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
   static cudaMemcpyBatchAsync_t fn = []() -> cudaMemcpyBatchAsync_t {
     void* symbol = nullptr;
     CUresult res = cuGetProcAddress("cudaMemcpyBatchAsync", &symbol, CUDART_VERSION, 0, nullptr);
@@ -42,36 +42,6 @@ static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
 #else
   return nullptr;
 #endif
-}
-
-static inline void dispatch_memcpy_batch(
-    void** dsts,
-    void** srcs,
-    size_t* sizes,
-    size_t count,
-    cudaMemcpyAttributes* attrs,
-    size_t* attrsIdxs,
-    size_t numAttrs,
-    cudaStream_t stream) {
-  if (count == 0) {
-    return;
-  }
-  auto memcpy_batch_async = get_cudaMemcpyBatchAsync();
-  if (memcpy_batch_async != nullptr) {
-    size_t fail_idx = std::numeric_limits<size_t>::max();
-    cudaError_t err =
-        memcpy_batch_async(dsts, srcs, sizes, count, attrs, attrsIdxs, numAttrs, &fail_idx, stream);
-    if (err != cudaSuccess) {
-      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
-    }
-  } else {
-    for (size_t i = 0; i < count; ++i) {
-      cudaError_t err = cudaMemcpyAsync(dsts[i], srcs[i], sizes[i], cudaMemcpyDefault, stream);
-      if (err != cudaSuccess) {
-        TORCH_CHECK(false, "cudaMemcpyAsync failed. error=", cudaGetErrorString(err));
-      }
-    }
-  }
 }
 
 __device__ __forceinline__ void
@@ -808,6 +778,59 @@ inline void transfer_kv_page_first_direct_impl(
   int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
   int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
 
+  auto fallback_to_page_copy = [&]() {
+    if constexpr (IsLf2Pf) {
+      const bool is_mla = dst_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? src_ptrs.size() : src_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size];
+        const int64_t d_index = dst_indices_ptr[i * page_size] / page_size;
+        for (int64_t j = 0; j < num_layers; ++j) {
+          transfer_page_direct(
+              src_ptrs[j], dst_ptrs[0].select(0, d_index).select(0, start_layer_id + j), s_index, 0, page_size);
+          if (!is_mla) {
+            transfer_page_direct(
+                src_ptrs[j + num_layers],
+                dst_ptrs[1].select(0, d_index).select(0, start_layer_id + j),
+                s_index,
+                0,
+                page_size);
+          }
+        }
+      }
+    } else {
+      const bool is_mla = src_ptrs.size() == 1;
+      const int64_t num_layers = is_mla ? dst_ptrs.size() : dst_ptrs.size() / 2;
+      for (const auto i : c10::irange(num_pages)) {
+        const int64_t s_index = src_indices_ptr[i * page_size] / page_size;
+        const int64_t d_index = dst_indices_ptr[i * page_size];
+        for (int64_t j = 0; j < num_layers; ++j) {
+          transfer_page_direct(
+              src_ptrs[0].select(0, s_index).select(0, start_layer_id + j), dst_ptrs[j], 0, d_index, page_size);
+          if (!is_mla) {
+            transfer_page_direct(
+                src_ptrs[1].select(0, s_index).select(0, start_layer_id + j),
+                dst_ptrs[j + num_layers],
+                0,
+                d_index,
+                page_size);
+          }
+        }
+      }
+    }
+  };
+
+#ifdef USE_ROCM
+  fallback_to_page_copy();
+  return;
+#endif
+
+  auto memcpy_batch_async = get_cudaMemcpyBatchAsync();
+  if (memcpy_batch_async == nullptr) {
+    fallback_to_page_copy();
+    return;
+  }
+
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   size_t num_copies = 0;
   std::vector<void*> batch_srcs;
@@ -909,15 +932,22 @@ inline void transfer_kv_page_first_direct_impl(
   }
 
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
-  dispatch_memcpy_batch(
-      batch_dsts.data(),
-      batch_srcs.data(),
-      batch_sizes.data(),
-      num_copies,
-      &attrs,
-      attrs_idxs.data(),
-      1,
-      stream);
+  if (num_copies > 0) {
+    size_t fail_idx = std::numeric_limits<size_t>::max();
+    cudaError_t err = memcpy_batch_async(
+        batch_dsts.data(),
+        batch_srcs.data(),
+        batch_sizes.data(),
+        num_copies,
+        &attrs,
+        attrs_idxs.data(),
+        1,
+        &fail_idx,
+        stream);
+    if (err != cudaSuccess) {
+      TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+    }
+  }
 }
 
 void transfer_kv_per_layer_direct_pf_lf(
