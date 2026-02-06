@@ -15,6 +15,7 @@ from sglang.jit_kernel.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+logger = logging.getLogger(__name__)
 
 @cache_once
 def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
@@ -40,7 +41,6 @@ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
 
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
-    logger = logging.getLogger(__name__)
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")
         return False
