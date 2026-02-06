@@ -408,6 +408,67 @@ class HFRunner:
         self.in_queue = self.out_queue = None
 
     @staticmethod
+    def _generate_single(
+        model,
+        input_ids,
+        tokenizer,
+        max_new_tokens,
+        output_str_only,
+        token_ids_logprob,
+        patch_model_do_sample_false,
+    ):
+        """Generate output for a single prompt and return results tuple."""
+        if patch_model_do_sample_false:
+            model.generation_config.do_sample = False
+        outputs = model.generate(
+            input_ids=input_ids,
+            generation_config=GenerationConfig(
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                max_new_tokens=max_new_tokens,
+                return_dict_in_generate=True,
+                output_scores=(not output_str_only),
+                disable_compile=True,
+            ),
+        )
+
+        text = tokenizer.decode(
+            outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
+        )
+        if not text.strip():
+            raise ValueError(
+                "Received an empty text response. "
+                "Please verify your input or model configuration."
+            )
+
+        top_output = None
+        top_input = None
+        tid_output = None
+        tid_input = None
+        if not output_str_only:
+            top_output = [
+                get_top_logprobs(logits[0], NUM_TOP_LOGPROBS).tolist()
+                for logits in outputs.scores
+            ]
+            if token_ids_logprob is not None:
+                tid_output = [
+                    get_token_ids_logprobs(logits[0], token_ids_logprob).tolist()
+                    for logits in outputs.scores
+                ]
+            del outputs
+
+            input_logits = model.forward(input_ids).logits[0]
+            top_input = get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
+            if token_ids_logprob is not None:
+                tid_input = get_token_ids_logprobs(
+                    input_logits, token_ids_logprob
+                ).tolist()
+            del input_logits
+
+        return text, top_output, top_input, tid_output, tid_input
+
+    @staticmethod
     def forward_generation_raw(
         base_model,
         prompts: Union[List[str], List[torch.Tensor]],
@@ -419,137 +480,101 @@ class HFRunner:
         token_ids_logprob: Optional[int] = None,
         patch_model_do_sample_false: Optional[bool] = False,
     ) -> ModelOutput:
-        output_strs = []
-        top_input_logprobs = []
-        top_output_logprobs = []
-        if token_ids_logprob is not None:
-            token_ids_input_logprobs = []
-            token_ids_output_logprobs = []
-        else:
-            token_ids_input_logprobs = token_ids_output_logprobs = None
+        n = len(prompts)
+        results = [None] * n
 
-        # Persist PeftModel across calls to avoid base_model corruption.
-        # PeftModel.from_pretrained() modifies base_model in place, and unload()
-        # doesn't fully restore state. Instead, keep the PeftModel alive and use
-        # disable_adapter() for base model inference.
-        peft_model = getattr(base_model, "_peft_wrapper", None)
+        # Encode all prompts upfront
+        all_input_ids = []
+        for p in prompts:
+            if isinstance(p, str):
+                all_input_ids.append(
+                    tokenizer.encode(p, return_tensors="pt").to(get_device())
+                )
+            else:
+                all_input_ids.append(torch.tensor([p], device=get_device()))
 
-        has_any_lora = lora_paths is not None and any(p is not None for p in lora_paths)
-        if has_any_lora:
-            from peft import PeftModel
+        gen_kwargs = dict(
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+            output_str_only=output_str_only,
+            token_ids_logprob=token_ids_logprob,
+            patch_model_do_sample_false=patch_model_do_sample_false,
+        )
 
+        # Phase 1: Process base model (None adapter) prompts FIRST on the
+        # clean base model, before PeftModel.from_pretrained() modifies it.
+        # peft's disable_adapter() is not numerically identical to the clean
+        # base model, so we must run base prompts before any wrapping.
+        for i in range(n):
+            if lora_paths is None or lora_paths[i] is None:
+                results[i] = HFRunner._generate_single(
+                    base_model, all_input_ids[i], **gen_kwargs
+                )
+
+        # Phase 2: Process LoRA adapter prompts.
+        # Load all unique adapters into a single PeftModel, then switch.
+        peft_model = None
+        adapter_names = {}
+        if lora_paths is not None:
             unique_paths = list(dict.fromkeys(p for p in lora_paths if p is not None))
-            for path in unique_paths:
-                adapter_name = path.replace("/", "_")
-                if peft_model is not None:
-                    if adapter_name not in peft_model.peft_config:
+            if unique_paths:
+                from peft import PeftModel
+
+                for path in unique_paths:
+                    adapter_name = path.replace("/", "_")
+                    if peft_model is None:
+                        peft_model = PeftModel.from_pretrained(
+                            base_model,
+                            path,
+                            adapter_name=adapter_name,
+                            torch_dtype=torch_dtype,
+                            is_trainable=False,
+                        )
+                    else:
                         peft_model.load_adapter(
                             path,
                             adapter_name=adapter_name,
                             is_trainable=False,
                         )
-                else:
-                    peft_model = PeftModel.from_pretrained(
-                        base_model,
-                        path,
-                        adapter_name=adapter_name,
-                        torch_dtype=torch_dtype,
-                        is_trainable=False,
+                    adapter_names[path] = adapter_name
+
+            for i in range(n):
+                if lora_paths[i] is not None:
+                    peft_model.set_adapter(adapter_names[lora_paths[i]])
+                    results[i] = HFRunner._generate_single(
+                        peft_model, all_input_ids[i], **gen_kwargs
                     )
 
-        for i, p in enumerate(prompts):
-            if isinstance(p, str):
-                input_ids = tokenizer.encode(p, return_tensors="pt").to(get_device())
-            else:
-                input_ids = torch.tensor([p], device=get_device())
-
-            use_base_model = lora_paths is None or lora_paths[i] is None
-
-            if not use_base_model:
-                adapter_name = lora_paths[i].replace("/", "_")
-                peft_model.enable_adapter_layers()
-                peft_model.set_adapter(adapter_name)
-                model = peft_model
-            elif peft_model is not None:
-                model = peft_model
-            else:
-                model = base_model
-
-            if patch_model_do_sample_false:
-                model.generation_config.do_sample = False
-
-            generation_config = GenerationConfig(
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-                max_new_tokens=max_new_tokens,
-                return_dict_in_generate=True,
-                output_scores=(not output_str_only),
-                disable_compile=True,
-            )
-
-            if use_base_model and peft_model is not None:
-                with peft_model.disable_adapter():
-                    outputs = model.generate(
-                        input_ids=input_ids,
-                        generation_config=generation_config,
-                    )
-            else:
-                outputs = model.generate(
-                    input_ids=input_ids,
-                    generation_config=generation_config,
-                )
-
-            text = tokenizer.decode(
-                outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
-            )
-
-            # Check if the text is empty or only whitespace.
-            if not text.strip():
-                raise ValueError(
-                    "Received an empty text response. Please verify your input or model configuration."
-                )
-            output_strs.append(text)
-
-            if not output_str_only:
-                # outputs.scores: (num_token, 1, vocab_size)
-                top_output_logprobs.append(
-                    [
-                        get_top_logprobs(logits[0], NUM_TOP_LOGPROBS).tolist()
-                        for logits in outputs.scores
-                    ]
-                )
-                if token_ids_logprob is not None:
-                    token_ids_output_logprobs.append(
-                        [
-                            get_token_ids_logprobs(
-                                logits[0], token_ids_logprob
-                            ).tolist()
-                            for logits in outputs.scores
-                        ]
-                    )
-                del outputs
-
-                # Use context manager for forward pass too
-                if use_base_model and peft_model is not None:
-                    with peft_model.disable_adapter():
-                        input_logits = model.forward(input_ids).logits[0]
-                else:
-                    input_logits = model.forward(input_ids).logits[0]
-                top_input_logprobs.append(
-                    get_top_logprobs(input_logits, NUM_TOP_LOGPROBS).tolist()
-                )
-                if token_ids_logprob is not None:
-                    token_ids_input_logprobs.append(
-                        get_token_ids_logprobs(input_logits, token_ids_logprob).tolist()
-                    )
-                del input_logits
-
-        # Persist peft_model for reuse across calls (don't unload - it corrupts
-        # the base model). Store reference on base_model to keep it alive.
+        # Unload adapters to restore base_model for the next call.
+        # Since we never merge adapters, unload() restores original weights.
+        # Also clean up leftover peft metadata to prevent warnings on
+        # subsequent PeftModel.from_pretrained() calls.
         if peft_model is not None:
-            peft_model.disable_adapter_layers()
-            base_model._peft_wrapper = peft_model
+            peft_model.unload()
+            for attr in [
+                "peft_config",
+                "peft_type",
+                "active_adapter",
+                "active_adapters",
+            ]:
+                if hasattr(base_model, attr):
+                    delattr(base_model, attr)
+
+        # Assemble results in original order
+        output_strs = []
+        top_input_logprobs = []
+        top_output_logprobs = []
+        token_ids_input_logprobs = [] if token_ids_logprob is not None else None
+        token_ids_output_logprobs = [] if token_ids_logprob is not None else None
+
+        for text, top_out, top_in, tid_out, tid_in in results:
+            output_strs.append(text)
+            if not output_str_only:
+                top_output_logprobs.append(top_out)
+                top_input_logprobs.append(top_in)
+                if token_ids_logprob is not None:
+                    token_ids_output_logprobs.append(tid_out)
+                    token_ids_input_logprobs.append(tid_in)
 
         return ModelOutput(
             output_strs=output_strs,
