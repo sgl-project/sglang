@@ -51,7 +51,7 @@ class RMSNorm(CustomOp):
         var_hidden_size: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
@@ -318,6 +318,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_scale_residual_norm_scale_shift,
         )
+
+        if isinstance(gate, int) and gate != 1:
+            raise ValueError(
+                f"Only gate value of 1 is supported for int type, but got {gate}"
+            )
 
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
