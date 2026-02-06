@@ -143,10 +143,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         all_scheme_dicts = [
             quant_config.get_scheme_dict(layer, name) for name in unfused_names
         ]
-        scheme_dict = all_scheme_dicts.pop()
+        scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
 
         # multiple schemes found
-        if not all([cur_dict == scheme_dict for cur_dict in all_scheme_dicts]):
+        if not all(d == scheme_dict for d in all_scheme_dicts):
             raise ValueError(
                 "All MoE projections need to have same "
                 "quantization scheme but found multiple"
