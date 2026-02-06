@@ -192,14 +192,15 @@ class TestROPE(CustomTestCase):
         )
         query = query.view(num_tokens, num_heads, head_size)
         key = key.view(num_tokens, num_heads, head_size)
-        cos = torch.rand(num_tokens, head_size).to(torch.float32)
-        sin = torch.rand(num_tokens, head_size).to(torch.float32)
-        q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
-        q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
-            query, key, cos, sin
-        )
-        torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
-        torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
+        for sincos_dtype in [torch.float32, torch.bfloat16]:
+            cos = torch.rand(num_tokens, head_size).to(sincos_dtype)
+            sin = torch.rand(num_tokens, head_size).to(sincos_dtype)
+            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+            q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
+                query, key, cos, sin
+            )
+            torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
