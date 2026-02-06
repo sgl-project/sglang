@@ -48,7 +48,7 @@ from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
     is_cpu,
-    is_cuda_alike,
+    is_cuda,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -56,7 +56,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
-_is_cuda_alike = is_cuda_alike()
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -385,9 +385,9 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         seq_len, _ = hidden_states.shape
         if (
-            seq_len < DUAL_STREAM_TOKEN_THRESHOLD
-            and self.alt_stream is not None
+            self.alt_stream is not None
             and get_is_capture_mode()
+            and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -830,7 +830,7 @@ class Qwen3NextModel(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda_alike else None
+        alt_stream = torch.cuda.Stream() if _is_cuda else None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
