@@ -16,7 +16,7 @@ jobs:
     environment: 'prod'
     strategy:
       matrix:
-        gpu_arch: ['gfx942', 'gfx942-rocm700', 'gfx950']
+        gpu_arch: ['gfx942', 'gfx950']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -56,8 +56,6 @@ jobs:
           echo "Version: ${version}"
 
           if [ "${{ matrix.gpu_arch }}" = "gfx942" ]; then
-            rocm_tag="rocm630-mi30x"
-          elif [ "${{ matrix.gpu_arch }}" = "gfx942-rocm700" ]; then
             rocm_tag="rocm700-mi30x"
           elif [ "${{ matrix.gpu_arch }}" = "gfx950" ]; then
             rocm_tag="rocm700-mi35x"
@@ -69,5 +67,5 @@ jobs:
           tag=v${version}-${rocm_tag}
 
           # rocm.Dockerfile expects SGL_BRANCH with 'v' prefix for git tag checkout
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg SGL_BRANCH=v${version} -t lmsysorg/sglang:${tag} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t lmsysorg/sglang:${tag} --no-cache
           docker push lmsysorg/sglang:${tag}

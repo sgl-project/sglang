@@ -20,12 +20,15 @@ from sglang.multimodal_gen.configs.models import (
     VAEConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
+from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
-from sglang.multimodal_gen.runtime.distributed import (
+from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
-    sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -131,8 +134,14 @@ def shard_rotary_emb_for_sp(emb):
 
 def maybe_unpad_latents(latents, batch):
     # If SP padding was applied, remove extra tokens before reshaping
-    width, height = batch.raw_latent_shape[-1], batch.raw_latent_shape[-2]
-    target_tokens = width * height
+    raw_shape = batch.raw_latent_shape
+    if len(raw_shape) == 3:
+        # Sequence format [B, S, D]: use seq_len directly
+        target_tokens = raw_shape[1]
+    else:
+        # Spatial format [B, C, H, W] or [B, C, T, H, W]: use width * height
+        width, height = raw_shape[-1], raw_shape[-2]
+        target_tokens = width * height
     if latents.shape[1] > target_tokens:
         latents = latents[:, :target_tokens, :]
     return latents
@@ -486,6 +495,11 @@ class PipelineConfig:
 
         DiTConfig.add_cli_args(parser, prefix=f"{prefix_with_dot}dit-config")
 
+        # Add T5 configuration arguments
+        from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+
+        T5Config.add_cli_args(parser, prefix=f"{prefix_with_dot}t5-config")
+
         return parser
 
     def update_config_from_dict(self, args: dict[str, Any], prefix: str = "") -> None:
@@ -497,6 +511,14 @@ class PipelineConfig:
         update_config_from_args(
             self.dit_config, args, f"{prefix_with_dot}dit_config", pop_args=True
         )
+        for text_encoder_config in self.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                update_config_from_args(
+                    text_encoder_config,
+                    args,
+                    f"{prefix_with_dot}t5_config",
+                    pop_args=True,
+                )
 
     @classmethod
     def from_kwargs(
@@ -547,7 +569,7 @@ class PipelineConfig:
                     f"using {pipeline_config_cls.__name__} directly without model_index.json"
                 )
             else:
-                model_info = get_model_info(model_path)
+                model_info = get_model_info(model_path, backend=kwargs.get("backend"))
                 if model_info is None:
                     from sglang.multimodal_gen.registry import (
                         _PIPELINE_CONFIG_REGISTRY,
@@ -563,7 +585,7 @@ class PipelineConfig:
                     )
                 pipeline_config_cls = model_info.pipeline_config_cls
         else:
-            model_info = get_model_info(model_path)
+            model_info = get_model_info(model_path, backend=kwargs.get("backend"))
             if model_info is None:
                 raise ValueError(
                     f"Could not get model info for '{model_path}'. "
