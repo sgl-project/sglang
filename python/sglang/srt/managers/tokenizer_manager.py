@@ -1868,7 +1868,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 and len(recv_obj.spec_acceptance_histogram) > i
                 and recv_obj.spec_acceptance_histogram[i]
             ):
-                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[i]
+                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
+                    i
+                ]
 
     def _calculate_timing_metrics(
         self,

@@ -865,7 +865,7 @@ class Req:
 
     def update_spec_acceptance_histogram(self, accepted_draft_tokens: int):
         """Update the speculative decoding acceptance histogram.
-        
+
         Args:
             accepted_draft_tokens: Number of draft tokens accepted in this step.
         """
