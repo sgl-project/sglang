@@ -16,7 +16,6 @@ class MooncakeEmbeddingStore(MooncakeBaseStore):
         MooncakeDistributedStore = self._import_mooncake_store()
         self.store = MooncakeDistributedStore()
         self.config = self._load_config(storage_config)
-        self.store = MooncakeDistributedStore()
         ret_code = self.store.setup(
             self.config.local_hostname,
             self.config.metadata_server,
