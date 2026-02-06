@@ -56,7 +56,7 @@ class KVCacheEvent(
     """Base class for all KV cache-related events"""
 
 
-# Medium values for storage tiers (compatible with vLLM)
+# Medium values for hicache storage tiers 
 MEDIUM_GPU = "GPU"
 MEDIUM_CPU = "CPU_PINNED"
 
