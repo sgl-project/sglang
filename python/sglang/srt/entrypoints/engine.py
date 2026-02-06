@@ -42,13 +42,16 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -230,7 +233,9 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -266,7 +271,9 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -315,7 +322,9 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -352,7 +361,9 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -368,6 +379,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
@@ -380,6 +392,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            external_trace_header=external_trace_header,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -393,6 +406,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
@@ -407,6 +421,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            external_trace_header=external_trace_header,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -438,6 +453,37 @@ class Engine(EngineBase):
 
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def open_session(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Open a session for multi-turn conversation with shared context.
+
+        Args:
+            capacity_of_str_len: Maximum string length capacity for the session.
+            session_id: Optional session ID. If not provided, a UUID will be generated.
+
+        Returns:
+            The session ID (either the provided one or a newly generated UUID).
+        """
+        obj = OpenSessionReqInput(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.open_session(obj, None)
+        )
+
+    def close_session(self, session_id: str) -> None:
+        """Close a session and release its resources.
+
+        Args:
+            session_id: The session ID to close.
+        """
+        obj = CloseSessionReqInput(session_id=session_id)
+        self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
@@ -590,6 +636,22 @@ class Engine(EngineBase):
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def load_lora_adapter_from_tensors(
+        self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+    ):
+        # Load LoRA adapter again
+        serialized_tensors = MultiprocessingSerializer.serialize(
+            tensors, output_str=True
+        )
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
@@ -775,7 +837,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.5.3",
+                "0.6.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -783,7 +845,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sgl-kernel",
-                "0.3.20",
+                "0.3.21",
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
@@ -809,6 +871,31 @@ def _set_envs_and_config(server_args: ServerArgs):
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
+
+
+def _wait_for_scheduler_ready(
+    scheduler_pipe_readers: List,
+    scheduler_procs: List,
+) -> List[Dict]:
+    """Wait for the model to finish loading and return scheduler infos."""
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
+
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+    return scheduler_infos
 
 
 def _launch_scheduler_processes(
@@ -920,13 +1007,13 @@ def _launch_subprocesses(
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
 
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            assert data["status"] == "ready"
+        scheduler_infos = _wait_for_scheduler_ready(
+            scheduler_pipe_readers, scheduler_procs
+        )
 
         if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
             # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None, port_args
+            return None, None, scheduler_infos, port_args
 
         launch_dummy_health_check_server(
             server_args.host, server_args.port, server_args.enable_metrics
@@ -937,7 +1024,7 @@ def _launch_subprocesses(
             logger.error(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
-        return None, None, None, port_args
+        return None, None, scheduler_infos, port_args
 
     # Launch detokenizer process
     detoken_proc = mp.Process(
@@ -960,23 +1047,7 @@ def _launch_subprocesses(
         template_manager = None
 
     # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
+    scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
 
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]

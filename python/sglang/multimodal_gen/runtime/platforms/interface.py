@@ -7,7 +7,7 @@ from __future__ import annotations
 import enum
 import random
 from functools import lru_cache
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -33,6 +33,8 @@ class AttentionBackendEnum(enum.Enum):
     VIDEO_SPARSE_ATTN = enum.auto()
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
+    SLA_ATTN = enum.auto()
+    SAGE_SLA_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -45,6 +47,7 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    MUSA = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -76,6 +79,7 @@ class Platform:
     _enum: PlatformEnum
     device_name: str
     device_type: str
+    device: torch.device | None = None  # Dummy attribute for compatibility
 
     # available dispatch keys:
     # check https://github.com/pytorch/pytorch/blob/313dac6c1ca0fa0cde32477509cce32089f8532a/torchgen/model.py#L134 # noqa
@@ -116,6 +120,13 @@ class Platform:
 
     @classmethod
     @lru_cache(maxsize=1)
+    def is_hopper(cls):
+        if not cls.is_cuda_static():
+            return False
+        return torch.cuda.get_device_capability() == (9, 0)
+
+    @classmethod
+    @lru_cache(maxsize=1)
     def is_sm120(cls):
         if not cls.is_cuda_static():
             return False
@@ -147,7 +158,7 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda_alike(self) -> bool:
         """Stateless version of :func:`torch.cuda.is_available`."""
-        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM, PlatformEnum.MUSA)
 
     @lru_cache(maxsize=1)
     def is_mps(self) -> bool:
@@ -216,6 +227,7 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
@@ -308,6 +320,19 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    def get_available_gpu_memory(
+        cls,
+        device_id: int = 0,
+        distributed: bool = False,
+        empty_cache: bool = True,
+        cpu_group: Any = None,
+    ) -> float:
+        """
+        Return the available memory in GiB.
+        """
+        raise NotImplementedError
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         """
         Get device specific communicator class for distributed communication.
@@ -318,6 +343,11 @@ class Platform:
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """Whether to enable DIT layerwise offload by default on the current platform."""
+        return True
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)

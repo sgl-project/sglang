@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
 
@@ -11,6 +12,11 @@
 #include <type_traits>
 
 namespace device::warp {
+
+template <typename T, std::size_t N>
+struct device_vec {
+  T data[N];
+};
 
 namespace details {
 

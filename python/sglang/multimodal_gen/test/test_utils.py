@@ -1,21 +1,14 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
-import dataclasses
 import json
 import os
-import shlex
 import socket
-import subprocess
-import sys
 import time
-import unittest
 from pathlib import Path
-from typing import Optional
 
 import cv2
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -33,31 +26,6 @@ def is_image_url(image_path: str | Path | None) -> bool:
     return isinstance(image_path, str) and (
         image_path.startswith("http://") or image_path.startswith("https://")
     )
-
-
-def run_command(command) -> Optional[float]:
-    """Runs a command and returns the execution time and status."""
-    print(f"Running command: {shlex.join(command)}")
-
-    duration = None
-    with subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-    ) as process:
-        for line in process.stdout:
-            sys.stdout.write(line)
-            if "Pixel data generated" in line:
-                words = line.split(" ")
-                duration = float(words[-2])
-
-    if process.returncode == 0:
-        return duration
-    else:
-        print(f"Command failed with exit code {process.returncode}")
-        return None
 
 
 def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:
@@ -309,7 +277,7 @@ def _get_video_dimensions_from_metadata(
     if width == 0 or height == 0:
         return None
 
-    return (int(width), int(height))
+    return int(width), int(height)
 
 
 def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
@@ -321,8 +289,6 @@ def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
     Returns:
         Tuple of (width, height)
 
-    Raises:
-        ValueError: If unable to read a frame from the video
     """
     ret, frame = cap.read()
     if not ret or frame is None:
@@ -330,7 +296,7 @@ def _get_video_dimensions_from_frame(cap: cv2.VideoCapture) -> tuple[int, int]:
 
     # frame.shape is (height, width, channels)
     height, width = frame.shape[:2]
-    return (int(width), int(height))
+    return int(width), int(height)
 
 
 def get_video_dimensions(file_path: str) -> tuple[int, int]:
@@ -338,14 +304,9 @@ def get_video_dimensions(file_path: str) -> tuple[int, int]:
 
     Tries to get dimensions from metadata first, falls back to reading first frame.
 
-    Args:
-        file_path: Path to the video file
-
     Returns:
         Tuple of (width, height)
 
-    Raises:
-        ValueError: If unable to get video dimensions
     """
     cap = cv2.VideoCapture(file_path)
     try:
@@ -397,199 +358,3 @@ def validate_video_file(
         assert (
             actual_height == expected_height
         ), f"Video height mismatch: expected {expected_height}, got {actual_height}"
-
-
-@dataclasses.dataclass
-class TestResult:
-    name: str
-    key: str
-    duration: Optional[float]
-    succeed: bool
-
-    @property
-    def duration_str(self):
-        return f"{self.duration:.4f}" if self.duration else "NA"
-
-
-class TestCLIBase(unittest.TestCase):
-    model_path: str = None
-    extra_args = []
-    data_type: DataType = None
-    # tested on h100
-    thresholds = {}
-
-    width: int = 720
-    height: int = 720
-    output_path: str = "test_outputs"
-
-    base_command = [
-        "sglang",
-        "generate",
-        "--text-encoder-cpu-offload",
-        "--pin-cpu-memory",
-        "--prompt",
-        "A curious raccoon",
-        "--save-output",
-        "--log-level=debug",
-        f"--width={width}",
-        f"--height={height}",
-        f"--output-path={output_path}",
-    ]
-
-    results = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.results = []
-
-    def _run_command(self, name: str, model_path: str, test_key: str = "", args=[]):
-        command = (
-            self.base_command
-            + [f"--model-path={model_path}"]
-            + shlex.split(args or "")
-            + ["--output-file-name", f"{name}"]
-            + self.extra_args
-        )
-        duration = run_command(command)
-        status = "Success" if duration else "Failed"
-        succeed = duration is not None
-
-        duration = float(duration) if succeed else None
-        self.results.append(TestResult(name, test_key, duration, succeed))
-
-        return name, duration, status
-
-
-class TestGenerateBase(TestCLIBase):
-    model_path: str = None
-    extra_args = []
-    data_type: DataType = None
-    # tested on h100
-    thresholds = {}
-
-    width: int = 720
-    height: int = 720
-    output_path: str = "test_outputs"
-    image_path: str | None = None
-    prompt: str | None = "A curious raccoon"
-
-    base_command = [
-        "sglang",
-        "generate",
-        # "--text-encoder-cpu-offload",
-        # "--pin-cpu-memory",
-        f"--prompt",
-        f"{prompt}",
-        "--save-output",
-        "--log-level=debug",
-        f"--width={width}",
-        f"--height={height}",
-        f"--output-path={output_path}",
-    ]
-
-    results: list[TestResult] = []
-
-    @classmethod
-    def setUpClass(cls):
-        cls.results = []
-
-    @classmethod
-    def tearDownClass(cls):
-        # Print markdown table
-        print("\n## Test Results\n")
-        print("| Test Case                      | Duration | Status  |")
-        print("|--------------------------------|----------|---------|")
-        test_keys = ["test_single_gpu", "test_cfg_parallel", "test_usp", "test_mixed"]
-        test_key_to_order = {
-            test_key: order for order, test_key in enumerate(test_keys)
-        }
-
-        ordered_results: list[TestResult] = [None] * len(test_keys)
-        for result in cls.results:
-            order = test_key_to_order[result.key]
-            ordered_results[order] = result
-
-        for result in ordered_results:
-            if not result:
-                continue
-            status = (
-                "Succeed"
-                if (
-                    result.succeed
-                    and float(result.duration) <= float(cls.thresholds[result.key])
-                )
-                else "Failed"
-            )
-            print(f"| {result.name:<30} | {result.duration_str:<8} | {status:<7} |")
-        print()
-        durations = [result.duration_str for result in cls.results]
-        print(" | ".join([""] + durations + [""]))
-
-    def _run_test(self, name: str, args, model_path: str, test_key: str):
-        time_threshold = self.thresholds[test_key]
-        name, duration, status = self._run_command(
-            name, args=args, model_path=model_path, test_key=test_key
-        )
-        self.verify(status, name, duration, time_threshold)
-
-    def verify(self, status, name, duration, time_threshold):
-        print("-" * 80)
-        print("\n" * 3)
-
-        # test task status
-        self.assertEqual(status, "Success", f"{name} command failed")
-        self.assertIsNotNone(duration, f"Could not parse duration for {name}")
-        self.assertLessEqual(
-            duration,
-            time_threshold,
-            f"{name} failed with {duration:.4f}s > {time_threshold}s",
-        )
-
-        # test output file
-        path = os.path.join(
-            self.output_path, f"{name}.{self.data_type.get_default_extension()}"
-        )
-        self.assertTrue(os.path.exists(path), f"Output file not exist for {path}")
-        if self.data_type == DataType.IMAGE:
-            with Image.open(path) as image:
-                check_image_size(self, image, self.width, self.height)
-        logger.info(f"{name} passed in {duration:.4f}s (threshold: {time_threshold}s)")
-
-    def model_name(self):
-        return self.model_path.split("/")[-1]
-
-    def test_single_gpu(self):
-        """single gpu"""
-        self._run_test(
-            name=f"{self.model_name()}_single_gpu",
-            args=None,
-            model_path=self.model_path,
-            test_key="test_single_gpu",
-        )
-
-    def test_cfg_parallel(self):
-        """cfg parallel"""
-        self._run_test(
-            name=f"{self.model_name()}_cfg_parallel",
-            args="--num-gpus 2 --enable-cfg-parallel",
-            model_path=self.model_path,
-            test_key="test_cfg_parallel",
-        )
-
-    def test_usp(self):
-        """usp"""
-        self._run_test(
-            name=f"{self.model_name()}_usp",
-            args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
-            model_path=self.model_path,
-            test_key="test_usp",
-        )
-
-    def test_mixed(self):
-        """mixed"""
-        self._run_test(
-            name=f"{self.model_name()}_mixed",
-            args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",
-            model_path=self.model_path,
-            test_key="test_mixed",
-        )

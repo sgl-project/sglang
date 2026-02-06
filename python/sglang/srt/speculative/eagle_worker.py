@@ -19,7 +19,6 @@ from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -186,6 +185,15 @@ class EAGLEWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        self.eagle_use_aux_hidden_state = False
+        if self.speculative_algorithm.is_eagle3():
+            self.eagle_use_aux_hidden_state = True
+            eagle_config = getattr(
+                self.draft_model_runner.model_config.hf_config, "eagle_config", {}
+            )
+            self.eagle_use_aux_hidden_state = eagle_config.get(
+                "use_aux_hidden_state", True
+            )
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -366,9 +374,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
-        if isinstance(batch.tree_cache, SWAChunkCache):
-            for req in batch.reqs:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
 
         # Parse args
         num_seqs = batch.batch_size()
@@ -386,10 +394,11 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
+            alloc_len_per_decode = self.speculative_num_steps * self.topk
             # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
-                num_seqs * self.speculative_num_steps * self.topk,
+                num_seqs * alloc_len_per_decode,
                 backup_state=True,
             )
         else:
@@ -895,6 +904,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_size = (
                 self.model_config.hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
+                and self.eagle_use_aux_hidden_state
                 else self.model_config.hidden_size
             )
             batch.spec_info = EagleDraftInput.create_idle_input(
