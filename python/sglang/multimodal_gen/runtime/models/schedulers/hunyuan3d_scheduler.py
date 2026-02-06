@@ -111,6 +111,14 @@ class Hunyuan3DFlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         """
         self._begin_index = begin_index
 
+    def scale_model_input(
+        self,
+        sample: torch.FloatTensor,
+        timestep: Optional[Union[float, torch.FloatTensor]] = None,
+    ) -> torch.FloatTensor:
+        """Identity operation for flow matching (no input scaling needed)."""
+        return sample
+
     def scale_noise(
         self,
         sample: torch.FloatTensor,
@@ -342,6 +350,14 @@ class Hunyuan3DConsistencyFlowMatchEulerDiscreteScheduler(SchedulerMixin, Config
 
     def set_begin_index(self, begin_index: int = 0):
         self._begin_index = begin_index
+
+    def scale_model_input(
+        self,
+        sample: torch.FloatTensor,
+        timestep: Optional[Union[float, torch.FloatTensor]] = None,
+    ) -> torch.FloatTensor:
+        """Identity operation for flow matching (no input scaling needed)."""
+        return sample
 
     def _sigma_to_t(self, sigma: float) -> float:
         return sigma * self.config.num_train_timesteps
