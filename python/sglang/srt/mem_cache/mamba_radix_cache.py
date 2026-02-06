@@ -50,6 +50,7 @@ from sglang.srt.mem_cache.radix_cache import (
     get_child_key,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -58,6 +59,10 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+MARCONI_EVICTION_MAX_CANDIDATES = max(
+    1, get_int_env_var("SGLANG_MARCONI_EVICTION_MAX_CANDIDATES", 512)
+)
 
 
 class TreeNode:
@@ -409,6 +414,7 @@ class MambaRadixCache(BasePrefixCache):
                 self.marconi_mamba_layer_mask_indices,
                 self.marconi_mamba_layer_mask_full_bits,
             ) = self._parse_mamba_layer_mask(self.marconi_config.mamba_layer_mask)
+            self.marconi_eviction_max_candidates = MARCONI_EVICTION_MAX_CANDIDATES
         self.marconi_admission_tree = (
             MarconiAdmissionTree(
                 min_hits=self.marconi_admission_min_hits,
@@ -1436,7 +1442,7 @@ class MambaRadixCache(BasePrefixCache):
             return 0
         return int(node.mamba_layer_mask_bits.bit_count())
 
-    def _marconi_collect_leaf_nodes(self) -> List[TreeNode]:
+    def _marconi_collect_leaf_nodes_full_scan(self) -> List[TreeNode]:
         nodes = []
         for node in self._collect_leaves():
             if node == self.root_node:
@@ -1445,7 +1451,19 @@ class MambaRadixCache(BasePrefixCache):
                 nodes.append(node)
         return nodes
 
-    def _marconi_collect_leaf_and_single_child_nodes(self) -> List[TreeNode]:
+    def _marconi_collect_leaf_nodes(self) -> List[TreeNode]:
+        max_candidates = self.marconi_eviction_max_candidates
+        nodes = []
+        node = self.full_lru_list.get_leaf_lru_no_lock()
+        while self.full_lru_list.in_list(node) and len(nodes) < max_candidates:
+            if node.mamba_lock_ref == 0:
+                nodes.append(node)
+            node = self.full_lru_list.get_prev_leaf_no_lock(node)
+        if nodes:
+            return nodes
+        return self._marconi_collect_leaf_nodes_full_scan()
+
+    def _marconi_collect_leaf_and_single_child_nodes_full_scan(self) -> List[TreeNode]:
         nodes = []
         stack = [self.root_node]
         while stack:
@@ -1461,6 +1479,27 @@ class MambaRadixCache(BasePrefixCache):
                     nodes.append(node)
             stack.extend(node.children.values())
         return nodes
+
+    def _marconi_collect_leaf_and_single_child_nodes(self) -> List[TreeNode]:
+        max_candidates = self.marconi_eviction_max_candidates
+        nodes = []
+        node = self.mamba_lru_list.get_lru_no_lock()
+        while self.mamba_lru_list.in_list(node) and len(nodes) < max_candidates:
+            if (
+                node != self.root_node
+                and len(node.children) <= 1
+                and node.mamba_value is not None
+            ):
+                # For leaf nodes (no children), evicting them frees both KV and Mamba,
+                # so we need both full_lock_ref == 0 and mamba_lock_ref == 0.
+                # For internal nodes (one child), we only tombstone the Mamba state,
+                # so only mamba_lock_ref == 0 is required.
+                if len(node.children) > 0 or node.full_lock_ref == 0:
+                    nodes.append(node)
+            node = self.mamba_lru_list.get_prev_no_lock(node)
+        if nodes:
+            return nodes
+        return self._marconi_collect_leaf_and_single_child_nodes_full_scan()
 
     def _marconi_compute_utilities(self, nodes: List[TreeNode]) -> List[float]:
         stats = self.marconi_model_stats
