@@ -282,26 +282,6 @@ class ComponentLoader(ABC):
         if module_type == "vocoder" or module_type == "connectors":
             transformers_or_diffusers = "diffusers"
 
-        # Hunyuan3D shape components - use lazy import to keep this module clean
-        hy3d_shape_modules = {
-            "hy3dshape_model",
-            "hy3dshape_vae",
-            "hy3dshape_scheduler",
-            "hy3dshape_conditioner",
-            "hy3dshape_image_processor",
-        }
-
-        if module_type in hy3d_shape_modules:
-            # Lazy import to avoid circular imports and keep this module clean
-            from sglang.multimodal_gen.runtime.loader.hunyuan3d_loader import (
-                Hunyuan3DShapeLoader,
-            )
-
-            assert (
-                transformers_or_diffusers == "diffusers"
-            ), f"{module_type} must be loaded from diffusers, got {transformers_or_diffusers}"
-            return Hunyuan3DShapeLoader()
-
         if module_type in module_loaders:
             loader_cls, expected_library = module_loaders[module_type]
             # Assert that the library matches what's expected for this module type

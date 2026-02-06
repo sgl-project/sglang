@@ -1920,12 +1920,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
 
         Args:
             pretrained_model_name_or_path: Path to the pretrained model directory.
-            **kwargs: Additional arguments (e.g., torch_dtype).
+            **kwargs: Additional arguments (e.g., dtype).
 
         Returns:
             Loaded UNet2p5DConditionModel instance.
         """
-        torch_dtype = kwargs.pop("torch_dtype", torch.float32)
+        torch_dtype = kwargs.pop("dtype", kwargs.pop("torch_dtype", torch.float32))
         config_path = _os.path.join(pretrained_model_name_or_path, "config.json")
         unet_ckpt_path = _os.path.join(
             pretrained_model_name_or_path, "diffusion_pytorch_model.bin"
