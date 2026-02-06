@@ -347,7 +347,7 @@ class MoEGate(nn.Module):
                 logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
                 )
-            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
+            elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256 and self.weight.shape[0] <= 256:
                 logits = aiter_dsv3_router_gemm(
                     hidden_states, self.weight, gemm_output_zero_allocator
                 )
