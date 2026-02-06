@@ -390,15 +390,11 @@ class GPUWorker:
             return OutputBatch(error="Profiler is already running")
 
         try:
-            # Note: The profiler uses singleton pattern - it registers itself as _instance
-            # profile_id is used for trace filename correlation with HTTP Server trace
             profiler = SGLDiffusionProfiler(
                 request_id=profile_id,
                 rank=self.rank,
                 full_profile=True,  # Always profile all stages
                 activities=activities,
-                num_steps=-1,  # Profile all steps
-                num_inference_steps=100,  # Large number to capture all
                 log_dir=output_dir,
                 with_stack=with_stack,
                 record_shapes=record_shapes,

@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
@@ -102,9 +103,6 @@ async def health_generate():
     return {"status": "ok"}
 
 
-# ============== Profile API ==============
-
-
 class ProfileReqInput(BaseModel):
     """
     Request input for profile endpoints.
@@ -132,7 +130,7 @@ class ProfileReqOutput(BaseModel):
 _global_profiler_state = {
     "profiler": None,
     "is_profiling": False,
-    "profile_id": None,  # Unified profile ID for HTTP Server and GPU Worker
+    "profile_id": None,
 }
 
 
@@ -158,14 +156,8 @@ async def start_profile(request: Request, obj: Optional[ProfileReqInput] = None)
         profile_id = str(int(time_module.time()))
 
         # Read env vars for with_stack and record_shapes
-        env_with_stack = os.getenv("SGLANG_PROFILE_WITH_STACK", "false").lower() in (
-            "true",
-            "1",
-            "yes",
-        )
-        env_record_shapes = os.getenv(
-            "SGLANG_PROFILE_RECORD_SHAPES", "false"
-        ).lower() in ("true", "1", "yes")
+        env_with_stack = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "false")
+        env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "false")
 
         with_stack = obj.with_stack if obj.with_stack is not None else env_with_stack
         record_shapes = (

@@ -9,7 +9,7 @@ Usage:
     sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
     # With profiling:
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-         --backend sglang-image --dataset vbench --task ti2i --num-prompts 5 --profile
+         --backend sglang-image --dataset vbench --task image-to-image --num-prompts 5 --profile
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
@@ -373,14 +373,12 @@ async def async_request_image_sglang(
         if input.guidance_scale is not None:
             data.add_field("guidance_scale", str(input.guidance_scale))
 
-        # Add profiling parameter if set
-        if input.extra_body.get("profile"):
+        # Add profiling and other extra parameters
+        extra_params = input.extra_body.copy()
+        if extra_params.pop("profile", None):
             data.add_field("profile", "true")
-
-        # Merge extra parameters (exclude profile param already handled)
-        for key, value in input.extra_body.items():
-            if key != "profile":
-                data.add_field(key, str(value))
+        for key, value in extra_params.items():
+            data.add_field(key, str(value))
 
         # Add image file(s)
         for idx, img_path in enumerate(input.image_paths):
@@ -777,7 +775,6 @@ async def benchmark(args):
             return await request_func(req, session, pbar)
 
     # Start profiler if --profile is enabled
-    # This captures ALL requests in a single trace file (both HTTP Server and GPU Worker)
     if args.profile:
         profile_output = await async_request_profile(
             api_url=f"{args.base_url}/start_profile"
@@ -960,13 +957,13 @@ if __name__ == "__main__":
         "--num-inference-steps",
         type=int,
         default=None,
-        help="Number of denoising steps (default: model default, e.g., 50 for QwenImage).",
+        help="Number of denoising steps",
     )
     parser.add_argument(
         "--guidance-scale",
         type=float,
         default=None,
-        help="Classifier-free guidance scale (default: model default, e.g., 4.0 for QwenImage).",
+        help="Classifier-free guidance scale",
     )
     parser.add_argument(
         "--output-file", type=str, default=None, help="Output JSON file for metrics."
@@ -977,7 +974,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--profile",
         action="store_true",
-        help="Enable full pipeline profiling (request -> inference -> response). "
+        help="Enable full pipeline profiling"
         "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR (default: ./logs/). ",
     )
     parser.add_argument(

@@ -54,7 +54,6 @@ class StartProfileReq:
 
     output_dir: Optional[str] = None
     profile_id: Optional[str] = None
-    # Activities to profile: ["CPU", "GPU"]
     activities: Optional[List[str]] = None
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
