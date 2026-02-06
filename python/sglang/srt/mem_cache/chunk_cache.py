@@ -77,7 +77,6 @@ class ChunkCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
         kv_indices = self.process_sp_kv_indices(req, kv_indices)
-        self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):

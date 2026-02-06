@@ -84,14 +84,19 @@ class RMSNorm(MultiPlatformOp):
         var_hidden_size: Optional[int] = None,
         cast_x_before_out_mul: bool = False,
         fp32_residual: bool = False,
+        has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
     ) -> None:
         super().__init__()
+        self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+        if self.has_weight:
+            self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+        else:
+            self.weight = torch.ones(hidden_size, dtype=weight_dtype)
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
@@ -351,7 +356,7 @@ class LayerNorm(MultiPlatformOp):
         return F.layer_norm(
             x,
             (self.hidden_size,),
-            weight=self.weight,
+            weight=weight,
             bias=bias,
             eps=self.variance_epsilon,
         ).to(orig_dtype)
