@@ -28,9 +28,10 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device, is_hip, is_xpu
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 
 
 def benchmark_config(
@@ -196,8 +197,8 @@ def benchmark_config(
 class BenchmarkWorker:
 
     def __init__(self, seed: int) -> None:
-        torch.set_default_device("cuda")
-        torch.cuda.manual_seed_all(0)
+        torch.set_default_device(get_device())
+        torch.get_device_module().manual_seed_all(0)
         self.seed = seed
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU.
@@ -280,7 +281,11 @@ class BenchmarkWorker:
     ) -> Dict[str, int]:
         best_config = None
         best_time = float("inf")
-        with torch.cuda.device(self.device_id) if is_hip() else nullcontext():
+        with (
+            torch.get_device_module().device(self.device_id)
+            if _is_xpu or _is_hip
+            else nullcontext()
+        ):
             for config in tqdm(search_space):
                 try:
                     kernel_time = benchmark_config(
