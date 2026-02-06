@@ -109,8 +109,7 @@ else
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
-    # Note: Not using --index-strategy unsafe-best-match to let uv respect [tool.uv.sources] in pyproject.toml
-    PIP_INSTALL_SUFFIX="--prerelease allow"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 fi
@@ -128,6 +127,13 @@ fi
 echo "Installing python extras: [${EXTRAS}]"
 
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
+
+# Force reinstall torch packages from pytorch.org to ensure matching CUDA versions.
+# PyPI's torch 2.9.1 bundles cu128 while torchaudio from pytorch.org uses cu129,
+# causing "partially initialized module 'torchaudio' has no attribute 'lib'" errors.
+# uv pip install does NOT respect [tool.uv.sources] in pyproject.toml, so we must
+# explicitly reinstall from the cu129 index.
+$PIP_CMD install torch torchaudio torchvision --index-url https://download.pytorch.org/whl/${CU_VERSION} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
