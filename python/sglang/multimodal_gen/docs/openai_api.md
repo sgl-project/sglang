@@ -396,13 +396,14 @@ The server supports adjusting output quality and compression levels for both ima
 
 #### Parameters
 
-- **`output_quality`** (string, optional): Preset quality level that automatically sets compression. **Default is `None`**. Valid values:
-  - `"maximum"`: Highest quality (100%)
-  - `"high"`: High quality (90%)
-  - `"medium"`: Medium quality (55%)
-  - `"low"`: Lower quality (35%) - smaller file size
+- **`output_quality`** (string, optional): Preset quality level that automatically sets compression. **Default is `"default"`**. Valid values:
+  - `"maximum"`: Highest quality (100)
+  - `"high"`: High quality (90)
+  - `"medium"`: Medium quality (55)
+  - `"low"`: Lower quality (35)
+  - `"default"`: Auto-adjust based on media type (50 for video, 75 for image)
 
-- **`output_compression`** (integer, optional): Direct compression level override (0-100). **Default is `None`**. When both `output_quality` and `output_compression` are `None`, automatically uses **50 for video** and **75 for image**. Takes precedence over `output_quality` when provided.
+- **`output_compression`** (integer, optional): Direct compression level override (0-100). **Default is `None`**. When provided (not `None`), takes precedence over `output_quality`.
   - `0`: Lowest quality, smallest file size
   - `100`: Highest quality, largest file size
 
@@ -470,6 +471,3 @@ curl -sS -X POST "http://localhost:30000/v1/videos" \
 - **Precedence**: When both `output_quality` and `output_compression` are provided, `output_compression` takes precedence
 - **Format Support**: Quality settings apply to JPEG, and video formats. PNG uses lossless compression and ignores these settings
 - **File Size vs Quality**: Lower compression values (or "low" quality preset) produce smaller files but may show visible artifacts
-- **Default Behavior**: When neither parameter is specified (both are `None`), the system uses format-specific defaults:
-  - **Video**: 50% compression
-  - **Image**: 75% compression

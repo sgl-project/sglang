@@ -97,6 +97,8 @@ class SamplingParams:
     prompt_path: str | None = None
     output_path: str | None = None
     output_file_name: str | None = None
+    output_quality: str | None = "default"
+    output_compression: int | None = None
 
     # Batch info
     num_outputs_per_prompt: int = 1

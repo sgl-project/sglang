@@ -312,8 +312,7 @@ def add_common_data_to_response(
     return response
 
 
-def adjust_output_quality(output_quality: str, output_compression: int) -> int:
-    if output_compression is not None:
-        return output_compression
-    else:
-        return OUTPUT_QUALITY_MAPPER.get(output_quality, None)
+def adjust_output_quality(output_quality: str, data_type: DataType = None) -> int:
+    if output_quality == "default":
+        return 50 if data_type == DataType.VIDEO else 75
+    return OUTPUT_QUALITY_MAPPER.get(output_quality, None)

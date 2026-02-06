@@ -89,6 +89,8 @@ def _build_sampling_params_from_request(
         sampling_kwargs["enable_teacache"] = request.enable_teacache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
+    if request.output_compression is not None:
+        sampling_kwargs["output_compression"] = request.output_compression
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
@@ -174,7 +176,7 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
-    output_quality: Optional[str] = Form(None),
+    output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
@@ -285,9 +287,10 @@ async def create_video(
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
-    batch.output_compression = adjust_output_quality(
-        req.output_quality, req.output_compression
-    )
+    if batch.output_compression is None:
+        batch.output_compression = adjust_output_quality(
+            req.output_quality, batch.data_type
+        )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
