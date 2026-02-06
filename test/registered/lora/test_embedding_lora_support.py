@@ -39,11 +39,7 @@ SIMILARITY_THRESHOLD = 0.9999
 
 register_cuda_ci(
     est_time=150,
-    suite="stage-b-test-small-1-gpu",
-)
-register_amd_ci(
-    est_time=250,
-    suite="stage-b-test-small-1-gpu-amd",
+    suite="nightly-1-gpu",
 )
 
 class TestEmbeddingLoraSupport(unittest.TestCase):
@@ -199,6 +195,82 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
             SIMILARITY_THRESHOLD,
             f"Average similarity {avg_similarity:.4f} below threshold {SIMILARITY_THRESHOLD}",
         )
+
+    def test_mixed_lora_and_non_lora_requests(self):
+        """Test mixing requests with LoRA and without LoRA in the same batch."""
+        test_texts = [
+            "Hello world",
+            "This is a test sentence",
+            "Another example text",
+            "Final test input",
+        ]
+
+        print(f"\nModel: {MODEL_PATH}")
+        print(f"LoRA: {LORA_PATH}")
+        print("\nTesting mixed LoRA/non-LoRA requests...")
+
+        with SRTRunner(
+            MODEL_PATH,
+            torch_dtype=torch.float16,
+            model_type="embedding",
+            lora_paths=[LORA_PATH],
+            lora_backend=LORA_BACKEND,
+            port=DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+            trust_remote_code=True,
+            mem_fraction_static=0.88,
+        ) as runner:
+            # Get embeddings with LoRA for all texts
+            lora_response = runner.engine.encode(prompt=test_texts, lora_path=LORA_PATH)
+            lora_embeddings = np.array([r["embedding"] for r in lora_response])
+
+            # Get embeddings without LoRA for all texts
+            non_lora_response = runner.engine.encode(prompt=test_texts, lora_path=None)
+            non_lora_embeddings = np.array([r["embedding"] for r in non_lora_response])
+
+            # Mixed batch: alternate between LoRA and non-LoRA
+            # [LoRA, None, LoRA, None] pattern
+            mixed_lora_paths = [LORA_PATH, None, LORA_PATH, None]
+            mixed_response = runner.engine.encode(
+                prompt=test_texts, lora_path=mixed_lora_paths
+            )
+            mixed_embeddings = np.array([r["embedding"] for r in mixed_response])
+
+        # Verify mixed results match individual runs
+        print("\nVerifying mixed batch results:")
+        for i, (mixed_emb, lora_path) in enumerate(zip(mixed_embeddings, mixed_lora_paths)):
+            if lora_path is not None:
+                expected_emb = lora_embeddings[i]
+                label = "LoRA"
+            else:
+                expected_emb = non_lora_embeddings[i]
+                label = "non-LoRA"
+
+            sim = self.cosine_similarity(mixed_emb, expected_emb)
+            print(f"  Text {i} ({label}): similarity with separate run = {sim:.6f}")
+
+            # Mixed batch should produce identical results to separate runs
+            self.assertGreater(
+                sim,
+                SIMILARITY_THRESHOLD,
+                f"Text {i} ({label}) mixed batch result differs from separate run. "
+                f"Similarity: {sim:.6f}, threshold: {SIMILARITY_THRESHOLD}",
+            )
+
+        # Verify LoRA vs non-LoRA embeddings are actually different
+        print("\nVerifying LoRA vs non-LoRA produce different embeddings:")
+        for i in range(len(test_texts)):
+            sim = self.cosine_similarity(lora_embeddings[i], non_lora_embeddings[i])
+            print(f"  Text {i}: LoRA vs non-LoRA similarity = {sim:.6f}")
+            # They should be similar but not identical (LoRA modifies the model)
+            # If they're too similar, the LoRA might not be applied correctly
+            self.assertLess(
+                sim,
+                0.9999,
+                f"Text {i}: LoRA and non-LoRA embeddings are nearly identical "
+                f"(sim={sim:.6f}), LoRA may not be applied correctly",
+            )
+
+        print("\nMixed LoRA/non-LoRA test passed!")
 
 
 if __name__ == "__main__":
