@@ -21,11 +21,14 @@ class UsageProcessor:
         enable_cache_report: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(r["meta_info"]["completion_tokens"] for r in responses)
-        reasoning_tokens = sum(r["meta_info"]["reasoning_tokens"] for r in responses)
-
         prompt_tokens = sum(
             responses[i]["meta_info"]["prompt_tokens"]
             for i in range(0, len(responses), n_choices)
+        )
+
+        # some API don't have reasoning_tokens semantics
+        reasoning_tokens = sum(
+            r["meta_info"].get("reasoning_tokens", 0) for r in responses
         )
 
         cached_details = None
