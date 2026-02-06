@@ -15,7 +15,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.amx_utils import (
+    CPUQuantMethod,
+    _amx_process_weight_after_loading,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
@@ -1355,13 +1358,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 topk_weights,
                 topk_ids,
                 False,  # inplace See [Note] inplace should be False in fused_experts.
-                False,  # use_int8_w8a8
-                True,  # use_fp8_w8a16
+                CPUQuantMethod.FP8_W8A16,
                 layer.w13_weight_scale_inv,  # w1_scale
                 layer.w2_weight_scale_inv,  # w2_scale
+                None,  # w1_zp
+                None,  # w2_zp
                 self.quant_config.weight_block_size,  # block_size
-                None,  # a1_scale
-                None,  # a2_scale
                 True,  # is_vnni
             )
             return StandardCombineInput(hidden_states=output)
@@ -1465,6 +1467,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 global_num_experts=global_num_experts,
                 local_expert_offset=moe_ep_rank * num_local_experts,
                 local_num_experts=num_local_experts,
+                intermediate_size=layer.w2_weight.shape[2],
                 routing_method_type=int(
                     getattr(layer, "routing_method_type", RoutingMethodType.DeepSeekV3)
                 ),
