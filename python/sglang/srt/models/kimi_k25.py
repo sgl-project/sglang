@@ -723,7 +723,6 @@ class KimiK25ForConditionalGeneration(nn.Module):
         mapper = getattr(self, "hf_to_sglang_mapper", None)
         if mapper is not None:
             weights = mapper.apply(weights)
-        weights = list(weights)
 
         # Separate vision tower weights and language model weights
         vision_weights = []
