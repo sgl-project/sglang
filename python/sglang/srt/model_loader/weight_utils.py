@@ -1237,13 +1237,14 @@ class KVCacheQuantSchema(BaseModel):
     # layer indices to their per-tensor KV cache scaling factor.
     # TODO: Consider pulling this and its validation methods out into its
     # own schema class (tricky as its members are variable)
-    scaling_factor: Dict[int, Dict[int, float]]
+    scaling_factor: Dict[int, Dict[int, List[float]]]
 
     @model_validator(mode="after")
     def check_is_fp8(self) -> "KVCacheQuantSchema":
-        assert self.dtype == "float8_e4m3fn", (
+        supported_dtypes = {"float8_e4m3fn", "float8_e5m2"}
+        assert self.dtype in supported_dtypes, (
             "Loaded scaling factors intended for KV cache dtype = "
-            f"{self.dtype} rather than float8_e4m3fn!"
+            f"{self.dtype} rather than {sorted(supported_dtypes)}!"
         )
         return self
 
@@ -1311,7 +1312,7 @@ def kv_cache_scales_loader(
     tp_size: int,
     num_hidden_layers: int,
     model_type: Optional[str],
-) -> Iterable[Tuple[int, float]]:
+) -> Iterable[Tuple[int, float, float]]:
     """
     A simple utility to read in KV cache scaling factors that have been
     previously serialized to disk. Used by the model to populate the appropriate
@@ -1330,7 +1331,17 @@ def kv_cache_scales_loader(
             schema_dct = json.load(f)
             schema = QuantParamSchema.model_validate(schema_dct, context=context)
             layer_scales_map = schema.kv_cache.scaling_factor[tp_rank]
-            return layer_scales_map.items()
+            scales = []
+            for layer_idx, scale in layer_scales_map.items():
+                if not isinstance(scale, list) or len(scale) != 2:
+                    raise ValueError(
+                        f"Layer {layer_idx} scale must be a list [k_scale, v_scale]. "
+                        "Use [x, x] to represent shared k/v scales."
+                    )
+                k_scale = float(scale[0])
+                v_scale = float(scale[1])
+                scales.append((layer_idx, k_scale, v_scale))
+            return scales
     except FileNotFoundError:
         logger.error("File or directory '%s' not found.", filename)
     except json.JSONDecodeError:
@@ -1346,6 +1357,31 @@ def kv_cache_scales_loader(
         tp_rank,
     )
     return []
+
+
+def apply_kv_cache_scales(
+    layer_self_attn: torch.nn.Module, k_scale: float, v_scale: float
+) -> None:
+    attn = layer_self_attn.attn
+    device = next(layer_self_attn.parameters()).device
+
+    if isinstance(attn.k_scale, torch.nn.Parameter):
+        attn.k_scale.fill_(k_scale)
+    else:
+        attn.k_scale = torch.nn.Parameter(
+            torch.tensor(k_scale, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+
+    if isinstance(attn.v_scale, torch.nn.Parameter):
+        attn.v_scale.fill_(v_scale)
+    else:
+        attn.v_scale = torch.nn.Parameter(
+            torch.tensor(v_scale, dtype=torch.float32, device=device),
+            requires_grad=False,
+        )
+    attn.k_scale_float = k_scale
+    attn.v_scale_float = v_scale
 
 
 def get_actual_shard_size(shard_size, weight_start, weight_end):
