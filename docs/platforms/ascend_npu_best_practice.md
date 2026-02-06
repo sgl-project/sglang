@@ -32,7 +32,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Model      | Hardware      | CardNum | Deploy Mode | Dataset | Quantization | Configuration                                           |
 |------------|---------------|---------|-------------|---------|--------------|---------------------------------------------------------|
 | Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed    | 11K-1K  | BF16         | [Optimal Configuration](#qwen3-235b-low-latency-10ms)   |
-| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 6K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-low-latency-18ms)    |
+| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 6K-1.5K | BF16         | [Optimal Configuration](#qwen3-32b-low-latency-18ms)    |
 | Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 4K-1.5K | BF16         | [Optimal Configuration](#qwen3-32b-low-latency-11ms)    |
 | Qwen3-32B  | Atlas 800I A3 | 8       | PD Mixed    | 18K-4K  | BF16         | [Optimal Configuration](#qwen3-32b-low-latency-12ms)    |
 | Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 6K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-a2-low-latency-18ms) |
@@ -48,7 +48,7 @@ you encounter issues or have any questions, please [open an issue](https://githu
 | Qwen3-235B | Atlas 800I A3 | 16      | PD Mixed      | 2K-2K     | W8A8         | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-4)   |
 | Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-1)    |
 | Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 2K-2K     | W8A8         | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-2)    |
-| Qwen3-30B  | Atlas 800I A3 | 1       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-3)    |
+| Qwen3-30B  | Atlas 800I A3 | 1       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-30b-high-throughput-50ms-3)    |
 | Qwen3-480B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-1)   |
 | Qwen3-480B | Atlas 800I A3 | 16      | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-2)   |
 | Qwen3-480B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-3)   |
@@ -1690,10 +1690,10 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend --device npu  --quantization modelslim  \
     --max-running-requests 78 \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
-    --chunked-prefill-size 65536 --max-prefill-tokens 65536  \
+    --chunked-prefill-size -1 --max-prefill-tokens 49152  \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --tp-size 4  --mem-fraction-static 0.7 --cuda-graph-bs 16 32 64 68 72 78 --dtype bfloat16
+    --tp-size 4  --mem-fraction-static 0.72 --cuda-graph-bs 16 32 64 68 72 78 --dtype bfloat16
 ```
 
 #### Benchmark
@@ -1772,7 +1772,7 @@ We tested it based on the GSM8K dataset.
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 120 --random-output-len 2000 --random-input-len 2000 --num-prompts 480 --random-range-ratio 1
 ```
 
-### Qwen3 32B High Throughput 50ms 3
+### Qwen3 30B High Throughput 50ms 3
 
 Model: Qwen3 30B
 
@@ -1819,13 +1819,13 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu  --quantization modelslim  \
     --max-running-requests 192 \
     --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 32768 \
@@ -2283,13 +2283,13 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu   \
     --max-running-requests 32 \
     --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx  \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
@@ -2417,7 +2417,6 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
