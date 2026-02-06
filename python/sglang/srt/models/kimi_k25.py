@@ -743,5 +743,11 @@ class KimiK25ForConditionalGeneration(nn.Module):
         if language_weights:
             self.language_model.load_weights(language_weights)
 
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        return self.language_model.set_eagle3_layers_to_capture(layer_ids)
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
 
 EntryClass = [KimiK25ForConditionalGeneration]
