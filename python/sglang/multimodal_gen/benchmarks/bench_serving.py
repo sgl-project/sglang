@@ -7,6 +7,9 @@ Usage:
 
     # T2V or T2I or any other multimodal generation model
     sglang serve Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    # With profiling:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task ti2i --num-prompts 5 --profile
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
@@ -50,6 +53,8 @@ class RequestFuncInput:
     height: Optional[int] = None
     num_frames: Optional[int] = None
     fps: Optional[int] = None
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
     extra_body: Dict[str, Any] = field(default_factory=dict)
     image_paths: Optional[List[str]] = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -309,6 +314,8 @@ class VBenchDataset(BaseDataset):
             height=self.args.height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
+            num_inference_steps=getattr(self.args, "num_inference_steps", None),
+            guidance_scale=getattr(self.args, "guidance_scale", None),
             image_paths=image_paths,
         )
 
@@ -360,9 +367,20 @@ async def async_request_image_sglang(
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
 
-        # Merge extra parameters
+        # Add inference parameters
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
+        if input.guidance_scale is not None:
+            data.add_field("guidance_scale", str(input.guidance_scale))
+
+        # Add profiling parameter if set
+        if input.extra_body.get("profile"):
+            data.add_field("profile", "true")
+
+        # Merge extra parameters (exclude profile param already handled)
         for key, value in input.extra_body.items():
-            data.add_field(key, str(value))
+            if key != "profile":
+                data.add_field(key, str(value))
 
         # Add image file(s)
         for idx, img_path in enumerate(input.image_paths):
@@ -405,6 +423,12 @@ async def async_request_image_sglang(
 
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
+
+        # Add inference parameters
+        if input.num_inference_steps is not None:
+            payload["num_inference_steps"] = input.num_inference_steps
+        if input.guidance_scale is not None:
+            payload["guidance_scale"] = input.guidance_scale
 
         # Merge extra parameters
         payload.update(input.extra_body)
@@ -630,6 +654,46 @@ def wait_for_service(base_url: str, timeout: int = 1200) -> None:
         time.sleep(1)
 
 
+@dataclass
+class ProfileReqOutput:
+    """Output for profile request."""
+
+    success: bool = False
+    message: str = ""
+    error: str = ""
+
+
+async def async_request_profile(
+    api_url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> ProfileReqOutput:
+    """Send a profile start/stop request to the server."""
+    output = ProfileReqOutput()
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(api_url) as response:
+            response_text = await response.text()
+            if response.status == 200:
+                output.success = True
+                output.message = response_text.strip()
+            else:
+                output.success = False
+                output.error = f"HTTP {response.status}: {response_text}"
+    except Exception as e:
+        output.success = False
+        output.error = str(e)
+    finally:
+        if close_session:
+            await session.close()
+
+    return output
+
+
 async def benchmark(args):
     from huggingface_hub import model_info
 
@@ -712,6 +776,17 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
+    # Start profiler if --profile is enabled
+    # This captures ALL requests in a single trace file (both HTTP Server and GPU Worker)
+    if args.profile:
+        profile_output = await async_request_profile(
+            api_url=f"{args.base_url}/start_profile"
+        )
+        if profile_output.success:
+            print(f"Profiler started: {profile_output.message}")
+        else:
+            print(f"Warning: Failed to start profiler: {profile_output.error}")
+
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
 
@@ -731,6 +806,17 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
     pbar.close()
+
+    # Stop profiler if it was started
+    if args.profile:
+        print("Stopping profiler and saving traces...")
+        profile_output = await async_request_profile(
+            api_url=f"{args.base_url}/stop_profile"
+        )
+        if profile_output.success:
+            print(f"Profiler stopped: {profile_output.message}")
+        else:
+            print(f"Warning: Failed to stop profiler: {profile_output.error}")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration)
@@ -871,10 +957,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help="Number of denoising steps (default: model default, e.g., 50 for QwenImage).",
+    )
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale (default: model default, e.g., 4.0 for QwenImage).",
+    )
+    parser.add_argument(
         "--output-file", type=str, default=None, help="Output JSON file for metrics."
     )
     parser.add_argument(
         "--disable-tqdm", action="store_true", help="Disable progress bar."
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable full pipeline profiling (request -> inference -> response). "
+        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR (default: ./logs/). ",
     )
     parser.add_argument(
         "--log-level",

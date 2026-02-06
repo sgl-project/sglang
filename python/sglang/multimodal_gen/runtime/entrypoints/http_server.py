@@ -5,11 +5,12 @@ import base64
 import os
 import uuid
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from fastapi import APIRouter, FastAPI, Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, Response
+from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
@@ -24,6 +25,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -98,6 +100,197 @@ async def get_models(request: Request):
 async def health_generate():
     # TODO : health generate endpoint
     return {"status": "ok"}
+
+
+# ============== Profile API ==============
+
+
+class ProfileReqInput(BaseModel):
+    """
+    Request input for profile endpoints.
+    Similar to LLM's ProfileReqInput for consistency.
+    """
+
+    # Directory to save traces. Uses SGLANG_TORCH_PROFILER_DIR env var if not provided.
+    output_dir: Optional[str] = None
+    # Activities to profile: ["CPU", "GPU"]
+    activities: Optional[list[str]] = None
+    # Whether to record stack traces
+    with_stack: Optional[bool] = None
+    # Whether to record tensor shapes
+    record_shapes: Optional[bool] = None
+
+
+class ProfileReqOutput(BaseModel):
+    """Response output for profile endpoints."""
+
+    success: bool
+    message: str
+
+
+# Global profiler state for online serving
+_global_profiler_state = {
+    "profiler": None,
+    "is_profiling": False,
+    "profile_id": None,  # Unified profile ID for HTTP Server and GPU Worker
+}
+
+
+@health_router.api_route("/start_profile", methods=["GET", "POST"])
+async def start_profile(request: Request, obj: Optional[ProfileReqInput] = None):
+    """Start profiling."""
+    import time as time_module
+
+    if _global_profiler_state["is_profiling"]:
+        return Response(
+            content="Profiling is already in progress. Call /stop_profile first.\n",
+            status_code=400,
+        )
+
+    try:
+        # Get parameters
+        if obj is None:
+            obj = ProfileReqInput()
+
+        output_dir = obj.output_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+
+        # Generate unified profile_id (similar to LLM implementation)
+        profile_id = str(int(time_module.time()))
+
+        # Read env vars for with_stack and record_shapes
+        env_with_stack = os.getenv("SGLANG_PROFILE_WITH_STACK", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        env_record_shapes = os.getenv(
+            "SGLANG_PROFILE_RECORD_SHAPES", "false"
+        ).lower() in ("true", "1", "yes")
+
+        with_stack = obj.with_stack if obj.with_stack is not None else env_with_stack
+        record_shapes = (
+            obj.record_shapes if obj.record_shapes is not None else env_record_shapes
+        )
+
+        # 1. Start profiler in HTTP Server process
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_world_rank,
+        )
+
+        try:
+            rank = get_world_rank()
+        except Exception:
+            rank = 0
+
+        http_profiler = SGLDiffusionProfiler(
+            request_id=profile_id,
+            rank=rank,
+            full_profile=True,
+            activities=obj.activities,
+            num_steps=-1,
+            num_inference_steps=100,
+            log_dir=output_dir,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+            is_host=True,
+        )
+        _global_profiler_state["profiler"] = http_profiler
+        _global_profiler_state["profile_id"] = profile_id
+
+        # 2. Start profiler in GPU Worker process via ZMQ
+        from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+            StartProfileReq,
+        )
+
+        start_req = StartProfileReq(
+            output_dir=output_dir,
+            profile_id=profile_id,
+            activities=obj.activities,
+            with_stack=with_stack,
+            record_shapes=record_shapes,
+        )
+        try:
+            response = await async_scheduler_client.forward(start_req)
+            if response.error:
+                logger.warning(f"GPU Worker profiler warning: {response.error}")
+        except Exception as e:
+            logger.warning(f"Could not start GPU Worker profiler: {e}")
+
+        _global_profiler_state["is_profiling"] = True
+
+        logger.info(
+            f"Profilers started with profile_id={profile_id}. " f"Output: {output_dir}"
+        )
+
+        return Response(
+            content=f"Profiling started (profile_id={profile_id}). Traces will be saved to: {output_dir}\n",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to start profiler: {e}")
+        return Response(
+            content=f"Failed to start profiler: {str(e)}\n",
+            status_code=500,
+        )
+
+
+@health_router.api_route("/stop_profile", methods=["GET", "POST"])
+async def stop_profile():
+    """Stop profiling and save traces."""
+    if not _global_profiler_state["is_profiling"]:
+        return Response(
+            content="Profiling is not in progress. Call /start_profile first.\n",
+            status_code=400,
+        )
+
+    errors = []
+    profile_id = _global_profiler_state.get("profile_id", "unknown")
+
+    try:
+        # 1. Stop profiler in HTTP Server process
+        profiler = _global_profiler_state["profiler"]
+        if profiler is not None:
+            profiler.stop(export_trace=True, dump_rank=None)  # Save for all ranks
+
+        # 2. Stop profiler in GPU Worker process via ZMQ
+        from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+            StopProfileReq,
+        )
+
+        stop_req = StopProfileReq(export_trace=True)
+        try:
+            response = await async_scheduler_client.forward(stop_req)
+            if response.error:
+                errors.append(f"GPU Worker: {response.error}")
+        except Exception as e:
+            errors.append(f"GPU Worker: {str(e)}")
+
+        _global_profiler_state["profiler"] = None
+        _global_profiler_state["is_profiling"] = False
+        _global_profiler_state["profile_id"] = None
+
+        logger.info(f"Profilers stopped (profile_id={profile_id}). Traces saved.")
+
+        if errors:
+            return Response(
+                content=f"Profiling stopped (profile_id={profile_id}) with warnings: {'; '.join(errors)}\n",
+                status_code=200,
+            )
+        return Response(
+            content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
+            status_code=200,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to stop profiler: {e}")
+        _global_profiler_state["profiler"] = None
+        _global_profiler_state["is_profiling"] = False
+        _global_profiler_state["profile_id"] = None
+        return Response(
+            content=f"Failed to stop profiler: {str(e)}\n",
+            status_code=500,
+        )
 
 
 def make_serializable(obj):

@@ -4,6 +4,7 @@ import os
 import torch
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.utils import get_bool_env_var
 
 logger = init_logger(__name__)
 
@@ -12,7 +13,6 @@ class SGLDiffusionProfiler:
     """
     A wrapper around torch.profiler to simplify usage in pipelines.
     Supports both full profiling and scheduled profiling.
-
 
     1. if profile_all_stages is on: profile all stages, including all denoising steps
     2. otherwise, if num_profiled_timesteps is specified: profile {num_profiled_timesteps} denoising steps. profile all steps if num_profiled_timesteps==-1
@@ -25,18 +25,29 @@ class SGLDiffusionProfiler:
         request_id: str | None = None,
         rank: int = 0,
         full_profile: bool = False,
+        activities: list[str] | None = None,
         num_steps: int | None = None,
         num_inference_steps: int | None = None,
         log_dir: str | None = None,
+        with_stack: bool | None = None,
+        record_shapes: bool | None = None,
+        is_host: bool = False,
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
         self.full_profile = full_profile
+        self.is_host = is_host
 
-        self.log_dir = (
-            log_dir
-            if log_dir is not None
-            else os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        # Use environment variables with fallback to parameters
+        self.log_dir = log_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+
+        # Read from environment variables, allow parameter override
+        env_with_stack = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "false")
+        env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "false")
+
+        self.with_stack = with_stack if with_stack is not None else env_with_stack
+        self.record_shapes = (
+            record_shapes if record_shapes is not None else env_record_shapes
         )
 
         try:
@@ -44,15 +55,19 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        torch_activities = self._resolve_activities(activities)
 
         common_torch_profiler_args = dict(
-            activities=activities,
-            record_shapes=True,
-            with_stack=True,
+            activities=torch_activities,
+            record_shapes=self.record_shapes,
+            with_stack=self.with_stack,
             on_trace_ready=None,
+        )
+
+        logger.info(
+            f"Profiler config: output_dir={self.log_dir}, "
+            f"with_stack={self.with_stack}, record_shapes={self.record_shapes}, "
+            f"activities={[a.name for a in torch_activities]}"
         )
         if self.full_profile:
             # profile all stages
@@ -81,6 +96,53 @@ class SGLDiffusionProfiler:
 
         SGLDiffusionProfiler._instance = self
         self.start()
+
+    @staticmethod
+    def _resolve_activities(
+        activities: list[str] | None,
+    ) -> list[torch.profiler.ProfilerActivity]:
+        """
+        Resolve user-provided activity strings to torch profiler activities.
+
+        Supported values (case-insensitive):
+        - "CPU"
+        - "GPU" / "CUDA"
+        """
+
+        def _default() -> list[torch.profiler.ProfilerActivity]:
+            ret = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                ret.append(torch.profiler.ProfilerActivity.CUDA)
+            return ret
+
+        if not activities:
+            return _default()
+
+        use_cpu = False
+        use_cuda = False
+        for a in activities:
+            if a is None:
+                continue
+            s = str(a).strip().lower()
+            if s == "cpu":
+                use_cpu = True
+            elif s in ("gpu", "cuda"):
+                if torch.cuda.is_available():
+                    use_cuda = True
+                else:
+                    logger.warning(
+                        "Profiler activities requested GPU/CUDA but CUDA is not available; ignoring."
+                    )
+            else:
+                logger.warning(f"Unknown profiler activity: {a!r}; ignoring.")
+
+        ret: list[torch.profiler.ProfilerActivity] = []
+        if use_cpu:
+            ret.append(torch.profiler.ProfilerActivity.CPU)
+        if use_cuda:
+            ret.append(torch.profiler.ProfilerActivity.CUDA)
+
+        return ret or _default()
 
     def start(self):
         logger.info("Starting Profiler...")
@@ -127,13 +189,16 @@ class SGLDiffusionProfiler:
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
-            sanitized_profile_mode_id = self.profile_mode_id.replace(" ", "_")
-            trace_path = os.path.abspath(
-                os.path.join(
-                    self.log_dir,
-                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
-                )
-            )
+
+            # Filename format:
+            # - Host process: {profile_id}-host.trace.json.gz
+            # - GPU Worker:   {profile_id}-rank-{rank}.trace.json.gz
+            if self.is_host:
+                filename = f"{self.request_id}-host.trace.json.gz"
+            else:
+                filename = f"{self.request_id}-rank-{self.rank}.trace.json.gz"
+
+            trace_path = os.path.abspath(os.path.join(self.log_dir, filename))
             self.profiler.export_chrome_trace(trace_path)
 
             if self._check_trace_integrity(trace_path):
