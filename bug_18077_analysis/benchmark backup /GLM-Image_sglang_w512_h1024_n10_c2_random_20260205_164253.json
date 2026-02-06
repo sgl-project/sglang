@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "model": "zai-org/GLM-Image",
+    "backend": "sglang",
+    "base_url": "http://localhost:30000",
+    "dataset": "random",
+    "num_prompts": 10,
+    "width": 512,
+    "height": 1024,
+    "concurrency": 2,
+    "request_rate": "inf",
+    "timestamp": "20260205_164253"
+  },
+  "metrics": {
+    "duration": 470.7443793840066,
+    "completed_requests": 10,
+    "failed_requests": 0,
+    "throughput_qps": 0.021242951457191094,
+    "latency_mean": 89.48802355740045,
+    "latency_median": 93.15047178650275,
+    "latency_p99": 97.37798204989492,
+    "latency_p50": 93.15047178650275,
+    "peak_memory_mb_max": 36605.03125,
+    "peak_memory_mb_mean": 36605.03125,
+    "peak_memory_mb_median": 36605.03125
+  }
+}

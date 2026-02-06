@@ -1,113 +1,105 @@
-# Issue #18077 分析文档
+# Bug #18077: GLM-Image 性能测试
 
-## 📋 文档结构
+## 📋 快速开始
 
-### A01: GLM-Image 推理效率优化详解
-- **[A01_glm_image_performance.md](./A01_glm_image_performance.md)** ⭐ **主文档**
-  - GLM-Image 在 SGLang-D 中的性能问题
-  - 与 Diffusers 的性能对比
-  - 优化方向分析
+### 1. 安装依赖（必需）
 
-### A02: FLUX.2-Klein 测试设计方案
-- **[A02_flux_klein_test_design.md](./A02_flux_klein_test_design.md)** 🧪 **测试设计**
-  - 测试模型确定（FLUX.2-Klein）
-  - 完整的测试设计方案
-  - 测试脚本和报告结构
+```bash
+cd /data/users/yandache/workspaces/sglang
+source env_sglang/bin/activate
+cd repo/sglang-src/python
 
-### A01_Bxx: 平行文档（与 A01 同级）
+# 安装 diffusion extras（必需！）
+pip install -e ".[diffusion]"
+```
 
-- **[A01_B01_original_issue.md](./A01_B01_original_issue.md)** ⭐ **原始 Issue 内容**
-  - Issue 链接和标题
-  - 问题描述和性能数据
-  - 目标和任务清单
+**重要**：`diffusion` 是 optional dependency，必须显式安装才能使用 GLM-Image 等 diffusion 模型。
 
-- **[A01_B02_performance_analysis.md](./A01_B02_performance_analysis.md)** ⭐ **性能分析**
-  - 性能基准测试结果
-  - SGLang vs Diffusers 对比
-  - 瓶颈识别
+### 2. 设置环境变量（按照 BME2-Workspace-Standard）
 
-- **[A01_B03_code_analysis.md](./A01_B03_code_analysis.md)** ⭐ **代码分析**
-  - GLM-Image 在 SGLang-D 中的实现
-  - 关键代码路径分析
-  - Sequence Parallelism 支持情况
+```bash
+source /data/users/yandache/_shared/tools/env.sh
+```
 
-- **[A01_B04_optimization_proposals.md](./A01_B04_optimization_proposals.md)** ⭐ **优化方案** 🔍 **重点**
-  - Sequence Parallelism 集成方案
-  - 内存管理优化
-  - 内核优化建议
+### 3. 启动服务器
 
-- **[A01_B05_benchmark_setup.md](./A01_B05_benchmark_setup.md)** ⭐ **基准测试设置**
-  - 可复现的基准测试脚本
-  - 测试配置和环境
-  - 结果收集方法
+```bash
+cd /data/users/yandache/workspaces/sglang
+source env_sglang/bin/activate
 
-- **[A01_B06_documentation_links.md](./A01_B06_documentation_links.md)** 📚 **相关文档链接**
-  - SGLang-D 文档
-  - GLM-Image 相关代码
-  - 参考资源
+# 启动 SGLang 后端
+sglang serve \
+    --model-path zai-org/GLM-Image \
+    --backend sglang \
+    --port 30000 \
+    --trust-remote-code
+```
 
-- **[A01_B07_model_size_analysis.md](./A01_B07_model_size_analysis.md)** 💾 **模型大小分析**
-  - Wan2.1-T2V-1.3B 显存需求
-  - RTX 4090 运行可行性
-  - 优化建议
+### 4. 运行性能测试
 
-- **[A01_B08_supported_models_and_minimum_gpu.md](./A01_B08_supported_models_and_minimum_gpu.md)** 📋 **支持的模型和最小 GPU 需求**
-  - SGLang-D 官方支持的 Diffusion 模型列表
-  - 最小 GPU 需求的 DiT 模型分析
-  - 显存需求对比
+#### 方式 A：使用官方 bench_serving.py（推荐，与 haojin2 相同）
 
----
+```bash
+# 在另一个终端
+cd /data/users/yandache/workspaces/sglang
+source /data/users/yandache/_shared/tools/env.sh
+source env_sglang/bin/activate
 
-## 🎯 快速导航
+# 使用官方脚本（与 Issue #18077 中 haojin2 的测试方式相同）
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --model zai-org/GLM-Image \
+    --dataset vbench \
+    --num-prompts 10 \
+    --port 30000 \
+    --max-concurrency 1 \
+    --output-file repo/sglang-src/bug_18077_analysis/benchmark/results/zai-org_GLM-Image_sglang_$(date +%Y%m%d_%H%M%S).json
+```
 
-1. **想了解问题详情** → [A01_B01_original_issue.md](./A01_B01_original_issue.md) ⭐ **从这里开始**
-2. **想阅读相关文档** → [A01_B06_documentation_links.md](./A01_B06_documentation_links.md) 📚 **文档链接**
-3. **想了解性能分析** → [A01_B02_performance_analysis.md](./A01_B02_performance_analysis.md) 🔍 **重点推荐**
-4. **想查看代码实现** → [A01_B03_code_analysis.md](./A01_B03_code_analysis.md)
-5. **想了解优化方案** → [A01_B04_optimization_proposals.md](./A01_B04_optimization_proposals.md) 🎓 **核心推荐**
-6. **想设置基准测试** → [A01_B05_benchmark_setup.md](./A01_B05_benchmark_setup.md)
-7. **想了解模型大小** → [A01_B07_model_size_analysis.md](./A01_B07_model_size_analysis.md) 💾 **硬件需求**
-8. **想了解支持的模型** → [A01_B08_supported_models_and_minimum_gpu.md](./A01_B08_supported_models_and_minimum_gpu.md) 📋 **模型列表**
-9. **想了解测试设计** → [A02_flux_klein_test_design.md](./A02_flux_klein_test_design.md) 🧪 **测试方案**
-10. **想了解整体问题** → [A01_glm_image_performance.md](./A01_glm_image_performance.md) ⭐ **主文档**
+**或者使用便捷脚本**：
+```bash
+cd repo/sglang-src/bug_18077_analysis/code
+./03_run_benchmark.sh sglang 30000 512 512 50 10 1 random
+```
 
 ---
 
-## 📁 其他文件
+## 📚 文档索引
 
-### 代码相关
-- `code/` - 基准测试脚本和优化代码
+### 核心文档
+- [A01_B01: Issue 原始内容](./A01_B01_original_issue.md) - 问题背景和发现
+- [A01_B09: 模型选择建议](./A01_B09_glm_image_model_selection.md) - 推荐使用 `zai-org/GLM-Image`
+- [A01_B11: 常见问题解决方案](./A01_B11_disk_quota_solution.md) - 磁盘配额、依赖安装等问题
+- [A01_B13: 完整测试命令](./A01_B13_complete_test_commands.md) - 详细的测试步骤和命令
 
-### 测试相关
-- `benchmark/` - 基准测试结果
-
----
-
-## 📝 文档命名规则
-
-- **A01_xxx.md**: 主文档（A01 系列）
-- **A01_B01_xxx.md**: A01 的平行文档（A01_B01 系列）
+### 测试设计
+- [A02: FLUX-Klein 测试设计](./A02_flux_klein_test_design.md) - 参考测试设计
 
 ---
 
-## 🔗 Issue 链接
+## 🔧 关键要点
 
-https://github.com/sgl-project/sglang/issues/18077
+1. **必须安装 `sglang[diffusion]`**：`pip install -e ".[diffusion]"`
+2. **必须设置环境变量**：`source /data/users/yandache/_shared/tools/env.sh`
+3. **必须指定后端**：`--backend sglang` 或 `--backend diffusers`
+4. **必须使用 `--trust-remote-code`**：GLM-Image 需要自定义代码
 
-## 🎯 Issue 摘要
+---
 
-**问题**: GLM-Image 在 SGLang-D 引擎上的推理性能相比 Diffusers 实现存在显著差距。
+## 📁 文件结构
 
-**性能对比**:
-- **Diffusers backend**: ~0.50 req/s, ~2.0s latency
-- **SGLang backend**: ~0.11 req/s, ~9.2s latency
-
-**主要问题**:
-- 缺乏 Sequence Parallelism (SP) 支持
-- 高分辨率图像生成效率低下
-- 可能的内存管理问题
-
-**目标**:
-1. 建立性能基准（延迟、吞吐量、VRAM使用）
-2. 识别瓶颈（注意力内核、内存开销等）
-3. 提出优化方案（SP集成、内存管理等）
+```
+bug_18077_analysis/
+├── README.md                    # 本文件
+├── DESIGN.md                    # 测试设计文档
+├── A01_B01_original_issue.md    # Issue 原始内容
+├── A01_B09_glm_image_model_selection.md  # 模型选择
+├── A01_B11_disk_quota_solution.md        # 常见问题
+├── A01_B13_complete_test_commands.md     # 完整测试命令
+├── code/
+│   ├── 01_check_environment.sh  # 环境检查脚本
+│   ├── 02_start_server.sh      # 启动服务器脚本
+│   ├── 03_run_benchmark.sh     # 运行性能测试脚本
+│   ├── 04_compare.sh           # 对比结果脚本
+│   └── 05_stop_server.sh       # 停止服务器脚本
+└── benchmark/                   # 测试结果目录
+```
