@@ -9,11 +9,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import (
-    get_pp_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
+from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
@@ -92,7 +88,9 @@ class SDARMLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
-        hidden_states, _ = self.down_proj(hidden_states, skip_all_reduce=use_reduce_scatter)
+        hidden_states, _ = self.down_proj(
+            hidden_states, skip_all_reduce=use_reduce_scatter
+        )
         return hidden_states
 
 
@@ -126,8 +124,10 @@ class SDARAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert attn_tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-        
-        self.head_dim = getattr(config, "head_dim", self.hidden_size // self.total_num_heads)
+
+        self.head_dim = getattr(
+            config, "head_dim", self.hidden_size // self.total_num_heads
+        )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scale = self.head_dim**-0.5
@@ -229,7 +229,12 @@ class SDARAttention(nn.Module):
         )
         return q, k, v
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
         if get_global_server_args().rl_on_policy_target is not None:
             hidden_states = hidden_states.bfloat16()
 
@@ -237,7 +242,7 @@ class SDARAttention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
-                forward_batch=forward_batch
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(
@@ -284,8 +289,12 @@ class SDARBlock(nn.Module):
             if get_global_server_args().rl_on_policy_target is not None
             else {}
         )
-        self.input_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs)
-        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs)
+        self.input_layernorm = RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
+        self.post_attention_layernorm = RMSNorm(
+            self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
 
         self.self_attn = SDARAttention(
             layer_id=layer_id,
@@ -355,7 +364,9 @@ class SDARBlock(nn.Module):
             ),
         )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(forward_batch)
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
         hidden_states = self.mlp(hidden_states, use_reduce_scatter=use_reduce_scatter)
 
         if _is_npu and get_cmo_stream():
@@ -417,9 +428,7 @@ class SDARModel(nn.Module):
                 if get_global_server_args().rl_on_policy_target is not None
                 else {}
             )
-            self.norm = RMSNorm(
-                self.embed_dim, eps=config.rms_norm_eps, **norm_kwargs
-            )
+            self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps, **norm_kwargs)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -432,7 +441,9 @@ class SDARModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
             residual = None
         else:
             assert pp_proxy_tensors is not None
@@ -442,14 +453,13 @@ class SDARModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual
+                positions, hidden_states, forward_batch, residual
             )
 
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors({"hidden_states": hidden_states, "residual": residual})
+            return PPProxyTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
         else:
             if not forward_batch.forward_mode.is_idle():
                 hidden_states, residual = self.norm(hidden_states, residual)
@@ -461,7 +471,7 @@ class SDARForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = ""
+        prefix: str = "",
     ):
         super().__init__()
         self.pp_group = get_pp_group()
@@ -469,16 +479,20 @@ class SDARForCausalLM(nn.Module):
         self.quant_config = quant_config
         alt_stream = torch.cuda.Stream() if _is_cuda else None
 
-
         self.model = SDARModel(
             config,
             quant_config=quant_config,
             prefix=add_prefix("model", ""),
-            alt_stream=alt_stream,)
+            alt_stream=alt_stream,
+        )
 
         if self.pp_group.is_last_rank:
             tp_size = get_tensor_model_parallel_world_size()
-            if self.pp_group.world_size == 1 and config.tie_word_embeddings and tp_size == 1:
+            if (
+                self.pp_group.world_size == 1
+                and config.tie_word_embeddings
+                and tp_size == 1
+            ):
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -518,7 +532,9 @@ class SDARForCausalLM(nn.Module):
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
-            return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
         else:
             return hidden_states
 
