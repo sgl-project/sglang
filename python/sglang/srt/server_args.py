@@ -1151,8 +1151,8 @@ class ServerArgs:
         user_set_decode = self.nsa_decode_backend is not None
 
         if not user_set_prefill and not user_set_decode and is_hip():
-            self.nsa_prefill_backend = "aiter"
-            self.nsa_decode_backend = "aiter"
+            self.nsa_prefill_backend = "tilelang"
+            self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
             if not user_set_prefill:
