@@ -58,8 +58,7 @@ class KVCacheEvent(
 
 # Medium values for storage tiers (compatible with vLLM)
 MEDIUM_GPU = "GPU"
-MEDIUM_CPU_TIER1 = "CPU_TIER1"
-MEDIUM_CPU_TIER2 = "CPU_TIER2"
+MEDIUM_CPU = "CPU_PINNED"
 
 
 class BlockStored(KVCacheEvent):
