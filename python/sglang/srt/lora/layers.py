@@ -16,12 +16,12 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -614,10 +614,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
         self._lora_runner = MoeRunner(
             base_layer.quant_method.runner.runner_backend,
             base_layer.moe_runner_config,
-            lora_enabled=True
+            lora_enabled=True,
         )
 
         # Pre-compute quant info for efficiency (weights don't change during inference)
@@ -642,9 +643,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
 
-    def _get_lora_info(
-        self
-    ):
+    def _get_lora_info(self):
         """
         Build LoRAInfo for the current batch.
 
@@ -662,7 +661,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # Create adapter_enabled tensor for the current batch
         # Only enable LoRA adapters that are actually used in this batch
         # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
-        adapter_enabled = torch.zeros(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
+        adapter_enabled = torch.zeros(
+            len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
+        )
         adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
 
         return LoRAInfo(
@@ -670,8 +671,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
             down_lora_a_weights=self.down_lora_a_weights,
             down_lora_b_weights=self.down_lora_b_weights,
-            seg_indptr = batch_info.seg_indptr,
-            req_to_lora = batch_info.weight_indices,
+            seg_indptr=batch_info.seg_indptr,
+            req_to_lora=batch_info.weight_indices,
             lora_ranks=lora_ranks,
             adapter_enabled=adapter_enabled,
             max_lora_rank=max_lora_rank,

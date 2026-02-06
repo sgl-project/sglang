@@ -1,16 +1,13 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_moe_lora_align_sum.py
 import random
-import os
+
 import pytest
 import torch
-from torch.utils.cpp_extension import load
-import sys
 
 # ---------------------------------------------------------
 # IMPORT PREBUILT KERNEL
 # ---------------------------------------------------------
 from sgl_kernel import moe_lora_align_block_size
-
 
 
 def round_up(x, base):

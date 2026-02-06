@@ -38,13 +38,11 @@ from sglang.srt.layers.moe.moe_runner.triton import (
 )
 from sglang.srt.utils import is_cuda, is_hip
 
-
-
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul, moe_lora_align_block_size
+    from sgl_kernel import gelu_and_mul, moe_lora_align_block_size, silu_and_mul
 
 
 @dataclass
@@ -216,7 +214,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             dtype=hidden_states.dtype,
         )
 
-
         invoke_fused_moe_kernel(
             hidden_states,
             w13,
@@ -280,7 +277,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         # Get token-to-LoRA mapping from lora_info
         lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
-
 
         moe_lora_align_block_size(
             topk_ids,
@@ -368,7 +364,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         else:
             out_hidden_states = torch.empty_like(hidden_states)
 
-
         invoke_fused_moe_kernel(
             intermediate_cache2,
             w2,
@@ -411,7 +406,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             expert_ids_reshaped=expert_ids_reshaped,
             num_tokens_post_padded_lora=num_tokens_post_padded_lora,
         )
-
 
         # ============================================================
         # Stage 4: Final reduction (sum across top_k)
@@ -483,7 +477,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         M, top_k, gate_up_dim = intermediate_cache.shape
 
-
         # Skip LoRA computation if no LoRA adapters have non-zero rank
         if lora_info.max_lora_rank == 0:
             return
@@ -495,8 +488,9 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         max_loras = len(lora_info.lora_ranks)
 
-        lora_ids = torch.arange(max_loras, dtype=torch.int32, device=hidden_states.device)
-
+        lora_ids = torch.arange(
+            max_loras, dtype=torch.int32, device=hidden_states.device
+        )
 
         fused_moe_lora(
             output=intermediate_cache,
@@ -548,7 +542,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         M, top_k, hidden_dim = intermediate_cache.shape
 
-
         # Skip LoRA computation if no LoRA adapters have non-zero rank
         if lora_info.max_lora_rank == 0:
             return
@@ -562,7 +555,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
 
         device = intermediate_cache.device
         lora_ids = torch.arange(max_loras, dtype=torch.int32, device=device)
-
 
         fused_moe_lora(
             output=intermediate_cache,

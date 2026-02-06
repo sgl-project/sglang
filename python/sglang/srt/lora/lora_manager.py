@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -28,7 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
+from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -43,8 +44,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.lora.layers import FusedMoEWithLoRA
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +292,6 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
         )
 
-
     def update_lora_info(self):
         """
         Update all LoRA modules to associate them with the latest memory buffer.
@@ -378,8 +376,8 @@ class LoRAManager:
         the target modules and max_lora_rank.
         """
 
-        assert (
-            lora_paths or (max_lora_rank is not None and target_modules is not None)
+        assert lora_paths or (
+            max_lora_rank is not None and target_modules is not None
         ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
         self.init_lora_adapters(lora_paths)

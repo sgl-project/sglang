@@ -1,24 +1,17 @@
 # adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_fused_moe_lora_kernel.py
-import sys
-import os
 import random
+
 import pytest
 import torch
-
-from sglang.srt.distributed import (
-    init_distributed_environment,
-    initialize_model_parallel,
-)
-from sglang.srt.distributed.parallel_state import (
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.lora.triton_ops import fused_moe_lora
-from sglang.srt.utils import set_random_seed
 
 # ==============================================================================
 # IMPORT PREBUILT KERNEL
 # ==============================================================================
 from sgl_kernel import moe_lora_align_block_size
+
+from sglang.srt.lora.triton_ops import fused_moe_lora
+from sglang.srt.utils import set_random_seed
+
 # ==============================================================================
 
 
@@ -153,11 +146,11 @@ def use_fused_moe_lora_kernel(
 
     # init output tensors
     sorted_token_ids = torch.empty(
-        (max_loras * max_num_tokens_padded,),
-        dtype=torch.int32,
-        device=device
+        (max_loras * max_num_tokens_padded,), dtype=torch.int32, device=device
     )
-    expert_ids = torch.empty((max_loras * max_num_m_blocks,), dtype=torch.int32, device=device)
+    expert_ids = torch.empty(
+        (max_loras * max_num_m_blocks,), dtype=torch.int32, device=device
+    )
     num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32, device=device)
     adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32, device=device)
     lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device=device)
@@ -177,7 +170,7 @@ def use_fused_moe_lora_kernel(
         num_tokens_post_padded,
         adapter_enabled,
         lora_ids,
-        None # maybe_expert_map
+        None,  # maybe_expert_map
     )
 
     config = {
@@ -303,7 +296,7 @@ def test_fused_moe_lora_kernel(
                 K,
             ),
             dtype=dtype,
-            device=device
+            device=device,
         )
     ]
     lora_b_stacked = [
@@ -315,7 +308,7 @@ def test_fused_moe_lora_kernel(
                 max_lora_rank,
             ),
             dtype=dtype,
-            device=device
+            device=device,
         )
     ]
     hidden_states = torch.rand(
@@ -324,7 +317,7 @@ def test_fused_moe_lora_kernel(
             K,
         ),
         dtype=dtype,
-        device=device
+        device=device,
     )
 
     # fused_moe_lora_kernel output
@@ -356,6 +349,7 @@ def test_fused_moe_lora_kernel(
     )
 
     torch.testing.assert_close(output, output2, atol=1e-1, rtol=1e-1)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
