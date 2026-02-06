@@ -128,15 +128,19 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
 from sglang.srt.models.deepseek_common.utils import (
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _device_sm,
+    _get_llama_4_scaling,
     _is_cpu,
     _is_cpu_amx_available,
+    _is_cublas_ge_129,
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
     _is_npu,
     _use_aiter,
     _use_aiter_gfx95,
+    yarn_get_mscale,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -146,7 +150,6 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_non_idle_and_non_empty,
-    is_nvidia_cublas_cu12_version_ge_12_9,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -192,8 +195,6 @@ elif _is_npu:
     )
 else:
     pass
-
-_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
 
@@ -466,7 +467,9 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
+                    or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     else {}
                 ),
@@ -508,6 +511,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
@@ -528,7 +532,9 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
@@ -736,8 +742,6 @@ class DeepseekV2MoE(nn.Module):
                 if self.shared_experts_is_fp8
                 else None
             ),  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
             True,  # is_vnni
         )
         if self.tp_size > 1 and not should_allreduce_fusion:
@@ -882,6 +886,52 @@ class DeepseekV2MoE(nn.Module):
             post_combine_hook_handle = (
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
+        elif envs.SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO.get():
+            # On GB200: Shared experts overlapped on alt_stream, down gemm overlapped with DeepEP Combine
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+
+                post_dispatch_hook_handle.remove()
+
+            def _pre_combine_hook(
+                dispatcher: BaseDispatcher, combine_input: CombineInput
+            ):
+                if (
+                    e := dispatcher.meta_overlap_args.get("record_event_after_down")
+                ) is not None:
+                    e.record()
+                pre_combine_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            pre_combine_hook_handle = self.experts.dispatcher.register_pre_combine_hook(
+                _pre_combine_hook
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -896,13 +946,17 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            # aiter moe call will handle routed_scaling_factor in the function
+            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
+            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if not (
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -1001,24 +1055,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
 
         state.hidden_states_mlp_output = final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
-
-
-def _get_llama_4_scaling(
-    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
-) -> torch.Tensor:
-    scaling = 1 + scaling_beta * torch.log(
-        1 + torch.floor(positions / original_max_position_embeddings)
-    )
-    # Broadcast over num_heads and head_dim
-    return scaling[..., None, None]
 
 
 class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
@@ -1174,6 +1210,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 self.rotary_emb.forward = self.rotary_emb.forward_native
         else:
             self.rotary_emb = None
+        self.use_deepseek_yarn_rope = rope_scaling is not None
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -2474,7 +2511,7 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                enable_tp=not is_dp_attention_enabled(),
+                use_attn_tp_group=is_dp_attention_enabled(),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -2544,7 +2581,16 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    tp_size = get_tensor_model_parallel_world_size()
+                    # tp_size = get_tensor_model_parallel_world_size()
+                    a2a_backend = get_moe_a2a_backend()
+                    is_a2a_moe = (
+                        a2a_backend.is_deepep()
+                        or a2a_backend.is_mori()
+                        or a2a_backend.is_mooncake()
+                    )
+                    tp_size = (
+                        1 if is_a2a_moe else get_tensor_model_parallel_world_size()
+                    )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
@@ -2798,7 +2844,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Config not support fused shared expert(s)."
+            disable_reason = "Config does not support fused shared expert(s)."
         elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
@@ -2810,8 +2856,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
+        elif disable_reason is None and (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
+        ):
+            disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 

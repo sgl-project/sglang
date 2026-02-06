@@ -92,11 +92,13 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
-              - "scripts/ci/**"
+              - "scripts/ci/amd/*"
+              - "scripts/ci/utils/*"
               - "test/**"
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+              - ".github/workflows/pr-test-amd.yml"
             multimodal_gen:
               - "python/sglang/multimodal_gen/**"
               - "python/sglang/cli/**"
@@ -130,13 +132,13 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 14
@@ -148,11 +150,49 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_activation.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_topk.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_kvcacheio.py
-          docker exec -w /sglang-checkout/sgl-kernel/tests/sgl_diffusion ci_sglang python3 -m pytest test_timestep_embedding.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
+
+  sgl-kernel-unit-test-2-gpu-amd:
+    needs: [check-changes]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'sgl-kernel-unit-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          needs.check-changes.outputs.sgl_kernel == 'true'
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-2]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 20
+        run: |
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
+
   # =============================================== primary ====================================================
 
   stage-a-test-1-amd:
@@ -182,18 +222,18 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh
+          bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd
 
   stage-b-test-small-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -223,17 +263,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 --timeout-per-file 1800
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 --timeout-per-file 1800
 
   stage-b-test-small-1-gpu-amd-mi35x:
     needs: [check-changes, stage-a-test-1-amd]
@@ -262,17 +302,57 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x
+
+  stage-b-test-large-1-gpu-amd:
+    needs: [check-changes, stage-a-test-1-amd]
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-b-test-large-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-1]
+        part: [0, 1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Start CI container
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800
 
   stage-b-test-large-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -290,6 +370,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-gpu-2]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -301,17 +382,17 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-2-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
@@ -341,13 +422,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
 
       - name: Setup kernel caches
         run: |
@@ -461,13 +542,13 @@ jobs:
           pattern: wheel-python3.10-cuda12.9
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+          bash scripts/ci/amd/amd_ci_install_dependency.sh diffusion
 
       - name: Setup kernel caches
         run: |
@@ -570,7 +651,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi325-gpu-8]
-        part: [0, 1]
+        part: [0, 1, 2]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -582,23 +663,23 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Test RCCL multi-GPU communication
         timeout-minutes: 5
         run: |
           echo "Testing RCCL multi-GPU communication with debug info..."
-          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/test_rccl_multi_gpu.py"
+          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/amd/test_rccl_multi_gpu.py"
 
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
 
   stage-c-test-large-8-gpu-amd-mi35x:
     needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
@@ -616,7 +697,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [linux-mi35x-gpu-8]
-        part: [0, 1, 2]
+        part: [0]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -628,24 +709,25 @@ jobs:
         run: bash scripts/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+        run: bash scripts/ci/amd/amd_ci_start_container.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600
 
-  performance-test-1-gpu-part-1-amd:
+  # =============================================== Disaggregation ====================================================
+  stage-b-test-large-8-gpu-35x-disaggregation-amd:
     needs: [check-changes, stage-a-test-1-amd]
     if: |
       always() &&
       (
-        (inputs.target_stage == 'performance-test-1-gpu-part-1-amd') ||
+        (inputs.target_stage == 'stage-b-test-large-8-gpu-disaggregation-amd') ||
         (
           !inputs.target_stage &&
           (!failure() && !cancelled()) &&
@@ -655,8 +737,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-1]
+        runner: [linux-mi35x-gpu-8.fabric]
+
     runs-on: ${{matrix.runner}}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -666,301 +750,88 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
 
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
+      - name: Check Host RDMA Environment
+        id: rdma_detect
+        run: |
+          set +e
+          echo "=== Checking Host RDMA Environment ==="
+
+          echo ""
+          echo "=== 1. Ionic driver library check ==="
+          ls -l /usr/lib/x86_64-linux-gnu/libibverbs/libionic* 2>/dev/null || echo "libionic not found in standard path"
+
+          echo ""
+          echo "=== 2. Infiniband devices ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "/dev/infiniband not found"
+          ls -la /sys/class/infiniband/ 2>/dev/null || echo "/sys/class/infiniband not found"
+
+          echo ""
+          echo "=== 3. ibv_devinfo ==="
+          which ibv_devinfo 2>/dev/null && ibv_devinfo 2>&1 || echo "ibv_devinfo not available"
+
+          echo ""
+          echo "=== 4. Kernel modules ==="
+          lsmod 2>/dev/null | grep -E "ib_|rdma|ionic" || echo "No RDMA kernel modules loaded"
+
+          echo ""
+          echo "=== 5. Detect RDMA Devices for test environment ==="
+          if [ -d "/sys/class/infiniband" ]; then
+            RDMA_DEVS=$(ls /sys/class/infiniband | paste -sd "," -)
+            echo "Detected RDMA Devices: $RDMA_DEVS"
+            echo "SGLANG_TEST_RDMA_DEVICE=$RDMA_DEVS" >> $GITHUB_ENV
+          else
+            echo "No RDMA devices found in /sys/class/infiniband"
+            echo "SGLANG_TEST_RDMA_DEVICE=" >> $GITHUB_ENV
+          fi
+
+          echo ""
+          echo "=== Host RDMA Check Complete ==="
+
+      - name: Start Special Container
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
+        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Benchmark single latency
-        timeout-minutes: 20
+      - name: Verify RDMA in Container
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_one_batch_1gpu.TestBenchOneBatch1GPU.test_bs1_small
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_one_batch_1gpu.TestBenchOneBatch1GPU.test_bs1_default
+          docker exec -u root ci_sglang bash -c '
+            echo "=== Container RDMA Verification ==="
+            echo "Device nodes:"
+            ls -la /dev/infiniband/
+            echo ""
+            echo "Provider libraries:"
+            ls /usr/lib/x86_64-linux-gnu/libibverbs/ | grep -E "ionic|mlx" || echo "No Ionic/Mellanox providers"
+            echo ""
+            echo "HCA devices:"
+            HCA_COUNT=$(ibv_devinfo -list 2>&1 | grep -oE "^[0-9]+ HCAs? found" | grep -oE "^[0-9]+" || echo "0")
+            ibv_devinfo -list
+            if [ "$HCA_COUNT" -gt 0 ]; then
+              echo ""
+              echo "=== SUCCESS: RDMA setup complete. Found $HCA_COUNT HCA(s) ==="
+            else
+              echo ""
+              echo "=== WARNING: No HCAs detected. RDMA tests may fail ==="
+            fi
+          '
 
-      - name: Benchmark online latency
-        timeout-minutes: 15
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_online_latency_default
-
-      - name: Benchmark online latency (LoRA)
+      - name: Run Aiter Op Test (RMSNorm)
         timeout-minutes: 10
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_lora_online_latency
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_lora_online_latency_with_concurrent_adapter_updates
+          echo "Running pre-check: test_rmsnorm2d.py"
+          docker exec \
+            -e MAX_JOBS=192 \
+            ci_sglang \
+            python /sgl-workspace/aiter/op_tests/test_rmsnorm2d.py
 
-      - name: Benchmark offline throughput
-        timeout-minutes: 15
+      - name: Run test_disaggregation
+        timeout-minutes: 60
         run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_offline_throughput_default
-
-      - name: Benchmark offline throughput (Non-streaming, small batch size)
-        timeout-minutes: 15
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_offline_throughput_non_stream_small_batch_size
-
-  performance-test-1-gpu-part-2-amd:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-1-gpu-part-2-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-gpu-1]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Benchmark offline throughput (w/o RadixAttention)
-        timeout-minutes: 15
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline throughput (w/ Triton)
-        timeout-minutes: 15
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part1.TestBenchServing1GPUPart1.test_offline_throughput_with_triton_attention_backend
-
-      - name: Benchmark offline throughput (w/ FP8)
-        timeout-minutes: 15
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_large.TestBenchServing1GPULarge.test_offline_throughput_default_fp8
-
-      - name: Benchmark VLM offline throughput
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_vlm_offline_throughput
-
-      - name: Benchmark VLM online latency
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_vlm_online_latency
-
-  performance-test-1-gpu-part-3-amd:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-1-gpu-part-3-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-gpu-1]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Benchmark Scores online latency and throughput
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_score_api_latency_throughput
-
-      - name: Benchmark Scores online latency and throughput (batch size scaling)
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_score_api_batch_scaling
-
-      - name: Benchmark Embeddings online latency and throughput
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_embeddings_api_latency_throughput
-
-      - name: Benchmark Embeddings online latency and throughput (batch size scaling)
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_1gpu_part2.TestBenchServing1GPUPart2.test_embeddings_api_batch_scaling
-
-  performance-test-2-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'performance-test-2-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-gpu-2]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Benchmark dummy grok (TP=2)
-        timeout-minutes: 30
-        run: |
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
-
-      - name: Benchmark single latency (TP=2)
-        timeout-minutes: 25
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_one_batch_2gpu.TestBenchOneBatch2GPU.test_moe_tp2_bs1
-
-      - name: Benchmark single latency + torch.compile (TP=2)
-        timeout-minutes: 25
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_one_batch_2gpu.TestBenchOneBatch2GPU.test_torch_compile_tp2_bs1
-
-      - name: Benchmark offline throughput (TP=2)
-        timeout-minutes: 25
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_2gpu.TestBenchServing2GPU.test_moe_offline_throughput_default
-
-      - name: Benchmark offline throughput (w/o RadixAttention) (TP=2)
-        timeout-minutes: 25
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_2gpu.TestBenchServing2GPU.test_moe_offline_throughput_without_radix_cache
-
-      - name: Benchmark offline PP decode throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_2gpu.TestBenchServing2GPU.test_pp_offline_throughput_default_decode
-
-      - name: Benchmark offline PP prefill throughput (PP=2)
-        timeout-minutes: 10
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/perf python3 -m unittest test_bench_serving_2gpu.TestBenchServing2GPU.test_pp_long_context_prefill
-
-  accuracy-test-1-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'accuracy-test-1-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-gpu-1]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Evaluate Accuracy
-        timeout-minutes: 30
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/eval -e SGLANG_USE_AITER=0 python3 test_eval_accuracy_large.py
-
-  accuracy-test-2-gpu-amd:
-    needs: [check-changes, accuracy-test-1-gpu-amd]
-    # Temporarily disabled - uncomment when ready to re-enable (tracked here: https://github.com/sgl-project/sglang/issues/13107)
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
-        (
-          !inputs.target_stage &&
-          (!failure() && !cancelled()) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [linux-mi325-gpu-2]
-    runs-on: ${{matrix.runner}}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Evaluate accuracy (TP=2)
-        timeout-minutes: 30
-        run: |
-          bash scripts/ci/amd_ci_exec.sh -w /sglang-checkout/test/registered/eval -e SGLANG_USE_AITER_AR=0 -e SGLANG_USE_AITER=0 -e HF_HUB_ENABLE_HF_TRANSFER=0 python3 test_moe_eval_accuracy_large.py
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
+            -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 1800
 
   pr-test-amd-finish:
     needs:
@@ -969,21 +840,18 @@ jobs:
         check-changes,
 
         sgl-kernel-unit-test-amd,
+        sgl-kernel-unit-test-2-gpu-amd,
         multimodal-gen-test-1-gpu-amd,
         multimodal-gen-test-2-gpu-amd,
 
         stage-a-test-1-amd,
         stage-b-test-small-1-gpu-amd,
         stage-b-test-small-1-gpu-amd-mi35x,
+        stage-b-test-large-1-gpu-amd,
         stage-b-test-large-2-gpu-amd,
+        stage-b-test-large-8-gpu-35x-disaggregation-amd,
         stage-c-test-large-8-gpu-amd,
         stage-c-test-large-8-gpu-amd-mi35x,
-        performance-test-1-gpu-part-1-amd,
-        performance-test-1-gpu-part-2-amd,
-        performance-test-1-gpu-part-3-amd,
-        performance-test-2-gpu-amd,
-        accuracy-test-1-gpu-amd,
-        accuracy-test-2-gpu-amd,
       ]
     if: always()
     runs-on: ubuntu-latest

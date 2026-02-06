@@ -288,7 +288,7 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """
         Convert ComfyUI Flux weights to SGLang format.
-        Splits fused linear1 into separate to_qkv and proj_mlp weights.
+        Splits fused qkv weights into to_q/to_k/to_v plus proj_mlp.
         Filters out guidance_in weights if model doesn't support guidance embeddings.
         Handles scale/shift order difference between ComfyUI and AdaLayerNormContinuous.
         """
@@ -297,6 +297,41 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                 logger.debug(
                     f"Skipping {name} (model doesn't support guidance embeddings)"
                 )
+                continue
+
+            # Split fused qkv in double blocks into separate q/k/v projections
+            match = re.match(
+                r"double_blocks\.(\d+)\.(img_attn|txt_attn)\.qkv\.(weight|bias)$", name
+            )
+            if match:
+                block_idx, attn_type, param_type = match.groups()
+                hidden_size = qkv_size // 3
+
+                if tensor.shape[0] < 3 * hidden_size:
+                    logger.warning(
+                        f"{name} shape {tensor.shape} smaller than expected qkv size {3 * hidden_size}, skipping"
+                    )
+                    continue
+
+                if param_type == "bias":
+                    q_tensor = tensor[:hidden_size]
+                    k_tensor = tensor[hidden_size : 2 * hidden_size]
+                    v_tensor = tensor[2 * hidden_size : 3 * hidden_size]
+                else:
+                    q_tensor = tensor[:hidden_size, :]
+                    k_tensor = tensor[hidden_size : 2 * hidden_size, :]
+                    v_tensor = tensor[2 * hidden_size : 3 * hidden_size, :]
+
+                target_prefix = f"transformer_blocks.{block_idx}.attn"
+                if attn_type == "img_attn":
+                    yield f"{target_prefix}.to_q.{param_type}", q_tensor
+                    yield f"{target_prefix}.to_k.{param_type}", k_tensor
+                    yield f"{target_prefix}.to_v.{param_type}", v_tensor
+                else:
+                    # txt_attn corresponds to encoder projections
+                    yield f"{target_prefix}.add_q_proj.{param_type}", q_tensor
+                    yield f"{target_prefix}.add_k_proj.{param_type}", k_tensor
+                    yield f"{target_prefix}.add_v_proj.{param_type}", v_tensor
                 continue
 
             match = re.match(r"single_blocks\.(\d+)\.linear1\.(weight|bias)$", name)
@@ -319,8 +354,20 @@ class ComfyUIFluxPipeline(LoRAPipeline, ComposedPipelineBase):
                     tensor[qkv_size:] if param_type == "bias" else tensor[qkv_size:, :]
                 )
 
-                # Yield split weights
-                yield f"single_transformer_blocks.{block_idx}.attn.to_qkv.{param_type}", qkv_tensor
+                # Split qkv into q/k/v for single blocks
+                hidden_size = qkv_size // 3
+                if param_type == "bias":
+                    q_tensor = qkv_tensor[:hidden_size]
+                    k_tensor = qkv_tensor[hidden_size : 2 * hidden_size]
+                    v_tensor = qkv_tensor[2 * hidden_size : 3 * hidden_size]
+                else:
+                    q_tensor = qkv_tensor[:hidden_size, :]
+                    k_tensor = qkv_tensor[hidden_size : 2 * hidden_size, :]
+                    v_tensor = qkv_tensor[2 * hidden_size : 3 * hidden_size, :]
+
+                yield f"single_transformer_blocks.{block_idx}.attn.to_q.{param_type}", q_tensor
+                yield f"single_transformer_blocks.{block_idx}.attn.to_k.{param_type}", k_tensor
+                yield f"single_transformer_blocks.{block_idx}.attn.to_v.{param_type}", v_tensor
                 yield f"single_transformer_blocks.{block_idx}.proj_mlp.{param_type}", mlp_tensor
             elif name == "final_layer.adaLN_modulation.1.weight":
                 # ComfyUI: output order is [shift, scale]

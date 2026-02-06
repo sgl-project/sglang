@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -56,9 +57,14 @@ jobs:
           filters: |
             main_package:
               - "python/sglang/!(multimodal_gen)/**"
-              - "python/pyproject_other.toml"
-              - "scripts/ci/npu_ci_install_dependency.sh"
+              - "python/pyproject_npu.toml"
+              - "scripts/ci/npu/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
+              - ".github/workflows/pr-test-npu.yml"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
+              - "python/pyproject_npu.toml"
+              - "scripts/ci/npu_ci_install_dependency.sh"
               - ".github/workflows/pr-test-npu.yml"
 
   # ==================== PR Gate ==================== #
@@ -73,7 +79,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-1
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -89,7 +95,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -105,7 +111,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-1-npu-a2
 
@@ -118,7 +123,7 @@ jobs:
       matrix:
         part: [0, 1, 2]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -134,7 +139,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -150,7 +155,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
@@ -159,7 +163,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a2-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -175,7 +179,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -191,7 +195,6 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-4-npu-a2 --timeout-per-file 3600
 
@@ -204,7 +207,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -220,7 +223,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -236,6 +239,5 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
-          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
           python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
