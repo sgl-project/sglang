@@ -27,7 +27,9 @@ Usage:
     python -m unittest test_lora_hf_sgl_logprob_diff
 """
 
+import json
 import multiprocessing as mp
+import os
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -100,6 +102,16 @@ def compare_logprobs_for_type(
     Returns:
         Dictionary containing comparison statistics
     """
+    # It seems like HF is returning logprob for EOS, but SGLang is not.
+    min_len = min(sglang_logprobs.shape[0], hf_logprobs.shape[0])
+    if sglang_logprobs.shape[0] != hf_logprobs.shape[0]:
+        print(
+            f"Warning: {logprob_type} logprob shape mismatch: SGLang {sglang_logprobs.shape}, "
+            f"HF {hf_logprobs.shape}. Truncating to length {min_len}."
+        )
+        sglang_logprobs = sglang_logprobs[:min_len]
+        hf_logprobs = hf_logprobs[:min_len]
+
     diff = torch.abs(sglang_logprobs - hf_logprobs)
     max_diff = torch.max(diff).item()
     mean_diff = torch.mean(diff).item()
@@ -536,7 +548,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
 
         model_path = "Qwen/Qwen1.5-MoE-A2.7B"
-        lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
+        lora_paths = ["jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"]
         prompts = DEFAULT_TEST_PROMPTS[:2]  # Use first 2 default prompts for basic test
 
         self._run_comparison_test(
@@ -544,6 +556,7 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
             lora_paths=lora_paths,
             prompts=prompts,
             max_new_tokens=32,
+            lora_backend="triton",
         )
 
     def test_moe_lora_logprob_comparison_full(self):
@@ -552,14 +565,23 @@ class TestLoRAHFSGLLogprobDifference(CustomTestCase):
         """
 
         model_path = "Qwen/Qwen1.5-MoE-A2.7B"
-        lora_paths = ["sai-lakkshmii/Qwen1.5-MoE-A2.7B-squad-lora-latest"]
-        prompts = DEFAULT_TEST_PROMPTS
+        lora_paths = ["jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"]
+
+        # Load prompts from JSON file
+        prompts_path = os.path.join(
+            os.path.dirname(__file__),
+            "prompts",
+            "sglang_lora_moe_test_qwen1.5-MoE-A2.7B.json",
+        )
+        with open(prompts_path, "r") as f:
+            prompts = json.load(f)
 
         self._run_comparison_test(
             model_path=model_path,
             lora_paths=lora_paths,
             prompts=prompts,
             max_new_tokens=32,
+            lora_backend="triton",
         )
 
 

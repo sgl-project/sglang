@@ -31,28 +31,38 @@ from sglang.srt.lora.lora_moe_runners import LoRAInfo
 from sglang.srt.utils import set_random_seed
 
 
-def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
+def generate_request_data(num_tokens: int, num_sequences: int, max_loras: int, device="cuda"):
+    """
+    Generates segment-based request data instead of token-based data.
+    """
     assert num_sequences > 0 and max_loras > 0
     assert num_tokens >= num_sequences, "num_tokens must be >= num_sequences"
 
-    tokens_per_seq = num_tokens // num_sequences
-    remainder = num_tokens % num_sequences
+    # 1. Generate random segment lengths
+    remaining = num_tokens
+    seg_lens = []
+    for _ in range(num_sequences - 1):
+        # Ensure at least 1 token per sequence
+        max_len = remaining - (num_sequences - len(seg_lens)) + 1
+        length = random.randint(1, min(max_len, num_tokens // num_sequences * 2))
+        seg_lens.append(length)
+        remaining -= length
+    seg_lens.append(remaining) # Last segment gets the rest
 
-    token_lora_mapping = torch.empty(num_tokens, dtype=torch.int32)
+    # 2. Build seg_indptr [0, len1, len1+len2, ...]
+    seg_indptr = torch.cumsum(torch.tensor([0] + seg_lens, dtype=torch.int32, device=device), dim=0, dtype=torch.int32)
 
-    start = 0
-    for seq_idx in range(num_sequences):
-        end = start + tokens_per_seq + (1 if seq_idx < remainder else 0)
-        lora_id = random.randint(0, max_loras - 1)
-        token_lora_mapping[start:end] = lora_id
-        start = end
+    # 3. Assign one LoRA ID per Request
+    req_to_lora = torch.randint(0, max_loras, (num_sequences,), dtype=torch.int32, device=device)
 
-    return token_lora_mapping
+    # 4. Create dense mapping for the Naive verification function
+    # (Expand req_to_lora based on seg_lens)
+    token_lora_mapping = torch.repeat_interleave(req_to_lora, torch.tensor(seg_lens, device=device))
+
+    return seg_indptr, req_to_lora, token_lora_mapping
 
 
-def assign_experts_to_tokens(
-    num_tokens: int, num_experts: int, top_k_num: int, dtype=torch.float32
-):
+def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int, dtype=torch.float32):
     assert top_k_num <= num_experts, "top_k_num must be <= num_experts"
 
     expert_indices = torch.empty((num_tokens, top_k_num), dtype=torch.int32)
@@ -66,76 +76,38 @@ def assign_experts_to_tokens(
     return expert_indices, expert_weights
 
 
-def sample_data(
-    num_tokens: int,
-    num_sequences: int,
-    max_loras: int,
-    num_experts: int,
-    top_k_num: int,
-    dtype=torch.float32,
-):
-    topk_ids, topk_weights = assign_experts_to_tokens(
-        num_tokens, num_experts, top_k_num, dtype
-    )
-    token_lora_mapping = assign_loras_to_tokens(num_tokens, num_sequences, max_loras)
-    return topk_ids, topk_weights, token_lora_mapping
+def sample_data(num_tokens: int, num_sequences: int, max_loras: int, num_experts: int, top_k_num: int, dtype=torch.float32, device="cuda"):
+    topk_ids, topk_weights = assign_experts_to_tokens(num_tokens, num_experts, top_k_num, dtype)
+    seg_indptr, req_to_lora, token_lora_mapping = generate_request_data(num_tokens, num_sequences, max_loras, device)
+    return topk_ids, topk_weights, seg_indptr, req_to_lora, token_lora_mapping
 
 
-def create_lora_info(
-    token_lora_mapping,
-    topk_ids,
-    max_loras,
-    num_experts,
-    max_lora_rank,
-    hidden_dim,
-    intermediate_dim,
-    gate_up_dim,
-    dtype,
-    device,
-):
+def create_lora_info(seg_indptr, weight_indices, topk_ids, max_loras, num_experts, max_lora_rank, hidden_dim, intermediate_dim, gate_up_dim, dtype, device):
     # -------------------------------------------------------------------------
     # 1. Deterministic LoRA A Initialization
     # -------------------------------------------------------------------------
-    # We fill A with (1 / input_dim).
-    # If input is all 1s, A @ x will result in a vector of all 1s.
-
     val_gate_up_a = 1.0 / hidden_dim
     gate_up_lora_a_weights = torch.full(
         (max_loras, num_experts, max_lora_rank, hidden_dim),
-        val_gate_up_a,
-        dtype=dtype,
-        device=device,
+        val_gate_up_a, dtype=dtype, device=device
     )
 
     val_down_a = 1.0 / intermediate_dim
     down_lora_a_weights = torch.full(
         (max_loras, num_experts, max_lora_rank, intermediate_dim),
-        val_down_a,
-        dtype=dtype,
-        device=device,
+        val_down_a, dtype=dtype, device=device
     )
 
     # -------------------------------------------------------------------------
-    # 2. Deterministic LoRA B Initialization (Expert-Specific)
+    # 2. Deterministic LoRA B Initialization
     # -------------------------------------------------------------------------
-    # We want the output to be safe but noticeable.
-    # Let's target a base value of 0.1 per expert index.
-    # Formula: fill_value = (target / rank) * (expert_id + 1)
+    base_target = 0.01
 
-    base_target = 0.01  # Small enough to not explode SiLU, big enough to see
-
-    gate_up_lora_b_weights = torch.zeros(
-        (max_loras, num_experts, gate_up_dim, max_lora_rank), dtype=dtype, device=device
-    )
-    down_lora_b_weights = torch.zeros(
-        (max_loras, num_experts, hidden_dim, max_lora_rank), dtype=dtype, device=device
-    )
+    gate_up_lora_b_weights = torch.zeros((max_loras, num_experts, gate_up_dim, max_lora_rank), dtype=dtype, device=device)
+    down_lora_b_weights = torch.zeros((max_loras, num_experts, hidden_dim, max_lora_rank), dtype=dtype, device=device)
 
     for i in range(num_experts):
-        # Make every expert add a slightly different value so we can check routing
-        # Expert 0 adds ~0.01, Expert 10 adds ~0.11
-        expert_multiplier = i + 1
-
+        expert_multiplier = (i + 1)
         fill_val = (base_target * expert_multiplier) / max_lora_rank
 
         gate_up_lora_b_weights[:, i, :, :] = fill_val
@@ -144,17 +116,21 @@ def create_lora_info(
     # -------------------------------------------------------------------------
     # 3. Setup Metadata
     # -------------------------------------------------------------------------
-    lora_ranks = torch.full(
-        (max_loras,), max_lora_rank, dtype=torch.int32, device=device
-    )
-    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32, device=device)
+    lora_ranks = torch.full((max_loras,), max_lora_rank, dtype=torch.int32, device=device)
+
+    # Enable all adapters referenced in weight_indices
+    adapter_enabled = torch.zeros(max_loras + 1, dtype=torch.int32, device=device)
+    adapter_enabled.index_fill_(0, weight_indices.long(), 1)
 
     return LoRAInfo(
         gate_up_lora_a_weights=gate_up_lora_a_weights,
         gate_up_lora_b_weights=gate_up_lora_b_weights,
         down_lora_a_weights=down_lora_a_weights,
         down_lora_b_weights=down_lora_b_weights,
-        token_lora_mapping=token_lora_mapping,
+        # UPDATED FIELDS
+        seg_indptr=seg_indptr,
+        req_to_lora=weight_indices,
+
         lora_ranks=lora_ranks,
         adapter_enabled=adapter_enabled,
         max_lora_rank=max_lora_rank,
@@ -162,24 +138,20 @@ def create_lora_info(
     )
 
 
-def torch_naive_moe_with_lora(
-    hidden_states, w13, w2, b13, b2, topk_weights, topk_ids, lora_info
-):
+def torch_naive_moe_with_lora(hidden_states, w13, w2, b13, b2, topk_weights, topk_ids, lora_info, token_lora_mapping):
+    """
+    Naive implementation. Note: We pass 'token_lora_mapping' explicitly because
+    lora_info no longer contains it, but the naive token-loop logic needs it.
+    """
     num_tokens, hidden_dim = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_experts = w13.shape[0]
-    intermediate_dim = w2.shape[2]
 
-    hidden_expanded = (
-        hidden_states.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, hidden_dim)
-    )
+    # Expand hidden states for top-k routing
+    hidden_expanded = hidden_states.unsqueeze(1).expand(-1, top_k, -1).reshape(-1, hidden_dim)
 
-    gate_up_out = torch.zeros(
-        num_tokens * top_k,
-        w13.shape[1],
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
+    # 1. Gate/Up Projection (Base)
+    gate_up_out = torch.zeros(num_tokens * top_k, w13.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
 
     for expert_id in range(num_experts):
         mask = (topk_ids == expert_id).flatten()
@@ -191,38 +163,35 @@ def torch_naive_moe_with_lora(
 
     gate_up_out = gate_up_out.view(num_tokens, top_k, -1)
 
+    # 1.5. LoRA Gate/Up Delta
     if lora_info.max_lora_rank > 0:
         for i in range(num_tokens):
             for k in range(top_k):
                 expert_id = topk_ids[i, k]
-                lora_id = lora_info.token_lora_mapping[i]
-                lora_a = lora_info.gate_up_lora_a_weights[lora_id, expert_id]
-                lora_b = lora_info.gate_up_lora_b_weights[lora_id, expert_id]
-                lora_a_result = lora_a @ hidden_states[i]
-                lora_b_result = lora_b @ lora_a_result
-                # Using scaling factor of 1.0 since lora_scalings was removed
-                lora_delta = 1.0 * lora_b_result
-                gate_up_out[i, k] += lora_delta
+                lora_id = token_lora_mapping[i] # Use explicit mapping
 
+                # Check if this adapter is enabled/valid
+                if lora_id < len(lora_info.lora_ranks):
+                     lora_a = lora_info.gate_up_lora_a_weights[lora_id, expert_id]
+                     lora_b = lora_info.gate_up_lora_b_weights[lora_id, expert_id]
+                     lora_a_result = lora_a @ hidden_states[i]
+                     lora_b_result = lora_b @ lora_a_result
+                     gate_up_out[i, k] += lora_b_result
+
+    # 2. Activation
     gate_up_dim = gate_up_out.shape[-1]
     gate_dim = gate_up_dim // 2
     gate = gate_up_out[..., :gate_dim]
     up = gate_up_out[..., gate_dim:]
 
     silu_gate = torch.nn.functional.silu(gate)
-
     intermediate_out = silu_gate * up
 
-    down_out = torch.zeros(
-        num_tokens,
-        top_k,
-        hidden_dim,
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
+    # 3. Down Projection (Base)
+    down_out = torch.zeros(num_tokens, top_k, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device)
 
     for expert_id in range(num_experts):
-        mask = topk_ids == expert_id
+        mask = (topk_ids == expert_id)
         if mask.any():
             masked_intermediate = intermediate_out[mask]
             expert_down_result = masked_intermediate @ w2[expert_id].T
@@ -230,21 +199,22 @@ def torch_naive_moe_with_lora(
             if b2 is not None:
                 down_out[mask] += b2[expert_id]
 
+    # 3.5. LoRA Down Delta
     if lora_info.max_lora_rank > 0:
         for i in range(num_tokens):
             for k in range(top_k):
                 expert_id = topk_ids[i, k]
-                lora_id = lora_info.token_lora_mapping[i]
-                lora_a = lora_info.down_lora_a_weights[lora_id, expert_id]
-                lora_b = lora_info.down_lora_b_weights[lora_id, expert_id]
-                lora_a_result = lora_a @ intermediate_out[i, k]
-                lora_b_result = lora_b @ lora_a_result
-                # Using scaling factor of 1.0 since lora_scalings was removed
-                lora_delta = 1.0 * lora_b_result
-                down_out[i, k] += lora_delta
+                lora_id = token_lora_mapping[i] # Use explicit mapping
 
+                if lora_id < len(lora_info.lora_ranks):
+                    lora_a = lora_info.down_lora_a_weights[lora_id, expert_id]
+                    lora_b = lora_info.down_lora_b_weights[lora_id, expert_id]
+                    lora_a_result = lora_a @ intermediate_out[i, k]
+                    lora_b_result = lora_b @ lora_a_result
+                    down_out[i, k] += lora_b_result
+
+    # 4. Final Reduction
     weighted_out = down_out * topk_weights.unsqueeze(-1)
-
     final_out = weighted_out.sum(dim=1)
 
     return final_out
@@ -254,9 +224,7 @@ def torch_naive_moe_with_lora(
 @pytest.mark.parametrize("top_k_num", [1, 2])
 @pytest.mark.parametrize("num_experts", [8, 20])
 @pytest.mark.parametrize("max_lora_rank", [8, 16])
-def test_lora_moe_runner_multi_expert(
-    num_tokens, top_k_num, num_experts, max_lora_rank
-):
+def test_lora_moe_runner_multi_expert(num_tokens, top_k_num, num_experts, max_lora_rank):
     # Fixed parameters
     max_loras = 2
     hidden_dim = 512
@@ -269,28 +237,27 @@ def test_lora_moe_runner_multi_expert(
     torch.set_default_device(device)
     set_random_seed(seed)
 
-    # Distribute tokens across all experts (Random Routing)
-    topk_ids, topk_weights = assign_experts_to_tokens(
-        num_tokens, num_experts, top_k_num, dtype
-    )
-
-    # Assign LoRAs randomly
     num_sequences = 4
-    token_lora_mapping = assign_loras_to_tokens(num_tokens, num_sequences, max_loras)
+
+    # Generate Data using the new Request-Based generator
+    topk_ids, topk_weights, seg_indptr, req_to_lora, token_lora_mapping = sample_data(
+        num_tokens, num_sequences, max_loras, num_experts, top_k_num, dtype, device
+    )
 
     gate_up_dim = intermediate_dim * 2
 
-    # Initialize ALL experts with non-zero random weights
+    # Initialize experts
     w13 = torch.randn(num_experts, gate_up_dim, hidden_dim, dtype=dtype) * 0.01
     w2 = torch.randn(num_experts, hidden_dim, intermediate_dim, dtype=dtype) * 0.01
     b13 = torch.randn(num_experts, gate_up_dim, dtype=dtype) * 0.01
     b2 = torch.randn(num_experts, hidden_dim, dtype=dtype) * 0.01
 
-    # Set input to random values
     hidden_states = torch.randn(num_tokens, hidden_dim, dtype=dtype)
 
+    # Create LoRA Info using the new fields
     lora_info = create_lora_info(
-        token_lora_mapping=token_lora_mapping,
+        seg_indptr=seg_indptr,
+        weight_indices=req_to_lora,
         topk_ids=topk_ids,
         max_loras=max_loras,
         num_experts=num_experts,
@@ -302,16 +269,14 @@ def test_lora_moe_runner_multi_expert(
         device=device,
     )
 
-    # Sort tokens by expert ID for the runner
+    # Sort tokens for the runner
     topk_ids_flat = topk_ids.flatten()
     sorted_indices = torch.argsort(topk_ids_flat)
     sorted_token_ids = sorted_indices // top_k_num
     expert_ids = topk_ids_flat[sorted_indices]
 
     num_dispatched = num_tokens * top_k_num
-    num_tokens_post_padded = torch.tensor(
-        [num_dispatched], dtype=torch.int32, device=device
-    )
+    num_tokens_post_padded = torch.tensor([num_dispatched], dtype=torch.int32, device=device)
 
     runner_input = TritonRunnerInput(
         hidden_states=hidden_states,
@@ -359,22 +324,20 @@ def test_lora_moe_runner_multi_expert(
     class MockServerArgs:
         enable_deterministic_inference = False
 
-    with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
-        return_value=MockServerArgs(),
-    ):
+    with patch('sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args', return_value=MockServerArgs()):
         runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
-        combine_input = runner.run(dispatch_output, quant_info, lora_info)
-        lora_output = combine_input
+        # Run SGLang runner (Uses Kernel)
+        lora_output = runner.run(dispatch_output, quant_info, lora_info)
 
+    # Run Naive Torch Implementation (Uses dense mapping for verification)
     torch_output = torch_naive_moe_with_lora(
-        hidden_states, w13, w2, b13, b2, topk_weights, topk_ids, lora_info
+        hidden_states, w13, w2, b13, b2, topk_weights, topk_ids, lora_info, token_lora_mapping
     )
 
     print(f"lora_output.hidden_states mean: {lora_output.hidden_states.mean()}")
     print(f"torch_output mean: {torch_output.mean()}")
 
-    # Assert close
-    torch.testing.assert_close(
-        lora_output.hidden_states, torch_output, atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(lora_output.hidden_states, torch_output, atol=1e-2, rtol=1e-2)
+
+if __name__ == "__main__":
+    pytest.main([__file__])

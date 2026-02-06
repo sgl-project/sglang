@@ -25,6 +25,40 @@ def moe_align_block_size(
     )
 
 
+def moe_lora_align_block_size(
+    topk_ids,
+    seg_indptr,
+    req_to_lora,
+    num_experts,
+    block_size,
+    max_loras,
+    max_num_tokens_padded,
+    max_num_m_blocks,
+    sorted_token_ids,
+    expert_ids,
+    num_tokens_post_pad,
+    adapter_enabled,
+    lora_ids,
+    maybe_expert_map=None,
+):
+    torch.ops.sgl_kernel.moe_lora_align_block_size.default(
+        topk_ids,
+        seg_indptr,
+        req_to_lora,
+        num_experts,
+        block_size,
+        max_loras,
+        max_num_tokens_padded,
+        max_num_m_blocks,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        adapter_enabled,
+        lora_ids,
+        maybe_expert_map,
+    )
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

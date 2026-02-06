@@ -228,6 +228,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(
+      "moe_lora_align_block_size(Tensor topk_ids, Tensor seg_indptr, Tensor req_to_lora, "
+      "int num_experts, int block_size, int max_loras, int max_num_tokens_padded, "
+      "int max_num_m_blocks, Tensor! sorted_token_ids, Tensor! expert_ids, "
+      "Tensor! num_tokens_post_pad, Tensor adapter_enabled, Tensor lora_ids, "
+      "Tensor? maybe_expert_map) -> ()");
+  m.impl("moe_lora_align_block_size", torch::kCUDA, &moe_lora_align_block_size);
+
+  m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
       "moe_softcapping, Tensor? correction_bias) -> ()");
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);

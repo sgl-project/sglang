@@ -848,10 +848,3 @@ void moe_lora_align_block_size(
       });
 }
 
-// TODO: Jonahbernard: remove this later
-#include <torch/extension.h>
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("moe_lora_align_block_size", &moe_lora_align_block_size,
-          "MoE LoRA Align Block Size");
-}

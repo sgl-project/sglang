@@ -4,26 +4,13 @@ import os
 import pytest
 import torch
 from torch.utils.cpp_extension import load
+import sys
 
-# ==============================================================================
-# 1. JIT Compile the Kernel
-# ==============================================================================
-# Pointing specifically to the path you provided
-source_path = ".."
+# ---------------------------------------------------------
+# IMPORT PREBUILT KERNEL
+# ---------------------------------------------------------
+from sgl_kernel import moe_lora_align_block_size
 
-print(f"Loading kernel from: {source_path}")
-
-# Check if file exists to avoid confusing compilation errors
-if not os.path.exists(source_path):
-    raise FileNotFoundError(f"Could not find CUDA file at {source_path}")
-
-moe_ops = load(
-    name="moe_lora_ops_jit",
-    sources=[source_path],
-    extra_cuda_cflags=["-O3"],
-    verbose=True,
-)
-print("Kernel loaded successfully.")
 
 
 def round_up(x, base):
@@ -35,20 +22,43 @@ def CEILDIV(x, y):
 
 
 def sample_data(num_experts, max_loras, num_tokens, topk_num):
+    # 1. Generate TopK IDs (Flattened tokens)
     topk_ids = torch.zeros((num_tokens, topk_num), dtype=torch.int32)
-    token_lora_mapping = torch.zeros((num_tokens,), dtype=torch.int32)
-
     for i in range(num_tokens):
         pool = list(range(num_experts))
         random.shuffle(pool)
         for j in range(topk_num):
             topk_ids[i, j] = pool[j]
-        token_lora_mapping[i] = random.randint(0, max_loras - 1)
 
-    return topk_ids.to("cuda"), token_lora_mapping.to("cuda")
+    # 2. Generate Random Requests (Segments)
+    # We split num_tokens into random chunks to simulate a batch of requests
+    remaining_tokens = num_tokens
+    seg_lens = []
+    while remaining_tokens > 0:
+        # Random length between 1 and remaining
+        length = random.randint(1, min(32, remaining_tokens))
+        if remaining_tokens - length < 0:
+            length = remaining_tokens
+        seg_lens.append(length)
+        remaining_tokens -= length
+
+    # Ensure we cover the full range exactly (cleanup last segment)
+    if sum(seg_lens) < num_tokens:
+        seg_lens.append(num_tokens - sum(seg_lens))
+
+    # 3. Build seg_indptr [0, len1, len1+len2, ...]
+    seg_indptr = torch.cumsum(
+        torch.tensor([0] + seg_lens, dtype=torch.int32), dim=0
+    ).to(dtype=torch.int32)
+
+    # 4. Assign a LoRA ID to each Request
+    num_reqs = len(seg_lens)
+    req_to_lora = torch.randint(0, max_loras, (num_reqs,), dtype=torch.int32)
+
+    return (topk_ids.to("cuda"), seg_indptr.to("cuda"), req_to_lora.to("cuda"))
 
 
-@pytest.mark.parametrize("num_tokens", [100, 200, 1024, 4096])  # 81920
+@pytest.mark.parametrize("num_tokens", [100, 200, 1024, 4096])
 @pytest.mark.parametrize("topk_num", [6])
 @pytest.mark.parametrize("num_experts", [64, 128, 256, 512])
 @pytest.mark.parametrize("max_loras", [2, 32])
@@ -58,7 +68,10 @@ def test_moe_lora_align_block_size(
 ):
     # sample data
     random.seed(1)
-    topk_ids, token_lora_mapping = sample_data(
+    torch.manual_seed(1)
+
+    # UPDATED: Get the new 3-step mapping tensors
+    topk_ids, seg_indptr, req_to_lora = sample_data(
         num_experts, max_loras, num_tokens, topk_num
     )
 
@@ -81,10 +94,11 @@ def test_moe_lora_align_block_size(
     adapter_enabled = torch.ones((max_loras + 1,), dtype=torch.int32, device="cuda")
     lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device="cuda")
 
-    # call kernel
-    moe_ops.moe_lora_align_block_size(
+    # UPDATED: Call kernel with new signature
+    moe_lora_align_block_size(
         topk_ids,
-        token_lora_mapping,
+        seg_indptr,  # Arg 2: Pointers
+        req_to_lora,  # Arg 3: Request Map
         num_experts,
         block_size,
         max_loras,
@@ -102,13 +116,48 @@ def test_moe_lora_align_block_size(
     expert_ids = expert_ids.view(max_loras, -1)
     sorted_token_ids = sorted_token_ids.view(max_loras, -1, block_size)
 
+    # Reconstruct token-level ownership for verification logic
+    # We expand req_to_lora back to [num_tokens] on CPU just to check correctness
+    # This proves the kernel (which used the compressed format) produced the right result
+    cpu_seg_indptr = seg_indptr.cpu()
+    cpu_req_to_lora = req_to_lora.cpu()
+    token_ownership = torch.zeros(num_tokens, dtype=torch.int32)
+
+    for r in range(len(cpu_req_to_lora)):
+        start = cpu_seg_indptr[r]
+        end = cpu_seg_indptr[r + 1]
+        token_ownership[start:end] = cpu_req_to_lora[r]
+
+    token_ownership = token_ownership.to("cuda")
+
     for lora_idx in range(max_loras):
+        # Count how many tokens actually belong to this LoRA
+        expected_count = (token_ownership == lora_idx).sum().item()
+
+        # Verify the kernel processed a reasonable number of tokens (sanity check)
+        # Note: num_tokens_post_pad includes padding, so it might be larger than expected_count
+        assert num_tokens_post_pad[lora_idx].item() >= expected_count * topk_num
+
         for token_idx in range(sorted_token_ids.size(1)):
             block = sorted_token_ids[lora_idx][token_idx]
+            # Valid indices are those less than total numel
             indices = block[block != topk_ids.numel()]
+
             if indices.numel() > 0:
+                # 1. Verify routing: Does the token actually route to this expert?
                 expert_id = expert_ids[lora_idx][token_idx]
                 assert torch.all(topk_ids.view(-1)[indices] == expert_id)
+
+                # 2. Verify ownership: Did the kernel grab the correct tokens for this LoRA?
+                # The indices in 'sorted_token_ids' point to the flattened [token, topk] array.
+                # We divide by topk_num to get the original token index.
+                original_token_indices = indices // topk_num
+
+                # Check that all tokens in this block truly belong to 'lora_idx'
+                actual_owners = token_ownership[original_token_indices]
+                assert torch.all(
+                    actual_owners == lora_idx
+                ), f"Kernel put tokens from LoRA {actual_owners} into block for LoRA {lora_idx}"
 
 
 if __name__ == "__main__":

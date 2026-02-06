@@ -670,7 +670,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
             down_lora_a_weights=self.down_lora_a_weights,
             down_lora_b_weights=self.down_lora_b_weights,
-            seg_ind = batch_info.seg_indptr,
+            seg_indptr = batch_info.seg_indptr,
             req_to_lora = batch_info.weight_indices,
             lora_ranks=lora_ranks,
             adapter_enabled=adapter_enabled,

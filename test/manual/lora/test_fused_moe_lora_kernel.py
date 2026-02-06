@@ -1,8 +1,7 @@
 # adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_fused_moe_lora_kernel.py
-
+import sys
 import os
 import random
-
 import pytest
 import torch
 
@@ -14,8 +13,13 @@ from sglang.srt.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.lora.triton_ops import fused_moe_lora
-from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 from sglang.srt.utils import set_random_seed
+
+# ==============================================================================
+# IMPORT PREBUILT KERNEL
+# ==============================================================================
+from sgl_kernel import moe_lora_align_block_size
+# ==============================================================================
 
 
 def round_up(x, base):
@@ -38,8 +42,9 @@ def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
         max_loras (int): Total number of available LoRA modules.
 
     Returns:
-        torch.Tensor: 1D tensor of shape [num_tokens], where each value
-                      is the LoRA index assigned to that token.
+        token_lora_mapping (torch.Tensor): 1D tensor of shape [num_tokens]
+        seg_indptr (torch.Tensor): 1D tensor of shape [num_sequences + 1]
+        req_to_lora (torch.Tensor): 1D tensor of shape [num_sequences]
     """
     assert num_sequences > 0 and max_loras > 0
     assert num_tokens >= num_sequences, "num_tokens must be >= num_sequences"
@@ -49,6 +54,8 @@ def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
     remainder = num_tokens % num_sequences
 
     token_lora_mapping = torch.empty(num_tokens, dtype=torch.int32)
+    seg_indptr = [0]
+    req_to_lora = []
 
     start = 0
     for seq_idx in range(num_sequences):
@@ -61,9 +68,15 @@ def assign_loras_to_tokens(num_tokens: int, num_sequences: int, max_loras: int):
         # Assign the same LoRA ID to all tokens in this sequence
         token_lora_mapping[start:end] = lora_id
 
+        seg_indptr.append(end)
+        req_to_lora.append(lora_id)
+
         start = end
 
-    return token_lora_mapping
+    seg_indptr = torch.tensor(seg_indptr, dtype=torch.int32)
+    req_to_lora = torch.tensor(req_to_lora, dtype=torch.int32)
+
+    return token_lora_mapping, seg_indptr, req_to_lora
 
 
 def assign_experts_to_tokens(num_tokens: int, num_experts: int, top_k_num: int):
@@ -108,14 +121,17 @@ def sample_data(
     topk_ids, topk_weights = assign_experts_to_tokens(
         num_tokens, num_experts, top_k_num
     )
-    token_lora_mapping = assign_loras_to_tokens(num_tokens, num_sequences, max_loras)
-    return topk_ids, topk_weights, token_lora_mapping
+    token_lora_mapping, seg_indptr, req_to_lora = assign_loras_to_tokens(
+        num_tokens, num_sequences, max_loras
+    )
+    return topk_ids, topk_weights, token_lora_mapping, seg_indptr, req_to_lora
 
 
 def use_fused_moe_lora_kernel(
     topk_ids,
     topk_weights,
-    token_lora_mapping,
+    seg_indptr,
+    req_to_lora,
     max_lora_rank,
     top_k_num,
     lora_a_stacked,
@@ -132,20 +148,25 @@ def use_fused_moe_lora_kernel(
     max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
     max_num_m_blocks = CEILDIV(max_num_tokens_padded, block_size)
 
+    # Important: Ensure output tensors are on the same device as inputs
+    device = topk_ids.device
+
     # init output tensors
     sorted_token_ids = torch.empty(
         (max_loras * max_num_tokens_padded,),
         dtype=torch.int32,
+        device=device
     )
-    expert_ids = torch.empty((max_loras * max_num_m_blocks,), dtype=torch.int32)
-    num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32)
-    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32)
-    lora_ids = torch.arange(max_loras + 2, dtype=torch.int32)
+    expert_ids = torch.empty((max_loras * max_num_m_blocks,), dtype=torch.int32, device=device)
+    num_tokens_post_padded = torch.empty((max_loras,), dtype=torch.int32, device=device)
+    adapter_enabled = torch.ones(max_loras + 1, dtype=torch.int32, device=device)
+    lora_ids = torch.arange(max_loras + 2, dtype=torch.int32, device=device)
 
     # call kernel
-    moe_align_block_size(
+    moe_lora_align_block_size(
         topk_ids,
-        token_lora_mapping,
+        seg_indptr,
+        req_to_lora,
         num_experts,
         block_size,
         max_loras,
@@ -156,6 +177,7 @@ def use_fused_moe_lora_kernel(
         num_tokens_post_padded,
         adapter_enabled,
         lora_ids,
+        None # maybe_expert_map
     )
 
     config = {
@@ -260,9 +282,16 @@ def test_fused_moe_lora_kernel(
     # the number of randomly generated sentences.
     num_sequences = 10
     # generate data
-    topk_ids, topk_weights, token_lora_mapping = sample_data(
+    topk_ids, topk_weights, token_lora_mapping, seg_indptr, req_to_lora = sample_data(
         num_tokens, num_sequences, max_loras, num_experts, top_k_num
     )
+
+    # Ensure generated data is on the correct device
+    topk_ids = topk_ids.to(device)
+    topk_weights = topk_weights.to(device)
+    token_lora_mapping = token_lora_mapping.to(device)
+    seg_indptr = seg_indptr.to(device)
+    req_to_lora = req_to_lora.to(device)
 
     # init lora weights
     lora_a_stacked = [
@@ -274,6 +303,7 @@ def test_fused_moe_lora_kernel(
                 K,
             ),
             dtype=dtype,
+            device=device
         )
     ]
     lora_b_stacked = [
@@ -285,6 +315,7 @@ def test_fused_moe_lora_kernel(
                 max_lora_rank,
             ),
             dtype=dtype,
+            device=device
         )
     ]
     hidden_states = torch.rand(
@@ -293,14 +324,17 @@ def test_fused_moe_lora_kernel(
             K,
         ),
         dtype=dtype,
+        device=device
     )
 
     # fused_moe_lora_kernel output
-    output = torch.zeros((num_tokens, top_k_num, N), dtype=dtype)
+    output = torch.zeros((num_tokens, top_k_num, N), dtype=dtype, device=device)
+
     use_fused_moe_lora_kernel(
         topk_ids,
         topk_weights,
-        token_lora_mapping,
+        seg_indptr,
+        req_to_lora,
         max_lora_rank,
         top_k_num,
         lora_a_stacked,
@@ -322,3 +356,6 @@ def test_fused_moe_lora_kernel(
     )
 
     torch.testing.assert_close(output, output2, atol=1e-1, rtol=1e-1)
+
+if __name__ == "__main__":
+    pytest.main([__file__])
