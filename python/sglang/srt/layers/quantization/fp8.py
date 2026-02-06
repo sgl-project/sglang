@@ -674,7 +674,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        if get_moe_runner_backend().is_cutlass():
+        if (
+            get_moe_runner_backend().is_cutlass()
+            or get_moe_runner_backend().is_flashinfer_cutlass()
+        ):
             assert (
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -807,7 +810,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
             layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
             assert self.quant_config.activation_scheme == "dynamic"
-            if get_moe_runner_backend().is_cutlass():
+            if (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_cutlass()
+            ):
                 self._ensure_cutlass_buffers_initialized(layer)
 
         else:
@@ -1056,7 +1062,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return qweight, scale
 
         if quantize:
-            if get_moe_runner_backend().is_cutlass():
+            if (
+                get_moe_runner_backend().is_cutlass()
+                or get_moe_runner_backend().is_flashinfer_cutlass()
+            ):
                 w13_q, w13_s = _quantize_and_swizzle_with_cutlass_es_kernel(
                     layer.w13_weight.data
                 )
@@ -1379,7 +1388,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if ret is not None:
                 return StandardCombineInput(hidden_states=ret)
 
-        if get_moe_runner_backend().is_cutlass():
+        if (
+            get_moe_runner_backend().is_cutlass()
+            or get_moe_runner_backend().is_flashinfer_cutlass()
+        ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
