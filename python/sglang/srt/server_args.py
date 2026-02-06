@@ -5507,7 +5507,7 @@ class PortArgs:
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
-    ) -> "PortArgs":
+    ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = server_args.port + random.randint(100, 1000)
             while True:

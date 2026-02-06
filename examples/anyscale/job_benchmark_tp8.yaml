@@ -1,0 +1,93 @@
+# Anyscale Job: Benchmark Both Backends with TP=8
+#
+# Configuration: TP=8, PP=1 (pure tensor parallelism)
+# Benchmarks: Ray Actor backend, then MP backend
+# Infrastructure: 2 worker nodes with 4xA10G GPUs each (8 GPUs total)
+# Model: Qwen3-8B (32 attention heads, divisible by 8)
+#
+# Submit with: anyscale job submit -f examples/anyscale/job_benchmark_tp8.yaml
+
+name: sglang-benchmark-tp8
+
+cloud:
+
+compute_config:
+  head_node:
+    instance_type: m5.2xlarge
+  worker_nodes:
+    - instance_type: g5.12xlarge  # 4x A10G GPUs
+      min_nodes: 2
+      max_nodes: 2
+
+containerfile: examples/anyscale/Dockerfile
+working_dir: .
+
+entrypoint: |
+  set -e
+
+  echo "=========================================="
+  echo "SGLang Benchmark: TP=8 (Both Backends)"
+  echo "=========================================="
+
+  # Fix packages on HEAD node
+  echo "Step 1: Fixing packages on HEAD node..."
+  pip install --no-cache-dir -q "numpy>=1.26.0,<2.0"
+  pip install --no-cache-dir -q sgl-kernel --force-reinstall
+
+  # Fix packages on WORKER nodes
+  echo "Step 2: Fixing packages on WORKER nodes..."
+  python examples/anyscale/fix_worker_packages.py
+
+  # Replace sglang with local version
+  echo "Step 3: Replacing sglang.srt with local version..."
+  # Use pip show instead of importing sglang (safe on CPU-only head node)
+  SGLANG_INSTALL_PATH=$(pip show sglang | grep Location | cut -d' ' -f2)/sglang
+  rm -rf "$SGLANG_INSTALL_PATH/srt"
+  cp -r python/sglang/srt "$SGLANG_INSTALL_PATH/srt"
+
+  # Benchmark 1: MP Backend
+  echo ""
+  echo "=========================================="
+  echo "Benchmark 1 MP Backend TP=8"
+  echo "=========================================="
+  python examples/anyscale/benchmark_driver.py \
+    --backend mp \
+    --model Qwen/Qwen3-8B \
+    --tp 8 \
+    --pp-size 1 \
+    --nnodes 2 \
+    --num-prompts 1000 \
+    --input-len 512 \
+    --output-len 256 \
+    --range-ratio 0.5 \
+    --skip-package-fix
+
+  # Benchmark 2: Ray Actor Backend
+  echo ""
+  echo "=========================================="
+  echo "Benchmark 2: Ray Actor Backend TP=8"
+  echo "=========================================="
+  python examples/anyscale/benchmark_driver.py \
+    --backend ray-actor \
+    --model Qwen/Qwen3-8B \
+    --tp 8 \
+    --pp 1 \
+    --num-prompts 1000 \
+    --input-len 512 \
+    --output-len 256 \
+    --range-ratio 0.5 \
+    --skip-package-fix
+
+  echo ""
+  echo "=========================================="
+  echo "All benchmarks completed!"
+  echo "=========================================="
+
+env_vars:
+  NCCL_DEBUG: INFO
+  NCCL_IB_DISABLE: "0"
+  NCCL_NET_GDR_LEVEL: "2"
+  RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES: "1"
+  SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK: "1"
+
+max_retries: 0

@@ -1,0 +1,46 @@
+# Anyscale Job Configuration for Multi-Node SGLang Server
+# This job launches a 2-node SGLang server with total TP=8 (4 GPUs per node)
+
+name: sglang-multinode-mp-tp2
+
+cloud:
+
+# Compute configuration
+compute_config:
+  # Head node configuration
+  head_node:
+    instance_type: m5.2xlarge
+    
+  # Worker nodes configuration  
+  worker_nodes:
+    - instance_type: g5.12xlarge  # 4x A10G GPUs (only 2 will be used)
+      min_nodes: 2
+      max_nodes: 2
+
+# Build from Dockerfile (path relative to working_dir)
+containerfile: examples/anyscale/Dockerfile
+
+# Working directory (will be uploaded - use repo root to include local sglang source)
+working_dir: .
+
+# Entrypoint script
+# First copy local sglang/srt to replace installed version, then run driver
+entrypoint: |
+  set -e
+  SGLANG_INSTALL_PATH=$(python -c "import sglang; import os; print(os.path.dirname(sglang.__file__))")
+  echo "Replacing installed sglang.srt with local version..."
+  echo "  Installed sglang path: $SGLANG_INSTALL_PATH"
+  echo "  Local srt source: python/sglang/srt"
+  rm -rf "$SGLANG_INSTALL_PATH/srt"
+  cp -r python/sglang/srt "$SGLANG_INSTALL_PATH/srt"
+  echo "  Done!"
+  python examples/anyscale/driver.py --tp 8
+
+# Environment variables
+env_vars:
+  NCCL_DEBUG: INFO
+  NCCL_IB_DISABLE: "0"
+  NCCL_NET_GDR_LEVEL: "2"
+
+# Job configuration
+max_retries: 0
