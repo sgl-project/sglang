@@ -437,7 +437,11 @@ class ModelConfig:
             rope_scaling = self.hf_text_config.rope_scaling
             if rope_scaling:
                 # v5 uses "rope_type", v4 uses "type"
-                rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type") or "default"
+                rope_type = (
+                    rope_scaling.get("rope_type")
+                    or rope_scaling.get("type")
+                    or "default"
+                )
                 if rope_type != "default":
                     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
                     scaling_factor = rope_scaling["factor"]
