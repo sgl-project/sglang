@@ -94,12 +94,13 @@ def _fused_moe_lora_kernel(
     launch_pdl: tl.constexpr,
     IS_PRIMARY: tl.constexpr,
 ):
-    # TODO (Jonahcb): investigate why GDC is not working
-    USE_GDC = False
     pid = tl.program_id(axis=0)
     slice_id = tl.program_id(axis=1)
     lora_idx = tl.program_id(axis=2)
     lora_id = tl.load(lora_ids + lora_idx)
+
+    USE_GDC = False # TODO (Jonahcb): remove this
+
 
     if lora_id == -1:
         # Early exit for the no-lora case.
@@ -132,6 +133,8 @@ def _fused_moe_lora_kernel(
     expert_id = tl.load(expert_ids_ptr + ind, ind < max_loras * stride_el, -1)
     if expert_id == -1:
         return
+
+
     # get a_ptr,b_ptr,c_ptr
     cur_a_ptr = a_ptr + (slice_id % num_slice_a) * slice_a_size
     cur_b_ptr = tl.load(b_ptr + slice_id).to(tl.pointer_type(c_ptr.dtype.element_ty))
@@ -139,6 +142,8 @@ def _fused_moe_lora_kernel(
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = pid_sk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    # ================================================================= secure
+
 
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     token_ind = stride_tl * lora_id + offs_token_id
@@ -146,6 +151,9 @@ def _fused_moe_lora_kernel(
         sorted_token_ids_ptr + token_ind, token_ind < max_loras * stride_tl, 0
     )
     token_mask = offs_token < num_valid_tokens
+
+    # ================================================================= secure
+
 
     # get a_ptrs,b_ptrs
     a_ptrs = cur_a_ptr + (
@@ -160,17 +168,29 @@ def _fused_moe_lora_kernel(
         + offs_bn[None, :] * stride_bn
     )
 
+
+
     if USE_GDC and IS_PRIMARY:
         # GDC launch dependents hints the runtime system to launch dependent kernels.
         tl.extra.cuda.gdc_launch_dependents()
 
+    # ================================================================= secure
+
     # accumulator
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+
+    # ================================================================= secure
+
+
+
 
     # GDC wait waits for ALL programs in the prior kernel to complete
     # before continuing.
     if USE_GDC and not IS_PRIMARY:
         tl.extra.cuda.gdc_wait()
+
+
 
     for k in range(0, grid_k):
         k_remaining = K - k * (BLOCK_SIZE_K * SPLIT_K)
@@ -235,7 +255,10 @@ def _fused_moe_lora_shrink(
     mul_routed_weight: bool = False,
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
-    use_gdc = is_arch_support_pdl()
+
+    # TODO (Jonahcb): investigate why relying on is_arch_support_pdl() is causing crash inside kernel
+    #use_gdc = is_arch_support_pdl()
+    use_gdc = False
     shrink_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
@@ -329,6 +352,7 @@ def _fused_moe_lora_expand(
     mul_routed_weight: bool = False,
     offset: int = 0,
 ) -> None:
+
     b_ptr = _get_ptr(lora_b_stacked, device)
     K = max_lora_rank
     N = w1_output_dim_size
@@ -439,6 +463,8 @@ def _fused_moe_lora(
         == qcurr_hidden_states.dim()
         == 2
     )
+    if sorted_token_ids.shape[0] != expert_ids.shape[0] or sorted_token_ids.shape[0] != num_tokens_post_padded.shape[0]:
+        x = 1
     assert (
         sorted_token_ids.shape[0]
         == expert_ids.shape[0]
@@ -468,6 +494,7 @@ def _fused_moe_lora(
         dtype=output.dtype,
         device=device,
     )
+
 
     _fused_moe_lora_shrink(
         a_intermediate_cache1,

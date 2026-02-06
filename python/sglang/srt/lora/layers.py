@@ -595,6 +595,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         base_layer: FusedMoE,
         lora_backend: BaseLoRABackend,
     ):
+
+        # initialize triton_lora moe runner for batches with lora enabled
+        if lora_backend.name != "triton":
+            raise ValueError(
+                "FusedMoEWithLoRA only supports 'triton' backend. "
+                "Please set --lora-backend triton when using LoRA on MoE models."
+            )
+
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
         # LoRA tensors will be set by LoRAManager
@@ -604,12 +612,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = None
 
         # initialize triton_lora moe runner for batches with lora enabled
-        if lora_backend.name != "triton":
-            raise ValueError(
-                "FusedMoEWithLoRA only supports 'triton' backend. "
-                "Please set --lora-backend triton when using LoRA on MoE models."
-            )
-
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
         self._lora_runner = MoeRunner(
@@ -641,8 +643,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_b_weights = down_lora_b_weights
 
     def _get_lora_info(
-        self,
-        topk_output: TopKOutput,
+        self
     ):
         """
         Build LoRAInfo for the current batch.
@@ -656,28 +657,21 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         lora_ranks = batch_info.lora_ranks  # [num_loras]
 
         # Compute max LoRA rank from current batch ranks
-        if hasattr(batch_info, "max_lora_rank") and batch_info.max_lora_rank is not None:
-            max_lora_rank = batch_info.max_lora_rank
-        else:
-            max_lora_rank = int(torch.max(lora_ranks))
-
-        # Use precomputed per-token LoRA indices from forward batch (int32 for kernel use)
-        lora_indices = self.lora_backend.forward_batch.token_lora_indices.to(
-            torch.int32
-        )
+        max_lora_rank = self.lora_backend.max_lora_rank
 
         # Create adapter_enabled tensor for the current batch
         # Only enable LoRA adapters that are actually used in this batch
         # TODO: Jonahbernard: check that this doesn't slow down inference for this batch
         adapter_enabled = torch.zeros(len(lora_ranks), dtype=torch.int32, device=lora_ranks.device)
-        adapter_enabled.index_fill_(0, lora_indices.long(), 1)
+        adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
             down_lora_a_weights=self.down_lora_a_weights,
             down_lora_b_weights=self.down_lora_b_weights,
-            token_lora_mapping=lora_indices,
+            seg_ind = batch_info.seg_indptr,
+            req_to_lora = batch_info.weight_indices,
             lora_ranks=lora_ranks,
             adapter_enabled=adapter_enabled,
             max_lora_rank=max_lora_rank,
@@ -694,7 +688,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
 
         # Build LoRA info for this batch
-        lora_info = self._get_lora_info(topk_output)
+        lora_info = self._get_lora_info()
 
         # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)

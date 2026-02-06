@@ -283,28 +283,6 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
         )
 
-        # Attach max_lora_rank to batch_info for MoE usage
-        self.lora_backend.batch_info.max_lora_rank = max(lora_ranks) if lora_ranks else 0
-
-        # Populate per-token LoRA indices from segment information
-        batch_info = self.lora_backend.batch_info
-        num_tokens = forward_batch.input_ids.shape[0]  # Tokens in current forward pass
-
-        # Create tensor and fill with adapter indices from segments
-        token_lora_indices = torch.empty(
-            num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device
-        )
-        seg_indptr = batch_info.seg_indptr  # [num_segments + 1]
-        for seg_idx in range(batch_info.num_segments):
-            start_token = seg_indptr[seg_idx]
-            end_token = seg_indptr[seg_idx + 1]
-            lora_adapter = batch_info.weight_indices[seg_idx]
-            token_lora_indices[start_token:end_token] = lora_adapter
-
-        forward_batch.token_lora_indices = token_lora_indices
-
-        # Store forward_batch reference in backend for MoE layer access
-        self.lora_backend.forward_batch = forward_batch
 
     def update_lora_info(self):
         """
@@ -399,6 +377,10 @@ class LoRAManager:
             max_lora_rank=max_lora_rank,
             target_modules=target_modules,
         )
+
+        # Inject max_lora_rank into backend
+        self.lora_backend.max_lora_rank = self.max_lora_rank
+
         self.init_lora_modules()
         self.init_memory_pool()
         self.update_lora_info()
