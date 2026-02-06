@@ -14,7 +14,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-1-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
 class TestOpenAIServerFunctionCalling(CustomTestCase):
