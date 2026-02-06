@@ -77,8 +77,8 @@ class UsageProcessor:
     @staticmethod
     def calculate_token_usage(
         prompt_tokens: int,
-        reasoning_tokens: int,
         completion_tokens: int,
+        reasoning_tokens: Optional[int] = 0,
         cached_tokens: Optional[PromptTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
