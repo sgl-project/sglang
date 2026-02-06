@@ -100,6 +100,14 @@ class TestPenalty(CustomTestCase):
         max_tokens=50,
     ):
         """Generic test for penalty effects."""
+        # Use higher temperature so penalties can actually affect token selection.
+        # The default temperature (0.05) is near-greedy, making penalty adjustments
+        # to logits ineffective since the top token still dominates.
+        baseline_params = baseline_params.copy()
+        penalty_params = penalty_params.copy()
+        baseline_params.setdefault("temperature", 0.8)
+        penalty_params.setdefault("temperature", 0.8)
+
         # Run multiple iterations to get more reliable results
         # Use fixed seeds for deterministic behavior
         base_seed = 42
