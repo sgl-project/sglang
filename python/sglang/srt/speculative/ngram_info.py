@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.server_args import get_global_server_args
@@ -450,3 +451,76 @@ class NgramVerifyInput(SpecInput):
 
     def merge_batch(self, spec_info: NgramVerifyInput):
         pass
+
+
+@triton.jit
+def generate_tree_mask(
+    req_masks, tree_masks, seq_lens_cumsum, draft_token_num, output_ptr
+):
+    BLOCK_SIZE: tl.constexpr = 256
+    pid = tl.program_id(axis=0)
+    batch_idx = pid // draft_token_num
+    draft_idx = pid % draft_token_num
+
+    prev_seq_len_sum = 0
+    if batch_idx > 0:
+        prev_seq_len_sum = tl.load(seq_lens_cumsum + batch_idx - 1).to(tl.int32)
+    cur_seq_len_sum = tl.load(seq_lens_cumsum + batch_idx).to(tl.int32)
+    seq_len = cur_seq_len_sum - prev_seq_len_sum
+
+    load_start = draft_token_num * prev_seq_len_sum + draft_idx * seq_len
+    load_offset = tl.arange(0, BLOCK_SIZE) + load_start
+    load_end = load_start + seq_len
+    save_start = (
+        draft_token_num * prev_seq_len_sum
+        + batch_idx * draft_token_num * draft_token_num
+    ) + draft_idx * (seq_len + draft_token_num)
+    save_offset = tl.arange(0, BLOCK_SIZE) + save_start
+    save_end = save_start + seq_len
+    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    # get req_mask and store
+    for _ in range(num_loop):
+        load_mask = load_offset < load_end
+        req_mask = tl.load(req_masks + load_offset, mask=load_mask)
+        save_mask = save_offset < save_end
+        tl.store(output_ptr + save_offset, req_mask, mask=save_mask)
+        load_offset += BLOCK_SIZE
+        save_offset += BLOCK_SIZE
+
+    load_start = (
+        batch_idx * draft_token_num * draft_token_num + draft_idx * draft_token_num
+    )
+    load_offset = tl.arange(0, BLOCK_SIZE) + load_start
+    load_end = load_start + draft_token_num
+    save_start = (
+        (
+            draft_token_num * prev_seq_len_sum
+            + batch_idx * draft_token_num * draft_token_num
+        )
+        + draft_idx * (seq_len + draft_token_num)
+        + seq_len
+    )
+    save_offset = tl.arange(0, BLOCK_SIZE) + save_start
+    save_end = save_start + draft_token_num
+    num_loop = tl.cdiv(draft_token_num, BLOCK_SIZE)
+    # get tree_mask and store
+    for _ in range(num_loop):
+        load_mask = load_offset < load_end
+        tree_mask = tl.load(tree_masks + load_offset, mask=load_mask)
+        save_mask = save_offset < save_end
+        tl.store(output_ptr + save_offset, tree_mask, mask=save_mask)
+        load_offset += BLOCK_SIZE
+        save_offset += BLOCK_SIZE
+
+
+def generate_tree_mask_func(req_masks, tree_masks, batch, draft_token_num, output_ptr):
+    batch_size = len(batch.reqs)
+    seq_lens_cumsum = torch.cumsum(batch.seq_lens, dim=0)
+    grid = (batch_size * draft_token_num,)
+    generate_tree_mask[grid](
+        req_masks,
+        tree_masks,
+        seq_lens_cumsum,
+        draft_token_num,
+        output_ptr,
+    )
