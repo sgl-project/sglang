@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Type
 
 import torch
 from torch.distributed import ProcessGroup
@@ -116,19 +116,31 @@ class DecodeReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, reqs: List["Req"]) -> Optional[List[int]]:
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        assert (
+            len(chunked) <= 1
+        ), "only one chunked request may reuse req_pool_idx in a batch"
+        assert all(
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
+
+        need_size = len(reqs) - len(chunked)
         if need_size > len(self.free_slots):
             return None
-
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        return select_index
+        offset = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_index[offset]
+                offset += 1
+        return [r.req_pool_idx for r in reqs]
 
-    def free(self, free_index: Union[int, List[int]]):
-        if isinstance(free_index, (int,)):
-            self.free_slots.append(free_index)
-        else:
-            self.free_slots.extend(free_index)
+    def free(self, req: "Req"):
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
@@ -652,16 +664,11 @@ class DecodePreallocQueue:
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
-        if isinstance(self.req_to_token_pool, HybridMambaDecodeReqToTokenPool):
-            req_pool_indices = self.req_to_token_pool.alloc(1, [req])
-        else:
-            req_pool_indices = self.req_to_token_pool.alloc(1)
+        req_pool_indices = self.req_to_token_pool.alloc([req])
 
         assert (
             req_pool_indices is not None
         ), "req_pool_indices is full! There is a bug in memory estimation."
-
-        req.req_pool_idx = req_pool_indices[0]
 
         # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
@@ -722,7 +729,12 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
+        """
+        Returns:
+            True if the request should be removed from the queue (success or corruption)
+            False if metadata not ready yet (keep in queue for next poll)
+        """
         idx = decode_req.metadata_buffer_index
         (
             output_id,
@@ -734,8 +746,48 @@ class DecodeTransferQueue:
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
+        # Validate bootstrap_room to detect context corruption
+        actual_room = output_bootstrap_room[0].item()
+        expected_room = (
+            decode_req.req.bootstrap_room
+            if decode_req.req.bootstrap_room is not None
+            else 0
+        )
+
+        if decode_req.req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
+            decode_req.req.bootstrap_host is None
+            and self.scheduler.server_args.disaggregation_decode_enable_fake_auto
+        ):
+            # Warm up or fake transfer mode
+            pass
+        elif actual_room == 0:
+            # Case 1: Metadata not ready yet (actual_room == 0)
+            # Keep request in queue and wait for next poll
+            return False
+        elif actual_room != expected_room:
+            # Case 2: Real corruption detected (mismatch)
+            # Abort the request and remove from the queue
+            error_msg = (
+                f"Context corruption detected: Request {decode_req.req.rid} "
+                f"(bootstrap_room={expected_room}) received metadata from "
+                f"bootstrap_room={actual_room}. "
+                f"Metadata buffer index: {idx}. "
+                f"This indicates metadata buffer index collision."
+            )
+            logger.error(error_msg)
+            prepare_abort(
+                decode_req.req,
+                "Metadata corruption detected - bootstrap_room mismatch",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+            return True
+
+        # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         if not self.spec_algorithm.is_none():
@@ -765,6 +817,7 @@ class DecodeTransferQueue:
             auto_next_anon=True,
         )
         decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+        return True
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
@@ -800,9 +853,21 @@ class DecodeTransferQueue:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-                self._commit_transfer_to_req(decode_req)
-                indices_to_remove.add(i)
-                transferred_reqs.append(decode_req.req)
+                should_remove = self._commit_transfer_to_req(decode_req)
+                if should_remove:
+                    indices_to_remove.add(i)
+                    # Check if request was aborted due to corruption
+                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        self.scheduler.stream_output(
+                            [decode_req.req], decode_req.req.return_logprob
+                        )
+                        release_kv_cache(
+                            decode_req.req, self.tree_cache, is_insert=False
+                        )
+                        if self.scheduler.enable_metrics:
+                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                    else:
+                        transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,

@@ -6,8 +6,8 @@ MindSpore is a high-performance AI framework optimized for Ascend NPUs. This doc
 
 ## Requirements
 
-MindSpore currently only supports Ascend NPU devices. Users need to first install Ascend CANN software packages.
-The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com). The recommended version is 8.3.RC2.
+MindSpore currently only supports Ascend NPU devices. Users need to first install CANN 8.5.
+The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com).
 
 ## Supported Models
 
@@ -32,9 +32,9 @@ pip install -e .
 
 Current SGLang-MindSpore supports Qwen3 and DeepSeek V3/R1 models. This doc uses Qwen3-8B as an example.
 
-### Offline infer
+### Offline inference
 
-Use the following script for offline infer:
+Use the following script for offline inference:
 
 ```python
 import sglang as sgl

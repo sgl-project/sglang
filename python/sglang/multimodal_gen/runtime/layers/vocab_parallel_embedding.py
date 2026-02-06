@@ -6,13 +6,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
-    get_tp_rank,
-    get_tp_world_size,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
+from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 from sglang.multimodal_gen.runtime.models.parameter import BasevLLMParameter
 from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -220,12 +221,15 @@ class VocabParallelEmbedding(torch.nn.Module):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        tp_group: dist.ProcessGroup = None,
     ):
         super().__init__()
 
         # Keep the input dimensions.
-        tp_rank = get_tp_rank()
-        self.tp_size = get_tp_world_size()
+        tp_group = tp_group or get_tp_group()
+        tp_rank = get_group_rank(tp_group)
+        self.tp_size = get_group_size(tp_group)
+        self.tp_group = tp_group
         self.num_embeddings = num_embeddings
         self.padding_size = padding_size
         self.org_vocab_size = org_num_embeddings or num_embeddings
@@ -468,7 +472,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         # Reduce across all the model parallel GPUs.
-        output = tensor_model_parallel_all_reduce(output_parallel)
+        output = tensor_model_parallel_all_reduce(
+            output_parallel, tp_group=self.tp_group
+        )
         return output
 
     def extra_repr(self) -> str:

@@ -42,6 +42,7 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -50,6 +51,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -233,6 +235,7 @@ class Engine(EngineBase):
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -270,6 +273,7 @@ class Engine(EngineBase):
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -320,6 +324,7 @@ class Engine(EngineBase):
         data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -358,6 +363,7 @@ class Engine(EngineBase):
             data_parallel_rank=data_parallel_rank,
             external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -447,6 +453,37 @@ class Engine(EngineBase):
 
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def open_session(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Open a session for multi-turn conversation with shared context.
+
+        Args:
+            capacity_of_str_len: Maximum string length capacity for the session.
+            session_id: Optional session ID. If not provided, a UUID will be generated.
+
+        Returns:
+            The session ID (either the provided one or a newly generated UUID).
+        """
+        obj = OpenSessionReqInput(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.open_session(obj, None)
+        )
+
+    def close_session(self, session_id: str) -> None:
+        """Close a session and release its resources.
+
+        Args:
+            session_id: The session ID to close.
+        """
+        obj = CloseSessionReqInput(session_id=session_id)
+        self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))

@@ -5,11 +5,8 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.jit_kernel.cutedsl_gdn import cutedsl_fused_sigmoid_gating_delta_rule_update
 from sglang.srt.environ import Envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
@@ -17,7 +14,6 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.layers.attention.fla.kda import chunk_kda
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
     causal_conv1d_fn,
@@ -36,8 +32,19 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
+
+if not is_cpu():
+    # fix import error on CPU device, no impacts when non-CPU path
+    from sglang.jit_kernel.cutedsl_gdn import (
+        cutedsl_fused_sigmoid_gating_delta_rule_update,
+    )
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.srt.layers.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+    from sglang.srt.layers.attention.fla.kda import chunk_kda
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -59,6 +66,23 @@ elif is_npu():
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
+elif is_cpu():
+    assert (
+        cpu_has_amx_support()
+    ), "CPU requires AMX support for hybrid linear attn backend"
+    from sgl_kernel.mamba import (
+        causal_conv1d_fn_cpu,
+        causal_conv1d_update_cpu,
+        chunk_gated_delta_rule_cpu,
+    )
+
+    chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
+    causal_conv1d_fn = causal_conv1d_fn_cpu
+    causal_conv1d_update = causal_conv1d_update_cpu
+    fused_sigmoid_gating_delta_rule_update = (
+        torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
+    )
+    fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 
 
 # Kernel to track mamba states if needed based on track mask
@@ -790,9 +814,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        assert (
-            self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-        ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+        if not is_cpu():
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
         rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
@@ -983,7 +1008,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Only cuda env uses fuse ssm_states update
             recurrent_state = ssm_states
             recurrent_state_indices_args = {"initial_state_indices": cache_indices}
-            if is_npu():
+            if is_npu() or is_cpu():
                 recurrent_state = ssm_states[cache_indices]
                 recurrent_state_indices_args = {}
             core_attn_out, last_recurrent_state, h = chunk_gated_delta_rule(
@@ -998,7 +1023,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 **recurrent_state_indices_args,
             )
-            if is_npu():
+            if is_npu() or is_cpu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False
                 )

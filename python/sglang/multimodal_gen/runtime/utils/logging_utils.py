@@ -68,21 +68,7 @@ DEFAULT_LOGGING_CONFIG = {
 }
 
 
-class NewLineFormatter(logging.Formatter):
-    """Adds logging prefix to newlines to align multi-line messages."""
-
-    def __init__(self, fmt, datefmt=None, style="%"):
-        logging.Formatter.__init__(self, fmt, datefmt, style)
-
-    def format(self, record):
-        msg = logging.Formatter.format(self, record)
-        if record.message != "":
-            parts = msg.split(record.message)
-            msg = msg.replace("\n", "\r\n" + parts[0])
-        return msg
-
-
-class ColoredFormatter(NewLineFormatter):
+class ColoredFormatter(logging.Formatter):
     """A logging formatter that adds color to log levels."""
 
     LEVEL_COLORS = {
@@ -91,16 +77,13 @@ class ColoredFormatter(NewLineFormatter):
     }
 
     def format(self, record: logging.LogRecord) -> str:
-        """Adds color to the log level name."""
-        original_levelname = record.levelname
-        color = self.LEVEL_COLORS.get(record.levelno)
-        if color:
-            record.levelname = f"{color}{original_levelname}{RESET}"
+        """Adds color to the log"""
 
         formatted_message = super().format(record)
 
+        color = self.LEVEL_COLORS.get(record.levelno)
         if color:
-            record.levelname = original_levelname
+            formatted_message = f"{color}{formatted_message}{RESET}"
 
         return formatted_message
 
@@ -376,12 +359,15 @@ def set_uvicorn_logging_configs():
 def configure_logger(server_args, prefix: str = ""):
     log_format = f"[%(asctime)s{prefix}] %(message)s"
     datefmt = "%m-%d %H:%M:%S"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=log_format,
-        datefmt=datefmt,
-        force=True,
-    )
+
+    formatter = ColoredFormatter(log_format, datefmt=datefmt)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.addHandler(handler)
+    root.setLevel(getattr(logging, server_args.log_level.upper()))
 
     set_uvicorn_logging_configs()
 

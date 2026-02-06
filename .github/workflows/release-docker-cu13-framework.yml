@@ -1,0 +1,163 @@
+name: Release CUDA 13 Framework Docker Images (Temporary)
+
+# Temporary workflow to build only versioned cu13 framework images
+# Can be deleted after use
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without v prefix, e.g., 0.5.8)"
+        required: true
+      flashinfer_version:
+        description: "FlashInfer version (default: 0.6.1)"
+        required: false
+        default: "0.6.1"
+
+jobs:
+  publish-x86:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: x64-docker-build-node
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Validate version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push AMD64 Framework (CUDA 13)
+        run: |
+          version=${{ steps.version.outputs.version }}
+          tag=v${version}-cu130-amd64
+
+          docker buildx build \
+            --target framework \
+            --platform linux/amd64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg SGL_VERSION=${version} \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+  publish-arm64:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: arm-docker-build-node
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Validate version
+        id: version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push ARM64 Framework (CUDA 13)
+        run: |
+          version=${{ steps.version.outputs.version }}
+          tag=v${version}-cu130-arm64
+
+          docker buildx build \
+            --target framework \
+            --platform linux/arm64 \
+            --push \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg FLASHINFER_VERSION=${{ github.event.inputs.flashinfer_version }} \
+            --build-arg GRACE_BLACKWELL=1 \
+            --build-arg SGL_VERSION=${version} \
+            -t lmsysorg/sglang:${tag} \
+            --no-cache \
+            .
+
+  create-manifest:
+    runs-on: ubuntu-22.04
+    needs: [publish-x86, publish-arm64]
+    if: github.repository == 'sgl-project/sglang'
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        run: |
+          version=${{ github.event.inputs.version }}
+
+          # Create versioned CUDA 13 framework manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:v${version}-cu130 \
+            lmsysorg/sglang:v${version}-cu130-amd64 \
+            lmsysorg/sglang:v${version}-cu130-arm64
+
+          # Create latest CUDA 13 framework manifest
+          docker buildx imagetools create \
+            -t lmsysorg/sglang:latest-cu130 \
+            lmsysorg/sglang:v${version}-cu130-amd64 \
+            lmsysorg/sglang:v${version}-cu130-arm64

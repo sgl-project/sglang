@@ -27,7 +27,19 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Install apt packages
-apt install -y git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+# Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
+# The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
+apt-get install -y --no-install-recommends git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
+    echo "Warning: apt-get install failed, checking if required packages are available..."
+    # Verify the packages we need are actually installed
+    for pkg in git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
+        if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+            echo "ERROR: Required package $pkg is not installed and apt-get failed"
+            exit 1
+        fi
+    done
+    echo "All required packages are already installed, continuing..."
+}
 
 # Check if protoc of correct architecture is already installed
 if command -v protoc >/dev/null 2>&1; then
@@ -47,8 +59,17 @@ if [ "${INSTALL_PROTOC:-0}" = "1" ]; then
     echo "Installing protoc..."
     if command -v apt-get &> /dev/null; then
         # Ubuntu/Debian
-        apt-get update
-        apt-get install -y wget unzip gcc g++ perl make
+        apt-get update || true  # May fail due to unrelated broken packages
+        apt-get install -y --no-install-recommends wget unzip gcc g++ perl make || {
+            echo "Warning: apt-get install failed, checking if required packages are available..."
+            for pkg in wget unzip gcc g++ perl make; do
+                if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                    echo "ERROR: Required package $pkg is not installed and apt-get failed"
+                    exit 1
+                fi
+            done
+            echo "All required packages are already installed, continuing..."
+        }
     elif command -v yum &> /dev/null; then
         # RHEL/CentOS
         yum update -y

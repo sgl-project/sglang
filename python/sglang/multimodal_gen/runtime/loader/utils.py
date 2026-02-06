@@ -3,12 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Utilities for selecting and loading models."""
 import contextlib
+import glob
+import os
 import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, Dict, Type
 
 import torch
+from torch import nn
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -102,3 +105,65 @@ def hf_to_custom_state_dict(
                 continue
         custom_param_sd[target_param_name] = full_tensor
     return custom_param_sd, reverse_param_names_mapping
+
+
+class skip_init_modules:
+    def __enter__(self):
+        # Save originals
+        self._orig_reset = {}
+        for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d):
+            self._orig_reset[cls] = cls.reset_parameters
+            cls.reset_parameters = lambda self: None  # skip init
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        # restore originals
+        for cls, orig in self._orig_reset.items():
+            cls.reset_parameters = orig
+
+
+def _normalize_component_type(module_type: str) -> str:
+    """Normalize module types like 'text_encoder_2' -> 'text_encoder'."""
+    if module_type.endswith("_2"):
+        return module_type[:-2]
+    return module_type
+
+
+def _clean_hf_config_inplace(model_config: dict) -> None:
+    """Remove common extraneous HF fields if present."""
+    for key in (
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
+    ):
+        model_config.pop(key, None)
+
+
+def _list_safetensors_files(model_path: str) -> list[str]:
+    """List all .safetensors files under a directory."""
+    return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+
+
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    BYTES_PER_GB = 1024**3
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
+
+
+# component name ->  ComponentLoader class
+component_name_to_loader_cls: Dict[str, Type[Any]] = {}

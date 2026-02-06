@@ -13,6 +13,8 @@ concurrency:
   group: execute-notebook-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
 
 jobs:
   run-all-notebooks:

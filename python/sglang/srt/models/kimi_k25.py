@@ -39,6 +39,8 @@ from sglang.srt.utils import add_prefix
 KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
 
 def apply_rope(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, x_shape=None
@@ -126,6 +128,7 @@ class MoonViTEncoderLayer(nn.Module):
             prefix=add_prefix("attn", prefix),
             use_data_parallel=use_data_parallel,
             customized_position_embedding_applier=apply_rope,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
         )
 
     def forward(

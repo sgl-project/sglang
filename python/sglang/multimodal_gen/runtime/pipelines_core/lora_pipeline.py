@@ -98,7 +98,7 @@ class LoRAPipeline(ComposedPipelineBase):
         if self.lora_path is not None:
             self.convert_to_lora_layers()
             self.set_lora(
-                self.lora_nickname, self.lora_path  # type: ignore
+                self.lora_nickname, self.lora_path, strength=self.server_args.lora_scale  # type: ignore
             )  # type: ignore
 
     def is_target_layer(self, module_name: str) -> bool:

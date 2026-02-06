@@ -640,6 +640,7 @@ def run_lora_multiple_batch_on_model_cases(
     disable_cuda_graph: bool = True,
     enable_deterministic_inference: bool = False,
     disable_radix_cache: bool = True,
+    enable_lora_overlap_loading: Optional[bool] = None,
 ):
     for model_case in model_cases:
         for torch_dtype in TORCH_DTYPES:
@@ -673,6 +674,7 @@ def run_lora_multiple_batch_on_model_cases(
                 torch_dtype=torch_dtype,
                 model_type="generation",
                 lora_paths=[lora_adapter_paths[0], lora_adapter_paths[1]],
+                enable_lora_overlap_loading=enable_lora_overlap_loading,
                 max_loras_per_batch=len(lora_adapter_paths) + 1,
                 max_loaded_loras=model_case.max_loaded_loras,
                 sleep_on_idle=True,  # Eliminate non-determinism by forcing all requests to be processed in one batch.
@@ -733,6 +735,7 @@ def run_lora_batch_splitting_equivalence_test(
     attention_backend: str = "torch_native",
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
+    enable_lora_overlap_loading: Optional[bool] = None,
 ):
     """
     Test that SRT correctly handles batch splitting with multiple LoRA adapters.
@@ -801,6 +804,7 @@ def run_lora_batch_splitting_equivalence_test(
             torch_dtype=torch_dtype,
             model_type="generation",
             lora_paths=lora_adapter_paths,
+            enable_lora_overlap_loading=enable_lora_overlap_loading,
             max_loras_per_batch=max_loras_per_batch,
             max_loaded_loras=model_case.max_loaded_loras,
             sleep_on_idle=True,

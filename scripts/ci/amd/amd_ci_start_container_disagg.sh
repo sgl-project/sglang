@@ -1,0 +1,244 @@
+#!/bin/bash
+set -euo pipefail
+
+# Get version from git tags
+SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
+
+# Fetch tags from origin to ensure we have the latest
+if git fetch --tags origin; then
+  # Get the latest version tag sorted by version number (e.g., v0.5.7)
+  VERSION_FROM_TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+  if [ -n "$VERSION_FROM_TAG" ]; then
+    SGLANG_VERSION="$VERSION_FROM_TAG"
+    echo "Using SGLang version from git tags: $SGLANG_VERSION"
+  else
+    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
+  fi
+else
+  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+fi
+
+
+# Default base tags (can be overridden by command line arguments)
+ROCM_VERSION="rocm700"
+DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
+DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+
+# Parse command line arguments
+MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
+MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
+    --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    -h|--help)
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG]"
+      exit 0
+      ;;
+    *) echo "Unknown option $1"; exit 1;;
+  esac
+done
+
+
+
+# Detect GPU architecture from the Kubernetes runner hostname
+HOSTNAME_VALUE=$(hostname)
+GPU_ARCH="mi30x"   # default
+
+# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+  GPU_ARCH="${BASH_REMATCH[1]}"
+  echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
+else
+  echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
+fi
+
+# Normalise / collapse architectures we don’t yet build specifically for
+case "${GPU_ARCH}" in
+  mi35x)
+    echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
+    ;;
+  mi30x|mi300|mi325)
+    echo "Runner uses ${GPU_ARCH}; will fetch mi30x image."
+    GPU_ARCH="mi30x"
+    ;;
+  *)
+    echo "Runner architecture '${GPU_ARCH}' unrecognised; defaulting to mi30x image." >&2
+    GPU_ARCH="mi30x"
+    ;;
+esac
+
+
+# Set up DEVICE_FLAG based on Kubernetes pod info
+if [[ -f /etc/podinfo/gha-render-devices ]]; then
+  DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+else
+  DEVICE_FLAG="--device /dev/dri"
+fi
+
+
+# Find the latest image
+find_latest_image() {
+  local gpu_arch=$1
+  local base_tag days_back image_tag
+
+  case "${gpu_arch}" in
+      mi30x) base_tag="${MI30X_BASE_TAG}" ;;
+      mi35x) base_tag="${MI35X_BASE_TAG}" ;;
+      *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
+  esac
+
+  # First, check local cache
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    local local_image="rocm/sgl-dev:${image_tag}"
+    image_id=$(docker images -q "${local_image}")
+    if [[ -n "$image_id" ]]; then
+        echo "Found cached image locally: ${local_image}" >&2
+        echo "${local_image}"
+        return 0
+    fi
+  done
+
+  # If not found locally, fall back to pulling from public registry
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
+    if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
+      echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
+    fi
+  done
+
+  # If still not found, try finding any image matching ROCm+arch from remote registry
+  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  for days_back in {0..6}; do
+    local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
+    local remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1)
+    if [[ -n "$remote_tags" ]]; then
+      echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
+      echo "rocm/sgl-dev:${remote_tags}"
+      return 0
+    fi
+  done
+
+  echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
+  local any_local
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
+  if [[ -n "$any_local" ]]; then
+      echo "Using cached fallback image: ${any_local}" >&2
+      echo "${any_local}"
+      return 0
+  fi
+
+  echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
+  echo "Using hard-coded fallback…" >&2
+  if [[ "${gpu_arch}" == "mi35x" ]]; then
+    echo "rocm/sgl-dev:v0.5.5-rocm700-mi35x-20251110"
+  else
+    echo "rocm/sgl-dev:v0.5.5-rocm700-mi30x-20251110"
+  fi
+}
+
+# Pull and run the latest image
+IMAGE=$(find_latest_image "${GPU_ARCH}")
+echo "Pulling Docker image: ${IMAGE}"
+docker pull "${IMAGE}"
+
+CACHE_HOST=/home/runner/sgl-data
+if [[ -d "$CACHE_HOST" ]]; then
+    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+else
+    CACHE_VOLUME=""
+fi
+
+# Detect libionic library for RDMA support
+LIBIONIC_MOUNT=""
+IONIC_SYMLINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+if [[ -L "$IONIC_SYMLINK" ]]; then
+    LIBIONIC_LIB=$(readlink -f "$IONIC_SYMLINK" 2>/dev/null)
+    if [[ -f "$LIBIONIC_LIB" ]]; then
+        echo "Found libionic library: $LIBIONIC_LIB (resolved from symlink)"
+        LIBIONIC_MOUNT="-v ${LIBIONIC_LIB}:${LIBIONIC_LIB}:ro"
+    else
+        echo "Warning: libionic symlink exists but target does not: $LIBIONIC_LIB"
+    fi
+else
+    # Fallback: try to find directly
+    LIBIONIC_FOUND=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 -name "libionic.so.*" 2>/dev/null | head -1)
+    if [[ -n "$LIBIONIC_FOUND" ]]; then
+        LIBIONIC_LIB=$(readlink -f "$LIBIONIC_FOUND" 2>/dev/null)
+        if [[ -f "$LIBIONIC_LIB" ]]; then
+            echo "Found libionic library: $LIBIONIC_LIB"
+            LIBIONIC_MOUNT="-v ${LIBIONIC_LIB}:${LIBIONIC_LIB}:ro"
+        else
+            echo "Warning: libionic found but cannot resolve real path: $LIBIONIC_FOUND"
+        fi
+    else
+        echo "Warning: libionic library not found on host, RDMA may not work"
+    fi
+fi
+
+MOUNT_ARGS=""
+
+add_mount_if_exists() {
+    local name=$1
+    local search_pattern=$2
+    local path=$(find /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64 -name "$search_pattern" -print -quit 2>/dev/null)
+
+    if [ -n "$path" ]; then
+        echo "Found $name at: $path"
+        MOUNT_ARGS="$MOUNT_ARGS -v $path:$path:ro"
+    else
+        echo "WARNING: Could not find $name on host! (Pattern: $search_pattern)"
+    fi
+}
+
+IONIC_LINK="/usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav34.so"
+if [ -L "$IONIC_LINK" ]; then
+    IONIC_REAL=$(readlink -f "$IONIC_LINK")
+    if [ -f "$IONIC_REAL" ]; then
+        echo "Ionic Driver: $IONIC_REAL"
+        MOUNT_ARGS="$MOUNT_ARGS -v $IONIC_REAL:$IONIC_REAL:ro"
+    fi
+fi
+
+add_mount_if_exists "libnl-3" "libnl-3.so*"
+add_mount_if_exists "libmnl" "libmnl.so*"
+
+echo "Mount args: $MOUNT_ARGS"
+
+echo "Launching container: ci_sglang"
+docker run -dt --user root \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  ${DEVICE_FLAG} \
+  -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+  -v /sys/class/infiniband:/sys/class/infiniband:ro \
+  -v /sys/class/infiniband_verbs:/sys/class/infiniband_verbs:ro \
+  -v /sys/class/net:/sys/class/net:ro \
+  -v /etc/libibverbs.d:/etc/libibverbs.d:ro \
+  -v /usr/lib/x86_64-linux-gnu/libibverbs:/usr/lib/x86_64-linux-gnu/libibverbs:ro \
+  $MOUNT_ARGS \
+  $CACHE_VOLUME \
+  --privileged \
+  --network=host \
+  --ipc=host \
+  --ulimit memlock=-1 \
+  --cap-add=IPC_LOCK \
+  --cap-add=SYS_PTRACE \
+  --security-opt seccomp=unconfined \
+  --group-add video \
+  --group-add rdma \
+  --shm-size 32g \
+  -e HF_TOKEN="${HF_TOKEN:-}" \
+  -e HF_HOME=/sgl-data/hf-cache \
+  -e HF_HUB_ETAG_TIMEOUT=300 \
+  -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
+  -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
+  -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
+  -w /sglang-checkout \
+  --name ci_sglang \
+  "${IMAGE}"

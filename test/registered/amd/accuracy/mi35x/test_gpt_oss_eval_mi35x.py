@@ -75,7 +75,9 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "0"
+        },  # Disabled due to SWA eviction bug with aiter (#17220)
     ),
     ModelConfig(
         model_path="openai/gpt-oss-120b",
@@ -93,7 +95,9 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "0"
+        },  # Disabled due to SWA eviction bug with aiter (#17220)
     ),
 ]
 

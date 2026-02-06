@@ -301,6 +301,8 @@ class RadixCache(BasePrefixCache):
             raise ValueError(
                 f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
             )
+
+        self.evictable_leaves = set()
         self.reset()
 
     @classmethod
@@ -333,6 +335,7 @@ class RadixCache(BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
@@ -451,7 +454,6 @@ class RadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
-            self.req_to_token_pool.free(req.req_pool_idx)
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -485,7 +487,6 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
 
         # Remove req slot release the cache lock
-        self.req_to_token_pool.free(req.req_pool_idx)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -566,7 +567,7 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        leaves = self._collect_leaves()
+        leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
@@ -600,6 +601,7 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
             node.lock_ref += 1
+            self._update_leaf_status(node)
             node = node.parent
         return delta
 
@@ -614,6 +616,7 @@ class RadixCache(BasePrefixCache):
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
+            self._update_leaf_status(node)
             if node.parent is None:
                 assert (
                     node is self.root_node
@@ -727,6 +730,8 @@ class RadixCache(BasePrefixCache):
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length
@@ -755,6 +760,24 @@ class RadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.evictable_size_ -= len(node.key)
+        if node in self.evictable_leaves:
+            self.evictable_leaves.remove(node)
+        self._update_leaf_status(node.parent)
+
+    def _update_leaf_status(self, node: TreeNode):
+        if node.evicted or node.lock_ref > 0:
+            if node in self.evictable_leaves:
+                self.evictable_leaves.remove(node)
+            return
+
+        for child in node.children.values():
+            if not child.evicted:
+                if node in self.evictable_leaves:
+                    self.evictable_leaves.remove(node)
+                return
+
+        if node not in self.evictable_leaves:
+            self.evictable_leaves.add(node)
 
     def _total_size_helper(self):
         total_size = 0
@@ -767,20 +790,6 @@ class RadixCache(BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size
-
-    def _collect_leaves(self):
-        ret_list = []
-        stack = list(self.root_node.children.values())
-
-        while stack:
-            cur_node = stack.pop()
-            if len(cur_node.children) == 0:
-                if cur_node.lock_ref == 0:
-                    ret_list.append(cur_node)
-            else:
-                stack.extend(cur_node.children.values())
-
-        return ret_list
 
     def _record_store_event(self, node: TreeNode):
         # One BlockStored per ``page_size`` chunk.

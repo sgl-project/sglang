@@ -124,6 +124,9 @@ class CudaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
+
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
             free_gpu_memory = psutil.virtual_memory().available

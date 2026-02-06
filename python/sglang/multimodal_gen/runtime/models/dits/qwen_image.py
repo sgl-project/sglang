@@ -19,8 +19,10 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
-    LayerNorm,
+    LayerNormScaleShift,
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
+    apply_layernorm_only,
     apply_qk_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
@@ -646,7 +648,9 @@ class QwenImageTransformerBlock(nn.Module):
                 dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
-        self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.img_norm1 = LayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
 
         self.attn = QwenImageCrossAttention(
             dim=dim,
@@ -655,7 +659,9 @@ class QwenImageTransformerBlock(nn.Module):
             context_pre_only=False,
             head_dim=attention_head_dim,
         )
-        self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.img_norm2 = ScaleResidualLayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
         self.img_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
@@ -667,16 +673,37 @@ class QwenImageTransformerBlock(nn.Module):
                 dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
-        self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm1 = LayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
         # Text doesn't need separate attention - it's handled by img_attn joint computation
-        self.txt_norm2 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm2 = ScaleResidualLayerNormScaleShift(
+            hidden_size=dim, eps=eps, elementwise_affine=False
+        )
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
         # Utils
         self.fuse_mul_add = MulAdd()
 
-    def _modulate(self, x, mod_params, index=None):
+    def _modulate(
+        self,
+        x: torch.Tensor,
+        mod_params: torch.Tensor,
+        norm_module: Union[LayerNormScaleShift, ScaleResidualLayerNormScaleShift],
+        index: Optional[torch.Tensor] = None,
+        gate_x: Optional[torch.Tensor] = None,
+        residual_x: Optional[torch.Tensor] = None,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        # Apply attention gates and add residual (like in Megatron)
+        #   - residual_out = gate_x * x + residual_x
+        # - x = norm(residual_out) * (1 + scale) + shift
+        # TODO: clean code here
+        is_scale_residual = isinstance(norm_module, ScaleResidualLayerNormScaleShift)
+
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         if index is not None:
             actual_batch = x.shape[0]
@@ -689,12 +716,16 @@ class QwenImageTransformerBlock(nn.Module):
                 scale[actual_batch : 2 * actual_batch],
             )
             gate0, gate1 = gate[:actual_batch], gate[actual_batch : 2 * actual_batch]
-
             if _is_cuda:
+                if is_scale_residual:
+                    x = gate_x * x + residual_x
+                    residual_out = x
                 if not x.is_contiguous():
                     x = x.contiguous()
                 if not index.is_contiguous():
                     index = index.contiguous()
+                # TODO: fuse norm with above select01 kernel, workaround now
+                x = apply_layernorm_only(x, norm_module)
                 x, gate_result = fuse_scale_shift_gate_select01_kernel(
                     x,
                     scale0=scale0.contiguous(),
@@ -705,7 +736,10 @@ class QwenImageTransformerBlock(nn.Module):
                     gate1=gate1.contiguous(),
                     index=index,
                 )
-                return x, gate_result
+                if is_scale_residual:
+                    return x, residual_out, gate_result
+                else:
+                    return x, gate_result
             else:
                 mask = (index == 0).unsqueeze(-1)
                 shift_result = torch.where(
@@ -715,15 +749,34 @@ class QwenImageTransformerBlock(nn.Module):
                     mask, scale0.unsqueeze(1), scale1.unsqueeze(1)
                 )
                 gate_result = torch.where(mask, gate0.unsqueeze(1), gate1.unsqueeze(1))
-                return (
-                    self.fuse_mul_add(x, scale_result, shift_result, k=1.0),
-                    gate_result,
-                )
+                if is_scale_residual:
+                    modulated, residual_out = norm_module(
+                        residual=residual_x,
+                        x=x,
+                        gate=gate_x,
+                        shift=shift_result,
+                        scale=scale_result,
+                    )
+                    return modulated, residual_out, gate_result
+                else:
+                    modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+                    return modulated, gate_result
         else:
             shift_result = shift.unsqueeze(1)
             scale_result = scale.unsqueeze(1)
             gate_result = gate.unsqueeze(1)
-            return self.fuse_mul_add(x, scale_result, shift_result, k=1.0), gate_result
+            if is_scale_residual:
+                modulated, residual_out = norm_module(
+                    residual=residual_x,
+                    x=x,
+                    gate=gate_x,
+                    shift=shift_result,
+                    scale=scale_result,
+                )
+                return modulated, residual_out, gate_result
+            else:
+                modulated = norm_module(x=x, shift=shift_result, scale=scale_result)
+                return modulated, gate_result
 
     def forward(
         self,
@@ -745,13 +798,15 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-
-        img_normed = self.img_norm1(hidden_states)
-
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, modulate_index)
+        img_modulated, img_gate1 = self._modulate(
+            hidden_states, img_mod1, self.img_norm1, modulate_index
+        )
         # Process text stream - norm1 + modulation
-        txt_normed = self.txt_norm1(encoder_hidden_states)
-        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+        txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
+        txt_modulated = self.txt_norm1(
+            encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
+        )
+        txt_gate1 = txt_gate1_raw.unsqueeze(1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -772,23 +827,28 @@ class QwenImageTransformerBlock(nn.Module):
 
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
-
-        # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
-
         # Process image stream - norm2 + MLP
-        img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(
-            img_normed2, img_mod2, modulate_index
+        img_modulated2, hidden_states, img_gate2 = self._modulate(
+            img_attn_output,
+            img_mod2,
+            self.img_norm2,
+            modulate_index,
+            gate_x=img_gate1,
+            residual_x=hidden_states,
         )
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = self.fuse_mul_add(img_mlp_output, img_gate2, hidden_states)
 
         # Process text stream - norm2 + MLP
-        txt_normed2 = self.txt_norm2(encoder_hidden_states)
-        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+        txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
+        txt_modulated2, encoder_hidden_states = self.txt_norm2(
+            residual=encoder_hidden_states,
+            x=txt_attn_output,
+            gate=txt_gate1,
+            shift=txt_shift2,
+            scale=txt_scale2,
+        )
+        txt_gate2 = txt_gate2_raw.unsqueeze(1)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = self.fuse_mul_add(
             txt_mlp_output, txt_gate2, encoder_hidden_states

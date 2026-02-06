@@ -412,20 +412,6 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
             "Only HuggingFace diffusers format is supported."
         )
 
-    # Check for transformer and vae directories
-    transformer_dir = os.path.join(model_path, "transformer")
-    vae_dir = os.path.join(model_path, "vae")
-
-    if not os.path.exists(transformer_dir):
-        raise ValueError(
-            f"Model directory {model_path} does not contain a transformer/ directory."
-        )
-
-    if not os.path.exists(vae_dir):
-        raise ValueError(
-            f"Model directory {model_path} does not contain a vae/ directory."
-        )
-
     # Load the config
     with open(config_path) as f:
         config = json.load(f)
@@ -435,6 +421,37 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
         raise ValueError("model_index.json does not contain _diffusers_version")
 
     logger.info("Diffusers version: %s", config["_diffusers_version"])
+
+    component_keys = [
+        key
+        for key, value in config.items()
+        if isinstance(value, (list, tuple))
+        and len(value) == 2
+        and all(isinstance(item, str) for item in value)
+    ]
+    if component_keys:
+        missing_components = [
+            component_key
+            for component_key in component_keys
+            if not os.path.exists(os.path.join(model_path, component_key))
+        ]
+        if missing_components:
+            missing_str = ", ".join(missing_components)
+            raise ValueError(
+                f"Model directory {model_path} is missing required component "
+                f"directories: {missing_str}."
+            )
+    else:
+        transformer_dir = os.path.join(model_path, "transformer")
+        vae_dir = os.path.join(model_path, "vae")
+        if not os.path.exists(transformer_dir):
+            raise ValueError(
+                f"Model directory {model_path} does not contain a transformer/ directory."
+            )
+        if not os.path.exists(vae_dir):
+            raise ValueError(
+                f"Model directory {model_path} does not contain a vae/ directory."
+            )
     return cast(dict[str, Any], config)
 
 
@@ -543,14 +560,35 @@ def maybe_download_model(
 
     def _verify_model_complete(path: str) -> bool:
         """Check if model directory has required subdirectories."""
+        config_path = os.path.join(path, "model_index.json")
+        if not os.path.exists(config_path):
+            return False
+
+        try:
+            with open(config_path) as config_file:
+                model_index = json.load(config_file)
+        except Exception as exc:
+            logger.warning(
+                "Failed to read model_index.json at %s: %s", config_path, exc
+            )
+            return False
+
+        component_keys = [
+            key
+            for key, value in model_index.items()
+            if isinstance(value, (list, tuple))
+            and len(value) == 2
+            and all(isinstance(item, str) for item in value)
+        ]
+        if component_keys:
+            return all(
+                os.path.exists(os.path.join(path, component_key))
+                for component_key in component_keys
+            )
+
         transformer_dir = os.path.join(path, "transformer")
         vae_dir = os.path.join(path, "vae")
-        config_path = os.path.join(path, "model_index.json")
-        return (
-            os.path.exists(config_path)
-            and os.path.exists(transformer_dir)
-            and os.path.exists(vae_dir)
-        )
+        return os.path.exists(transformer_dir) and os.path.exists(vae_dir)
 
     # 1. Local path check: if path exists locally, verify it's complete (skip for LoRA)
     if os.path.exists(model_name_or_path):
@@ -584,7 +622,7 @@ def maybe_download_model(
                 return model_name_or_path
         else:
             logger.warning(
-                "Local model at %s appears incomplete (missing transformer/ or vae/), "
+                "Local model at %s appears incomplete (missing required components), "
                 "will attempt re-download",
                 model_name_or_path,
             )

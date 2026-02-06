@@ -211,7 +211,10 @@ def prepare_request(
     """
     Create a Req object with sampling_params as a parameter.
     """
-    req = Req(sampling_params=sampling_params, VSA_sparsity=server_args.VSA_sparsity)
+    req = Req(
+        sampling_params=sampling_params,
+        VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+    )
     try:
         diffusers_kwargs = sampling_params.diffusers_kwargs
     except AttributeError:

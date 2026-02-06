@@ -475,23 +475,6 @@ class MllamaVisionModel(nn.Module):
         return hidden_state
 
 
-class MllamaTextRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-    def extra_repr(self):
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
-
-
 class MllamaTextCrossAttention(nn.Module):
     def __init__(
         self,
@@ -534,10 +517,8 @@ class MllamaTextCrossAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        # vllm.model_executor.layers.layernorm.RMSNorm has precision issue,
-        # use huggingface's instead
-        self.q_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MllamaTextRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.scaling = self.head_dim**-0.5
 
         self.attn = RadixAttention(
@@ -572,9 +553,13 @@ class MllamaTextCrossAttention(nn.Module):
             )
             k = k.view(-1, self.num_local_key_value_heads, self.head_dim)
             v = v.view(-1, self.num_local_key_value_heads, self.head_dim)
-            k = self.k_norm(k)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(
+                -1, self.num_local_key_value_heads, self.head_dim
+            )
         q = q.view(-1, self.num_local_heads, self.head_dim)
-        q = self.q_norm(q)
+        q = self.q_norm(q.reshape(-1, self.head_dim)).reshape(
+            -1, self.num_local_heads, self.head_dim
+        )
 
         output = self.attn(q, k, v, forward_batch)
         out, _ = self.o_proj(output)

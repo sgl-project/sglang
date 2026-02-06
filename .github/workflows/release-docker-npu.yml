@@ -67,6 +67,13 @@ jobs:
           fi
           echo "version=v${VERSION}" >> $GITHUB_OUTPUT
           echo "TAG=lmsysorg/sglang:v${VERSION}-cann${{ matrix.cann_version }}-${{ matrix.device_type }}" >> $GITHUB_OUTPUT
+      # Enable Docker multi-architecture build environment
+      # Emulate non-native architectures
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      # Required for building and pushing multi-arch Docker images
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push Docker image
         id: build-and-push
@@ -74,14 +81,13 @@ jobs:
         with:
           context: docker
           file: docker/npu.Dockerfile
-          # TODO: need add x86 platforms support when memfabric is ready
-          platforms: linux/arm64
+          platforms: linux/arm64,linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags || steps.version.outputs.TAG }}
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=2026.01.21
+            SGLANG_KERNEL_NPU_TAG=2026.01.28
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
             SGLANG_TAG=${{ steps.version.outputs.version }}
