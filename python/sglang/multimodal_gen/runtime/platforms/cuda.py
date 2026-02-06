@@ -124,6 +124,9 @@ class CudaPlatformBase(Platform):
         if empty_cache:
             torch.cuda.empty_cache()
 
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
+
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
             free_gpu_memory = psutil.virtual_memory().available
@@ -243,6 +246,16 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.SLA_ATTN:
             logger.info("Using Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
+            logger.info("Using Sage Sparse Linear Attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.FA2:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+                FlashAttention2Backend,
+            )
+
+            logger.info("Using FlashAttention2 backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:

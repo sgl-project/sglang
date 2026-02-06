@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -16,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     BaseFinishReason,
     Req,
     RequestStage,
@@ -43,6 +45,45 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def _get_storage_backend_type(self) -> str:
+        """Get storage backend type from tree_cache."""
+        storage_backend_type = "none"
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        if cache_controller and hasattr(cache_controller, "storage_backend"):
+            storage_backend = cache_controller.storage_backend
+            if storage_backend is not None:
+                storage_backend_type = type(storage_backend).__name__
+        return storage_backend_type
+
+    def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+        """Get detailed cache breakdown for a request, if available.
+
+        Returns:
+            - None if HiCache is not enabled
+            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
+            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+        """
+        # Only show details if HiCache is enabled
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return None
+
+        # Only show if there are any cached tokens
+        if (
+            req.cached_tokens_device > 0
+            or req.cached_tokens_host > 0
+            or req.cached_tokens_storage > 0
+        ):
+            details = {
+                "device": req.cached_tokens_device,
+                "host": req.cached_tokens_host,
+            }
+            # Only include storage fields if L3 storage is enabled
+            if getattr(self, "enable_hicache_storage", False):
+                details["storage"] = req.cached_tokens_storage
+                details["storage_backend"] = self._get_storage_backend_type()
+            return details
+        return None
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -122,7 +163,19 @@ class SchedulerOutputProcessorMixin:
             # Check finish conditions
             logprob_pt = 0
 
+            deadline = -1
+            if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+                deadline = time.perf_counter() - timeout_ms / 1000.0
+
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                if (
+                    not req.finished()
+                    and 0 < req.time_stats.forward_entry_time < deadline
+                ):
+                    req.to_finish = FINISH_ABORT(
+                        "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                    )
+
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
@@ -287,6 +340,16 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                adder=self.adder,
+                can_run_list=self.can_run_list,
+                running_bs=self.running_bs,
+                running_bs_offline_batch=0,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> List[List[int]]:
@@ -356,6 +419,16 @@ class SchedulerOutputProcessorMixin:
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
+        if self.current_scheduler_metrics_enabled:
+            can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
+            self.log_prefill_stats(
+                adder=self.adder,
+                can_run_list=self.can_run_list,
+                running_bs=self.running_bs,
+                running_bs_offline_batch=0,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -388,9 +461,19 @@ class SchedulerOutputProcessorMixin:
         # NOTE: in any case, we should check finish here
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
+        deadline = -1
+        if (timeout_ms := envs.SGLANG_FORWARD_TIMEOUT_MS.get()) > 0:
+            deadline = time.perf_counter() - timeout_ms / 1000.0
+
         # Check finish condition
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
+
+            if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                # req.set_finish_with_abort()
+                req.to_finish = FINISH_ABORT(
+                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                )
 
             if self.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
@@ -849,12 +932,13 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
         load = self.get_load()
-        output_routed_experts = None
+        routed_experts = None
         customized_info = {}
 
         queue_times = []
@@ -961,6 +1045,10 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
+
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -1051,9 +1139,9 @@ class SchedulerOutputProcessorMixin:
                         output_hidden_states = []
                     output_hidden_states.append(req.hidden_states)
                 if req.return_routed_experts:
-                    if output_routed_experts is None:
-                        output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
+                    if routed_experts is None:
+                        routed_experts = []
+                    routed_experts.append(req.routed_experts)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1072,7 +1160,6 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
-
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1095,6 +1182,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    cached_tokens_details=cached_tokens_details,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
@@ -1109,7 +1197,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
-                    output_routed_experts=output_routed_experts,
+                    routed_experts=routed_experts,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
@@ -1126,6 +1214,7 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         queue_times = []
         forward_entry_times = []
         prefill_launch_delays = []
@@ -1140,6 +1229,9 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
 
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
@@ -1165,6 +1257,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
+                cached_tokens_details=cached_tokens_details,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,
