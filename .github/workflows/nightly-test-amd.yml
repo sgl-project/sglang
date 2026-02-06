@@ -908,7 +908,6 @@ jobs:
       - nightly-8-gpu-deepseek-v31
       - nightly-8-gpu-deepseek-v32
       - nightly-8-gpu-deepseek-v32-mtp
-      - nightly-8-gpu-kimi-k2
       - nightly-8-gpu-kimi-k25
       # MI35x jobs
       - nightly-test-1-gpu-mi35x
