@@ -135,7 +135,6 @@ class Scheduler:
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
             model_path=req.model_path,
-            load_format=req.load_format or "auto",
             flush_cache=req.flush_cache,
             target_modules=req.target_modules,
         )

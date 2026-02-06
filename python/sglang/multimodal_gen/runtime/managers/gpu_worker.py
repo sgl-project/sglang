@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     Req,
     build_pipeline,
 )
+from sglang.multimodal_gen.runtime.loader.weights_updater import (
+    WeightsUpdater,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
@@ -342,318 +345,26 @@ class GPUWorker:
         status = self.pipeline.get_lora_status()
         return OutputBatch(output=status)
 
-    # Module name to weight directory mapping for different model architectures
-    _MODULE_WEIGHT_DIR_MAPPING = {
-        "transformer": ["transformer", "dit", "model"],
-        "transformer_2": ["transformer_2"],
-        "video_dit": ["video_dit", "transformer", "dit", "model"],
-        "video_dit_2": ["video_dit_2"],
-        "audio_dit": ["audio_dit"],
-    }
-
-    # Default modules to update for RL workflows (typically only transformer is trained)
-    _DEFAULT_TARGET_MODULES = [
-        "transformer",
-        "transformer_2",
-        "video_dit",
-        "video_dit_2",
-        "audio_dit",
-    ]
-
     def update_weights_from_disk(
         self,
         model_path: str,
-        load_format: str = "auto",
         flush_cache: bool = True,
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
-        """
-        Update model weights from disk in-place without restarting the server.
-
-        This method enables dynamic weight updates for RL workflows and iterative
-        model fine-tuning scenarios. Includes rollback mechanism to restore original
-        weights if loading fails.
-
-        By default, updates ALL nn.Module components in the pipeline (transformer, vae,
-        text_encoder, etc.). Use target_modules to specify a subset if needed.
-
-        Args:
-            model_path: Path to the new model weights (HuggingFace model path or local directory).
-            load_format: Format of the weights to load (default: "auto").
-            flush_cache: Whether to reset cache state after updating weights (default: True).
-            target_modules: List of module names to update. If None or ["all"], updates all
-                           nn.Module components. Specify a list like ["transformer"] to update
-                           only specific modules.
-
-        Returns:
-            Tuple of (success: bool, message: str).
-        """
-        import gc
-        import os
-
-        from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
-        from sglang.multimodal_gen.runtime.loader.weight_utils import (
-            safetensors_weights_iterator,
-        )
-        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-            maybe_download_model,
-        )
-
-        logger.info(f"Updating weights from disk: {model_path}")
-
-        # Store original model path for potential rollback
-        original_model_path = self.server_args.model_path
-
+        """Update model weights from disk inplace without restarting the server."""
         if not self.pipeline:
             return False, "Pipeline is not initialized"
 
-        available_modules: list[str] = []
-        if hasattr(self.pipeline, "modules"):
-            available_modules = list(self.pipeline.modules.keys())
-
-        # Determine which modules to update
-        if target_modules is None or target_modules == ["all"]:
-            # Default: update all nn.Module components in the pipeline
-            module_names = [
-                name
-                for name in available_modules
-                if isinstance(self.pipeline.get_module(name), torch.nn.Module)
-            ]
-        else:
-            module_names = target_modules
-
-        # Collect all modules that need to be updated
-        modules_to_update: list[tuple[str, torch.nn.Module]] = []
-
-        for name in module_names:
-            module = self.pipeline.get_module(name)
-            if module is not None and isinstance(module, torch.nn.Module):
-                modules_to_update.append((name, module))
-
-        # For DiffusersPipeline, also check diffusers_pipe attributes
-        diffusers_pipe = self.pipeline.get_module("diffusers_pipeline")
-        if diffusers_pipe is not None and not modules_to_update:
-            for name in module_names:
-                if hasattr(diffusers_pipe, name):
-                    module = getattr(diffusers_pipe, name)
-                    if module is not None and isinstance(module, torch.nn.Module):
-                        modules_to_update.append((name, module))
-
-        if not modules_to_update:
-            # Provide detailed error message
-            error_msg = (
-                f"No matching modules found for update. "
-                f"Requested: {module_names}. "
-                f"Available in pipeline: {available_modules}"
-            )
-            logger.error(error_msg)
-            return False, error_msg
-
-        # Helper function to find weights directory for a module
-        def find_weights_dir(local_path: str, module_name: str) -> str | None:
-            possible_dirs = self._MODULE_WEIGHT_DIR_MAPPING.get(
-                module_name, [module_name]
-            )
-            for dir_name in possible_dirs:
-                dir_path = os.path.join(local_path, dir_name)
-                if os.path.exists(dir_path):
-                    return dir_path
-            # Fallback: check if weights are in root directory (for single-module models)
-            if _list_safetensors_files(local_path):
-                return local_path
-            return None
-
-        # Helper function to get weights iterator from a directory
-        def get_weights_iter(weights_dir: str):
-            safetensors_files = _list_safetensors_files(weights_dir)
-            if not safetensors_files:
-                raise FileNotFoundError(f"No safetensors files found in {weights_dir}")
-            return safetensors_weights_iterator(safetensors_files), len(
-                safetensors_files
-            )
-
-        # Helper function to load weights into model
-        def load_weights_into_model(
-            weights_iter, model_params: dict
-        ) -> tuple[int, int]:
-            try:
-                from torch.distributed.tensor import DTensor, distribute_tensor
-            except ImportError:
-                DTensor = None
-                distribute_tensor = None
-
-            updated = 0
-            skipped = 0
-            for name, loaded_weight in weights_iter:
-                if name in model_params:
-                    param = model_params[name]
-                    if param.shape == loaded_weight.shape:
-                        if DTensor is not None and isinstance(param, DTensor):
-                            # For DTensor, distribute the loaded weight first then copy
-                            distributed_weight = distribute_tensor(
-                                loaded_weight.to(param.device, param.dtype),
-                                param.device_mesh,
-                                param.placements,
-                            )
-                            param._local_tensor.copy_(distributed_weight._local_tensor)
-                        else:
-                            param.data.copy_(
-                                loaded_weight.to(param.device, param.dtype)
-                            )
-                        updated += 1
-                    else:
-                        logger.warning(
-                            f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}"
-                        )
-                        skipped += 1
-                else:
-                    skipped += 1
-            return updated, skipped
-
-        # Download model if it's a HuggingFace path
-        try:
-            local_model_path = maybe_download_model(model_path)
-        except Exception as e:
-            return False, f"Failed to download model: {e}"
-
-        # Phase 1: Validate ALL modules have their weight directories before any update
-        # This ensures we don't do partial updates
-        module_weights_map: dict[str, str] = {}  # module_name -> weights_dir
-        missing_modules: list[str] = []
-
-        for module_name, module in modules_to_update:
-            weights_dir = find_weights_dir(local_model_path, module_name)
-            if weights_dir is None:
-                missing_modules.append(module_name)
-            else:
-                # Also validate that we can get weights iterator
-                try:
-                    safetensors_files = _list_safetensors_files(weights_dir)
-                    if not safetensors_files:
-                        missing_modules.append(module_name)
-                    else:
-                        module_weights_map[module_name] = weights_dir
-                except Exception:
-                    missing_modules.append(module_name)
-
-        # Fail if any module is missing weights - no partial updates allowed
-        if missing_modules:
-            error_message = (
-                f"Cannot update weights: missing weight files for modules: {missing_modules}. "
-                f"All modules must have corresponding weights. No partial updates allowed."
-            )
-            logger.error(error_message)
-            return False, error_message
-
-        # Log which modules will be updated from which directories
-        logger.info(
-            f"Updating {len(module_weights_map)} modules: "
-            + ", ".join(
-                f"{name} <- {path}" for name, path in module_weights_map.items()
-            )
+        updater = WeightsUpdater(self.pipeline)
+        success, message = updater.update_weights_from_disk(
+            model_path,
+            original_model_path=self.server_args.model_path,
+            flush_cache=flush_cache,
+            target_modules=target_modules,
         )
-
-        # Phase 2: Update all modules
-        # First, disable layerwise offload for all modules (load weights from CPU to GPU)
-        offload_disabled_modules: list[torch.nn.Module] = []
-        for module_name, module in modules_to_update:
-            if (
-                hasattr(module, "layerwise_offload_managers")
-                and module.layerwise_offload_managers
-            ):
-                module.disable_offload()
-                offload_disabled_modules.append(module)
-
-        total_updated = 0
-        total_skipped = 0
-        updated_modules: list[str] = []
-
-        for module_name, module in modules_to_update:
-            weights_dir = module_weights_map[module_name]
-            model_state_dict = dict(module.named_parameters())
-
-            try:
-                weights_iter, _ = get_weights_iter(weights_dir)
-                updated, skipped = load_weights_into_model(
-                    weights_iter, model_state_dict
-                )
-                total_updated += updated
-                total_skipped += skipped
-                updated_modules.append(module_name)
-            except Exception as e:
-                # Rollback ALL modules (including the ones already updated)
-                error_message = (
-                    f"Failed to update {module_name}: {e}. Rolling back all modules."
-                )
-                logger.error(error_message, exc_info=True)
-
-                if updated_modules:
-                    try:
-                        original_local_path = maybe_download_model(original_model_path)
-                        for rollback_name in updated_modules:
-                            rollback_module = self.pipeline.get_module(rollback_name)
-                            if rollback_module is None:
-                                continue
-                            rollback_weights_dir = find_weights_dir(
-                                original_local_path, rollback_name
-                            )
-                            if rollback_weights_dir is None:
-                                continue
-                            rollback_iter, _ = get_weights_iter(rollback_weights_dir)
-                            rollback_params = dict(rollback_module.named_parameters())
-                            load_weights_into_model(rollback_iter, rollback_params)
-                    except Exception as rollback_error:
-                        logger.error(f"Rollback failed: {rollback_error}")
-                        # Re-enable offload before returning
-                        for m in offload_disabled_modules:
-                            m.enable_offload()
-                        return (
-                            False,
-                            f"{error_message} Rollback also failed: {rollback_error}",
-                        )
-
-                gc.collect()
-                torch.cuda.empty_cache()
-                # Re-enable offload before returning
-                for m in offload_disabled_modules:
-                    m.enable_offload()
-                return False, error_message
-
-        # Clean up GPU memory
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Reset cache state for all updated modules
-        if flush_cache:
-            for module_name, module in modules_to_update:
-                if module_name in updated_modules:
-                    self._reset_cache_state_after_weight_update(module)
-
-        # Re-enable layerwise offload (sync new weights to CPU)
-        for module in offload_disabled_modules:
-            module.enable_offload()
-
-        # Update the model path in server_args
-        self.server_args.model_path = model_path
-
-        message = f"Successfully updated {len(updated_modules)} modules ({', '.join(updated_modules)}): {total_updated} params updated"
-        logger.info(message)
-        return True, message
-
-    def _reset_cache_state_after_weight_update(self, module: torch.nn.Module) -> None:
-        """
-        Reset cache state for a single module after weight updates.
-
-        This resets TeaCache state. Cache-DiT context is automatically refreshed
-        at the start of each inference request with the correct num_inference_steps,
-        so we don't need to manually reset it here.
-
-        Args:
-            module: The module whose cache state should be reset.
-        """
-        # Reset TeaCache state if the module has it
-        if hasattr(module, "reset_teacache_state"):
-            module.reset_teacache_state()
+        if success:
+            self.server_args.model_path = model_path
+        return success, message
 
 
 OOM_MSG = f"""

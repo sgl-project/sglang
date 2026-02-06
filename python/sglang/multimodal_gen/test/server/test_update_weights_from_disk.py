@@ -54,12 +54,6 @@ class TestUpdateWeightsFromDisk:
     def _get_base_url(self, ctx: ServerContext) -> str:
         return f"http://localhost:{ctx.port}"
 
-    def _get_model_info(self, base_url: str) -> dict:
-        """Get current model info from server."""
-        response = requests.get(f"{base_url}/get_model_info", timeout=30)
-        assert response.status_code == 200, f"get_model_info failed: {response.text}"
-        return response.json()
-
     def _update_weights(
         self,
         base_url: str,
@@ -83,27 +77,13 @@ class TestUpdateWeightsFromDisk:
         )
         return response.json(), response.status_code
 
-    def test_get_model_info(self, diffusion_server_for_weight_update: ServerContext):
-        """Test that we can get model info from the server."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
-        model_info = self._get_model_info(base_url)
-
-        assert "model_path" in model_info, "model_path not in response"
-        logger.info(f"Model info: {model_info}")
-
     def test_update_weights_same_model(
         self, diffusion_server_for_weight_update: ServerContext
     ):
         """Test updating weights with the same model (should succeed)."""
         base_url = self._get_base_url(diffusion_server_for_weight_update)
 
-        # Get current model path
-        model_info = self._get_model_info(base_url)
-        current_model_path = model_info["model_path"]
-        logger.info(f"Current model path: {current_model_path}")
-
-        # Update with same model
-        result, status_code = self._update_weights(base_url, current_model_path)
+        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
         logger.info(f"Update result: {result}")
 
         assert status_code == 200, f"Expected 200, got {status_code}"
@@ -114,12 +94,10 @@ class TestUpdateWeightsFromDisk:
     ):
         """Test updating weights with flush_cache=True."""
         base_url = self._get_base_url(diffusion_server_for_weight_update)
-        model_info = self._get_model_info(base_url)
-        current_model_path = model_info["model_path"]
 
         result, status_code = self._update_weights(
             base_url,
-            current_model_path,
+            DEFAULT_DIFFUSION_MODEL,
             flush_cache=True,
         )
 
@@ -131,12 +109,10 @@ class TestUpdateWeightsFromDisk:
     ):
         """Test updating weights with flush_cache=False."""
         base_url = self._get_base_url(diffusion_server_for_weight_update)
-        model_info = self._get_model_info(base_url)
-        current_model_path = model_info["model_path"]
 
         result, status_code = self._update_weights(
             base_url,
-            current_model_path,
+            DEFAULT_DIFFUSION_MODEL,
             flush_cache=False,
         )
 
@@ -179,13 +155,11 @@ class TestUpdateWeightsFromDisk:
     ):
         """Test updating only specific modules (e.g., transformer only)."""
         base_url = self._get_base_url(diffusion_server_for_weight_update)
-        model_info = self._get_model_info(base_url)
-        current_model_path = model_info["model_path"]
 
         # Try to update only transformer module
         result, status_code = self._update_weights(
             base_url,
-            current_model_path,
+            DEFAULT_DIFFUSION_MODEL,
             target_modules=["transformer"],
         )
         logger.info(f"Update specific modules result: {result}")
@@ -222,10 +196,6 @@ class TestUpdateWeightsFromDiskWithOffload:
     def _get_base_url(self, ctx: ServerContext) -> str:
         return f"http://localhost:{ctx.port}"
 
-    def _get_model_info(self, base_url: str) -> dict:
-        response = requests.get(f"{base_url}/get_model_info", timeout=30)
-        return response.json()
-
     def _update_weights(
         self, base_url: str, model_path: str, **kwargs
     ) -> tuple[dict, int]:
@@ -240,20 +210,12 @@ class TestUpdateWeightsFromDiskWithOffload:
     def test_update_weights_with_offload_enabled(
         self, diffusion_server_with_offload: ServerContext
     ):
-        """Test that weight update works correctly when layerwise offload is enabled.
-
-        This tests the fix for the shape mismatch issue where offloaded weights
-        have placeholder size [1] tensors on GPU.
-        """
+        """Test that weight update works correctly when layerwise offload is enabled."""
         base_url = self._get_base_url(diffusion_server_with_offload)
-        model_info = self._get_model_info(base_url)
-        current_model_path = model_info["model_path"]
 
-        logger.info(
-            f"Testing weight update with offload enabled, model: {current_model_path}"
-        )
+        logger.info("Testing weight update with offload enabled")
 
-        result, status_code = self._update_weights(base_url, current_model_path)
+        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
         logger.info(f"Update result: {result}")
 
         assert status_code == 200, f"Expected 200, got {status_code}"
@@ -320,10 +282,9 @@ class TestUpdateWeightsEndToEnd:
         logger.info("Generation before update succeeded")
 
         # Update weights
-        model_info = requests.get(f"{base_url}/get_model_info", timeout=30).json()
         update_response = requests.post(
             f"{base_url}/update_weights_from_disk",
-            json={"model_path": model_info["model_path"], "flush_cache": True},
+            json={"model_path": DEFAULT_DIFFUSION_MODEL, "flush_cache": True},
             timeout=300,
         )
         assert update_response.json().get("success"), "Weight update failed"

@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.io_struct import UpdateWeightsFromDiskReq
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 
@@ -91,89 +92,38 @@ async def health_generate():
     # TODO : health generate endpoint
     return {"status": "ok"}
 
-
-@health_router.get("/get_model_info")
-async def get_model_info(request: Request):
-    """Get information about the current model."""
-    server_args: ServerArgs = request.app.state.server_args
-    return {
-        "model_path": server_args.model_path,
-    }
-
-
-# Weight update router for RL workflows
-weight_update_router = APIRouter()
-
-
-@weight_update_router.post("/update_weights_from_disk")
+@health_router.post("/update_weights_from_disk")
 async def update_weights_from_disk(request: Request):
-    """
-    Update model weights from disk without restarting the server.
+    """Update model weights from disk inplace without restarting the server."""
+    body = await request.json()
+    model_path = body.get("model_path")
+    if not model_path:
+        return ORJSONResponse(
+            {"success": False, "message": "model_path is required"},
+            status_code=400,
+        )
 
-    This endpoint enables dynamic weight updates for RL workflows and iterative
-    model fine-tuning scenarios.
-
-    Request body:
-        - model_path (str): Path to the new model weights (HuggingFace model path or local directory)
-        - load_format (str, optional): Format of the weights to load (default: "auto")
-        - flush_cache (bool, optional): Whether to flush cache after update (default: True)
-        - target_modules (list[str], optional): List of module names to update.
-            Default: updates ALL nn.Module components (transformer, vae, text_encoder, etc.)
-            Examples: ["transformer"] to update only transformer
-
-    Returns:
-        - success (bool): Whether the update was successful
-        - message (str): Status message
-    """
-    from sglang.multimodal_gen.runtime.managers.io_struct import (
-        UpdateWeightsFromDiskReq,
+    req = UpdateWeightsFromDiskReq(
+        model_path=model_path,
+        flush_cache=body.get("flush_cache", True),
+        target_modules=body.get("target_modules"),
     )
 
     try:
-        body = await request.json()
-        model_path = body.get("model_path")
-        if not model_path:
-            return ORJSONResponse(
-                {"success": False, "message": "model_path is required"},
-                status_code=400,
-            )
-
-        # Create the request object with diffusion-specific fields
-        req = UpdateWeightsFromDiskReq(
-            model_path=model_path,
-            load_format=body.get("load_format", "auto"),
-            flush_cache=body.get("flush_cache", True),
-            target_modules=body.get("target_modules"),
-        )
-
         response = await async_scheduler_client.forward(req)
-
-        # Handle response
-        if hasattr(response, "output") and response.output:
-            result = response.output
-            return ORJSONResponse(
-                {
-                    "success": result.get("success", False),
-                    "message": result.get("message", "Unknown status"),
-                },
-                status_code=200 if result.get("success") else 400,
-            )
-        elif hasattr(response, "error") and response.error:
-            return ORJSONResponse(
-                {"success": False, "message": response.error},
-                status_code=400,
-            )
-        else:
-            return ORJSONResponse(
-                {"success": False, "message": "Unknown response format"},
-                status_code=500,
-            )
-
     except Exception as e:
         return ORJSONResponse(
-            {"success": False, "message": f"Error: {str(e)}"},
+            {"success": False, "message": str(e)},
             status_code=500,
         )
+
+    result = response.output
+    success = result.get("success", False)
+    message = result.get("message", "Unknown status")
+    return ORJSONResponse(
+        {"success": success, "message": message},
+        status_code=200 if success else 400,
+    )
 
 
 def make_serializable(obj):
@@ -295,7 +245,6 @@ def create_app(server_args: ServerArgs):
     app = FastAPI(lifespan=lifespan)
 
     app.include_router(health_router)
-    app.include_router(weight_update_router)
     app.include_router(vertex_router)
 
     from sglang.multimodal_gen.runtime.entrypoints.openai import common_api

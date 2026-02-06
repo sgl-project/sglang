@@ -106,6 +106,23 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 **Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None)`
 
+**Diffusion engine (SGLang-D):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint. The update is all-or-nothing with automatic rollback on failure. When layerwise offload (`--dit-layerwise-offload`) is enabled, offload is temporarily disabled during the update, which causes a temporary GPU memory peak before returning to normal offloaded memory usage.
+
+**Request body:**
+
+| Field | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `model_path` | The model path with the new weights. | Required | Type: str |
+| `flush_cache` | Flush TeaCache state after update. | `True` | Type: bool |
+| `target_modules` | List of module names to update (e.g. `["transformer"]`). If omitted, all `nn.Module` components are updated. | `None` | Type: list[str] |
+
+**Response body:**
+
+| Field | Description | Defaults | Options |
+| --- | --- | --- | --- |
+| `success` | Whether the update succeeded. | - | Type: bool |
+| `message` | Status / error message. | - | Type: str |
+
 ### Update Weights from Tensor
 
 **When to use:**
