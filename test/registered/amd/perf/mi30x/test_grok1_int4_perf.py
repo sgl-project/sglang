@@ -1,13 +1,13 @@
-"""AMD Nightly performance benchmark for DeepSeek-V3.2 model (basic variant).
+"""Nightly performance benchmark for Grok-1 INT4 (W4A8KV8).
 
-This test benchmarks the DeepSeek-V3.2 model with basic TP=8 configuration on 8 GPUs.
+This test benchmarks Grok-1 (314B MOE) with INT4 weight quantization on 8 GPUs.
 
-The model path can be configured via DEEPSEEK_V32_MODEL_PATH environment variable.
-
-Registry: nightly-perf-8-gpu-deepseek-v32-basic suite
+Model paths can be configured via environment variables:
+- GROK1_MODEL_PATH: Path to Grok-1 INT4 model (default: amd/grok-1-W4A8KV8)
+- GROK1_TOKENIZER_PATH: Path to Grok-1 tokenizer (default: Xenova/grok-1-tokenizer)
 
 Example usage:
-    DEEPSEEK_V32_MODEL_PATH=deepseek-ai/DeepSeek-V3.2 python -m pytest test_deepseek_v32_basic_perf_amd.py -v
+    python -m pytest test_grok1_int4_perf.py -v
 """
 
 import os
@@ -19,10 +19,8 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-# Register for AMD CI - DeepSeek-V3.2 basic benchmark (~90 min)
-register_amd_ci(
-    est_time=5400, suite="nightly-perf-8-gpu-deepseek-v32-basic", nightly=True
-)
+# Register for AMD CI - Grok-1 INT4 benchmark (~25 min)
+register_amd_ci(est_time=1500, suite="nightly-perf-8-gpu-grok1-int4", nightly=True)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
@@ -34,7 +32,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     if results[0].run_name and results[0].run_name != "default":
         model_header += f" ({results[0].run_name})"
 
-    gpu_config = os.getenv("GPU_CONFIG", "MI325")
+    gpu_config = os.getenv("GPU_CONFIG", "")
     if gpu_config:
         model_header += f" [{gpu_config}]"
 
@@ -56,85 +54,89 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
-# Model path can be overridden via environment variable
-DEEPSEEK_V32_MODEL_PATH = os.environ.get(
-    "DEEPSEEK_V32_MODEL_PATH", "deepseek-ai/DeepSeek-V3.2"
-)
-PROFILE_DIR = "performance_profiles_deepseek_v32_basic_mi325"
+# Model and tokenizer paths can be overridden via environment variables
+GROK1_MODEL_PATH = os.environ.get("GROK1_MODEL_PATH", "amd/grok-1-W4A8KV8")
+GROK1_TOKENIZER_PATH = os.environ.get("GROK1_TOKENIZER_PATH", "Xenova/grok-1-tokenizer")
+PROFILE_DIR = "performance_profiles_grok1_int4"
 
 
-class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
-    """AMD Nightly performance benchmark for DeepSeek-V3.2 model (basic variant).
+class TestNightlyGrok1INT4Performance(unittest.TestCase):
+    """Nightly performance benchmark for Grok-1 INT4 (W4A8KV8).
 
-    Tests the DeepSeek-V3.2 model with basic TP=8 configuration on MI325/MI300X.
+    Tests Grok-1 (314B MOE) with INT4 weight quantization on TP=8.
+    Runtime: ~25 minutes
     """
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 8, 16, 64]
-        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
+        cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "1024"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
-        # Basic variant configuration for DeepSeek-V3.2
-        # MI325 uses aiter attention backend
-        cls.variant_config = {
-            "name": "basic",
+        cls.model_config = {
+            "name": "grok1-int4",
+            "model_path": GROK1_MODEL_PATH,
             "other_args": [
                 "--trust-remote-code",
                 "--tp",
                 "8",
-                "--attention-backend",
-                "aiter",
-                "--chunked-prefill-size",
-                "131072",
+                "--quantization",
+                "fp8",
                 "--mem-fraction-static",
                 "0.85",
-                "--model-loader-extra-config",
-                '{"enable_multithread_load": true}',
-                "--watchdog-timeout",
-                "1200",
+                "--tokenizer-path",
+                GROK1_TOKENIZER_PATH,
+                "--attention-backend",
+                "aiter",
             ],
-            "env_vars": {"SGLANG_USE_AITER": "1"},
+            "env_vars": {
+                "RCCL_MSCCL_ENABLE": "0",
+                "SGLANG_USE_AITER": "1",
+                "SGLANG_INT4_WEIGHT": "1",
+            },
         }
 
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
         cls.runner.setup_profile_directory()
-        # Override full_report to remove traces help text
         cls.runner.full_report = f"## {cls.__name__}\n"
 
-    def test_bench_one_batch(self):
-        """Run benchmark for basic variant."""
+    def test_bench_grok1_int4(self):
+        """Run benchmark for Grok-1 INT4."""
+        # Set environment variables
+        old_env = {}
+        for key, value in self.model_config.get("env_vars", {}).items():
+            old_env[key] = os.environ.get(key)
+            os.environ[key] = value
+            print(f"Setting env: {key}={value}")
+
         try:
             result_tuple = self.runner.run_benchmark_for_model(
-                model_path=self.model,
+                model_path=self.model_config["model_path"],
                 batch_sizes=self.batch_sizes,
                 input_lens=self.input_lens,
                 output_lens=self.output_lens,
-                other_args=self.variant_config["other_args"],
-                variant=self.variant_config["name"],
+                other_args=self.model_config["other_args"],
+                variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
+                enable_profile=False,  # Disable profiling for AMD tests
             )
             results = result_tuple[0]
             success = result_tuple[1]
-            avg_spec_accept_length = result_tuple[2] if len(result_tuple) > 2 else None
 
-            # Log speculative decoding accept length
-            if avg_spec_accept_length is not None:
-                print(f"  avg_spec_accept_length={avg_spec_accept_length:.2f}")
-
-            # Use simplified report format without traces
             if results:
                 self.runner.full_report += (
                     generate_simple_markdown_report(results) + "\n"
                 )
 
-            if not success:
-                raise AssertionError(
-                    f"Benchmark failed for {self.model} (basic variant)"
-                )
+            self.assertTrue(success, "Benchmark failed for Grok-1 INT4")
         finally:
+            # Restore original environment
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
             self.runner.write_final_report()
 
 

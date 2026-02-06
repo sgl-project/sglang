@@ -46,6 +46,45 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _get_storage_backend_type(self) -> str:
+        """Get storage backend type from tree_cache."""
+        storage_backend_type = "none"
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        if cache_controller and hasattr(cache_controller, "storage_backend"):
+            storage_backend = cache_controller.storage_backend
+            if storage_backend is not None:
+                storage_backend_type = type(storage_backend).__name__
+        return storage_backend_type
+
+    def _get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+        """Get detailed cache breakdown for a request, if available.
+
+        Returns:
+            - None if HiCache is not enabled
+            - {"device": X, "host": Y} if HiCache enabled but L3 storage is not
+            - {"device": X, "host": Y, "storage": Z, "storage_backend": "..."} if L3 enabled
+        """
+        # Only show details if HiCache is enabled
+        if not getattr(self, "enable_hierarchical_cache", False):
+            return None
+
+        # Only show if there are any cached tokens
+        if (
+            req.cached_tokens_device > 0
+            or req.cached_tokens_host > 0
+            or req.cached_tokens_storage > 0
+        ):
+            details = {
+                "device": req.cached_tokens_device,
+                "host": req.cached_tokens_host,
+            }
+            # Only include storage fields if L3 storage is enabled
+            if getattr(self, "enable_hicache_storage", False):
+                details["storage"] = req.cached_tokens_storage
+                details["storage_backend"] = self._get_storage_backend_type()
+            return details
+        return None
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -893,6 +932,7 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         completion_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
@@ -1005,6 +1045,10 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
+
                 retraction_counts.append(req.retraction_count)
 
                 queue_times.append(req.time_stats.get_queueing_time())
@@ -1138,6 +1182,7 @@ class SchedulerOutputProcessorMixin:
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
+                    cached_tokens_details=cached_tokens_details,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,
@@ -1169,6 +1214,7 @@ class SchedulerOutputProcessorMixin:
         embeddings = []
         prompt_tokens = []
         cached_tokens = []
+        cached_tokens_details = []  # Detailed breakdown by cache source
         queue_times = []
         forward_entry_times = []
         prefill_launch_delays = []
@@ -1183,6 +1229,9 @@ class SchedulerOutputProcessorMixin:
                 embeddings.append(req.embedding)
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
+
+                # Collect detailed cache breakdown if available
+                cached_tokens_details.append(self._get_cached_tokens_details(req))
 
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
@@ -1208,6 +1257,7 @@ class SchedulerOutputProcessorMixin:
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
+                cached_tokens_details=cached_tokens_details,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,
                 retraction_counts=retraction_counts,

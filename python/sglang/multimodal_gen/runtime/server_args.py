@@ -642,7 +642,7 @@ class ServerArgs:
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
-            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan). "
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan, MOVA). "
             "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
@@ -998,13 +998,14 @@ class ServerArgs:
 
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             # TODO: need a better way to tell this
+            pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
             if (
-                "wan" in self.pipeline_config.__class__.__name__.lower()
+                ("wan" in pipeline_name_lower or "mova" in pipeline_name_lower)
                 and self.dit_layerwise_offload is None
                 and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
             ):
                 logger.info(
-                    "Automatically enable dit_layerwise_offload for Wan for best performance"
+                    f"Automatically enable dit_layerwise_offload for {self.pipeline_config.__class__.__name__} for low memory and performance balance"
                 )
                 self.dit_layerwise_offload = True
 
