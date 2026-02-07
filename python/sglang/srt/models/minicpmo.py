@@ -1462,10 +1462,11 @@ class MiniCPMO4_5(MiniCPMBaseModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
-        super().__init__(config=config, quant_config=quant_config)
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
-        self.llm = self.init_llm(config=config, quant_config=quant_config)
+        self.llm = self.init_llm(config=config, quant_config=quant_config, prefix=prefix)
 
         self.embed_dim = self.llm.config.hidden_size
 
