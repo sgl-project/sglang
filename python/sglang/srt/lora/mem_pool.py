@@ -588,7 +588,7 @@ class LoRAMemoryPool:
                 c = get_stacked_multiply(name)  # TODO: delete this
                 target_buffer = self.A_buffer[name][layer_id]
 
-                if isinstance(weights, dict):
+                if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     # MoE: multiple tensors per module (one per expert)
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, max_rank, hidden_dim]
@@ -605,7 +605,7 @@ class LoRAMemoryPool:
             for name, weights in temp_B_buffer.items():
                 target_buffer = self.B_buffer[name][layer_id]
 
-                if isinstance(weights, dict):
+                if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     # MoE: multiple tensors per module (one per expert)
                     for expert_id, expert_weight in weights.items():
                         # Buffer shape: [num_loras, num_experts, intermediate_dim, max_rank]
