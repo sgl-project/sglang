@@ -97,7 +97,7 @@ CI_MULTI_LORA_MODELS = [
         ],
         max_loras_per_batch=2,
         max_loaded_loras=4,
-        rouge_l_tolerance=0.7,
+        rouge_l_tolerance=0.9,
     ),
 ]
 
@@ -616,15 +616,14 @@ def create_multiple_batch_test_samples(
             ],
             [lora_adapter_paths[0], lora_adapter_paths[1], None],
         ),
-        # Skip this flaky case for now
-        # (
-        #     [
-        #         random.choice(prompts),
-        #         random.choice(prompts),
-        #         random.choice(prompts),
-        #     ],
-        #     [None, lora_adapter_paths[1], None],
-        # ),
+        (
+            [
+                random.choice(prompts),
+                random.choice(prompts),
+                random.choice(prompts),
+            ],
+            [None, lora_adapter_paths[1], None],
+        ),
         (
             [
                 random.choice(prompts),
