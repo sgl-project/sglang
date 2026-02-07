@@ -1505,16 +1505,15 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         """
         return (
             (
-                (
-                    self.current_attention_backend == "nsa"
-                    and self.nsa_attention_backend_impl == "trtllm"
-                )
-                or self.current_attention_backend == "trtllm_mla"
+                self.current_attention_backend == "nsa"
+                and self.nsa_attention_backend_impl == "trtllm"
             )
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend()
+            or (
+                self.current_attention_backend == "trtllm_mla"
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
             )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
