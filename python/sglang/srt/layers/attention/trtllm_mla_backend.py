@@ -909,15 +909,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
         # Scale components:
         # - q_scale: Query scaling factor (set to 1.0 for both FP16/FP8 paths)
-        # - k_scale: Key scaling factor from model checkpoint (defaults to 1.0 if not available)
+        # - k_scale: Key scaling factor from model checkpoint. Only applied when KV cache
+        #   stores FP8-quantized values, to compensate for the quantization scaling.
+        #   For BF16/FP16 KV cache, k_scale must be 1.0 since values are unscaled.
         # - softmax_scale: Attention softmax scaling = 1/sqrt(head_dim), pre-computed as layer.scaling
-        # This unified approach works for both FP16 and FP8 quantized attention paths.
         q_scale = 1.0
-        k_scale = (
-            layer.k_scale_float
-            if getattr(layer, "k_scale_float", None) is not None
-            else 1.0
-        )
+        if self.data_type == torch.float8_e4m3fn:
+            k_scale = (
+                layer.k_scale_float
+                if getattr(layer, "k_scale_float", None) is not None
+                else 1.0
+            )
+        else:
+            k_scale = 1.0
 
         bmm1_scale = q_scale * k_scale * layer.scaling
 
@@ -1033,11 +1037,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
             q_scale = 1.0
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
+            if self.data_type == torch.float8_e4m3fn:
+                k_scale = (
+                    layer.k_scale_float
+                    if getattr(layer, "k_scale_float", None) is not None
+                    else 1.0
+                )
+            else:
+                k_scale = 1.0
             q = q.to(self.data_type)
 
             bmm1_scale = q_scale * k_scale * layer.scaling
