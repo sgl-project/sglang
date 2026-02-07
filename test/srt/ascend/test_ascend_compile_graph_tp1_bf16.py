@@ -1,5 +1,4 @@
 import os
-
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
