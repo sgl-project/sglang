@@ -310,9 +310,7 @@ class DiTBlock(nn.Module):
         input_x = self.norm1(x, shift_msa, scale_msa)
         attn_output = self.self_attn(input_x, freqs)
         # Fused: x = x + gate_msa * attn_output, then layernorm (affine, no scale/shift modulation)
-        null_shift = null_scale = torch.zeros(
-            (1,), device=x.device, dtype=x.dtype
-        )
+        null_shift = null_scale = torch.zeros((1,), device=x.device, dtype=x.dtype)
         norm_x, x = self.self_attn_residual_norm(
             x, attn_output, gate_msa, null_shift, null_scale
         )
