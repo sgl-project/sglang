@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAt
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -248,14 +249,12 @@ class CrossAttention(nn.Module):
         return x
 
 
-class GateModule(nn.Module):
-    def __init__(
-        self,
-    ):
+class MulAdd(nn.Module):
+    def __init__(self):
         super().__init__()
 
     def forward(self, x, gate, residual):
-        return x + gate * residual
+        return residual + gate * x
 
 
 class DiTBlock(nn.Module):
@@ -276,13 +275,20 @@ class DiTBlock(nn.Module):
         self.norm1 = LayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
-        self.norm2 = LayerNormScaleShift(
+        # Fused: residual + gate * self_attn_out → layernorm (with affine)
+        # Replaces the old norm3 (nn.LayerNorm) + GateModule for self-attention
+        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=True, dtype=torch.float32
+        )
+        # Fused: residual + 1 * cross_attn_out → layernorm + scale/shift
+        # Replaces the old norm2 (LayerNormScaleShift) + residual add for cross-attention
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
         self.ffn = MLP(dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh")
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        self.gate = GateModule()
+        self.mlp_residual = MulAdd()
+        self.register_buffer("null_shift_scale", torch.zeros(1), persistent=False)
 
     def forward(self, x, context, t_mod, freqs):
         has_seq = len(t_mod.shape) == 4
@@ -300,11 +306,25 @@ class DiTBlock(nn.Module):
                 scale_mlp.squeeze(2),
                 gate_mlp.squeeze(2),
             )
+        orig_dtype = x.dtype
+        # 1. Self-attention
         input_x = self.norm1(x, shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
-        input_x = self.norm2(x, shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        attn_output = self.self_attn(input_x, freqs)
+        # Fused: x = x + gate_msa * attn_output, then layernorm (affine, no scale/shift modulation)
+        norm_x, x = self.self_attn_residual_norm(
+            x, attn_output, gate_msa, self.null_shift_scale, self.null_shift_scale
+        )
+        norm_x, x = norm_x.to(orig_dtype), x.to(orig_dtype)
+        # 2. Cross-attention
+        cross_output = self.cross_attn(norm_x, context)
+        # Fused: x = x + 1 * cross_output, then layernorm + scale/shift
+        input_x, x = self.cross_attn_residual_norm(
+            x, cross_output, 1, shift_mlp, scale_mlp
+        )
+        input_x, x = input_x.to(orig_dtype), x.to(orig_dtype)
+        # 3. Feed-forward
+        x = self.mlp_residual(self.ffn(input_x), gate_mlp, x)
+        x = x.to(orig_dtype)
         return x
 
 
