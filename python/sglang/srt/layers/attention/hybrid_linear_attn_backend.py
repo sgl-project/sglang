@@ -1165,23 +1165,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # State layout: [pool_size+1, HV, V, K] (K-last / V-major)
             # The pooled kernel reads/writes state directly from the pool via indices,
             # eliminating the need for gather before and index_copy_ after.
+            # Negative indices (PAD_SLOT_ID = -1) are handled inside the kernel:
+            # blocks with negative indices skip computation and write zeros to output.
             num_value_heads = value.shape[2]
             batch_size = cache_indices.shape[0]
-
-            # Remap padding slots (PAD_SLOT_ID = -1) to the sentinel slot at
-            # the end of the pool.  CUDA graph replay may set padding entries to
-            # -1 when the real batch is smaller than the captured batch size.
-            # The sentinel slot (pool_size, the extra +1 entry) is always zeros.
-            ssm_cache_indices = torch.where(
-                cache_indices >= 0,
-                cache_indices,
-                ssm_states.shape[0] - 1,
-            )
 
             # FlashInfer pretranspose pooled decode expects:
             # q, k: [B, 1, H, K], v: [B, 1, HV, V]
             # initial_state: [pool_size+1, HV, V, K] (the full pool)
-            # initial_state_indices: [B] int32 (maps each batch to pool slot)
+            # initial_state_indices: [B] int32 (maps each batch to pool slot, <0 = skip)
             # a, b: [B, 1, HV]
             query_fi = query.view(batch_size, 1, num_heads, head_k_dim)
             key_fi = key.view(batch_size, 1, num_heads, head_k_dim)
@@ -1195,7 +1187,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 k=key_fi,
                 v=value_fi,
                 initial_state=ssm_states,
-                initial_state_indices=ssm_cache_indices.to(torch.int32),
+                initial_state_indices=cache_indices.to(torch.int32),
                 A_log=A_log.detach(),
                 a=a_fi,
                 dt_bias=dt_bias.detach(),
