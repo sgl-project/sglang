@@ -212,6 +212,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             head_v_dim=self.head_v_dim,
             conv_weights=conv_weights,
             bias=self.conv1d.bias,
+            activation=self.activation,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
