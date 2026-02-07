@@ -40,7 +40,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
-class LlamaDecoderLayer(LlamaDecoderLayer):
+class Eagle3LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         config: LlamaConfig,
@@ -100,7 +100,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class Eagle3LlamaModel(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -139,7 +139,7 @@ class LlamaModel(nn.Module):
 
         self.midlayers = nn.ModuleList(
             [
-                LlamaDecoderLayer(
+                Eagle3LlamaDecoderLayer(
                     config,
                     i,
                     quant_config=quant_config,
@@ -176,25 +176,26 @@ class LlamaModel(nn.Module):
             return hidden_states, [hidden_states]
 
         hidden_states, residual = self.midlayers[0](
-          positions,
-          embeds,
-          hidden_states,
-          forward_batch,
-          None,
+            positions,
+            embeds,
+            hidden_states,
+            forward_batch,
+            None,
         )
 
         for layer in self.midlayers[1:]:
-          # The residual connections here are only internal to the 
-          # draft model's multi decoder layers and has nothing to do with Eagle3 architecture
-          # 
-          # The complication is that the LlamaDecoderLayer for Eagle3 in SGLang derives from that of a 
-          # target model, which requires interpolating intermediate states without residuals.
-          # However, the residuals are always added in LlamaDecoderLayer of SpecForge. Therefore, 
-          # the special handling of `hidden_states + residual` is necessary.
+            # The residual connections here are only internal to the
+            # draft model's multi decoder layers and has nothing to do with Eagle3 architecture
+            #
+            # The complication is that the Eagle3LlamaDecoderLayer for Eagle3 in SGLang derives from that of a
+            # target model, which requires interpolating intermediate states without residuals.
+            # However, the residuals are always added in Eagle3LlamaDecoderLayer of SpecForge. Therefore,
+            # the special handling of `hidden_states + residual` is necessary.
             hidden_states, residual = layer(
                 positions,
                 embeds,
-                hidden_states + residual, # compatible with LlamaDecoderLayer in SpecForge
+                hidden_states
+                + residual,  # compatible with Eagle3LlamaDecoderLayer in SpecForge
                 forward_batch,
                 residual,
             )
@@ -219,7 +220,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
-        self.model = LlamaModel(
+        self.model = Eagle3LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
