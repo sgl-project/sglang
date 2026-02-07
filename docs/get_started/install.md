@@ -20,7 +20,8 @@ Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not h
 
 1. Install PyTorch with CUDA 13 support first:
 ```bash
-uv pip install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+# Replace X.Y.Z with the version by your SGLang install
+uv pip install torch==X.Y.Z torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
 ```
 
 2. Install sglang:
