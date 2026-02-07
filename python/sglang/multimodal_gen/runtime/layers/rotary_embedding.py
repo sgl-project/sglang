@@ -34,6 +34,10 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    apply_rotary_embedding,
+    apply_rotary_embedding_qk,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -77,6 +81,25 @@ def _apply_rotary_emb_naive(
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
+def _apply_rotary_emb_triton(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [batch_size, seq_len, num_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    cos = cos.float()
+    sin = sin.float()
+    return apply_rotary_embedding(x, cos, sin, is_neox_style)
+
+
 def _apply_rotary_emb_flashinfer(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -114,7 +137,10 @@ def _apply_rotary_emb(
     if _is_flashinfer_available:
         return _apply_rotary_emb_flashinfer(x, cos, sin, is_neox_style=is_neox_style)
     else:
-        return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
+        try:
+            return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
+        except Exception:
+            return _apply_rotary_emb_triton(x, cos, sin, is_neox_style=is_neox_style)
 
 
 def _apply_rotary_emb_qk_naive(
@@ -139,6 +165,27 @@ def _apply_rotary_emb_qk_naive(
         _apply_rotary_emb(q, cos, sin, is_neox_style=is_neox_style),
         _apply_rotary_emb(k, cos, sin, is_neox_style=is_neox_style),
     )
+
+
+def _apply_rotary_emb_qk_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Args:
+        q: [batch_size, seq_len, num_q_heads, head_dim]
+        k: [batch_size, seq_len, num_kv_heads, head_dim]
+        cos: [seq_len, head_dim // 2]
+        sin: [seq_len, head_dim // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    cos = cos.float()
+    sin = sin.float()
+    return apply_rotary_embedding_qk(q, k, cos, sin, is_neox_style)
 
 
 def _apply_rotary_emb_qk_flashinfer(
@@ -195,7 +242,10 @@ def _apply_rotary_emb_qk(
     if _is_flashinfer_available:
         return _apply_rotary_emb_qk_flashinfer(q, k, cos, sin, is_neox_style)
     else:
-        return _apply_rotary_emb_qk_naive(q, k, cos, sin, is_neox_style)
+        try:
+            return _apply_rotary_emb_qk_triton(q, k, cos, sin, is_neox_style)
+        except Exception:
+            return _apply_rotary_emb_qk_naive(q, k, cos, sin, is_neox_style)
 
 
 @CustomOp.register("rotary_embedding")
