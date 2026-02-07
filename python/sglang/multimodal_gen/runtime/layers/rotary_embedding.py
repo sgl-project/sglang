@@ -138,9 +138,9 @@ def _apply_rotary_emb(
         return _apply_rotary_emb_flashinfer(x, cos, sin, is_neox_style=is_neox_style)
     else:
         try:
-            return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
-        except Exception:
             return _apply_rotary_emb_triton(x, cos, sin, is_neox_style=is_neox_style)
+        except Exception:
+            return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
 
 
 def _apply_rotary_emb_qk_naive(
