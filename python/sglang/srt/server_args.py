@@ -315,16 +315,14 @@ class ServerArgs:
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_marconi: bool = False
-    marconi_admission_policy: Optional[str] = None
-    marconi_admission_min_hits: int = 2
-    marconi_admission_min_success_ratio: float = 0.1
-    marconi_admission_score_threshold: float = 0.5
-    marconi_admission_decay: float = 0.99
     marconi_eff_weight: Optional[float] = None
     marconi_eviction_hot_weight: float = 0.2
     marconi_branch_align_interval: Optional[int] = None
     marconi_two_pass_branch_prefill: Optional[bool] = None
     marconi_mamba_layer_mask: Optional[str] = None
+    marconi_admission_max_nodes: Optional[int] = None
+    marconi_admission_max_tokens: Optional[int] = None
+    marconi_admission_prune_interval: int = 200
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
@@ -2250,36 +2248,17 @@ class ServerArgs:
             setattr(self, name, value)
 
     def _handle_marconi_mode(self):
-        if self.marconi_admission_policy is None:
-            if not self.enable_marconi:
-                return
-            self.marconi_admission_policy = "thresholded"
-
-        mode = self.marconi_admission_policy.lower()
-        if mode == "taxonomy":
-            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.0)
-            self._marconi_set_if_default("marconi_branch_align_interval", 512)
-            self._marconi_set_if_default("marconi_eff_weight", 0.75)
-            if self.marconi_two_pass_branch_prefill is None:
-                self.marconi_two_pass_branch_prefill = False
-        elif mode == "thresholded":
-            self._marconi_set_if_default("marconi_admission_min_hits", 2)
-            self._marconi_set_if_default("marconi_admission_min_success_ratio", 0.1)
-            self._marconi_set_if_default("marconi_admission_score_threshold", 0.5)
-            self._marconi_set_if_default("marconi_admission_decay", 0.99)
-            self._marconi_set_if_default("marconi_eviction_hot_weight", 0.4)
-            self._marconi_set_if_default("marconi_branch_align_interval", 512)
-            self._marconi_set_if_default("marconi_eff_weight", 0.0)
-            if self.marconi_two_pass_branch_prefill is None:
-                self.marconi_two_pass_branch_prefill = True
-        else:
-            raise ValueError(
-                "marconi_admission_policy must be one of: thresholded, taxonomy."
-            )
-
-        if self.enable_marconi:
-            if self.marconi_mamba_layer_mask is None:
-                self.marconi_mamba_layer_mask = "all"
+        if not self.enable_marconi:
+            return
+        self._marconi_set_if_default("marconi_eviction_hot_weight", 0.0)
+        self._marconi_set_if_default("marconi_branch_align_interval", 512)
+        self._marconi_set_if_default("marconi_eff_weight", 0.75)
+        self._marconi_set_if_default("marconi_admission_max_nodes", 100000)
+        self._marconi_set_if_default("marconi_admission_max_tokens", 4000000)
+        if self.marconi_two_pass_branch_prefill is None:
+            self.marconi_two_pass_branch_prefill = True
+        if self.marconi_mamba_layer_mask is None:
+            self.marconi_mamba_layer_mask = "all"
 
     def _handle_load_format(self):
         if (
@@ -2427,6 +2406,18 @@ class ServerArgs:
                 self.enable_marconi = False
             if self.marconi_eviction_hot_weight < 0.0:
                 raise ValueError("marconi_eviction_hot_weight must be non-negative.")
+            if self.marconi_admission_max_nodes is not None:
+                if self.marconi_admission_max_nodes <= 0:
+                    raise ValueError(
+                        "marconi_admission_max_nodes must be positive when set."
+                    )
+            if self.marconi_admission_max_tokens is not None:
+                if self.marconi_admission_max_tokens <= 0:
+                    raise ValueError(
+                        "marconi_admission_max_tokens must be positive when set."
+                    )
+            if self.marconi_admission_prune_interval <= 0:
+                raise ValueError("marconi_admission_prune_interval must be positive.")
             if self.marconi_branch_align_interval is not None:
                 if self.marconi_branch_align_interval <= 0:
                     raise ValueError(
@@ -2997,43 +2988,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-marconi",
             action="store_true",
-            help="Enable Marconi eviction and tuning for hybrid radix cache.",
-        )
-        parser.add_argument(
-            "--marconi-policy",
-            type=str,
-            default=ServerArgs.marconi_admission_policy,
-            dest="marconi_admission_policy",
-            help="Marconi policy. 'thresholded' uses taxonomy + thresholds; "
-            "'taxonomy' uses taxonomy-only admission.",
-        )
-        parser.add_argument(
-            "--marconi-min-hits",
-            type=int,
-            default=ServerArgs.marconi_admission_min_hits,
-            dest="marconi_admission_min_hits",
-            help="Minimum hits required for thresholded admission.",
-        )
-        parser.add_argument(
-            "--marconi-min-success-ratio",
-            type=float,
-            default=ServerArgs.marconi_admission_min_success_ratio,
-            dest="marconi_admission_min_success_ratio",
-            help="Minimum success ratio for thresholded admission.",
-        )
-        parser.add_argument(
-            "--marconi-score-threshold",
-            type=float,
-            default=ServerArgs.marconi_admission_score_threshold,
-            dest="marconi_admission_score_threshold",
-            help="Score threshold for thresholded admission.",
-        )
-        parser.add_argument(
-            "--marconi-decay",
-            type=float,
-            default=ServerArgs.marconi_admission_decay,
-            dest="marconi_admission_decay",
-            help="Exponential decay factor for admission scoring.",
+            help="Enable Marconi eviction for hybrid radix cache.",
         )
         parser.add_argument(
             "--marconi-eff-weight",
@@ -3074,6 +3029,24 @@ class ServerArgs:
             type=str,
             default=ServerArgs.marconi_mamba_layer_mask,
             help="Optional mamba layer mask for cached state (e.g., '0,2,4-6').",
+        )
+        parser.add_argument(
+            "--marconi-admission-max-nodes",
+            type=int,
+            default=ServerArgs.marconi_admission_max_nodes,
+            help="Maximum number of nodes tracked by Marconi admission tree.",
+        )
+        parser.add_argument(
+            "--marconi-admission-max-tokens",
+            type=int,
+            default=ServerArgs.marconi_admission_max_tokens,
+            help="Maximum number of logical tokens tracked by Marconi admission tree.",
+        )
+        parser.add_argument(
+            "--marconi-admission-prune-interval",
+            type=int,
+            default=ServerArgs.marconi_admission_prune_interval,
+            help="Insertion interval between Marconi admission-tree pruning passes.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

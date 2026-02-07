@@ -144,27 +144,24 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--swa-full-tokens-ratio` | The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens. | `0.8` | Type: float |
 | `--disable-hybrid-swa-memory` | Disable the hybrid SWA memory. | `False` | bool flag (set to enable) |
 | `--radix-eviction-policy` | The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used. | `lru` | `lru`, `lfu` |
-| `--enable-marconi` | Enable Marconi eviction and tuning for the Mamba radix cache. | `False` | bool flag (set to enable) |
-| `--marconi-policy` | Marconi admission policy. `thresholded` uses taxonomy + thresholds; `taxonomy` uses taxonomy-only admission. If Marconi is enabled and this is unset, it defaults to `thresholded`. | `None` | `thresholded`, `taxonomy` |
-| `--marconi-min-hits` | Minimum hits for thresholded admission. Default follows the `thresholded` preset. | `2` | Type: int |
-| `--marconi-min-success-ratio` | Minimum success ratio for thresholded admission. Default follows the `thresholded` preset. | `0.1` | Type: float |
-| `--marconi-score-threshold` | Score threshold for thresholded admission. Default follows the `thresholded` preset. | `0.5` | Type: float |
-| `--marconi-decay` | Exponential decay for admission scoring. Default follows the `thresholded` preset. | `0.99` | Type: float |
-| `--marconi-eff-weight` | FLOP-efficiency weight for eviction utility. Default follows the preset (`taxonomy`=0.75, `thresholded`=0.0). | `None` | Type: float |
-| `--marconi-branch-align` | Alignment interval for Marconi branch checkpoints. Default follows the preset (512 for both). | `None` | Type: int |
+| `--enable-marconi` | Enable Marconi eviction for the Mamba radix cache. | `False` | bool flag (set to enable) |
+| `--marconi-eff-weight` | FLOP-efficiency weight for eviction utility. | `None` | Type: float |
+| `--marconi-branch-align` | Alignment interval for Marconi branch checkpoints. | `None` | Type: int |
 | `--marconi-two-pass` | Enable two-pass prefill for branch checkpoints. | `None` | Type: bool |
 | `--marconi-no-two-pass` | Disable two-pass prefill for branch checkpoints. | `None` | Type: bool |
 | `--marconi-mamba-layer-mask` | Optional mamba layer mask for cached state (e.g., `0,2,4-6`). | `None` | Type: str |
-| `--marconi-hot-weight` | Weight for hotness in Marconi eviction utility. Default follows the preset (`taxonomy`=0.0, `thresholded`=0.4). | `0.2` | Type: float |
+| `--marconi-hot-weight` | Weight for hotness in Marconi eviction utility. | `0.2` | Type: float |
+| `--marconi-admission-max-nodes` | Maximum number of nodes tracked by Marconi admission tree. | `None` | Type: int |
+| `--marconi-admission-max-tokens` | Maximum number of logical tokens tracked by Marconi admission tree. | `None` | Type: int |
+| `--marconi-admission-prune-interval` | Insertion interval between Marconi admission-tree pruning passes. | `200` | Type: int |
 
-### Marconi mode defaults
-`--marconi-policy` provides a production-friendly preset that sets the admission policy and key eviction/checkpoint defaults.
+### Marconi defaults
+Marconi uses one admission/eviction behavior.
+When Marconi is enabled, two-pass branch prefill is enabled by default.
 When Marconi is enabled and `--mamba-scheduler-strategy` is left at `auto`, it is promoted to `extra_buffer`.
 If `--marconi-mamba-layer-mask` is not set, it defaults to `all` under Marconi.
-Other Marconi tuning parameters are fixed in code to keep the CLI surface minimal.
-
-- `thresholded`: taxonomy + thresholds (stable default behavior).
-- `taxonomy`: taxonomy-only admission (more aggressive reuse; use when workloads are highly shared and ordered).
+If `--marconi-branch-align` is not set, Marconi defaults it to `512`.
+If admission bounds are not set, Marconi defaults to `--marconi-admission-max-nodes 100000` and `--marconi-admission-max-tokens 4000000`.
 | `--enable-prefill-delayer` | Enable prefill delayer for DP attention to reduce idle time. | `False` | bool flag (set to enable) |
 | `--prefill-delayer-max-delay-passes` | Maximum forward passes to delay prefill. | `30` | Type: int |
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |

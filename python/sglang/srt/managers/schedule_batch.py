@@ -650,6 +650,7 @@ class Req:
         self.kv_cache_inserted_end: Optional[int] = None
         self.mamba_branching_seqlen: Optional[int] = None
         self.marconi_cache_len: Optional[int] = None
+        self.marconi_admission_seeded: bool = False
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

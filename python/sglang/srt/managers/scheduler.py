@@ -164,8 +164,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.marconi_config import (
-    DEFAULT_MARCONI_EFF_WEIGHT_TAXONOMY,
-    DEFAULT_MARCONI_EFF_WEIGHT_THRESHOLD,
+    DEFAULT_MARCONI_EFF_WEIGHT,
     MarconiConfig,
     MarconiModelStats,
 )
@@ -739,39 +738,26 @@ class Scheduler(
                     logger.warning(
                         "Marconi is enabled but model stats could not be derived."
                     )
-                marconi_policy = (
-                    server_args.marconi_admission_policy or "thresholded"
-                ).lower()
-                if marconi_policy == "taxonomy":
-                    admission_policy = "taxonomy"
-                    default_two_pass = False
-                    default_eff_weight = DEFAULT_MARCONI_EFF_WEIGHT_TAXONOMY
-                else:
-                    admission_policy = "thresholded"
-                    default_two_pass = True
-                    default_eff_weight = DEFAULT_MARCONI_EFF_WEIGHT_THRESHOLD
                 marconi_two_pass_branch_prefill = (
                     server_args.marconi_two_pass_branch_prefill
                     if server_args.marconi_two_pass_branch_prefill is not None
-                    else default_two_pass
+                    else True
                 )
                 eff_weight = (
                     server_args.marconi_eff_weight
                     if server_args.marconi_eff_weight is not None
-                    else default_eff_weight
+                    else DEFAULT_MARCONI_EFF_WEIGHT
                 )
                 marconi_config = MarconiConfig(
                     enable=True,
                     eff_weight=eff_weight,
                     model_stats=marconi_model_stats,
-                    admission_policy=admission_policy,
-                    admission_min_hits=server_args.marconi_admission_min_hits,
-                    admission_min_success_ratio=server_args.marconi_admission_min_success_ratio,
-                    admission_score_threshold=server_args.marconi_admission_score_threshold,
-                    admission_decay=server_args.marconi_admission_decay,
                     eviction_hot_weight=server_args.marconi_eviction_hot_weight,
                     mamba_layer_mask=server_args.marconi_mamba_layer_mask,
                     two_pass_branch_prefill=marconi_two_pass_branch_prefill,
+                    admission_max_nodes=server_args.marconi_admission_max_nodes,
+                    admission_max_tokens=server_args.marconi_admission_max_tokens,
+                    admission_prune_interval=server_args.marconi_admission_prune_interval,
                 )
 
         # Create cache
@@ -2109,13 +2095,10 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
-        marconi_policy = (
-            self.server_args.marconi_admission_policy or "thresholded"
-        ).lower()
         marconi_two_pass_branch_prefill = (
             self.server_args.marconi_two_pass_branch_prefill
             if self.server_args.marconi_two_pass_branch_prefill is not None
-            else marconi_policy != "taxonomy"
+            else True
         )
         adder = PrefillAdder(
             self.page_size,

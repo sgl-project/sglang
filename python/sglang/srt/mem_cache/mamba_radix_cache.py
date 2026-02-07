@@ -387,6 +387,9 @@ class MambaRadixCache(BasePrefixCache):
         self.marconi_enabled = bool(
             self.marconi_config is not None and self.marconi_config.enable
         )
+        self.marconi_admission_max_nodes = None
+        self.marconi_admission_max_tokens = None
+        self.marconi_admission_prune_interval = 200
         self.marconi_mamba_layer_mask_bits = None
         self.marconi_mamba_layer_mask_indices = None
         self.marconi_mamba_layer_mask_full_bits = None
@@ -399,14 +402,6 @@ class MambaRadixCache(BasePrefixCache):
                 )
         if self.marconi_enabled:
             self.marconi_eff_weight = self.marconi_config.eff_weight
-            self.marconi_admission_min_hits = self.marconi_config.admission_min_hits
-            self.marconi_admission_min_success_ratio = (
-                self.marconi_config.admission_min_success_ratio
-            )
-            self.marconi_admission_decay = self.marconi_config.admission_decay
-            self.marconi_admission_score_threshold = (
-                self.marconi_config.admission_score_threshold
-            )
             self.marconi_eviction_hot_weight = self.marconi_config.eviction_hot_weight
             self.marconi_eviction_latency_weights = (1.0, 1.0, 1.0)
             (
@@ -415,15 +410,13 @@ class MambaRadixCache(BasePrefixCache):
                 self.marconi_mamba_layer_mask_full_bits,
             ) = self._parse_mamba_layer_mask(self.marconi_config.mamba_layer_mask)
             self.marconi_eviction_max_candidates = MARCONI_EVICTION_MAX_CANDIDATES
-        self.marconi_admission_tree = (
-            MarconiAdmissionTree(
-                min_hits=self.marconi_admission_min_hits,
-                min_success_ratio=self.marconi_admission_min_success_ratio,
-                decay=self.marconi_admission_decay,
-                score_threshold=self.marconi_admission_score_threshold,
+            self.marconi_admission_max_nodes = self.marconi_config.admission_max_nodes
+            self.marconi_admission_max_tokens = self.marconi_config.admission_max_tokens
+            self.marconi_admission_prune_interval = (
+                self.marconi_config.admission_prune_interval
             )
-            if self.marconi_enabled
-            else None
+        self.marconi_admission_tree = (
+            self._make_marconi_admission_tree() if self.marconi_enabled else None
         )
 
         self.page_size = params.page_size
@@ -513,6 +506,13 @@ class MambaRadixCache(BasePrefixCache):
             return node.mamba_layer_mask_bits == 0
         return node.mamba_layer_mask_bits == self.marconi_mamba_layer_mask_full_bits
 
+    def _make_marconi_admission_tree(self) -> MarconiAdmissionTree:
+        return MarconiAdmissionTree(
+            max_nodes=self.marconi_admission_max_nodes,
+            max_tokens=self.marconi_admission_max_tokens,
+            prune_interval=self.marconi_admission_prune_interval,
+        )
+
     def reset(self) -> None:
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
@@ -546,13 +546,7 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_admission_match_count = 0
             self.marconi_admission_branch_count = 0
             self.marconi_num_reqs_before_eviction = None
-            self.marconi_admission_tree = MarconiAdmissionTree(
-                policy=self.marconi_config.admission_policy,
-                min_hits=self.marconi_admission_min_hits,
-                min_success_ratio=self.marconi_admission_min_success_ratio,
-                decay=self.marconi_admission_decay,
-                score_threshold=self.marconi_admission_score_threshold,
-            )
+            self.marconi_admission_tree = self._make_marconi_admission_tree()
 
     def _marconi_filter_free_indices(
         self, indices: torch.Tensor, where: str
@@ -718,6 +712,13 @@ class MambaRadixCache(BasePrefixCache):
             and req is not None
             and self.marconi_admission_tree is not None
         ):
+            if not getattr(req, "marconi_admission_seeded", False):
+                input_len = min(len(req.origin_input_ids), len(key.token_ids))
+                if input_len > 0:
+                    self.marconi_admission_tree.insert(
+                        req.origin_input_ids[:input_len], key.extra_key
+                    )
+                    req.marconi_admission_seeded = True
             admission_len, branchoff_required = (
                 self.marconi_admission_tree.match_prefix(key.token_ids, key.extra_key)
             )
@@ -825,12 +826,14 @@ class MambaRadixCache(BasePrefixCache):
             self.marconi_enabled
             and self.marconi_admission_tree is not None
             and kv_committed_len > 0
+            and not getattr(req, "marconi_admission_seeded", False)
         ):
             input_len = min(len(req.origin_input_ids), kv_committed_len)
             if input_len > 0:
                 self.marconi_admission_tree.insert(
-                    list(req.origin_input_ids[:input_len]), req.extra_key
+                    req.origin_input_ids[:input_len], req.extra_key
                 )
+                req.marconi_admission_seeded = True
 
         track_entries = None
         primary_entry = None
@@ -1153,7 +1156,8 @@ class MambaRadixCache(BasePrefixCache):
                 ):
                     branch_checkpoint_len = page_aligned_len
         branch_checkpoint = branch_checkpoint_len is not None
-        if self.marconi_enabled and not branch_checkpoint:
+        needs_branch_checkpoint = req.mamba_branching_seqlen is not None
+        if self.marconi_enabled and needs_branch_checkpoint and not branch_checkpoint:
             return _skip_cache_unfinished_req(req)
         if self.marconi_enabled and branch_checkpoint_len is not None:
             # Only cache up to the branch checkpoint when Marconi is enabled.
