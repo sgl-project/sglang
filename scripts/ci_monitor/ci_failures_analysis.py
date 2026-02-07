@@ -25,6 +25,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from ci_performance_regression import (
+    analyze_performance_regressions,
+    format_performance_summary_for_github,
+)
 
 
 class SGLangFailuresAnalyzer:
@@ -1610,7 +1614,14 @@ class SGLangFailuresAnalyzer:
                 data: Dict[str, Dict],
                 show_test_failures: bool = True,
                 test_failures_dict: Optional[Dict[str, Dict[str, Dict]]] = None,
+                perf_key: Optional[str] = None,
             ):
+                """Generate markdown section for a single workflow
+
+                Args:
+                    perf_key: Key to lookup performance data in report_data["performance"]
+                             e.g., "pr_test_nvidia_scheduled"
+                """
                 sorted_data = sorted(
                     data.items(),
                     key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
@@ -2034,6 +2045,46 @@ class SGLangFailuresAnalyzer:
                 summary_lines.append("</details>")
                 summary_lines.append("")
 
+                # ==== PERFORMANCE REGRESSIONS (if available) ====
+                if perf_key:
+                    perf_results = report_data.get("performance", {}).get(perf_key, {})
+                    if perf_results and perf_results.get("regressions"):
+                        regressions = perf_results["regressions"]
+                        summary_lines.append("### 📊 Performance Regressions")
+                        summary_lines.append("")
+                        summary_lines.append(
+                            f"⚠️ **{len(regressions)} jobs with performance regressions detected**"
+                        )
+                        summary_lines.append("")
+
+                        # Show each job with regressions
+                        for job_name, job_perf in sorted(regressions.items()):
+                            summary_lines.append(f"#### {job_name}")
+                            summary_lines.append(
+                                f"Run: #{job_perf['run_number']} ({job_perf['head_sha']})"
+                            )
+                            summary_lines.append("")
+                            summary_lines.append(
+                                "| Metric | Baseline | Recent | Change |"
+                            )
+                            summary_lines.append(
+                                "|--------|----------|--------|--------|"
+                            )
+
+                            for metric in job_perf["metrics"]:
+                                if metric["is_regression"]:
+                                    metric_name = metric["metric"]
+                                    baseline = metric["baseline_avg"]
+                                    recent = metric["recent_value"]
+                                    change = metric["change_pct"]
+
+                                    emoji = "⬆️" if change > 0 else "⬇️"
+                                    summary_lines.append(
+                                        f"| {metric_name} | {baseline:.2f} | {recent:.2f} | {emoji} {change:+.1f}% |"
+                                    )
+
+                            summary_lines.append("")
+
             # ========== RUNNERS (at the top) ==========
             summary_lines.append("---")
             summary_lines.append("# 🖥️ RUNNER HEALTH")
@@ -2276,40 +2327,49 @@ class SGLangFailuresAnalyzer:
             generate_job_section_md(
                 f"1. PR Test NVIDIA - Scheduled (latest {pr_sched_limit} runs)",
                 report_data.get("pr_test_nvidia_scheduled_data", {}),
+                perf_key="pr_test_nvidia_scheduled",
             )
             generate_job_section_md(
                 f"2. PR Test AMD - Scheduled (latest {pr_sched_limit} runs)",
                 report_data.get("pr_test_amd_scheduled_data", {}),
+                perf_key="pr_test_amd_scheduled",
             )
             generate_job_section_md(
                 f"3. PR Test Xeon - Scheduled (latest {pr_sched_limit} runs)",
                 report_data.get("pr_test_xeon_scheduled_data", {}),
+                perf_key="pr_test_xeon_scheduled",
             )
             generate_job_section_md(
                 f"4. PR Test XPU - Scheduled (latest {pr_sched_limit} runs)",
                 report_data.get("pr_test_xpu_scheduled_data", {}),
+                perf_key="pr_test_xpu_scheduled",
             )
             generate_job_section_md(
                 f"5. PR Test NPU - Scheduled (latest {pr_sched_limit} runs)",
                 report_data.get("pr_test_npu_scheduled_data", {}),
+                perf_key="pr_test_npu_scheduled",
             )
 
             # Nightly Tests - Scheduled (4 workflows)
             generate_job_section_md(
                 f"6. Nightly NVIDIA - Scheduled (latest {nightly_sched_limit} runs)",
                 report_data.get("nightly_nvidia_scheduled_data", {}),
+                perf_key="nightly_nvidia_scheduled",
             )
             generate_job_section_md(
                 f"7. Nightly AMD - Scheduled (latest {nightly_sched_limit} runs)",
                 report_data.get("nightly_amd_scheduled_data", {}),
+                perf_key="nightly_amd_scheduled",
             )
             generate_job_section_md(
                 f"8. Nightly Intel - Scheduled (latest {nightly_sched_limit} runs)",
                 report_data.get("nightly_intel_scheduled_data", {}),
+                perf_key="nightly_intel_scheduled",
             )
             generate_job_section_md(
                 f"9. Nightly NPU - Scheduled (latest {nightly_sched_limit} runs)",
                 report_data.get("nightly_npu_scheduled_data", {}),
+                perf_key="nightly_npu_scheduled",
             )
 
             # ========== GENERAL RUNS (9 sections) ==========
@@ -2667,6 +2727,60 @@ def main():
             runner_runs
         )
 
+        # === PERFORMANCE REGRESSION ANALYSIS ===
+        print("\n" + "=" * 80)
+        print("PERFORMANCE REGRESSION ANALYSIS")
+        print("=" * 80)
+
+        # Analyze performance for each scheduled workflow
+        perf_results = {}
+
+        perf_results["pr_test_nvidia_scheduled"] = analyze_performance_regressions(
+            pr_test_nvidia_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["pr_test_amd_scheduled"] = analyze_performance_regressions(
+            pr_test_amd_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["pr_test_xeon_scheduled"] = analyze_performance_regressions(
+            pr_test_xeon_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["pr_test_xpu_scheduled"] = analyze_performance_regressions(
+            pr_test_xpu_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["pr_test_npu_scheduled"] = analyze_performance_regressions(
+            pr_test_npu_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["nightly_nvidia_scheduled"] = analyze_performance_regressions(
+            nightly_nvidia_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["nightly_amd_scheduled"] = analyze_performance_regressions(
+            nightly_amd_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["nightly_intel_scheduled"] = analyze_performance_regressions(
+            nightly_intel_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+        perf_results["nightly_npu_scheduled"] = analyze_performance_regressions(
+            nightly_npu_scheduled_runs,
+            analyzer.get_jobs_for_run,
+            analyzer.get_job_logs,
+        )
+
         # Generate report with all datasets
         report_data = analyzer.generate_failure_report(
             # Scheduled runs (9 workflows)
@@ -2705,6 +2819,9 @@ def main():
             nightly_scheduled_limit,
             args.limit,
         )
+
+        # Add performance data to report
+        report_data["performance"] = perf_results
 
         # Generate GitHub Actions summary
         analyzer.generate_github_summary(report_data)
