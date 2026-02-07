@@ -3,10 +3,7 @@ name: Execute Notebooks
 on:
   pull_request:
     branches: [ main ]
-    types: [synchronize, labeled]
-    paths:
-      - "python/sglang/**"
-      - "docs/**"
+    types: [synchronize, labeled, reopened]
   workflow_dispatch:
 
 
@@ -18,9 +15,39 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_or_sglang: ${{ steps.filter.outputs.docs_or_sglang || steps.force.outputs.docs_or_sglang }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Detect file changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs_or_sglang:
+              - "python/sglang/**"
+              - "docs/**"
+              - "!docs/**/*.md"
+      - name: Force run for non-PR events
+        id: force
+        if: github.event_name != 'pull_request'
+        run: echo "docs_or_sglang=true" >> $GITHUB_OUTPUT
+
   run-all-notebooks:
+    needs: check-changes
     runs-on: 1-gpu-runner
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' || (
+        (
+          (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+          (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+        ) &&
+        needs.check-changes.outputs.docs_or_sglang == 'true'
+      )
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
