@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     NSATokenToKVPoolHost,
 )
 from sglang.srt.disaggregation.kv_events import (
-    MEDIUM_CPU_TIER1,
+    MEDIUM_CPU,
     MEDIUM_CPU_TIER2,
     MEDIUM_GPU,
     BlockRemoved,
@@ -621,7 +621,7 @@ class HiRadixCache(RadixCache):
 
         Args:
             node: The TreeNode being stored
-            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU_TIER1, etc.)
+            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU, etc.)
         """
         if not self.enable_kv_cache_events:
             return
@@ -666,7 +666,7 @@ class HiRadixCache(RadixCache):
 
         Args:
             node: The TreeNode being removed
-            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU_TIER1, etc.)
+            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU, etc.)
         """
         if not self.enable_kv_cache_events:
             return
@@ -765,7 +765,7 @@ class HiRadixCache(RadixCache):
             # Note: We don't emit BlockRemoved(GPU) here because the GPU memory
             # is still allocated. BlockRemoved(GPU) is emitted in _evict_backuped()
             # when the GPU memory is actually freed.
-            self._record_tier_store_event(node, MEDIUM_CPU_TIER1)
+            self._record_tier_store_event(node, MEDIUM_CPU)
         else:
             return 0
 
@@ -1002,7 +1002,7 @@ class HiRadixCache(RadixCache):
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             # Emit BlockRemoved event for host memory (L2) eviction
-            self._record_tier_remove_event(x, MEDIUM_CPU_TIER1)
+            self._record_tier_remove_event(x, MEDIUM_CPU)
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -1270,7 +1270,7 @@ class HiRadixCache(RadixCache):
                 parent_hash = last_host_node.hash_value[-1]
 
             self._record_prefetch_store_events(
-                new_token_ids, new_hash_values, parent_hash, MEDIUM_CPU_TIER1
+                new_token_ids, new_hash_values, parent_hash, MEDIUM_CPU
             )
 
         if self.enable_storage_metrics:
