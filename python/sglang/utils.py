@@ -472,7 +472,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         timeout: Maximum time to wait in seconds. None means wait forever.
     """
     start_time = time.perf_counter()
-    
+
     while True:
         try:
             response = requests.get(
