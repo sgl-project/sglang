@@ -726,13 +726,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         return final_hidden_states
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
-        # For MoE layers, tensor parallelism is typically not used
-        # Return weights unchanged
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # For MoE layers, tensor parallelism is typically not used
-        # Return weights unchanged
         return B
 
 
