@@ -1,6 +1,5 @@
 import logging
 import os
-import sys
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -25,25 +24,17 @@ _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_decode_pooled = None
 
-# Path to the custom FlashInfer repo with GDN kernels
-_FLASHINFER_GDN_REPO_PATH = "/lustre/raplab/client/xutingz/workspace/gitsrc/flashinfer"
-
-
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
-    
-    Uses the custom FlashInfer repo at _FLASHINFER_GDN_REPO_PATH for GDN kernels.
+
+    Requires flashinfer with GDN kernel support to be installed
+    (e.g. ``pip install -e ".[cutlass]"`` from the FlashInfer repo).
     """
     global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_decode_pooled
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
-            
-            # Add custom FlashInfer repo to sys.path to ensure we use the correct version
-            if _FLASHINFER_GDN_REPO_PATH not in sys.path:
-                sys.path.insert(0, _FLASHINFER_GDN_REPO_PATH)
-                logger.info(f"Using FlashInfer GDN kernels from: {_FLASHINFER_GDN_REPO_PATH}")
-            
+
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
             from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode_pretranspose, gated_delta_rule_decode_pretranspose_pooled
 
@@ -1016,6 +1007,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
             
             pool_size = batch_size + 16
+            # K-last layout: [pool, HV, V, K].  Since K == V == head_dim the
+            # shape is symmetric and random data is layout-agnostic for warmup.
             initial_state = torch.randn(pool_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
             cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
             intermediate_state_cache = torch.zeros(
@@ -1077,7 +1070,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             
-            # State in K-last layout: [B, HV, V, K] (V-major / pretranspose)
+            # K-last layout: [B, HV, V, K].  Since K == V == head_dim the
+            # shape is symmetric and random data is layout-agnostic for warmup.
             state = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
             
             # Run warmup call
