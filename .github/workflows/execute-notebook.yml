@@ -3,6 +3,7 @@ name: Execute Notebooks
 on:
   pull_request:
     branches: [ main ]
+    types: [synchronize, labeled]
     paths:
       - "python/sglang/**"
       - "docs/**"
