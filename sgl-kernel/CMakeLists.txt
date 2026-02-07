@@ -265,7 +265,7 @@ set(SOURCES
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
-    "csrc/elementwise/activation.cu"
+    # "csrc/elementwise/activation.cu"
     "csrc/elementwise/cast.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
