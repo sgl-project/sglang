@@ -590,6 +590,40 @@ class OpenAIServingChat(OpenAIServingBase):
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
+    @staticmethod
+    def _find_suffix_prefix_overlap(lhs: List[int], rhs: List[int]) -> int:
+        """Find max k where lhs[-k:] == rhs[:k]."""
+        max_overlap = min(len(lhs), len(rhs))
+        for overlap in range(max_overlap, 0, -1):
+            if lhs[-overlap:] == rhs[:overlap]:
+                return overlap
+        return 0
+
+    def _merge_stream_output_ids(
+        self,
+        accumulated_ids: List[int],
+        chunk_output_ids: List[int],
+    ) -> None:
+        """Merge stream output ids that can be either cumulative or incremental."""
+        if not chunk_output_ids:
+            return
+
+        if not accumulated_ids:
+            accumulated_ids.extend(chunk_output_ids)
+            return
+
+        # Common cumulative case: current chunk starts from request start.
+        if (
+            len(chunk_output_ids) >= len(accumulated_ids)
+            and chunk_output_ids[: len(accumulated_ids)] == accumulated_ids
+        ):
+            accumulated_ids.extend(chunk_output_ids[len(accumulated_ids) :])
+            return
+
+        # Generic overlap merge (also handles duplicate incremental chunks).
+        overlap = self._find_suffix_prefix_overlap(accumulated_ids, chunk_output_ids)
+        accumulated_ids.extend(chunk_output_ids[overlap:])
+
     async def _generate_chat_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -632,9 +666,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_token_ids = content["meta_info"].get(
                         "prompt_token_ids", None
                     )
-                completion_token_ids_by_index.setdefault(index, []).extend(
-                    content.get("output_ids", [])
-                )
+                output_ids = content.get("output_ids", [])
+                acc_ids = completion_token_ids_by_index.setdefault(index, [])
+                self._merge_stream_output_ids(acc_ids, output_ids)
+                # Keep token ids aligned with final completion length (e.g., stop trim).
+                final_len = completion_tokens[index]
+                if len(acc_ids) > final_len:
+                    del acc_ids[final_len:]
 
                 # Handle logprobs
                 finish_reason = content["meta_info"]["finish_reason"]
