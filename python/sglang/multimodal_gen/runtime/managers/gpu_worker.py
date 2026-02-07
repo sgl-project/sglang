@@ -85,6 +85,7 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            dist_timeout=self.server_args.dist_timeout,
         )
 
         self.pipeline = build_pipeline(self.server_args)

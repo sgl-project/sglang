@@ -219,6 +219,7 @@ def init_distributed_environment(
     local_rank: int = 0,
     backend: str = "nccl",
     device_id: torch.device | None = None,
+    timeout: int | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -229,12 +230,14 @@ def init_distributed_environment(
         logger.info("Using gloo backend for %s platform", current_platform.device_name)
 
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d "
+        "distributed_init_method=%s backend=%s timeout=%s",
         world_size,
         rank,
         local_rank,
         distributed_init_method,
         backend,
+        timeout,
     )
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
@@ -248,6 +251,14 @@ def init_distributed_environment(
             if (current_platform.is_mps() or current_platform.is_musa())
             else dict(device_id=device_id)
         )
+
+        # set time out in seconds
+        if timeout is not None:
+            import datetime
+
+            extra_args["timeout"] = datetime.timedelta(seconds=timeout)
+            logger.info(f"Setting distributed timeout to {timeout} seconds")
+
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -577,6 +588,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     ring_degree: int = 1,
     dp_size: int = 1,
     distributed_init_method: str = "env://",
+    dist_timeout: int | None = None,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -594,9 +606,10 @@ def maybe_init_distributed_environment_and_model_parallel(
     rank = int(os.environ.get("RANK", 0))
     device = get_local_torch_device()
     logger.info(
-        "Initializing distributed environment with world_size=%d, device=%s",
+        "Initializing distributed environment with world_size=%d, device=%s, timeout=%s",
         world_size,
         device,
+        dist_timeout,
         main_process_only=False,
     )
 
@@ -606,6 +619,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
         device_id=device,
+        timeout=dist_timeout,
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
