@@ -659,8 +659,8 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         if quant_config is not None and hasattr(quant_config, "exclude_modules"):
             quant_config.exclude_modules = [
-                item.replace("language_model", "model").replace(
-                    "language_model.lm_head", "lm_head"
+                item.replace("language_model.lm_head", "lm_head").replace(
+                    "language_model", "model"
                 )
                 for item in quant_config.exclude_modules
             ]
