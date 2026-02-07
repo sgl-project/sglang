@@ -3,6 +3,7 @@ name: Execute Notebooks
 on:
   pull_request:
     branches: [ main ]
+    types: [synchronize, labeled]
     paths:
       - "python/sglang/**"
       - "docs/**"
@@ -13,6 +14,8 @@ concurrency:
   group: execute-notebook-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
 
 jobs:
   run-all-notebooks:

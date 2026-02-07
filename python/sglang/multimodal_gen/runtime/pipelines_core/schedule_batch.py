@@ -309,7 +309,7 @@ class Req:
             output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
         if not self.suppress_logs:
-            logger.info(debug_str)
+            logger.debug(debug_str)
 
 
 @dataclass

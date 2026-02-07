@@ -14,6 +14,9 @@ concurrency:
   group: release-docs-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
