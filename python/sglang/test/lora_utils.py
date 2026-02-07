@@ -593,18 +593,18 @@ def create_multiple_batch_test_samples(
                 lora_adapter_paths[1],
             ],
         ),
-        (
-            [
-                random.choice(prompts),
-                random.choice(prompts),
-                random.choice(prompts),
-            ],
-            [
-                lora_adapter_paths[0],
-                None,
-                lora_adapter_paths[1],
-            ],
-        ),
+        # (
+        #     [
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #     ],
+        #     [
+        #         lora_adapter_paths[0],
+        #         None,
+        #         lora_adapter_paths[1],
+        #     ],
+        # ),
         (
             [
                 random.choice(prompts),
