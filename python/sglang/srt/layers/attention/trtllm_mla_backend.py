@@ -358,7 +358,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.page_size,
                 out=metadata.positions[:nnz],
             )
-            # kv_indptr and batch_indices are arange - unchanging, no update needed
+            total_tokens = metadata.kv_indices.shape[0]
+            if nnz < total_tokens:
+                # Zero padded tail so padded tokens write harmlessly to page 0.
+                metadata.kv_indices[nnz:total_tokens].zero_()
+                metadata.positions[nnz:total_tokens].zero_()
+                # NOTE: Do NOT zero batch_indices — it must stay as arange.
+                # With kv_indptr=arange, batch_indices[i]=0 would redirect
+                # padded token i to request 0's page (a valid page), corrupting
+                # it. With batch_indices[i]=i (arange), each padded token uses
+                # its own kv_indices[i]=0 (zeroed), writing to page 0.
         else:
             # Fresh allocation (normal mode or CUDA graph capture)
             metadata.kv_indices = (out_cache_loc // self.page_size).to(torch.int32)
@@ -894,6 +903,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Call the fused FlashInfer kernel
         # For MLA mode: v=None, paged_kv_cache=(ckv_cache, kpe_cache)
+        metadata = self.forward_decode_metadata
         flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache(
             q_rope=q_rope,
             k_rope=k_rope,
@@ -903,10 +913,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             cos_sin_cache=cos_sin_cache,
             pos_ids=forward_batch.positions,
             paged_kv_cache=(ckv_cache, kpe_cache),
-            kv_indices=self.forward_decode_metadata.kv_indices,
-            kv_indptr=self.forward_decode_metadata.kv_indptr,
-            batch_indices=self.forward_decode_metadata.batch_indices,
-            positions=self.forward_decode_metadata.positions,
+            kv_indices=metadata.kv_indices[:nnz],
+            kv_indptr=metadata.kv_indptr[: nnz + 1],
+            batch_indices=metadata.batch_indices[:nnz],
+            positions=metadata.positions[:nnz],
             is_neox=is_neox,
             quantize_dtype=torch.float8_e4m3fn,
             quant_scale_q=1.0,
