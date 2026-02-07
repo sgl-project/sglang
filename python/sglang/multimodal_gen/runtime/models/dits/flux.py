@@ -31,7 +31,11 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    ScaleResidualLayerNormScaleShift,
+    apply_qk_norm,
+)
 from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -320,13 +324,19 @@ class FluxTransformerBlock(nn.Module):
             eps=eps,
         )
 
-        self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        # Fused: residual + gate * attn_output → layernorm + scale/shift
+        self.attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=1e-6, elementwise_affine=False, dtype=torch.float32
+        )
         self.ff = MLP(
             input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
         )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-        self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        # Fused: residual + gate * context_attn_output → layernorm + scale/shift
+        self.attn_residual_norm_context = ScaleResidualLayerNormScaleShift(
+            dim, eps=1e-6, elementwise_affine=False, dtype=torch.float32
+        )
         self.ff_context = MLP(
             input_dim=dim, mlp_hidden_dim=dim * 4, output_dim=dim, act_type="gelu"
         )
@@ -343,6 +353,8 @@ class FluxTransformerBlock(nn.Module):
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        orig_dtype = hidden_states.dtype
+
         norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
             hidden_states, emb=temb
         )
@@ -365,13 +377,18 @@ class FluxTransformerBlock(nn.Module):
         elif len(attention_outputs) == 3:
             attn_output, context_attn_output, ip_attn_output = attention_outputs
 
-        # Process attention outputs for the `hidden_states`.
-        attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = (
-            norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        # Fused: hidden_states = hidden_states + gate_msa * attn_output, then layernorm + scale/shift
+        # AdaLayerNormZero outputs 2D [batch_size, dim] modulation params, unsqueeze to 3D for fused kernel
+        norm_hidden_states, hidden_states = self.attn_residual_norm(
+            hidden_states,
+            attn_output,
+            gate_msa.unsqueeze(1),
+            shift_mlp.unsqueeze(1),
+            scale_mlp.unsqueeze(1),
         )
+        norm_hidden_states, hidden_states = norm_hidden_states.to(
+            orig_dtype
+        ), hidden_states.to(orig_dtype)
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -380,14 +397,19 @@ class FluxTransformerBlock(nn.Module):
 
         if len(attention_outputs) == 3:
             hidden_states = hidden_states + ip_attn_output
-        # Process attention outputs for the `encoder_hidden_states`.
-        context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
-        encoder_hidden_states = encoder_hidden_states + context_attn_output
-
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp[:, None])
-            + c_shift_mlp[:, None]
+        # Fused: encoder_hidden_states = encoder_hidden_states + c_gate_msa * context_attn_output, then layernorm + scale/shift
+        norm_encoder_hidden_states, encoder_hidden_states = (
+            self.attn_residual_norm_context(
+                encoder_hidden_states,
+                context_attn_output,
+                c_gate_msa.unsqueeze(1),
+                c_shift_mlp.unsqueeze(1),
+                c_scale_mlp.unsqueeze(1),
+            )
+        )
+        norm_encoder_hidden_states, encoder_hidden_states = (
+            norm_encoder_hidden_states.to(orig_dtype),
+            encoder_hidden_states.to(orig_dtype),
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
