@@ -1,5 +1,4 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
@@ -31,6 +30,7 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 import contextlib
+import datetime
 import os
 import weakref
 from collections import namedtuple
@@ -252,9 +252,7 @@ def init_distributed_environment(
             else dict(device_id=device_id)
         )
 
-        # set time out in seconds
         if timeout is not None:
-            import datetime
 
             extra_args["timeout"] = datetime.timedelta(seconds=timeout)
             logger.info(f"Setting distributed timeout to {timeout} seconds")
@@ -266,6 +264,7 @@ def init_distributed_environment(
             rank=rank,
             **extra_args,
         )
+
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
