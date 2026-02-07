@@ -257,7 +257,13 @@ class ReplicatedLinear(LinearBase):
                     param.dtype == loaded_weight.dtype
                 ), "init para dtype and loaded weight dtype should be the same"
 
-        assert param.size() == loaded_weight.size()
+        assert param.size() == loaded_weight.size(), (
+            f"ReplicatedLinear weight size mismatch: "
+            f"param.size()={list(param.size())}, "
+            f"loaded_weight.size()={list(loaded_weight.size())}, "
+            f"param.dtype={param.dtype}, "
+            f"loaded_weight.dtype={loaded_weight.dtype}"
+        )
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
