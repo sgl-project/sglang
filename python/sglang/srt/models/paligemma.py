@@ -26,6 +26,7 @@ from transformers import PaliGemmaConfig, PreTrainedModel
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -98,6 +99,11 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+
+        # PaliGemma uses prefix-LM attention: bidirectional during prefill,
+        # causal during decode. Set this on all attention layers.
+        for layer in self.language_model.model.layers:
+            layer.self_attn.attn.attn_type = AttentionType.PREFIX_LM
 
         logit_scale = getattr(config, "logit_scale", 1.0)
         if self.language_model.logits_processor.logit_scale:

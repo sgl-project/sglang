@@ -39,6 +39,8 @@ class AttentionType(Enum):
     DECODER = "decoder"
     # Encoder attention between previous layer Q/K/V
     ENCODER_ONLY = "encoder_only"
+    # Prefix-LM: bidirectional attention during extend, causal during decode
+    PREFIX_LM = "prefix_lm"
 
 
 class RadixAttention(nn.Module):
