@@ -44,15 +44,6 @@ class LoRAConfig:
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
 
-        # Compute effective target modules from actual weights in safetensors
-        # This is more accurate than using the declared target_modules from config,
-        # especially when exclude_modules was used during training.
-        if path is not None:
-            self.effective_target_modules = self._compute_effective_target_modules()
-        else:
-            # For from_dict case, fall back to declared target_modules
-            self.effective_target_modules = None
-
     def filter_added_tokens(self, base_vocab_size: int) -> None:
         """
         Filter added_tokens_config to only include truly added tokens.

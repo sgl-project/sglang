@@ -385,25 +385,16 @@ class LoRAManager:
         )
 
         for lora_id, config in self.configs.items():
-            # Use effective_target_modules (computed from actual safetensors weights)
-            # if available and non-empty, otherwise fall back to declared target_modules.
-            # This handles cases where exclude_modules was used during training,
-            # resulting in fewer actual LoRA weights than declared in target_modules.
-            if config.effective_target_modules:
-                adapter_target_modules = get_normalized_target_modules(
-                    config.effective_target_modules
+            if not isinstance(config.target_modules, list):
+                raise ValueError(
+                    f"SGLang currently only supports inferring LoRA target modules when a list of "
+                    "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
+                    "specify `--lora-target-modules` during server startup. You can specify `all` to "
+                    "enable all support modules types. "
                 )
-            else:
-                if not isinstance(config.target_modules, list):
-                    raise ValueError(
-                        f"SGLang currently only supports inferring LoRA target modules when a list of "
-                        "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
-                        "specify `--lora-target-modules` during server startup. You can specify `all` to "
-                        "enable all support modules types. "
-                    )
-                adapter_target_modules = get_normalized_target_modules(
-                    config.target_modules
-                )
+            adapter_target_modules = get_normalized_target_modules(
+                config.target_modules
+            )
 
             if target_modules is not None:
                 # When `--lora-target-modules` is provided, validate adapter target modules is a subset of the specified target modules.
