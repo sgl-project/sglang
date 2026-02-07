@@ -58,7 +58,10 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
     CompressedTensorsMxInt4MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMxfp8MoEMethod,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args

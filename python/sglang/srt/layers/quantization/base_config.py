@@ -171,16 +171,22 @@ class QuantizationConfig(ABC):
 
         # If user specified generic "modelopt", auto-detect the specific method
         if user_quant == "modelopt":
-            if "FP8" in quant_algo:
+            # Check MXFP8 before FP8 since "MXFP8" contains "FP8"
+            if "MXFP8" in quant_algo:
+                return "modelopt_mxfp8"
+            elif "FP8" in quant_algo:
                 return "modelopt_fp8"
             elif "NVFP4" in quant_algo or "FP4" in quant_algo:
                 return "modelopt_fp4"
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.
-        if hf_quant_config.get("quant_method", "") == "modelopt_fp8":
+        quant_method = hf_quant_config.get("quant_method", "")
+        if quant_method == "modelopt_mxfp8":
+            return "modelopt_mxfp8"
+        elif quant_method == "modelopt_fp8":
             return "modelopt_fp8"
-        elif hf_quant_config.get("quant_method", "") == "modelopt_fp4":
+        elif quant_method == "modelopt_fp4":
             return "modelopt_fp4"
 
         return None

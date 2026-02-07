@@ -203,27 +203,29 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(
     w2_weight = cast(torch.Tensor, layer.w2_weight)
     num_experts = w13_weight.shape[0]
 
-    if quantize:
-        # Quantize BF16 weights to MXFP8 using flashinfer (swizzled scales for weights)
-        w13_q_list, w13_s_list = [], []
-        w2_q_list, w2_s_list = [], []
-        for i in range(num_experts):
-            w13_q, w13_s = mxfp8_quantize(w13_weight[i], is_sf_swizzled_layout=True)
-            w13_q_list.append(w13_q)
-            w13_s_list.append(w13_s.view(torch.uint8))
+    if not quantize:
+        # Pre-quantized FP8 checkpoint: upcast to BF16 so mxfp8_quantize can
+        # re-derive properly swizzled 1D scale factors (the checkpoint stores
+        # raw 2D UE8M0 scales which the trtllm kernel cannot consume directly).
+        w13_weight = w13_weight.to(torch.bfloat16)
+        w2_weight = w2_weight.to(torch.bfloat16)
 
-            w2_q, w2_s = mxfp8_quantize(w2_weight[i], is_sf_swizzled_layout=True)
-            w2_q_list.append(w2_q)
-            w2_s_list.append(w2_s.view(torch.uint8))
+    # Quantize (or re-quantize) to MXFP8 with swizzled scales for weights
+    w13_q_list, w13_s_list = [], []
+    w2_q_list, w2_s_list = [], []
+    for i in range(num_experts):
+        w13_q, w13_s = mxfp8_quantize(w13_weight[i], is_sf_swizzled_layout=True)
+        w13_q_list.append(w13_q)
+        w13_s_list.append(w13_s.view(torch.uint8))
 
-        w13_weight = torch.stack(w13_q_list)
-        w13_scales = torch.stack(w13_s_list)
-        w2_weight = torch.stack(w2_q_list)
-        w2_scales = torch.stack(w2_s_list)
-    else:
-        # Already quantized checkpoint — scales are already in layer
-        w13_scales = cast(torch.Tensor, layer.w13_weight_scale_inv)
-        w2_scales = cast(torch.Tensor, layer.w2_weight_scale_inv)
+        w2_q, w2_s = mxfp8_quantize(w2_weight[i], is_sf_swizzled_layout=True)
+        w2_q_list.append(w2_q)
+        w2_s_list.append(w2_s.view(torch.uint8))
+
+    w13_weight = torch.stack(w13_q_list)
+    w13_scales = torch.stack(w13_s_list)
+    w2_weight = torch.stack(w2_q_list)
+    w2_scales = torch.stack(w2_s_list)
 
     # Reorder rows for gated activation (w13 only — interleaves gate/up halves)
     w13_interleaved = torch.stack(

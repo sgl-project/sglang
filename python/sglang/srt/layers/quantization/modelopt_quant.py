@@ -1951,7 +1951,11 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt MXFP8 quantization.
 
     Loads FP8 weights with uint8 UE8M0 block scales (group_size=32).
-    Uses the existing MXFP8 blockscaled linear infrastructure.
+    Uses flashinfer's bmm_mxfp8 (cuDNN) for inference.
+
+    During process_weights_after_loading, the weight [N, K] is transposed to
+    [K, N] and re-quantized with mxfp8_quantize so that the MXFP8 block scales
+    align with the K-contiguous layout expected by bmm_mxfp8.
     """
 
     BLOCK_K = 32  # MXFP8 group size
@@ -2007,9 +2011,19 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Rename weight_scale → weight_scale_inv for downstream MXFP8 code
+        from flashinfer.fp8_quantization import mxfp8_quantize
+
+        # Checkpoint weight is [N, K] fp8 with scales for [N, K] layout.
+        # bmm_mxfp8 needs B as [K, N] (column-major) with scales for that layout.
+        # Re-quantize the transposed weight to get correct MXFP8 block scales.
+        weight_bf16 = layer.weight.data.to(torch.bfloat16)  # [N, K]
+        weight_t = weight_bf16.T.contiguous()  # [K, N] row-major
+        weight_t_q, weight_t_scale = mxfp8_quantize(
+            weight_t, is_sf_swizzled_layout=False
+        )
+        layer.weight = Parameter(weight_t_q, requires_grad=False)  # [K, N] fp8
         layer.weight_scale_inv = Parameter(
-            layer.weight_scale.data, requires_grad=False
+            weight_t_scale.view(torch.uint8), requires_grad=False
         )
 
     def apply(
@@ -2018,24 +2032,34 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.quantization.fp8_utils import (
-            triton_mxfp8_blockscaled_linear,
-        )
+        from flashinfer import bmm_mxfp8
+        from flashinfer.fp8_quantization import mxfp8_quantize
 
+        input_2d = x.view(-1, x.shape[-1])  # [M, K]
+        output_shape = [*x.shape[:-1], layer.weight.shape[1]]  # [..., N]
+
+        # Quantize activations to MXFP8
         if isinstance(x, tuple):
-            return triton_mxfp8_blockscaled_linear(
-                input=x[0],
-                weight=layer.weight,
-                weight_scale=layer.weight_scale_inv,
-                input_scale=x[1],
-                bias=bias,
+            input_q = input_2d
+            input_scale = x[1]
+        else:
+            input_q, input_scale = mxfp8_quantize(
+                input_2d, is_sf_swizzled_layout=False
             )
-        return triton_mxfp8_blockscaled_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale_inv,
-            bias=bias,
+
+        # bmm_mxfp8: A [1, M, K] @ B [1, K, N] → [1, M, N]
+        out = bmm_mxfp8(
+            input_q.unsqueeze(0),
+            layer.weight.unsqueeze(0),
+            input_scale,
+            layer.weight_scale_inv,
+            dtype=torch.bfloat16,
         )
+        out = out.squeeze(0)  # [M, N]
+
+        if bias is not None:
+            out = out + bias
+        return out.view(*output_shape)
 
 
 class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
@@ -2089,9 +2113,7 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
             weight_loader=weight_loader,
         )
         layer.register_parameter("w13_weight", w13_weight)
-        set_weight_attrs(w13_weight, extra_weight_attrs)
         layer.register_parameter("w2_weight", w2_weight)
-        set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # Block scales: uint8 UE8M0, named "weight_scale" to match ModelOpt checkpoint
         # Shape: [num_experts, N, K // 32]
