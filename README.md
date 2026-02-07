@@ -79,7 +79,7 @@ SGLang has been deployed at large scale, generating trillions of tokens in produ
 As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
 SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
 
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/partner-logo.svg" alt="logo" width="800" margin="10px"></img>
+<img src="assets/partner-logo.svg" alt="partner logos" width="800" margin="10px"></img>
 
 ## Contact Us
 For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at sglang@lmsys.org
