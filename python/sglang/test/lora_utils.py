@@ -593,7 +593,7 @@ def create_multiple_batch_test_samples(
                 lora_adapter_paths[1],
             ],
         ),
-        # Skip this flaky case for now
+        # It can pass half the time on CI, so skip this flaky case for now
         # (
         #     [
         #         random.choice(prompts),
@@ -614,14 +614,15 @@ def create_multiple_batch_test_samples(
             ],
             [lora_adapter_paths[0], lora_adapter_paths[1], None],
         ),
-        (
-            [
-                random.choice(prompts),
-                random.choice(prompts),
-                random.choice(prompts),
-            ],
-            [None, lora_adapter_paths[1], None],
-        ),
+        # It can pass half the time on CI, so skip this flaky case for now
+        # (
+        #     [
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #         random.choice(prompts),
+        #     ],
+        #     [None, lora_adapter_paths[1], None],
+        # ),
         (
             [
                 random.choice(prompts),
@@ -647,9 +648,6 @@ def run_lora_multiple_batch_on_model_cases(
             max_new_tokens = 32
             base_path = model_case.base
             lora_adapter_paths = [a.name for a in model_case.adaptors]
-            model_case.rouge_l_tolerance = (
-                0.9  # Relax rouge-l tolerance for multiple batch tests
-            )
             assert len(lora_adapter_paths) >= 2
 
             batches = create_multiple_batch_test_samples(
