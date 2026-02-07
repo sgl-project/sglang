@@ -4,7 +4,7 @@ include(FetchContent)
 FetchContent_Declare(
     repo-flashmla
     GIT_REPOSITORY https://github.com/sgl-project/FlashMLA
-    GIT_TAG d4874d6725cf7289324fe04999b510fe6cbf839c
+    GIT_TAG fbc1802ae0b219d39c7305235681dfbac661db32
     GIT_SHALLOW OFF
 )
 FetchContent_Populate(repo-flashmla)
@@ -72,8 +72,11 @@ Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOA
 target_compile_options(flashmla_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${FLASHMLA_CUDA_FLAGS}>)
 target_include_directories(flashmla_ops PRIVATE
     ${repo-flashmla_SOURCE_DIR}/csrc
+    ${repo-flashmla_SOURCE_DIR}/csrc/api
+    ${repo-flashmla_SOURCE_DIR}/csrc/kerutils/include
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90
     ${repo-flashmla_SOURCE_DIR}/csrc/sm100
+    ${repo-flashmla_SOURCE_DIR}/csrc/smxx
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/include
     ${repo-flashmla_SOURCE_DIR}/csrc/cutlass/tools/util/include
