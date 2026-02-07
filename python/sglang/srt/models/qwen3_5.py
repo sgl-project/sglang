@@ -198,6 +198,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
         # RadixLinearAttention layer
         self.attn = RadixLinearAttention(
             layer_id=layer_id,
@@ -207,9 +210,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
-            conv_weights=None,  # Will be set dynamically in forward
-            bias=None,  # Will be set dynamically in forward
-            activation=self.activation,
+            conv_weights=conv_weights,
+            bias=self.conv1d.bias,
             A_log=self.A_log,
             dt_bias=self.dt_bias,
         )
@@ -274,9 +276,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         seq_len, _ = hidden_states.shape
 
-        # ============================================================
-        # Part 1: Input Projection
-        # ============================================================
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
         z, _ = self.in_proj_z(hidden_states)
         z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -285,22 +284,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         b = b.contiguous()
         a = a.contiguous()
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
-
-        # ============================================================
-        # Part 2: Core Attention (Custom Op via RadixLinearAttention)
-        # ============================================================
-        # Update dynamic weights in the attention layer
-        self.attn.conv_weights = conv_weights
-        self.attn.bias = self.conv1d.bias
-        # Store additional attributes needed by attn_backend
-        self.attn.key_dim = self.key_dim // self.attn_tp_size
-        self.attn.value_dim = self.value_dim // self.attn_tp_size
-        self.attn.attention_tp_size = self.attn_tp_size
-        self.attn.seq_len = seq_len
-        self.attn.z = z
 
         core_attn_out = self.attn.forward(
             forward_batch=forward_batch,
@@ -309,11 +292,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             b=b,
         )
 
-        # ============================================================
-        # Part 3: Output Projection
-        # ============================================================
         z_shape_og = z.shape
-        # Reshape input data into 2D tensor
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
