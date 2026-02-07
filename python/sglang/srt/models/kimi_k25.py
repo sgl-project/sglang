@@ -657,6 +657,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
         print(f"659 {quant_config=}")
+        for item in self.quant_config.exclude_modules:
+            print(f"661 {item=}")
+
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
