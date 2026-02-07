@@ -669,13 +669,11 @@ def benchmark_all_layer_lf_pf(
         ),
         "pytorch": lambda: [
             (
-                k_cache_dst[indices_dst_cpu, i].__iadd__(
-                    k_caches_src[i, indices_src_gpu].cpu()
-                    - k_cache_dst[indices_dst_cpu, i]
+                k_cache_dst.__setitem__(
+                    (indices_dst_cpu, i), k_caches_src[i, indices_src_gpu].cpu()
                 ),
-                v_cache_dst[indices_dst_cpu, i].__iadd__(
-                    v_caches_src[i, indices_src_gpu].cpu()
-                    - v_cache_dst[indices_dst_cpu, i]
+                v_cache_dst.__setitem__(
+                    (indices_dst_cpu, i), v_caches_src[i, indices_src_gpu].cpu()
                 ),
             )
             for i in range(NUM_LAYERS)
