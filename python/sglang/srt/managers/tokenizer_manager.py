@@ -39,7 +39,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.encode_receiver import MMReceiver
+from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
@@ -422,7 +422,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Encoder Disaggregation
         if self.server_args.language_only:
-            self.mm_receiver = MMReceiver(
+            self.mm_receiver = MMReceiverHTTP(
                 self.server_args,
                 dtype=self.model_config.dtype,
             )
@@ -437,6 +437,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             if self.server_args.tokenizer_metrics_allowed_custom_labels:
                 for label in self.server_args.tokenizer_metrics_allowed_custom_labels:
                     labels[label] = ""
+            if self.server_args.extra_metric_labels:
+                labels.update(self.server_args.extra_metric_labels)
             self.metrics_collector = TokenizerMetricsCollector(
                 server_args=self.server_args,
                 labels=labels,
@@ -1534,6 +1536,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                # Add detailed cache breakdown if available
+                if (
+                    hasattr(recv_obj, "cached_tokens_details")
+                    and recv_obj.cached_tokens_details
+                ):
+                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
+                        i
+                    ]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
@@ -1972,6 +1982,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Get detailed cache breakdown if available
+            cached_tokens_details = None
+            if (
+                hasattr(recv_obj, "cached_tokens_details")
+                and recv_obj.cached_tokens_details
+            ):
+                cached_tokens_details = recv_obj.cached_tokens_details[i]
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1980,6 +1998,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                cached_tokens_details,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
@@ -2078,6 +2097,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         data_to_dump_with_server_args = {
             "server_args": self.server_args,  # Include server_args in the dump
             "requests": data_to_dump,
+            "launch_command": " ".join(sys.argv),
         }
         with open(filename, "wb") as f:
             pickle.dump(data_to_dump_with_server_args, f)
