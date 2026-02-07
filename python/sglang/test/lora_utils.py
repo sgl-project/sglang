@@ -548,7 +548,6 @@ def ensure_reproducibility():
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True)
 
 
 TEST_MULTIPLE_BATCH_PROMPTS = [
