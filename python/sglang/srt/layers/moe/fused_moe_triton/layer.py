@@ -704,6 +704,7 @@ class FusedMoE(torch.nn.Module):
         # Flashinfer assumes w31 format for w13_weight. Same for the scales.
         if self.use_flashinfer_trtllm_moe and (
             isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            or isinstance(self.quant_method, ModelOptMxfp8MoEMethod)
             or isinstance(self.quant_method, Fp8MoEMethod)
             or isinstance(self.quant_method, UnquantizedFusedMoEMethod)
             or isinstance(self.quant_method, CompressedTensorsMxInt4MoEMethod)
@@ -768,8 +769,20 @@ class FusedMoE(torch.nn.Module):
             return
 
         if "ModelOpt" in self.quant_method.__class__.__name__:
-            # Determine per-tensor weight scale patterns based on variant
             is_fp4_variant = isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            is_mxfp8_variant = isinstance(self.quant_method, ModelOptMxfp8MoEMethod)
+
+            if is_mxfp8_variant:
+                # MXFP8: weight_scale is block scale (uint8 UE8M0), not per-tensor
+                if "weight_scale" in weight_name or "weight" in weight_name:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=tp_rank,
+                    )
+                return
 
             # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
             per_tensor_conditions = (
