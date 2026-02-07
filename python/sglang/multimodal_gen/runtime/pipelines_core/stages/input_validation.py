@@ -68,12 +68,13 @@ class InputValidationStage(PipelineStage):
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
         """Generate seeds for the inference"""
-        seed = batch.seed
-        num_videos_per_prompt = batch.num_outputs_per_prompt
-
-        assert seed is not None
-        seeds = [seed + i for i in range(num_videos_per_prompt)]
-        batch.seeds = seeds
+        if batch.seeds is not None and len(batch.seeds) > 0:
+            seeds = batch.seeds
+        else:
+            seed = batch.sampling_params.seed
+            assert seed is not None, "Either seed or seeds must be provided"
+            seeds = [seed + i for i in range(batch.batch_size)]
+            batch.seeds = seeds
 
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator

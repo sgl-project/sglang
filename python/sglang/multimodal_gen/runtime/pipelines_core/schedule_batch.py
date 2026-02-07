@@ -228,19 +228,54 @@ class Req:
     @property
     def batch_size(self):
         # Determine batch size
-        if isinstance(self.prompt, list):
-            batch_size = len(self.prompt)
-        elif self.prompt is not None:
+        if isinstance(self.sampling_params.prompt, list):
+            if self.sampling_params.per_prompt_num_outputs:
+                return sum(self.sampling_params.per_prompt_num_outputs)
+            batch_size = len(self.sampling_params.prompt)
+        elif self.sampling_params.prompt is not None:
             batch_size = 1
         else:
             batch_size = self.prompt_embeds[0].shape[0]
 
         # Adjust batch size for number of videos per prompt
-        batch_size *= self.num_outputs_per_prompt
+        batch_size *= self.sampling_params.num_outputs_per_prompt
         return batch_size
 
+    @property
+    def prompts_as_list(self) -> list[str]:
+        """Always return prompts as a list."""
+        if self.sampling_params.prompt is None:
+            return []
+        if isinstance(self.sampling_params.prompt, str):
+            return [self.sampling_params.prompt]
+        return self.sampling_params.prompt
+
+    @property
+    def negative_prompts_as_list(self) -> list[str]:
+        """Always return negative prompts as a list matching batch size."""
+        prompts_count = (
+            len(self.sampling_params.prompt)
+            if isinstance(self.sampling_params.prompt, list)
+            else 1
+        )
+        if self.sampling_params.negative_prompt is None:
+            return [""] * prompts_count
+        if isinstance(self.sampling_params.negative_prompt, str):
+            return [self.sampling_params.negative_prompt] * prompts_count
+        return self.sampling_params.negative_prompt
+
+    def get_fps_for_index(self, idx: int) -> int:
+        """Get fps for a specific batch index."""
+        if isinstance(self.sampling_params.fps, list):
+            return (
+                self.sampling_params.fps[idx]
+                if idx < len(self.sampling_params.fps)
+                else self.sampling_params.fps[0]
+            )
+        return self.sampling_params.fps
+
     def output_file_path(self, num_outputs=1, output_idx=None):
-        output_file_name = self.output_file_name
+        output_file_name = self.sampling_params.output_file_name
         if num_outputs > 1 and output_file_name:
             base, ext = os.path.splitext(output_file_name)
             output_file_name = f"{base}_{output_idx}{ext}"
@@ -300,6 +335,7 @@ class Req:
                         seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
+      per_prompt_num_outputs: {self.sampling_params.per_prompt_num_outputs}
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}

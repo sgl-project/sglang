@@ -219,10 +219,8 @@ async def process_generation_batch(
         save_file_path_list = []
         audio_sample_rate = result.audio_sample_rate
         if batch.data_type == DataType.VIDEO:
+            num_outputs = len(result.output)
             for idx, output in enumerate(result.output):
-                save_file_path = str(
-                    os.path.join(batch.output_path, batch.output_file_name)
-                )
                 sample = result.output[idx]
                 audio = result.audio
                 if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
@@ -231,6 +229,7 @@ async def process_generation_batch(
                     isinstance(sample, (tuple, list)) and len(sample) == 2
                 ):
                     sample = (sample, audio)
+                save_file_path = batch.output_file_path(num_outputs, idx)
                 post_process_sample(
                     sample,
                     batch.data_type,

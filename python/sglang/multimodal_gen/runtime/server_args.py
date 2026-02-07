@@ -303,6 +303,11 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
+    # Batching configuration
+    enable_batching: bool = True
+    max_batch_size: int = 4
+    batch_max_wait_time_s: float = 30.0
+
     # warmup
     warmup: bool = False
     warmup_resolutions: list[str] = None
@@ -614,6 +619,30 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+
+        # Batching configuration
+        parser.add_argument(
+            "--enable-batching",
+            action=StoreBoolean,
+            default=ServerArgs.enable_batching,
+            help="Enable request batching to improve throughput. When enabled, "
+            "requests with compatible configurations are batched together.",
+        )
+        parser.add_argument(
+            "--max-batch-size",
+            type=int,
+            default=ServerArgs.max_batch_size,
+            help="Maximum number of requests to batch together. Higher values "
+            "increase throughput but also memory usage.",
+        )
+        parser.add_argument(
+            "--batch-max-wait-time",
+            type=float,
+            default=ServerArgs.batch_max_wait_time_s,
+            dest="batch_max_wait_time_s",
+            help="Maximum time (seconds) a request can wait before being dispatched, "
+            "even if batch is not full. Prevents starvation.",
         )
 
         # warmup

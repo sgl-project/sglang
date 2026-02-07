@@ -59,51 +59,90 @@ class TextEncodingStage(PipelineStage):
             server_args.pipeline_config.text_encoder_configs
         )
 
-        # Encode positive prompt with all available encoders
-        assert batch.prompt is not None
-        prompt_text: str | list[str] = batch.prompt
+        if batch.is_prompt_processed:
+            return batch
 
+        # Normalize prompts to list for batch processing
+        prompts: list[str] = batch.prompts_as_list
+        negative_prompts: list[str] = batch.negative_prompts_as_list
+
+        batch_size = len(prompts)
+        logger.info(f"Encoding {batch_size} prompts in batch")
         all_indices: list[int] = list(range(len(self.text_encoders)))
 
+        # Encode all positive prompts together
         prompt_embeds_list, prompt_masks_list, pooler_embeds_list = self.encode_text(
-            prompt_text,
+            prompts,  # Pass full list for batched encoding
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
         )
 
-        for pe in prompt_embeds_list:
-            batch.prompt_embeds.append(pe)
-
-        for pe in pooler_embeds_list:
-            batch.pooled_embeds.append(pe)
-
-        if batch.prompt_attention_mask is None:
-            batch.prompt_attention_mask = []
-            for am in prompt_masks_list:
-                batch.prompt_attention_mask.append(am)
+        # Store batched embeddings - shape: [batch_size, seq_len, hidden_dim]
+        batch.prompt_embeds = prompt_embeds_list
+        if prompt_masks_list:
+            batch.prompt_attention_mask = prompt_masks_list
+        if pooler_embeds_list:
+            batch.pooled_embeds = pooler_embeds_list
 
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
-            assert isinstance(batch.negative_prompt, str)
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-                batch.negative_prompt,
+            assert (
+                negative_prompts is not None
+            ), "Negative prompts cannot be None for CFG "
+            assert len(prompts) == len(
+                negative_prompts
+            ), "Negative prompts number must match number of prompts"
+
+            neg_embeds_list, neg_masks_list, neg_pooler_list = self.encode_text(
+                negative_prompts,
                 server_args,
                 encoder_index=all_indices,
                 return_attention_mask=True,
             )
+            batch.negative_prompt_embeds = neg_embeds_list
+            if neg_masks_list:
+                batch.negative_attention_mask = neg_masks_list
+            if neg_pooler_list:
+                batch.neg_pooled_embeds = neg_pooler_list
 
-            assert batch.negative_prompt_embeds is not None
+        expansion_factors = batch.sampling_params.num_outputs_per_prompt
+        factor = expansion_factors
+        if batch.sampling_params.per_prompt_num_outputs:
+            expansion_factors = torch.tensor(
+                batch.sampling_params.per_prompt_num_outputs,
+                dtype=torch.long,
+                device=prompt_embeds_list[0].device,
+            )
+            factor = len(expansion_factors)
 
-            for ne in neg_embeds_list:
-                batch.negative_prompt_embeds.append(ne)
+        if factor > 1:
+            batch.prompt_embeds = [
+                pe.repeat_interleave(expansion_factors, dim=0)
+                for pe in prompt_embeds_list
+            ]
+            batch.pooled_embeds = [
+                pe.repeat_interleave(expansion_factors, dim=0)
+                for pe in pooler_embeds_list
+            ]
 
-            for pe in neg_pooler_embeds_list:
-                batch.neg_pooled_embeds.append(pe)
-            if batch.negative_attention_mask is None:
-                batch.negative_attention_mask = []
-                for nm in neg_masks_list:
-                    batch.negative_attention_mask.append(nm)
+            if batch.do_classifier_free_guidance:
+                batch.negative_prompt_embeds = [
+                    pe.repeat_interleave(expansion_factors, dim=0)
+                    for pe in neg_embeds_list
+                ]
+                if neg_masks_list:
+                    batch.negative_attention_mask = [
+                        pe.repeat_interleave(expansion_factors, dim=0)
+                        for pe in neg_masks_list
+                    ]
+                if neg_pooler_list:
+                    batch.neg_pooled_embeds = [
+                        pe.repeat_interleave(expansion_factors, dim=0)
+                        for pe in neg_pooler_list
+                    ]
+
+        batch.is_prompt_processed = True
 
         return batch
 
@@ -114,7 +153,8 @@ class TextEncodingStage(PipelineStage):
         result.add_check(
             "negative_prompt",
             batch.negative_prompt,
-            lambda x: not batch.do_classifier_free_guidance or V.string_not_none(x),
+            lambda x: not batch.do_classifier_free_guidance
+            or V.string_or_list_strings(x),
         )
         result.add_check(
             "do_classifier_free_guidance",
