@@ -635,59 +635,101 @@ if HAS_TRITON:
             best_count = tl.where(better, target_count, best_count)
             best_rank = tl.where(better, target_rank, best_rank)
 
-        # Optional sampling among candidate ranks. When disabled, keep the deterministic
-        # best_rank selected above (argmin with local preference), which tends to reduce
-        # remote shared dispatch under static EPLB.
-        if ENABLE_SAMPLING:
-            # Total weight per token across candidate ranks.
-            total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-            for r in range(world_size):
-                present = ((candidate_mask >> r) & 1) == 1
-                routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
-                w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(
-                    tl.int32
-                )
-                w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
-                # Apply local preference (scale down remote weights).
-                w_vec = tl.where(
-                    src_rank_i32 == r,
-                    w_vec,
-                    (w_vec * local_pref_denom) // local_pref_numer,
-                )
-                total_w += tl.where(present, w_vec, 0)
+        # Weighted deterministic spread: distribute shared tokens proportionally
+        # to each candidate rank's remaining capacity.
+        #
+        # Key insight: routed_counts are global (aggregated across all source ranks),
+        # but each source rank makes its decisions independently.  With world_size
+        # source ranks all sending shared tokens to the least-loaded destination,
+        # the actual shared load a rank receives is ~world_size times what a single
+        # source would send (cross-source herding).
+        #
+        # Fix: adjust each rank's effective load by adding an estimate of the shared
+        # tokens it will receive from *all* source ranks.  Under the uniform
+        # approximation each rank receives total_tokens_global / world_size shared
+        # tokens, but ranks with more remaining capacity attract more.  We use a
+        # simple first-order correction:
+        #   effective_load[r] = routed_counts[r] + shared_est[r]
+        # where shared_est[r] = (target_total - routed_counts[r]) * (world_size - 1)
+        #                       / (sum of (target_total - routed_counts) over all ranks)
+        #                       * total_tokens_global
+        # This flattens the weight distribution, reducing cross-source herding while
+        # still preferring less-loaded ranks.
+        #
+        # To keep the kernel lightweight we approximate with integer arithmetic:
+        #   gap[r] = max(target_total - routed_counts[r], 0)
+        #   total_gap = sum(gap[r])  (over all ranks, not just candidates)
+        #   shared_est[r] = gap[r] * total_tokens_global * (world_size - 1)
+        #                   / (total_gap * world_size)
+        #   effective[r] = routed_counts[r] + shared_est[r]
+        #   w[r] = max(target_total - effective[r], 0)
+        #
+        # Then we use token_idx for deterministic proportional spread (no random hash),
+        # so within each block the allocation is exact up to rounding.
 
-            # Deterministic per-token draw in [0, total_w).
-            token_seed = token_idx.to(tl.uint32) ^ (
-                src_rank_i32.to(tl.uint32)
-                * tl.full([BLOCK_SIZE], 0x9E3779B9, dtype=tl.uint32)
+        # --- Compute per-rank gap and total_gap ---
+        # Use scalar accumulation: tl.load returns a scalar in Triton,
+        # and we keep total_gap as a scalar to avoid block-tensor issues.
+        total_gap = tl.cast(0, tl.int64)
+        _zero_i64 = tl.cast(0, tl.int64)
+        for r in range(world_size):
+            routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
+            gap_r = tl.maximum(target_total - routed_r, _zero_i64)
+            total_gap += gap_r
+
+        # --- Compute weights with shared-load correction ---
+        # We precompute the denominator once (scalar).
+        _one_i64 = tl.cast(1, tl.int64)
+        denom = tl.where(total_gap > 0, total_gap * world_size, _one_i64)
+
+        total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
+            gap_r = tl.maximum(target_total - routed_r, _zero_i64)
+            # shared_est = gap_r * total_tokens_global * (world_size - 1) / denom
+            shared_est = (gap_r * total_tokens_global * (world_size - 1)) // denom
+            effective_r = routed_r + shared_est
+            w = tl.maximum(target_total - effective_r, _zero_i64).to(tl.int32)
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            # Apply local preference (scale down remote weights).
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
             )
-            token_seed = token_seed * tl.full(
-                [BLOCK_SIZE], 1664525, dtype=tl.uint32
-            ) + tl.full([BLOCK_SIZE], 1013904223, dtype=tl.uint32)
-            u = tl.where(total_w > 0, token_seed % total_w.to(tl.uint32), 0).to(
-                tl.int32
+            total_w += tl.where(present, w_vec, 0)
+
+        # Deterministic proportional spread using token_idx.
+        # Each token picks a position in [0, total_w) based on its index,
+        # giving near-perfect proportional allocation within each block.
+        u = tl.where(
+            total_w > 0,
+            (token_idx.to(tl.uint32) % total_w.to(tl.uint32)).to(tl.int32),
+            0,
+        )
+
+        chosen = src_rank_i32
+        cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+        for r in range(world_size):
+            present = ((candidate_mask >> r) & 1) == 1
+            routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
+            gap_r = tl.maximum(target_total - routed_r, _zero_i64)
+            shared_est = (gap_r * total_tokens_global * (world_size - 1)) // denom
+            effective_r = routed_r + shared_est
+            w = tl.maximum(target_total - effective_r, _zero_i64).to(tl.int32)
+            w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
+            w_vec = tl.where(
+                src_rank_i32 == r,
+                w_vec,
+                (w_vec * local_pref_denom) // local_pref_numer,
             )
+            w_vec = tl.where(present, w_vec, 0)
+            pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
+            chosen = tl.where(pick, r, chosen)
+            cum += w_vec
 
-            chosen = src_rank_i32
-            cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-            for r in range(world_size):
-                present = ((candidate_mask >> r) & 1) == 1
-                routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
-                w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(
-                    tl.int32
-                )
-                w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
-                w_vec = tl.where(
-                    src_rank_i32 == r,
-                    w_vec,
-                    (w_vec * local_pref_denom) // local_pref_numer,
-                )
-                w_vec = tl.where(present, w_vec, 0)
-                pick = (total_w > 0) & present & (u >= cum) & (u < (cum + w_vec))
-                chosen = tl.where(pick, r, chosen)
-                cum += w_vec
-
-            best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
+        best_rank = tl.where(total_w > 0, chosen.to(tl.int64), best_rank)
 
         # ===== Step 2: Compute shared expert ID and local mask =====
         is_local = best_rank == source_rank
