@@ -150,6 +150,7 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+    prompt_ids: List[int] = dataclasses.field(default_factory=list)
 
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
@@ -1067,6 +1068,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         state = self.req_state_class(
             [], False, asyncio.Event(), obj, created_time=created_time
         )
+        state.prompt_ids = list(getattr(tokenized_obj, "input_ids", []) or [])
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
@@ -1095,6 +1097,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             state = self.req_state_class(
                 [], False, asyncio.Event(), tmp_obj, created_time=created_time
             )
+            state.prompt_ids = list(getattr(tokenized_obj, "input_ids", []) or [])
             self.rid_to_state[tmp_obj.rid] = state
 
     async def _wait_one_response(
@@ -1501,6 +1504,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
+                "prompt_token_ids": state.prompt_ids,
                 "weight_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
             }
