@@ -43,7 +43,9 @@ except ImportError:
     apply_rope_with_cos_sin_cache_inplace = None
 
 logger = init_logger(__name__)
-_is_cuda = current_platform.is_cuda()
+_is_flashinfer_available = (
+    current_platform.is_cuda() and apply_rope_with_cos_sin_cache_inplace is not None
+)
 
 
 def _apply_rotary_emb_naive(
@@ -109,7 +111,7 @@ def _apply_rotary_emb(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    if _is_cuda and apply_rope_with_cos_sin_cache_inplace is not None:
+    if _is_flashinfer_available:
         return _apply_rotary_emb_flashinfer(x, cos, sin, is_neox_style=is_neox_style)
     else:
         return _apply_rotary_emb_naive(x, cos, sin, is_neox_style=is_neox_style)
@@ -190,7 +192,7 @@ def _apply_rotary_emb_qk(
         is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
             positional embeddings.
     """
-    if _is_cuda and apply_rope_with_cos_sin_cache_inplace is not None:
+    if _is_flashinfer_available:
         return _apply_rotary_emb_qk_flashinfer(q, k, cos, sin, is_neox_style)
     else:
         return _apply_rotary_emb_qk_naive(q, k, cos, sin, is_neox_style)
