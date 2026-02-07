@@ -755,7 +755,7 @@ class SamplingParams:
         )
         parser.add_argument(
             "--enable-sequence-shard",
-            action="store_true",
+            action=StoreBoolean,
             default=SamplingParams.enable_sequence_shard,
             help="Enable sequence dimension shard with sequence parallelism.",
         )
