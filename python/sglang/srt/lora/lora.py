@@ -118,8 +118,8 @@ class LoRAAdapter(nn.Module):
             # added/extra token emb
             self.added_tokens_embeddings[name] = loaded_weight.cpu()
             assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
-                f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
+                f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
             )
 
     def _normalize_weights(self):
