@@ -656,7 +656,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
-
+        print(f"659 {quant_config=}")
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
