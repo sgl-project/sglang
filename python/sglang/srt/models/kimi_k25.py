@@ -659,7 +659,10 @@ class KimiK25ForConditionalGeneration(nn.Module):
         print(f"659 {quant_config=}")
         for item in quant_config.exclude_modules:
             print(f"661 {item=}")
-
+        quant_config.exclude_modules = [
+            item.replace("language_model", "model")
+            for item in quant_config.exclude_modules
+        ]
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
         # Ensure that the dtype of the vision_tower and mm_projector matches that of the language_model.
