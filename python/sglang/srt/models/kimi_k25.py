@@ -656,9 +656,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
         self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
         # Create mm projector
         self.mm_projector = K2VLMultiModalProjector(config.vision_config)
-        print(f"659 {quant_config=}")
-        for item in quant_config.exclude_modules:
-            print(f"661 {item=}")
+
         quant_config.exclude_modules = [
             item.replace("language_model", "model").replace(
                 "language_model.lm_head", "lm_head"
