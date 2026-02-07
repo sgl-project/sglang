@@ -137,8 +137,11 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
 echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
 if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-    echo "Reinstalling torchaudio/torchvision from ${TORCH_CUDA_VER} index to match torch..."
-    $PIP_CMD install torchaudio torchvision --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    # Pin versions to match what was installed by pyproject.toml (strip +cuXYZ suffix)
+    TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
+    echo "Reinstalling torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${TORCH_CUDA_VER} index to match torch..."
+    $PIP_CMD install "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${TORCH_CUDA_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 fi
 
 # Install router for pd-disagg test
