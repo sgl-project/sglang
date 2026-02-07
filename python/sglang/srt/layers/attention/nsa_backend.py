@@ -1195,6 +1195,25 @@ class NativeSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        causal = not layer.is_cross_attention
+        assert causal, "NSA is causal only"
+
+        if self.nsa_decode_impl == "trtllm" and not self.use_mha:
+            return self._forward_trtllm(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling
+            )
+
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -1211,8 +1230,6 @@ class NativeSparseAttnBackend(
                 )
 
         metadata = self.forward_metadata
-        causal = not layer.is_cross_attention
-        assert causal, "NSA is causal only"
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1346,21 +1363,6 @@ class NativeSparseAttnBackend(
                 logit_cap=layer.logit_cap,
                 page_size=1,
             )
-        elif nsa_impl == "trtllm":
-            # assert forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend(
-            #     include_v2=True
-            # ), "TRT-LLM NSA only supports target_verify/draft_extend; normal extend untested."
-            if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
-            # Use expanded seq_lens for per-token decode in target_verify/draft_extend.
-            return self._forward_trtllm(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                page_table_1=page_table_1,
-                metadata=metadata,
-                sm_scale=layer.scaling,
-                seq_lens=metadata.nsa_cache_seqlens_int32,
-            )
         else:
             raise ValueError(f"Unsupported {nsa_impl = }")
 
@@ -1380,50 +1382,68 @@ class NativeSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        metadata = self.forward_metadata
+
         causal = not layer.is_cross_attention
         assert causal, "NSA is causal only"
 
-        if self.nsa_decode_impl != "trtllm":
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    cache_loc = (
-                        forward_batch.out_cache_loc
-                        if not layer.is_cross_attention
-                        else forward_batch.encoder_out_cache_loc
-                    )
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                        layer,
-                        cache_loc,
-                        k,
-                        k_rope,
-                    )
+        if self.nsa_decode_impl == "trtllm":
+            return self._forward_trtllm(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling
+            )
 
-            # Do absorbed multi-latent attention
-            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            if q_rope is not None:
-                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                q_rope = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+        metadata = self.forward_metadata
+
+
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not layer.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
                 )
-            else:
-                q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-                q_nope = q_all[:, :, : layer.v_head_dim]
-                q_rope = q_all[:, :, layer.v_head_dim :]
-
-            # Align topk_indices with q dimensions
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-
-            if envs.SGLANG_NSA_FUSE_TOPK.get():
-                page_table_1 = topk_indices
-            else:
-                page_table_1 = transform_index_page_table_decode(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    page_size=1,
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                    layer,
+                    cache_loc,
+                    k,
+                    k_rope,
                 )
+
+        # Do absorbed multi-latent attention
+        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+        else:
+            q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = q_all[:, :, : layer.v_head_dim]
+            q_rope = q_all[:, :, layer.v_head_dim :]
+
+        # Align topk_indices with q dimensions
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
+
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
+            page_table_1 = topk_indices
+        else:
+            page_table_1 = transform_index_page_table_decode(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                page_size=1,
+            )
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -1483,84 +1503,6 @@ class NativeSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 bs=forward_batch.batch_size,
-            )
-
-        elif self.nsa_decode_impl == "trtllm":
-            merge_query = q_rope is not None
-            if self.data_type == torch.float8_e4m3fn:
-                # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
-                # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
-                assert q_rope is not None, "For FP8 path q_rope should not be None."
-                assert k_rope is not None, "For FP8 path k_rope should not be None."
-                assert cos_sin_cache is not None, "For FP8 path cos_sin_cache should not be None."
-                # assert all(
-                #     x is not None for x in [q_rope, k_rope, cos_sin_cache]
-                # ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-                q, k, k_rope = self._quantize_and_rope_for_fp8(
-                    q,
-                    q_rope,
-                    k.squeeze(1),
-                    k_rope.squeeze(1),
-                    forward_batch,
-                    cos_sin_cache,
-                    is_neox,
-                )
-                merge_query = False
-
-            # Save KV cache if requested
-            if save_kv_cache:
-                assert (
-                    k is not None and k_rope is not None
-                ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-                cache_loc = (
-                    forward_batch.out_cache_loc
-                    if not layer.is_cross_attention
-                    else forward_batch.encoder_out_cache_loc
-                )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                    layer, cache_loc, k, k_rope
-                )
-
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
-
-            if merge_query:
-                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-                q_rope_reshaped = q_rope.view(
-                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
-                )
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
-            else:
-                q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-
-            # Align topk_indices with q dimensions
-            if topk_indices is not None:
-                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
-
-            if envs.SGLANG_NSA_FUSE_TOPK.get():
-                page_table_1 = topk_indices
-            else:
-                page_table_1 = transform_index_page_table_decode(
-                    page_table=metadata.page_table_1,
-                    topk_indices=topk_indices,
-                    page_size=1,
-                )
-
-            q_scale = 1.0
-            k_scale = (
-                layer.k_scale_float
-                if getattr(layer, "k_scale_float", None) is not None
-                else 1.0
-            )
-            bmm1_scale = q_scale * k_scale * layer.scaling
-
-            return self._forward_trtllm(
-                q_all=q_all,
-                kv_cache=kv_cache,
-                page_table_1=page_table_1,
-                metadata=metadata,
-                sm_scale=bmm1_scale,
-                seq_lens=metadata.cache_seqlens_int32,
             )
 
         else:
@@ -1903,15 +1845,92 @@ class NativeSparseAttnBackend(
 
     def _forward_trtllm(
         self,
-        q_all: torch.Tensor,
-        kv_cache: torch.Tensor,
-        page_table_1: torch.Tensor,
-        metadata: NSAMetadata,
-        sm_scale: float,
-        seq_lens: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        # For multi-head latent attention
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         import flashinfer.decode
+
+        metadata = self.forward_metadata
+
+        merge_query = q_rope is not None
+        if self.data_type == torch.float8_e4m3fn:
+            # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
+            # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
+            assert q_rope is not None, "For FP8 path q_rope should not be None."
+            assert k_rope is not None, "For FP8 path k_rope should not be None."
+            assert cos_sin_cache is not None, "For FP8 path cos_sin_cache should not be None."
+            # assert all(
+            #     x is not None for x in [q_rope, k_rope, cos_sin_cache]
+            # ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+            q, k, k_rope = self._quantize_and_rope_for_fp8(
+                q,
+                q_rope,
+                k.squeeze(1),
+                k_rope.squeeze(1),
+                forward_batch,
+                cos_sin_cache,
+                is_neox,
+            )
+            merge_query = False
+
+            # Save KV cache if requested
+        if save_kv_cache:
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else forward_batch.encoder_out_cache_loc
+            )
+            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                layer, cache_loc, k, k_rope
+            )
+
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
+
+        if merge_query:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            q_all = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+        else:
+            q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # Align topk_indices with q dimensions
+        if topk_indices is not None:
+            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
+
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
+            page_table_1 = topk_indices
+        else:
+            page_table_1 = transform_index_page_table_decode(
+                page_table=metadata.page_table_1,
+                topk_indices=topk_indices,
+                page_size=1,
+            )
+
+        q_scale = 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+        bmm1_scale = q_scale * k_scale * layer.scaling
 
         batch_size = page_table_1.shape[0]
         _, num_heads, head_dim = q_all.shape
@@ -1928,10 +1947,10 @@ class NativeSparseAttnBackend(
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
-            seq_lens=seq_lens,
+            seq_lens=metadata.cache_seqlens_int32,
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
-            bmm1_scale=sm_scale,
+            bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
