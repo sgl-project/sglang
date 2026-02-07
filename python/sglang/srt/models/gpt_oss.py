@@ -25,6 +25,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -72,8 +76,6 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
