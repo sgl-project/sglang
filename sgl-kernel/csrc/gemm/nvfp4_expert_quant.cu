@@ -126,7 +126,8 @@ cvt_fp16_to_fp4(
     uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
     int n_experts,
-    bool low_latency) {
+    bool low_latency,
+    bool use_silu_and_mul = false) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -135,11 +136,9 @@ cvt_fp16_to_fp4(
   // Input tensor row/col loops.
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
-  // TODO(kaixih@nvidia): For now, we assume mask is used together with
-  // silu_and_mal. Maybe we want a more general behavior of mask later. In the
-  // silu case, the input last dim doubles.
   bool use_mask = mask != nullptr;
-  int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
+  // When use_silu_and_mul is true, input last dim is 2*k (gate+up concatenated).
+  int actualColsPerRow = (use_mask || use_silu_and_mul) ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
   for (int globalIdx = tid; globalIdx < numRows * colsPerRow; globalIdx += gridDim.x * blockDim.x) {
@@ -196,7 +195,7 @@ cvt_fp16_to_fp4(
 
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-    if (use_mask) {
+    if (use_mask || use_silu_and_mul) {
       PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
       silu_and_mul(in_vec, in_vec_mul);
     }
@@ -343,7 +342,8 @@ cvt_fp16_to_fp4(
     uint32_t* input_offset_by_experts,
     uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
-    int n_experts) {
+    int n_experts,
+    bool use_silu_and_mul = false) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -371,7 +371,8 @@ cvt_fp16_to_fp4(
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
   bool use_mask = mask != nullptr;
-  int actualColsPerRow = use_mask ? colsPerRow * 2 : colsPerRow;
+  // When use_silu_and_mul is true, input last dim is 2*k (gate+up concatenated).
+  int actualColsPerRow = (use_mask || use_silu_and_mul) ? colsPerRow * 2 : colsPerRow;
 
   // Each global thread processes one element
   for (int globalIdx = tid; globalIdx < numRows * colsPerRow; globalIdx += gridDim.x * blockDim.x) {
@@ -410,7 +411,7 @@ cvt_fp16_to_fp4(
     int64_t inOffset = rowIdx * actualColsPerRow + colIdx;
 
     PackedVec in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
-    if (use_mask) {
+    if (use_mask || use_silu_and_mul) {
       PackedVec in_vec_mul = reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
       silu_and_mul(in_vec, in_vec_mul);
     }
@@ -496,7 +497,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(input_offset_by_experts),
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
-          n_experts);
+          n_experts,
+          use_silu_and_mul);
     } else {
       cvt_fp16_to_fp4<T, false, true><<<grid, block, shared_mem_size, stream>>>(
           m_topk,
@@ -508,7 +510,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(input_offset_by_experts),
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
-          n_experts);
+          n_experts,
+          use_silu_and_mul);
     }
   } else {
     if (n_experts >= 16) {
@@ -523,7 +526,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
           n_experts,
-          /* bool low_latency */ true);
+          /* bool low_latency */ true,
+          use_silu_and_mul);
     } else {
       cvt_fp16_to_fp4<T, false, true><<<grid, block, 0, stream>>>(
           m_topk,
@@ -536,7 +540,8 @@ void quant_impl(
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
           reinterpret_cast<int32_t*>(mask),
           n_experts,
-          /* bool low_latency */ true);
+          /* bool low_latency */ true,
+          use_silu_and_mul);
     }
   }
 }
