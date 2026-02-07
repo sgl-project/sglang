@@ -1388,7 +1388,12 @@ void launch_sm120_fp8_scaled_mm(
   TORCH_CHECK(status == cutlass::Status::kSuccess)
 }
 
-template <typename OutType>
+template <
+    typename OutType,
+    typename CTAShape = Shape<_128, _128, _128>,
+    typename ClusterShape = Shape<_1, _1, _1>,
+    typename MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto,
+    typename TileSchedulerType = void>
 void sm120_fp8_dispatch_bias(
     torch::Tensor& out,
     const torch::Tensor& a,
@@ -1396,43 +1401,38 @@ void sm120_fp8_dispatch_bias(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
-  using CTAShapeDefault = Shape<_128, _128, _128>;
-  using ClusterShapeDefault = Shape<_1, _1, _1>;
-
-  using MainloopScheduleType = cutlass::gemm::collective::KernelScheduleAuto;
   using EpilogueScheduleType = cutlass::epilogue::collective::EpilogueScheduleAuto;
-  using TileSchedulerType = void;
 
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
   using AccumElementType = float;
 
-  using BiasGemmDefault = DeviceGemmFp8RowwiseSm120<
+  using BiasGemm = DeviceGemmFp8RowwiseSm120<
       ElementInput,
       ElementOutput,
       AccumElementType,
-      CTAShapeDefault,
-      ClusterShapeDefault,
+      CTAShape,
+      ClusterShape,
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
       true>;
 
-  using GemmDefault = DeviceGemmFp8RowwiseSm120<
+  using Gemm = DeviceGemmFp8RowwiseSm120<
       ElementInput,
       ElementOutput,
       AccumElementType,
-      CTAShapeDefault,
-      ClusterShapeDefault,
+      CTAShape,
+      ClusterShape,
       MainloopScheduleType,
       EpilogueScheduleType,
       TileSchedulerType,
       false>;
 
   if (bias) {
-    return launch_sm120_fp8_scaled_mm<BiasGemmDefault, true>(out, a, b, scales_a, scales_b, bias);
+    return launch_sm120_fp8_scaled_mm<BiasGemm, true>(out, a, b, scales_a, scales_b, bias);
   } else {
-    return launch_sm120_fp8_scaled_mm<GemmDefault, false>(out, a, b, scales_a, scales_b, bias);
+    return launch_sm120_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias);
   }
 }
 
