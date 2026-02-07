@@ -1211,7 +1211,7 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 cos_sin_cache,
                 is_neox,
-                llama_4_scaling
+                llama_4_scaling,
             )
 
         if k is not None:
@@ -1399,11 +1399,10 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 cos_sin_cache,
                 is_neox,
-                llama_4_scaling
+                llama_4_scaling,
             )
 
         metadata = self.forward_metadata
-
 
         if k is not None:
             assert v is not None
@@ -1519,6 +1518,7 @@ class NativeSparseAttnBackend(
         is_neox: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         import flashinfer.rope
+
         """Quantize and apply RoPE for FP8 attention path.
 
         This function handles the FP8 quantization and RoPE application for MLA attention.
@@ -1870,7 +1870,9 @@ class NativeSparseAttnBackend(
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert cos_sin_cache is not None, "For FP8 path cos_sin_cache should not be None."
+            assert (
+                cos_sin_cache is not None
+            ), "For FP8 path cos_sin_cache should not be None."
             # assert all(
             #     x is not None for x in [q_rope, k_rope, cos_sin_cache]
             # ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
@@ -2077,6 +2079,7 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
+
 
 def _concat_mla_absorb_q_general(q_nope, q_rope):
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:

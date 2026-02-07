@@ -1514,7 +1514,11 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
 
-        if self.use_nsa and self.nsa_kv_cache_store_fp8 and self.should_quantize_k_cache_separate:
+        if (
+            self.use_nsa
+            and self.nsa_kv_cache_store_fp8
+            and self.should_quantize_k_cache_separate
+        ):
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
@@ -1761,7 +1765,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
         )
 
         should_quantize_k_cache_separate = True
-        if prefill_attention_backend == "trtllm" and decode_attention_backend == "trtllm":
+        if (
+            prefill_attention_backend == "trtllm"
+            and decode_attention_backend == "trtllm"
+        ):
             override_dim = kv_lora_rank + qk_rope_head_dim
             should_quantize_k_cache_separate = False
 
