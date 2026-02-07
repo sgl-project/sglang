@@ -38,6 +38,14 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     torch::Tensor const& mask,
     bool use_silu_and_mul);
 
+void silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
+
 #endif
 
 void scaled_fp4_quant(
@@ -75,3 +83,24 @@ void silu_and_mul_scaled_fp4_experts_quant(
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 experts quantization kernel");
 }
+
+void silu_and_mul_scaled_fp4_experts_quant_packed(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts) {
+#if defined ENABLE_NVFP4 && ENABLE_NVFP4
+  return silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
+      output,
+      output_scale,
+      input,
+      input_global_scale,
+      input_offset_by_experts,
+      output_scale_offset_by_experts);
+#endif
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 experts quantization kernel");
+}
+
+

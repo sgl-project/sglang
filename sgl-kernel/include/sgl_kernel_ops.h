@@ -425,6 +425,15 @@ void scaled_fp4_experts_quant(
     torch::Tensor const& input_offset_by_experts,
     torch::Tensor const& output_scale_offset_by_experts);
 
+// fused variant for packed MoE inputs: applies SiLU+mul then FP4 expert quant
+void silu_and_mul_scaled_fp4_experts_quant_packed(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts);
+
 void silu_and_mul_scaled_fp4_experts_quant(
     torch::Tensor& output,
     torch::Tensor& output_scale,

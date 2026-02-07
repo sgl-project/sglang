@@ -505,6 +505,120 @@ def scaled_fp4_experts_quant(
     return output, output_scales
 
 
+def silu_and_mul_scaled_fp4_experts_quant_packed(
+    input_tensor: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    blockscale_offsets: torch.Tensor,
+    topk: int,
+    expert_map: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused SiLU+mul then FP4 quant for packed MoE inputs (expert_offsets aware).
+    Mirrors `scaled_fp4_experts_quant` but performs SiLU+mul before quantization
+    inside the CUDA kernel.
+
+    Key difference from `scaled_fp4_experts_quant`:
+      - Input shape is (m, 2*k) — the gate and up projections are concatenated
+        along the last dimension. The kernel internally applies SiLU to the first
+        half (gate) and multiplies with the second half (up), producing a result
+        of dimension k, which is then FP4-quantized.
+      - In contrast, `scaled_fp4_experts_quant` takes input shape (m, k) where k
+        is already the final dimension (no SiLU+mul is performed).
+
+    Args:
+        input_tensor: (m, 2*k) — concatenated [gate, up] from GEMM1 output.
+        input_global_scale: Per-expert FP32 scaling factors, shape (num_experts,).
+        expert_offsets: Cumulative token offsets per expert, shape (num_experts+1,).
+        blockscale_offsets: Cumulative blockscale offsets per expert.
+        topk: Number of top-k experts per token.
+        expert_map: Optional routing map for row shuffling.
+
+    Returns:
+        output: FP4-quantized tensor, shape (m, k//2) — two FP4 values packed per uint8.
+        output_scales: Block scales in float8_e4m3fn format.
+    """
+    assert (
+        input_tensor.ndim == 2
+    ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
+    if expert_map is not None:
+        (m, k) = input_tensor.shape
+        output_tensor_shape = (m * topk, k)
+        input_tensor = shuffle_rows(input_tensor, expert_map, output_tensor_shape)
+
+    # --- Dimension semantics (critical difference from scaled_fp4_experts_quant) ---
+    # input_tensor.shape = (m_numtopk, 2*k)
+    #   The last dim is 2*k because GEMM1 output contains [gate, up] concatenated.
+    #   The CUDA kernel will internally split this into gate[:k] and up[k:],
+    #   compute SiLU(gate) * up, then FP4-quantize the k-dim result.
+    #
+    # Compare with scaled_fp4_experts_quant where:
+    #   input_tensor.shape = (m_numtopk, k)  — k is the direct feature dimension,
+    #   no halving needed.
+    m_numtopk, k_input_doubled = input_tensor.shape
+    k = k_input_doubled // 2  # Actual feature dim after SiLU+mul reduces 2k -> k
+
+    import os
+
+    MAX_TOKENS_PER_EXPERT = int(os.environ.get("MODELOPT_MAX_TOKENS_PER_EXPERT", 65536))
+    assert m_numtopk <= MAX_TOKENS_PER_EXPERT * topk, (
+        f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT("
+        f"{MAX_TOKENS_PER_EXPERT})"
+        f" for cutlass_moe_fp4, observed m_numtopk = {m_numtopk}. Use"
+        f" MODELOPT_MAX_TOKENS_PER_EXPERT to set this value."
+    )
+
+    # --- Block scale dimensions ---
+    # One scale per 16 elements along k (the post-SiLU+mul dimension, not 2k).
+    scales_k = k // 16
+    # NVIDIA Blackwell MMA requires scale factors aligned to multiple of 4 (swizzle layout).
+    padded_k = (scales_k + (4 - 1)) // 4 * 4
+    # 4 fp8_e4m3fn values are packed into one int32, so the int32 column count is padded_k / 4.
+    # This matches the C++ kernel check: output_scale.size(1) * 4 == padded_k
+    padded_k_int32 = padded_k // 4
+
+    # --- Output tensor ---
+    # After SiLU+mul, the result has k features. Two FP4 values pack into one uint8,
+    # so output shape is (m, k // 2).
+    # Compare: scaled_fp4_experts_quant also uses k // 2, but its k = input.shape[1]
+    # directly (no halving). Here k = input.shape[1] // 2.
+    output = torch.empty(
+        m_numtopk, k // 2, device=input_tensor.device, dtype=torch.uint8
+    )
+
+    # padded part should be zeroed out to avoid garbage in swizzled scale layout
+    if padded_k > scales_k:
+        output_scales = torch.zeros(
+            MAX_TOKENS_PER_EXPERT * topk,
+            padded_k_int32,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
+    else:
+        output_scales = torch.empty(
+            MAX_TOKENS_PER_EXPERT * topk,
+            padded_k_int32,
+            dtype=torch.int32,
+            device=input_tensor.device,
+        )
+
+    torch.ops.sgl_kernel.silu_and_mul_scaled_fp4_experts_quant_packed.default(
+        output,
+        output_scales,
+        input_tensor,
+        input_global_scale,
+        expert_offsets,
+        blockscale_offsets,
+    )
+
+    # The kernel writes scales as packed int32 (4 x fp8_e4m3fn per int32).
+    # Reinterpret as float8_e4m3fn so downstream GEMM (cutlass_fp4_group_mm)
+    # receives the correct dtype. Without this, the second GEMM would fail with
+    # "Inconsistency of Tensor type: a_blockscale".
+    output_scales = output_scales.view(torch.float8_e4m3fn)
+    return output, output_scales
+
+
 # GPTQ kernels
 def gptq_marlin_gemm(
     a: torch.Tensor,

@@ -726,3 +726,95 @@ void silu_and_mul_scaled_fp4_experts_quant_sm100a(
     TORCH_CHECK(false, "Expected input data type to be half or bfloat16");
   }
 }
+
+void silu_and_mul_scaled_fp4_experts_quant_packed_sm100a(
+    torch::Tensor& output,
+    torch::Tensor& output_scale,
+    torch::Tensor const& input,
+    torch::Tensor const& input_global_scale,
+    torch::Tensor const& input_offset_by_experts,
+    torch::Tensor const& output_scale_offset_by_experts) {
+  auto sm_version = getSMVersion();
+  TORCH_CHECK(sm_version >= 100, "fp4_quant is only supported on sm100+");
+
+  CHECK_INPUT(output, "output must be a CUDA tensor");
+  CHECK_INPUT(output_scale, "output_scale must be a CUDA tensor");
+  CHECK_INPUT(input, "input must be a CUDA tensor");
+  CHECK_INPUT(input_global_scale, "input_global_scale must be a CUDA tensor");
+  CHECK_INPUT(input_offset_by_experts, "input_offset_by_experts must be a CUDA tensor");
+  CHECK_INPUT(output_scale_offset_by_experts, "output_scale_offset_by_experts must be a CUDA tensor");
+
+  TORCH_CHECK(output.dim() == 2);
+  TORCH_CHECK(output_scale.dim() == 2);
+  TORCH_CHECK(input.dim() == 2);
+  TORCH_CHECK(input_global_scale.dim() == 1);
+  TORCH_CHECK(input_offset_by_experts.dim() == 1);
+  TORCH_CHECK(output_scale_offset_by_experts.dim() == 1);
+
+  TORCH_CHECK(input.scalar_type() == HALF || input.scalar_type() == BF16);
+  TORCH_CHECK(input_global_scale.scalar_type() == FLOAT);
+  TORCH_CHECK(input_offset_by_experts.scalar_type() == INT);
+  TORCH_CHECK(output_scale_offset_by_experts.scalar_type() == INT);
+  TORCH_CHECK(output.scalar_type() == UINT8);
+  TORCH_CHECK(output_scale.scalar_type() == INT);
+
+  const int BLOCK_SIZE = 16;
+  auto m_topk = input.size(0);
+  auto k_by_2 = input.size(1);
+  // NOTE: For fused SiLU+mul, the input's last dim is 2*k (gate + up).
+  // The kernel reads two vectors per position (see actualColsPerRow = colsPerRow * 2),
+  // so the effective k for quantization is half of the input last dim.
+  TORCH_CHECK(k_by_2 % 2 == 0, "input last dim must be even (2*k)");
+  auto k = k_by_2 / 2;
+  TORCH_CHECK(k % BLOCK_SIZE == 0, "k must be a multiple of 16");
+
+  auto n_experts = input_global_scale.size(0);
+  TORCH_CHECK(input_offset_by_experts.size(0) == n_experts + 1);
+  TORCH_CHECK(output_scale_offset_by_experts.size(0) == n_experts + 1);
+  TORCH_CHECK(output.size(0) == m_topk);
+  TORCH_CHECK(output.size(1) == k / 2);
+
+  int scales_k = k / BLOCK_SIZE;
+  int padded_k = (scales_k + (4 - 1)) / 4 * 4;
+  TORCH_CHECK(output_scale.size(1) * 4 == padded_k);
+
+  auto in_dtype = input.dtype();
+  at::cuda::CUDAGuard device_guard{(char)input.get_device()};
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  // Use the offset-based kernel path (not the mask-based cvt_fp16_to_fp4_expert)
+  // because the offset-based path correctly handles non-uniform token distribution
+  // across experts. The mask-based path assumes m = numRows / n_experts which is
+  // wrong for packed MoE routing.
+  if (in_dtype == at::ScalarType::Half) {
+    quant_impl<half>(
+        output.data_ptr(),
+        output_scale.data_ptr(),
+        input.data_ptr(),
+        input_global_scale.data_ptr(),
+        input_offset_by_experts.data_ptr(),
+        output_scale_offset_by_experts.data_ptr(),
+        nullptr,  // mask - not needed, offsets handle expert boundaries
+        true,     // use_silu_and_mul - fused SiLU+mul+quant operation
+        m_topk,
+        k,
+        n_experts,
+        stream);
+  } else if (in_dtype == at::ScalarType::BFloat16) {
+    quant_impl<__nv_bfloat16>(
+        output.data_ptr(),
+        output_scale.data_ptr(),
+        input.data_ptr(),
+        input_global_scale.data_ptr(),
+        input_offset_by_experts.data_ptr(),
+        output_scale_offset_by_experts.data_ptr(),
+        nullptr,  // mask - not needed, offsets handle expert boundaries
+        true,     // use_silu_and_mul - fused SiLU+mul+quant operation
+        m_topk,
+        k,
+        n_experts,
+        stream);
+  } else {
+    TORCH_CHECK(false, "Expected input data type to be half or bfloat16");
+  }
+}
