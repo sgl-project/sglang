@@ -361,6 +361,8 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
 def is_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
+def is_in_amd_ci() -> bool:
+    return envs.SGLANG_IS_IN_CI_AMD.get()
 
 
 def print_highlight(html_content: str):
