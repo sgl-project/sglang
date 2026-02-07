@@ -1823,7 +1823,7 @@ def launch_server(
     run_detokenizer_process_func: Callable = run_detokenizer_process,
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
-    ray_cluster_info=None,
+    _ray_placement_groups=None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -1852,7 +1852,7 @@ def launch_server(
         init_tokenizer_manager_func=init_tokenizer_manager_func,
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
-        ray_cluster_info=ray_cluster_info,
+        _ray_placement_groups=_ray_placement_groups,
     )
 
     # Parse info got from the schedulers
