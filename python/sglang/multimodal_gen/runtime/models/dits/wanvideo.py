@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -775,6 +776,29 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         self.layer_names = ["blocks"]
 
+    @lru_cache(maxsize=1)
+    def _compute_rope_for_sequence_shard(
+        self,
+        local_len: int,
+        rank: int,
+        frame_stride_local: int,
+        width_local: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_start = rank * local_len
+        token_indices = torch.arange(
+            token_start,
+            token_start + local_len,
+            device=device,
+            dtype=torch.long,
+        )
+        t_idx = token_indices // frame_stride_local
+        rem = token_indices % frame_stride_local
+        h_idx = rem // width_local
+        w_idx = rem % width_local
+        positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
+        return self.rotary_emb.forward_uncached(positions)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -855,31 +879,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             )
             hidden_states = hidden_states[:, sp_rank, :, :]
 
-            # a temporary fix to compatible with torch compile
-            @torch.compiler.disable
-            def _compute_rope_for_sequence_shard(
-                local_len: int,
-                rank: int,
-                frame_stride_local: int,
-                width_local: int,
-                device: torch.device,
-            ) -> tuple[torch.Tensor, torch.Tensor]:
-                token_start = rank * local_len
-                token_indices = torch.arange(
-                    token_start,
-                    token_start + local_len,
-                    device=device,
-                    dtype=torch.long,
-                )
-                t_idx = token_indices // frame_stride_local
-                rem = token_indices % frame_stride_local
-                h_idx = rem // width_local
-                w_idx = rem % width_local
-                positions = torch.stack((t_idx, h_idx, w_idx), dim=1)
-                return self.rotary_emb.forward_uncached(positions)
-
             frame_stride = post_patch_height * post_patch_width
-            freqs_cos, freqs_sin = _compute_rope_for_sequence_shard(
+            freqs_cos, freqs_sin = self._compute_rope_for_sequence_shard(
                 local_seq_len,
                 sp_rank,
                 frame_stride,
