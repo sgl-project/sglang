@@ -981,34 +981,33 @@ class GDNAttnBackend(MambaAttnBackendBase):
         logger.info("Warming up FlashInfer GDN MTP kernel (may take a few seconds)...")
         start_time = time.perf_counter()
         
-        # Get model config from the mamba pool
-        # Use small but representative sizes for warmup
-        # The kernel config is: batch_size, seq_len=4 (draft_token_num), num_heads, head_dim=128
+        # Use small but representative sizes for warmup.
+        # The kernel config is: batch_size, seq_len=4 (draft_token_num), num_heads, k/v_dim=128
         batch_size = 4
         seq_len = 4  # draft_token_num for speculative decoding
         num_heads = 4  # typical per-GPU head count
-        head_dim = 128  # ssm_state_size
+        k_dim = 128  # ssm_state_size (key dimension)
+        v_dim = 128  # ssm_state_size (value dimension)
         
         device = "cuda"
         dtype = torch.bfloat16
         
         try:
             # Create dummy tensors
-            q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-            k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
-            v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+            q = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
+            k = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
+            v = torch.randn(batch_size, seq_len, num_heads, v_dim, device=device, dtype=dtype)
             A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
             dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
             a = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
             b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
             
             pool_size = batch_size + 16
-            # K-last layout: [pool, HV, V, K].  Since K == V == head_dim the
-            # shape is symmetric and random data is layout-agnostic for warmup.
-            initial_state = torch.randn(pool_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+            # K-last (V-major) layout: [pool, HV, V, K]
+            initial_state = torch.randn(pool_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32)
             cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
             intermediate_state_cache = torch.zeros(
-                pool_size, seq_len, num_heads, head_dim, head_dim,
+                pool_size, seq_len, num_heads, v_dim, k_dim,
                 device=device, dtype=torch.float32
             )
             
@@ -1029,7 +1028,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             logger.info(f"FlashInfer GDN MTP kernel warmup completed in {elapsed:.2f}s")
             
             # Clean up
-            del q, k, v, A_log, dt_bias, a, b, initial_state, cache_indices, intermediate_state_cache
+            del q, k, v, A_log, dt_bias, a, b, initial_state, cache_indices
+            del intermediate_state_cache
             torch.cuda.empty_cache()
             
         except Exception as e:
@@ -1051,24 +1051,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Use representative sizes for warmup
         batch_size = 4
         num_heads = 4  # typical per-GPU head count
-        head_dim = 128  # ssm_state_size
+        k_dim = 128  # ssm_state_size (key dimension)
+        v_dim = 128  # ssm_state_size (value dimension)
         
         device = "cuda"
         dtype = torch.bfloat16
         
         try:
             # Create dummy tensors matching decode kernel expectations
-            q = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=dtype)
-            k = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=dtype)
-            v = torch.randn(batch_size, 1, num_heads, head_dim, device=device, dtype=dtype)
+            q = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
+            k = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
+            v = torch.randn(batch_size, 1, num_heads, v_dim, device=device, dtype=dtype)
             A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
             dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
             a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             
-            # K-last layout: [B, HV, V, K].  Since K == V == head_dim the
-            # shape is symmetric and random data is layout-agnostic for warmup.
-            state = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+            # K-last (V-major) layout: [B, HV, V, K]
+            state = torch.randn(batch_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32)
             
             # Run warmup call
             self._flashinfer_gated_delta_rule_decode(
