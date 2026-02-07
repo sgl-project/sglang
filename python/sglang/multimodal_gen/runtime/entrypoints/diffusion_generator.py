@@ -14,12 +14,8 @@ import time
 from typing import Any, List, Union
 
 import numpy as np
-import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -28,8 +24,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     format_lora_message,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    post_process_sample,
     prepare_request,
+    save_outputs,
 )
 from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -266,42 +262,27 @@ class DiffGenerator:
                             results.append(result_item)
                         continue
 
-                    for output_idx, sample in enumerate(output_batch.output):
-                        num_outputs = len(output_batch.output)
-                        audio = output_batch.audio
-                        if req.data_type == DataType.VIDEO:
-                            if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
-                                audio = (
-                                    audio[output_idx]
-                                    if audio.shape[0] > output_idx
-                                    else None
-                                )
-                            elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
-                                audio = (
-                                    audio[output_idx]
-                                    if audio.shape[0] > output_idx
-                                    else None
-                                )
-                            if audio is not None and not (
-                                isinstance(sample, (tuple, list)) and len(sample) == 2
-                            ):
-                                sample = (sample, audio)
-                        frames = post_process_sample(
-                            sample,
-                            fps=req.fps,
-                            save_output=req.save_output,
-                            # TODO: output file path for req should be determined
-                            save_file_path=req.output_file_path(
-                                num_outputs, output_idx
-                            ),
-                            data_type=req.data_type,
-                            audio_sample_rate=audio_sample_rate,
-                        )
+                    samples_out: list[Any] = []
+                    audios_out: list[Any] = []
+                    frames_out: list[Any] = []
+                    save_outputs(
+                        output_batch.output,
+                        req.data_type,
+                        req.fps,
+                        req.save_output,
+                        lambda idx: req.output_file_path(len(output_batch.output), idx),
+                        audio=output_batch.audio,
+                        audio_sample_rate=audio_sample_rate,
+                        samples_out=samples_out,
+                        audios_out=audios_out,
+                        frames_out=frames_out,
+                    )
 
+                    for output_idx in range(len(samples_out)):
                         result_item: dict[str, Any] = {
-                            "samples": sample,
-                            "frames": frames,
-                            "audio": audio,
+                            "samples": samples_out[output_idx],
+                            "frames": frames_out[output_idx],
+                            "audio": audios_out[output_idx],
                             "prompts": req.prompt,
                             "size": (req.height, req.width, req.num_frames),
                             "generation_time": timer.duration,
