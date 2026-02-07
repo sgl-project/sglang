@@ -7,9 +7,8 @@ on:
     paths:
       - "python/sglang/**"
       - "docs/**"
-    paths-ignore:
-      - "python/sglang/**/*.md"
-      - "docs/**/*.md"
+      - "!python/sglang/**/*.md"
+      - "!docs/**/*.md"
   workflow_dispatch:
 
 
