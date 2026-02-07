@@ -97,7 +97,6 @@ CI_MULTI_LORA_MODELS = [
         ],
         max_loras_per_batch=2,
         max_loaded_loras=4,
-        rouge_l_tolerance=0.9,
     ),
 ]
 
@@ -115,7 +114,6 @@ ALL_OTHER_MULTI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=2,
-        rouge_l_tolerance=0.9,
     ),
 ]
 
@@ -649,6 +647,7 @@ def run_lora_multiple_batch_on_model_cases(
             max_new_tokens = 32
             base_path = model_case.base
             lora_adapter_paths = [a.name for a in model_case.adaptors]
+            model_case.rouge_l_tolerance = 0.9
             assert len(lora_adapter_paths) >= 2
 
             batches = create_multiple_batch_test_samples(
