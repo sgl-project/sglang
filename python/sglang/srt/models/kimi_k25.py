@@ -660,7 +660,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         for item in quant_config.exclude_modules:
             print(f"661 {item=}")
         quant_config.exclude_modules = [
-            item.replace("language_model", "model")
+            item.replace("language_model", "model").replace(
+                "language_model.lm_head", "lm_head"
+            )
             for item in quant_config.exclude_modules
         ]
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
