@@ -356,8 +356,7 @@ class MoEGate(nn.Module):
                     self.weight.t(),
                     logits,
                     launch_with_pdl=os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
-                )
- 
+                ) 
             elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
                 logits = aiter_dsv3_router_gemm(
                     hidden_states, self.weight, gemm_output_zero_allocator
