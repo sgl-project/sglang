@@ -603,7 +603,8 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
+    const c10::optional<torch::Tensor>& bias,
+    int sm_count = 0) {
   using ElementT = typename Gemm::ElementA;
   using ElementOutput = typename Gemm::ElementD;
   using ElementComputeEpilogue = float;
@@ -630,6 +631,10 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
   StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, make_shape(n, k, 1));
   StrideC stride_c;
   StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(m, n, 1));
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.sm_count = sm_count;
+
   typename Gemm::Arguments args = {
       cutlass::gemm::GemmUniversalMode::kGemm,
       {m, n, k, 1},
@@ -638,7 +643,8 @@ typename Gemm::Arguments prepare_sm90_fp8_args(
        nullptr,
        stride_c,
        ptr_d,
-       stride_d}};
+       stride_d},
+      hw_info};
   if constexpr (WithBias) {
     args.epilogue.thread = {
         {ptr_scales_a},
@@ -672,8 +678,9 @@ void launch_sm90_fp8_scaled_mm(
     const torch::Tensor& b,
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
-    const c10::optional<torch::Tensor>& bias) {
-  auto args = prepare_sm90_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias);
+    const c10::optional<torch::Tensor>& bias,
+    int sm_count = 0) {
+  auto args = prepare_sm90_fp8_args<Gemm, WithBias>(out, a, b, scales_a, scales_b, bias, sm_count);
   Gemm gemm_op;
 
   size_t workspace_size = gemm_op.get_workspace_size(args);
@@ -702,8 +709,7 @@ void sm90_fp8_dispatch_bias(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias,
-    bool fast_accum = true,
-    bool use_persistent = false) {
+    int sm_count = 0) {
   using ElementInput = cutlass::float_e4m3_t;
   using ElementOutput = OutType;
   using AccumElementType = float;
@@ -720,7 +726,7 @@ void sm90_fp8_dispatch_bias(
         EpilogueScheduleType,
         TileSchedulerType,
         true>::Gemm;
-    return launch_sm90_fp8_scaled_mm<Gemm, true>(out, a, b, scales_a, scales_b, bias);
+    return launch_sm90_fp8_scaled_mm<Gemm, true>(out, a, b, scales_a, scales_b, bias, sm_count);
   } else {
     using Gemm = typename DeviceGemmFp8RowwiseSm90<
         ElementInput,
@@ -732,8 +738,21 @@ void sm90_fp8_dispatch_bias(
         EpilogueScheduleType,
         TileSchedulerType,
         false>::Gemm;
-    return launch_sm90_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias);
+    return launch_sm90_fp8_scaled_mm<Gemm, false>(out, a, b, scales_a, scales_b, bias, sm_count);
   }
+}
+
+// Compute minimum SM count to reduce L2 contention for multi-wave kernels.
+// Returns 0 when the problem fits in a single wave (no benefit from limiting).
+static int compute_min_sms(int m, int n, int tile_m, int tile_n,
+                           int cluster_m, int cluster_n, int device_sm_count) {
+  int total_blocks = div_ceil(m, tile_m) * div_ceil(n, tile_n);
+  if (total_blocks <= device_sm_count) return 0;  // single wave, no benefit
+  int num_waves = div_ceil(total_blocks, device_sm_count);
+  int min_sms = div_ceil(total_blocks, num_waves);
+  int cluster_size = cluster_m * cluster_n;
+  if (cluster_size > 1) min_sms = round_to_next_multiple_of(min_sms, cluster_size);
+  return (min_sms >= device_sm_count) ? 0 : min_sms;
 }
 
 template <typename OutType>
@@ -745,11 +764,23 @@ void sm90_fp8_dispatch_shape(
     const torch::Tensor& scales_b,
     const c10::optional<torch::Tensor>& bias) {
   uint32_t const m = a.size(0);
+  uint32_t const n = out.size(1);
   using FastPingpongScheduler = cutlass::gemm::KernelTmaWarpSpecializedPingpongFP8FastAccum;
   using FastBasicScheduler = cutlass::gemm::KernelTmaWarpSpecializedFP8FastAccum;
   using PersistentTileScheduler = cutlass::gemm::PersistentScheduler;
   using BasicTileScheduler = void;
+
+  // Cache device SM count for min_sms computation
+  static int device_sms = [] {
+    int dev;
+    cudaGetDevice(&dev);
+    int sms;
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    return sms;
+  }();
+
   if (m <= 1) {
+    // BasicScheduler, tiny shape — no min_sms benefit
     return sm90_fp8_dispatch_bias<
         OutType,
         Shape<_64, _64, _128>,
@@ -758,7 +789,7 @@ void sm90_fp8_dispatch_shape(
         BasicTileScheduler>(out, a, b, scales_a, scales_b, bias);
   }
   if (m <= 64) {
-    // m in [1, 64]
+    // m in [2, 64], tile 64x64, cluster 1x4x1 — skip min_sms (cluster already limits SMs)
     return sm90_fp8_dispatch_bias<
         OutType,
         Shape<_64, _64, _128>,
@@ -766,29 +797,32 @@ void sm90_fp8_dispatch_shape(
         FastPingpongScheduler,
         PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
   } else if (m <= 256) {
-    // m in (64, 256]
+    // m in (64, 256], tile 64x64, cluster 1x1x1
+    int min_sms = compute_min_sms(m, n, 64, 64, 1, 1, device_sms);
     return sm90_fp8_dispatch_bias<
         OutType,
         Shape<_64, _64, _128>,
         Shape<_1, _1, _1>,
         FastPingpongScheduler,
-        PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+        PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias, min_sms);
   } else if (m <= 1024) {
-    // m in (256, 1024]
+    // m in (256, 1024], tile 128x128, cluster 1x1x1
+    int min_sms = compute_min_sms(m, n, 128, 128, 1, 1, device_sms);
     return sm90_fp8_dispatch_bias<
         OutType,
         Shape<_128, _128, _128>,
         Shape<_1, _1, _1>,
         FastPingpongScheduler,
-        PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+        PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias, min_sms);
   } else {
-    // m in (1024, inf)
+    // m in (1024, inf), tile 128x128, cluster 2x1x1
+    int min_sms = compute_min_sms(m, n, 128, 128, 2, 1, device_sms);
     return sm90_fp8_dispatch_bias<
         OutType,
         Shape<_128, _128, _128>,
         Shape<_2, _1, _1>,
         FastPingpongScheduler,
-        PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias);
+        PersistentTileScheduler>(out, a, b, scales_a, scales_b, bias, min_sms);
   }
 }
 #endif
