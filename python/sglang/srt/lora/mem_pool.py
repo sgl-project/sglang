@@ -115,18 +115,7 @@ class LoRAMemoryPool:
             if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False
 
-            # Use effective_target_modules (computed from actual safetensors weights)
-            # if available and non-empty, otherwise fall back to declared target_modules.
-            # This handles cases where exclude_modules was used during training,
-            # resulting in fewer actual LoRA weights than declared in target_modules.
-            if config.effective_target_modules:
-                target_module_names = get_normalized_target_modules(
-                    config.effective_target_modules
-                )
-            else:
-                target_module_names = get_normalized_target_modules(
-                    config.target_modules
-                )
+            target_module_names = get_normalized_target_modules(config.target_modules)
             return target_module_names.issubset(self.target_modules)
 
         if isinstance(config, LoRAConfig):

@@ -13,17 +13,13 @@
 # ==============================================================================
 
 import json
-import logging
 import os
-from typing import Dict, Optional, Set
+from typing import Dict, Optional
+import logging
 
 from huggingface_hub import snapshot_download
-from safetensors import safe_open
-
-from sglang.srt.lora.utils import get_target_module_name
 
 logger = logging.getLogger(__name__)
-
 
 class LoRAConfig:
     def __init__(
@@ -56,71 +52,6 @@ class LoRAConfig:
         else:
             # For from_dict case, fall back to declared target_modules
             self.effective_target_modules = None
-
-    def _compute_effective_target_modules(self) -> Optional[Set[str]]:
-        """
-        Extract actual module names from safetensors weights.
-
-        This scans the safetensors file to determine which modules actually have
-        LoRA weights, rather than relying on the declared target_modules in the
-        config (which may include modules that were excluded during training).
-
-        Returns:
-            Set of module names that actually have LoRA weights, or None if
-            safetensors file not found.
-        """
-        weights_dir = self._get_weights_dir()
-        if weights_dir is None:
-            # _get_weights_dir already logged the warning
-            return None
-
-        safetensors_path = self._find_safetensors_file(weights_dir)
-        if safetensors_path is None:
-            logger.warning(
-                f"No safetensors file found in {weights_dir}, "
-                "falling back to declared target_modules"
-            )
-            return None
-
-        modules = set()
-        with safe_open(safetensors_path, framework="pt") as f:
-            for key in f.keys():
-                module_name = get_target_module_name(key, set(self.target_modules))
-                modules.add(module_name)
-
-        if not modules:
-            logger.warning(
-                "No LoRA modules found in safetensors, "
-                "falling back to declared target_modules"
-            )
-            return None
-
-        logger.debug(f"Computed effective target modules from safetensors: {modules}")
-        return modules
-
-    def _get_weights_dir(self) -> Optional[str]:
-        """Get the directory containing adapter weights."""
-        if os.path.isdir(self.path):
-            return self.path
-        # For HF repo IDs, download the safetensors file to inspect it.
-        # This is cached by huggingface_hub, so it won't be re-downloaded later.
-        try:
-            return snapshot_download(
-                self.path, allow_patterns=["adapter_model.safetensors"]
-            )
-        except Exception as e:
-            logger.warning(
-                f"Could not download adapter_model.safetensors for '{self.path}'. "
-                f"Falling back to declared target_modules. Error: {e}"
-            )
-            return None
-
-    def _find_safetensors_file(self, weights_dir: str) -> Optional[str]:
-        """Find the safetensors file in the weights directory."""
-        path = os.path.join(weights_dir, "adapter_model.safetensors")
-        if os.path.exists(path):
-            return path
-        return None
 
     def filter_added_tokens(self, base_vocab_size: int) -> None:
         """

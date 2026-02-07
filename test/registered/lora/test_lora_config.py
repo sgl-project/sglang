@@ -134,23 +134,5 @@ class TestLoRAConfigFilterAddedTokens(unittest.TestCase):
         self.assertEqual(config.added_tokens_config, {"<real>": 32000})
 
 
-class TestLoRAConfigEffectiveTargetModules(unittest.TestCase):
-    """Test cases for LoRAConfig.effective_target_modules attribute."""
-
-    def test_from_dict_has_no_effective_modules(self):
-        """Test that from_dict creates config without effective_target_modules."""
-        config_dict = {
-            "target_modules": ["q_proj", "k_proj", "v_proj"],
-            "r": 8,
-            "lora_alpha": 16,
-        }
-        config = LoRAConfig.from_dict(config_dict)
-
-        # When created from dict (no path), effective_target_modules should be None
-        self.assertIsNone(config.effective_target_modules)
-        # target_modules should still be set
-        self.assertEqual(config.target_modules, ["q_proj", "k_proj", "v_proj"])
-
-
 if __name__ == "__main__":
     unittest.main(warnings="ignore")
