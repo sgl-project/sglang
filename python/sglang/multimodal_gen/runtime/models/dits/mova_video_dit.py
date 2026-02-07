@@ -288,7 +288,6 @@ class DiTBlock(nn.Module):
         self.ffn = MLP(dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh")
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         self.mlp_residual = MulAdd()
-        self.register_buffer("null_shift_scale", torch.zeros(1), persistent=False)
 
     def forward(self, x, context, t_mod, freqs):
         has_seq = len(t_mod.shape) == 4
@@ -311,8 +310,11 @@ class DiTBlock(nn.Module):
         input_x = self.norm1(x, shift_msa, scale_msa)
         attn_output = self.self_attn(input_x, freqs)
         # Fused: x = x + gate_msa * attn_output, then layernorm (affine, no scale/shift modulation)
+        null_shift = null_scale = torch.zeros(
+            (1,), device=x.device, dtype=x.dtype
+        )
         norm_x, x = self.self_attn_residual_norm(
-            x, attn_output, gate_msa, self.null_shift_scale, self.null_shift_scale
+            x, attn_output, gate_msa, null_shift, null_scale
         )
         norm_x, x = norm_x.to(orig_dtype), x.to(orig_dtype)
         # 2. Cross-attention
