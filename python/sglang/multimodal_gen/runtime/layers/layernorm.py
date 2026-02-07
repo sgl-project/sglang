@@ -319,6 +319,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
             fused_scale_residual_norm_scale_shift,
         )
 
+        if isinstance(gate, int) and gate != 1:
+            raise ValueError(
+                f"Only gate value of 1 is supported for int type, but got {gate}"
+            )
+
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),
             x.contiguous(),

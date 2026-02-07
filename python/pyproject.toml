@@ -129,6 +129,7 @@ test = [
   "bitsandbytes",
   "expecttest",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
   "parameterized",
