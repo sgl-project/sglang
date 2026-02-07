@@ -23,6 +23,7 @@ _flashinfer_gdn_available = None
 _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
+_flashinfer_gated_delta_rule_decode_pooled = None
 
 # Path to the custom FlashInfer repo with GDN kernels
 _FLASHINFER_GDN_REPO_PATH = "/lustre/raplab/client/xutingz/workspace/gitsrc/flashinfer"
@@ -33,7 +34,7 @@ def _get_flashinfer_gdn_kernels():
     
     Uses the custom FlashInfer repo at _FLASHINFER_GDN_REPO_PATH for GDN kernels.
     """
-    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
+    global _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_decode_pooled
     if _flashinfer_gdn_available is None:
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
@@ -44,13 +45,14 @@ def _get_flashinfer_gdn_kernels():
                 logger.info(f"Using FlashInfer GDN kernels from: {_FLASHINFER_GDN_REPO_PATH}")
             
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
-            from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode_pretranspose
+            from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode_pretranspose, gated_delta_rule_decode_pretranspose_pooled
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
             # Use pretranspose (K-last / V-major) decode kernel to match
             # the K-last pool layout [pool, HV, V, K]
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
+            _flashinfer_gated_delta_rule_decode_pooled = gated_delta_rule_decode_pretranspose_pooled
             # Check if SM90+ (required for FlashInfer GDN kernels)
             _flashinfer_gdn_available = (
                 torch.cuda.is_available()
@@ -62,13 +64,14 @@ def _get_flashinfer_gdn_kernels():
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
             _flashinfer_gated_delta_rule_decode = None
-    return _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
+            _flashinfer_gated_delta_rule_decode_pooled = None
+    return _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode, _flashinfer_gated_delta_rule_decode_pooled
 
 
 # Legacy alias for backward compatibility
 def _get_flashinfer_gdn_prefill():
     """Lazy import for FlashInfer GDN prefill kernel (legacy alias)."""
-    available, prefill_fn, _, _ = _get_flashinfer_gdn_kernels()
+    available, prefill_fn, _, _, _ = _get_flashinfer_gdn_kernels()
     return available, prefill_fn
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -939,7 +942,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_chunk_gated_delta_rule = None
         self._flashinfer_gated_delta_rule_mtp = None
         if self.ssm_k_last:
-            flashinfer_available, flashinfer_prefill, flashinfer_mtp, flashinfer_decode = _get_flashinfer_gdn_kernels()
+            flashinfer_available, flashinfer_prefill, flashinfer_mtp, flashinfer_decode, flashinfer_decode_pooled = _get_flashinfer_gdn_kernels()
             if not flashinfer_available:
                 raise RuntimeError(
                     "K-last SSM layout is enabled but FlashInfer GDN kernels are unavailable. "
@@ -960,7 +963,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._flashinfer_chunk_gated_delta_rule = flashinfer_prefill
             self._flashinfer_gated_delta_rule_mtp = flashinfer_mtp
             self._flashinfer_gated_delta_rule_decode = flashinfer_decode
-            logger.info("K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels")
+            self._flashinfer_gated_delta_rule_decode_pooled = flashinfer_decode_pooled
+            logger.info("K-last mode: Using FlashInfer GDN prefill, decode (pooled) and MTP (verify) kernels")
             
             # Warmup MTP kernel to avoid JIT compilation overhead during serving
             # The MTP kernel has ~4s JIT compilation on first call
@@ -1157,30 +1161,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         if self.ssm_k_last:
-            # K-last decode uses FlashInfer GDN pretranspose decode kernel.
+            # K-last decode uses FlashInfer GDN pretranspose pooled decode kernel.
             # State layout: [pool_size+1, HV, V, K] (K-last / V-major)
-            # FlashInfer pretranspose expects [B, HV, V, K] so we gather the states
+            # The pooled kernel reads/writes state directly from the pool via indices,
+            # eliminating the need for gather before and index_copy_ after.
             num_value_heads = value.shape[2]
             batch_size = cache_indices.shape[0]
 
             # Remap padding slots (PAD_SLOT_ID = -1) to the sentinel slot at
             # the end of the pool.  CUDA graph replay may set padding entries to
             # -1 when the real batch is smaller than the captured batch size.
-            # index_copy_ does not support negative indices, so we redirect them
-            # to the sentinel slot (pool_size, the extra +1 entry, always zeros).
-            # This is safe: the sentinel is never allocated to real requests, so
-            # reading/writing it is a no-op from a correctness standpoint.
+            # The sentinel slot (pool_size, the extra +1 entry) is always zeros.
             ssm_cache_indices = torch.where(
                 cache_indices >= 0,
                 cache_indices,
                 ssm_states.shape[0] - 1,
             )
 
-            # Gather states for this batch: [pool_size+1, HV, V, K] -> [B, HV, V, K]
-            gathered_state = ssm_states[ssm_cache_indices]
-
-            # FlashInfer pretranspose decode expects:
-            # q, k: [B, 1, H, K], v: [B, 1, HV, V], state: [B, HV, V, K]
+            # FlashInfer pretranspose pooled decode expects:
+            # q, k: [B, 1, H, K], v: [B, 1, HV, V]
+            # initial_state: [pool_size+1, HV, V, K] (the full pool)
+            # initial_state_indices: [B] int32 (maps each batch to pool slot)
             # a, b: [B, 1, HV]
             query_fi = query.view(batch_size, 1, num_heads, head_k_dim)
             key_fi = key.view(batch_size, 1, num_heads, head_k_dim)
@@ -1188,12 +1189,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a_fi = a.view(batch_size, 1, num_value_heads)
             b_fi = b.view(batch_size, 1, num_value_heads)
 
-            # Call FlashInfer GDN decode kernel
-            output_fi, updated_state = self._flashinfer_gated_delta_rule_decode(
+            # Call FlashInfer GDN pooled decode kernel (zero-copy pool indexing)
+            output_fi, _ = self._flashinfer_gated_delta_rule_decode_pooled(
                 q=query_fi,
                 k=key_fi,
                 v=value_fi,
-                state=gathered_state,
+                initial_state=ssm_states,
+                initial_state_indices=ssm_cache_indices.to(torch.int32),
                 A_log=A_log.detach(),
                 a=a_fi,
                 dt_bias=dt_bias.detach(),
@@ -1202,9 +1204,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 output=None,
                 use_qk_l2norm=True,
             )
-
-            # Write updated state back to pool
-            ssm_states.index_copy_(0, ssm_cache_indices.to(torch.int64), updated_state.to(ssm_states.dtype))
 
             # Reshape output: [B, 1, HV, V] -> [1, B, HV, V]
             core_attn_out = output_fi.view(1, batch_size, num_value_heads, head_v_dim)
