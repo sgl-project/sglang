@@ -37,7 +37,9 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_cuda,
     is_port_available,
+    is_xpu,
     kill_process_tree,
     retry,
 )
@@ -126,6 +128,7 @@ DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST_NEXTN = "lmsys/DeepSeek-V3-NextN"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -204,7 +207,7 @@ else:
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3600  # Match H200 timeout for large models
 
 if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
@@ -1495,6 +1498,10 @@ def run_bench_one_batch(model, other_args):
         command += ["--model-path", model]
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+    prefill_latency = None
+    decode_throughput = None
+    decode_latency = None
+
     try:
         stdout, stderr = process.communicate()
         output = stdout.decode(errors="backslashreplace")
@@ -1516,6 +1523,12 @@ def run_bench_one_batch(model, other_args):
             decode_throughput = float(match.group("throughput"))
     finally:
         kill_process_tree(process.pid)
+
+    if prefill_latency is None or decode_throughput is None or decode_latency is None:
+        raise RuntimeError(
+            f"Failed to parse benchmark output. "
+            f"prefill_latency={prefill_latency}, decode_throughput={decode_throughput}, decode_latency={decode_latency}"
+        )
 
     return prefill_latency, decode_throughput, decode_latency
 
@@ -1652,6 +1665,7 @@ def run_and_check_memory_leak(
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
+    api_key: Optional[str] = None,
 ):
     other_args = [
         "--chunked-prefill-size",
@@ -1679,6 +1693,7 @@ def run_and_check_memory_leak(
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         other_args=other_args,
         return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
     )
 
     # Launch a thread to stream the output
@@ -2228,6 +2243,44 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def get_gpu_count():
+    if get_device() == "cpu":
+        gpu_count = 0
+    else:
+        gpu_count = torch.accelerator.device_count()
+    return gpu_count
+
+
+def empty_gpu_cache():
+    """
+    Unified empty_cache for PyTorch 2.8 (no torch.accelerator)
+    and PyTorch 2.9+ (where torch.accelerator.empty_cache() exists).
+    """
+    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "empty_cache"):
+        return torch.accelerator.empty_cache()
+
+    # CUDA
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        return
+
+    # XPU (Intel)
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch.xpu.empty_cache()
+        return
+
+    return
+
+
+def get_gpu_memory_gb():
+    if is_cuda():
+        return torch.cuda.device_memory_used() / 1024**3
+    elif is_xpu():
+        return torch.xpu.memory_allocated() / 1024**3
+    else:
+        return 0
 
 
 def run_doctests(obj: Callable[..., Any] | ModuleType):
