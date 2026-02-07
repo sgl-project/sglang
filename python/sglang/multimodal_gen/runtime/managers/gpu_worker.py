@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -186,6 +187,21 @@ class GPUWorker:
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
 
+            # Save output to file and return file path only if requested. Avoid the serialization
+            # and deserialization overhead between scheduler_client and gpu_worker.
+            if req.save_output and req.return_file_paths_only:
+                output_paths = save_outputs(
+                    output_batch.output,
+                    req.data_type,
+                    req.fps,
+                    True,
+                    lambda idx: req.output_file_path(len(output_batch.output), idx),
+                    audio=output_batch.audio,
+                    audio_sample_rate=output_batch.audio_sample_rate,
+                )
+                output_batch.output_file_paths = output_paths
+                output_batch.output = None
+
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
@@ -198,8 +214,7 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
-        finally:
-            return output_batch
+        return output_batch
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
