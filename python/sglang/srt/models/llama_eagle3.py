@@ -37,82 +37,31 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.llama import (
-    LlamaDecoderLayer,
-    LlamaForCausalLM,
-    LlamaMLP,
-)
+from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
-class BasicDecoderLayer(LlamaDecoderLayer):
-    """
-    The traditional decoder layer.
-    """
-
+class Eagle3LlamaDecoderLayer(LlamaDecoderLayer):
     def __init__(
         self,
         config: LlamaConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-    ):
-        super().__init__(config, layer_id, quant_config, prefix)
-        self.hidden_size = config.hidden_size
-
-        if config.model_type == "llama4_text":
-            inter_size = config.intermediate_size_mlp
-        else:
-            inter_size = config.intermediate_size
-        self.mlp = LlamaMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
-        )
-
-        self.input_layernorm = None  # not needed for decoder
-        self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Basic decoder layer forward pass with self-attention and mlp.
-        """
-        residual = hidden_states
-        hidden_states = self.hidden_norm(hidden_states)
-
-        # Self Attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
-        # Fully Connected
-        hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
-
-
-class LlamaDecoderLayer(LlamaDecoderLayer):
-    def __init__(
-        self,
-        config: LlamaConfig,
-        layer_id: int = 0,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
+        fused_input=True,
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
+        # fused_input denotes whether this decoder layer will
+        # also take embeddings as input
+        self.fused_input = fused_input
+
+        if fused_input:
+            hidden_size = 2 * self.hidden_size
+        else:
+            hidden_size = self.hidden_size
 
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
-            2 * self.hidden_size,
+            hidden_size,
             self.self_attn.head_dim,
             self.self_attn.total_num_heads,
             self.self_attn.total_num_kv_heads,
@@ -135,17 +84,19 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     def forward(
         self,
         positions: torch.Tensor,
-        embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        embeds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         residual = hidden_states
-        embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
 
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        if self.fused_input:
+            embeds = self.input_layernorm(embeds)
+            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -198,7 +149,8 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(
+        # only requires fusing features if this is the first decoder
+        self.midlayer = Eagle3LlamaDecoderLayer(
             config,
             0,
             quant_config=quant_config,
@@ -207,11 +159,12 @@ class LlamaModel(nn.Module):
         if self.num_hidden_layers > 1:
             self.additional_layers = nn.ModuleList(
                 [
-                    BasicDecoderLayer(
+                    Eagle3LlamaDecoderLayer(
                         config,
                         i,
                         quant_config=quant_config,
                         prefix=add_prefix(f"midlayers.{i}", prefix),
+                        fused_input=False,
                     )
                     for i in range(1, config.num_hidden_layers)
                 ]
@@ -245,19 +198,19 @@ class LlamaModel(nn.Module):
 
         hidden_states, residual = self.midlayer(
             positions,
-            embeds,
             hidden_states,
             forward_batch,
             None,
+            embeds,
         )
 
         if self.num_hidden_layers > 1:
             for layer in self.additional_layers:
                 hidden_states, residual = layer(
                     positions,
-                    hidden_states + residual, # compatible with SpecForge
+                    hidden_states + residual,  # compatible with SpecForge
                     forward_batch,
-                    residual,
+                    None,
                 )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
