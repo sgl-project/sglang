@@ -44,11 +44,13 @@ def _get_flashinfer_gdn_kernels():
                 logger.info(f"Using FlashInfer GDN kernels from: {_FLASHINFER_GDN_REPO_PATH}")
             
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
-            from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode
+            from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode_pretranspose
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
-            _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode
+            # Use pretranspose (K-last / V-major) decode kernel to match
+            # the K-last pool layout [pool, HV, V, K]
+            _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
             # Check if SM90+ (required for FlashInfer GDN kernels)
             _flashinfer_gdn_available = (
                 torch.cuda.is_available()
@@ -1071,7 +1073,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             
-            # State in K-last layout: [B, HV, K, V]
+            # State in K-last layout: [B, HV, V, K] (V-major / pretranspose)
             state = torch.randn(batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
             
             # Run warmup call
@@ -1155,9 +1157,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         if self.ssm_k_last:
-            # K-last decode uses FlashInfer GDN decode kernel directly.
-            # State layout: [pool_size+1, HV, K, V] (K-last)
-            # FlashInfer expects [B, HV, K, V] so we gather the states
+            # K-last decode uses FlashInfer GDN pretranspose decode kernel.
+            # State layout: [pool_size+1, HV, V, K] (K-last / V-major)
+            # FlashInfer pretranspose expects [B, HV, V, K] so we gather the states
             num_value_heads = value.shape[2]
             batch_size = cache_indices.shape[0]
 
@@ -1174,11 +1176,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states.shape[0] - 1,
             )
 
-            # Gather states for this batch: [pool_size+1, HV, K, V] -> [B, HV, K, V]
+            # Gather states for this batch: [pool_size+1, HV, V, K] -> [B, HV, V, K]
             gathered_state = ssm_states[ssm_cache_indices]
 
-            # FlashInfer decode expects:
-            # q, k: [B, 1, H, K], v: [B, 1, HV, V], state: [B, HV, K, V]
+            # FlashInfer pretranspose decode expects:
+            # q, k: [B, 1, H, K], v: [B, 1, HV, V], state: [B, HV, V, K]
             # a, b: [B, 1, HV]
             query_fi = query.view(batch_size, 1, num_heads, head_k_dim)
             key_fi = key.view(batch_size, 1, num_heads, head_k_dim)
