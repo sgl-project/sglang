@@ -276,6 +276,60 @@ class LayerwiseOffloadManager:
         for layer_idx in list(self._gpu_layers):
             self.sync_layer_to_cpu(layer_idx)
 
+    @torch.compiler.disable
+    def update_cpu_weights(self, weight_dict: Dict[str, torch.Tensor]) -> Set[str]:
+        """Update consolidated CPU buffers with new weights.
+
+        For layers currently on GPU, the live GPU parameter is also updated
+        so the change takes effect immediately.
+
+        Args:
+            weight_dict: Mapping of parameter name to new weight tensor.
+
+        Returns:
+            Set of parameter names that were successfully updated.
+
+        Raises:
+            ValueError: If a weight's shape does not match the recorded
+                metadata (i.e. the real shape, not the placeholder shape).
+        """
+        if not self.enabled:
+            return set()
+
+        updated_names: Set[str] = set()
+        for name, loaded_weight in weight_dict.items():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None:
+                continue
+            meta_layer = self._weight_metadata.get(layer_idx)
+            if meta_layer is None or name not in meta_layer:
+                continue
+
+            meta = meta_layer[name]
+            if tuple(meta["shape"]) != tuple(loaded_weight.shape):
+                raise ValueError(
+                    f"Shape mismatch for {name}: "
+                    f"expected={tuple(meta['shape'])}, "
+                    f"loaded={tuple(loaded_weight.shape)}"
+                )
+
+            dtype = meta["dtype"]
+            offset = meta["offset"]
+            numel = meta["numel"]
+            cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+            cpu_buffer[offset : offset + numel].copy_(
+                loaded_weight.to(dtype=dtype).flatten()
+            )
+
+            # If this layer is currently on GPU, update the live parameter.
+            if layer_idx in self._gpu_layers:
+                target = self.get_target_with_name(name)
+                target.data.copy_(loaded_weight.to(dtype=target.dtype))
+
+            updated_names.add(name)
+
+        return updated_names
+
     def register_forward_hooks(self) -> None:
         if not self.enabled:
             return

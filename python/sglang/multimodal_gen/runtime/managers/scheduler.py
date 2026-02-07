@@ -20,8 +20,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
 )
+from sglang.multimodal_gen.runtime.loader.weights_updater import (
+    UpdateWeightsFromDiskReq,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
-from sglang.multimodal_gen.runtime.managers.io_struct import UpdateWeightsFromDiskReq
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (

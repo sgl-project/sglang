@@ -106,7 +106,11 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 
 **Python Engine API:** `engine.update_weights_from_disk(model_path, load_format=None)`
 
-**Diffusion engine (SGLang-D):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint. The update is all-or-nothing with automatic rollback on failure. When layerwise offload (`--dit-layerwise-offload`) is enabled, offload is temporarily disabled during the update, which causes a temporary GPU memory peak before returning to normal offloaded memory usage.
+**Diffusion engine (SGLang-D):** The diffusion engine exposes the same `POST /update_weights_from_disk` endpoint with the following behavior:
+
+- **All-or-nothing with rollback:** if any module fails to load, all previously updated modules are rolled back to the original weights by reloading from the original model path. No partial updates are left behind. If rollback itself fails, the exception propagates so the caller knows the model is in an inconsistent state.
+- **Offload-aware:** when layerwise offload (`--dit-layerwise-offload`) is enabled, the diffusion offload manager replaces GPU parameters with small `torch.empty((1,))` placeholders while real weights live in consolidated pinned CPU buffers. A naive `param.data.copy_()` would fail with a shape mismatch. Instead, the updater dynamically detects active offload managers and writes new weights directly into their CPU buffers, bypassing the placeholders entirely. For any layer that happens to be prefetched on GPU at update time, the live GPU tensor is also updated so the change takes effect immediately. This requires no extra GPU memory and does not disturb the offload state.
+- **DTensor-aware:** parameters distributed via `torch.distributed.tensor` (tensor parallelism) are updated through `distribute_tensor` so that each shard is correctly placed on the right device mesh.
 
 **Request body:**
 
