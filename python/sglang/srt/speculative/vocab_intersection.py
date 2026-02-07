@@ -36,11 +36,55 @@ class VocabIntersectionMapper:
         self.draft_vocab_mask = self._create_draft_vocab_mask()
         self.draft_to_target_tensor = self._create_draft_to_target_tensor()
 
+        self._log_vocab_info(draft_tokenizer, target_tokenizer)
+
+    def _log_vocab_info(self, draft_tokenizer, target_tokenizer):
+        draft_only_size = self.draft_vocab_size - self.intersection_size
+        target_only_size = self.target_vocab_size - self.intersection_size
+        ratio = 100 * self.intersection_size / self.draft_vocab_size
+
         logger.info(
-            f"VocabIntersectionMapper: draft={self.draft_vocab_size}, "
-            f"target={self.target_vocab_size}, "
-            f"intersection={self.intersection_size} "
-            f"({100 * self.intersection_size / self.draft_vocab_size:.1f}%)"
+            f"Vocab intersection stats:\n"
+            f"  draft vocab:        {self.draft_vocab_size}\n"
+            f"  target vocab:       {self.target_vocab_size}\n"
+            f"  intersection:       {self.intersection_size} ({ratio:.1f}% of draft)\n"
+            f"  draft-only tokens:  {draft_only_size}\n"
+            f"  target-only tokens: {target_only_size}"
+        )
+
+        draft_vocab = draft_tokenizer.get_vocab()
+        target_vocab = target_tokenizer.get_vocab()
+
+        draft_only_tokens = set(draft_vocab.keys()) - self.shared_tokens
+        target_only_tokens = set(target_vocab.keys()) - self.shared_tokens
+
+        def _sample(token_set, n=20):
+            # pick short, printable tokens first so the log is readable
+            printable = sorted(
+                (t for t in token_set if t.isprintable() and len(t) > 0),
+                key=len,
+            )
+            picked = printable[:n]
+            if len(picked) < n:
+                rest = [t for t in token_set if t not in set(picked)]
+                picked.extend(rest[: n - len(picked)])
+            return picked
+
+        shared_sample = _sample(self.shared_tokens)
+        draft_only_sample = _sample(draft_only_tokens)
+        target_only_sample = _sample(target_only_tokens)
+
+        logger.info(
+            f"Sample shared tokens ({len(shared_sample)}/{self.intersection_size}): "
+            f"{shared_sample}"
+        )
+        logger.info(
+            f"Sample draft-only tokens ({len(draft_only_sample)}/{draft_only_size}): "
+            f"{draft_only_sample}"
+        )
+        logger.info(
+            f"Sample target-only tokens ({len(target_only_sample)}/{target_only_size}): "
+            f"{target_only_sample}"
         )
 
     def _compute_vocab_intersection(

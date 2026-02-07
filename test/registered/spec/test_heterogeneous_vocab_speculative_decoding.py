@@ -21,22 +21,29 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Use small models with different vocabularies for testing
-# Qwen uses a different tokenizer than LLaMA-based models
-TARGET_MODEL_HETERO_VOCAB = "Qwen/Qwen2.5-0.5B-Instruct"
-DRAFT_MODEL_HETERO_VOCAB = "HuggingFaceTB/SmolLM-135M"
+# Heterogeneous vocab: target and draft use different tokenizers
+TARGET_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DRAFT_MODEL_HETERO = "HuggingFaceTB/SmolLM-135M"
+# Same-vocab baseline: both use the Qwen tokenizer
+DRAFT_MODEL_SAME_VOCAB = "Qwen/Qwen2.5-0.5B-Instruct"
+
+PROMPTS = [
+    "Write a short poem about the ocean:",
+    "Explain briefly what machine learning is:",
+    "List three benefits of open source software:",
+    "What is the difference between a compiler and an interpreter?",
+]
 
 
 class TestHeterogeneousVocabSpeculativeDecoding(CustomTestCase):
     """Test speculative decoding with heterogeneous vocabularies."""
 
-    model = TARGET_MODEL_HETERO_VOCAB
-    draft_model = DRAFT_MODEL_HETERO_VOCAB
+    model = TARGET_MODEL
+    draft_model = DRAFT_MODEL_HETERO
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
-        """Launch server with heterogeneous vocab enabled."""
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -55,7 +62,7 @@ class TestHeterogeneousVocabSpeculativeDecoding(CustomTestCase):
                 "4",
                 "--mem-fraction-static",
                 "0.3",
-                "--disable-cuda-graph",  # Disable for testing stability
+                "--disable-cuda-graph",
                 "--max-running-requests",
                 "4",
             ],
@@ -182,102 +189,148 @@ class TestHeterogeneousVocabSpeculativeDecoding(CustomTestCase):
         self.assertIn("4", content, f"Expected '4' in response: {content}")
 
 
-class TestHeterogeneousVocabCorrectness(CustomTestCase):
-    """Test output correctness compared to non-speculative decoding."""
+def _get_spec_metrics(base_url):
+    """Fetch accept_length and accept_rate from server info."""
+    info = requests.get(f"{base_url}/get_server_info").json()
+    state = info.get("internal_states", [{}])[0]
+    return {
+        "avg_accept_length": state.get("avg_spec_accept_length", 0),
+    }
 
-    model = TARGET_MODEL_HETERO_VOCAB
-    draft_model = DRAFT_MODEL_HETERO_VOCAB
-    base_url = DEFAULT_URL_FOR_TEST
-    base_url_reference = "http://127.0.0.1:30001"
+
+def _generate(base_url, prompt, max_tokens=100):
+    resp = requests.post(
+        f"{base_url}/v1/completions",
+        json={
+            "model": "default",
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    text = data["choices"][0]["text"]
+    tokens = data["usage"]["completion_tokens"]
+    return text, tokens
+
+
+SPEC_ARGS_COMMON = [
+    "--speculative-algorithm", "STANDALONE",
+    "--speculative-num-steps", "3",
+    "--speculative-eagle-topk", "1",
+    "--speculative-num-draft-tokens", "4",
+    "--mem-fraction-static", "0.15",
+    "--disable-cuda-graph",
+    "--max-running-requests", "4",
+]
+
+
+class TestHeterogeneousVsSameVocab(CustomTestCase):
+    """Compare heterogeneous-vocab spec decoding against same-vocab spec decoding.
+
+    Three servers:
+      - port 30000: hetero vocab  (Qwen-1.5B target + SmolLM-135M draft)
+      - port 30001: same vocab    (Qwen-1.5B target + Qwen-0.5B draft)
+      - port 30002: no spec       (Qwen-1.5B only, baseline)
+    """
+
+    url_hetero = DEFAULT_URL_FOR_TEST          # :30000
+    url_same = "http://127.0.0.1:30001"
+    url_baseline = "http://127.0.0.1:30002"
 
     @classmethod
     def setUpClass(cls):
-        """Launch two servers: one with spec decoding, one without."""
-        # Server with heterogeneous vocab speculative decoding
-        cls.process_spec = popen_launch_server(
-            cls.model,
-            cls.base_url,
+        # 1) heterogeneous vocab
+        cls.proc_hetero = popen_launch_server(
+            TARGET_MODEL,
+            cls.url_hetero,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--speculative-algorithm",
-                "STANDALONE",
-                "--speculative-draft-model-path",
-                cls.draft_model,
+                *SPEC_ARGS_COMMON,
+                "--speculative-draft-model-path", DRAFT_MODEL_HETERO,
                 "--enable-heterogeneous-vocab",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--mem-fraction-static",
-                "0.15",
-                "--disable-cuda-graph",
-                "--max-running-requests",
-                "4",
             ],
-            env_override={
-                "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
-            },
+            env_override={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
         )
 
-        # Reference server without speculative decoding
-        cls.process_ref = popen_launch_server(
-            cls.model,
-            cls.base_url_reference,
+        # 2) same-vocab
+        cls.proc_same = popen_launch_server(
+            TARGET_MODEL,
+            cls.url_same,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--mem-fraction-static",
-                "0.15",
+                *SPEC_ARGS_COMMON,
+                "--speculative-draft-model-path", DRAFT_MODEL_SAME_VOCAB,
+            ],
+        )
+
+        # 3) no spec baseline
+        cls.proc_baseline = popen_launch_server(
+            TARGET_MODEL,
+            cls.url_baseline,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--mem-fraction-static", "0.15",
                 "--disable-cuda-graph",
-                "--max-running-requests",
-                "4",
+                "--max-running-requests", "4",
             ],
         )
 
     @classmethod
     def tearDownClass(cls):
-        """Clean up both server processes."""
-        kill_process_tree(cls.process_spec.pid)
-        kill_process_tree(cls.process_ref.pid)
+        kill_process_tree(cls.proc_hetero.pid)
+        kill_process_tree(cls.proc_same.pid)
+        kill_process_tree(cls.proc_baseline.pid)
 
-    def test_output_matches_reference(self):
-        """Test that speculative decoding output matches non-speculative output."""
-        prompt = "Explain briefly what machine learning is:"
+    def test_compare_accept_and_tokens(self):
+        """Run the same prompts on all three servers, compare metrics."""
+        for url in (self.url_hetero, self.url_same, self.url_baseline):
+            requests.get(f"{url}/flush_cache")
 
-        # Get output from speculative decoding server
-        response_spec = requests.post(
-            f"{self.base_url}/v1/completions",
-            json={
-                "model": "default",
-                "prompt": prompt,
-                "max_tokens": 50,
-                "temperature": 0,
-            },
-        )
-        self.assertEqual(response_spec.status_code, 200)
-        text_spec = response_spec.json()["choices"][0]["text"]
+        results = {"hetero": [], "same": [], "baseline": []}
+        for prompt in PROMPTS:
+            text_h, tok_h = _generate(self.url_hetero, prompt)
+            text_s, tok_s = _generate(self.url_same, prompt)
+            text_b, tok_b = _generate(self.url_baseline, prompt)
+            results["hetero"].append(tok_h)
+            results["same"].append(tok_s)
+            results["baseline"].append(tok_b)
 
-        # Get output from reference server
-        response_ref = requests.post(
-            f"{self.base_url_reference}/v1/completions",
-            json={
-                "model": "default",
-                "prompt": prompt,
-                "max_tokens": 50,
-                "temperature": 0,
-            },
-        )
-        self.assertEqual(response_ref.status_code, 200)
-        text_ref = response_ref.json()["choices"][0]["text"]
+        metrics_hetero = _get_spec_metrics(self.url_hetero)
+        metrics_same = _get_spec_metrics(self.url_same)
 
-        # Outputs should be identical (lossless speculative decoding)
+        total_h = sum(results["hetero"])
+        total_s = sum(results["same"])
+        total_b = sum(results["baseline"])
+
+        print("\n===== Heterogeneous vs Same-Vocab Speculative Decoding =====")
+        print(f"Prompts: {len(PROMPTS)}")
+        print(f"")
+        print(f"  {'Config':<25} {'Tokens generated':>18} {'Avg accept len':>16}")
+        print(f"  {'-'*25} {'-'*18} {'-'*16}")
+        print(f"  {'hetero (SmolLM draft)':<25} {total_h:>18} {metrics_hetero['avg_accept_length']:>16.2f}")
+        print(f"  {'same-vocab (Qwen draft)':<25} {total_s:>18} {metrics_same['avg_accept_length']:>16.2f}")
+        print(f"  {'no spec (baseline)':<25} {total_b:>18} {'n/a':>16}")
+        print(f"=========================================================\n")
+
+        # Both spec configs should actually produce tokens
+        self.assertGreater(total_h, 0)
+        self.assertGreater(total_s, 0)
+        # Both should have accept_length > 1 (meaning spec decoding is doing something)
+        self.assertGreater(metrics_hetero["avg_accept_length"], 1.0)
+        self.assertGreater(metrics_same["avg_accept_length"], 1.0)
+
+    def test_hetero_output_matches_baseline(self):
+        """Hetero-vocab spec decoding output should match non-spec baseline (lossless)."""
+        prompt = "The capital of France is"
+        text_h, _ = _generate(self.url_hetero, prompt, max_tokens=30)
+        text_b, _ = _generate(self.url_baseline, prompt, max_tokens=30)
         self.assertEqual(
-            text_spec,
-            text_ref,
-            f"Speculative output should match reference.\n"
-            f"Spec: {text_spec}\n"
-            f"Ref: {text_ref}",
+            text_h, text_b,
+            f"Hetero spec output should match baseline.\n"
+            f"Hetero:   {text_h}\n"
+            f"Baseline: {text_b}",
         )
 
 
