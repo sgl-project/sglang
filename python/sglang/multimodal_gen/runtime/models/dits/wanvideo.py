@@ -739,8 +739,11 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             elementwise_affine=False,
             dtype=torch.float32,
         )
-        self.proj_out = nn.Linear(
-            inner_dim, config.out_channels * math.prod(config.patch_size)
+        self.proj_out = ColumnParallelLinear(
+            inner_dim,
+            config.out_channels * math.prod(config.patch_size),
+            bias=True,
+            gather_output=True,
         )
         self.scale_shift_table = nn.Parameter(
             torch.randn(1, 2, inner_dim) / inner_dim**0.5
@@ -891,7 +894,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
 
         hidden_states = self.norm_out(hidden_states, shift, scale)
-        hidden_states = self.proj_out(hidden_states)
+        hidden_states, _ = self.proj_out(hidden_states)
 
         hidden_states = hidden_states.reshape(
             batch_size,
