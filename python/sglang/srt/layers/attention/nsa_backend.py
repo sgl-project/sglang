@@ -1873,9 +1873,7 @@ class NativeSparseAttnBackend(
             assert (
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
-            # assert all(
-            #     x is not None for x in [q_rope, k_rope, cos_sin_cache]
-            # ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
+
             q, k, k_rope = self._quantize_and_rope_for_fp8(
                 q,
                 q_rope,
@@ -2002,7 +2000,7 @@ class NativeSparseAttnBackend(
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                # and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
+                and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
