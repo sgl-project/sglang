@@ -1621,7 +1621,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["cached_tokens"] = recv_obj.cached_tokens[i]
                 # Add detailed cache breakdown if available
                 if has_cached_tokens_details:
-                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[i]
+                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
+                        i
+                    ]
 
             # Add optional outputs (batch-level checks)
             if has_hidden_states:
