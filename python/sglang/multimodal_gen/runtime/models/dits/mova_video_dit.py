@@ -275,11 +275,7 @@ class DiTBlock(nn.Module):
         self.norm1 = LayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
         )
-        # Fused: residual + gate * self_attn_out → layernorm (with affine)
-        # Replaces the old norm3 (nn.LayerNorm) + GateModule for self-attention
-        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
-            dim, eps=eps, elementwise_affine=True, dtype=torch.float32
-        )
+        self.self_attn_norm = nn.LayerNorm(dim, eps=eps)
         # Fused: residual + 1 * cross_attn_out → layernorm + scale/shift
         # Replaces the old norm2 (LayerNormScaleShift) + residual add for cross-attention
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
@@ -306,23 +302,20 @@ class DiTBlock(nn.Module):
                 gate_mlp.squeeze(2),
             )
         orig_dtype = x.dtype
-        # 1. Self-attention
+        # 1. Self-attention, fuse:
+        # - layernorm(x) * (1 + scale_msa) + shift_msa
         input_x = self.norm1(x, shift_msa, scale_msa)
-        attn_output = self.self_attn(input_x, freqs)
-        # Fused: x = x + gate_msa * attn_output, then layernorm (affine, no scale/shift modulation)
-        null_shift = null_scale = torch.zeros((1,), device=x.device, dtype=x.dtype)
-        norm_x, x = self.self_attn_residual_norm(
-            x, attn_output, gate_msa, null_shift, null_scale
-        )
-        norm_x, x = norm_x.to(orig_dtype), x.to(orig_dtype)
-        # 2. Cross-attention
+        # 2. torch.compile may fuse mlp_residual and self_attn_norm
+        x = self.mlp_residual(self.self_attn(input_x, freqs), gate_msa, x)
+        norm_x = self.self_attn_norm(x)
+        # 3. Cross-attention, fuse:
+        # - x = x + 1 * cross_output
+        # - input_x = layernorm(x) * (1 + scale_mlp) + shift_mlp
         cross_output = self.cross_attn(norm_x, context)
-        # Fused: x = x + 1 * cross_output, then layernorm + scale/shift
         input_x, x = self.cross_attn_residual_norm(
             x, cross_output, 1, shift_mlp, scale_mlp
         )
-        input_x, x = input_x.to(orig_dtype), x.to(orig_dtype)
-        # 3. Feed-forward
+        # 4. Feed-forward
         x = self.mlp_residual(self.ffn(input_x), gate_mlp, x)
         x = x.to(orig_dtype)
         return x
