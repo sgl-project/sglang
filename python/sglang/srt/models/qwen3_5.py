@@ -233,6 +233,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.hidden_size,
             bias=False,
             input_is_parallel=True,
+            reduce_results=False,
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
