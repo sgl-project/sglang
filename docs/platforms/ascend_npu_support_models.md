@@ -49,6 +49,11 @@ You are welcome to enable various models based on your business requirements.
 | OpenBMB/MiniCPM3-4B                        | MiniCPM (v3, 4B)               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | Kimi/Kimi-K2-Thinking                      | Kimi                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | openai/gpt-oss-120b                        | GPTOSS                         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| allenai/OLMo-2-1124-7B-Instruct            | OLMo                           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| minimax/MiniMax-M2                         | MiniMax-M2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| upstage/SOLAR-10.7B-Instruct-v1.0          | Solar                          | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| bigcode/starcoder2-7b                      | StarCoder2                     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| arcee-ai/Trinity-Mini                      | Trinity (Nano, Mini)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Multimodal Language Models
 
@@ -75,6 +80,7 @@ You are welcome to enable various models based on your business requirements.
 | Kimi/Kimi-VL-A3B-Instruct                     | Kimi-VL (A3B)             | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | ZhipuAI/GLM-4.5V                              | GLM-4.5V (106B)           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | LLM-Research/Llama-3.2-11B-Vision-Instruct    | Llama 3.2 Vision (11B)    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| rednote-hilab/dots.ocr                        | DotsVLM-OCR               | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Embedding Models
 
@@ -89,13 +95,13 @@ You are welcome to enable various models based on your business requirements.
 
 ## Reward Models
 
-| Models                                      | Model Family              | A2 Supported                             |               A3 Supported               |
-|---------------------------------------------|---------------------------|------------------------------------------|:----------------------------------------:|
-| 	Skywork/Skywork-Reward-Llama-3.1-8B-v0.2   | Llama3.1 Reward           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	Shanghai_AI_Laboratory/internlm2-7b-reward | InternLM 2 Reward         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	Qwen/Qwen2.5-Math-RM-72B                   | Qwen2.5 Reward - Math     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	Howeee/Qwen2.5-1.5B-apeach                 | Qwen2.5 Reward - Sequence | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| 	AI-ModelScope/Skywork-Reward-Gemma-2-27B-v0.2    | Gemma 2-27B Reward  | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| Models                                         | Model Family              | A2 Supported                             |               A3 Supported               |
+|------------------------------------------------|---------------------------|------------------------------------------|:----------------------------------------:|
+| 	Skywork/Skywork-Reward-Llama-3.1-8B-v0.2      | Llama3.1 Reward           | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Shanghai_AI_Laboratory/internlm2-7b-reward    | InternLM 2 Reward         | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Qwen/Qwen2.5-Math-RM-72B                      | Qwen2.5 Reward - Math     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	Howeee/Qwen2.5-1.5B-apeach                    | Qwen2.5 Reward - Sequence | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| 	AI-ModelScope/Skywork-Reward-Gemma-2-27B-v0.2 | Gemma 2-27B Reward        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 
 ## Rerank Models
 
