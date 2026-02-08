@@ -96,11 +96,8 @@ class ObjectStorageModel:
         """
         from runai_model_streamer import pull_files as runai_pull_files
 
-        # Remove the directory if it exists
-        if os.path.exists(self.dir):
-            shutil.rmtree(self.dir)
-
         # Create the directory
+        # Do not cleanup the directory if it exists
         os.makedirs(self.dir, exist_ok=True)
 
         if not model_path.endswith("/"):
