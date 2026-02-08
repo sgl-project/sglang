@@ -308,9 +308,7 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         )
 
         target_dtype = next(self.transformer.parameters()).dtype
-        autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not server_args.disable_autocast
+        autocast_enabled = False
 
         pos_cond_kwargs = {"encoder_hidden_states": cond}
         neg_cond_kwargs = {}
