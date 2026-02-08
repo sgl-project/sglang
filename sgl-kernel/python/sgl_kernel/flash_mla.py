@@ -36,11 +36,14 @@ def get_mla_metadata(
         num_splits: (batch_size + 1), dtype torch.int32.
     """
     if is_fp8_kvcache and topk is None:
-        return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
-            cache_seqlens,
-            num_q_tokens_per_head_k,
-            num_heads_k,
+        raise NotImplementedError(
+            "FP8 KV cache with  is temporarily disabled on latest FlashMLA"
         )
+        # return torch.ops.sgl_kernel.get_mla_decoding_metadata_dense_fp8.default(
+        #     cache_seqlens,
+        #     num_q_tokens_per_head_k,
+        #     num_heads_k,
+        # )
     return torch.ops.sgl_kernel.get_mla_decoding_metadata.default(
         cache_seqlens,
         num_q_tokens_per_head_k,
@@ -95,19 +98,22 @@ def flash_mla_with_kvcache(
     ), "descale_q and descale_k should be both None or both not None"
 
     if indices is None and q.element_size() == 1:
-        out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
-            q,
-            k_cache,
-            head_dim_v,
-            cache_seqlens,
-            block_table,
-            softmax_scale,
-            causal,
-            tile_scheduler_metadata,
-            num_splits,
-            descale_q,
-            descale_k,
+        raise NotImplementedError(
+            "fwd_kvcache_mla_fp8 is temporarily disabled on latest FlashMLA"
         )
+        # out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_fp8.default(
+        #     q,
+        #     k_cache,
+        #     head_dim_v,
+        #     cache_seqlens,
+        #     block_table,
+        #     softmax_scale,
+        #     causal,
+        #     tile_scheduler_metadata,
+        #     num_splits,
+        #     descale_q,
+        #     descale_k,
+        # )
     else:
         out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla.default(
             q,
