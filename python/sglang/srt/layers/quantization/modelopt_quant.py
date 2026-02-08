@@ -467,10 +467,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ) -> None:
         """Creates and registers weights, weight scales, and input scales for FP8 quantization."""
-        del (
-            input_size,
-            output_size,
-        )  # Unused, but required by LinearMethodBase interface
         output_size_per_partition = sum(output_partition_sizes)
         weight_loader = extra_weight_attrs.get("weight_loader")
         weight_dtype = (
