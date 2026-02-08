@@ -24,10 +24,10 @@ import unittest
 import numpy as np
 import torch
 
-from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.entrypoints.openai.protocol import EmbeddingRequest
+from sglang.srt.managers.io_struct import EmbeddingReqInput, TokenizedEmbeddingReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
@@ -42,13 +42,16 @@ register_cuda_ci(
     suite="nightly-1-gpu",
 )
 
+
 class TestEmbeddingLoraSupport(unittest.TestCase):
     """Test LoRA support in embedding request structures."""
 
     def test_embedding_lora_fields(self):
         """Test LoRA fields exist and work correctly across all embedding structures."""
         # EmbeddingReqInput: fields exist, normalization expands single to batch, indexing works
-        req = EmbeddingReqInput(text=["Hello", "World"], lora_path="my-adapter", lora_id=["id1", "id2"])
+        req = EmbeddingReqInput(
+            text=["Hello", "World"], lora_path="my-adapter", lora_id=["id1", "id2"]
+        )
         self.assertIsNotNone(req.lora_path)
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, ["my-adapter", "my-adapter"])
@@ -62,11 +65,20 @@ class TestEmbeddingLoraSupport(unittest.TestCase):
 
         # TokenizedEmbeddingReqInput and EmbeddingRequest have lora fields
         tokenized = TokenizedEmbeddingReqInput(
-            input_text="Hello", input_ids=[1, 2, 3], image_inputs={},
-            token_type_ids=[], sampling_params=SamplingParams(), lora_id="my-lora-id",
+            input_text="Hello",
+            input_ids=[1, 2, 3],
+            image_inputs={},
+            token_type_ids=[],
+            sampling_params=SamplingParams(),
+            lora_id="my-lora-id",
         )
         self.assertEqual(tokenized.lora_id, "my-lora-id")
-        self.assertEqual(EmbeddingRequest(input="Hello", model="test", lora_path="adapter").lora_path, "adapter")
+        self.assertEqual(
+            EmbeddingRequest(
+                input="Hello", model="test", lora_path="adapter"
+            ).lora_path,
+            "adapter",
+        )
 
 
 class TestEmbeddingLoraHFComparison(CustomTestCase):
@@ -75,8 +87,8 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
     @classmethod
     def get_hf_embedding_with_lora(cls, model_path, lora_path, texts, torch_dtype):
         """Get embeddings from HuggingFace model with LoRA adapter."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
         # Load base model as CausalLM to match adapter's expected structure
         base_model = AutoModelForCausalLM.from_pretrained(
@@ -95,10 +107,7 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
 
         with torch.no_grad():
             inputs = tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                return_tensors="pt"
+                texts, padding=True, truncation=True, return_tensors="pt"
             ).to("cuda")
 
             # Access the inner model (CausalLM wraps the base model)
@@ -237,7 +246,9 @@ class TestEmbeddingLoraHFComparison(CustomTestCase):
 
         # Verify mixed results match individual runs
         print("\nVerifying mixed batch results:")
-        for i, (mixed_emb, lora_path) in enumerate(zip(mixed_embeddings, mixed_lora_paths)):
+        for i, (mixed_emb, lora_path) in enumerate(
+            zip(mixed_embeddings, mixed_lora_paths)
+        ):
             if lora_path is not None:
                 expected_emb = lora_embeddings[i]
                 label = "LoRA"
