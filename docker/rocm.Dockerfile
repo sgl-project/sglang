@@ -278,8 +278,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   printf "#!/usr/bin/env bash\nexec \"%s\" \"\$@\"\n" "$LLVM_CONFIG_PATH" > /usr/local/bin/llvm-config-16 && \
   chmod +x /usr/local/bin/llvm-config-16; \
   \
-  # TVM Python bits need Cython + z3 before configure
-  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver>=4.13.0"; \
+  # TVM Python bits need Cython + z3 before configure.
+  # Pin z3-solver==4.15.4.0: 4.15.4.0 has a manylinux wheel; 4.15.5.0 has no wheel and builds from source (fails: C++20 <format> needs GCC 14+, image has GCC 11).
+  "$VENV_PIP" install --no-cache-dir "cython>=0.29.36,<3.0" "apache-tvm-ffi>=0.1.6" "z3-solver==4.15.4.0"; \
   \
   # Clone + pin TileLang (bundled TVM), then build
   git clone --recursive "${TILELANG_REPO}" /opt/tilelang && \
