@@ -314,8 +314,8 @@ class VBenchDataset(BaseDataset):
             height=self.args.height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
-            num_inference_steps=getattr(self.args, "num_inference_steps", None),
-            guidance_scale=getattr(self.args, "guidance_scale", None),
+            num_inference_steps=self.args.num_inference_steps,
+            guidance_scale=self.args.guidance_scale,
             image_paths=image_paths,
         )
 
@@ -780,9 +780,9 @@ async def benchmark(args):
             api_url=f"{args.base_url}/start_profile"
         )
         if profile_output.success:
-            print(f"Profiler started: {profile_output.message}")
+            logger.info(f"Profiler started: {profile_output.message}")
         else:
-            print(f"Warning: Failed to start profiler: {profile_output.error}")
+            logger.warning(f"Failed to start profiler: {profile_output.error}")
 
     # Run benchmark
     pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
@@ -806,14 +806,14 @@ async def benchmark(args):
 
     # Stop profiler if it was started
     if args.profile:
-        print("Stopping profiler and saving traces...")
+        logger.info("Stopping profiler and saving traces...")
         profile_output = await async_request_profile(
             api_url=f"{args.base_url}/stop_profile"
         )
         if profile_output.success:
-            print(f"Profiler stopped: {profile_output.message}")
+            logger.info(f"Profiler stopped: {profile_output.message}")
         else:
-            print(f"Warning: Failed to stop profiler: {profile_output.error}")
+            logger.warning(f"Failed to stop profiler: {profile_output.error}")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration)

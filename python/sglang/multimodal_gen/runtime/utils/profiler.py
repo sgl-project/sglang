@@ -1,10 +1,12 @@
 import gzip
 import os
+from pathlib import Path
 
 import torch
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -38,12 +40,10 @@ class SGLDiffusionProfiler:
         self.full_profile = full_profile
         self.is_host = is_host
 
-        # Use environment variables with fallback to parameters
-        self.log_dir = log_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        self.log_dir = log_dir or envs.SGLANG_TORCH_PROFILER_DIR.get()
 
-        # Read from environment variables, allow parameter override
-        env_with_stack = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "false")
-        env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "false")
+        env_with_stack = envs.SGLANG_PROFILE_WITH_STACK.get()
+        env_record_shapes = envs.SGLANG_PROFILE_RECORD_SHAPES.get()
 
         self.with_stack = with_stack if with_stack is not None else env_with_stack
         self.record_shapes = (
@@ -107,7 +107,7 @@ class SGLDiffusionProfiler:
 
         def _default() -> list[torch.profiler.ProfilerActivity]:
             ret = [torch.profiler.ProfilerActivity.CPU]
-            if torch.cuda.is_available():
+            if current_platform.is_cuda_alike():
                 ret.append(torch.profiler.ProfilerActivity.CUDA)
             return ret
 
@@ -123,7 +123,7 @@ class SGLDiffusionProfiler:
             if s == "cpu":
                 use_cpu = True
             elif s in ("gpu", "cuda"):
-                if torch.cuda.is_available():
+                if current_platform.is_cuda_alike():
                     use_cuda = True
                 else:
                     logger.warning(
@@ -169,7 +169,7 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        if torch.cuda.is_available():
+        if current_platform.is_cuda_alike():
             torch.cuda.synchronize()
         self.profiler.stop()
 
@@ -194,7 +194,7 @@ class SGLDiffusionProfiler:
             else:
                 filename = f"{self.request_id}-rank-{self.rank}.trace.json.gz"
 
-            trace_path = os.path.abspath(os.path.join(self.log_dir, filename))
+            trace_path = str(Path(self.log_dir, filename).resolve())
             self.profiler.export_chrome_trace(trace_path)
 
             if self._check_trace_integrity(trace_path):

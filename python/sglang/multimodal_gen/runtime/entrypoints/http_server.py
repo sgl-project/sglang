@@ -13,20 +13,24 @@ from fastapi.responses import ORJSONResponse, Response
 from pydantic import BaseModel
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    StartProfileReq,
+    StopProfileReq,
+    build_sampling_params,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -150,29 +154,21 @@ async def start_profile(request: Request, obj: Optional[ProfileReqInput] = None)
         if obj is None:
             obj = ProfileReqInput()
 
-        output_dir = obj.output_dir or os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        output_dir = obj.output_dir or envs.SGLANG_TORCH_PROFILER_DIR.get()
 
-        # Generate unified profile_id (similar to LLM implementation)
         profile_id = str(int(time_module.time()))
 
-        # Read env vars for with_stack and record_shapes
-        env_with_stack = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "false")
-        env_record_shapes = get_bool_env_var("SGLANG_PROFILE_RECORD_SHAPES", "false")
-
-        with_stack = obj.with_stack if obj.with_stack is not None else env_with_stack
-        record_shapes = (
-            obj.record_shapes if obj.record_shapes is not None else env_record_shapes
-        )
-
-        # 1. Start profiler in HTTP Server process
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_world_rank,
-        )
+        with_stack = obj.with_stack or envs.SGLANG_PROFILE_WITH_STACK.get()
+        record_shapes = obj.record_shapes or envs.SGLANG_PROFILE_RECORD_SHAPES.get()
 
         try:
             rank = get_world_rank()
         except Exception:
+            logger.warning("Failed to get world rank, defaulting to 0")
             rank = 0
+
+        # Lazy import to reduce import time (see issue #10492)
+        from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 
         http_profiler = SGLDiffusionProfiler(
             request_id=profile_id,
@@ -188,11 +184,6 @@ async def start_profile(request: Request, obj: Optional[ProfileReqInput] = None)
         )
         _global_profiler_state["profiler"] = http_profiler
         _global_profiler_state["profile_id"] = profile_id
-
-        # 2. Start profiler in GPU Worker process via ZMQ
-        from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-            StartProfileReq,
-        )
 
         start_req = StartProfileReq(
             output_dir=output_dir,
@@ -244,11 +235,6 @@ async def stop_profile():
         profiler = _global_profiler_state["profiler"]
         if profiler is not None:
             profiler.stop(export_trace=True, dump_rank=None)  # Save for all ranks
-
-        # 2. Stop profiler in GPU Worker process via ZMQ
-        from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-            StopProfileReq,
-        )
 
         stop_req = StopProfileReq(export_trace=True)
         try:
