@@ -32,6 +32,18 @@ Requires
 make build
 ```
 
+### Limit build resource usage (CPU / parallelism)
+
+By default, `make build` uses all available CPU cores. You can override build parallelism and NVCC compile threads:
+
+```bash
+# Limit parallel jobs (controls both make and cmake parallelism)
+make build MAX_JOBS=2
+
+# Additionally limit NVCC internal threads (reduces CPU and peak memory)
+make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
+```
+
 ## Contribution
 
 ### Steps to add a new kernel:

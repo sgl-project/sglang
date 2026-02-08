@@ -17,17 +17,37 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["default"],
-    HWBackend.AMD: ["stage-a-test-1"],
+    HWBackend.CPU: ["default", "stage-a-cpu-only"],
+    HWBackend.AMD: [
+        "stage-a-test-1-amd",
+        "stage-b-test-small-1-gpu-amd",
+        "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-8-gpu-35x-disaggregation-amd",
+        "stage-b-test-large-1-gpu-amd",
+        "stage-b-test-large-2-gpu-amd",
+        "stage-c-test-large-8-gpu-amd-mi35x",
+    ],
     HWBackend.CUDA: [
         "stage-a-test-1",
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
-        "stage-c-test-large-4-gpu",
-        "stage-b-test-4-gpu-b200",
+        "stage-c-test-4-gpu-h100",
+        "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-gb200",
+        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-8-gpu-h20",
+        "stage-c-test-8-gpu-h200",
+        "stage-c-test-8-gpu-b200",
+        "stage-c-test-deepep-8-gpu-h200",
     ],
-    HWBackend.NPU: [],
+    HWBackend.NPU: [
+        "stage-a-test-1",
+        "stage-b-test-1-npu-a2",
+        "stage-b-test-2-npu-a2",
+        "stage-b-test-4-npu-a3",
+        "stage-b-test-16-npu-a3",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -50,12 +70,19 @@ NIGHTLY_SUITES = {
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
     ],
-    HWBackend.AMD: ["nightly-amd", "nightly-amd-8-gpu"],
+    HWBackend.AMD: [
+        "nightly-amd",
+        "nightly-amd-8-gpu",
+        "nightly-amd-vlm",
+        # MI35x 8-GPU suite (different model configs)
+        "nightly-amd-8-gpu-mi35x",
+    ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
+        "nightly-8-npu-a3",
         "nightly-16-npu-a3",
     ],
 }
@@ -126,26 +153,27 @@ def pretty_print_tests(
 
     headers = ["Hardware", "Suite", "Nightly", "Partition"]
     rows = [[hw.name, suite, str(nightly), partition_info]]
-    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql")
-    print(msg + "\n")
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
 
     if skipped_tests:
-        print(f"⚠️  Skipped {len(skipped_tests)} test(s):")
+        msg += f"⚠️  Skipped {len(skipped_tests)} test(s):\n"
         for t in skipped_tests:
             reason = t.disabled or "disabled"
-            print(f"  - {t.filename} (reason: {reason})")
-
-        print()
+            msg += f"  - {t.filename} (reason: {reason})\n"
+        msg += "\n"
 
     if len(ci_tests) == 0:
-        print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
-        print("This is expected during incremental migration. Skipping.")
-        return
+        msg += f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}\n"
+        msg += "This is expected during incremental migration. Skipping.\n"
+    else:
+        total_est_time = sum(t.est_time for t in ci_tests)
+        msg += (
+            f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):\n"
+        )
+        for t in ci_tests:
+            msg += f"  - {t.filename} (est_time={t.est_time})\n"
 
-    total_est_time = sum(t.est_time for t in ci_tests)
-    print(f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):")
-    for t in ci_tests:
-        print(f"  - {t.filename} (est_time={t.est_time})")
+    print(msg, flush=True)
 
 
 def run_a_suite(args):

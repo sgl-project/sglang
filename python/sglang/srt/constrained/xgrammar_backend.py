@@ -264,8 +264,8 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     schema=key_string, any_whitespace=self.any_whitespace
                 )
 
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
-            logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+        except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
@@ -273,7 +273,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
-            logging.error(f"Hit invalid ebnf: {key_string=}, {e=}")
+            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
@@ -281,7 +281,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
-            logging.error(f"Hit invalid regex: {key_string=}, {e=}")
+            logger.error(f"Hit invalid regex: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
@@ -310,7 +310,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     key_string = json.dumps(structural_tag)
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
-            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
+            logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")

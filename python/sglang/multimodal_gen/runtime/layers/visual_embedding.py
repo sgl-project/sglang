@@ -14,15 +14,19 @@ from diffusers.models.embeddings import (
 )
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
 from diffusers.models.embeddings import Timesteps as _Timesteps
+from diffusers.models.embeddings import (
+    get_timestep_embedding as timestep_embedding_diffusers,
+)
 
-try:
-    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
-except Exception as _e:
-    pass
-
+from sglang.jit_kernel.timestep_embedding import (
+    timestep_embedding as timestep_embedding_cuda,
+)
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_cuda = current_platform.is_cuda()
 
 
 class PatchEmbed(nn.Module):
@@ -81,14 +85,22 @@ class PatchEmbed(nn.Module):
 
 class Timesteps(_Timesteps):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        t_emb = timestep_embedding_cuda(
-            timesteps,
-            self.num_channels,
-            flip_sin_to_cos=self.flip_sin_to_cos,
-            downscale_freq_shift=self.downscale_freq_shift,
-            scale=self.scale,
-        )
-        return t_emb
+        if _is_cuda:
+            return timestep_embedding_cuda(
+                timesteps,
+                self.num_channels,
+                flip_sin_to_cos=self.flip_sin_to_cos,
+                downscale_freq_shift=self.downscale_freq_shift,
+                scale=self.scale,
+            )
+        else:
+            return timestep_embedding_diffusers(
+                timesteps,
+                self.num_channels,
+                flip_sin_to_cos=self.flip_sin_to_cos,
+                downscale_freq_shift=self.downscale_freq_shift,
+                scale=self.scale,
+            )
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(
@@ -219,8 +231,12 @@ class ModulateProjection(nn.Module):
         super().__init__()
         self.factor = factor
         self.hidden_size = hidden_size
-        self.linear = ReplicatedLinear(
-            hidden_size, hidden_size * factor, bias=True, params_dtype=dtype
+        self.linear = ColumnParallelLinear(
+            hidden_size,
+            hidden_size * factor,
+            bias=True,
+            gather_output=True,
+            params_dtype=dtype,
         )
         self.act = get_act_fn(act_layer)
 

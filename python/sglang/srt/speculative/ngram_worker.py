@@ -5,9 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -16,6 +14,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import generate_token_bitmask
 
 logger = logging.getLogger(__name__)
 
@@ -198,85 +197,6 @@ class NGRAMWorker:
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
 
-    def add_logprob_values(
-        self,
-        batch: ScheduleBatch,
-        res: NgramVerifyInput,
-        logits_output: LogitsProcessorOutput,
-    ):
-        # Extract args
-        top_logprobs_nums = batch.top_logprobs_nums
-        token_ids_logprobs = batch.token_ids_logprobs
-        accepted_indices = res.accept_index
-        assert len(accepted_indices) == len(logits_output.next_token_logits)
-
-        temperatures = batch.sampling_info.temperatures
-        num_draft_tokens = batch.spec_info.draft_token_num
-        # acceptance indices are the indices in a "flattened" batch.
-        # dividing it to num_draft_tokens will yield the actual batch index.
-        temperatures = temperatures[accepted_indices // num_draft_tokens]
-        if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
-            logprobs = torch.nn.functional.log_softmax(
-                logits_output.next_token_logits, dim=-1
-            )
-        else:
-            logprobs = torch.nn.functional.log_softmax(
-                logits_output.next_token_logits / temperatures, dim=-1
-            )
-        batch_next_token_ids = res.verified_id
-        accept_length_per_req_cpu = res.accept_length.tolist()
-        num_tokens_per_req = [accept + 1 for accept in accept_length_per_req_cpu]
-
-        # We should repeat top_logprobs_nums to match num_tokens_per_req.
-        top_logprobs_nums_repeat_interleaved = []
-        token_ids_logprobs_repeat_interleaved = []
-        for num, num_tokens in zip(top_logprobs_nums, num_tokens_per_req):
-            top_logprobs_nums_repeat_interleaved.extend([num] * num_tokens)
-        for token_ids, num_tokens in zip(token_ids_logprobs, num_tokens_per_req):
-            token_ids_logprobs_repeat_interleaved.extend([token_ids] * num_tokens)
-
-        # Extract logprobs
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(
-                logprobs,
-                top_logprobs_nums_repeat_interleaved,
-            )
-
-        if any(x is not None for x in token_ids_logprobs):
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                logprobs,
-                token_ids_logprobs_repeat_interleaved,
-            )
-
-        logits_output.next_token_logprobs = logprobs[
-            torch.arange(len(batch_next_token_ids), device=batch.sampling_info.device),
-            batch_next_token_ids,
-        ]
-
-        # Add output logprobs to the request
-        pt = 0
-        next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        verified_ids = batch_next_token_ids.tolist()
-        for req, num_tokens in zip(batch.reqs, num_tokens_per_req, strict=True):
-            for _ in range(num_tokens):
-                if req.return_logprob:
-                    req.output_token_logprobs_val.append(next_token_logprobs[pt])
-                    req.output_token_logprobs_idx.append(verified_ids[pt])
-                    if req.top_logprobs_num > 0:
-                        req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[pt]
-                        )
-                        req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[pt]
-                        )
-                pt += 1
-
     def _update_ngram_cache(self, batch: ScheduleBatch):
         batch_tokens = []
         for req in batch.reqs:
@@ -294,10 +214,18 @@ class NGRAMWorker:
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
+        spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
         accept_lens = None
 
         if model_worker_batch.forward_mode.is_target_verify():
+            if batch.has_grammar:
+                retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+                retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+                draft_tokens_cpu = spec_info.draft_token.view(
+                    spec_info.retrive_next_token.shape
+                ).cpu()
+
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -305,14 +233,35 @@ class NGRAMWorker:
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
-            verify_input = model_worker_batch.spec_info
+
+            verify_input: NgramVerifyInput = model_worker_batch.spec_info
+            vocab_mask = None
+            if batch.has_grammar:
+                # Generate the logit mask for structured output.
+                # Overlap the CPU operations for bitmask generation with the forward pass.
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    verify_input,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
+
+                if vocab_mask is not None:
+                    assert verify_input.grammar is not None
+                    vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+                    # and will be applied to produce wrong results
+                    batch.sampling_info.vocab_mask = None
+
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-                batch, logits_output, self.page_size
+                batch, logits_output, self.page_size, vocab_mask
             )
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
-                self.add_logprob_values(batch, verify_input, logits_output)
+                add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
 

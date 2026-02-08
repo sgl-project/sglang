@@ -19,10 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from diffusers.models.attention import AttentionModuleMixin, FeedForward
-from diffusers.models.embeddings import (
-    CombinedTimestepGuidanceTextProjEmbeddings,
-    CombinedTimestepTextProjEmbeddings,
-)
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
     AdaLayerNormContinuous,
@@ -35,15 +31,20 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
+from sglang.multimodal_gen.runtime.layers.visual_embedding import (
+    CombinedTimestepGuidanceTextProjEmbeddings,
+    CombinedTimestepTextProjEmbeddings,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -52,13 +53,15 @@ logger = init_logger(__name__)  # pylint: disable=invalid-name
 def _get_qkv_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
-    qkv, _ = attn.to_qkv(hidden_states)
-    query, key, value = qkv.chunk(3, dim=-1)
+    query, _ = attn.to_q(hidden_states)
+    key, _ = attn.to_k(hidden_states)
+    value, _ = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
+        encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
+        encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
+        encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -96,13 +99,22 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        # Use ReplicatedLinear for fused QKV projections
-        self.to_qkv = ReplicatedLinear(query_dim, self.inner_dim * 3, bias=bias)
+        self.to_q = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
+        self.to_k = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
+        self.to_v = ColumnParallelLinear(
+            query_dim, self.inner_dim, bias=bias, gather_output=True
+        )
 
         if not self.pre_only:
             self.to_out = torch.nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.out_dim, bias=out_bias)
+                ColumnParallelLinear(
+                    self.inner_dim, self.out_dim, bias=out_bias, gather_output=True
+                )
             )
             if dropout != 0.0:
                 self.to_out.append(torch.nn.Dropout(dropout))
@@ -110,11 +122,27 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         if added_kv_proj_dim is not None:
             self.norm_added_q = RMSNorm(dim_head, eps=eps)
             self.norm_added_k = RMSNorm(dim_head, eps=eps)
-            # Use ReplicatedLinear for added (encoder) QKV projections
-            self.to_added_qkv = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim * 3, bias=added_proj_bias
+            self.add_q_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
             )
-            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
+            self.add_k_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
+            )
+            self.add_v_proj = ColumnParallelLinear(
+                added_kv_proj_dim,
+                self.inner_dim,
+                bias=added_proj_bias,
+                gather_output=True,
+            )
+            self.to_add_out = ColumnParallelLinear(
+                self.inner_dim, query_dim, bias=out_bias, gather_output=True
+            )
 
         self.attn = USPAttention(
             num_heads=num_heads,
@@ -137,16 +165,28 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         query = query.unflatten(-1, (self.heads, -1))
         key = key.unflatten(-1, (self.heads, -1))
         value = value.unflatten(-1, (self.heads, -1))
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        query, key = apply_qk_norm(
+            q=query,
+            k=key,
+            q_norm=self.norm_q,
+            k_norm=self.norm_k,
+            head_dim=self.head_dim,
+            allow_inplace=True,
+        )
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
             encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
             encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
-            encoder_query = self.norm_added_q(encoder_query)
-            encoder_key = self.norm_added_k(encoder_key)
+            encoder_query, encoder_key = apply_qk_norm(
+                q=encoder_query,
+                k=encoder_key,
+                q_norm=self.norm_added_q,
+                k_norm=self.norm_added_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
             bsz, seq_len, _, _ = query.shape
             query = torch.cat([encoder_query, query], dim=1)
@@ -155,11 +195,15 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         if freqs_cis is not None:
             cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=False
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
             )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=False
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
             )
 
         x = self.attn(query, key, value)
@@ -196,9 +240,13 @@ class FluxSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim)
-        self.proj_mlp = ReplicatedLinear(dim, self.mlp_hidden_dim)
+        self.proj_mlp = ColumnParallelLinear(
+            dim, self.mlp_hidden_dim, bias=True, gather_output=True
+        )
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = ReplicatedLinear(dim + self.mlp_hidden_dim, dim)
+        self.proj_out = ColumnParallelLinear(
+            dim + self.mlp_hidden_dim, dim, bias=True, gather_output=True
+        )
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -361,7 +409,11 @@ class FluxPosEmbed(nn.Module):
             rope_theta=theta,
             use_real=False,
             repeat_interleave_real=False,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if current_platform.is_mps() or current_platform.is_musa()
+                else torch.float64
+            ),
         )
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -372,7 +424,7 @@ class FluxPosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class FluxTransformer2DModel(CachableDiT):
+class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     """
     The Transformer model introduced in Flux.
 
@@ -404,10 +456,15 @@ class FluxTransformer2DModel(CachableDiT):
             pooled_projection_dim=self.config.pooled_projection_dim,
         )
 
-        self.context_embedder = ReplicatedLinear(
-            self.config.joint_attention_dim, self.inner_dim
+        self.context_embedder = ColumnParallelLinear(
+            self.config.joint_attention_dim,
+            self.inner_dim,
+            bias=True,
+            gather_output=True,
         )
-        self.x_embedder = ReplicatedLinear(self.config.in_channels, self.inner_dim)
+        self.x_embedder = ColumnParallelLinear(
+            self.config.in_channels, self.inner_dim, bias=True, gather_output=True
+        )
         self.transformer_blocks = nn.ModuleList(
             [
                 FluxTransformerBlock(
@@ -433,11 +490,17 @@ class FluxTransformer2DModel(CachableDiT):
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
         )
-        self.proj_out = ReplicatedLinear(
+        self.proj_out = ColumnParallelLinear(
             self.inner_dim,
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
+            gather_output=True,
         )
+
+        self.layer_names = [
+            "transformer_blocks",
+            "single_transformer_blocks",
+        ]
 
     def forward(
         self,
@@ -478,11 +541,11 @@ class FluxTransformer2DModel(CachableDiT):
             )
         hidden_states, _ = self.x_embedder(hidden_states)
 
-        temb = (
-            self.time_text_embed(timestep, pooled_projections)
-            if guidance is None
-            else self.time_text_embed(timestep, guidance, pooled_projections)
-        )
+        # Only pass guidance to time_text_embed if the model supports it
+        if self.config.guidance_embeds and guidance is not None:
+            temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = self.time_text_embed(timestep, pooled_projections)
 
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
@@ -496,7 +559,7 @@ class FluxTransformer2DModel(CachableDiT):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for index_block, block in enumerate(self.transformer_blocks):
+        for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -504,8 +567,7 @@ class FluxTransformer2DModel(CachableDiT):
                 freqs_cis=freqs_cis,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
-
-        for index_block, block in enumerate(self.single_transformer_blocks):
+        for block in self.single_transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
