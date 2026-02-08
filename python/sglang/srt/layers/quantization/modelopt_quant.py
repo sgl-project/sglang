@@ -2208,7 +2208,13 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=RoutingMethodType.Default,
+                routing_method_type=int(
+                    getattr(
+                        layer,
+                        "routing_method_type",
+                        RoutingMethodType.Renormalize,
+                    )
+                ),
                 block_quant=True,
                 w13_weight_scale_inv=layer.w13_weight_scale_inv,
                 w2_weight_scale_inv=layer.w2_weight_scale_inv,

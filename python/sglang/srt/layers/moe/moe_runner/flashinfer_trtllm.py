@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -349,12 +352,41 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # It ignored the `output` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
             # so we put the whole function under the ``use_symmetric_memory`` context manager.
             # If the bug is fixed, we can only put the output tensor allocation under the context manager.
+            _rl = router_logits.to(torch.float32) if routing_method_type == RoutingMethodType.DeepSeekV3 else router_logits
+            logger.info(
+                "trtllm_fp8_block_scale_moe call:\n"
+                "  fp8_quantization_type=%s\n"
+                "  routing_logits: shape=%s dtype=%s\n"
+                "  routing_bias: %s\n"
+                "  hidden_states (a_q): shape=%s dtype=%s\n"
+                "  hidden_states_scale (a_sf): shape=%s dtype=%s\n"
+                "  gemm1_weights (w13): shape=%s dtype=%s\n"
+                "  gemm1_weights_scale (w13_scale_inv): shape=%s dtype=%s\n"
+                "  gemm2_weights (w2): shape=%s dtype=%s\n"
+                "  gemm2_weights_scale (w2_scale_inv): shape=%s dtype=%s\n"
+                "  num_experts=%s top_k=%s n_group=%s topk_group=%s\n"
+                "  intermediate_size=%s local_expert_offset=%s local_num_experts=%s\n"
+                "  routed_scaling_factor=%s routing_method_type=%s\n"
+                "  use_shuffled_weight=%s tune_max_num_tokens=%s",
+                fp8_quant_type,
+                _rl.shape, _rl.dtype,
+                f"shape={correction_bias.shape} dtype={correction_bias.dtype}" if correction_bias is not None else "None",
+                a_q.shape, a_q.dtype,
+                a_sf.shape, a_sf.dtype,
+                quant_info.w13_weight.shape, quant_info.w13_weight.dtype,
+                quant_info.w13_weight_scale_inv.shape, quant_info.w13_weight_scale_inv.dtype,
+                quant_info.w2_weight.shape, quant_info.w2_weight.dtype,
+                quant_info.w2_weight_scale_inv.shape, quant_info.w2_weight_scale_inv.dtype,
+                quant_info.global_num_experts, topk_config.top_k,
+                topk_config.num_expert_group if topk_config.num_expert_group else 0,
+                topk_config.topk_group if topk_config.topk_group else 0,
+                quant_info.intermediate_size, quant_info.local_expert_offset, quant_info.local_num_experts,
+                runner_config.routed_scaling_factor if runner_config.routed_scaling_factor is not None else 1.0,
+                routing_method_type,
+                use_shuffled_weight, next_power_of_2(a_q.shape[0]),
+            )
             output = trtllm_fp8_block_scale_moe(
-                routing_logits=(
-                    router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits
-                ),
+                routing_logits=_rl,
                 routing_bias=correction_bias,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf,

@@ -2055,6 +2055,13 @@ class ServerArgs:
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
     def _handle_moe_kernel_config(self):
+        if self.quantization == "modelopt_mxfp8" and not self.disable_cuda_graph:
+            logger.warning(
+                "Cuda graph is disabled for modelopt_mxfp8 because bmm_mxfp8 currently uses "
+                "a cuDNN path that is not graph-capture safe."
+            )
+            self.disable_cuda_graph = True
+
         if self.quantization == "mxfp8":
             if self.moe_runner_backend not in ["auto", "cutlass"]:
                 logger.warning(
