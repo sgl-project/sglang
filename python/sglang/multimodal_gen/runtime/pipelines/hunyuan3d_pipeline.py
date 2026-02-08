@@ -2,8 +2,8 @@
 """
 Hunyuan3D image-to-mesh pipeline implementation.
 
-This module provides the main pipeline class for Hunyuan3D 3D generation,
-composing shape generation and optional texture painting stages.
+Shape pipeline: BeforeDenoising -> Denoising -> Export -> Save
+Paint pipeline (optional): Preprocess -> TexGen -> Postprocess
 """
 
 from __future__ import annotations
@@ -29,19 +29,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
     ComposedPipelineBase,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
-    Hunyuan3DInputStage,
-    Hunyuan3DPaintDiffusionStage,
     Hunyuan3DPaintPostprocessStage,
     Hunyuan3DPaintPreprocessStage,
-    Hunyuan3DPaintRenderStage,
-    Hunyuan3DShapeConditioningStage,
+    Hunyuan3DPaintTexGenStage,
+    Hunyuan3DShapeBeforeDenoisingStage,
     Hunyuan3DShapeDenoisingStage,
     Hunyuan3DShapeExportStage,
-    Hunyuan3DShapeLatentStage,
-    Hunyuan3DShapeOnlyOutputStage,
-    Hunyuan3DShapePreprocessStage,
     Hunyuan3DShapeSaveStage,
-    InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -52,13 +46,8 @@ logger = init_logger(__name__)
 class Hunyuan3D2Pipeline(ComposedPipelineBase):
     """Hunyuan3D 2.0 image-to-mesh pipeline.
 
-    This pipeline generates 3D meshes from input images using:
-    1. Shape generation stages: preprocess -> conditioning -> latent -> denoising -> export -> save
-    2. Optional paint stages: preprocess -> render -> diffusion -> postprocess
-
-    The pipeline supports two modes:
-    - Shape only: Generates untextured 3D mesh
-    - Shape + Paint: Generates textured 3D mesh with multi-view texture baking
+    Shape pipeline: BeforeDenoising -> Denoising -> Export -> Save
+    Paint pipeline (optional): Preprocess -> TexGen -> Postprocess
     """
 
     pipeline_name = "Hunyuan3D2Pipeline"
@@ -142,7 +131,6 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             )
             local_path = os.path.join(downloaded, subfolder)
 
-        # Find config file
         config_path = os.path.join(local_path, "config.yaml")
         if not os.path.exists(config_path):
             for alt in ("config.yml", "model_config.yaml"):
@@ -151,7 +139,6 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                     config_path = alt_path
                     break
 
-        # Find checkpoint file
         if use_safetensors:
             ckpt_name = (
                 f"model.{variant}.safetensors" if variant else "model.safetensors"
@@ -276,13 +263,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, torch.nn.Module] | None = None,
     ) -> dict[str, Any]:
-        """Load all Hunyuan3D shape components from a bundled checkpoint.
-
-        Overrides the base class to handle Hunyuan3D's non-standard distribution
-        format (single YAML config + single bundled checkpoint containing all
-        components).  The DiT model is instantiated on a meta device and loaded
-        via ``load_model_from_full_model_state_dict`` for memory efficiency.
-        """
+        """Load all Hunyuan3D shape components from a bundled checkpoint."""
         import yaml
 
         from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -314,22 +295,18 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
 
         components: dict[str, Any] = {}
 
-        # DiT model — meta-device instantiation + standard weight loading
         components["hy3dshape_model"] = self._load_dit_model(
             model_config["model"], ckpt["model"], device, dtype
         )
 
-        # VAE
         components["hy3dshape_vae"] = self._load_simple_component(
             model_config["vae"], ckpt.get("vae"), device, dtype
         )
 
-        # Conditioner (weights may or may not be in the checkpoint)
         components["hy3dshape_conditioner"] = self._load_simple_component(
             model_config["conditioner"], ckpt.get("conditioner"), device, dtype
         )
 
-        # Scheduler and image processor — lightweight, no weights
         components["hy3dshape_scheduler"] = self._instantiate_component(
             model_config["scheduler"]
         )
@@ -352,97 +329,54 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 f"got {type(config)}"
             )
 
-        if config.paint_enable:
-            self._initialize_paint_pipeline(config)
-
-    def _initialize_paint_pipeline(self, config: Hunyuan3D2PipelineConfig):
-        """Initialize the paint pipeline for texture generation.
-
-        This sets up the 4-stage texture generation pipeline:
-        1. PaintPreprocessStage: UV unwrap (CPU) + delight (GPU) in parallel
-        2. PaintRenderStage: Multi-view normal/position rendering
-        3. PaintDiffusionStage: Texture diffusion generation
-        4. PaintPostprocessStage: Texture baking and export
-        """
-        logger.info(
-            "Paint pipeline (texture generation) initialized with 4-stage architecture."
-        )
-
     def create_pipeline_stages(self, server_args: ServerArgs):
         config = server_args.pipeline_config
         assert isinstance(config, Hunyuan3D2PipelineConfig)
 
-        # Input validation
+        # Shape: 4 stages
         self.add_stage(
-            stage_name="input_validation_stage", stage=InputValidationStage()
-        )
-        self.add_stage(
-            stage_name="input_stage", stage=Hunyuan3DInputStage(config=config)
-        )
-
-        # Shape generation stages
-        self.add_stage(
-            stage_name="shape_preprocess_stage",
-            stage=Hunyuan3DShapePreprocessStage(
+            stage_name="shape_before_denoising",
+            stage=Hunyuan3DShapeBeforeDenoisingStage(
                 image_processor=self.get_module("hy3dshape_image_processor"),
-            ),
-        )
-        self.add_stage(
-            stage_name="shape_conditioning_stage",
-            stage=Hunyuan3DShapeConditioningStage(
                 conditioner=self.get_module("hy3dshape_conditioner"),
-                model=self.get_module("hy3dshape_model"),
-            ),
-        )
-        self.add_stage(
-            stage_name="shape_latent_stage",
-            stage=Hunyuan3DShapeLatentStage(
-                scheduler=self.get_module("hy3dshape_scheduler"),
                 vae=self.get_module("hy3dshape_vae"),
                 model=self.get_module("hy3dshape_model"),
+                scheduler=self.get_module("hy3dshape_scheduler"),
+                config=config,
             ),
         )
         self.add_stage(
-            stage_name="shape_denoising_stage",
+            stage_name="shape_denoising",
             stage=Hunyuan3DShapeDenoisingStage(
                 transformer=self.get_module("hy3dshape_model"),
                 scheduler=self.get_module("hy3dshape_scheduler"),
             ),
         )
         self.add_stage(
-            stage_name="shape_export_stage",
+            stage_name="shape_export",
             stage=Hunyuan3DShapeExportStage(
                 vae=self.get_module("hy3dshape_vae"),
                 config=config,
             ),
         )
         self.add_stage(
-            stage_name="shape_save_stage", stage=Hunyuan3DShapeSaveStage(config)
+            stage_name="shape_save",
+            stage=Hunyuan3DShapeSaveStage(config=config),
         )
 
-        # Paint stages (optional)
+        # Paint: 3 stages (optional)
         if config.paint_enable:
-            # 4-stage texture generation pipeline with CPU/GPU parallelism
             self.add_stage(
-                stage_name="paint_preprocess_stage",
+                stage_name="paint_preprocess",
                 stage=Hunyuan3DPaintPreprocessStage(config=config),
             )
             self.add_stage(
-                stage_name="paint_render_stage",
-                stage=Hunyuan3DPaintRenderStage(config=config),
+                stage_name="paint_texgen",
+                stage=Hunyuan3DPaintTexGenStage(config=config),
             )
             self.add_stage(
-                stage_name="paint_diffusion_stage",
-                stage=Hunyuan3DPaintDiffusionStage(config=config),
-            )
-            self.add_stage(
-                stage_name="paint_postprocess_stage",
+                stage_name="paint_postprocess",
                 stage=Hunyuan3DPaintPostprocessStage(config=config),
-            )
-        else:
-            self.add_stage(
-                stage_name="paint_stage",
-                stage=Hunyuan3DShapeOnlyOutputStage(config=config),
             )
 
 

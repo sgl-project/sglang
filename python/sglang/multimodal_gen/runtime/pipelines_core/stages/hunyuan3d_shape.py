@@ -2,8 +2,7 @@
 """
 Hunyuan3D shape generation stages.
 
-This module contains the pipeline stages for Hunyuan3D 3D shape generation,
-including preprocessing, conditioning, denoising, and export stages.
+Four-stage pipeline: BeforeDenoising -> Denoising -> Export -> Save.
 """
 
 from __future__ import annotations
@@ -35,6 +34,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+
 def retrieve_timesteps(
     scheduler,
     num_inference_steps=None,
@@ -43,11 +47,7 @@ def retrieve_timesteps(
     sigmas=None,
     **kwargs,
 ):
-    """Retrieve timesteps from scheduler.
-
-    Calls the scheduler's set_timesteps method and retrieves timesteps.
-    Handles custom timesteps and sigmas.
-    """
+    """Retrieve timesteps from scheduler."""
     import inspect
 
     if timesteps is not None and sigmas is not None:
@@ -117,14 +117,36 @@ def _move_to_device(payload, device, dtype):
     return payload
 
 
-class Hunyuan3DInputStage(PipelineStage):
-    """Input validation stage for Hunyuan3D pipeline."""
+# ---------------------------------------------------------------------------
+# Stage 1: BeforeDenoising (monolithic pre-processing)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
+
+class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
+    """Monolithic pre-processing stage for Hunyuan3D shape generation.
+
+    Consolidates input validation, image preprocessing, conditioning, and
+    latent/timestep preparation into a single stage.
+    """
+
+    def __init__(
+        self,
+        image_processor: Any,
+        conditioner: Any,
+        vae: Any,
+        model: Any,
+        scheduler: Any,
+        config: Hunyuan3D2PipelineConfig,
+    ) -> None:
         super().__init__()
+        self.image_processor = image_processor
+        self.conditioner = conditioner
+        self.vae = vae
+        self.model = model
+        self.scheduler = scheduler
         self.config = config
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def _validate_input(self, batch: Req, server_args: ServerArgs) -> None:
         if server_args.num_gpus != 1:
             raise ValueError("Hunyuan3D pipeline only supports num_gpus=1.")
         if batch.image_path is None:
@@ -141,42 +163,28 @@ class Hunyuan3DInputStage(PipelineStage):
             raise FileNotFoundError(f"Image path not found: {batch.image_path}")
         if batch.num_outputs_per_prompt != 1:
             raise ValueError("Hunyuan3D only supports num_outputs_per_prompt=1.")
-        return batch
 
+    def _prepare_latents(self, batch_size, dtype, device, generator):
+        from diffusers.utils.torch_utils import randn_tensor
 
-class Hunyuan3DShapePreprocessStage(PipelineStage):
-    """Preprocess stage for shape generation."""
-
-    def __init__(self, image_processor: Any) -> None:
-        super().__init__()
-        self.image_processor = image_processor
+        shape = (batch_size, *self.vae.latent_shape)
+        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        return latents * getattr(self.scheduler, "init_noise_sigma", 1.0)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        # 1. Input validation
+        self._validate_input(batch, server_args)
+
+        # 2. Image preprocessing
         cond_inputs = _prepare_shape_image(self.image_processor, batch.image_path)
         image = cond_inputs.pop("image")
 
-        batch.extra["shape_cond_inputs"] = cond_inputs
-        batch.extra["shape_image"] = image
-        return batch
-
-
-class Hunyuan3DShapeConditioningStage(PipelineStage):
-    """Stage for computing shape conditioning embeddings with CFG support."""
-
-    def __init__(self, conditioner: Any, model: Any) -> None:
-        super().__init__()
-        self.conditioner = conditioner
-        self.model = model
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        image = batch.extra["shape_image"]
-        cond_inputs = batch.extra["shape_cond_inputs"]
         device = self.device
         dtype = next(self.model.parameters()).dtype
-
         image = _move_to_device(image, device, dtype)
         cond_inputs = _move_to_device(cond_inputs, device, dtype)
 
+        # 3. Conditioning with CFG
         do_cfg = batch.guidance_scale >= 0 and not (
             hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True
         )
@@ -197,34 +205,8 @@ class Hunyuan3DShapeConditioningStage(PipelineStage):
 
             cond = cat_recursive(cond, un_cond)
 
-        batch.prompt_embeds = [cond]
-        batch.do_classifier_free_guidance = do_cfg
-        batch.extra["shape_image"] = image
-        return batch
-
-
-class Hunyuan3DShapeLatentStage(PipelineStage):
-    """Latent preparation stage for shape generation."""
-
-    def __init__(self, scheduler: Any, vae: Any, model: Any) -> None:
-        super().__init__()
-        self.scheduler = scheduler
-        self.vae = vae
-        self.model = model
-
-    def _prepare_latents(self, batch_size, dtype, device, generator):
-        from diffusers.utils.torch_utils import randn_tensor
-
-        shape = (batch_size, *self.vae.latent_shape)
-        latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return latents * getattr(self.scheduler, "init_noise_sigma", 1.0)
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        image = batch.extra["shape_image"]
+        # 4. Latent and timestep preparation
         batch_size = image.shape[0]
-        device = self.device
-        dtype = next(self.model.parameters()).dtype
-
         sigmas = np.linspace(0, 1, batch.num_inference_steps)
         timesteps, _ = retrieve_timesteps(
             self.scheduler,
@@ -245,10 +227,34 @@ class Hunyuan3DShapeLatentStage(PipelineStage):
                 [batch.guidance_scale] * batch_size, device=device, dtype=dtype
             )
 
+        # 5. Populate batch
+        batch.prompt_embeds = [cond]
+        batch.do_classifier_free_guidance = do_cfg
         batch.timesteps = timesteps
         batch.latents = latents
         batch.extra["shape_guidance"] = guidance
+        batch.extra["shape_image"] = image
         return batch
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("image_path", batch.image_path, V.not_none)
+        result.add_check(
+            "num_inference_steps", batch.num_inference_steps, V.positive_int
+        )
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
+        result.add_check("latents", batch.latents, V.is_tensor)
+        result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Denoising (kept unchanged)
+# ---------------------------------------------------------------------------
 
 
 class Hunyuan3DShapeDenoisingStage(DenoisingStage):
@@ -398,7 +404,6 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         return noise_pred
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """Verify Hunyuan3D denoising stage inputs."""
         result = VerificationResult()
         result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
         result.add_check("latents", batch.latents, V.is_tensor)
@@ -410,14 +415,18 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         return result
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """Verify Hunyuan3D denoising stage outputs."""
         result = VerificationResult()
         result.add_check("latents", batch.latents, V.is_tensor)
         return result
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: Export (VAE decode + mesh extraction)
+# ---------------------------------------------------------------------------
+
+
 class Hunyuan3DShapeExportStage(PipelineStage):
-    """Export stage for shape generation (VAE decoding and mesh extraction)."""
+    """VAE decoding and mesh extraction stage."""
 
     def __init__(self, vae: Any, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
@@ -463,9 +472,27 @@ class Hunyuan3DShapeExportStage(PipelineStage):
         batch.extra["shape_meshes"] = outputs
         return batch
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("latents", batch.latents, V.is_tensor)
+        return result
+
+    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Save (mesh file export + output decision)
+# ---------------------------------------------------------------------------
+
 
 class Hunyuan3DShapeSaveStage(PipelineStage):
-    """Save stage for shape generation (mesh export to file)."""
+    """Mesh file export and output decision stage.
+
+    Returns Req when paint is enabled, OutputBatch when paint is disabled.
+    """
 
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
@@ -482,7 +509,7 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
             return output_path, output_path
         return output_path + ".obj", output_path + ".obj"
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req | OutputBatch:
         mesh_outputs = batch.extra["shape_meshes"]
         mesh = mesh_outputs[0] if isinstance(mesh_outputs, list) else mesh_outputs
         if isinstance(mesh, list):
@@ -496,32 +523,24 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
 
         batch.extra["shape_obj_path"] = obj_path
         batch.extra["shape_return_path"] = return_path
-        return batch
 
+        if self.config.paint_enable:
+            return batch
 
-class Hunyuan3DShapeOnlyOutputStage(PipelineStage):
-    """Output stage when paint is disabled (shape only)."""
-
-    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
-        super().__init__()
-        self.config = config
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        obj_path = batch.extra["shape_obj_path"]
-        return_path = batch.extra["shape_return_path"]
         if return_path.endswith(".glb"):
             return_path = obj_path
         return OutputBatch(output=[return_path], timings=batch.timings)
 
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        result = VerificationResult()
+        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
+        return result
+
 
 __all__ = [
     "retrieve_timesteps",
-    "Hunyuan3DInputStage",
-    "Hunyuan3DShapePreprocessStage",
-    "Hunyuan3DShapeConditioningStage",
-    "Hunyuan3DShapeLatentStage",
+    "Hunyuan3DShapeBeforeDenoisingStage",
     "Hunyuan3DShapeDenoisingStage",
     "Hunyuan3DShapeExportStage",
     "Hunyuan3DShapeSaveStage",
-    "Hunyuan3DShapeOnlyOutputStage",
 ]

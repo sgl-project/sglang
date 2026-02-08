@@ -2,8 +2,7 @@
 """
 Hunyuan3D paint/texture generation stages.
 
-This module contains the pipeline stages for Hunyuan3D texture generation,
-including preprocessing, rendering, diffusion, and postprocessing stages.
+Three-stage pipeline: Preprocess -> TexGen -> Postprocess.
 """
 
 from __future__ import annotations
@@ -39,14 +38,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+
 def guidance_scale_embedding(
     w: torch.Tensor, embedding_dim: int = 512, dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
-    """Generate guidance scale embeddings.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/pipeline.py
-    Reference: https://github.com/google-research/vdm
-    """
+    """Generate guidance scale embeddings."""
     assert len(w.shape) == 1
     w = w * 1000.0
 
@@ -64,10 +64,7 @@ def guidance_scale_embedding(
 def extract_into_tensor(
     a: torch.Tensor, t: torch.Tensor, x_shape: tuple, n_gen: int
 ) -> torch.Tensor:
-    """Extract values from tensor and reshape for multi-view generation.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/pipeline.py
-    """
+    """Extract values from tensor and reshape for multi-view generation."""
     out = a.gather(-1, t)
     out = out.repeat(n_gen)
     out = rearrange(out, "(b n) -> b n", n=n_gen)
@@ -84,10 +81,7 @@ def get_predicted_original_sample(
     sigmas: torch.Tensor,
     n_gen: int,
 ) -> torch.Tensor:
-    """Get predicted original sample from model output.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/pipeline.py
-    """
+    """Get predicted original sample from model output."""
     alphas = extract_into_tensor(alphas, timesteps, sample.shape, n_gen)
     sigmas = extract_into_tensor(sigmas, timesteps, sample.shape, n_gen)
     model_output = rearrange(model_output, "(b n) c h w -> b n c h w", n=n_gen)
@@ -116,10 +110,7 @@ def get_predicted_noise(
     sigmas: torch.Tensor,
     n_gen: int,
 ) -> torch.Tensor:
-    """Get predicted noise from model output.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/pipeline.py
-    """
+    """Get predicted noise from model output."""
     alphas = extract_into_tensor(alphas, timesteps, sample.shape, n_gen)
     sigmas = extract_into_tensor(sigmas, timesteps, sample.shape, n_gen)
     model_output = rearrange(model_output, "(b n) c h w -> b n c h w", n=n_gen)
@@ -140,10 +131,7 @@ def get_predicted_noise(
 
 
 def to_rgb_image(maybe_rgba):
-    """Convert RGBA image to RGB.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/pipeline.py
-    """
+    """Convert RGBA image to RGB."""
     from PIL import Image
 
     if maybe_rgba.mode == "RGB":
@@ -160,10 +148,7 @@ def to_rgb_image(maybe_rgba):
 
 
 class DDIMSolver:
-    """DDIM solver for fast sampling.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/hunyuanpaint/pipeline.py
-    """
+    """DDIM solver for fast sampling."""
 
     def __init__(
         self,
@@ -179,7 +164,6 @@ class DDIMSolver:
         self.ddim_alpha_cumprods_prev = np.asarray(
             [alpha_cumprods[0]] + alpha_cumprods[self.ddim_timesteps[:-1]].tolist()
         )
-        # Convert to torch tensors
         self.ddim_timesteps = torch.from_numpy(self.ddim_timesteps).long()
         self.ddim_alpha_cumprods = torch.from_numpy(self.ddim_alpha_cumprods)
         self.ddim_alpha_cumprods_prev = torch.from_numpy(self.ddim_alpha_cumprods_prev)
@@ -211,10 +195,7 @@ def _recorrect_rgb(
     alpha_channel: torch.Tensor,
     scale: float = 0.95,
 ) -> torch.Tensor:
-    """Correct RGB values to match target color distribution.
-
-    Source: Hunyuan3D-2/hy3dgen/texgen/utils/dehighlight_utils.py
-    """
+    """Correct RGB values to match target color distribution."""
 
     def flat_and_mask(bgr, a):
         mask = torch.where(a > 0.5, True, False)
@@ -249,22 +230,33 @@ def _recorrect_rgb(
     return corrected_bgr
 
 
-class Hunyuan3DPaintUVUnwrapStage(PipelineStage):
-    """Stage 1a: UV unwrap preprocessing.
+# ---------------------------------------------------------------------------
+# Stage 1: Preprocess (UV unwrap + delight + multi-view rendering)
+# ---------------------------------------------------------------------------
 
-    This stage applies UV unwrapping to the mesh using xatlas.
-    """
+
+class Hunyuan3DPaintPreprocessStage(PipelineStage):
+    """Preprocessing: UV unwrap + delight in parallel, then multi-view rendering."""
+
+    CAMERA_AZIMS = [0, 90, 180, 270, 0, 180]
+    CAMERA_ELEVS = [0, 0, 0, 0, 90, -90]
+    VIEW_WEIGHTS = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
 
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
         self.config = config
+        self._delight_pipeline = None
+        self._delight_loaded = False
+        self._renderer = None
+        self._renderer_loaded = False
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    # --- UV unwrap ---
+
+    def _do_uv_unwrap(self, batch: Req, server_args: ServerArgs) -> Req:
         import time
 
         from sglang.multimodal_gen.runtime.models.mesh3d_utils import mesh_uv_wrap
 
-        # Get mesh from shape generation
         mesh = batch.extra["shape_meshes"]
         if isinstance(mesh, list):
             mesh = mesh[0]
@@ -280,33 +272,10 @@ class Hunyuan3DPaintUVUnwrapStage(PipelineStage):
         batch.extra["paint_mesh"] = mesh
         return batch
 
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
-        return result
-
-    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
-        return result
-
-
-class Hunyuan3DPaintDelightStage(PipelineStage):
-    """Stage 1b: Image delight preprocessing.
-
-    This stage removes lighting/shadows from the reference image
-    using the StableDiffusionInstructPix2PixPipeline (delight model).
-    """
-
-    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.pipeline = None
-        self._loaded = False
+    # --- Delight ---
 
     def _load_delight_model(self, server_args: ServerArgs):
-        """Lazy load the delight model."""
-        if self._loaded:
+        if self._delight_loaded:
             return
 
         from diffusers import (
@@ -315,13 +284,11 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
         )
         from huggingface_hub import snapshot_download
 
-        # Get model path from config
         model_path = server_args.model_path
         delight_subfolder = getattr(
             self.config, "delight_subfolder", "hunyuan3d-delight-v2-0"
         )
 
-        # Try to load from HuggingFace or local path
         base_dir = os.environ.get("HY3DGEN_MODELS", "~/.cache/hy3dgen")
         local_path = os.path.expanduser(
             os.path.join(base_dir, model_path, delight_subfolder)
@@ -349,18 +316,17 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
                 pipeline.scheduler.config
             )
             pipeline.set_progress_bar_config(disable=True)
-            self.pipeline = pipeline.to("cuda", torch.float16)
-            self._loaded = True
+            self._delight_pipeline = pipeline.to("cuda", torch.float16)
             logger.info("Delight model loaded successfully")
         else:
             logger.warning(
                 "Delight model not available, skipping delight preprocessing"
             )
-            self._loaded = True
+
+        self._delight_loaded = True
 
     @torch.no_grad()
     def _run_delight(self, image):
-        """Run the delight pipeline on an image."""
         import cv2
         from PIL import Image as PILImage
 
@@ -386,7 +352,7 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
 
         image = image.convert("RGB")
 
-        image = self.pipeline(
+        image = self._delight_pipeline(
             prompt=self.config.delight_prompt,
             image=image,
             generator=torch.manual_seed(42),
@@ -403,17 +369,11 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
         image = image[:, :, :3] * image[:, :, 3:] + torch.ones_like(image[:, :, :3]) * (
             1.0 - image[:, :, 3:]
         )
-        from PIL import Image as PILImage
-
         image = PILImage.fromarray((image.cpu().numpy() * 255).astype(np.uint8))
 
         return image
 
     def _recenter_image(self, image, border_ratio=0.2):
-        """Recenter an RGBA image by cropping to non-transparent region and adding border.
-
-        This matches the native Hunyuan3D-2 implementation.
-        """
         from PIL import Image as PILImage
 
         if image.mode == "RGB":
@@ -422,7 +382,6 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
             image = image.convert("RGB")
             return image
 
-        # For RGBA images, crop to non-transparent bounding box
         alpha_channel = np.array(image)[:, :, 3]
         non_zero_indices = np.argwhere(alpha_channel > 0)
         if non_zero_indices.size == 0:
@@ -439,38 +398,28 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
 
         new_width = width + 2 * border_width
         new_height = height + 2 * border_height
-
         square_size = max(new_width, new_height)
 
         new_image = PILImage.new("RGBA", (square_size, square_size), (255, 255, 255, 0))
 
         paste_x = (square_size - new_width) // 2 + border_width
         paste_y = (square_size - new_height) // 2 + border_height
-
         new_image.paste(cropped_image, (paste_x, paste_y))
         return new_image
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def _do_delight(self, batch: Req, server_args: ServerArgs) -> Req:
         from PIL import Image
 
-        # Load reference image
         image = Image.open(batch.image_path)
-
-        # Recenter image (matches native Hunyuan3D-2 preprocessing)
         image = self._recenter_image(image)
-        print(
-            f"[DEBUG SGLANG delight] after recenter_image: size={image.size}, mode={image.mode}"
-        )
 
-        # Check if delight is enabled
         if not self.config.delight_enable:
             logger.info("Delight preprocessing disabled, using original image")
             batch.extra["delighted_image"] = image
             return batch
 
-        # Apply delight if model is available
         self._load_delight_model(server_args)
-        if self.pipeline is not None:
+        if self._delight_pipeline is not None:
             try:
                 image = self._run_delight(image)
                 logger.info("Image delight completed")
@@ -480,100 +429,96 @@ class Hunyuan3DPaintDelightStage(PipelineStage):
         batch.extra["delighted_image"] = image
         return batch
 
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check("image_path", batch.image_path, V.not_none)
-        return result
-
-    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check(
-            "delighted_image", batch.extra.get("delighted_image"), V.not_none
-        )
-        return result
-
-
-class Hunyuan3DPaintRenderStage(PipelineStage):
-    """Stage 2: Multi-view normal and position map rendering.
-
-    This stage renders the mesh from multiple viewpoints to create
-    conditioning inputs for the texture diffusion model.
-    """
-
-    # Camera configuration constants for 6 views
-    CAMERA_AZIMS = [0, 90, 180, 270, 0, 180]
-    CAMERA_ELEVS = [0, 0, 0, 0, 90, -90]
-    VIEW_WEIGHTS = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
-
-    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.renderer = None
-        self._loaded = False
+    # --- Multi-view rendering ---
 
     def _init_renderer(self):
-        """Initialize the mesh renderer."""
-        if self._loaded:
+        if self._renderer_loaded:
             return
 
         from sglang.multimodal_gen.runtime.models.mesh3d_utils import MeshRender
 
-        self.renderer = MeshRender(
+        self._renderer = MeshRender(
             default_resolution=self.config.paint_render_size,
             texture_size=self.config.paint_texture_size,
         )
-        self._loaded = True
+        self._renderer_loaded = True
         logger.info("Mesh renderer initialized")
 
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+    def _render_multiview(self, mesh) -> tuple:
         self._init_renderer()
+        self._renderer.load_mesh(mesh)
 
-        mesh = batch.extra["paint_mesh"]
-
-        # Load mesh into renderer
-        self.renderer.load_mesh(mesh)
-
-        # Render normal maps
-        normal_maps = self.renderer.render_normal_multiview(
+        normal_maps = self._renderer.render_normal_multiview(
             self.CAMERA_ELEVS, self.CAMERA_AZIMS, use_abs_coor=True
         )
-
-        # Render position maps
-        position_maps = self.renderer.render_position_multiview(
+        position_maps = self._renderer.render_position_multiview(
             self.CAMERA_ELEVS, self.CAMERA_AZIMS
         )
 
+        logger.info(f"Rendered {len(normal_maps)} views for texture generation")
+        return normal_maps, position_maps
+
+    # --- Forward ---
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        import concurrent.futures
+        import copy
+
+        # 1. UV unwrap + delight in parallel
+        batch_for_uv = batch
+        batch_for_delight = copy.copy(batch)
+        batch_for_delight.extra = batch.extra.copy()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            uv_future = executor.submit(self._do_uv_unwrap, batch_for_uv, server_args)
+            delight_future = executor.submit(
+                self._do_delight, batch_for_delight, server_args
+            )
+            uv_future.result()
+            delight_future.result()
+
+        batch.extra["paint_mesh"] = batch_for_uv.extra.get("paint_mesh")
+        batch.extra["delighted_image"] = batch_for_delight.extra.get("delighted_image")
+
+        # 2. Multi-view rendering
+        normal_maps, position_maps = self._render_multiview(batch.extra["paint_mesh"])
         batch.extra["normal_maps"] = normal_maps
         batch.extra["position_maps"] = position_maps
         batch.extra["camera_azims"] = self.CAMERA_AZIMS
         batch.extra["camera_elevs"] = self.CAMERA_ELEVS
         batch.extra["view_weights"] = self.VIEW_WEIGHTS
-        batch.extra["renderer"] = self.renderer
+        batch.extra["renderer"] = self._renderer
 
-        logger.info(f"Rendered {len(normal_maps)} views for texture generation")
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
-        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
+        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
+        result.add_check("image_path", batch.image_path, V.not_none)
         return result
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
+        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
+        result.add_check(
+            "delighted_image", batch.extra.get("delighted_image"), V.not_none
+        )
         result.add_check("normal_maps", batch.extra.get("normal_maps"), V.is_list)
         result.add_check("position_maps", batch.extra.get("position_maps"), V.is_list)
         result.add_check("renderer", batch.extra.get("renderer"), V.not_none)
         return result
 
 
-class Hunyuan3DPaintDiffusionStage(PipelineStage):
-    """Stage 3: Multi-view texture diffusion generation.
+# ---------------------------------------------------------------------------
+# Stage 2: TexGen (model loading + input prep + denoising + decode)
+# ---------------------------------------------------------------------------
 
-    This stage uses the HunyuanPaint model to generate textures
-    for multiple views based on the reference image and rendered maps.
 
-    Inherits core denoising functionality and gains access to SGLang optimizations
-    like Cache-DIT, Torch Compile, and Attention Backend optimizations.
+class Hunyuan3DPaintTexGenStage(PipelineStage):
+    """Multi-view texture generation via UNet2.5D diffusion.
+
+    Loads paint models lazily, prepares denoising inputs, runs the
+    denoising loop, and decodes latents to multi-view texture images.
     """
 
     def __init__(
@@ -603,7 +548,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         return StageParallelismType.MAIN_RANK_ONLY
 
     def _load_paint_models(self, server_args: ServerArgs) -> None:
-        """Load paint models if not already loaded via pipeline."""
         if self._loaded:
             return
 
@@ -652,7 +596,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
             self.transformer = UNet2p5DConditionModel.from_pretrained(
                 os.path.join(local_path, "unet"),
-                dtype=torch.float16,
+                torch_dtype=torch.float16,
             ).to("cuda")
 
             self.is_turbo = bool(getattr(self.config, "paint_turbo_mode", False))
@@ -704,7 +648,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
     def _convert_pil_list_to_tensor(
         self, images: list, device: torch.device
     ) -> torch.Tensor:
-        """Convert list of PIL images to tensor."""
         bg_c = [1.0, 1.0, 1.0]
         images_tensor = []
         for batch_imgs in images:
@@ -732,7 +675,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
     @torch.no_grad()
     def _encode_images(self, images: torch.Tensor) -> torch.Tensor:
-        """Encode images to latent space using VAE."""
         batch_size = images.shape[0]
         images = rearrange(images, "b n c h w -> (b n) c h w")
         dtype = next(self.vae.parameters()).dtype
@@ -743,7 +685,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
     @staticmethod
     def _compute_camera_index(azim: float, elev: float) -> int:
-        """Compute camera index from azimuth and elevation angles."""
         base_idx = int(((azim // 30) + 9) % 12)
         if elev == 0:
             base, divisor = 12, 1
@@ -764,7 +705,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> dict[str, Any]:
-        """Prepare all inputs needed for the denoising loop."""
         import random
 
         from diffusers.utils.torch_utils import randn_tensor
@@ -946,7 +886,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         generator: torch.Generator,
         num_channels_latents: int,
     ) -> torch.Tensor:
-        """Run the denoising loop."""
         import inspect
 
         if do_cfg:
@@ -1004,14 +943,12 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
     @torch.no_grad()
     def _decode_latents(self, latents: torch.Tensor) -> list:
-        """Decode latents to PIL images."""
         image = self.vae.decode(
             latents / self.vae.config.scaling_factor, return_dict=False
         )[0]
         return self.image_processor.postprocess(image, output_type="pil")
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        """Execute the paint diffusion stage."""
         self._load_paint_models(server_args)
 
         delighted_image = batch.extra["delighted_image"]
@@ -1064,7 +1001,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         return batch
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """Verify paint diffusion stage inputs."""
         result = VerificationResult()
         result.add_check(
             "delighted_image", batch.extra.get("delighted_image"), V.not_none
@@ -1076,7 +1012,6 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         return result
 
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        """Verify paint diffusion stage outputs."""
         result = VerificationResult()
         result.add_check(
             "multiview_textures", batch.extra.get("multiview_textures"), V.is_list
@@ -1084,12 +1019,13 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
         return result
 
 
-class Hunyuan3DPaintPostprocessStage(PipelineStage):
-    """Stage 4: Texture baking and mesh export.
+# ---------------------------------------------------------------------------
+# Stage 3: Postprocess (texture baking + mesh export)
+# ---------------------------------------------------------------------------
 
-    This stage bakes the generated textures onto the mesh UV space
-    and exports the final textured mesh.
-    """
+
+class Hunyuan3DPaintPostprocessStage(PipelineStage):
+    """Texture baking from multi-view images and final mesh export."""
 
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
@@ -1102,7 +1038,6 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         camera_azims = batch.extra["camera_azims"]
         view_weights = batch.extra["view_weights"]
 
-        # Resize textures if needed
         render_size = getattr(self.config, "paint_render_size", 2048)
         resized_textures = []
         for tex in multiview_textures:
@@ -1111,7 +1046,6 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
             else:
                 resized_textures.append(tex)
 
-        # Bake textures from multiple views
         try:
             texture, mask = renderer.bake_from_multiview(
                 resized_textures,
@@ -1121,11 +1055,9 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
                 method="fast",
             )
 
-            # Inpaint missing regions
             mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype("uint8")
             texture = renderer.texture_inpaint(texture, mask_np)
 
-            # Apply texture to mesh
             renderer.set_texture(texture)
             textured_mesh = renderer.save_mesh()
             logger.info("Texture baking completed")
@@ -1133,7 +1065,6 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
             logger.error(f"Texture baking failed: {e}")
             textured_mesh = batch.extra["paint_mesh"]
 
-        # Export mesh
         obj_path = batch.extra["shape_obj_path"]
         return_path = batch.extra["shape_return_path"]
 
@@ -1160,98 +1091,8 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         return result
 
 
-# Legacy PaintStage kept for backward compatibility
-class Hunyuan3DPaintStage(PipelineStage):
-    """Legacy paint stage - redirects to new multi-stage implementation."""
-
-    def __init__(self, paint_pipeline: Any, config: Hunyuan3D2PipelineConfig) -> None:
-        super().__init__()
-        self.paint_pipeline = paint_pipeline
-        self.config = config
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        return StageParallelismType.MAIN_RANK_ONLY
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        obj_path = batch.extra["shape_obj_path"]
-        return_path = batch.extra["shape_return_path"]
-
-        if self.paint_pipeline is not None:
-            self.paint_pipeline(
-                mesh_path=obj_path,
-                image_path=batch.image_path,
-                output_mesh_path=obj_path,
-                use_remesh=self.config.paint_use_remesh,
-                save_glb=self.config.paint_save_glb,
-            )
-
-        if self.config.paint_save_glb:
-            return_path = obj_path[:-4] + ".glb"
-        elif return_path.endswith(".glb"):
-            return_path = obj_path
-
-        return OutputBatch(output=[return_path], timings=batch.timings)
-
-
-class Hunyuan3DPaintPreprocessStage(PipelineStage):
-    """Combined preprocessing stage that runs UV unwrap (CPU) and delight (GPU) in parallel.
-
-    This stage improves performance by executing CPU-bound UV unwrapping
-    concurrently with GPU-bound image delight processing.
-    """
-
-    def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
-        super().__init__()
-        self.config = config
-        self.uv_stage = Hunyuan3DPaintUVUnwrapStage(config)
-        self.delight_stage = Hunyuan3DPaintDelightStage(config)
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        import concurrent.futures
-        import copy
-
-        batch_for_uv = batch
-        batch_for_delight = copy.copy(batch)
-        batch_for_delight.extra = batch.extra.copy()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            uv_future = executor.submit(
-                self.uv_stage.forward, batch_for_uv, server_args
-            )
-            delight_future = executor.submit(
-                self.delight_stage.forward, batch_for_delight, server_args
-            )
-
-            uv_future.result()
-            delight_future.result()
-
-        batch.extra["paint_mesh"] = batch_for_uv.extra.get("paint_mesh")
-        batch.extra["delighted_image"] = batch_for_delight.extra.get("delighted_image")
-
-        return batch
-
-    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check("shape_meshes", batch.extra.get("shape_meshes"), V.not_none)
-        result.add_check("image_path", batch.image_path, V.not_none)
-        return result
-
-    def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
-        result = VerificationResult()
-        result.add_check("paint_mesh", batch.extra.get("paint_mesh"), V.not_none)
-        result.add_check(
-            "delighted_image", batch.extra.get("delighted_image"), V.not_none
-        )
-        return result
-
-
 __all__ = [
-    "Hunyuan3DPaintUVUnwrapStage",
-    "Hunyuan3DPaintDelightStage",
-    "Hunyuan3DPaintRenderStage",
-    "Hunyuan3DPaintDiffusionStage",
-    "Hunyuan3DPaintPostprocessStage",
     "Hunyuan3DPaintPreprocessStage",
-    "Hunyuan3DPaintStage",
+    "Hunyuan3DPaintTexGenStage",
+    "Hunyuan3DPaintPostprocessStage",
 ]
