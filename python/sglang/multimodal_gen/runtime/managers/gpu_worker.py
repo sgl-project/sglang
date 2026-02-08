@@ -71,7 +71,7 @@ class GPUWorker:
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
-        torch.cuda.set_device(self.local_rank)
+        torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -86,6 +86,7 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
             dist_timeout=self.server_args.dist_timeout,
         )
 
@@ -160,7 +161,7 @@ class GPUWorker:
         output_batch = None
         try:
             if self.rank == 0:
-                torch.cuda.reset_peak_memory_stats()
+                torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
@@ -347,7 +348,8 @@ def run_scheduler_process(
     """
     configure_logger(server_args)
     globally_suppress_loggers()
-    set_cuda_arch()
+    if current_platform.is_cuda():
+        set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 
