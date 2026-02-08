@@ -163,11 +163,7 @@ class LoRAMemoryPool:
             input_dim = divide(input_dim, self.tp_size)
 
         if self.is_moe_module(module_name):
-            num_experts = getattr(
-                self.base_hf_config,
-                "num_local_experts",
-                getattr(self.base_hf_config, "num_experts", 0),
-            )
+            num_experts = self.base_model.config.num_experts
             return (
                 self.max_loras_per_batch,
                 num_experts,
@@ -216,11 +212,7 @@ class LoRAMemoryPool:
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
-            num_experts = getattr(
-                self.base_hf_config,
-                "num_local_experts",
-                getattr(self.base_hf_config, "num_experts", 0),
-            )
+            num_experts = self.base_model.config.num_experts
             return (self.max_loras_per_batch, num_experts, output_dim, max_lora_dim)
         else:
             return (self.max_loras_per_batch, output_dim, max_lora_dim)
