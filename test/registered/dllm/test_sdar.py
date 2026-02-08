@@ -37,7 +37,7 @@ class TestSDARMini(CustomTestCase):
             "--dllm-algorithm",
             "LowConfidence",
             "--tp",
-            "1",
+            "4",
         ]
 
         cls.process = popen_launch_server(

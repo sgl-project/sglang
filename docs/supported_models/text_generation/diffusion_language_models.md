@@ -107,3 +107,5 @@ Below the supported models are summarized in a table.
 | Model Family               | Example Model                | Description                                                                                          |
 | -------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
 | **LLaDA2.0 (mini, flash)** | `inclusionAI/LLaDA2.0-flash` | LLaDA2.0-flash is a diffusion language model featuring a 100B Mixture-of-Experts (MoE) architecture. |
+| **SDAR (JetLM)**           | `JetLM/SDAR-8B-Chat`         | SDAR series diffusion language model (Chat), dense architecture.                                 |
+| **SDAR (JetLM)**           | `JetLM/SDAR-30B-A3B-Chat`    | SDAR series diffusion language model (Chat), MoE architecture.                                   |
