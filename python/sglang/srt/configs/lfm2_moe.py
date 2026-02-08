@@ -22,10 +22,7 @@ from typing import List, Optional
 from transformers import CONFIG_MAPPING
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.mamba_utils import (
-    Mamba2CacheParams,
-    Mamba2StateShape,
-)
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 
 
 class Lfm2MoeConfig(PretrainedConfig):
