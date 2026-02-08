@@ -1946,14 +1946,14 @@ class Scheduler(
         ):
             return None
 
-        running_bs = len(self.running_batch.reqs)
+        self.running_bs = len(self.running_batch.reqs)
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
+            self.get_num_allocatable_reqs(self.running_bs) <= 0
             and (self.dllm_staging_reqs.empty() or self.chunked_req is not None)
             and not self.try_preemption
         ):
@@ -1966,7 +1966,7 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
-        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+        if TEST_RETRACT and self.running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
@@ -1989,7 +1989,7 @@ class Scheduler(
             self.new_token_ratio,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            self.running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
@@ -2032,8 +2032,9 @@ class Scheduler(
                     ):
                         continue
 
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(
+                self.running_bs
+            ):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
@@ -2119,7 +2120,6 @@ class Scheduler(
         # Record for logging prefill stats after forward
         self.adder = adder
         self.can_run_list = can_run_list
-        self.running_bs = len(self.running_batch.reqs)
 
         # Record metrics
         for req in can_run_list:

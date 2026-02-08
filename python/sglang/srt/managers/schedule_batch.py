@@ -1318,7 +1318,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     temp_scaled_logprobs: bool = False
     top_p_normalized_logprobs: bool = False
 
-    # For extend and mixed chunekd prefill
+    # For extend and mixed chunked prefill
     prefix_lens: List[int] = None
     extend_lens: List[int] = None
     extend_num_tokens: Optional[int] = None
