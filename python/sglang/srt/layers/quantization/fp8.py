@@ -972,15 +972,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if not (_is_cuda and is_sm100_supported()):
             raise RuntimeError("MXFP8 MoE quantization requires SM100.")
 
-        # For trtllm backend, use flashinfer-native MXFP8 weight preparation
-        if get_moe_runner_backend().is_flashinfer_trtllm():
-            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                align_mxfp8_moe_weights_for_flashinfer_trtllm,
-            )
-
-            align_mxfp8_moe_weights_for_flashinfer_trtllm(layer, quantize=quantize)
-            return
-
         def _quantize_and_swizzle_with_cutlass_es_kernel(weight: torch.Tensor):
             from sgl_kernel import es_sm100_mxfp8_blockscaled_grouped_quant
 
@@ -1508,7 +1499,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
-                use_mxfp8=self.use_mxfp8,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(

@@ -181,104 +181,6 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     )
 
 
-def align_mxfp8_moe_weights_for_flashinfer_trtllm(
-    layer: Module, quantize: bool = True
-) -> None:
-    """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels.
-
-    For the trtllm MXFP8 path, weights must be:
-    1. Quantized to MXFP8 using flashinfer's mxfp8_quantize (swizzled scales)
-    2. Rows reordered for gated activation (w13 only)
-    3. Shuffled for transposed MMA output
-
-    Args:
-        layer: The MoE layer to process.
-        quantize: If True, quantize BF16 weights to MXFP8.
-            If False, assume weights are already MXFP8 quantized.
-    """
-    from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
-    from flashinfer.fp8_quantization import mxfp8_quantize
-
-    w13_weight = cast(torch.Tensor, layer.w13_weight)
-    w2_weight = cast(torch.Tensor, layer.w2_weight)
-    num_experts = w13_weight.shape[0]
-
-    def _dequantize_mxfp8_2d(fp8_weight: torch.Tensor, scale_u8: torch.Tensor):
-        group_size = 32
-        n, k = fp8_weight.shape
-        n_groups = k // group_size
-        scales_f32 = torch.pow(
-            2.0, scale_u8.to(dtype=torch.float32, device=fp8_weight.device) - 127.0
-        )
-        weight_f32 = fp8_weight.to(torch.float32).view(n, n_groups, group_size)
-        return (weight_f32 * scales_f32.unsqueeze(-1)).view(n, k).to(torch.bfloat16)
-
-    if not quantize:
-        # Pre-quantized FP8 checkpoint stores raw FP8 mantissas plus 2D UE8M0
-        # block scales. Reconstruct bf16 first, then requantize to flashinfer's
-        # swizzled scale layout expected by the TRT-LLM kernel.
-        w13_scale = cast(torch.Tensor, layer.w13_weight_scale_inv)
-        w2_scale = cast(torch.Tensor, layer.w2_weight_scale_inv)
-        w13_weight = torch.stack(
-            [
-                _dequantize_mxfp8_2d(w13_weight[i], w13_scale[i])
-                for i in range(num_experts)
-            ]
-        )
-        w2_weight = torch.stack(
-            [
-                _dequantize_mxfp8_2d(w2_weight[i], w2_scale[i])
-                for i in range(num_experts)
-            ]
-        )
-
-    # Quantize (or re-quantize) to MXFP8 with swizzled scales for weights
-    w13_q_list, w13_s_list = [], []
-    w2_q_list, w2_s_list = [], []
-    for i in range(num_experts):
-        w13_q, w13_s = mxfp8_quantize(
-            w13_weight[i], is_sf_swizzled_layout=True, backend="cuda"
-        )
-        w13_q_list.append(w13_q)
-        w13_s_list.append(w13_s.view(torch.uint8))
-
-        w2_q, w2_s = mxfp8_quantize(
-            w2_weight[i], is_sf_swizzled_layout=True, backend="cuda"
-        )
-        w2_q_list.append(w2_q)
-        w2_s_list.append(w2_s.view(torch.uint8))
-
-    w13_weight = torch.stack(w13_q_list)
-    w13_scales = torch.stack(w13_s_list)
-    w2_weight = torch.stack(w2_q_list)
-    w2_scales = torch.stack(w2_s_list)
-
-    # Reorder rows for gated activation (w13 only — interleaves gate/up halves)
-    w13_interleaved = torch.stack(
-        [reorder_rows_for_gated_act_gemm(w13_weight[i]) for i in range(num_experts)]
-    ).reshape_as(w13_weight)
-
-    # Shuffle weights for transposed MMA output (both w13 and w2)
-    epilogue_tile_m = 128
-    w13_shuffled = torch.stack(
-        [
-            shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
-            for i in range(num_experts)
-        ]
-    ).view(torch.float8_e4m3fn)
-    w2_shuffled = torch.stack(
-        [
-            shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
-            for i in range(num_experts)
-        ]
-    ).view(torch.float8_e4m3fn)
-
-    layer.w13_weight = Parameter(w13_shuffled, requires_grad=False)
-    layer.w2_weight = Parameter(w2_shuffled, requires_grad=False)
-    layer.w13_weight_scale_inv = Parameter(w13_scales, requires_grad=False)
-    layer.w2_weight_scale_inv = Parameter(w2_scales, requires_grad=False)
-
-
 @dataclass
 class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP8 MoE kernels."""
@@ -308,9 +210,6 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     output2_scales_scalar: torch.Tensor | None = None
     use_routing_scales_on_input: bool = False
 
-    # MXFP8 path
-    use_mxfp8: bool = False
-
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
@@ -318,7 +217,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     from flashinfer.fused_moe import (
-        Fp8QuantizationType,
         trtllm_fp8_block_scale_moe,
         trtllm_fp8_per_tensor_scale_moe,
     )
@@ -345,28 +243,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     routing_method_type = quant_info.routing_method_type
 
     if quant_info.block_quant:
+        assert quant_info.weight_block_k is not None
         assert quant_info.w13_weight_scale_inv is not None
         assert quant_info.w2_weight_scale_inv is not None
 
-        if quant_info.use_mxfp8:
-            # MXFP8 path: quantize activations with flashinfer's mxfp8_quantize
-            from flashinfer.fp8_quantization import mxfp8_quantize
-
-            a_q, a_sf = mxfp8_quantize(
-                hidden_states, is_sf_swizzled_layout=False, backend="cuda"
-            )
-            a_sf = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
-            fp8_quant_type = Fp8QuantizationType.MxFp8
-            use_shuffled_weight = True
-        else:
-            # DeepSeek FP8 block scale path
-            assert quant_info.weight_block_k is not None
-            a_q, a_sf = per_token_group_quant_fp8(
-                hidden_states, quant_info.weight_block_k
-            )
-            a_sf = a_sf.t().contiguous()
-            fp8_quant_type = Fp8QuantizationType.DeepSeekFp8
-            use_shuffled_weight = False
+        a_q, a_sf = per_token_group_quant_fp8(hidden_states, quant_info.weight_block_k)
+        a_sf_t = a_sf.t().contiguous()
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -375,16 +257,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # It ignored the `output` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
             # so we put the whole function under the ``use_symmetric_memory`` context manager.
             # If the bug is fixed, we can only put the output tensor allocation under the context manager.
-            _rl = (
-                router_logits.to(torch.float32)
-                if routing_method_type == RoutingMethodType.DeepSeekV3
-                else router_logits
-            )
             output = trtllm_fp8_block_scale_moe(
-                routing_logits=_rl,
+                routing_logits=(
+                    router_logits.to(torch.float32)
+                    if routing_method_type == RoutingMethodType.DeepSeekV3
+                    else router_logits
+                ),
                 routing_bias=correction_bias,
                 hidden_states=a_q,
-                hidden_states_scale=a_sf,
+                hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
                 gemm2_weights=quant_info.w2_weight,
@@ -404,9 +285,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     else 1.0
                 ),
                 routing_method_type=routing_method_type,
-                use_shuffled_weight=use_shuffled_weight,
+                use_shuffled_weight=False,
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
-                fp8_quantization_type=fp8_quant_type,
             )
     else:
         assert quant_info.w13_input_scale is not None

@@ -1298,8 +1298,7 @@ class ServerArgs:
                 if (
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
-                    and self.quantization
-                    in ["fp8", "modelopt_fp8", "modelopt_mxfp8", "modelopt_fp4"]
+                    and self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
@@ -1458,7 +1457,7 @@ class ServerArgs:
                 "intel_xpu",
             }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-                if self.quantization in {"fp8", "modelopt_fp8", "modelopt_mxfp8"}:
+                if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on SM100 for Llama4"
@@ -2080,7 +2079,6 @@ class ServerArgs:
                 "modelopt_fp4",
                 "fp8",
                 "modelopt_fp8",
-                "modelopt_mxfp8",
                 "compressed-tensors",
                 None,
             ], f"Invalid quantization '{self.quantization}'. \nFlashInfer TRTLLM MOE supports only: 'modelopt_fp4', 'fp8', 'modelopt_fp8', 'compressed-tensors', or bfloat16 (None)."
