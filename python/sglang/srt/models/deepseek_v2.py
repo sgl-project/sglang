@@ -1651,6 +1651,18 @@ class DeepseekV2MoE(nn.Module):
         device = hidden_states.device
 
         if num_tokens == 0:
+            # Must still participate in the all_reduce collective over the EP
+            # group (used by ranks with num_tokens > 0 for global routed counts).
+            # Skipping this causes a deadlock because the EP group's all_reduce
+            # and DeepEP dispatch are both collectives requiring all ranks.
+            dummy_counts = torch.zeros(
+                self.moe_ep_size, dtype=torch.int64, device=device
+            )
+            torch.distributed.all_reduce(
+                dummy_counts,
+                op=torch.distributed.ReduceOp.SUM,
+                group=get_moe_ep_group().device_group,
+            )
             topk_output = self.topk.empty_topk_output(device)
             return self.experts(hidden_states=hidden_states, topk_output=topk_output)
 
