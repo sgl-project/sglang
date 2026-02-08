@@ -85,8 +85,19 @@ class EpDispatchConfig:
     rdma_block_num: int
 
 
-def get_ep_dispatch_configs():
+def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     import mori
+
+    # Threshold for switching between InterNodeV1 and InterNodeV1LL kernel types. Defaults to 256. When the threshold is less than num_max_dispatch_tokens_per_rank, InterNodeV1 is used; otherwise InterNodeV1LL is used.
+    inter_kernel_swtich_threshold = get_int_env_var(
+        "SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD", 256
+    )
+
+    inter_kernel_type = (
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1
+        if inter_kernel_swtich_threshold < num_max_dispatch_tokens_per_rank
+        else mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+    )
 
     return {
         EpMode.INTRA_NODE: EpDispatchConfig(
@@ -96,7 +107,7 @@ def get_ep_dispatch_configs():
             rdma_block_num=0,
         ),
         EpMode.INTER_NODE: EpDispatchConfig(
-            kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1,
+            kernel_type=inter_kernel_type,
             warp_num_per_block=8,
             block_num=64,
             rdma_block_num=32,
@@ -130,7 +141,7 @@ def init_mori_op(
     )
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
-    cfg = get_ep_dispatch_configs()[mode]
+    cfg = get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank)[mode]
 
     kernel_type = cfg.kernel_type
     warp_num_per_block = cfg.warp_num_per_block
