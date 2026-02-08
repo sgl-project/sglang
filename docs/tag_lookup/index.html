@@ -235,6 +235,7 @@
 <script>
     let tagIndex = null;
     let tagsArray = null;  // Compact format: array of [name, date, type]
+    let sortedCommitKeys = null;  // Sorted keys for binary prefix search
     const INDEX_FILE = 'tag_index.json';
     const EXAMPLE_FILE = 'example_index.json';
     const SHORT_HASH_LEN = 8;
@@ -314,6 +315,8 @@
                 tagIndex = data;
                 tagsArray = null;
             }
+            // Pre-sort commit keys for binary prefix search
+            sortedCommitKeys = Object.keys(tagIndex.commits).sort();
 
             const tagCount = tagsArray ? tagsArray.length : Object.keys(tagIndex.tags).length;
             const prCount = Object.keys(tagIndex.prs).length;
@@ -321,11 +324,30 @@
             statusDiv.innerText = `Ready. Indexed ${tagCount} releases and ${prCount} PRs.`;
             btn.disabled = false;
         } catch (e) {
-            statusDiv.innerHTML = `<span style="color: var(--error-text)">Error: ${e.message}</span>`;
+            statusDiv.textContent = '';
+            const errorSpan = document.createElement('span');
+            errorSpan.style.color = 'var(--error-text)';
+            errorSpan.textContent = `Error: ${e.message}`;
+            statusDiv.appendChild(errorSpan);
             btn.disabled = true;
         } finally {
             loadingDiv.style.display = 'none';
         }
+    }
+
+    // Binary search for first commit key matching the given prefix (O(log n))
+    function prefixSearchCommit(prefix) {
+        if (!sortedCommitKeys) return null;
+        let lo = 0, hi = sortedCommitKeys.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (sortedCommitKeys[mid] < prefix) lo = mid + 1;
+            else hi = mid;
+        }
+        if (lo < sortedCommitKeys.length && sortedCommitKeys[lo].startsWith(prefix)) {
+            return sortedCommitKeys[lo];
+        }
+        return null;
     }
 
     // Start loading
@@ -380,9 +402,9 @@
             const shortKey = key.slice(0, SHORT_HASH_LEN);
             tagData = tagIndex.commits[shortKey];
 
-            // If not found with short hash, try prefix match
+            // If not found with short hash, try prefix match (binary search)
             if (!tagData) {
-                const matchKey = Object.keys(tagIndex.commits).find(h => h.startsWith(shortKey) || shortKey.startsWith(h));
+                const matchKey = prefixSearchCommit(shortKey);
                 if (matchKey) {
                     tagData = tagIndex.commits[matchKey];
                 }
@@ -424,17 +446,33 @@
 
         if (tagRefs.length === 0) {
             const label = queryType === 'pr' ? `PR #${key}` : `Commit ${key.substring(0, 7)}`;
-            resultDiv.innerHTML = `
-                <div class="result-content result-error">
-                    <div class="result-row">
-                        <span class="result-label">Status</span>
-                        <span>Not Found</span>
-                    </div>
-                    <div style="margin-top: 8px;">
-                        The ${queryType} <strong>${label}</strong> has not been included in any release tag yet, or is not in the index.
-                    </div>
-                </div>
-            `;
+
+            const container = document.createElement('div');
+            container.className = 'result-content result-error';
+
+            const statusRow = document.createElement('div');
+            statusRow.className = 'result-row';
+            const statusLabel = document.createElement('span');
+            statusLabel.className = 'result-label';
+            statusLabel.textContent = 'Status';
+            const statusValue = document.createElement('span');
+            statusValue.textContent = 'Not Found';
+            statusRow.appendChild(statusLabel);
+            statusRow.appendChild(statusValue);
+
+            const msgDiv = document.createElement('div');
+            msgDiv.style.marginTop = '8px';
+            const strongEl = document.createElement('strong');
+            strongEl.textContent = label;
+            msgDiv.append(
+                `The ${queryType} `,
+                strongEl,
+                ' has not been included in any release tag yet, or is not in the index.'
+            );
+
+            container.appendChild(statusRow);
+            container.appendChild(msgDiv);
+            resultDiv.appendChild(container);
             return;
         }
 

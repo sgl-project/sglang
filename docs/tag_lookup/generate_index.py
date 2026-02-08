@@ -8,11 +8,12 @@ from datetime import datetime
 
 # Short hash length for commits (7 is git's default short hash)
 SHORT_HASH_LEN = 8
+COMMIT_CHUNK_SIZE = 1000
 
 
 def run_git(cmd):
     try:
-        output = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT)
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         return output.decode("utf-8", errors="replace").strip()
     except subprocess.CalledProcessError as e:
         print(f"Error running cmd: {cmd}\n{e.output.decode('utf-8', errors='replace')}")
@@ -21,7 +22,15 @@ def run_git(cmd):
 
 def get_tags():
     # Get tags sorted by creator date
-    cmd = "git tag --list 'v*' 'gateway-v*' --sort=creatordate --format='%(refname:short)|%(creatordate:iso8601)|%(objectname)'"
+    cmd = [
+        "git",
+        "tag",
+        "--list",
+        "v*",
+        "gateway-v*",
+        "--sort=creatordate",
+        "--format=%(refname:short)|%(creatordate:iso8601)|%(objectname)",
+    ]
     raw = run_git(cmd)
     tags = []
     if not raw:
@@ -52,16 +61,15 @@ def extract_pr_num(message):
     return None
 
 
-def process_tag_line(tags, tag_info, commit_map, pr_map, tag_type, tag_to_idx):
+def process_tag_line(tags, commit_map, pr_map, tag_type, tag_to_idx):
     """Process a single release line (main or gateway) independently."""
     seen_commits = set()
 
     for tag in tags:
         tag_name = tag["name"]
         print(f"Processing {tag_name}...")
-        tag_info[tag_name] = {"date": tag["date"], "type": tag["type"]}
 
-        commits = run_git(f"git rev-list {tag_name}").split("\n")
+        commits = run_git(["git", "rev-list", tag_name]).split("\n")
 
         new_commits = []
         for c in commits:
@@ -76,11 +84,10 @@ def process_tag_line(tags, tag_info, commit_map, pr_map, tag_type, tag_to_idx):
         if not new_commits:
             continue
 
-        chunk_size = 1000
-        for i in range(0, len(new_commits), chunk_size):
-            chunk = new_commits[i : i + chunk_size]
+        for i in range(0, len(new_commits), COMMIT_CHUNK_SIZE):
+            chunk = new_commits[i : i + COMMIT_CHUNK_SIZE]
 
-            cmd = f"git show -s --format='%H|%B%n--END-COMMIT--' {' '.join(chunk)}"
+            cmd = ["git", "show", "-s", "--format=%H|%B%n--END-COMMIT--"] + chunk
             raw_logs = run_git(cmd)
 
             entries = raw_logs.split("--END-COMMIT--\n")
@@ -140,10 +147,9 @@ def main():
 
     pr_map = {}
     commit_map = {}
-    tag_info = {}  # Still needed for process_tag_line
 
-    process_tag_line(main_tags, tag_info, commit_map, pr_map, "m", tag_to_idx)
-    process_tag_line(gateway_tags, tag_info, commit_map, pr_map, "g", tag_to_idx)
+    process_tag_line(main_tags, commit_map, pr_map, "m", tag_to_idx)
+    process_tag_line(gateway_tags, commit_map, pr_map, "g", tag_to_idx)
 
     # Compact output format:
     # - tags: array of [name, date, type]
