@@ -328,103 +328,59 @@ class WanEncoder3d(nn.Module):
             world_size = get_sp_world_size()
 
         if use_parallel_encode and world_size > 1:
-            # init block
-            self.conv_in = WanDistCausalConv3d(in_channels, dims[0], 3, padding=1)
-
-            # downsample blocks
-            self.down_blocks = nn.ModuleList([])
-            for i, (in_dim, out_dim) in enumerate(
-                zip(dims[:-1], dims[1:], strict=True)
-            ):
-                # residual (+attention) blocks
-                if is_residual:
-                    self.down_blocks.append(
-                        WanDistResidualDownBlock(
-                            in_dim,
-                            out_dim,
-                            dropout,
-                            num_res_blocks,
-                            temperal_downsample=(
-                                temperal_downsample[i]
-                                if i != len(dim_mult) - 1
-                                else False
-                            ),
-                            down_flag=i != len(dim_mult) - 1,
-                        )
-                    )
-                else:
-                    for _ in range(num_res_blocks):
-                        self.down_blocks.append(
-                            WanDistResidualBlock(in_dim, out_dim, dropout)
-                        )
-                        if scale in attn_scales:
-                            self.down_blocks.append(WanDistAttentionBlock(out_dim))
-                        in_dim = out_dim
-
-                    # downsample block
-                    if i != len(dim_mult) - 1:
-                        mode = (
-                            "downsample3d" if temperal_downsample[i] else "downsample2d"
-                        )
-                        self.down_blocks.append(WanDistResample(out_dim, mode=mode))
-                        scale /= 2.0
-
-            # middle blocks
-            self.mid_block = WanDistMidBlock(
-                out_dim, dropout, non_linearity, num_layers=1
-            )
-
-            # output blocks
-            self.norm_out = WanRMS_norm(out_dim, images=False)
-            self.conv_out = WanDistCausalConv3d(out_dim, z_dim, 3, padding=1)
+            CausalConv3d = WanDistCausalConv3d
+            ResidualDownBlock = WanDistResidualDownBlock
+            ResidualBlock = WanDistResidualBlock
+            AttentionBlock = WanDistAttentionBlock
+            Resample = WanDistResample
+            MidBlock = WanDistMidBlock
         else:
-            # init block
-            self.conv_in = WanCausalConv3d(in_channels, dims[0], 3, padding=1)
+            CausalConv3d = WanCausalConv3d
+            ResidualDownBlock = WanResidualDownBlock
+            ResidualBlock = WanResidualBlock
+            AttentionBlock = WanAttentionBlock
+            Resample = WanResample
+            MidBlock = WanMidBlock
 
-            # downsample blocks
-            self.down_blocks = nn.ModuleList([])
-            for i, (in_dim, out_dim) in enumerate(
-                zip(dims[:-1], dims[1:], strict=True)
-            ):
-                # residual (+attention) blocks
-                if is_residual:
-                    self.down_blocks.append(
-                        WanResidualDownBlock(
-                            in_dim,
-                            out_dim,
-                            dropout,
-                            num_res_blocks,
-                            temperal_downsample=(
-                                temperal_downsample[i]
-                                if i != len(dim_mult) - 1
-                                else False
-                            ),
-                            down_flag=i != len(dim_mult) - 1,
-                        )
+        # init block
+        self.conv_in = CausalConv3d(in_channels, dims[0], 3, padding=1)
+
+        # downsample blocks
+        self.down_blocks = nn.ModuleList([])
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+            # residual (+attention) blocks
+            if is_residual:
+                self.down_blocks.append(
+                    ResidualDownBlock(
+                        in_dim,
+                        out_dim,
+                        dropout,
+                        num_res_blocks,
+                        temperal_downsample=(
+                            temperal_downsample[i] if i != len(dim_mult) - 1 else False
+                        ),
+                        down_flag=i != len(dim_mult) - 1,
                     )
-                else:
-                    for _ in range(num_res_blocks):
-                        self.down_blocks.append(
-                            WanResidualBlock(in_dim, out_dim, dropout)
-                        )
-                        if scale in attn_scales:
-                            self.down_blocks.append(WanAttentionBlock(out_dim))
-                        in_dim = out_dim
+                )
+            else:
+                for _ in range(num_res_blocks):
+                    self.down_blocks.append(ResidualBlock(in_dim, out_dim, dropout))
+                    if scale in attn_scales:
+                        self.down_blocks.append(AttentionBlock(out_dim))
+                    in_dim = out_dim
 
-                    # downsample block
-                    if i != len(dim_mult) - 1:
-                        mode = (
-                            "downsample3d" if temperal_downsample[i] else "downsample2d"
-                        )
-                        self.down_blocks.append(WanResample(out_dim, mode=mode))
-                        scale /= 2.0
+                # downsample block
+                if i != len(dim_mult) - 1:
+                    mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
+                    self.down_blocks.append(Resample(out_dim, mode=mode))
+                    scale /= 2.0
 
-            # middle blocks
-            self.mid_block = WanMidBlock(out_dim, dropout, non_linearity, num_layers=1)
+        # middle blocks
+        self.mid_block = MidBlock(out_dim, dropout, non_linearity, num_layers=1)
 
-            # output blocks
-            self.norm_out = WanRMS_norm(out_dim, images=False)
-            self.conv_out = WanCausalConv3d(out_dim, z_dim, 3, padding=1)
+        # output blocks
+        self.norm_out = WanRMS_norm(out_dim, images=False)
+        self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
 
         self.gradient_checkpointing = False
 
@@ -670,112 +626,67 @@ class WanDecoder3d(nn.Module):
             world_size = get_sp_world_size()
 
         if use_parallel_decode and world_size > 1:
-            # init block
-            self.conv_in = WanDistCausalConv3d(z_dim, dims[0], 3, padding=1)
-
-            # middle blocks
-            self.mid_block = WanDistMidBlock(
-                dims[0], dropout, non_linearity, num_layers=1
-            )
-
-            # upsample blocks
-            self.upsample_count = 0
-            self.up_blocks = nn.ModuleList([])
-            for i, (in_dim, out_dim) in enumerate(
-                zip(dims[:-1], dims[1:], strict=True)
-            ):
-                # residual (+attention) blocks
-                if i > 0 and not is_residual:
-                    # wan vae 2.1
-                    in_dim = in_dim // 2
-
-                # determine if we need upsampling
-                up_flag = i != len(dim_mult) - 1
-                # determine upsampling mode, if not upsampling, set to None
-                upsample_mode = None
-                if up_flag and temperal_upsample[i]:
-                    upsample_mode = "upsample3d"
-                elif up_flag:
-                    upsample_mode = "upsample2d"
-
-                # Create and add the upsampling block
-                if is_residual:
-                    up_block = WanDistResidualUpBlock(
-                        in_dim=in_dim,
-                        out_dim=out_dim,
-                        num_res_blocks=num_res_blocks,
-                        dropout=dropout,
-                        temperal_upsample=temperal_upsample[i] if up_flag else False,
-                        up_flag=up_flag,
-                        non_linearity=non_linearity,
-                    )
-                else:
-                    up_block = WanDistUpBlock(
-                        in_dim=in_dim,
-                        out_dim=out_dim,
-                        num_res_blocks=num_res_blocks,
-                        dropout=dropout,
-                        upsample_mode=upsample_mode,
-                        non_linearity=non_linearity,
-                    )
-                self.up_blocks.append(up_block)
-                if up_flag:
-                    self.upsample_count += 1
-
-            # output blocks
-            self.norm_out = WanRMS_norm(out_dim, images=False)
-            self.conv_out = WanDistCausalConv3d(out_dim, out_channels, 3, padding=1)
+            CausalConv3d = WanDistCausalConv3d
+            MidBlock = WanDistMidBlock
+            ResidualUpBlock = WanDistResidualUpBlock
+            UpBlock = WanDistUpBlock
         else:
-            # init block
-            self.conv_in = WanCausalConv3d(z_dim, dims[0], 3, padding=1)
+            CausalConv3d = WanCausalConv3d
+            MidBlock = WanMidBlock
+            ResidualUpBlock = WanResidualUpBlock
+            UpBlock = WanUpBlock
 
-            # middle blocks
-            self.mid_block = WanMidBlock(dims[0], dropout, non_linearity, num_layers=1)
+        # init block
+        self.conv_in = CausalConv3d(z_dim, dims[0], 3, padding=1)
 
-            # upsample blocks
-            self.up_blocks = nn.ModuleList([])
-            for i, (in_dim, out_dim) in enumerate(
-                zip(dims[:-1], dims[1:], strict=True)
-            ):
-                # residual (+attention) blocks
-                if i > 0 and not is_residual:
-                    # wan vae 2.1
-                    in_dim = in_dim // 2
+        # middle blocks
+        self.mid_block = MidBlock(dims[0], dropout, non_linearity, num_layers=1)
 
-                # determine if we need upsampling
-                up_flag = i != len(dim_mult) - 1
-                # determine upsampling mode, if not upsampling, set to None
-                upsample_mode = None
-                if up_flag and temperal_upsample[i]:
-                    upsample_mode = "upsample3d"
-                elif up_flag:
-                    upsample_mode = "upsample2d"
+        # upsample blocks
+        self.upsample_count = 0
+        self.up_blocks = nn.ModuleList([])
+        for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+            # residual (+attention) blocks
+            if i > 0 and not is_residual:
+                # wan vae 2.1
+                in_dim = in_dim // 2
 
-                # Create and add the upsampling block
-                if is_residual:
-                    up_block = WanResidualUpBlock(
-                        in_dim=in_dim,
-                        out_dim=out_dim,
-                        num_res_blocks=num_res_blocks,
-                        dropout=dropout,
-                        temperal_upsample=temperal_upsample[i] if up_flag else False,
-                        up_flag=up_flag,
-                        non_linearity=non_linearity,
-                    )
-                else:
-                    up_block = WanUpBlock(
-                        in_dim=in_dim,
-                        out_dim=out_dim,
-                        num_res_blocks=num_res_blocks,
-                        dropout=dropout,
-                        upsample_mode=upsample_mode,
-                        non_linearity=non_linearity,
-                    )
-                self.up_blocks.append(up_block)
+            # determine if we need upsampling
+            up_flag = i != len(dim_mult) - 1
+            # determine upsampling mode, if not upsampling, set to None
+            upsample_mode = None
+            if up_flag and temperal_upsample[i]:
+                upsample_mode = "upsample3d"
+            elif up_flag:
+                upsample_mode = "upsample2d"
 
-            # output blocks
-            self.norm_out = WanRMS_norm(out_dim, images=False)
-            self.conv_out = WanCausalConv3d(out_dim, out_channels, 3, padding=1)
+            # Create and add the upsampling block
+            if is_residual:
+                up_block = ResidualUpBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    dropout=dropout,
+                    temperal_upsample=temperal_upsample[i] if up_flag else False,
+                    up_flag=up_flag,
+                    non_linearity=non_linearity,
+                )
+            else:
+                up_block = UpBlock(
+                    in_dim=in_dim,
+                    out_dim=out_dim,
+                    num_res_blocks=num_res_blocks,
+                    dropout=dropout,
+                    upsample_mode=upsample_mode,
+                    non_linearity=non_linearity,
+                )
+            self.up_blocks.append(up_block)
+            if up_flag:
+                self.upsample_count += 1
+
+        # output blocks
+        self.norm_out = WanRMS_norm(out_dim, images=False)
+        self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
 
