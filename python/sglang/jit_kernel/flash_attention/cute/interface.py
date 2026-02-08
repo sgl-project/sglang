@@ -428,7 +428,7 @@ def _flash_attn_fwd(
             cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
         if compute_capability == 9:
-            assert page_size == None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 9.0"
+            assert page_size is None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
