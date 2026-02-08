@@ -86,7 +86,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
     ):        
         # if get_pp_group().is_first_rank:
         assert input_embeds is None
-        input_embeds = forward_batch.target_extend_input_embeds
+        input_embeds = forward_batch.mm_input_embeds
         if forward_batch.forward_mode.is_extend() and forward_batch.contains_mm_inputs() and not forward_batch.forward_mode.is_draft_extend():
             assert input_embeds is not None
             input_embeds = torch.cat([input_embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))])
