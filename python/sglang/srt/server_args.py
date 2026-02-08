@@ -541,7 +541,7 @@ class ServerArgs:
     kt_method: Optional[str] = None
     kt_cpuinfer: Optional[int] = None
     kt_threadpool_count: Optional[int] = None
-    kt_num_gpu_experts: Optional[int] = None
+    kt_gpu_experts_mask: Optional[List[int]] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
 
     # Diffusion LLM
