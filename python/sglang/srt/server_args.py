@@ -2436,18 +2436,6 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
-        # Reset mamba_backend to triton when speculative decoding is enabled
-        # FlashInfer mamba kernels don't support speculative decoding parameters
-        if (
-            self.speculative_algorithm is not None
-            and self.mamba_backend == "flashinfer"
-        ):
-            self.mamba_backend = "triton"
-            logger.info(
-                "Mamba backend reset to 'triton' because speculative decoding is enabled. "
-                "FlashInfer mamba kernels don't support speculative decoding yet."
-            )
-
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
