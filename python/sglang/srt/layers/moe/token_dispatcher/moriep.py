@@ -88,15 +88,16 @@ class EpDispatchConfig:
 def get_ep_dispatch_configs(num_max_dispatch_tokens_per_rank: int = 4096):
     import mori
 
-    # Threshold for switching between InterNodeV1 and InterNodeV1LL kernel types. Defaults to 256. When the threshold is less than num_max_dispatch_tokens_per_rank, InterNodeV1 is used; otherwise InterNodeV1LL is used.
-    inter_kernel_swtich_threshold = get_int_env_var(
+    # Selects the inter-node kernel. `InterNodeV1LL` is used if `num_max_dispatch_tokens_per_rank`
+    # is less than or equal to the threshold, otherwise `InterNodeV1` is used. The threshold defaults to 256.
+    inter_kernel_switch_threshold = get_int_env_var(
         "SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD", 256
     )
 
     inter_kernel_type = (
-        mori.ops.EpDispatchCombineKernelType.InterNodeV1
-        if inter_kernel_swtich_threshold < num_max_dispatch_tokens_per_rank
-        else mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+        mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+        if num_max_dispatch_tokens_per_rank <= inter_kernel_switch_threshold
+        else mori.ops.EpDispatchCombineKernelType.InterNodeV1
     )
 
     return {
