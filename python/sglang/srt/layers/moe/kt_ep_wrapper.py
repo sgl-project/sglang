@@ -38,7 +38,7 @@ class KTConfig:
 
     Args:
         layer_idx: Layer index in the model
-        num_gpu_experts: Number of experts to run on GPU
+        gpu_experts_mask: mask or None for all experts on CPU
         cpuinfer_threads: Number of CPU inference threads
         threadpool_count: Number of thread pools for CPU computation
         weight_path: Path to CPU quantized weights
@@ -48,7 +48,7 @@ class KTConfig:
     """
 
     layer_idx: int
-    num_gpu_experts: int
+    gpu_experts_mask: Optional[torch.Tensor]
     cpuinfer_threads: int
     threadpool_count: int
     weight_path: str
@@ -84,7 +84,7 @@ def create_kt_config_from_server_args(
 
     return KTConfig(
         layer_idx=layer_idx,
-        num_gpu_experts=server_args.kt_num_gpu_experts,
+        gpu_experts_mask=torch.tensor(server_args.kt_gpu_experts_mask),
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
         weight_path=server_args.kt_weight_path,
@@ -151,7 +151,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
-        self.num_gpu_experts = kt_config.num_gpu_experts
+        self.gpu_experts_mask = kt_config.gpu_experts_mask
+        self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -222,7 +223,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=self.gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
