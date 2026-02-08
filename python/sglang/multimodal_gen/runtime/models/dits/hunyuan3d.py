@@ -41,6 +41,9 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.encoders.hunyuan3d import (
+    get_1d_sincos_pos_embed_from_grid,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -50,26 +53,6 @@ logger = init_logger(__name__)
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
-
-    return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
 class Timesteps(nn.Module):
@@ -857,14 +840,6 @@ class HunYuanDiTPlain(CachableDiT, OffloadableDiTMixin):
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-
-
-def _flux_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **kwargs
-) -> torch.Tensor:
-    x = F.scaled_dot_product_attention(q, k, v)
-    x = rearrange(x, "B H L D -> B L (H D)")
-    return x
 
 
 def _flux_timestep_embedding(
