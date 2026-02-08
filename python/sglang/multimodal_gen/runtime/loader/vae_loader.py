@@ -33,7 +33,12 @@ class VAELoader(ComponentLoader):
         return server_args.vae_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        *args,
+        **kwargs,
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)

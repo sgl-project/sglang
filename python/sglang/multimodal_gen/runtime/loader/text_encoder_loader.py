@@ -1,12 +1,10 @@
 import dataclasses
 import glob
 import os
-from collections.abc import Generator, Iterable
 from typing import Generator, Iterable, cast
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 from torch import nn
 from torch.distributed import init_device_mesh
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
@@ -128,7 +126,10 @@ class TextEncoderLoader(ComponentLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source", to_cpu: bool
+        self,
+        source: "Source",
+        to_cpu: bool,
+        use_runai_model_streamer: bool = True,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
@@ -138,7 +139,9 @@ class TextEncoderLoader(ComponentLoader):
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
-                hf_weights_files, to_cpu=to_cpu
+                hf_weights_files,
+                to_cpu=to_cpu,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
@@ -151,6 +154,7 @@ class TextEncoderLoader(ComponentLoader):
         model: nn.Module,
         model_path: str,
         to_cpu: bool,
+        use_runai_model_streamer: bool = True,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         primary_weights = TextEncoderLoader.Source(
             model_path,
@@ -158,7 +162,9 @@ class TextEncoderLoader(ComponentLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights, to_cpu)
+        yield from self._get_weights_iterator(
+            primary_weights, to_cpu, use_runai_model_streamer
+        )
 
         secondary_weights = cast(
             Iterable[TextEncoderLoader.Source],
@@ -168,7 +174,13 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(source, to_cpu)
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        use_runai_model_streamer: bool = True,
+        *args,
+        **kwargs,
     ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -205,6 +217,7 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             server_args,
             encoder_dtype,
+            use_runai_model_streamer,
         )
 
     def load_model(
@@ -214,6 +227,7 @@ class TextEncoderLoader(ComponentLoader):
         server_args: ServerArgs,
         dtype: str = "fp16",
         cpu_offload_flag: bool | None = None,
+        use_runai_model_streamer: bool = True,
     ):
         # Determine CPU offload behavior and target device
 
@@ -241,7 +255,12 @@ class TextEncoderLoader(ComponentLoader):
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
-                self._get_all_weights(model, model_path, to_cpu=should_offload)
+                self._get_all_weights(
+                    model,
+                    model_path,
+                    to_cpu=should_offload,
+                    use_runai_model_streamer=use_runai_model_streamer,
+                )
             )
 
             # Explicitly move model to target device after loading weights

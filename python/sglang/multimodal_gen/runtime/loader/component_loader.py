@@ -93,7 +93,10 @@ class ComponentLoader(ABC):
         )
         try:
             component = self.load_customized(
-                component_model_path, server_args, component_name,use_runai_model_streamer
+                component_model_path,
+                server_args,
+                component_name,
+                use_runai_model_streamer,
             )
             source = "sgl-diffusion"
         except Exception as e:

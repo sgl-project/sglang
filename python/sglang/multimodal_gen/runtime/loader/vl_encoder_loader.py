@@ -17,6 +17,8 @@ class VisionLanguageEncoderLoader(ComponentLoader):
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str = "vision_language_encoder",
+        *args,
+        **kwargs,
     ) -> Any:
         if transformers_or_diffusers == "vision_language_encoder":
             from transformers import GlmImageForConditionalGeneration

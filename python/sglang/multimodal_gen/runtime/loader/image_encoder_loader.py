@@ -11,7 +11,6 @@ logger = init_logger(__name__)
 
 
 class ImageEncoderLoader(TextEncoderLoader):
-
     component_names = ["image_encoder"]
     expected_library = "transformers"
 
@@ -30,7 +29,12 @@ class ImageEncoderLoader(TextEncoderLoader):
         return use_cpu_offload
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, *args
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        use_runai_model_streamer: bool = True,
+        *args,
+        **kwargs
     ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -55,4 +59,5 @@ class ImageEncoderLoader(TextEncoderLoader):
             server_args,
             server_args.pipeline_config.image_encoder_precision,
             cpu_offload_flag=server_args.image_encoder_cpu_offload,
+            use_runai_model_streamer=use_runai_model_streamer,
         )

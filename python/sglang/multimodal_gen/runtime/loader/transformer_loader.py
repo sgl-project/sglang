@@ -28,7 +28,12 @@ class TransformerLoader(ComponentLoader):
     expected_library = "diffusers"
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        *args,
+        **kwargs,
     ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
