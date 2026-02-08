@@ -13,7 +13,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils.common import calc_diff, get_bool_env_var
 
 if ENABLE_JIT_DEEPGEMM:
-    import deep_gemm
+    import sglang.jit_kernel.deep_gemm as deep_gemm
 
 _ENABLE_MM_DEEPGEMM = get_bool_env_var(
     "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"

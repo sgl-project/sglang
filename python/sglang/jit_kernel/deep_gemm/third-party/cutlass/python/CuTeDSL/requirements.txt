@@ -1,0 +1,3 @@
+# Use `pip install -r requirements.txt` with the present file to install a
+# wheel consistent with the present state of the github repository
+nvidia-cutlass-dsl==4.2.1

@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+
+"""Compile source on a range of commits
+
+Usage:
+  check-commits <start> <source>
+"""
+
+import docopt, os, sys, tempfile
+from subprocess import check_call, check_output, run
+
+args = docopt.docopt(__doc__)
+start = args.get('<start>')
+source = args.get('<source>')
+
+cwd = os.getcwd()
+
+with tempfile.TemporaryDirectory() as work_dir:
+  check_call(['git', 'clone', 'https://github.com/fmtlib/fmt.git'],
+             cwd=work_dir)
+  repo_dir = os.path.join(work_dir, 'fmt')
+  commits = check_output(
+    ['git', 'rev-list', f'{start}..HEAD', '--abbrev-commit',
+     '--', 'include', 'src'],
+    text=True, cwd=repo_dir).rstrip().split('\n')
+  commits.reverse()
+  print('Time\tCommit')
+  for commit in commits:
+    check_call(['git', '-c', 'advice.detachedHead=false', 'checkout', commit],
+               cwd=repo_dir)
+    returncode = run(
+      ['c++', '-std=c++11', '-O3', '-DNDEBUG', '-I', 'include',
+       'src/format.cc', os.path.join(cwd, source)], cwd=repo_dir).returncode
+    if returncode != 0:
+      continue
+    times = []
+    for i in range(5):
+      output = check_output([os.path.join(repo_dir, 'a.out')], text=True)
+      times.append(float(output))
+    message = check_output(['git', 'log', '-1', '--pretty=format:%s', commit],
+                           cwd=repo_dir, text=True)
+    print(f'{min(times)}\t{commit} {message[:40]}')
+    sys.stdout.flush()

@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# A script to invoke mkdocs with the correct environment.
+# Additionally supports deploying via mike:
+#   ./mkdocs deploy [mike-deploy-options]
+
+import errno, os, shutil, sys
+from subprocess import call
+
+support_dir = os.path.dirname(os.path.normpath(__file__))
+build_dir = os.path.join(os.path.dirname(support_dir), 'build')
+
+# Set PYTHONPATH for the mkdocstrings handler.
+env = os.environ.copy()
+path = env.get('PYTHONPATH')
+env['PYTHONPATH'] = \
+  (path + ':' if path else '') + os.path.join(support_dir, 'python')
+
+redirect_page = \
+'''<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Redirecting</title>
+  <noscript>
+    <meta http-equiv="refresh" content="1; url=11.0/" />
+  </noscript>
+  <script>
+    window.location.replace(
+      "api/" + window.location.search + window.location.hash
+    );
+  </script>
+</head>
+<body>
+  Redirecting to <a href="api/">api</a>...
+</body>
+</html>
+'''
+
+config_path = os.path.join(support_dir, 'mkdocs.yml')
+args = sys.argv[1:]
+if len(args) > 0:
+  command = args[0]
+  if command == 'deploy':
+    git_url = 'https://github.com/' if 'CI' in os.environ else 'git@github.com:'
+    site_repo = git_url + 'fmtlib/fmt.dev.git'
+
+    site_dir = os.path.join(build_dir, 'fmt.dev')
+    try:
+      shutil.rmtree(site_dir)
+    except OSError as e:
+      if e.errno == errno.ENOENT:
+        pass
+    ret = call(['git', 'clone', '--depth=1', site_repo, site_dir])
+    if ret != 0:
+      sys.exit(ret)
+
+    # Copy the config to the build dir because the site is built relative to it.
+    config_build_path = os.path.join(build_dir, 'mkdocs.yml')
+    shutil.copyfile(config_path, config_build_path)
+
+    version = args[1]
+    ret = call(['mike'] + args + ['--config-file', config_build_path,
+               '--branch', 'master'], cwd=site_dir, env=env)
+    if ret != 0 or version == 'dev':
+      sys.exit(ret)
+    current_doc_path = os.path.join(site_dir, version)
+    os.makedirs(current_doc_path, exist_ok=True)
+    redirect_page_path = os.path.join(current_doc_path, 'api.html')
+    with open(redirect_page_path, "w") as file:
+      file.write(redirect_page)
+    ret = call(['git', 'add', redirect_page_path], cwd=site_dir)
+    if ret != 0:
+      sys.exit(ret)
+    ret = call(['git', 'commit', '--amend', '--no-edit'], cwd=site_dir)
+    sys.exit(ret)
+  elif not command.startswith('-'):
+    args += ['-f', config_path]
+sys.exit(call(['mkdocs'] + args, env=env))

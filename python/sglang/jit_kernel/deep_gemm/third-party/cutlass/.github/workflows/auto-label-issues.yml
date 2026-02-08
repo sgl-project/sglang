@@ -1,0 +1,51 @@
+name: Auto Label Issues
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  add-labels:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Add component label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = issue.body || '';
+            
+            // Parse the issue body to find the component selection
+            // GitHub renders dropdown selections as "### {label}\n\n{selection}"
+            // Check for both bug report and feature request dropdown labels
+            const bugComponentMatch = body.match(/### Which component has the problem\?\s*\n\s*\n\s*(.+?)(?:\n|$)/);
+            const featureComponentMatch = body.match(/### Which component requires the feature\?\s*\n\s*\n\s*(.+?)(?:\n|$)/);
+            
+            const componentMatch = bugComponentMatch || featureComponentMatch;
+            
+            if (componentMatch) {
+              const component = componentMatch[1].trim();
+              let label = '';
+              
+              // Map component selections to labels
+              switch(component) {
+                case 'CuTe DSL':
+                  label = 'CuTe DSL';
+                  break;
+                case 'CUTLASS C++':
+                  label = 'CUTLASS C++';
+                  break;
+              }
+              
+              if (label) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  labels: [label]
+                });
+                console.log(`Added label: ${label}`);
+              }
+            } 

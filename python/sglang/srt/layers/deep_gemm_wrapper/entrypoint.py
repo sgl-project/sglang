@@ -16,8 +16,10 @@ from sglang.srt.utils import get_bool_env_var
 logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
-    import deep_gemm
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
+    import sglang.jit_kernel.deep_gemm as deep_gemm
+    from sglang.jit_kernel.deep_gemm.utils.layout import (  # noqa: F401
+        get_mn_major_tma_aligned_tensor,
+    )
 
 _SANITY_CHECK = get_bool_env_var("SGLANG_DEEPGEMM_SANITY_CHECK")
 

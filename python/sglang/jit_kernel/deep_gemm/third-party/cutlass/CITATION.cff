@@ -1,0 +1,112 @@
+cff-version: 1.2.0
+title: CUTLASS
+message: >-
+  If you use this software, please cite using the
+  following metadata.
+type: software
+authors:
+  - given-names: Vijay
+    family-names: Thakkar
+    email: vithakkar@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Pradeep
+    family-names: Ramani
+    email: prramani@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Cris
+    family-names: Cecka
+    email: ccecka@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Aniket
+    family-names: Shivam
+    email: ashivam@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Honghao
+    family-names: Lu
+    email: honghaol@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Ethan
+    family-names: Yan
+    email: etyan@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Jack
+    family-names: Kosaian
+    email: jkosaian@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Mark
+    family-names: Hoemmen
+    email: mhoemmen@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Haicheng
+    family-names: Wu
+    email: haichengw@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Andrew
+    family-names: Kerr
+    email: akerr@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Matt
+    family-names: Nicely
+    email: mnicely@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Duane
+    family-names: Merrill
+    email: dumerrill@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Dustyn
+    family-names: Blasig
+    email: dblasig@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Fengqi
+    family-names: Qiao
+    email: fqiao@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Piotr
+    family-names: Majcher
+    email: pmajcher@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Paul
+    family-names: Springer
+    email: pspringer@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Markus
+    family-names: Hohnerbach
+    affiliation: NVIDIA
+    email: mhohnerbach@nvidia.com
+  - given-names: Jin
+    family-names: Wang
+    email: jinw@nvidia.com
+    affiliation: NVIDIA
+  - given-names: Manish
+    family-names: Gupta
+    affiliation: Google
+    email: manigupta@google.com
+
+
+repository-code: 'https://github.com/NVIDIA/cutlass'
+abstract: >-
+  CUTLASS is a collection of CUDA C++ template
+  abstractions for implementing high-performance
+  matrix-multiplication (GEMM) and related
+  computations at all levels and scales within CUDA.
+  It incorporates strategies for hierarchical
+  decomposition and data movement similar to those
+  used to implement cuBLAS and cuDNN. CUTLASS
+  decomposes these "moving parts" into reusable,
+  modular software components abstracted by C++
+  template classes. These thread-wide, warp-wide,
+  block-wide, and device-wide primitives can be
+  specialized and tuned via custom tiling sizes, data
+  types, and other algorithmic policy. The resulting
+  flexibility simplifies their use as building blocks
+  within custom kernels and applications.
+keywords:
+  - 'cutlass, tensor cores, cuda, cute, nvidia, gpu, linear algebra, matrix computations'
+license: BSD-3-Clause
+license-url: https://github.com/NVIDIA/cutlass/blob/v3.0.0/LICENSE.txt
+version: '3.0.0'
+date-released: '2023-01-23'
+identifiers:
+  - type: url
+    value: "https://github.com/NVIDIA/cutlass/tree/v3.0.0"
+    description: The GitHub release URL of tag 3.0.0

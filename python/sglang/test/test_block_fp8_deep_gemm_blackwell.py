@@ -3,8 +3,8 @@ import unittest
 from typing import List, Tuple
 
 import torch
-from deep_gemm import fp8_gemm_nt
 
+from sglang.jit_kernel.deep_gemm import fp8_gemm_nt
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda

@@ -912,12 +912,12 @@ def transform_scale_ue8m0_inplace(param, mn):
 
 # NOTE copy and modified from DeepGEMM
 def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
-    import deep_gemm.utils.layout
+    import sglang.jit_kernel.deep_gemm.utils.layout
 
     get_mn_major_tma_aligned_packed_ue8m0_tensor = (
         _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
         if use_torch_impl
-        else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
+        else sglang.jit_kernel.deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
     )
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
@@ -929,7 +929,7 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
 def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
     x: torch.Tensor,
 ) -> torch.Tensor:
-    from deep_gemm.utils import align, get_tma_aligned_size
+    from sglang.jit_kernel.deep_gemm.utils import align, get_tma_aligned_size
 
     assert x.dtype == torch.float and x.dim() in (2, 3)
 

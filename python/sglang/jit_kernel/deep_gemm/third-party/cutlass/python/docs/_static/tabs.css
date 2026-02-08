@@ -1,0 +1,110 @@
+/* body[data-theme] { */
+:root {
+  --tabs--label-text: #4b5563;
+  --tabs--label-text--hover: #4b5563;
+  --tabs--label-text--active: #0ea5e9;
+  --tabs--label-text--active--hover: #0ea5e9;
+  --tabs--label-background: transparent;
+  --tabs--label-background--hover: transparent;
+  --tabs--label-background--active: transparent;
+  --tabs--label-background--active--hover: transparent;
+  --tabs--label-border: transparent;
+  --tabs--label-border--hover: #d1d5db;
+  --tabs--label-border--active: #0ea5e9;
+  --tabs--label-border--active--hover: #0ea5e9;
+  --tabs--padding-x: 1.25em;
+  --tabs--margin-x: 0;
+  --tabs--border: #e6e6e6;
+}
+
+/* Hide radio buttons */
+.tab-set > input {
+  position: absolute;
+  opacity: 0;
+}
+
+/* Tab set container */
+.tab-set {
+  border-radius: 2px;
+  display: flex;
+  flex-wrap: wrap;
+  margin: 0.75em 0;
+  position: relative;
+}
+
+/* Tab label */
+.tab-set > label {
+  z-index: 1;
+
+  width: auto;
+  border-bottom: 2px solid var(--tabs--label-border);
+  padding: 1em var(--tabs--padding-x) 0.5em;
+  margin-left: var(--tabs--margin-x);
+
+  color: var(--tabs--label-text);
+  background: var(--tabs--label-background);
+
+  transition: color 250ms;
+
+  cursor: pointer;
+
+  font-size: 0.875em;
+  font-weight: 700;
+}
+.tab-set > label:nth-child(2) {
+  margin-left: 0;
+}
+
+/* Hovered label */
+.tab-set > label:hover {
+  color: var(--tabs--label-text--hover);
+  background: var(--tabs--label-background--hover);
+  border-color: var(--tabs--label-border--hover);
+}
+
+/* Active tab label */
+.tab-set > input:checked + label {
+  color: var(--tabs--label-text--active);
+  background: var(--tabs--label-background--active);
+  border-color: var(--tabs--label-border--active);
+}
+.tab-set > input:checked + label:hover {
+  color: var(--tabs--label-text--active--hover);
+  background: var(--tabs--label-background--active--hover);
+  border-color: var(--tabs--label-border--active--hover);
+}
+
+/* Tab content */
+.tab-content {
+  order: 99;
+  display: none;
+  width: 100%;
+  box-shadow: 0 -0.0625rem var(--tabs--border);
+}
+
+/* Show content, when input is checked. */
+.tab-set > input:checked + label + .tab-content {
+  display: block;
+}
+.tab-content > p:first-child {
+  margin-top: 0.75rem;
+}
+/* Remove the top border on first code block */
+.tab-content > [class^="highlight-"]:first-child .highlight {
+  border-top: none;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+/* Remove margins on children */
+.tab-content > *:first-child {
+  margin-top: 0;
+}
+.tab-content > *:last-child {
+  margin-bottom: 0;
+}
+
+/* Remove margins on nested tabs */
+.tab-content > .tab-set {
+  margin: 0;
+}

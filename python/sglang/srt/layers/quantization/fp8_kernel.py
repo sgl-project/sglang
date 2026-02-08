@@ -296,7 +296,7 @@ def _per_token_group_quant_8bit_raw(
         )
 
     if scale_ue8m0:
-        from deep_gemm import transform_sf_into_required_layout
+        from sglang.jit_kernel.deep_gemm import transform_sf_into_required_layout
 
         assert group_size == 128
         x_s = transform_sf_into_required_layout(
@@ -336,8 +336,7 @@ def _per_token_group_quant_8bit_fuse_silu_and_mul(
     #     scale_ue8m0=scale_ue8m0,
     # )
 
-    from deep_gemm import transform_sf_into_required_layout
-
+    from sglang.jit_kernel.deep_gemm import transform_sf_into_required_layout
     from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
     assert column_major_scales

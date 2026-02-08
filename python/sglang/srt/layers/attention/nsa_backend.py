@@ -601,7 +601,7 @@ class NativeSparseAttnBackend(
             or forward_batch.forward_mode.is_draft_extend()
         ):
             try:
-                import deep_gemm
+                import sglang.jit_kernel.deep_gemm as deep_gemm
 
                 # NOTE: DeepGEMM paged path uses block_size=64.
                 seqlens_32 = (
@@ -884,7 +884,7 @@ class NativeSparseAttnBackend(
             or forward_mode.is_draft_extend()
         ):
             try:
-                import deep_gemm
+                import sglang.jit_kernel.deep_gemm as deep_gemm
 
                 seqlens_32 = (
                     seqlens_expanded
@@ -1053,7 +1053,7 @@ class NativeSparseAttnBackend(
             or forward_mode.is_draft_extend()
         ):
             try:
-                import deep_gemm
+                import sglang.jit_kernel.deep_gemm as deep_gemm
 
                 seqlens_32 = (
                     seqlens_expanded

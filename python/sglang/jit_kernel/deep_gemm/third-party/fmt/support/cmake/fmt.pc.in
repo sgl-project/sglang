@@ -1,0 +1,11 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=@CMAKE_INSTALL_PREFIX@
+libdir=@libdir_for_pc_file@
+includedir=@includedir_for_pc_file@
+
+Name: fmt
+Description: A modern formatting library
+Version: @FMT_VERSION@
+Libs: -L${libdir} -l@FMT_LIB_NAME@
+Cflags: -I${includedir}
+

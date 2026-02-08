@@ -1,0 +1,42 @@
+name: doc
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+
+    - name: Add Ubuntu mirrors
+      run: |
+        # Github Actions caching proxy is at times unreliable
+        # see https://github.com/actions/runner-images/issues/7048
+        printf 'http://azure.archive.ubuntu.com/ubuntu\tpriority:1\n' | sudo tee /etc/apt/mirrors.txt
+        curl http://mirrors.ubuntu.com/mirrors.txt | sudo tee --append /etc/apt/mirrors.txt
+        sudo sed -i 's~http://azure.archive.ubuntu.com/ubuntu/~mirror+file:/etc/apt/mirrors.txt~' /etc/apt/sources.list
+
+    - name: Create build environment
+      run: |
+        sudo apt update
+        sudo apt install doxygen
+        pip install mkdocs-material==9.5.25 mkdocstrings==0.26.1 mike==2.1.1
+        cmake -E make_directory ${{runner.workspace}}/build
+        # Workaround https://github.com/actions/checkout/issues/13:
+        git config --global user.name "$(git --no-pager log --format=format:'%an' -n 1)"
+        git config --global user.email "$(git --no-pager log --format=format:'%ae' -n 1)"
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      run: $GITHUB_WORKSPACE/support/mkdocs deploy dev
+
+    - name: Deploy
+      env:
+        KEY: "${{secrets.KEY}}"
+      if: env.KEY != '' && github.ref == 'refs/heads/master'
+      working-directory: ${{runner.workspace}}/fmt/build/fmt.dev
+      run: git push https://$KEY@github.com/fmtlib/fmt.dev.git

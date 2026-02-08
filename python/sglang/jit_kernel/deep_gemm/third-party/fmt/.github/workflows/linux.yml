@@ -1,0 +1,176 @@
+name: linux
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        cxx: [g++-4.9, g++-11, clang++-3.6, clang++-11]
+        build_type: [Debug, Release]
+        std: [11]
+        shared: [""]
+        include:
+          - cxx: g++-4.9
+          - cxx: clang++-3.6
+          - cxx: g++-11
+            build_type: Debug
+            std: 14
+            install: sudo apt install g++-11
+          - cxx: g++-11
+            build_type: Debug
+            std: 17
+          - cxx: g++-11
+            build_type: Debug
+            std: 20
+            install: sudo apt install g++-11
+          - cxx: g++-13
+            build_type: Release
+            std: 23
+            install: sudo apt install g++-13
+            shared: -DBUILD_SHARED_LIBS=ON
+          - cxx: clang++-11
+            build_type: Debug
+            std: 17
+            cxxflags: -stdlib=libc++
+            install: sudo apt install clang-11 libc++-11-dev libc++abi-11-dev
+          - cxx: clang++-11
+            install: sudo apt install clang-11
+          - cxx: clang++-11
+            build_type: Debug
+            fuzz: -DFMT_FUZZ=ON -DFMT_FUZZ_LINKMAIN=ON
+            std: 17
+            install: sudo apt install clang-11
+          - cxx: clang++-14
+            build_type: Debug
+            std: 20
+          - cxx: clang++-14
+            build_type: Debug
+            std: 20
+            cxxflags: -stdlib=libc++
+            install: sudo apt install libc++-14-dev libc++abi-14-dev
+
+    steps:
+    - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+
+    - name: Set timezone
+      run: sudo timedatectl set-timezone 'Europe/Kyiv'
+
+    - name: Install GCC 4.9
+      run: |
+        sudo apt update
+        sudo apt install libatomic1 libc6-dev libgomp1 libitm1 libmpc3
+        # https://launchpad.net/ubuntu/xenial/amd64/g++-4.9/4.9.3-13ubuntu2
+        wget --no-verbose \
+          http://launchpadlibrarian.net/230069137/libmpfr4_3.1.3-2_amd64.deb \
+          http://launchpadlibrarian.net/253728424/libasan1_4.9.3-13ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/445346135/libubsan0_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346112/libcilkrts5_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/253728426/libgcc-4.9-dev_4.9.3-13ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/253728432/libstdc++-4.9-dev_4.9.3-13ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/253728314/gcc-4.9-base_4.9.3-13ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/445345919/gcc-5-base_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/253728399/cpp-4.9_4.9.3-13ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/253728404/gcc-4.9_4.9.3-13ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/253728401/g++-4.9_4.9.3-13ubuntu2_amd64.deb
+        sudo dpkg -i \
+          libmpfr4_3.1.3-2_amd64.deb \
+          libasan1_4.9.3-13ubuntu2_amd64.deb \
+          libubsan0_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libcilkrts5_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libgcc-4.9-dev_4.9.3-13ubuntu2_amd64.deb \
+          libstdc++-4.9-dev_4.9.3-13ubuntu2_amd64.deb \
+          gcc-4.9-base_4.9.3-13ubuntu2_amd64.deb \
+          gcc-5-base_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          cpp-4.9_4.9.3-13ubuntu2_amd64.deb \
+          gcc-4.9_4.9.3-13ubuntu2_amd64.deb \
+          g++-4.9_4.9.3-13ubuntu2_amd64.deb
+      if: ${{ matrix.cxx == 'g++-4.9' }}
+
+    - name: Install Clang 3.6
+      run: |
+        sudo apt update
+        sudo apt install libtinfo5
+        # https://code.launchpad.net/ubuntu/xenial/amd64/clang-3.6/1:3.6.2-3ubuntu2
+        wget --no-verbose \
+          http://launchpadlibrarian.net/230019046/libffi6_3.2.1-4_amd64.deb \
+          http://launchpadlibrarian.net/445346109/libasan2_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346135/libubsan0_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346112/libcilkrts5_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346128/libmpx0_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346113/libgcc-5-dev_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346131/libstdc++-5-dev_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/445346022/libobjc-5-dev_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/254405108/libllvm3.6v5_3.6.2-3ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/254405097/libclang-common-3.6-dev_3.6.2-3ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/254405101/libclang1-3.6_3.6.2-3ubuntu2_amd64.deb \
+          http://launchpadlibrarian.net/445345919/gcc-5-base_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          http://launchpadlibrarian.net/254405091/clang-3.6_3.6.2-3ubuntu2_amd64.deb
+        sudo dpkg -i \
+          libffi6_3.2.1-4_amd64.deb \
+          libasan2_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libubsan0_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libcilkrts5_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libmpx0_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libgcc-5-dev_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libstdc++-5-dev_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libobjc-5-dev_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          libllvm3.6v5_3.6.2-3ubuntu2_amd64.deb \
+          libclang-common-3.6-dev_3.6.2-3ubuntu2_amd64.deb \
+          libclang1-3.6_3.6.2-3ubuntu2_amd64.deb \
+          gcc-5-base_5.4.0-6ubuntu1~16.04.12_amd64.deb \
+          clang-3.6_3.6.2-3ubuntu2_amd64.deb
+      if: ${{ matrix.cxx == 'clang++-3.6' }}
+
+    - name: Add repositories for newer GCC
+      run: |
+        sudo apt-add-repository ppa:ubuntu-toolchain-r/test
+      if: ${{ matrix.cxx == 'g++-13' }}
+
+    - name: Add Ubuntu mirrors
+      run: |
+        # GitHub Actions caching proxy is at times unreliable
+        # see https://github.com/actions/runner-images/issues/7048.
+        mirrors=/etc/apt/mirrors.txt
+        printf 'http://azure.archive.ubuntu.com/ubuntu\tpriority:1\n' | \
+          sudo tee $mirrors
+        curl http://mirrors.ubuntu.com/mirrors.txt | sudo tee --append $mirrors
+        sudo sed -i \
+          "s~http://azure.archive.ubuntu.com/ubuntu/~mirror+file:$mirrors~" \
+          /etc/apt/sources.list
+
+    - name: Create build environment
+      run: |
+        sudo apt update
+        ${{matrix.install}}
+        sudo apt install locales-all
+        cmake -E make_directory ${{runner.workspace}}/build
+
+    - name: Configure
+      working-directory: ${{runner.workspace}}/build
+      env:
+        CXX: ${{matrix.cxx}}
+        CXXFLAGS: ${{matrix.cxxflags}}
+      run: |
+        cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} \
+              -DCMAKE_CXX_STANDARD=${{matrix.std}} \
+              -DCMAKE_CXX_VISIBILITY_PRESET=hidden \
+              -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+              -DFMT_DOC=OFF -DFMT_PEDANTIC=ON -DFMT_WERROR=ON \
+              ${{matrix.fuzz}} ${{matrix.shared}} $GITHUB_WORKSPACE
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      run: |
+        threads=`nproc`
+        cmake --build . --config ${{matrix.build_type}} --parallel $threads
+
+    - name: Test
+      working-directory: ${{runner.workspace}}/build
+      run: ctest -C ${{matrix.build_type}}
+      env:
+        CTEST_OUTPUT_ON_FAILURE: True

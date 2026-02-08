@@ -12,7 +12,7 @@ def _compute_enable_deep_gemm():
         return False
 
     try:
-        import deep_gemm  # noqa: F401
+        import sglang.jit_kernel.deep_gemm as deep_gemm  # noqa: F401
     except ImportError:
         return False
 

@@ -1,0 +1,58 @@
+name: macos
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]
+        build_type: [Debug, Release]
+        std: [11, 17, 20]
+        shared: [""]
+        exclude:
+          - { os: macos-13, std: 11 }
+          - { os: macos-13, std: 17 }
+        include:
+          - os: macos-14
+            std: 23
+            build_type: Release
+            shared: -DBUILD_SHARED_LIBS=ON
+
+    runs-on: '${{ matrix.os }}'
+
+    steps:
+    - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+
+    - name: Set timezone
+      run: sudo systemsetup -settimezone 'Europe/Minsk'
+
+    - name: Select Xcode 14.3 (macOS 13)
+      run: sudo xcode-select -s "/Applications/Xcode_14.3.app"
+      if: ${{ matrix.os == 'macos-13' }}
+
+    - name: Create Build Environment
+      run: cmake -E make_directory ${{runner.workspace}}/build
+
+    - name: Configure
+      working-directory: ${{runner.workspace}}/build
+      run: |
+        cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} ${{matrix.shared}} \
+              -DCMAKE_CXX_STANDARD=${{matrix.std}} \
+              -DCMAKE_CXX_VISIBILITY_PRESET=hidden -DCMAKE_VISIBILITY_INLINES_HIDDEN=ON \
+              -DFMT_DOC=OFF -DFMT_PEDANTIC=ON -DFMT_WERROR=ON $GITHUB_WORKSPACE
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      run: |
+        threads=`sysctl -n hw.logicalcpu`
+        cmake --build . --config ${{matrix.build_type}} --parallel $threads
+
+    - name: Test
+      working-directory: ${{runner.workspace}}/build
+      run: ctest -C ${{matrix.build_type}}
+      env:
+        CTEST_OUTPUT_ON_FAILURE: True

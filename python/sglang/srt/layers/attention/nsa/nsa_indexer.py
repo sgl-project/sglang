@@ -19,7 +19,7 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     try:
-        import deep_gemm
+        import sglang.jit_kernel.deep_gemm as deep_gemm
     except ImportError as e:
         deep_gemm = e
 

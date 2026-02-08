@@ -1,0 +1,38 @@
+name: Bug Report
+description: Create a bug report to help us improve CUTLASS
+title: "[BUG] "
+labels: ["? - Needs Triage", "bug"]
+assignees: []
+
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component has the problem?
+      options:
+        - CuTe DSL
+        - CUTLASS C++
+    validations:
+      required: true
+  - type: textarea
+    id: bug-report
+    attributes:
+      label: Bug Report
+      description: Please fill out all sections below
+      value: |
+        **Describe the bug**
+        A clear and concise description of what the bug is.
+        
+        **Steps/Code to reproduce bug**
+        Follow this guide http://matthewrocklin.com/blog/work/2018/02/28/minimal-bug-reports to craft a minimal bug report. This helps us reproduce the issue you're having and resolve the issue more quickly.
+        
+        **Expected behavior**
+        A clear and concise description of what you expected to happen.
+        
+        **Environment details (please complete the following information):**
+         - Environment location: [Bare-metal, Docker, Cloud(specify cloud provider)] 
+        
+        **Additional context**
+        Add any other context about the problem here.
+    validations:
+      required: true 

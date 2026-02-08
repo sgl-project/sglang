@@ -1,0 +1,48 @@
+site_name: '{fmt}'
+
+docs_dir: ../doc
+
+repo_url: https://github.com/fmtlib/fmt
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.top
+    - toc.integrate
+
+extra_javascript:
+  - https://cdnjs.cloudflare.com/ajax/libs/highlight.js/10.7.2/highlight.min.js
+  - fmt.js
+
+extra_css:
+  - https://cdnjs.cloudflare.com/ajax/libs/highlight.js/10.7.2/styles/default.min.css
+  - fmt.css
+
+markdown_extensions:
+  - pymdownx.highlight:
+      # Use JavaScript syntax highlighter instead of Pygments because it
+      # automatically applies to code blocks extracted through Doxygen.
+      use_pygments: false
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: cxx
+nav:
+  - Home: index.md
+  - Get Started: get-started.md
+  - API: api.md
+  - Syntax: syntax.md
+
+exclude_docs: ChangeLog-old.md
+
+extra:
+  version:
+    provider: mike
+  generator: false

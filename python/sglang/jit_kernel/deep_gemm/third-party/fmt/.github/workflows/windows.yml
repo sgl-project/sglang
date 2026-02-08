@@ -1,0 +1,91 @@
+name: windows
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{matrix.os}}
+    strategy:
+      matrix:
+        # windows-2022 has MSVC 2022 installed:
+        # https://github.com/actions/virtual-environments.
+        os: [windows-2022]
+        platform: [Win32, x64]
+        toolset: [v142]
+        standard: [14, 17, 20]
+        shared: ["", -DBUILD_SHARED_LIBS=ON]
+        build_type: [Debug, Release]
+        exclude:
+          - { toolset: v142, standard: 14 }
+          - { platform: Win32, standard: 14 }
+          - { platform: Win32, standard: 20 }
+          - { platform: x64, standard: 14, shared: -DBUILD_SHARED_LIBS=ON }
+          - { platform: x64, standard: 20, shared: -DBUILD_SHARED_LIBS=ON }
+        include:
+          - os: windows-2022
+            platform: x64
+            toolset: v143
+            build_type: Debug
+            standard: 20
+
+    steps:
+    - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+
+    - name: Set timezone
+      run: tzutil /s "FLE Standard Time"
+
+    - name: Create Build Environment
+      run: cmake -E make_directory ${{runner.workspace}}/build
+
+    - name: Configure
+      # Use a bash shell for $GITHUB_WORKSPACE.
+      shell: bash
+      working-directory: ${{runner.workspace}}/build
+      run: |
+        cmake -A ${{matrix.platform}} -T ${{matrix.toolset}} \
+              -DCMAKE_CXX_STANDARD=${{matrix.standard}} \
+              ${{matrix.shared}} -DCMAKE_BUILD_TYPE=${{matrix.build_type}} \
+              $GITHUB_WORKSPACE
+
+    - name: Build
+      working-directory: ${{runner.workspace}}/build
+      run: |
+        $threads = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+        cmake --build . --config ${{matrix.build_type}} --parallel $threads
+
+    - name: Test
+      working-directory: ${{runner.workspace}}/build
+      run: ctest -C ${{matrix.build_type}} -V
+      env:
+        CTEST_OUTPUT_ON_FAILURE: True
+
+  mingw:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    strategy:
+      matrix:
+        sys: [ mingw64, ucrt64 ]
+    steps:
+    - name: Set timezone
+      run: tzutil /s "FLE Standard Time"
+      shell: cmd
+    - uses: msys2/setup-msys2@40677d36a502eb2cf0fb808cc9dec31bf6152638 # v2.28.0
+      with:
+        release: false
+        msystem: ${{matrix.sys}}
+        pacboy: cc:p cmake:p ninja:p lld:p
+    - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+    - name: Configure
+      run: cmake -B ../build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Debug
+      env: { LDFLAGS: -fuse-ld=lld }
+    - name: Build
+      run: cmake --build ../build
+    - name: Test
+      run: ctest -j `nproc` --test-dir ../build
+      env:
+        CTEST_OUTPUT_ON_FAILURE: True
