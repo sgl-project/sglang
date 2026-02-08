@@ -952,7 +952,7 @@ def get_image_bytes(image_file: Union[str, bytes]):
 
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
-    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.value:
+    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.get():
         return get_video_opencv_handler(video_file)
     else:
         return get_video_decord_handler(video_file, use_gpu)

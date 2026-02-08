@@ -151,7 +151,7 @@ async def preprocess_video(
 ) -> torch.Tensor:
     entry_time = time.perf_counter()
 
-    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.value:
+    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.get():
         import cv2
 
         total_frames, video_fps = int(vr.get(cv2.CAP_PROP_FRAME_COUNT)), vr.get(
@@ -165,7 +165,7 @@ async def preprocess_video(
     )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
-    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.value:
+    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.get():
         video_np = read_video_frames_opencv(vr, idx)
     else:
         video_np = vr.get_batch(idx).asnumpy()
