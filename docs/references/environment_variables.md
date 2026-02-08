@@ -19,6 +19,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_FORWARD_UNKNOWN_TOOLS`            | Forward unknown tool calls to clients instead of dropping them                                                                   | `false` (drop unknown tools) |
 | `SGLANG_REQ_WAITING_TIMEOUT`              | Timeout (in seconds) for requests waiting in the queue before being scheduled                                                    | `-1`                         |
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
+| `SGLANG_ABORTED_REQUEST_STATUS_CODE`                | Custom status code to use for aborted request                                                                                 | `503`                         |
+| `SGLANG_TIMED_OUT_REQUEST_STATUS_CODE`               | Custom status code to use for timed out request batch                                                                                | `503`                         |
 
 ## Performance Tuning
 
