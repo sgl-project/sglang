@@ -1951,7 +1951,11 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt MXFP8 quantization.
 
     Loads FP8 weights with uint8 UE8M0 block scales (group_size=32).
-    Uses cuBLAS torch._scaled_mm for inference.
+    Uses flashinfer's mm_mxfp8 for inference.
+
+    During process_weights_after_loading, checkpoint MXFP8 weights are
+    dequantized to bf16 and re-quantized with flashinfer's swizzled scale
+    layout required by mm_mxfp8.
     """
 
     BLOCK_K = 32  # MXFP8 group size
@@ -1959,6 +1963,19 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
     def __init__(self, quant_config: ModelOptMxfp8Config):
         super().__init__()
         self.quant_config = quant_config
+
+    @staticmethod
+    def _dequantize_mxfp8(data: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
+        """Dequantize MXFP8 tensor with UE8M0 scales back to bf16."""
+        group_size = 32
+        m, k = data.shape
+        n_groups = k // group_size
+        scales_f32 = torch.pow(
+            2.0, scale_u8.to(dtype=torch.float32, device=data.device) - 127.0
+        )
+        data_f32 = data.to(torch.float32).view(m, n_groups, group_size)
+        scales_f32 = scales_f32.view(m, n_groups, 1)
+        return (data_f32 * scales_f32).view(m, k).to(torch.bfloat16)
 
     def create_weights(
         self,
@@ -2007,30 +2024,18 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from sglang.srt.layers.quantization.fp8_utils import (
-            prepare_mxfp8_weight_for_cublas,
-        )
+        from flashinfer.fp8_quantization import mxfp8_quantize
 
-        # Keep checkpoint-native FP8 + UE8M0 tensors and precompute cuBLAS
-        # views/layouts once at load time.
-        layer.weight = Parameter(layer.weight.data, requires_grad=False)
-        layer.weight_scale_inv = Parameter(layer.weight_scale.data, requires_grad=False)
-        layer.weight_scale_inv.format_ue8m0 = True
-        if not hasattr(ModelOptMxfp8LinearMethod, "_debug_scale_log_count"):
-            ModelOptMxfp8LinearMethod._debug_scale_log_count = 0
-        if ModelOptMxfp8LinearMethod._debug_scale_log_count < 8:
-            s = layer.weight_scale_inv.data
-            logger.info(
-                "ModelOpt MXFP8 linear load stats: shape=%s dtype=%s min=%s max=%s mean=%.2f",
-                tuple(s.shape),
-                s.dtype,
-                int(s.min().item()),
-                int(s.max().item()),
-                float(s.float().mean().item()),
-            )
-            ModelOptMxfp8LinearMethod._debug_scale_log_count += 1
-        layer.weight_t, layer.weight_scale_cublas = prepare_mxfp8_weight_for_cublas(
-            layer.weight.data, layer.weight_scale_inv.data
+        # Checkpoint MXFP8 stores raw FP8 data and per-block UE8M0 scales.
+        # Reconstruct bf16 values first, then requantize to flashinfer swizzled
+        # scales so mm_mxfp8 can consume them directly.
+        weight_bf16 = self._dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
+        weight_q, weight_scale = mxfp8_quantize(weight_bf16, is_sf_swizzled_layout=True)
+
+        # mm_mxfp8 expects B as [K, N] column-major.
+        layer.weight = Parameter(weight_q.t(), requires_grad=False)
+        layer.weight_scale_inv = Parameter(
+            weight_scale.view(torch.uint8), requires_grad=False
         )
 
     def apply(
@@ -2039,22 +2044,51 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.quantization.fp8_utils import (
-            cublas_mxfp8_blockscaled_linear,
-        )
+        from flashinfer import mm_mxfp8
+        from flashinfer.fp8_quantization import mxfp8_quantize
 
+        input_tensor = x[0] if isinstance(x, tuple) else x
+        input_2d = input_tensor.view(-1, input_tensor.shape[-1])  # [M, K]
+        output_shape = [*input_tensor.shape[:-1], layer.weight.shape[1]]  # [..., N]
+        m_actual = input_2d.shape[0]
+        k_dim = input_2d.shape[1]
+
+        # Quantize activations to MXFP8 using swizzled scales for mm_mxfp8.
+        # If input is already pre-quantized, dequantize first when a 2D UE8M0
+        # scale tensor is provided.
         if isinstance(x, tuple):
-            input_data, input_scale = x
-        else:
-            input_data, input_scale = x, None
+            input_scale = x[1]
+            if input_scale.dim() == 2:
+                input_2d = self._dequantize_mxfp8(
+                    input_2d,
+                    input_scale.view(-1, input_scale.shape[-1]),
+                )
 
-        return cublas_mxfp8_blockscaled_linear(
-            input=input_data,
-            weight_t=layer.weight_t,
-            weight_scale_cublas=layer.weight_scale_cublas,
-            input_scale=input_scale,
-            bias=bias,
+        # CUTLASS MXFP8 requires M >= 32. Pad decode/capture micro-batches
+        # and slice the output back to original M.
+        if m_actual < 32:
+            input_padded = torch.zeros(
+                (32, k_dim),
+                dtype=input_2d.dtype,
+                device=input_2d.device,
+            )
+            input_padded[:m_actual, :] = input_2d
+            input_2d = input_padded
+
+        input_q, input_scale = mxfp8_quantize(input_2d, is_sf_swizzled_layout=True)
+
+        out = mm_mxfp8(
+            input_q,
+            layer.weight,
+            input_scale.view(torch.uint8),
+            layer.weight_scale_inv,
+            out_dtype=torch.bfloat16,
         )
+        out = out[:m_actual, :]
+
+        if bias is not None:
+            out = out + bias
+        return out.view(*output_shape)
 
 
 class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
