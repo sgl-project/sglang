@@ -4,6 +4,7 @@ from __future__ import annotations
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -921,6 +924,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 else 1.0
             )
         else:
+            if getattr(layer, "k_scale_float", None) is not None:
+                logger.warning_once(
+                    "Checkpoint has k_scale but KV cache dtype is not FP8. "
+                    "Ignoring k_scale for BMM1 (k_scale=%.4f, kv_dtype=%s).",
+                    layer.k_scale_float,
+                    self.data_type,
+                )
             k_scale = 1.0
 
         bmm1_scale = q_scale * k_scale * layer.scaling
@@ -1044,6 +1054,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     else 1.0
                 )
             else:
+                if getattr(layer, "k_scale_float", None) is not None:
+                    logger.warning_once(
+                        "Checkpoint has k_scale but KV cache dtype is not FP8. "
+                        "Ignoring k_scale for BMM1 (k_scale=%.4f, kv_dtype=%s).",
+                        layer.k_scale_float,
+                        self.data_type,
+                    )
                 k_scale = 1.0
             q = q.to(self.data_type)
 
