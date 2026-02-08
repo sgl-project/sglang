@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
 from sglang.srt.lora.triton_ops import (
     chunked_embedding_lora_a_forward,
@@ -13,7 +14,8 @@ from sglang.srt.lora.triton_ops import (
 )
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.lora_utils import (
     reference_embedding_lora_a_shrink,
@@ -717,6 +719,105 @@ class TestChunkedSGMV(unittest.TestCase):
                     lora_assignments,
                     f"decode skewed batch_size={batch_size}",
                 )
+
+
+class TestLmHeadPruningConsistency(unittest.TestCase):
+    """Verify get_lm_head_pruned_lens (LoRA) stays consistent with
+    LogitsProcessor._get_pruned_states (logits_processor).
+
+    If this test fails, it likely means one side was changed without
+    updating the other. See cross-references in both functions.
+    """
+
+    def _make_mock_forward_batch(
+        self,
+        forward_mode,
+        extend_seq_lens_cpu,
+        return_logprob=False,
+        logprob_start_lens_cpu=None,
+    ):
+        class MockForwardBatch:
+            pass
+
+        batch = MockForwardBatch()
+        batch.forward_mode = forward_mode
+        batch.batch_size = len(extend_seq_lens_cpu)
+        batch.return_logprob = return_logprob
+        batch.extend_seq_lens_cpu = extend_seq_lens_cpu
+        batch.extend_logprob_start_lens_cpu = logprob_start_lens_cpu
+        return batch
+
+    def _count_pruned_states_tokens(
+        self,
+        forward_mode,
+        extend_seq_lens_cpu,
+        return_logprob=False,
+        logprob_start_lens_cpu=None,
+    ):
+        """Call _get_pruned_states and return the number of output tokens."""
+        total_tokens = sum(extend_seq_lens_cpu)
+        hidden_states = torch.zeros(total_tokens, 4)
+
+        logits_meta = LogitsMetadata(
+            forward_mode=forward_mode,
+            extend_return_logprob=return_logprob,
+            extend_seq_lens=torch.tensor(extend_seq_lens_cpu, dtype=torch.int64),
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=logprob_start_lens_cpu,
+        )
+
+        # _get_pruned_states does not use self, so pass None
+        result = LogitsProcessor._get_pruned_states(
+            None, hidden_states, None, None, logits_meta
+        )
+        pruned_states = result[0]
+        return pruned_states.shape[0]
+
+    def _assert_consistency(
+        self,
+        forward_mode,
+        extend_seq_lens_cpu,
+        return_logprob=False,
+        logprob_start_lens_cpu=None,
+    ):
+        mock_batch = self._make_mock_forward_batch(
+            forward_mode,
+            extend_seq_lens_cpu,
+            return_logprob,
+            logprob_start_lens_cpu,
+        )
+        pruned_lens = get_lm_head_pruned_lens(mock_batch)
+
+        actual_count = self._count_pruned_states_tokens(
+            forward_mode,
+            extend_seq_lens_cpu,
+            return_logprob,
+            logprob_start_lens_cpu,
+        )
+
+        if pruned_lens is None:
+            expected_count = sum(extend_seq_lens_cpu)
+        else:
+            expected_count = sum(pruned_lens)
+
+        self.assertEqual(
+            expected_count,
+            actual_count,
+            f"get_lm_head_pruned_lens expects {expected_count} tokens, "
+            f"but _get_pruned_states produces {actual_count}. "
+            f"These functions must stay in sync — see their cross-reference comments.",
+        )
+
+    def test_extend_no_logprob(self):
+        self._assert_consistency(ForwardMode.EXTEND, [4, 5, 6])
+
+    def test_extend_with_logprob(self):
+        self._assert_consistency(
+            ForwardMode.EXTEND,
+            [4, 5, 6],
+            return_logprob=True,
+            logprob_start_lens_cpu=[0, 5, 3],
+        )
 
 
 if __name__ == "__main__":

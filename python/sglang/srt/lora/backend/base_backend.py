@@ -18,6 +18,7 @@ class BaseLoRABackend:
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        self.lm_head_batch_info = None
 
     def run_lora_a_embedding(
         self,

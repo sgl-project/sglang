@@ -241,7 +241,9 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         self.lm_head_B_buffer = lm_head_B_buffer  # (num_loras, vocab_size, rank)
 
     def apply_lora(
-        self, base_output: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        base_output: torch.Tensor,
+        hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         """
         Apply LoRA to LM head layer.
@@ -250,9 +252,31 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = hidden @ W^T + hidden @ A^T @ B^T
                            = base_output + (hidden @ A^T) @ B^T
         """
+        lm_head_batch_info = self.lora_backend.lm_head_batch_info
+        if lm_head_batch_info is not None:
+            if lm_head_batch_info.use_cuda_graph:
+                raise RuntimeError(
+                    "lm_head LoRA with pruned batch info is not supported "
+                    "under CUDA graph. lm_head pruning should only occur "
+                    "during extend, which does not use CUDA graph."
+                )
+            actual_tokens = hidden_states.shape[0]
+            if actual_tokens != lm_head_batch_info.expected_tokens:
+                raise RuntimeError(
+                    f"lm_head LoRA input token count mismatch: got "
+                    f"{actual_tokens} tokens but lm_head_batch_info expects "
+                    f"{lm_head_batch_info.expected_tokens}. This is likely caused by logprobs "
+                    f"chunking in LogitsProcessor (disable with "
+                    f"--disable-logprobs-chunk) or an additional pruning step "
+                    f"in LogitsProcessor._get_pruned_states that is not "
+                    f"reflected in get_lm_head_pruned_lens()."
+                )
+
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
-            hidden_states, self.lm_head_A_buffer
+            hidden_states,
+            self.lm_head_A_buffer,
+            pruned_batch_info=lm_head_batch_info,
         )
 
         # Apply lora_B^T: lora_a_output @ B^T
@@ -261,6 +285,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             weights=self.lm_head_B_buffer,
             output_offset=self.output_offset,
             base_output=base_output,
+            pruned_batch_info=lm_head_batch_info,
         )
 
         return lora_output

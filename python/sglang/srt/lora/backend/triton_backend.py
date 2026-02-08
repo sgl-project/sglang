@@ -1,3 +1,5 @@
+import dataclasses
+
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -8,7 +10,7 @@ from sglang.srt.lora.triton_ops import (
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sglang.srt.lora.utils import LoRABatchInfo
+from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_pruned_lens
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -42,19 +44,31 @@ class TritonLoRABackend(BaseLoRABackend):
         )
 
     def run_lora_a_sgemm(
-        self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        pruned_batch_info: LoRABatchInfo = None,
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_a_fwd(x, weights, self.batch_info)
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
+        return sgemm_lora_a_fwd(x, weights, batch_info)
 
     def run_lora_b_sgemm(
         self,
         x: torch.Tensor,
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
+        pruned_batch_info: LoRABatchInfo = None,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
+        batch_info = (
+            pruned_batch_info if pruned_batch_info is not None else self.batch_info
+        )
+        return sgemm_lora_b_fwd(x, weights, batch_info, base_output)
 
     def run_qkv_lora(
         self,
@@ -214,3 +228,25 @@ class TritonLoRABackend(BaseLoRABackend):
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
 
         self.batch_info = batch_info
+
+        # Precompute lm_head_batch_info for pruned lm_head LoRA
+        pruned_lens = get_lm_head_pruned_lens(forward_batch)
+
+        if pruned_lens is not None:
+            pruned_seg_lens = torch.tensor(
+                pruned_lens, dtype=torch.int32, device=self.device
+            )
+            pruned_seg_indptr = torch.zeros(
+                (bs + 1,), dtype=torch.int32, device=self.device
+            )
+            pruned_seg_indptr[1:] = torch.cumsum(pruned_seg_lens, dim=0)
+
+            self.lm_head_batch_info = dataclasses.replace(
+                batch_info,
+                max_len=max(pruned_lens),
+                seg_lens=pruned_seg_lens,
+                seg_indptr=pruned_seg_indptr,
+                expected_tokens=sum(pruned_lens),
+            )
+        else:
+            self.lm_head_batch_info = None
