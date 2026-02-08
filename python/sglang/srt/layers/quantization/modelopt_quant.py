@@ -2030,7 +2030,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         # Reconstruct bf16 values first, then requantize to flashinfer swizzled
         # scales so mm_mxfp8 can consume them directly.
         weight_bf16 = self._dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
-        weight_q, weight_scale = mxfp8_quantize(weight_bf16, is_sf_swizzled_layout=True)
+        weight_q, weight_scale = mxfp8_quantize(
+            weight_bf16, is_sf_swizzled_layout=True, backend="cuda"
+        )
 
         # mm_mxfp8 expects B as [K, N] column-major.
         layer.weight = Parameter(weight_q.t(), requires_grad=False)
@@ -2075,7 +2077,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             input_padded[:m_actual, :] = input_2d
             input_2d = input_padded
 
-        input_q, input_scale = mxfp8_quantize(input_2d, is_sf_swizzled_layout=True)
+        input_q, input_scale = mxfp8_quantize(
+            input_2d, is_sf_swizzled_layout=True, backend="cuda"
+        )
 
         out = mm_mxfp8(
             input_q,

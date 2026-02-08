@@ -217,11 +217,15 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(
     w13_q_list, w13_s_list = [], []
     w2_q_list, w2_s_list = [], []
     for i in range(num_experts):
-        w13_q, w13_s = mxfp8_quantize(w13_weight[i], is_sf_swizzled_layout=True)
+        w13_q, w13_s = mxfp8_quantize(
+            w13_weight[i], is_sf_swizzled_layout=True, backend="cuda"
+        )
         w13_q_list.append(w13_q)
         w13_s_list.append(w13_s.view(torch.uint8))
 
-        w2_q, w2_s = mxfp8_quantize(w2_weight[i], is_sf_swizzled_layout=True)
+        w2_q, w2_s = mxfp8_quantize(
+            w2_weight[i], is_sf_swizzled_layout=True, backend="cuda"
+        )
         w2_q_list.append(w2_q)
         w2_s_list.append(w2_s.view(torch.uint8))
 
@@ -330,7 +334,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             from flashinfer.fp8_quantization import mxfp8_quantize
 
             a_q, a_sf = mxfp8_quantize(
-                hidden_states, is_sf_swizzled_layout=False
+                hidden_states, is_sf_swizzled_layout=False, backend="cuda"
             )
             a_sf = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
             fp8_quant_type = Fp8QuantizationType.MxFp8
@@ -352,7 +356,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # It ignored the `output` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
             # so we put the whole function under the ``use_symmetric_memory`` context manager.
             # If the bug is fixed, we can only put the output tensor allocation under the context manager.
-            _rl = router_logits.to(torch.float32) if routing_method_type == RoutingMethodType.DeepSeekV3 else router_logits
+            _rl = (
+                router_logits.to(torch.float32)
+                if routing_method_type == RoutingMethodType.DeepSeekV3
+                else router_logits
+            )
             logger.info(
                 "trtllm_fp8_block_scale_moe call:\n"
                 "  fp8_quantization_type=%s\n"
@@ -369,21 +377,40 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 "  routed_scaling_factor=%s routing_method_type=%s\n"
                 "  use_shuffled_weight=%s tune_max_num_tokens=%s",
                 fp8_quant_type,
-                _rl.shape, _rl.dtype,
-                f"shape={correction_bias.shape} dtype={correction_bias.dtype}" if correction_bias is not None else "None",
-                a_q.shape, a_q.dtype,
-                a_sf.shape, a_sf.dtype,
-                quant_info.w13_weight.shape, quant_info.w13_weight.dtype,
-                quant_info.w13_weight_scale_inv.shape, quant_info.w13_weight_scale_inv.dtype,
-                quant_info.w2_weight.shape, quant_info.w2_weight.dtype,
-                quant_info.w2_weight_scale_inv.shape, quant_info.w2_weight_scale_inv.dtype,
-                quant_info.global_num_experts, topk_config.top_k,
+                _rl.shape,
+                _rl.dtype,
+                (
+                    f"shape={correction_bias.shape} dtype={correction_bias.dtype}"
+                    if correction_bias is not None
+                    else "None"
+                ),
+                a_q.shape,
+                a_q.dtype,
+                a_sf.shape,
+                a_sf.dtype,
+                quant_info.w13_weight.shape,
+                quant_info.w13_weight.dtype,
+                quant_info.w13_weight_scale_inv.shape,
+                quant_info.w13_weight_scale_inv.dtype,
+                quant_info.w2_weight.shape,
+                quant_info.w2_weight.dtype,
+                quant_info.w2_weight_scale_inv.shape,
+                quant_info.w2_weight_scale_inv.dtype,
+                quant_info.global_num_experts,
+                topk_config.top_k,
                 topk_config.num_expert_group if topk_config.num_expert_group else 0,
                 topk_config.topk_group if topk_config.topk_group else 0,
-                quant_info.intermediate_size, quant_info.local_expert_offset, quant_info.local_num_experts,
-                runner_config.routed_scaling_factor if runner_config.routed_scaling_factor is not None else 1.0,
+                quant_info.intermediate_size,
+                quant_info.local_expert_offset,
+                quant_info.local_num_experts,
+                (
+                    runner_config.routed_scaling_factor
+                    if runner_config.routed_scaling_factor is not None
+                    else 1.0
+                ),
                 routing_method_type,
-                use_shuffled_weight, next_power_of_2(a_q.shape[0]),
+                use_shuffled_weight,
+                next_power_of_2(a_q.shape[0]),
             )
             output = trtllm_fp8_block_scale_moe(
                 routing_logits=_rl,
