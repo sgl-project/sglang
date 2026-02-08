@@ -1227,9 +1227,8 @@ class DenoisingStage(PipelineStage):
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:
+            # attn_metadata can be None for SDPA attention backend
             return None
-
-        assert attn_metadata is not None, "attn_metadata cannot be None"
 
         return attn_metadata
 
