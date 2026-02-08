@@ -126,9 +126,6 @@ class SelfAttention(nn.Module):
         Returns:
             Output tensor [B, S_local, D]
         """
-        if isinstance(freqs, DTensor):
-            freqs = freqs.to_local()
-
         # Compute Q, K, V on local sequence
         q, _ = self.q(x)
         k, _ = self.k(x)
@@ -148,7 +145,7 @@ class SelfAttention(nn.Module):
         v = rearrange(v, "b s (n d) -> b s n d", n=self.num_heads_per_rank)
 
         # Apply RoPE
-        cos, sin = freqs.chunk(2, dim=-1)
+        cos, sin = freqs
         q, k = _apply_rotary_emb_qk(q, k, cos, sin, is_neox_style=False)
 
         # USPAttention handles SP communication internally
@@ -500,7 +497,7 @@ class WanModel(CachableDiT, OffloadableDiTMixin):
             .reshape(f * h * w, -1)
             .to(x.device)
         )
-        freqs = torch.cat([freqs.real, freqs.imag], dim=-1).float()
+        freqs = (freqs.real.contiguous().float(), freqs.imag.contiguous().float())
 
         for block in self.blocks:
             x = block(x, context, t_mod, freqs)
