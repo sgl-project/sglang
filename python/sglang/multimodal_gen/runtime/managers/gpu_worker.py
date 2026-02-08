@@ -13,10 +13,15 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     maybe_init_distributed_environment_and_model_parallel,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
+    get_classifier_free_guidance_rank,
+    get_ring_parallel_rank,
     get_tp_group,
+    get_tp_rank,
+    get_ulysses_parallel_rank,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -70,7 +75,6 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
         torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
@@ -89,6 +93,15 @@ class GPUWorker:
             distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
             dist_timeout=self.server_args.dist_timeout,
         )
+
+        if model_parallel_is_initialized():
+            u_rank = get_ulysses_parallel_rank()
+            r_rank = get_ring_parallel_rank()
+            t_rank = get_tp_rank()
+            c_rank = get_classifier_free_guidance_rank()
+            setproctitle(f"sgl_diffusion::u{u_rank}_r{r_rank}_t{t_rank}_c{c_rank}")
+        else:
+            setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
 
