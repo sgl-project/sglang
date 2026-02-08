@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
-
-logger = logging.getLogger(__name__)
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -206,12 +203,34 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(
     w2_weight = cast(torch.Tensor, layer.w2_weight)
     num_experts = w13_weight.shape[0]
 
+    def _dequantize_mxfp8_2d(fp8_weight: torch.Tensor, scale_u8: torch.Tensor):
+        group_size = 32
+        n, k = fp8_weight.shape
+        n_groups = k // group_size
+        scales_f32 = torch.pow(
+            2.0, scale_u8.to(dtype=torch.float32, device=fp8_weight.device) - 127.0
+        )
+        weight_f32 = fp8_weight.to(torch.float32).view(n, n_groups, group_size)
+        return (weight_f32 * scales_f32.unsqueeze(-1)).view(n, k).to(torch.bfloat16)
+
     if not quantize:
-        # Pre-quantized FP8 checkpoint: upcast to BF16 so mxfp8_quantize can
-        # re-derive properly swizzled 1D scale factors (the checkpoint stores
-        # raw 2D UE8M0 scales which the trtllm kernel cannot consume directly).
-        w13_weight = w13_weight.to(torch.bfloat16)
-        w2_weight = w2_weight.to(torch.bfloat16)
+        # Pre-quantized FP8 checkpoint stores raw FP8 mantissas plus 2D UE8M0
+        # block scales. Reconstruct bf16 first, then requantize to flashinfer's
+        # swizzled scale layout expected by the TRT-LLM kernel.
+        w13_scale = cast(torch.Tensor, layer.w13_weight_scale_inv)
+        w2_scale = cast(torch.Tensor, layer.w2_weight_scale_inv)
+        w13_weight = torch.stack(
+            [
+                _dequantize_mxfp8_2d(w13_weight[i], w13_scale[i])
+                for i in range(num_experts)
+            ]
+        )
+        w2_weight = torch.stack(
+            [
+                _dequantize_mxfp8_2d(w2_weight[i], w2_scale[i])
+                for i in range(num_experts)
+            ]
+        )
 
     # Quantize (or re-quantize) to MXFP8 with swizzled scales for weights
     w13_q_list, w13_s_list = [], []
@@ -360,57 +379,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 router_logits.to(torch.float32)
                 if routing_method_type == RoutingMethodType.DeepSeekV3
                 else router_logits
-            )
-            logger.info(
-                "trtllm_fp8_block_scale_moe call:\n"
-                "  fp8_quantization_type=%s\n"
-                "  routing_logits: shape=%s dtype=%s\n"
-                "  routing_bias: %s\n"
-                "  hidden_states (a_q): shape=%s dtype=%s\n"
-                "  hidden_states_scale (a_sf): shape=%s dtype=%s\n"
-                "  gemm1_weights (w13): shape=%s dtype=%s\n"
-                "  gemm1_weights_scale (w13_scale_inv): shape=%s dtype=%s\n"
-                "  gemm2_weights (w2): shape=%s dtype=%s\n"
-                "  gemm2_weights_scale (w2_scale_inv): shape=%s dtype=%s\n"
-                "  num_experts=%s top_k=%s n_group=%s topk_group=%s\n"
-                "  intermediate_size=%s local_expert_offset=%s local_num_experts=%s\n"
-                "  routed_scaling_factor=%s routing_method_type=%s\n"
-                "  use_shuffled_weight=%s tune_max_num_tokens=%s",
-                fp8_quant_type,
-                _rl.shape,
-                _rl.dtype,
-                (
-                    f"shape={correction_bias.shape} dtype={correction_bias.dtype}"
-                    if correction_bias is not None
-                    else "None"
-                ),
-                a_q.shape,
-                a_q.dtype,
-                a_sf.shape,
-                a_sf.dtype,
-                quant_info.w13_weight.shape,
-                quant_info.w13_weight.dtype,
-                quant_info.w13_weight_scale_inv.shape,
-                quant_info.w13_weight_scale_inv.dtype,
-                quant_info.w2_weight.shape,
-                quant_info.w2_weight.dtype,
-                quant_info.w2_weight_scale_inv.shape,
-                quant_info.w2_weight_scale_inv.dtype,
-                quant_info.global_num_experts,
-                topk_config.top_k,
-                topk_config.num_expert_group if topk_config.num_expert_group else 0,
-                topk_config.topk_group if topk_config.topk_group else 0,
-                quant_info.intermediate_size,
-                quant_info.local_expert_offset,
-                quant_info.local_num_experts,
-                (
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-                routing_method_type,
-                use_shuffled_weight,
-                next_power_of_2(a_q.shape[0]),
             )
             output = trtllm_fp8_block_scale_moe(
                 routing_logits=_rl,
