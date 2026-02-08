@@ -67,8 +67,8 @@ def _apply_rotary_emb_naive(
             positional embeddings.
     """
     # [seq_len, 1, head_dim // 2]
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    cos = cos.float().unsqueeze(1)
+    sin = sin.float().unsqueeze(1)
     if is_neox_style:
         x1, x2 = torch.chunk(x, 2, dim=-1)
     else:
