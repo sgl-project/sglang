@@ -162,22 +162,16 @@ class LoRAMemoryPool:
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
 
-        # Check if MoE module and return appropriate shape (the assumption is that down_proj and gate_up_proj are only used in MoE modules)
         if self.is_moe_module(module_name):
             num_experts = getattr(
                 self.base_hf_config,
                 "num_local_experts",
                 getattr(self.base_hf_config, "num_experts", 0),
             )
-            # Allocate all MoE buffers with the same maximum rank dimension
-            # to ensure consistent kernel compilation. The maximum stacking factor is 2.
-            max_rank_dim = (
-                max_lora_dim * 2
-            )  # Accommodate maximum stacking (gate_up_proj)
             return (
                 self.max_loras_per_batch,
                 num_experts,
-                max_rank_dim,
+                max_lora_dim * c,
                 input_dim,
             )
         else:
