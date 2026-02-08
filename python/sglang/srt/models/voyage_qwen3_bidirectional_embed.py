@@ -114,9 +114,9 @@ class VoyageQwen3BidirectionalEmbedModel(nn.Module):
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
         """Forward pass for embedding generation."""
-        assert get_embedding, (
-            "VoyageQwen3BidirectionalEmbedModel is only used for embedding"
-        )
+        assert (
+            get_embedding
+        ), "VoyageQwen3BidirectionalEmbedModel is only used for embedding"
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         # Apply the linear head to all hidden states
         hidden_states = self.linear(hidden_states)
