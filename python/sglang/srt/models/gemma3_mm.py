@@ -18,7 +18,7 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Dict, Iterable, List, Optional, Set, Tuple, TypedDict
+from typing import Iterable, List, Optional, Set, Tuple, TypedDict
 
 import torch
 from torch import nn
@@ -396,7 +396,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
         # NOTE: As described in https://huggingface.co/blog/gemma3#multimodality, in the prefill stage of Gemma-3, image tokens use bidirectional attention. Currently, only the TritonAttnBackend supports bidirectional attention; other backends have not yet implemented this. Bidirectional attention is incompatible with CUDA Graph and chunked prefill.
         if (
-            forward_batch.forward_mode == ForwardMode.EXTEND # only Extend mode is supported for now
+            forward_batch.forward_mode
+            == ForwardMode.EXTEND  # only Extend mode is supported for now
             and forward_batch.contains_image_inputs()  # Gemma-3 only supports image as mm inputs
         ):
             self.prepare_attn_masks(

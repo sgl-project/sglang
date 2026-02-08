@@ -16,7 +16,6 @@ from typing import Iterable, Optional, Set, Tuple
 
 import einops
 import torch
-import torch.nn.functional as F
 from torch import nn
 from transformers import (
     ROPE_INIT_FUNCTIONS,

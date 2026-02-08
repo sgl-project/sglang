@@ -820,9 +820,13 @@ class TritonAttnBackend(AttentionBackend):
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
         causal = True
-        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY or (
-            layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
-            and self.allow_bidirectional_attention_in_extend
+        if (
+            layer.is_cross_attention
+            or layer.attn_type == AttentionType.ENCODER_ONLY
+            or (
+                layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
+                and self.allow_bidirectional_attention_in_extend
+            )
         ):
             causal = False
 
