@@ -232,7 +232,6 @@ class ConditionalCrossAttention(nn.Module):
             q = self.norm_q(q)
             k = self.norm_k(k)
 
-        half_dim = self.head_dim // 2
         if x_freqs is not None:
             x_cos, x_sin = x_freqs
             q_view = rearrange(q, "b l (h d) -> b l h d", d=self.head_dim)
