@@ -13,15 +13,15 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
+    model_parallel_is_initialized, get_tp_world_size, get_tp_rank,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_ring_parallel_rank,
     get_tp_group,
-    get_tp_rank,
-    get_ulysses_parallel_rank,
+    get_ulysses_parallel_rank, get_ulysses_parallel_world_size, get_ring_parallel_world_size,
+    get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -93,15 +93,23 @@ class GPUWorker:
             distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
             dist_timeout=self.server_args.dist_timeout,
         )
-
         if model_parallel_is_initialized():
-            u_rank = get_ulysses_parallel_rank()
-            r_rank = get_ring_parallel_rank()
-            t_rank = get_tp_rank()
-            c_rank = get_classifier_free_guidance_rank()
-            setproctitle(f"sgl_diffusion::u{u_rank}_r{r_rank}_t{t_rank}_c{c_rank}")
+            suffix = ""
+            if get_tp_world_size() != 1:
+                tp_rank = get_tp_rank()
+                suffix += f"_TP{tp_rank}"
+            if get_ulysses_parallel_world_size() != 1:
+                u_rank = get_ulysses_parallel_rank()
+                suffix += f"_U{u_rank}"
+            if get_ring_parallel_world_size() != 1:
+                r_rank = get_ring_parallel_rank()
+                suffix += f"_R{r_rank}"
+            if get_classifier_free_guidance_world_size() != 1:
+                c_rank = get_classifier_free_guidance_rank()
+                suffix += f"_C{c_rank}"
+            setproctitle(f"sgl_diffusion::scheduler{suffix}")
         else:
-            setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
+            setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
 
@@ -132,10 +140,10 @@ class GPUWorker:
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         peak_memory_bytes = torch.cuda.max_memory_allocated()
-        output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
-        peak_memory_gb = peak_memory_bytes / (1024**3)
+        output_batch.peak_memory_mb = peak_memory_bytes / (1024 ** 2)
+        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
         remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024**3) - peak_memory_gb
+            current_platform.get_device_total_memory() / (1024 ** 3) - peak_memory_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
         suggested_args = set()
@@ -245,7 +253,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-            or self.server_args.dit_layerwise_offload,
+                           or self.server_args.dit_layerwise_offload,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,
