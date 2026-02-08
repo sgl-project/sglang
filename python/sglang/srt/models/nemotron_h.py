@@ -645,6 +645,7 @@ class NemotronHForCausalLM(nn.Module):
         super().__init__()
         lora_config = None
         self.config = config
+        self.quant_config = quant_config
         self.model = self._init_model(
             config=config, quant_config=quant_config, prefix=prefix
         )
