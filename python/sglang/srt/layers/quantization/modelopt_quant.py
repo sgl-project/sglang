@@ -2099,7 +2099,8 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
     """MoE method for ModelOpt MXFP8 quantization.
 
     Loads FP8 expert weights with uint8 UE8M0 block scales (group_size=32).
-    Converts UE8M0 scales to float32 and runs quantized Triton block-FP8 MoE.
+    Supports CUTLASS (native MXFP8) and Triton (block-FP8 with float scales)
+    MoE runner backends.
     """
 
     BLOCK_K = 32  # MXFP8 group size
@@ -2182,39 +2183,175 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs_block)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs_block)
 
+    @staticmethod
+    def _swizzle_mxfp8_scales(
+        weight_shape: tuple, scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Swizzle uint8 UE8M0 scales for CUTLASS MXFP8 MoE kernel."""
+        from triton_kernels.tensor import convert_layout, wrap_torch_tensor
+        from triton_kernels.tensor_details import layout
+
+        num_experts, m, k = weight_shape
+        aligned_m = ((m + 127) // 128) * 128
+        scale = scale.view(num_experts, aligned_m, k // 32)
+        num_warps = 8
+        scale_layout, scale_layout_opts = (
+            layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=1, num_warps=num_warps
+            )
+        )
+        scale = scale.transpose(-2, -1)
+        scale = convert_layout(
+            wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
+        )
+        scale = scale.data.view(num_experts, aligned_m, k // 32)
+        return scale
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Keep FP8 weights as-is; convert UE8M0 uint8 block scales to float32
-        # so the Triton block-FP8 kernel can use them directly.
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
 
-        layer.w13_weight_scale_inv = Parameter(
-            torch.pow(
-                2.0,
-                layer.w13_weight_scale.data.to(torch.float32) - 127.0,
-            ),
-            requires_grad=False,
+        if get_moe_runner_backend().is_cutlass():
+            # CUTLASS MXFP8: keep uint8 scales, swizzle for kernel layout
+            layer.w13_weight_scale_inv = Parameter(
+                self._swizzle_mxfp8_scales(
+                    layer.w13_weight.data.shape, layer.w13_weight_scale.data
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                self._swizzle_mxfp8_scales(
+                    layer.w2_weight.data.shape, layer.w2_weight_scale.data
+                ),
+                requires_grad=False,
+            )
+            layer.w13_weight_scale_inv.format_ue8m0 = True
+            layer.w2_weight_scale_inv.format_ue8m0 = True
+        else:
+            # Triton block-FP8: convert UE8M0 uint8 → float32 scales
+            layer.w13_weight_scale_inv = Parameter(
+                torch.pow(
+                    2.0,
+                    layer.w13_weight_scale.data.to(torch.float32) - 127.0,
+                ),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale_inv = Parameter(
+                torch.pow(
+                    2.0,
+                    layer.w2_weight_scale.data.to(torch.float32) - 127.0,
+                ),
+                requires_grad=False,
+            )
+
+    def _ensure_cutlass_buffers(self, layer: torch.nn.Module) -> None:
+        if getattr(self, "_cutlass_buffers_ready", False):
+            return
+        device = layer.w13_weight.device
+        num_experts = layer.w13_weight.shape[0]
+        hidden_size = layer.w2_weight.shape[1]
+        intermediate_size_per_partition = layer.w2_weight.shape[2]
+
+        self.ab_strides1 = torch.full(
+            (num_experts,), hidden_size, device=device, dtype=torch.int64
         )
-        layer.w2_weight_scale_inv = Parameter(
-            torch.pow(
-                2.0,
-                layer.w2_weight_scale.data.to(torch.float32) - 127.0,
-            ),
-            requires_grad=False,
+        self.c_strides1 = torch.full(
+            (num_experts,),
+            2 * intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
         )
+        self.ab_strides2 = torch.full(
+            (num_experts,),
+            intermediate_size_per_partition,
+            device=device,
+            dtype=torch.int64,
+        )
+        self.c_strides2 = torch.full(
+            (num_experts,), hidden_size, device=device, dtype=torch.int64
+        )
+        self.workspace = torch.empty(90000, device=device, dtype=torch.uint8)
+        self.a_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.b_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.out_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.a_scales_ptr = torch.empty(
+            num_experts, device=device, dtype=torch.int64
+        )
+        self.b_scales_ptr = torch.empty(
+            num_experts, device=device, dtype=torch.int64
+        )
+        self.expert_offsets = torch.empty(
+            num_experts + 1, device=device, dtype=torch.int32
+        )
+        self.problem_sizes1 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self.problem_sizes2 = torch.empty(
+            num_experts, 3, device=device, dtype=torch.int32
+        )
+        self._cutlass_buffers_ready = True
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        if get_moe_runner_backend().is_cutlass():
+            # CUTLASS path is called directly in apply(), no MoeRunner needed.
+            self._ensure_cutlass_buffers(layer)
+        else:
+            self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        # Run quantized Triton MoE with FP8 weights and block scales.
+        if get_moe_runner_backend().is_cutlass():
+            from sglang.srt.distributed import get_tp_group
+            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                use_symmetric_memory,
+            )
+            from sglang.srt.layers.dp_attention import is_allocation_symmetric
+            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            x = dispatch_output.hidden_states
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                symm_output = torch.empty_like(x)
+
+            output = cutlass_fused_experts_fp8(
+                x,
+                layer.w13_weight.transpose(1, 2),
+                layer.w2_weight.transpose(1, 2),
+                layer.w13_weight_scale_inv.transpose(1, 2),
+                layer.w2_weight_scale_inv.transpose(1, 2),
+                topk_weights,
+                topk_ids,
+                self.ab_strides1,
+                self.c_strides1,
+                self.ab_strides2,
+                self.c_strides2,
+                self.workspace,
+                self.a_ptr,
+                self.b_ptr,
+                self.out_ptr,
+                self.a_scales_ptr,
+                self.b_scales_ptr,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                use_fp8_blockscale=True,
+                use_mxfp8=True,
+                output=symm_output,
+                enable_es=(True, True),
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        # Fallback: Triton block-FP8 with float scales
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
         quant_info = TritonMoeQuantInfo(
