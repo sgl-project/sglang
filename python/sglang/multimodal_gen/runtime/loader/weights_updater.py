@@ -43,7 +43,6 @@ from __future__ import annotations
 import gc
 import os
 import time
-from dataclasses import dataclass
 
 import torch
 
@@ -63,15 +62,6 @@ except ImportError:
     distribute_tensor = None
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class UpdateWeightsFromDiskReq:
-    """Request to update model weights from disk for diffusion models."""
-
-    model_path: str
-    flush_cache: bool = True
-    target_modules: list[str] | None = None
 
 
 class WeightsUpdater:

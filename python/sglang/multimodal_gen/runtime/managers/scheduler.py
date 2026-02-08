@@ -20,8 +20,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
 )
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    UpdateWeightsFromDiskReq,
+from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+    UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -92,7 +92,7 @@ class Scheduler:
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
-            UpdateWeightsFromDiskReq: self._handle_update_weights_from_disk,
+            UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
         }
 
         # FIFO, new reqs are appended

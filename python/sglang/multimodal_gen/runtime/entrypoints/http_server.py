@@ -15,12 +15,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_ap
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
-)
-from sglang.multimodal_gen.runtime.loader.weights_updater import (
-    UpdateWeightsFromDiskReq,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
@@ -93,40 +91,6 @@ async def get_models(request: Request):
 async def health_generate():
     # TODO : health generate endpoint
     return {"status": "ok"}
-
-
-@health_router.post("/update_weights_from_disk")
-async def update_weights_from_disk(request: Request):
-    """Update model weights from disk inplace without restarting the server."""
-    body = await request.json()
-    model_path = body.get("model_path")
-    if not model_path:
-        return ORJSONResponse(
-            {"success": False, "message": "model_path is required"},
-            status_code=400,
-        )
-
-    req = UpdateWeightsFromDiskReq(
-        model_path=model_path,
-        flush_cache=body.get("flush_cache", True),
-        target_modules=body.get("target_modules"),
-    )
-
-    try:
-        response = await async_scheduler_client.forward(req)
-    except Exception as e:
-        return ORJSONResponse(
-            {"success": False, "message": str(e)},
-            status_code=500,
-        )
-
-    result = response.output
-    success = result.get("success", False)
-    message = result.get("message", "Unknown status")
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=200 if success else 400,
-    )
 
 
 def make_serializable(obj):
@@ -255,6 +219,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(weights_api.router)
 
     app.state.server_args = server_args
     return app
