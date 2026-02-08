@@ -34,7 +34,6 @@ endif()
 
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"
-    ${repo-flashmla_SOURCE_DIR}/csrc/api/api.cpp
 
     ${repo-flashmla_SOURCE_DIR}/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/smxx/decode/combine/combine.cu
