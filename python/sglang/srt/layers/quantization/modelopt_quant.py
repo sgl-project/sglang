@@ -2030,7 +2030,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         # Reconstruct bf16 values first, then requantize to flashinfer swizzled
         # scales so mm_mxfp8 can consume them directly.
         weight_bf16 = self._dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
-        weight_q, weight_scale = mxfp8_quantize(weight_bf16, is_sf_swizzled_layout=True)
+        weight_q, weight_scale = mxfp8_quantize(
+            weight_bf16, is_sf_swizzled_layout=True, backend="cuda"
+        )
 
         # mm_mxfp8 expects B as [K, N] column-major.
         layer.weight = Parameter(weight_q.t(), requires_grad=False)
@@ -2075,7 +2077,9 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
             input_padded[:m_actual, :] = input_2d
             input_2d = input_padded
 
-        input_q, input_scale = mxfp8_quantize(input_2d, is_sf_swizzled_layout=True)
+        input_q, input_scale = mxfp8_quantize(
+            input_2d, is_sf_swizzled_layout=True, backend="cuda"
+        )
 
         out = mm_mxfp8(
             input_q,
@@ -2094,9 +2098,8 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
 class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
     """MoE method for ModelOpt MXFP8 quantization.
 
-    Loads FP8 expert weights with uint8 UE8M0 block scales.
-    For correctness, this path dequantizes expert weights to BF16 at load time
-    and runs MoE with the Triton unquantized kernel path.
+    Loads FP8 expert weights with uint8 UE8M0 block scales (group_size=32).
+    Converts UE8M0 scales to float32 and runs quantized Triton block-FP8 MoE.
     """
 
     BLOCK_K = 32  # MXFP8 group size
@@ -2180,50 +2183,23 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs_block)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Rename weight_scale → weight_scale_inv to keep parameter naming
-        # consistent with existing MoE code paths.
-        layer.w13_weight_scale_inv = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale_inv = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        # Keep FP8 weights as-is; convert UE8M0 uint8 block scales to float32
+        # so the Triton block-FP8 kernel can use them directly.
         layer.w13_weight = Parameter(layer.w13_weight.data, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight.data, requires_grad=False)
-        layer.w13_weight_scale_inv.format_ue8m0 = True
-        layer.w2_weight_scale_inv.format_ue8m0 = True
 
-        # Correctness fallback: convert checkpoint MXFP8 MoE weights to BF16.
-        # This avoids backend-specific MXFP8 MoE scale-layout mismatches.
-        def _dequantize_mxfp8_3d(
-            fp8_weight: torch.Tensor, scale_u8: torch.Tensor
-        ) -> torch.Tensor:
-            # fp8_weight: [E, N, K], scale_u8: [E, N, K//32]
-            group_size = 32
-            num_experts, n_dim, k_dim = fp8_weight.shape
-            assert (
-                k_dim % group_size == 0
-            ), f"K={k_dim} must be divisible by {group_size} for MXFP8."
-            scales_f32 = torch.pow(
-                2.0, scale_u8.to(dtype=torch.float32, device=fp8_weight.device) - 127.0
-            )
-            weight_f32 = fp8_weight.to(torch.float32).view(
-                num_experts, n_dim, k_dim // group_size, group_size
-            )
-            return (
-                (weight_f32 * scales_f32.unsqueeze(-1))
-                .view(num_experts, n_dim, k_dim)
-                .to(torch.bfloat16)
-            )
-
-        layer.w13_weight = Parameter(
-            _dequantize_mxfp8_3d(
-                layer.w13_weight.data, layer.w13_weight_scale_inv.data
+        layer.w13_weight_scale_inv = Parameter(
+            torch.pow(
+                2.0,
+                layer.w13_weight_scale.data.to(torch.float32) - 127.0,
             ),
             requires_grad=False,
         )
-        layer.w2_weight = Parameter(
-            _dequantize_mxfp8_3d(layer.w2_weight.data, layer.w2_weight_scale_inv.data),
+        layer.w2_weight_scale_inv = Parameter(
+            torch.pow(
+                2.0,
+                layer.w2_weight_scale.data.to(torch.float32) - 127.0,
+            ),
             requires_grad=False,
         )
 
@@ -2231,12 +2207,6 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        requested_backend = get_moe_runner_backend()
-        if requested_backend.is_flashinfer_trtllm():
-            logger.warning(
-                "modelopt_mxfp8 MoE falls back to Triton BF16 execution for "
-                "correctness; ignoring flashinfer_trtllm runner for this layer."
-            )
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def apply(
@@ -2244,11 +2214,16 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        # Run as unquantized Triton MoE with dequantized BF16 weights.
+        # Run quantized Triton MoE with FP8 weights and block scales.
         from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 
         quant_info = TritonMoeQuantInfo(
             w13_weight=layer.w13_weight,
             w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=False,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            block_shape=[1, 32],
         )
         return self.runner.run(dispatch_output, quant_info)
