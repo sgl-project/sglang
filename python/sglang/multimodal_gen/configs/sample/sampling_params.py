@@ -132,6 +132,9 @@ class SamplingParams:
     # TeaCache parameters
     enable_teacache: bool = False
 
+    # MagCache parameters
+    enable_magcache: bool = False
+
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 5
@@ -506,6 +509,12 @@ class SamplingParams:
             "--enable-teacache",
             action="store_true",
             default=SamplingParams.enable_teacache,
+        )
+        parser.add_argument(
+            "--enable-magcache",
+            action="store_true",
+            default=SamplingParams.enable_magcache,
+            help="Enable MagCache optimization for diffusion inference",
         )
 
         # profiling

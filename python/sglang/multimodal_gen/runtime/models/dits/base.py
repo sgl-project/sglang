@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models import DiTConfig
 # For backwards compatibility, re-export from the new location
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
+from sglang.multimodal_gen.runtime.cache.magcache import MagCacheMixin
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -83,11 +84,12 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(TeaCacheMixin, BaseDiT):
+class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
     """
-    An intermediate base class that adds TeaCache optimization functionality to DiT models.
+    Intermediate base class that provides both TeaCache and MagCache optimization.
 
-    Inherits TeaCacheMixin for cache logic and BaseDiT for core DiT functionality.
+    Inherits from both TeaCacheMixin and MagCacheMixin, and routes between them
+    based on enable_teacache / enable_magcache flags.
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -106,4 +108,39 @@ class CachableDiT(TeaCacheMixin, BaseDiT):
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
-        self._init_teacache_state()
+        self._init_teacache_state()  # Initializes shared state + TeaCache state
+        self._init_magcache_state()  # Adds MagCache-specific state
+
+    def reset_cache_state(self) -> None:
+        """Reset both TeaCache and MagCache state."""
+        self.reset_teacache_state()  # Resets shared state + TeaCache state
+        self.reset_magcache_state()  # Resets MagCache state
+
+    def maybe_cache_states(
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+    ) -> None:
+        """
+        Cache residual for later retrieval.
+
+        SHARED implementation - both TeaCache and MagCache cache residuals identically.
+        """
+        residual = hidden_states.squeeze(0) - original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = residual
+        else:
+            self.previous_residual_negative = residual
+
+    def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Retrieve cached residual.
+
+        SHARED implementation - both TeaCache and MagCache retrieve identically.
+        """
+        if not self.is_cfg_negative:
+            return hidden_states + self.previous_residual
+        else:
+            return hidden_states + self.previous_residual_negative
+
+    def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        """Override in subclass to implement cache decision logic."""
+        return False

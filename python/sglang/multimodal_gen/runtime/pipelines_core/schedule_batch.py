@@ -24,6 +24,10 @@ from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
+from sglang.multimodal_gen.configs.sample.magcache import (
+    MagCacheParams,
+    WanMagCacheParams,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
@@ -141,6 +145,10 @@ class Req:
 
     # TeaCache parameters
     teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
+
+    # MagCache parameters
+    magcache_params: MagCacheParams | WanMagCacheParams | None = None
+    enable_magcache: bool = False
 
     # STA parameters
     STA_param: list | None = None

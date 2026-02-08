@@ -10,6 +10,8 @@ import torch.nn as nn
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
 from sglang.multimodal_gen.configs.sample.wan import WanTeaCacheParams
+from sglang.multimodal_gen.configs.sample.magcache import WanMagCacheParams
+from sglang.multimodal_gen.runtime.cache.magcache import MagCacheContext
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_world_size,
@@ -870,16 +872,16 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
         else:
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
+            # If any cache is enabled, we need to cache the original hidden states
+            if self.enable_teacache or self.enable_magcache:
                 original_hidden_states = hidden_states.clone()
 
             for block in self.blocks:
                 hidden_states = block(
                     hidden_states, encoder_hidden_states, timestep_proj, freqs_cis
                 )
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
+            # Cache states for both TeaCache and MagCache (same operation)
+            if self.enable_teacache or self.enable_magcache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
         self.cnt += 1
         # 5. Output norm, projection & unpatchify
@@ -924,50 +926,100 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             self.previous_residual_negative = residual
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
-        ic('hey')
-        if not self.enable_teacache:
-            return False
-        ctx = self._get_teacache_context()
-        if ctx is None:
-            ic('ctx is None')
-            return False
+        """Check both TeaCache and MagCache (route between strategies)."""
+        # Try TeaCache first
+        if self.enable_teacache:
+            ic('checking teacache')
+            ctx = self._get_teacache_context()
+            if ctx is None:
+                ic('teacache ctx is None')
+            else:
+                # Wan uses WanTeaCacheParams with additional fields
+                teacache_params = ctx.teacache_params
+                assert isinstance(
+                    teacache_params, WanTeaCacheParams
+                ), "teacache_params is not a WanTeaCacheParams"
 
-        # Wan uses WanTeaCacheParams with additional fields
-        teacache_params = ctx.teacache_params
-        assert isinstance(
-            teacache_params, WanTeaCacheParams
-        ), "teacache_params is not a WanTeaCacheParams"
+                # Initialize Wan-specific parameters
+                use_ret_steps = teacache_params.use_ret_steps
+                cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
+                ret_steps = teacache_params.ret_steps
 
-        # Initialize Wan-specific parameters
-        use_ret_steps = teacache_params.use_ret_steps
-        cutoff_steps = teacache_params.get_cutoff_steps(ctx.num_inference_steps)
-        ret_steps = teacache_params.ret_steps
+                # Adjust ret_steps and cutoff_steps for non-CFG mode
+                if not ctx.do_cfg:
+                    ret_steps = ret_steps // 2
+                    cutoff_steps = cutoff_steps // 2
 
-        # Adjust ret_steps and cutoff_steps for non-CFG mode
-        # (WanTeaCacheParams uses *2 factor assuming CFG)
-        if not ctx.do_cfg:
-            ret_steps = ret_steps // 2
-            cutoff_steps = cutoff_steps // 2
+                timestep_proj = kwargs["timestep_proj"]
+                temb = kwargs["temb"]
+                modulated_inp = timestep_proj if use_ret_steps else temb
 
-        timestep_proj = kwargs["timestep_proj"]
-        temb = kwargs["temb"]
-        modulated_inp = timestep_proj if use_ret_steps else temb
+                self.is_cfg_negative = ctx.is_cfg_negative
 
-        self.is_cfg_negative = ctx.is_cfg_negative
+                # Wan uses ret_steps/cutoff_steps for boundary detection
+                is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
 
-        # Wan uses ret_steps/cutoff_steps for boundary detection
-        is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
+                # Use shared helper to compute cache decision
+                should_calc = self._compute_teacache_decision(
+                    modulated_inp=modulated_inp,
+                    is_boundary_step=is_boundary_step,
+                    coefficients=ctx.coefficients,
+                    teacache_thresh=ctx.teacache_thresh,
+                )
+                ic(should_calc)
 
-        # Use shared helper to compute cache decision
-        should_calc = self._compute_teacache_decision(
-            modulated_inp=modulated_inp,
-            is_boundary_step=is_boundary_step,
-            coefficients=ctx.coefficients,
-            teacache_thresh=ctx.teacache_thresh,
-        )
-        ic(should_calc)
+                return not should_calc
 
-        return not should_calc
+        # Try MagCache
+        if self.enable_magcache:
+            ic('checking magcache')
+            ctx = self._get_magcache_context()
+            if ctx is None:
+                ic('magcache ctx is None')
+                return False
+
+            # Get Wan-specific params
+            magcache_params = ctx.magcache_params
+            assert isinstance(
+                magcache_params, WanMagCacheParams
+            ), "magcache_params is not a WanMagCacheParams"
+
+            ret_steps = magcache_params.ret_steps
+            cutoff_steps = magcache_params.get_cutoff_steps(ctx.num_inference_steps)
+
+            # Adjust for non-CFG
+            if not ctx.do_cfg:
+                ret_steps = ret_steps // 2
+                cutoff_steps = cutoff_steps // 2
+
+            self.is_cfg_negative = ctx.is_cfg_negative
+
+            # Boundary detection
+            is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
+
+            # Need previous residual to make decision
+            prev_residual = (
+                self.previous_residual_negative
+                if self.is_cfg_negative
+                else self.previous_residual
+            )
+            if prev_residual is None:
+                ic('no previous residual, computing')
+                return False  # No cache yet, compute
+
+            # Use previous residual norm to decide
+            should_calc = self._compute_magcache_decision(
+                residual=prev_residual,
+                is_boundary_step=is_boundary_step,
+                magcache_thresh=ctx.magcache_thresh,
+                max_skip_steps=ctx.max_skip_steps,
+                retention_steps=ret_steps,
+            )
+            ic(should_calc)
+
+            return not should_calc
+
+        return False
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Retrieve cached residual with CFG positive/negative separation."""
