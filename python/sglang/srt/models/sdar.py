@@ -442,6 +442,11 @@ class SDARForCausalLM(nn.Module):
     ):
         super().__init__()
         self.pp_group = get_pp_group()
+        assert self.pp_group.world_size == 1, (
+            f"SDARMoeForCausalLM does not support pipeline parallel (pp_size={self.pp_group.world_size}). "
+            "Please set pp_size=1."
+        )
+
         self.config = config
         self.quant_config = quant_config
         alt_stream = torch.cuda.Stream() if _is_cuda else None
