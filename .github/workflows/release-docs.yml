@@ -53,6 +53,12 @@ jobs:
           make markdown
           python3 wrap_run_llm.py
 
+          # Copy tag lookup tool
+          mkdir -p _build/html/tag_lookup
+          cp tag_lookup/index.html _build/html/tag_lookup/
+          cp tag_lookup/tag_index.json _build/html/tag_lookup/
+          cp tag_lookup/example_index.json _build/html/tag_lookup/
+
           cd _build/html
 
           git clone https://$GITHUB_TOKEN@github.com/sgl-project/sgl-project.github.io.git ../sgl-project.github.io --depth 1

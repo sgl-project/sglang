@@ -1,0 +1,42 @@
+name: Update Tag Lookup Index
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-index:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Generate Index
+        run: |
+          python3 docs/tag_lookup/generate_index.py --output docs/tag_lookup/tag_index.json
+
+      - name: Commit and Push
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+
+          if [[ -n $(git status -s docs/tag_lookup/tag_index.json) ]]; then
+            git add docs/tag_lookup/tag_index.json
+            git commit -m "[bot] Update tag lookup index"
+            git push origin main
+          else
+            echo "No changes to index."
+          fi
