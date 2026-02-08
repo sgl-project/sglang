@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"
-FLASHINFER_VERSION=0.6.2
+FLASHINFER_VERSION=0.6.3
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -182,7 +182,7 @@ fi
 $PIP_CMD list
 
 # Install other python dependencies
-$PIP_CMD install mooncake-transfer-engine==0.3.8.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+$PIP_CMD install mooncake-transfer-engine==0.3.9 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 if [ "$IS_BLACKWELL" != "1" ]; then
     # For lmms_evals evaluating MMMU

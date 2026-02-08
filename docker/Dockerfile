@@ -19,12 +19,10 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.1
-ARG MOONCAKE_VERSION=0.3.8.post1
+ARG FLASHINFER_VERSION=0.6.2
+ARG MOONCAKE_VERSION=0.3.9
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
-
-ARG FLASHINFER_VERSION=0.6.2
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -60,11 +58,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
-    && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends \
     # Core system utilities
-    tzdata \
     ca-certificates \
     software-properties-common \
     netcat-openbsd \
@@ -235,18 +230,21 @@ RUN set -eux; \
       cd DeepEP && \
       git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     elif [ "$HOPPER_SBO" = "1" ]; then \
       git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
       cd DeepEP && \
       git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
       cd .. ; \
     else \
         curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
         unzip -q ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/#define NUM_TIMEOUT_CYCLES 200000000000ull/#define NUM_TIMEOUT_CYCLES 2000000000000ull/' csrc/kernels/configs.cuh && \
         cd .. ; \
     fi
 
@@ -494,7 +492,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     python3.12-dev \
     wget \
     # Core system utilities
-    tzdata \
     ca-certificates \
     netcat-openbsd \
     curl \
