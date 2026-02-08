@@ -865,6 +865,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         should_skip_forward = self.should_skip_forward_for_cached_states(
             timestep_proj=timestep_proj, temb=temb
         )
+        ic(should_skip_forward)
 
         if should_skip_forward:
             hidden_states = self.retrieve_cached_states(hidden_states)
@@ -915,6 +916,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
     ) -> None:
         """Cache residual with CFG positive/negative separation."""
+        ic("caching states")
         residual = hidden_states.squeeze(0) - original_hidden_states
         if not self.is_cfg_negative:
             self.previous_residual = residual
@@ -922,10 +924,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             self.previous_residual_negative = residual
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
+        ic('hey')
         if not self.enable_teacache:
             return False
         ctx = self._get_teacache_context()
         if ctx is None:
+            ic('ctx is None')
             return False
 
         # Wan uses WanTeaCacheParams with additional fields
@@ -961,6 +965,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             coefficients=ctx.coefficients,
             teacache_thresh=ctx.teacache_thresh,
         )
+        ic(should_calc)
 
         return not should_calc
 

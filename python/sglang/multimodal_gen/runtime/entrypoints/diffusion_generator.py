@@ -210,6 +210,7 @@ class DiffGenerator:
             if diffusers_kwargs:
                 req.extra["diffusers_kwargs"] = diffusers_kwargs
             requests.append(req)
+        ic(requests)
 
         results = []
         total_start_time = time.perf_counter()

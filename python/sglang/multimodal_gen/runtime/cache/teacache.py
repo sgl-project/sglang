@@ -272,14 +272,18 @@ class TeaCacheMixin:
         forward_batch = forward_context.forward_batch
 
         # Early return checks
-        if (
-            forward_batch is None
-            or not forward_batch.enable_teacache
-            or forward_batch.teacache_params is None
-        ):
+        if forward_batch is None or not forward_batch.enable_teacache:
+            ic("forward_batch is None or enable_teacache is False")
             return None
 
+        # Get teacache_params from forward_batch, or fall back to sampling_params
         teacache_params = forward_batch.teacache_params
+        if teacache_params is None and hasattr(forward_batch, 'sampling_params'):
+            teacache_params = getattr(forward_batch.sampling_params, 'teacache_params', None)
+
+        if teacache_params is None:
+            ic("teacache_params is None even after fallback")
+            return None
 
         # Extract common values
         current_timestep = forward_context.current_timestep
