@@ -21,15 +21,15 @@ dependencies = [
   "anthropic>=0.20.0",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
-  "build",
+  "build",    
   "compressed-tensors",
   "cuda-python==12.9",
   "decord2",
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.3", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.3",
+  "flashinfer_python==0.6.2", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.2",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
