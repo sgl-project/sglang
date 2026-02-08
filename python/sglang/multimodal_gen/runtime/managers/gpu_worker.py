@@ -12,16 +12,20 @@ from setproctitle import setproctitle
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
+    get_tp_rank,
+    get_tp_world_size,
     maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized, get_tp_world_size, get_tp_rank,
+    model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_ring_parallel_rank,
-    get_tp_group,
-    get_ulysses_parallel_rank, get_ulysses_parallel_world_size, get_ring_parallel_world_size,
     get_classifier_free_guidance_world_size,
+    get_ring_parallel_rank,
+    get_ring_parallel_world_size,
+    get_tp_group,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -82,7 +86,7 @@ class GPUWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
-        # Initialize the distributed environment
+        # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
             enable_cfg_parallel=self.server_args.enable_cfg_parallel,
@@ -93,6 +97,8 @@ class GPUWorker:
             distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
             dist_timeout=self.server_args.dist_timeout,
         )
+
+        # set proc title
         if model_parallel_is_initialized():
             suffix = ""
             if get_tp_world_size() != 1:
@@ -140,10 +146,10 @@ class GPUWorker:
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         peak_memory_bytes = torch.cuda.max_memory_allocated()
-        output_batch.peak_memory_mb = peak_memory_bytes / (1024 ** 2)
-        peak_memory_gb = peak_memory_bytes / (1024 ** 3)
+        output_batch.peak_memory_mb = peak_memory_bytes / (1024**2)
+        peak_memory_gb = peak_memory_bytes / (1024**3)
         remaining_gpu_mem_gb = (
-            current_platform.get_device_total_memory() / (1024 ** 3) - peak_memory_gb
+            current_platform.get_device_total_memory() / (1024**3) - peak_memory_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
         suggested_args = set()
@@ -253,7 +259,7 @@ class GPUWorker:
         # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
-                           or self.server_args.dit_layerwise_offload,
+            or self.server_args.dit_layerwise_offload,
             "vae": self.server_args.vae_cpu_offload,
             "text_encoder": self.server_args.text_encoder_cpu_offload,
             "text_encoder_2": self.server_args.text_encoder_cpu_offload,
