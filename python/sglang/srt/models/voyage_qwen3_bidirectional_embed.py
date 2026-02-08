@@ -9,7 +9,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -65,8 +65,21 @@ class VoyageQwen3BidirectionalEmbedModel(nn.Module):
             bias=False,
         )
 
-        # Pooler for embedding output (MEAN pooling for sentence embeddings)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+    def _mean_pooling(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Apply mean pooling over sequence tokens for each request."""
+        seq_lens = forward_batch.extend_seq_lens
+        pooled_outputs = []
+        offset = 0
+        for seq_len in seq_lens:
+            # Get hidden states for this sequence
+            seq_hidden = hidden_states[offset : offset + seq_len]
+            # Mean pool over sequence length
+            pooled = seq_hidden.mean(dim=0)
+            pooled_outputs.append(pooled)
+            offset += seq_len
+        return torch.stack(pooled_outputs)
 
     @torch.no_grad()
     def forward(
@@ -82,9 +95,13 @@ class VoyageQwen3BidirectionalEmbedModel(nn.Module):
             "VoyageQwen3BidirectionalEmbedModel is only used for embedding"
         )
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        # Apply the linear head
+        # Apply the linear head to all hidden states
         hidden_states = self.linear(hidden_states)
-        return self.pooler(hidden_states, forward_batch)
+        # Apply MEAN pooling over sequence tokens
+        pooled_data = self._mean_pooling(hidden_states, forward_batch)
+        # Normalize embeddings
+        pooled_data = nn.functional.normalize(pooled_data, p=2, dim=-1)
+        return EmbeddingPoolerOutput(embeddings=pooled_data)
 
     def load_weights(self, weights: Iterable[WeightItem]):
         """Remap, fuse, and load weights directly
