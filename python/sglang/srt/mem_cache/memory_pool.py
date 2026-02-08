@@ -967,6 +967,10 @@ class MHATokenToKVPool(KVCache):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                max_val = torch.finfo(self.dtype).max
+                cache_k.clamp_(-max_val, max_val)
+                cache_v.clamp_(-max_val, max_val)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
