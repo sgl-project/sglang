@@ -207,8 +207,12 @@ def _apply_rotary_emb_qk_flashinfer(
     q = q.contiguous()
     k = k.contiguous()
     cos_sin_cache = torch.cat([cos, sin], dim=-1).float()
-    bsz, seq_len, num_q_heads, head_dim = q.shape
-    num_kv_heads = k.size(2)
+    if q.dim() > 3:
+        bsz, seq_len, num_q_heads, head_dim = q.shape
+    else:
+        seq_len, num_q_heads, head_dim = q.shape
+        bsz = 1
+    num_kv_heads = k.size(-2)
     pos_1d = torch.arange(seq_len, device=q.device, dtype=torch.long)
     positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
 
