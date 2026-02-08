@@ -4,6 +4,7 @@ import re
 import unittest
 from typing import Any, List, Optional, Tuple
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -22,6 +23,8 @@ register_amd_ci(est_time=195, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestPriorityScheduling(CustomTestCase):
+    _aborted_request_status_code = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -31,19 +34,30 @@ class TestPriorityScheduling(CustomTestCase):
         cls.stderr = open(STDERR_FILENAME, "w")
 
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=(
-                "--max-running-requests",  # Enforce max request concurrency is 1
-                "1",
-                "--max-queued-requests",  # Enforce max queued request number is 3
-                "3",
-                "--enable-priority-scheduling",  # Enable priority scheduling
-            ),
-            return_stdout_stderr=(cls.stdout, cls.stderr),
-        )
+
+        def launch_server():
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=(
+                    "--max-running-requests",  # Enforce max request concurrency is 1
+                    "1",
+                    "--max-queued-requests",  # Enforce max queued request number is 3
+                    "3",
+                    "--enable-priority-scheduling",  # Enable priority scheduling
+                ),
+                return_stdout_stderr=(cls.stdout, cls.stderr),
+            )
+
+        if cls._aborted_request_status_code is None:
+            cls._aborted_request_status_code = 503
+            launch_server()
+        else:
+            with envs.SGLANG_ABORTED_REQUEST_STATUS_CODE.override(
+                cls._aborted_request_status_code
+            ):
+                launch_server()
 
     @classmethod
     def tearDownClass(cls):
@@ -108,9 +122,18 @@ class TestPriorityScheduling(CustomTestCase):
 
         expected_status_and_error_messages = [
             (200, None),
-            (503, "The request is aborted by a higher priority request."),
-            (503, "The request is aborted by a higher priority request."),
-            (503, "The request is aborted by a higher priority request."),
+            (
+                self._aborted_request_status_code,
+                "This request is aborted from the waiting queue by a higher priority request.",
+            ),
+            (
+                self._aborted_request_status_code,
+                "This request is aborted from the waiting queue by a higher priority request.",
+            ),
+            (
+                self._aborted_request_status_code,
+                "This request is aborted from the waiting queue by a higher priority request.",
+            ),
             (200, None),
             (200, None),
             (200, None),
@@ -148,9 +171,9 @@ class TestPriorityScheduling(CustomTestCase):
             (200, None),
             (200, None),
             (200, None),
-            (503, "The request queue is full."),
-            (503, "The request queue is full."),
-            (503, "The request queue is full."),
+            (self._aborted_request_status_code, "The waiting queue is full."),
+            (self._aborted_request_status_code, "The waiting queue is full."),
+            (self._aborted_request_status_code, "The waiting queue is full."),
         ]
 
         e2e_latencies = []
@@ -225,6 +248,10 @@ class TestPriorityScheduling(CustomTestCase):
         )
 
         assert e2e_latencies[0] < e2e_latencies[1]
+
+
+class TestPrioritySchedulingCustomStatusCode(TestPriorityScheduling):
+    _aborted_request_status_code = 429
 
 
 class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):

@@ -237,11 +237,17 @@ class TestAbortAllWithRetraction(CustomTestCase):
 
 
 class TestAbortWithWaitingTimeout(CustomTestCase):
+    _timed_out_request_status_code = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_REQ_WAITING_TIMEOUT.override(0.001):
+
+        if cls._timed_out_request_status_code is None:
+            cls._timed_out_request_status_code = 503
+
+        def launch_server():
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -250,6 +256,14 @@ class TestAbortWithWaitingTimeout(CustomTestCase):
                     "--max-running-requests=1",
                 ],
             )
+
+        with (
+            envs.SGLANG_QUEUED_TIMEOUT_MS.override(0.001),
+            envs.SGLANG_TIMED_OUT_REQUEST_STATUS_CODE.override(
+                cls._timed_out_request_status_code
+            ),
+        ):
+            launch_server()
 
     @classmethod
     def tearDownClass(cls):
@@ -279,8 +293,14 @@ class TestAbortWithWaitingTimeout(CustomTestCase):
                 result = future.result()
                 if result.get("object") == "error":
                     error_count += 1
-                    self.assertEqual(result["code"], 503)
+                    self.assertEqual(
+                        result["code"], self._timed_out_request_status_code
+                    )
             self.assertEqual(error_count, 1)
+
+
+class TestAbortWithQueueTimeoutCustomStatusCode(TestAbortWithQueueTimeout):
+    _timed_out_request_status_code = 504
 
 
 class TestAbortWithRunningTimeout(CustomTestCase):
