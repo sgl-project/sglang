@@ -19,7 +19,7 @@ import os
 import signal
 import sys
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -2119,7 +2119,9 @@ class Scheduler(
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
-        self.num_running_reqs_by_priority = self._count_reqs_by_priority(self.running_batch.reqs)
+        self.num_running_reqs_by_priority = self._count_reqs_by_priority(
+            self.running_batch.reqs
+        )
 
         # Record metrics
         for req in can_run_list:

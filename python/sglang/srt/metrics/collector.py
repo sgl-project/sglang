@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Set, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -855,7 +855,12 @@ class SchedulerMetricsCollector:
             ],
         )
 
-    def _log_gauge(self, gauge, data: Union[int, float], by_priority_dict: Optional[Dict[int, int]] = None) -> None:
+    def _log_gauge(
+        self,
+        gauge,
+        data: Union[int, float],
+        by_priority_dict: Optional[Dict[int, int]] = None,
+    ) -> None:
         # Convenience function for logging to gauge.
         if by_priority_dict is not None:
             self._known_priorities.update(by_priority_dict.keys())
@@ -972,7 +977,11 @@ class SchedulerMetricsCollector:
             ).inc(t)
 
     def log_stats(self, stats: SchedulerStats) -> None:
-        self._log_gauge(self.num_running_reqs, stats.num_running_reqs, stats.num_running_reqs_by_priority)
+        self._log_gauge(
+            self.num_running_reqs,
+            stats.num_running_reqs,
+            stats.num_running_reqs_by_priority,
+        )
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
         self._log_gauge(
@@ -982,7 +991,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
-        self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs, stats.num_queue_reqs_by_priority)
+        self._log_gauge(
+            self.num_queue_reqs, stats.num_queue_reqs, stats.num_queue_reqs_by_priority
+        )
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
         self._log_gauge(
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
@@ -997,20 +1008,24 @@ class SchedulerMetricsCollector:
 
         # PD disaggregation
         self._log_gauge(
-            self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs,
-            stats.num_prefill_prealloc_queue_reqs_by_priority
+            self.num_prefill_prealloc_queue_reqs,
+            stats.num_prefill_prealloc_queue_reqs,
+            stats.num_prefill_prealloc_queue_reqs_by_priority,
         )
         self._log_gauge(
-            self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs,
-            stats.num_prefill_inflight_queue_reqs_by_priority
+            self.num_prefill_inflight_queue_reqs,
+            stats.num_prefill_inflight_queue_reqs,
+            stats.num_prefill_inflight_queue_reqs_by_priority,
         )
         self._log_gauge(
-            self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs,
-            stats.num_decode_prealloc_queue_reqs_by_priority
+            self.num_decode_prealloc_queue_reqs,
+            stats.num_decode_prealloc_queue_reqs,
+            stats.num_decode_prealloc_queue_reqs_by_priority,
         )
         self._log_gauge(
-            self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs,
-            stats.num_decode_transfer_queue_reqs_by_priority
+            self.num_decode_transfer_queue_reqs,
+            stats.num_decode_transfer_queue_reqs,
+            stats.num_decode_transfer_queue_reqs_by_priority,
         )
         self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
         self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
