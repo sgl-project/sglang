@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_tp_group,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -70,7 +71,7 @@ class GPUWorker:
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
         setproctitle(f"sgl_diffusion::scheduler_TP{self.local_rank}")
-        torch.cuda.set_device(self.local_rank)
+        torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -85,6 +86,8 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
+            distributed_init_method=f"tcp://127.0.0.1:{self.master_port}",
+            dist_timeout=self.server_args.dist_timeout,
         )
 
         self.pipeline = build_pipeline(self.server_args)
@@ -158,7 +161,7 @@ class GPUWorker:
         output_batch = None
         try:
             if self.rank == 0:
-                torch.cuda.reset_peak_memory_stats()
+                torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
@@ -185,6 +188,21 @@ class GPUWorker:
             duration_ms = (time.monotonic() - start_time) * 1000
             output_batch.timings.total_duration_ms = duration_ms
 
+            # Save output to file and return file path only if requested. Avoid the serialization
+            # and deserialization overhead between scheduler_client and gpu_worker.
+            if req.save_output and req.return_file_paths_only:
+                output_paths = save_outputs(
+                    output_batch.output,
+                    req.data_type,
+                    req.fps,
+                    True,
+                    lambda idx: req.output_file_path(len(output_batch.output), idx),
+                    audio=output_batch.audio,
+                    audio_sample_rate=output_batch.audio_sample_rate,
+                )
+                output_batch.output_file_paths = output_paths
+                output_batch.output = None
+
             # TODO: extract to avoid duplication
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
                 # Avoid logging warmup perf records that share the same request_id.
@@ -197,8 +215,7 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
-        finally:
-            return output_batch
+        return output_batch
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
@@ -331,7 +348,8 @@ def run_scheduler_process(
     """
     configure_logger(server_args)
     globally_suppress_loggers()
-    set_cuda_arch()
+    if current_platform.is_cuda():
+        set_cuda_arch()
 
     port_args = PortArgs.from_server_args(server_args)
 
