@@ -2,6 +2,8 @@
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
+// Copied from https://github.com/sgl-project/fast-hadamard-transform
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>

@@ -2,6 +2,8 @@
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
+// Copied from https://github.com/sgl-project/fast-hadamard-transform
+
 // #pragma once
 
 #include <c10/util/BFloat16.h>

@@ -3,6 +3,8 @@
  * Copyright (c) 2023, Tri Dao.
  ******************************************************************************/
 
+// Copied from https://github.com/sgl-project/fast-hadamard-transform
+
 // This file is auto-generated. See "code_gen.py"
 
 
