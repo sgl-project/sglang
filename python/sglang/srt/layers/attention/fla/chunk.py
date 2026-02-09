@@ -97,17 +97,52 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
-        g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            scale=scale,
-            initial_state=initial_state,
-            initial_state_indices=initial_state_indices,
-            cu_seqlens=cu_seqlens,
-        )
+        _chunk_gated_delta_rule_fi = None
+        # fi_initialized = False
+        # if not fi_initialized and is_sm90_supported():
+        #     try:
+        #         from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        #         _chunk_gated_delta_rule_fi = chunk_gated_delta_rule
+        #     except ImportError:
+        #         pass
+        #     fi_initialized = True
+
+        if _chunk_gated_delta_rule_fi is not None:
+            initial_state = initial_state[initial_state_indices]
+            q = rearrange(q, "1 l h d -> l h d").contiguous()
+            k = rearrange(k, "1 l h d -> l h d").contiguous()
+            v = rearrange(v, "1 l h d -> l h d").contiguous()
+            g = rearrange(g, "1 b h -> b h").contiguous()
+            beta = rearrange(beta, "1 b h -> b h").contiguous()
+            initial_state = initial_state.to(torch.float32)
+            g = g.to(torch.float32)
+            beta = beta.to(torch.float32)
+            g = torch.exp(g)
+
+            o, h = chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+            )
+        else:
+            g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                cu_seqlens=cu_seqlens,
+            )
         return o.to(q.dtype), h
 
 
