@@ -550,8 +550,19 @@ set(DEEPGEMM_SOURCES
 
 Python_add_library(deep_gemm_cpp MODULE WITH_SOABI ${DEEPGEMM_SOURCES})
 
+# DeepGEMM's Python package (`deep_gemm/__init__.py`) expects the extension module name to be `_C`,
+# i.e. it does `from . import _C`. Make sure the built module is importable as `deep_gemm._C`.
+set_target_properties(deep_gemm_cpp PROPERTIES
+    OUTPUT_NAME "_C"
+    PREFIX ""
+)
+
 # Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+find_library(TORCH_PYTHON_LIB
+    NAMES torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib" "${TORCH_INSTALL_PREFIX}/lib64"
+)
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIB}" c10 cuda nvrtc mscclpp_static)
 
 # Add include directories needed by DeepGEMM.
 target_include_directories(deep_gemm_cpp PRIVATE
