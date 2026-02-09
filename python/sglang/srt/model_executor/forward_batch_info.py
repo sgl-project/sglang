@@ -865,6 +865,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # TODO: check if we need to pad other tensors
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
+        if self.extend_seq_lens_cpu is not None and len(self.extend_seq_lens_cpu) < bs:
+            self.extend_seq_lens_cpu = list(self.extend_seq_lens_cpu) + [0] * (
+                bs - len(self.extend_seq_lens_cpu)
+            )
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             # FIXME(lsyin): remove this isinstance logic

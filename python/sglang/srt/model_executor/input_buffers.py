@@ -146,6 +146,7 @@ class GraphInputBuffers:
     ) -> Optional[torch.Tensor]:
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
+            self.req_pool_indices.zero_()
             self.out_cache_loc.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()

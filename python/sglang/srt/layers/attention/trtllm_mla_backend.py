@@ -542,15 +542,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
             del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs]) + 1
-                metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs]) + bs
+            if forward_mode.is_draft_extend_v2():
+                # DRAFT_EXTEND_V2: all draft tokens are processed regardless of accept_length.
+                # Use extend_seq_lens from spec_info (set by CUDA graph runner) or num_draft_tokens.
+                if getattr(spec_info, "extend_seq_lens_cpu", None):
+                    extend_seq_lens_cpu = spec_info.extend_seq_lens_cpu[:bs]
+                    metadata.max_seq_len_q = max(extend_seq_lens_cpu)
+                    metadata.sum_seq_lens_q = sum(extend_seq_lens_cpu)
+                else:
+                    metadata.max_seq_len_q = self.num_draft_tokens
+                    metadata.sum_seq_lens_q = self.num_draft_tokens * bs
+                if getattr(spec_info, "extend_seq_lens_tensor", None) is not None:
+                    extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs]
+                else:
+                    extend_seq_lens = torch.full(
+                        (bs,),
+                        metadata.max_seq_len_q,
+                        dtype=torch.int32,
+                        device=seq_lens.device,
+                    )
             else:
-                metadata.max_seq_len_q = 1
-                metadata.sum_seq_lens_q = bs
-            # draft_extend uses (accept_length + 1) query tokens per sequence
-            extend_seq_lens = accept_length + 1
+                # DRAFT_EXTEND (V1): extend by (accept_length + 1) tokens per sequence.
+                accept_length = spec_info.accept_length[:bs]
+                if spec_info.accept_length_cpu:
+                    metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs]) + 1
+                    metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs]) + bs
+                else:
+                    metadata.max_seq_len_q = 1
+                    metadata.sum_seq_lens_q = bs
+                extend_seq_lens = accept_length + 1
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
             )
