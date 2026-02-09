@@ -2,9 +2,38 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import direct_register_custom_op
+from sglang.srt.utils.custom_op import register_custom_op
 
 
+def _fake_fp8_block_scale_moe(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    hidden_states_scale: torch.Tensor,
+    gemm1_weights: torch.Tensor,
+    gemm1_weights_scale: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    gemm2_weights_scale: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = False,
+    weight_layout: int = 0,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+) -> torch.Tensor:
+    return torch.empty(
+        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
+    )
+
+
+@register_custom_op(fake_impl=_fake_fp8_block_scale_moe)
 def trtllm_fp8_block_scale_moe_wrapper(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -63,15 +92,15 @@ def trtllm_fp8_block_scale_moe_wrapper(
     return trtllm_fp8_block_scale_moe(**kwargs)
 
 
-def fake_trtllm_fp8_block_scale_moe_wrapper(
+def _fake_fp8_per_tensor_scale_moe(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
-    hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
-    gemm1_weights_scale: torch.Tensor,
+    output1_scales_scalar: torch.Tensor,
+    output1_scales_gate_scalar: torch.Tensor,
     gemm2_weights: torch.Tensor,
-    gemm2_weights_scale: torch.Tensor,
+    output2_scales_scalar: torch.Tensor,
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -80,9 +109,8 @@ def fake_trtllm_fp8_block_scale_moe_wrapper(
     local_expert_offset: int,
     local_num_experts: int,
     routed_scaling_factor: Optional[float],
+    use_routing_scales_on_input: bool,
     routing_method_type: int = 0,
-    use_shuffled_weight: bool = False,
-    weight_layout: int = 0,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
 ) -> torch.Tensor:
@@ -91,14 +119,7 @@ def fake_trtllm_fp8_block_scale_moe_wrapper(
     )
 
 
-direct_register_custom_op(
-    op_name="trtllm_fp8_block_scale_moe_wrapper",
-    op_func=trtllm_fp8_block_scale_moe_wrapper,
-    mutates_args=[],
-    fake_impl=fake_trtllm_fp8_block_scale_moe_wrapper,
-)
-
-
+@register_custom_op(fake_impl=_fake_fp8_per_tensor_scale_moe)
 def trtllm_fp8_per_tensor_scale_moe_wrapper(
     routing_logits: torch.Tensor,
     routing_bias: Optional[torch.Tensor],
@@ -154,38 +175,3 @@ def trtllm_fp8_per_tensor_scale_moe_wrapper(
     }
 
     return trtllm_fp8_per_tensor_scale_moe(**kwargs)
-
-
-def fake_trtllm_fp8_per_tensor_scale_moe_wrapper(
-    routing_logits: torch.Tensor,
-    routing_bias: Optional[torch.Tensor],
-    hidden_states: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    output1_scales_scalar: torch.Tensor,
-    output1_scales_gate_scalar: torch.Tensor,
-    gemm2_weights: torch.Tensor,
-    output2_scales_scalar: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    n_group: Optional[int],
-    topk_group: Optional[int],
-    intermediate_size: int,
-    local_expert_offset: int,
-    local_num_experts: int,
-    routed_scaling_factor: Optional[float],
-    use_routing_scales_on_input: bool,
-    routing_method_type: int = 0,
-    enable_pdl: Optional[bool] = None,
-    tune_max_num_tokens: int = 8192,
-) -> torch.Tensor:
-    return torch.empty(
-        hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
-    )
-
-
-direct_register_custom_op(
-    op_name="trtllm_fp8_per_tensor_scale_moe",
-    op_func=trtllm_fp8_per_tensor_scale_moe_wrapper,
-    mutates_args=[],
-    fake_impl=fake_trtllm_fp8_per_tensor_scale_moe_wrapper,
-)
