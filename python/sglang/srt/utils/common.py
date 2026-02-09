@@ -3562,17 +3562,17 @@ def parse_module_path(module_path, function_name, create_dummy):
     return final_module, None
 
 
-# Calculate the page range alloced to sp_rank
-def get_sp_page_range(sp_size, sp_rank, total_page_num):
-    base_page = total_page_num // sp_size
-    extra = total_page_num % sp_size
+# Calculate the page range alloced to split_kv_rank
+def get_split_kv_page_range(split_kv_size, split_kv_rank, total_page_num):
+    base_page = total_page_num // split_kv_size
+    extra = total_page_num % split_kv_size
 
-    if sp_rank < extra:
+    if split_kv_rank < extra:
         sp_page_num = base_page + 1
-        start_page = sp_rank * (base_page + 1)
+        start_page = split_kv_rank * (base_page + 1)
     else:
         sp_page_num = base_page
-        start_page = sp_rank * base_page + extra
+        start_page = split_kv_rank * base_page + extra
     end_page = start_page + sp_page_num - 1
     return start_page, end_page
 

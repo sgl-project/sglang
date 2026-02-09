@@ -34,7 +34,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address, get_sp_page_range
+from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address, get_split_kv_page_range
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -1379,14 +1379,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
 
-        if get_global_server_args().enable_sp_prefill:
+        if get_global_server_args().enable_kv_storage_optimization_mla:
             kv_indices_origin = kv_indices
 
         for idx, bootstrap_info in enumerate(self.bootstrap_infos):
-            # sp_rank in decode notifies the kvcache in prefill to transfer 1/sp for each_sp_rank
-            if self.prefill_sp_size > 1:
-                start_page, end_page = get_sp_page_range(self.prefill_sp_size, idx, len(kv_indices_origin))
-                kv_indices = kv_indices_origin[start_page, end_page + 1]
+            # tp_rank in decode notifies the kvcache in prefill to transfer 1/tp for each_tp_rank
+            if self.prefill_kv_split_size > 1:
+                start_page, end_page = get_split_kv_page_range(self.prefill_kv_split_size, idx, len(kv_indices_origin))
+                kv_indices = kv_indices_origin[start_page:end_page + 1]
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
 

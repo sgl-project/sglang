@@ -59,11 +59,11 @@ class ChunkCache(BasePrefixCache):
             last_host_node=None,
         )
 
-    def process_sp_kv_indices(self, req: Req, kv_indices):
-        if get_global_server_args().enable_sp_prefill and get_global_server_args().disaggregation_mode == "prefill":
+    def process_split_kv_indices(self, req: Req, kv_indices):
+        if get_global_server_args().enable_kv_storage_optimization_mla and get_global_server_args().disaggregation_mode == "prefill":
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :req.sp_seq_len
-            ]
+                         req.req_pool_idx, :req.tp_seq_len
+                         ]
         return kv_indices
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -76,14 +76,14 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
-        kv_indices = self.process_sp_kv_indices(req, kv_indices)
+        kv_indices = self.process_split_kv_indices(req, kv_indices)
         self.token_to_kv_pool_allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
-        kv_indices = self.process_sp_kv_indices(req, kv_indices)
+        kv_indices = self.process_split_kv_indices(req, kv_indices)
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 

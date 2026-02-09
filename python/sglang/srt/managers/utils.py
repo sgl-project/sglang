@@ -98,9 +98,9 @@ class GenerationBatchResult:
 
 
 # The maximu length is adjust to tp times
-def recalculate_sp_max_len(max_len):
+def recalculate_request_max_len(max_len):
     new_max_len = max_len
-    if get_global_server_args().enable_sp_prefill:
+    if get_global_server_args().enable_kv_storage_optimization_mla:
         attn_tp_size = get_attention_tp_size()
         new_max_len *= attn_tp_size
     return new_max_len
@@ -118,7 +118,7 @@ def validate_input_length(
     Returns:
         Error message if validation fails, None if successful
     """
-    max_req_input_len = recalculate_sp_max_len(max_req_input_len)
+    max_req_input_len = recalculate_request_max_len(max_req_input_len)
     if len(req.origin_input_ids) >= max_req_input_len:
         if allow_auto_truncate:
             logger.warning(

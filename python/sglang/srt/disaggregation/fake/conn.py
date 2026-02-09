@@ -25,10 +25,12 @@ class FakeKVSender(BaseKVSender):
         pp_rank: int,
     ):
         self.has_sent = False
-        self.has_sent_empty = False
+        self.has_send_empty = False
 
     def poll(self) -> KVPoll:
-        if self.has_sent is False and self.has_sent_empty is False:
+        if self.has_send_empty:
+            return KVPoll.Success
+        if self.has_sent is False and self.has_send_empty is False:
             # Assume handshake completed instantly
             return KVPoll.WaitingForInput
         else:
@@ -57,7 +59,7 @@ class FakeKVSender(BaseKVSender):
         )
 
     def send_empty(self):
-        self.has_sent_empty = True
+        self.has_send_empty = True
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")

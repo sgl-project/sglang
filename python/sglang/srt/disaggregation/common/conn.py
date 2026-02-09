@@ -371,22 +371,22 @@ class CommonKVReceiver(BaseKVReceiver):
                     self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
                 ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
 
-        self.prefill_sp_size = 1
-        if get_global_server_args().enable_sp_prefill:
-            self.prefill_sp_size = self.prefill_attn_tp_size
-            # sp_rank in prefill needs send_kvcache to all sp_rank in sp_group in decode
+        self.prefill_kv_split_size = 1
+        if get_global_server_args().enable_kv_storage_optimization_mla:
+            self.prefill_kv_split_size = self.prefill_attn_tp_size
+            # tp_rank in prefill needs send_kvcache to all tp_rank in tp_group in decode
             self.required_dst_info_num = self.kv_mgr.attn_tp_size
 
-            # All sp_rank in sp_group need to be notified
-            self.target_tp_rank = [rank for rank in range(self.prefill_attn_tp_size)]
+            # All tp_rank in tp_group need to be notified
+            self.target_tp_ranks = [rank for rank in range(self.prefill_attn_tp_size)]
 
-            # The sp_rank in decode needs to receive the response of each sp_rank in prefill
-            # in the case of short sequences, some sp_rank may be empty and not send to kvcache
+            # The tp_rank in decode needs to receive the response of each tp_rank in prefill
+            # in the case of short sequences, some tp_rank may be empty and not send to kvcache
             page_size = self.kv_mgr.kv_args.page_size
             total_page_num = (self.kv_mgr.kv_args.origin_input_len + page_size - 1) // page_size
-            base_page = total_page_num // self.prefill_sp_size
-            extra = total_page_num % self.prefill_sp_size
-            self.required_prefill_response_num = self.prefill_sp_size if base_page >= 1 else extra
+            base_page = total_page_num // self.prefill_kv_split_size
+            extra = total_page_num % self.prefill_kv_split_size
+            self.required_prefill_response_num = self.prefill_kv_split_size if base_page >= 1 else extra
 
         if prefill_dp_rank is not None:
             logger.debug(f"Targeting DP rank: {prefill_dp_rank}")
@@ -426,12 +426,12 @@ class CommonKVReceiver(BaseKVReceiver):
                     if bootstrap_info is not None:
                         if self.kv_mgr.is_mla_backend:
                             # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
+                            # For MLA and enable_kv_storage_optimization_mla: all target_tp_size are selected real ranks
                             bootstrap_info["is_dummy"] = not bool(
                                 target_tp_rank == self.target_tp_rank
                                 or self.target_tp_rank is None
                             )
-                            # For MLA and enable_sp_prefill: all target_tp_size are selected real ranks
-                            if get_global_server_args().enable_sp_prefill:
+                            if get_global_server_args().enable_kv_storage_optimization_mla:
                                 bootstrap_info["is_dummy"] = False
                         else:
                             # For non-MLA: all target_tp_ranks are selected real ranks

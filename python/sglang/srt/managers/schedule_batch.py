@@ -655,8 +655,8 @@ class Req:
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
         # Number of tokens to run prefill.
         self.extend_input_len = 0
-        # The total number of tokens currently stored in sp_rank
-        self.sp_seq_len = 0
+        # The total number of tokens currently stored in tp_rank
+        self.tp_seq_len = 0
         # The relative logprob_start_len in an extend batch
         self.extend_logprob_start_len = 0
         self.last_node: Any = None
@@ -1354,9 +1354,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Device
     device: str = "cuda"
 
-    # For sp
-    sp_size: int = 0
-    sp_rank: int = 0
+    # For split kv
+    split_kv_size: int = 0
+    split_kv_rank: int = 0
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
@@ -1395,8 +1395,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req: Optional[Req] = None,
         dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
-        sp_size: Optional[int] = 1,
-        sp_rank: Optional[int] = 0,
+        split_kv_size: Optional[int] = 1,
+        split_kv_rank: Optional[int] = 0,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1423,8 +1423,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
-            sp_size=sp_size,
-            sp_rank=sp_rank,
+            split_kv_size=split_kv_size,
+            split_kv_rank=split_kv_rank,
         )
 
     def batch_size(self):
