@@ -150,12 +150,14 @@ class LlamaModel(nn.Module):
         )
 
         # only requires fusing features if this is the first decoder
-        self.midlayer = Eagle3LlamaDecoderLayer(
+        self.fuse_layer = Eagle3LlamaDecoderLayer(
             config,
             0,
             quant_config=quant_config,
             prefix=add_prefix(f"midlayers.0", prefix),
+            fused_input=True,
         )
+        self.additional_layers = None
         if self.num_hidden_layers > 1:
             self.additional_layers = nn.ModuleList(
                 [
