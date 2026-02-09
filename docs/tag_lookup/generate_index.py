@@ -20,6 +20,14 @@ def run_git(cmd):
         sys.exit(1)
 
 
+def is_stable_release(tag_name):
+    """Check if tag is a stable release (not rc/alpha/beta)."""
+    # Skip release candidates, alpha, beta versions
+    if re.search(r"(rc|alpha|beta)\d*$", tag_name, re.IGNORECASE):
+        return False
+    return True
+
+
 def get_tags():
     # Get tags sorted by creator date
     cmd = [
@@ -39,6 +47,9 @@ def get_tags():
         parts = line.split("|")
         if len(parts) >= 3:
             name, date, commit = parts[0], parts[1], parts[2]
+            # Skip non-stable releases (rc, alpha, beta)
+            if not is_stable_release(name):
+                continue
             tag_type = "gateway" if name.startswith("gateway-") else "main"
             tags.append(
                 {"name": name, "date": date, "commit": commit, "type": tag_type}
@@ -100,14 +111,12 @@ def process_tag_line(tags, commit_map, pr_map, tag_type, tag_to_idx):
                 sha = parts[0].strip()
                 msg = parts[1].strip()
 
-                # Use short hash as key
-                short_sha = sha[:SHORT_HASH_LEN]
                 tag_idx = tag_to_idx[tag_name]
 
-                # Store tag index for this release line
-                if short_sha not in commit_map:
-                    commit_map[short_sha] = {}
-                commit_map[short_sha][tag_type] = tag_idx
+                # Store tag index using full SHA as key
+                if sha not in commit_map:
+                    commit_map[sha] = {}
+                commit_map[sha][tag_type] = tag_idx
 
                 pr = extract_pr_num(msg)
                 if pr:
@@ -146,10 +155,27 @@ def main():
         )
 
     pr_map = {}
-    commit_map = {}
+    commit_map_full = {}
 
-    process_tag_line(main_tags, commit_map, pr_map, "m", tag_to_idx)
-    process_tag_line(gateway_tags, commit_map, pr_map, "g", tag_to_idx)
+    process_tag_line(main_tags, commit_map_full, pr_map, "m", tag_to_idx)
+    process_tag_line(gateway_tags, commit_map_full, pr_map, "g", tag_to_idx)
+
+    # Convert full SHAs to short SHAs, checking for collisions
+    commit_map = {}
+    short_to_full_map = {}
+    for full_sha, data in commit_map_full.items():
+        short_sha = full_sha[:SHORT_HASH_LEN]
+        if short_sha in short_to_full_map and short_to_full_map[short_sha] != full_sha:
+            print(
+                f"CRITICAL: Short SHA collision detected for '{short_sha}'\n"
+                f"  Commit 1: {short_to_full_map[short_sha]}\n"
+                f"  Commit 2: {full_sha}\n"
+                "Please increase SHORT_HASH_LEN and re-run.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        commit_map[short_sha] = data
+        short_to_full_map[short_sha] = full_sha
 
     # Compact output format:
     # - tags: array of [name, date, type]
