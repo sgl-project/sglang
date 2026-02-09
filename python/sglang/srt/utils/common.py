@@ -1000,6 +1000,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+            vr = video_file
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
