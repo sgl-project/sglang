@@ -169,8 +169,8 @@ class EagleDraftInputV2Mixin:
             )
 
         # Get a forward batch
-        self.num_tokens_per_batch = topk
-        self.num_tokens_for_logprob_per_batch = topk
+        self.num_tokens_per_req = topk
+        self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
