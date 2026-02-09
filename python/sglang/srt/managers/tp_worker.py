@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -236,7 +236,7 @@ class TpModelWorker(BaseTpWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
         # MTP model runners
-        self.model_runner_list = []
+        self.model_runner_list: List[ModelRunner] = []
 
         self._init_model_config()
         self._init_model_runner()

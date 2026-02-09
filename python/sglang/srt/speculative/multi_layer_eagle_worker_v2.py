@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+    from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
 
         # Alias for better readability
-        self.draft_runner_list = self.draft_worker.model_runner_list
+        self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
 
         self.init_lm_head()
 
