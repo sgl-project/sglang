@@ -526,20 +526,21 @@ class Engine(EngineBase):
         ret = self.loop.run_until_complete(generator.__anext__())
         return ret
 
+    def _cleanup_processes(self):
+        """Clean up Ray actors, placement groups, and child processes."""
+        if hasattr(self, "_scheduler_result") and self._scheduler_result is not None:
+            self._scheduler_result.cleanup()
+        kill_process_tree(os.getpid(), include_parent=False)
+
     def _atexit_shutdown(self):
         """Atexit handler - cleans up Ray actors and child processes."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
-
-        if hasattr(self, "_scheduler_result") and self._scheduler_result is not None:
-            self._scheduler_result.cleanup()
-
-        # Clean up other child processes
-        kill_process_tree(os.getpid(), include_parent=False)
+        self._cleanup_processes()
 
     def shutdown(self):
-        """Shutdown the engine"""
+        """Shutdown the engine."""
         if self._shutdown_called:
             return
         self._shutdown_called = True
@@ -550,12 +551,7 @@ class Engine(EngineBase):
         except Exception:
             pass
 
-        # Clean up Ray actors and placement groups
-        if hasattr(self, "_scheduler_result") and self._scheduler_result is not None:
-            self._scheduler_result.cleanup()
-
-        # Kill all other child processes
-        kill_process_tree(os.getpid(), include_parent=False)
+        self._cleanup_processes()
 
     def __enter__(self):
         return self
