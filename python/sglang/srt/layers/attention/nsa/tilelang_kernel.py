@@ -867,19 +867,39 @@ def sparse_mla_fwd_decode_partial(
             for bi_i in T.Parallel(BI):
                 mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
             for bi_i, d_i in T.Parallel(BI, D):
-                KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, d_i]
+                KV_shared[bi_i, d_i] = KV[
+                    b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, d_i
+                ]
             for bi_i, d_i in T.Parallel(BI, D_tail):
-                K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, D + d_i]
+                K_tail_shared[bi_i, d_i] = KV[
+                    b_i, Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i], g_i, D + d_i
+                ]
             for h_i, bi_i in T.Parallel(H_per_block, BI):
-                acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
-            T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
-            T.gemm(Q_tail_shared, K_tail_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullCol)
+                acc_s[h_i, bi_i] = T.if_then_else(
+                    mask[bi_i], 0, -T.infinity(acc_s.dtype)
+                )
+            T.gemm(
+                Q_shared,
+                KV_shared,
+                acc_s,
+                transpose_B=True,
+                policy=T.GemmWarpPolicy.FullCol,
+            )
+            T.gemm(
+                Q_tail_shared,
+                K_tail_shared,
+                acc_s,
+                transpose_B=True,
+                policy=T.GemmWarpPolicy.FullCol,
+            )
 
             T.reduce_max(acc_s, m_i, dim=1, clear=True)
             for h_i in T.Parallel(H_per_block):
                 m_i[h_i] = T.max(m_i[h_i], -(2**30))
             for h_i, bi_i in T.Parallel(H_per_block, BI):
-                acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                acc_s[h_i, bi_i] = T.exp2(
+                    acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                )
 
             T.reduce_sum(acc_s, sumexp_i, dim=1)
             T.copy(acc_s, S_shared)
@@ -887,7 +907,9 @@ def sparse_mla_fwd_decode_partial(
 
             # sumexp_i==0 (all masked), divide by 1 to get 0 and avoid nan
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(sumexp_i[h_i] == 0.0, 1.0, sumexp_i[h_i])
+                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                    sumexp_i[h_i] == 0.0, 1.0, sumexp_i[h_i]
+                )
             # sumexp_i==0 (all masked), use large negative so combine ignores this split
             for h_i in T.Parallel(H_per_block):
                 sumexp_i[h_i] = T.if_then_else(
@@ -958,7 +980,7 @@ def sparse_mla_fwd_decode_combine(
             H1 = H0 + H_per_block
 
             for k in T.serial(NI):
-                 T.copy(Partial_Lse[b_i, s_i, k, H0:H1], shared_lse[k, :])
+                T.copy(Partial_Lse[b_i, s_i, k, H0:H1], shared_lse[k, :])
 
             T.fill(lse_max, -(2**30))
             for k in T.serial(NI):
@@ -967,15 +989,21 @@ def sparse_mla_fwd_decode_combine(
             T.fill(lse_sum, 0)
             for k in T.serial(NI):
                 for h_i in T.Parallel(H_per_block):
-                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(shared_lse[k, h_i] - lse_max[h_i])
+                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(
+                        shared_lse[k, h_i] - lse_max[h_i]
+                    )
             for k in T.serial(NI):
                 for h_i in T.Parallel(H_per_block):
-                    scale[h_i, k] = T.exp2(shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i]))
+                    scale[h_i, k] = T.exp2(
+                        shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
+                    )
 
             T.fill(acc_o, 0)
             for k in T.serial(NI):
                 for h_i, d_i in T.Parallel(H_per_block, dim):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[b_i, s_i, k, H0 + h_i, d_i].astype(accum_dtype)
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[
+                        b_i, s_i, k, H0 + h_i, d_i
+                    ].astype(accum_dtype)
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
 
@@ -1000,12 +1028,20 @@ def tilelang_sparse_fwd(
             # decode kernel
             if q.shape[0] <= 64:
                 kernel_partial = sparse_mla_fwd_decode_partial(
-                    num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, block_I=64, threads=256
+                    num_heads,
+                    d_v,
+                    tail_dim,
+                    topk,
+                    sm_scale=sm_scale,
+                    block_I=64,
+                    threads=256,
                 )
                 kernel_combine = sparse_mla_fwd_decode_combine(
                     num_heads, d_v, topk, head_per_block=4, block_I=64, threads=256
                 )
-                partial_o, partial_lse = kernel_partial(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))
+                partial_o, partial_lse = kernel_partial(
+                    q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
+                )
                 out = kernel_combine(partial_o, partial_lse)
                 return out
 
