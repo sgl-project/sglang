@@ -957,19 +957,6 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            # assert TopKOutputChecker.format_is_bypassed(
-            #     topk_output
-            # ), "Only bypassed topk output is supported for piecewise cuda graph"
-            # return fused_moe_bypassed_piecewise_cuda_graph_impl(
-            #     hidden_states,
-            #     topk_output.router_logits,
-            #     topk_output.topk_config.top_k,
-            #     topk_output.topk_config.topk_group,
-            #     topk_output.topk_config.num_expert_group,
-            #     topk_output.topk_config.correction_bias,
-            #     topk_output.topk_config.renormalize,
-            #     self.layer_id,
-            # )
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -979,7 +966,6 @@ class FusedMoE(torch.nn.Module):
                     self.layer_id,
                 )
             elif TopKOutputChecker.format_is_bypassed(topk_output):
-                # Use bypassed format custom op for piecewise cuda graph
                 return fused_moe_bypassed_piecewise_cuda_graph_impl(
                     hidden_states,
                     topk_output.router_logits,
