@@ -4,6 +4,7 @@ import pickle
 import random
 import threading
 import uuid
+from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
 
@@ -13,8 +14,10 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_mooncake_transfer_engine,
+)
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
@@ -241,7 +244,33 @@ def _determine_tensor_transport_mode(server_args):
         return "cuda_ipc"
 
 
-class MMReceiver:
+class MMReceiverBase(ABC):
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        dtype: Optional[torch.dtype] = None,
+        hf_config: Optional[PretrainedConfig] = None,
+        pp_rank: Optional[int] = None,
+        tp_rank: Optional[int] = None,
+        tp_group: Optional[GroupCoordinator] = None,
+        scheduler: Optional["Scheduler"] = None,
+    ):
+        pass
+
+    @abstractmethod
+    def process_waiting_requests(self, recv_reqs):
+        pass
+
+    @abstractmethod
+    async def recv_mm_data(self, img_data, mm_processor, prompt):
+        pass
+
+    @abstractmethod
+    def send_encode_request(self, obj):
+        pass
+
+
+class MMReceiverHTTP(MMReceiverBase):
 
     def __init__(
         self,
@@ -257,14 +286,10 @@ class MMReceiver:
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
         self.encode_idx = list(range(len(self.encode_urls)))
-        self.host = server_args.host
+        self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
-            self.embeddings_engine = MooncakeTransferEngine(
-                hostname=get_local_ip_auto(),
-                gpu_id=None,
-                ib_device=server_args.disaggregation_ib_device,
-            )
+            self.embeddings_engine = get_mooncake_transfer_engine()
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
@@ -602,7 +627,7 @@ class MMReceiver:
 
     # For zmq_to_tokenizer and mooncake
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
-        # Bypass MMReceiver
+        # Bypass MMReceiverHTTP
         if req_id is None:
             return None
 
