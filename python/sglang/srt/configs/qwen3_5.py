@@ -1,10 +1,13 @@
 from transformers import PretrainedConfig
+
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
+
 
 class Qwen3_5VisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen3_5"
     base_config_key = "vision_config"
+
 
 class Qwen3_5TextConfig(Qwen3NextConfig):
     model_type = "qwen3_5_text"
@@ -94,12 +97,13 @@ class Qwen3_5Config(PretrainedConfig):
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
 
-
 class Qwen3_5MoeVisionConfig(Qwen3_5VisionConfig):
     model_type = "qwen3_5_moe"
 
+
 class Qwen3_5MoeTextConfig(Qwen3_5TextConfig):
     model_type = "qwen3_5_moe_text"
+
 
 class Qwen3_5MoeConfig(Qwen3_5Config):
     model_type = "qwen3_5_moe"

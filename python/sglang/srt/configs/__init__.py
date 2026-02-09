@@ -18,8 +18,8 @@ from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
 from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.olmo3 import Olmo3Config
-from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,

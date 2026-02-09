@@ -38,9 +38,9 @@ from sglang.srt.configs import (
     Lfm2Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
-    Qwen3NextConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3NextConfig,
 )
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -1501,7 +1501,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def hybrid_gdn_config(self):
         config = self.model_config.hf_config.get_text_config()
-        if isinstance(config, Qwen3NextConfig | Qwen3_5Config | Qwen3_5MoeConfig | JetNemotronConfig | JetVLMConfig):
+        if isinstance(
+            config,
+            Qwen3NextConfig
+            | Qwen3_5Config
+            | Qwen3_5MoeConfig
+            | JetNemotronConfig
+            | JetVLMConfig,
+        ):
             return config
         return None
 
@@ -2478,8 +2485,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def model_is_mrope(self) -> bool:
         """Detect if the model has "mrope" rope_scaling type.
         mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(self.model_config.hf_text_config, "rope_parameters", None) or \
-                        getattr(self.model_config.hf_text_config, "rope_scaling", {})
+        rope_scaling = getattr(
+            self.model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(self.model_config.hf_text_config, "rope_scaling", {})
         if rope_scaling is None:
             return False
         is_mrope_enabled = "mrope_section" in rope_scaling

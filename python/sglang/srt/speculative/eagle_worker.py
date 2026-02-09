@@ -291,7 +291,11 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu, logits_output.mm_input_embeds,
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    logits_output.mm_input_embeds,
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,

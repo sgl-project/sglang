@@ -107,7 +107,6 @@ class LogitsProcessorOutput:
     mm_input_embeds: Optional[torch.Tensor] = None
 
 
-
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode

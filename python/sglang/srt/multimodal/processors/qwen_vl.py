@@ -7,6 +7,7 @@ from typing import List, Union
 import numpy as np
 import torch
 import torchvision
+from decord import VideoReader
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
@@ -15,17 +16,18 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+)
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
-from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration
-
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.utils import logger
-from decord import VideoReader
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28

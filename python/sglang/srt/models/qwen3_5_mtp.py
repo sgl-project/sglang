@@ -29,11 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    sharded_weight_loader,
-)
-
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5AttentionDecoderLayer
 from sglang.srt.utils import add_prefix
 
@@ -60,10 +56,17 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
 
         config.full_attention_interval = 1
         self.layers = torch.nn.ModuleList(
-            [Qwen3_5AttentionDecoderLayer(config, idx, quant_config, prefix=add_prefix(f"layers.{idx}", prefix))
-             for idx in range(self.num_mtp_layers)]
+            [
+                Qwen3_5AttentionDecoderLayer(
+                    config,
+                    idx,
+                    quant_config,
+                    prefix=add_prefix(f"layers.{idx}", prefix),
+                )
+                for idx in range(self.num_mtp_layers)
+            ]
         )
-        
+
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.pre_fc_norm_hidden = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -83,13 +86,19 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         forward_batch: torch.Tensor,
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
-    ):        
+    ):
         # if get_pp_group().is_first_rank:
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
-        if forward_batch.forward_mode.is_extend() and forward_batch.contains_mm_inputs() and not forward_batch.forward_mode.is_draft_extend():
+        if (
+            forward_batch.forward_mode.is_extend()
+            and forward_batch.contains_mm_inputs()
+            and not forward_batch.forward_mode.is_draft_extend()
+        ):
             assert input_embeds is not None
-            input_embeds = torch.cat([input_embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))])
+            input_embeds = torch.cat(
+                [input_embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
+            )
 
         if input_embeds is None:
             input_embeds = self.embed_tokens(input_ids)
@@ -101,7 +110,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             input_embeds = self.pre_fc_norm_embedding(input_embeds)
             hidden_states = self.pre_fc_norm_hidden(hidden_states)
         hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
-        
+
         hidden_states = self.fc(hidden_states)
         residual = None
 
@@ -113,7 +122,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            raise("not implementation for other mtp layers[self.num_mtp_layers > 1]")
+            raise ("not implementation for other mtp layers[self.num_mtp_layers > 1]")
 
         if not get_pp_group().is_last_rank:
             # For pipeline parallel, return intermediate tensors
@@ -132,8 +141,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        
-        self.is_multimodal = hasattr(config, 'text_config')
+
+        self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
 
@@ -183,7 +192,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
-    ):        
+    ):
         hidden_states = self.model(
             input_ids,
             positions,
@@ -305,7 +314,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 name_mapped = name.replace(weight_name, param_name)
 
                 # Skip loading extra parameters for GPTQ/modelopt models.
-                if name_mapped.endswith(ignore_suffixes) and name_mapped not in params_dict:
+                if (
+                    name_mapped.endswith(ignore_suffixes)
+                    and name_mapped not in params_dict
+                ):
                     continue
 
                 if name_mapped not in params_dict:
@@ -358,7 +370,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                             )
                     else:
                         # Non-fused expert, load by expert_id/shard
-                        if name_mapped.endswith(ignore_suffixes) and name_mapped not in params_dict:
+                        if (
+                            name_mapped.endswith(ignore_suffixes)
+                            and name_mapped not in params_dict
+                        ):
                             continue
                         if name_mapped not in params_dict:
                             break

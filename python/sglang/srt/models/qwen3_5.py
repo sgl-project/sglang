@@ -21,11 +21,19 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+# Model Executor
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+
 # Configs
-from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig, Qwen3_5TextConfig
+from sglang.srt.configs.qwen3_5 import (
+    Qwen3_5Config,
+    Qwen3_5MoeConfig,
+    Qwen3_5TextConfig,
+)
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -36,10 +44,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+# Layers - Others
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -48,38 +55,27 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-
-# Layers - Others
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-
-
-# Model Executor
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_next import gdn_with_output
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock, Qwen2MoeMLP
 
 # Utils
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    is_npu,
-    make_layers,
-    set_weight_attrs,
-)
+from sglang.srt.utils import add_prefix, is_cuda, is_npu, make_layers, set_weight_attrs
 from sglang.srt.utils.hf_transformers_utils import get_processor
-
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -247,7 +243,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         b,
         a,
     ):
-        raise NotImplementedError("Qwen3.5 Series dont need to fix query key value ordering")
+        raise NotImplementedError(
+            "Qwen3.5 Series dont need to fix query key value ordering"
+        )
 
     def forward(
         self,
@@ -306,7 +304,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
-    
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -321,7 +319,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, quant_config, alt_stream, prefix
         )
-        
+
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
         if config.model_type == "qwen3_5_moe_text":
@@ -342,7 +340,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
-        
+
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -350,7 +348,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_previous_layer_sparse=False,
             is_next_layer_sparse=False,
         )
-        
+
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -361,7 +359,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
         )
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -369,37 +367,37 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
-        
+
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-        
+
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
             )
-        
+
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        
+
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-        
+
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
-        
+
         return hidden_states, residual
 
 
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
-    
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -425,9 +423,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5        
+        self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        
+
         if hasattr(config, "rope_parameters"):
             self.rope_scaling = getattr(config, "rope_parameters", None)
         else:
@@ -436,11 +434,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
         self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
         self.layer_id = layer_id
-        
+
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
-        
+
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
@@ -451,7 +449,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_neox_style=True,
             dtype=torch.get_default_dtype(),
         )
-        
+
         self.qkv_proj = QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
@@ -463,7 +461,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
@@ -474,7 +472,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=add_prefix("o_proj", prefix),
         )
-        
+
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -483,7 +481,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
         )
-        
+
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
@@ -503,7 +501,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
-        
+
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -511,24 +509,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_previous_layer_sparse=False,
             is_next_layer_sparse=False,
         )
-        
+
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        
+
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        
+
         self.layer_communicator = LayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
         )
-        
+
         self.alt_stream = alt_stream
-    
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -550,7 +548,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q = q_by_head.view(q.shape)
         k = k_by_head.view(k.shape)
         return q, k
-    
+
     def self_attention(
         self,
         positions: torch.Tensor,
@@ -559,7 +557,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Full attention forward pass."""
         qkv, _ = self.qkv_proj(hidden_states)
-        
+
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
@@ -571,18 +569,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = gate.reshape(*orig_shape, -1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        
+
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
-        
+
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
-        
+
         output, _ = self.o_proj(attn_output)
         return output
-    
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -594,14 +592,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
-        
+
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        
+
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -610,11 +608,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch
         )
         hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-        
+
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
-        
+
         return hidden_states, residual
 
 
@@ -626,6 +624,7 @@ ALL_DECODER_LAYER_TYPES = {
 
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -636,9 +635,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
-        
+
         alt_stream = torch.cuda.Stream() if _is_cuda else None
-        
+
         # Embedding layer
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -647,7 +646,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
             )
-        
+
         # Decoder layers
         def get_layer(idx: int, prefix: str):
             layer_type = config.layers_block_type[idx]
@@ -663,20 +662,20 @@ class Qwen3_5ForCausalLM(nn.Module):
                 prefix=prefix,
                 alt_stream=alt_stream,
             )
-        
+
         self.layers = make_layers(
             config.num_hidden_layers,
             get_layer,
             prefix=f"{prefix}.layers",
         )
-        
+
         # Final normalization
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
-    
+
     @torch.no_grad()
     def forward(
         self,
@@ -698,18 +697,20 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
-        
+
         # Pass through decoder layers
         for layer_idx in range(len(self.layers)):
             layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(layer_idx):
+            with get_global_expert_distribution_recorder().with_current_layer(
+                layer_idx
+            ):
                 hidden_states, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     residual=residual,
                     forward_batch=forward_batch,
                 )
-            
+
             # Process deepstack embeddings if provided
             if (
                 input_deepstack_embeds is not None
@@ -720,7 +721,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states.add_(
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
-        
+
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -729,14 +730,14 @@ class Qwen3_5ForCausalLM(nn.Module):
                     "residual": residual,
                 }
             )
-        
+
         # Apply final normalization
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-        
+
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -796,6 +797,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
+
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
     def __init__(
@@ -988,8 +990,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-                
+
         return loaded_params
+
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def __init__(
@@ -1001,12 +1004,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     ):
         super().__init__(config, quant_config, prefix, language_model_cls)
 
-        rope_config = getattr(self.config, "rope_parameters", None) or \
-                getattr(self.config, "rope_scaling", {})
+        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+            self.config, "rope_scaling", {}
+        )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
-    
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -1080,9 +1084,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
         return loaded_params
 
+
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
-    
+
     def __init__(
         self,
         config: Qwen3_5MoeConfig,
@@ -1091,13 +1096,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         language_model_cls=Qwen3_5MoeForCausalLM,
     ) -> None:
         super().__init__(config, quant_config, prefix, language_model_cls)
-        rope_config = getattr(self.config, "rope_parameters", None) or \
-                getattr(self.config, "rope_scaling", {})
+        rope_config = getattr(self.config, "rope_parameters", None) or getattr(
+            self.config, "rope_scaling", {}
+        )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
 
-    
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -1279,7 +1284,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if is_expert_weight:
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
-                                        
+
                     if "visual" in name:
                         # adapt to VisionAttention
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
@@ -1298,7 +1303,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
-                
+
         return loaded_params
+
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
