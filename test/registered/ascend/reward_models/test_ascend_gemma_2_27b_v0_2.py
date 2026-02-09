@@ -59,7 +59,6 @@ class TestRewardModels(CustomTestCase):
             torch_dtype=torch_dtype,
             model_type="reward",
             mem_fraction_static=0.95,
-            enable_torch_compile=True,
         ) as srt_runner:
             prompts = srt_runner.tokenizer.apply_chat_template(
                 convs, tokenize=False, return_dict=False

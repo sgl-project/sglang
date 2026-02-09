@@ -294,6 +294,10 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
+    SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
+    # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
+    SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -462,12 +466,6 @@ class Envs:
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
-
-    # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
-    FORWARD_NATIVE_GELUTANH = EnvBool(False)
-
-    # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2
-    FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
 
 
 envs = Envs()
