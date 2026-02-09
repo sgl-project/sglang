@@ -80,7 +80,7 @@ if _is_hip:
 
             _has_vllm = True
         except ImportError:
-            # Fallback: vllm not available, will use triton implementation
+            # Fallback: vllm not available, will use native PyTorch implementation
             _has_vllm = False
 
 logger = logging.getLogger(__name__)
@@ -1541,8 +1541,8 @@ Raises:
 """
 if _is_hip:
 
-    def _triton_dynamic_per_token_quant_fp8(output, input, scale):
-        """Triton fallback for dynamic per-token FP8 quantization."""
+    def _native_dynamic_per_token_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-token FP8 quantization when vLLM is unavailable."""
         M, N = input.shape
         eps = 1e-12
         # Compute per-token scale
@@ -1554,8 +1554,8 @@ if _is_hip:
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
         output.copy_(output_data)
 
-    def _triton_dynamic_per_tensor_quant_fp8(output, input, scale):
-        """Triton fallback for dynamic per-tensor FP8 quantization."""
+    def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""
         eps = 1e-12
         absmax = input.abs().max()
         absmax = torch.clamp(absmax, min=eps)
@@ -1566,8 +1566,8 @@ if _is_hip:
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
         output.copy_(output_data)
 
-    def _triton_static_quant_fp8(output, input, scale):
-        """Triton fallback for static FP8 quantization."""
+    def _native_static_quant_fp8(output, input, scale):
+        """Native PyTorch fallback for static FP8 quantization when vLLM is unavailable."""
         # Use tensor directly instead of .item() to avoid CPU-GPU sync
         output_data = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
         output.copy_(output_data)
@@ -1597,7 +1597,7 @@ if _is_hip:
                         output, input.contiguous(), scale, None
                     )
                 else:
-                    _triton_dynamic_per_token_quant_fp8(output, input, scale)
+                    _native_dynamic_per_token_quant_fp8(output, input, scale)
             else:
                 scale = torch.zeros(1, device=input.device, dtype=torch.float32)
                 if _use_aiter:
@@ -1605,7 +1605,7 @@ if _is_hip:
                 elif _has_vllm:
                     torch.ops._C.dynamic_scaled_fp8_quant(output, input, scale)
                 else:
-                    _triton_dynamic_per_tensor_quant_fp8(output, input, scale)
+                    _native_dynamic_per_tensor_quant_fp8(output, input, scale)
         else:
             # Static scaling
             assert (
@@ -1616,7 +1616,7 @@ if _is_hip:
             elif _has_vllm:
                 torch.ops._C.static_scaled_fp8_quant(output, input, scale)
             else:
-                _triton_static_quant_fp8(output, input, scale)
+                _native_static_quant_fp8(output, input, scale)
 
         return output, scale
 
