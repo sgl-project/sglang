@@ -626,10 +626,10 @@ class Qwen3LLMModel(Qwen3Model):
                 post_residual_addition=deepstack_embeds,
             )
 
-            # Handle deepstack for the last processed layer if it exists.
-            last_deepstack = self.get_deepstack_embeds(
-                self.end_layer - 1, input_deepstack_embeds
-            )
+        # Handle deepstack for the last processed layer if it exists.
+        last_deepstack = self.get_deepstack_embeds(
+            self.end_layer - 1, input_deepstack_embeds
+        )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
