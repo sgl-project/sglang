@@ -1,9 +1,9 @@
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
 
-#include <cuda_runtime_api.h>
-
 #include <cstdint>
+#include <cuda_runtime_api.h>
 
 namespace {
 

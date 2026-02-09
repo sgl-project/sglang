@@ -1,12 +1,8 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
-register_cuda_ci(est_time=111, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=179, suite="stage-b-test-small-1-gpu-amd")
-
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMinxin
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.kits.ebnf_constrained_kit import TestEBNFConstrainedMixin
 from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.test_utils import (
@@ -16,6 +12,9 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=111, suite="stage-b-test-small-1-gpu")
+register_amd_ci(est_time=179, suite="stage-b-test-small-1-gpu-amd")
 
 
 class ServerWithGrammar(CustomTestCase):
@@ -51,7 +50,7 @@ class ServerWithGrammar(CustomTestCase):
 class TestXGrammarBackend(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     backend = "xgrammar"
@@ -64,7 +63,7 @@ class TestOutlinesBackend(ServerWithGrammar, TestJSONConstrainedMixin):
 class TestLLGuidanceBackend(
     ServerWithGrammar,
     TestJSONConstrainedMixin,
-    TestEBNFConstrainedMinxin,
+    TestEBNFConstrainedMixin,
     TestRegexConstrainedMixin,
 ):
     backend = "llguidance"

@@ -1,7 +1,9 @@
-from typing import Any, Optional
+import time
+from typing import Any, List, Optional, Union
 
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.responses import ORJSONResponse
+from pydantic import BaseModel, Field
 
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -9,15 +11,27 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
     UnmergeLoraWeightsReq,
+    format_lora_message,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.entrypoints.openai.protocol import ModelCard
 
 router = APIRouter(prefix="/v1")
 logger = init_logger(__name__)
+
+
+class ModelCard(BaseModel):
+    """Model cards."""
+
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "sglang"
+    root: Optional[str] = None
+    parent: Optional[str] = None
+    max_model_len: Optional[int] = None
 
 
 class DiffusionModelCard(ModelCard):
@@ -48,23 +62,27 @@ async def _handle_lora_request(req: Any, success_msg: str, failure_msg: str):
 
 @router.post("/set_lora")
 async def set_lora(
-    lora_nickname: str = Body(..., embed=True),
-    lora_path: Optional[str] = Body(None, embed=True),
-    target: str = Body("all", embed=True),
-    strength: float = Body(1.0, embed=True),
+    lora_nickname: Union[str, List[str]] = Body(..., embed=True),
+    lora_path: Optional[Union[str, List[Optional[str]]]] = Body(None, embed=True),
+    target: Union[str, List[str]] = Body("all", embed=True),
+    strength: Union[float, List[float]] = Body(1.0, embed=True),
 ):
     """
-    Set a LoRA adapter for the specified transformer(s).
+    Set LoRA adapter(s) for the specified transformer(s).
+    Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
     Args:
-        lora_nickname: The nickname of the adapter.
-        lora_path: Path to the LoRA adapter (local path or HF repo id).
-        target: Which transformer(s) to apply the LoRA to. One of:
+        lora_nickname: The nickname(s) of the adapter(s). Can be a string or a list of strings.
+        lora_path: Path(s) to the LoRA adapter(s) (local path or HF repo id).
+            Can be a string, None, or a list of strings/None. Must match the length of lora_nickname.
+        target: Which transformer(s) to apply the LoRA to. Can be a string or a list of strings.
+            If a list, must match the length of lora_nickname. Valid values:
             - "all": Apply to all transformers (default)
             - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
             - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
             - "critic": Apply only to the critic model
-        strength: LoRA strength for merge, default 1.0. Values < 1.0 reduce the effect,
+        strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
+            If a list, must match the length of lora_nickname. Values < 1.0 reduce the effect,
             values > 1.0 amplify the effect.
     """
     req = SetLoraReq(
@@ -73,9 +91,13 @@ async def set_lora(
         target=target,
         strength=strength,
     )
+    nickname_str, target_str, strength_str = format_lora_message(
+        lora_nickname, target, strength
+    )
+
     return await _handle_lora_request(
         req,
-        f"Successfully set LoRA adapter: {lora_nickname} (target: {target}, strength: {strength})",
+        f"Successfully set LoRA adapter(s): {nickname_str} (target: {target_str}, strength: {strength_str})",
         "Failed to set LoRA adapter",
     )
 
@@ -158,7 +180,7 @@ async def available_models():
     if not server_args:
         raise HTTPException(status_code=500, detail="Server args not initialized")
 
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, backend=server_args.backend)
 
     card_kwargs = {
         "id": server_args.model_path,
@@ -200,7 +222,7 @@ async def retrieve_model(model: str):
             },
         )
 
-    model_info = get_model_info(server_args.model_path)
+    model_info = get_model_info(server_args.model_path, backend=server_args.backend)
 
     card_kwargs = {
         "id": model,
