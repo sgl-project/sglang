@@ -195,6 +195,9 @@ class MllamaVisionEncoderLayer(nn.Module):
         self.num_attention_heads = config.attention_heads
         self.is_gated = is_gated
         self.intermediate_size = config.intermediate_size
+        num_dummy_heads = 0
+        if hasattr(config, "padded_attention_heads"):
+            num_dummy_heads = config.padded_attention_heads - config.attention_heads
 
         self.self_attn = VisionAttention(
             self.hidden_size,
@@ -204,6 +207,7 @@ class MllamaVisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            num_dummy_heads=num_dummy_heads,
         )
         self.mlp = MllamaVisionMLP(
             config, quant_config, prefix=add_prefix("mlp", prefix)
@@ -304,10 +308,11 @@ class MllamaVisionModel(nn.Module):
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
         self.scale = config.hidden_size**-0.5
+        out_channels = config.head_dim * config.padded_attention_heads if hasattr(config, "padded_attention_heads") else config.hidden_size
 
         self.patch_embedding = ColumnParallelConv2dPatch(
             in_channels=config.num_channels,
-            out_channels=self.hidden_size,
+            out_channels=out_channels,
             kernel_size=self.patch_size,
             stride=self.patch_size,
             bias=False,
@@ -376,6 +381,10 @@ class MllamaVisionModel(nn.Module):
 
         # tile embeddings
         _, num_patches, dim = hidden_state.shape
+        # slice off the padded part
+        if dim > self.hidden_size:
+            hidden_state = hidden_state[:, :, : self.hidden_size]
+            dim = self.hidden_size
         hidden_state = hidden_state.reshape(
             batch_size * num_concurrent_media, num_tiles, -1, dim
         )
@@ -512,6 +521,9 @@ class MllamaTextCrossAttention(nn.Module):
         self.dropout = config.dropout
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // self.num_heads
+        # Use original head_dim since num_heads might be changed for TP num dividability
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.q_local_size = self.num_local_heads * self.head_dim
@@ -878,7 +890,7 @@ class MllamaForConditionalGeneration(nn.Module):
                 dtype=torch.float32,
             )
             batched_ar_ids = torch.ones(
-                bs, max_num_images, dtype=torch.int64, device="cuda"
+                bs, max_num_images, dtype=torch.int64
             )
             batched_ar_mask = torch.zeros(
                 bs, max_num_images, max_num_tiles, dtype=torch.int64
