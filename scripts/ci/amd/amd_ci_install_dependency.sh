@@ -121,7 +121,9 @@ esac
 #docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
 git_clone_with_retry https://github.com/merrymercy/human-eval.git human-eval
 docker cp human-eval ci_sglang:/
-install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+# Ensure setuptools is installed (human-eval's setup.py imports pkg_resources)
+docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache setuptools
+install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .
 
 docker exec -w / ci_sglang mkdir -p /dummy-grok
 # Create dummy grok config inline (bypasses Azure blob storage which may have auth issues)
