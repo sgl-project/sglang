@@ -310,8 +310,21 @@ class MooncakeStore(HiCacheStorage):
                     self.config.client_server_address,
                 )
             else:
-                # TODO(shangming): disable mooncake transfer engine reuse for hicache temporary
-                # Need to wait for the next mooncake release
+                try:
+                    from sglang.srt.distributed.parallel_state import (
+                        get_mooncake_transfer_engine,
+                    )
+
+                    self._shared_mooncake_transfer_engine = (
+                        get_mooncake_transfer_engine().get_engine()
+                    )
+                    logger.info(
+                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
+                    )
+                except Exception:
+                    self._shared_mooncake_transfer_engine = None
+                    logger.debug("Failed to reuse initialized mooncake transfer engine")
+
                 ret_code = self.store.setup(
                     self.config.local_hostname,
                     self.config.metadata_server,
@@ -320,6 +333,7 @@ class MooncakeStore(HiCacheStorage):
                     self.config.protocol,
                     device_name,
                     self.config.master_server_address,
+                    self._shared_mooncake_transfer_engine,
                 )
             if ret_code:
                 raise RuntimeError(
