@@ -132,7 +132,7 @@ class GeluAndMul(MultiPlatformOp):
         return self._forward_impl(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        if envs.FORWARD_NATIVE_GELUTANH.get():
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GELUTANH.get():
             return self.forward_native(x)
         y_npu, gelu_npu = torch_npu.npu_geglu(
             x,
