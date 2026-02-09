@@ -310,8 +310,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
-    # Per-token LoRA adapter indices (expanded from lora_ids)
-    token_lora_indices: Optional[torch.Tensor] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
