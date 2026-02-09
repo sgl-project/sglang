@@ -498,7 +498,9 @@ class MMReceiverBase(ABC):
         try:
             self.embeddings_engine.deregister(embeddings.data_ptr())
         except Exception:
-            logger.exception("mooncake: failed to deregister buffer for req_id=%s", req_id)
+            logger.exception(
+                "mooncake: failed to deregister buffer for req_id=%s", req_id
+            )
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         if req_id is None:
