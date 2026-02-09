@@ -70,7 +70,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import orjson
@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+torch_release = pkg_version.parse(torch.__version__).release
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -298,6 +299,10 @@ def xpu_has_xmx_support():
     return False
 
 
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
+
+
 @lru_cache(maxsize=1)
 def is_flashinfer_available():
     """
@@ -309,15 +314,14 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-def is_nvidia_cublas_cu12_version_ge_12_9():
+def is_nvidia_cublas_version_ge_12_9():
     """
-    temporary fix for issue #11272
+    temporary fix for issue #11272 (cublas 12.9+)
     """
-    try:
-        installed_version = version("nvidia-cublas-cu12")
-    except PackageNotFoundError:
-        return False
-    return pkg_version.parse(installed_version) >= pkg_version.parse("12.9")
+    for pkg in ("nvidia-cublas", "nvidia-cublas-cu12"):
+        if check_pkg_version_at_least(pkg, "12.9"):
+            return True
+    return False
 
 
 def random_uuid() -> str:
@@ -860,6 +864,9 @@ def load_audio(
         audio_file = BytesIO(response.content)
         response.close()
         audio, original_sr = sf.read(audio_file)
+    elif audio_file.startswith("file://"):
+        audio_file = unquote(urlparse(audio_file).path)
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -905,6 +912,9 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        image = Image.open(image_file)
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -925,6 +935,10 @@ def get_image_bytes(image_file: Union[str, bytes]):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         return response.content
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        with open(image_file, "rb") as f:
+            return f.read()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -974,8 +988,11 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("file://"):
+                video_file = unquote(urlparse(video_file).path)
+                vr = VideoReader(video_file, ctx=ctx)
             # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(urlparse(video_file).path):
+            elif os.path.isfile(unquote(urlparse(video_file).path)):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -1927,7 +1944,7 @@ def init_custom_process_group(
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
     # We need to determine the appropriate parameter name based on PyTorch version
     pg_options_param_name = (
-        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+        "backend_options" if torch_release >= (2, 6) else "pg_options"
     )
     pg, _ = _new_process_group_helper(
         world_size,
@@ -2169,7 +2186,13 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
+        if is_npu():
+            # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_xpu():
+            my_lib.impl(op_name, op_func, "XPU")
+        else:
+            my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
