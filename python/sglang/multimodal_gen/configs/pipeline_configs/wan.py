@@ -87,6 +87,23 @@ class WanT2V480PConfig(PipelineConfig):
 
     # WanConfig-specific added parameters
 
+    def update_config_from_dict(self, args: dict, prefix: str = "") -> None:
+        prefix_with_dot = f"{prefix}." if (prefix.strip() != "") else ""
+        # Do not override if user explicitly sets T5 parallel folding options.
+        user_set = (
+            f"{prefix_with_dot}t5_config.parallel_folding" in args
+            or f"{prefix_with_dot}t5_config.parallel_folding_mode" in args
+        )
+        tp_size = args.get("tp_size", 1)
+        sp_degree = args.get("sp_degree", -1)
+        super().update_config_from_dict(args, prefix)
+        if user_set or (tp_size not in (-1, 1)) or sp_degree <= 1:
+            return
+        for text_encoder_config in self.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                text_encoder_config.parallel_folding = True
+                text_encoder_config.parallel_folding_mode = "sp"
+
     def __post_init__(self):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
