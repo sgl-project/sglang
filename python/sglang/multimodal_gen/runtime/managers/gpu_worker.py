@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import multiprocessing as mp
 import os
 import time
@@ -404,4 +405,12 @@ def run_scheduler_process(
         print(OOM_MSG)
         raise
     finally:
+        # Clean up resources to speed up shutdown
+        if "scheduler" in locals():
+            del scheduler
+        gc.collect()
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")
