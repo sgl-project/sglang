@@ -190,7 +190,10 @@ class ComponentLoader(ABC):
             return
 
         package_dir = os.path.dirname(__file__)
-        package_name = __package__ or "sglang.multimodal_gen.runtime.loader"
+        package_name = (
+            __package__
+            or "sglang.multimodal_gen.runtime.loader.component_loaders.component_loaders"
+        )
 
         for _, name, _ in pkgutil.iter_modules([package_dir]):
             # skip importing self to avoid circular dependency issues
