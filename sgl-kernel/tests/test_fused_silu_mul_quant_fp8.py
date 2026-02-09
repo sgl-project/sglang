@@ -62,9 +62,13 @@ def reference_silu_mul_quant_fp8(
 # ---------------------------------------------------------------------------
 
 # intermediate_size values from real models:
-#   14336 (Llama-8B), 11008 (Llama-7B), 5120 (smaller), 28672 (Llama-70B)
-# Smaller sizes for edge case coverage.
-INTERMEDIATE_SIZES = [128, 512, 2048, 4096, 11008, 14336]
+#   11008 (Llama-7B), 14336 (Llama-8B), 18432 (DeepSeek-V3), 27648 (Qwen-32B), 28672 (Llama-70B)
+# Dispatch paths exercised (BF16, VEC_SIZE=8, num_threads=1024):
+#   ROUNDS=1: d ≤ 8192          → 128, 512, 2048, 4096, 8192
+#   ROUNDS=2: 8192 < d ≤ 16384  → 11008, 14336
+#   ROUNDS=3: 16384 < d ≤ 24576 → 18432
+#   ROUNDS=4: 24576 < d ≤ 32768 → 27648, 28672
+INTERMEDIATE_SIZES = [128, 512, 2048, 4096, 8192, 11008, 14336, 18432, 27648, 28672]
 BATCH_SIZES = [1, 4, 17, 128]
 DTYPES = [torch.bfloat16, torch.float16]
 
@@ -100,7 +104,7 @@ def test_fused_silu_mul_quant_fp8_correctness(batch_size, d, dtype):
     )
 
 
-@pytest.mark.parametrize("d", [4096, 14336])
+@pytest.mark.parametrize("d", [4096, 14336, 18432, 27648, 28672])
 def test_fused_kernel_input_not_modified(d):
     """Verify that input tensor is not modified (read-only)."""
     torch.manual_seed(123)
@@ -115,7 +119,7 @@ def test_fused_kernel_input_not_modified(d):
     assert torch.equal(input_t, input_copy), "Input tensor was modified!"
 
 
-@pytest.mark.parametrize("d", [4096, 14336])
+@pytest.mark.parametrize("d", [4096, 14336, 18432, 27648, 28672])
 def test_fused_kernel_zero_gate(d):
     """Edge case: zero gate → silu(0) * up = 0 → all zeros output."""
     device = "cuda"
@@ -132,7 +136,7 @@ def test_fused_kernel_zero_gate(d):
     assert (fused_q.float() == 0).all(), "Output should be all zeros"
 
 
-@pytest.mark.parametrize("d", [4096, 14336])
+@pytest.mark.parametrize("d", [4096, 14336, 18432, 27648, 28672])
 def test_fused_kernel_matches_sequential_pipeline(d):
     """End-to-end: fused kernel == sgl_kernel.silu_and_mul + sgl_kernel.sgl_per_token_quant_fp8."""
     torch.manual_seed(99)
