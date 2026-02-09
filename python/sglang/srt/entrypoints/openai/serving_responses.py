@@ -47,14 +47,17 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -375,6 +378,23 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
 
+        # Convert ResponseTool (flat) to Tool (nested) format for ChatCompletionRequest
+        chat_tools: Optional[list[Tool]] = None
+        if request.tools:
+            function_tools = [
+                Tool(
+                    type="function",
+                    function=Function(
+                        name=tool.name,
+                        description=tool.description,
+                        parameters=tool.parameters,
+                        strict=tool.strict,
+                    ),
+                ) for tool in request.tools if tool.type == "function"
+            ]
+            if function_tools:
+                chat_tools = function_tools
+
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
@@ -382,6 +402,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=chat_tools,
+                tool_choice=request.tool_choice,
             )
 
             # Follow SGLang's _process_messages pattern
@@ -553,6 +575,59 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
+
+        # Handle tool call parsing if enabled
+        tool_call_parser = getattr(
+            self.tokenizer_manager.server_args, "tool_call_parser", None
+        )
+
+        if (
+            tool_call_parser
+            and request.tools
+            and request.tool_choice != "none"
+            and content
+        ):
+            # Convert ResponseTool to Tool format for the parser
+            tools_for_parser = []
+            for tool in request.tools:
+                if tool.type == "function":
+                    tools_for_parser.append(
+                        Tool(
+                            type="function",
+                            function=Function(
+                                name=tool.name,
+                                description=tool.description,
+                                parameters=tool.parameters,
+                                strict=tool.strict,
+                            ),
+                        )
+                    )
+
+            if tools_for_parser:
+                parser = FunctionCallParser(tools_for_parser, tool_call_parser)
+                if parser.has_tool_call(content):
+                    try:
+                        remaining_text, call_info_list = parser.parse_non_stream(
+                            content
+                        )
+                        # Add tool call items to output
+                        for call_info in call_info_list:
+                            tool_call_item = ResponseFunctionToolCall(
+                                id=f"fc_{random_uuid()}",
+                                call_id=f"call_{random_uuid()}",
+                                type="function_call",
+                                name=call_info.name,
+                                arguments=call_info.parameters,
+                            )
+                            output_items.append(tool_call_item)
+
+                        # Update content to remaining text after tool calls
+                        content = remaining_text
+                    except Exception as e:
+                        logger.warning(f"Tool call parsing failed: {e}")
+                        # Continue with original content if parsing fails
+
+        # Add text message if there's remaining content (either no tool calls or remaining text after parsing)
         if content:
             output_text = ResponseOutputText(
                 text=content,
