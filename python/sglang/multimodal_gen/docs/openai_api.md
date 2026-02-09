@@ -404,8 +404,6 @@ The server supports adjusting output quality and compression levels for both ima
   - `"default"`: Auto-adjust based on media type (50 for video, 75 for image)
 
 - **`output_compression`** (integer, optional): Direct compression level override (0-100). **Default is `None`**. When provided (not `None`), takes precedence over `output_quality`.
-  - `0`: Lowest quality, smallest file size
-  - `100`: Highest quality, largest file size
 
 #### Image API Usage
 
