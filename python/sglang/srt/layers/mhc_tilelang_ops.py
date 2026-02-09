@@ -405,10 +405,10 @@ def aggregate_kernel(M, n_streams, Dim, threads, block_M, block_D):
             threads=threads
         ) as (pid_m, pid_d):
             
-            # 共享内存缓存H_pre
+            # Shared memory cache for H_pre
             H_shared = T.alloc_shared([block_M, n_streams], fp32)
             
-            # 协作加载H_pre
+            # Cooperative load of H_pre
             for tid in T.Parallel(threads):
                 if tid < block_M * n_streams:
                     row = tid // n_streams
@@ -419,8 +419,8 @@ def aggregate_kernel(M, n_streams, Dim, threads, block_M, block_D):
             
             T.sync_threads()
             
-            # 计算 - 向量化
-            # 使用 T.thread_binding 替代 T.Parallel 以支持内部的向量化指令
+            # Compute - vectorized
+            # Use T.thread_binding instead of T.Parallel to support internal vectorized instructions
             for tid in T.thread_binding(threads, thread="threadIdx.x"):
                 m_offset = tid // block_D_threads
                 d_vec_idx = tid % block_D_threads
@@ -429,16 +429,16 @@ def aggregate_kernel(M, n_streams, Dim, threads, block_M, block_D):
                 m_idx = pid_m * block_M + m_offset
                 d_idx_base = pid_d * block_D + d_base
                 
-                # 只有当整个 vector 都在范围内时才执行
+                # Only execute when the entire vector is within bounds
                 if m_idx < M and d_idx_base < Dim:
                     
-                    # 加载 H 到寄存器
+                    # Load H into registers
                     h0 = H_shared[m_offset, 0]
                     h1 = H_shared[m_offset, 1]
                     h2 = H_shared[m_offset, 2]
                     h3 = H_shared[m_offset, 3]
 
-                    # 向量化读写和计算
+                    # Vectorized read/write and compute
                     for v in T.vectorized(vec_size):
                         d_idx = d_idx_base + v
                         
@@ -752,11 +752,11 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
             threads=threads
         ) as (pid_m, pid_d):
             
-            # 共享内存缓存 H_res 和 H_post
+            # Shared memory cache for H_res and H_post
             H_res_shared = T.alloc_shared([block_M, N * N], fp32)
             H_post_shared = T.alloc_shared([block_M, N], fp32)
             
-            # 协作加载 H_res
+            # Cooperative load of H_res
             for tid in T.Parallel(threads):
                 if tid < block_M * N * N:
                     row = tid // (N * N)
@@ -769,7 +769,7 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
                         n_col = col % N
                         H_res_shared[row, col] = H_res[global_row, n_row, n_col]
             
-            # 协作加载 H_post
+            # Cooperative load of H_post
             for tid in T.Parallel(threads):
                 if tid < block_M * N:
                     row = tid // N
@@ -780,7 +780,7 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
             
             T.sync_threads()
             
-            # 主计算
+            # Main computation
             for tid in T.Parallel(threads):
                 m_offset = tid // block_D
                 d_offset = tid % block_D
@@ -789,22 +789,22 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
                 d_idx = pid_d * block_D + d_offset
                 
                 if m_idx < M and d_idx < HiddenDim:
-                    # 从共享内存读取 H_post
+                    # Read H_post from shared memory
                     hp0 = H_post_shared[m_offset, 0]
                     hp1 = H_post_shared[m_offset, 1]
                     hp2 = H_post_shared[m_offset, 2]
                     hp3 = H_post_shared[m_offset, 3]
                     
-                    # 读取 Residuals
+                    # Read Residuals
                     res0 = T.cast(Residuals[m_idx, 0, d_idx], fp32)
                     res1 = T.cast(Residuals[m_idx, 1, d_idx], fp32)
                     res2 = T.cast(Residuals[m_idx, 2, d_idx], fp32)
                     res3 = T.cast(Residuals[m_idx, 3, d_idx], fp32)
                     
-                    # 读取 LayerOut
+                    # Read LayerOut
                     l_out = T.cast(LayerOut[m_idx, d_idx], fp32)
                     
-                    # 计算 Out[m, 0, d]
+                    # Compute Out[m, 0, d]
                     out0_0 = l_out * hp0
                     out0_1 = out0_0 + H_res_shared[m_offset, 0] * res0
                     out0_2 = out0_1 + H_res_shared[m_offset, 1] * res1
@@ -812,7 +812,7 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
                     out0_4 = out0_3 + H_res_shared[m_offset, 3] * res3
                     Out[m_idx, 0, d_idx] = T.cast(out0_4, bf16)
                     
-                    # 计算 Out[m, 1, d]
+                    # Compute Out[m, 1, d]
                     out1_0 = l_out * hp1
                     out1_1 = out1_0 + H_res_shared[m_offset, 4] * res0
                     out1_2 = out1_1 + H_res_shared[m_offset, 5] * res1
@@ -820,7 +820,7 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
                     out1_4 = out1_3 + H_res_shared[m_offset, 7] * res3
                     Out[m_idx, 1, d_idx] = T.cast(out1_4, bf16)
                     
-                    # 计算 Out[m, 2, d]
+                    # Compute Out[m, 2, d]
                     out2_0 = l_out * hp2
                     out2_1 = out2_0 + H_res_shared[m_offset, 8] * res0
                     out2_2 = out2_1 + H_res_shared[m_offset, 9] * res1
@@ -828,7 +828,7 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
                     out2_4 = out2_3 + H_res_shared[m_offset, 11] * res3
                     Out[m_idx, 2, d_idx] = T.cast(out2_4, bf16)
                     
-                    # 计算 Out[m, 3, d]
+                    # Compute Out[m, 3, d]
                     out3_0 = l_out * hp3
                     out3_1 = out3_0 + H_res_shared[m_offset, 12] * res0
                     out3_2 = out3_1 + H_res_shared[m_offset, 13] * res1
