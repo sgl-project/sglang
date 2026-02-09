@@ -6,6 +6,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.modelslim import ModelSlimConfig
+
 QuantizationMethods = Literal["modelslim"]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.srt.utils import add_prefix
 
+
 class MLP(nn.Module):
     """
     MLP for DiT blocks, NO gated linear units
