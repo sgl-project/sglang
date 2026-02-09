@@ -198,7 +198,7 @@ class LlamaModel(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
 
-        hidden_states, residual = self.midlayer(
+        hidden_states, residual = self.fuse_layer(
             positions,
             hidden_states,
             forward_batch,
