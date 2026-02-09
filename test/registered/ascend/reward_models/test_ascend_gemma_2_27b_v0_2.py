@@ -83,6 +83,6 @@ class TestRewardModels(CustomTestCase):
 
 
 if __name__ == "__main__":
-    os.environ["FORWARD_NATIVE_GELUTANH"] = "1"
-    os.environ["FORWARD_NATIVE_GEMMA_RMS_NORM"] = "1"
+    os.environ["SGLANG_NPU_FORWARD_NATIVE_GELUTANH"] = "1"
+    os.environ["SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM"] = "1"
     unittest.main()
