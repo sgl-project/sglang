@@ -86,7 +86,7 @@ class EngineActor:
     def __init__(self, **engine_kwargs):
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        from sglang.srt.entrypoints.ray_utils import create_placement_groups
+        from sglang.srt.utils.ray_utils import create_placement_groups
 
         pgs = create_placement_groups(
             tp_size=engine_kwargs.get("tp_size", 1),
