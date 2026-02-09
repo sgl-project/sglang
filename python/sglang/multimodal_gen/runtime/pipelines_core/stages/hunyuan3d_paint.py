@@ -647,7 +647,7 @@ class Hunyuan3DPaintDiffusionStage(PipelineStage):
 
             self.vae = AutoencoderKL.from_pretrained(
                 os.path.join(local_path, "vae"),
-                dtype=torch.float16,
+                torch_dtype=torch.float16,
             ).to("cuda")
 
             self.transformer = UNet2p5DConditionModel.from_pretrained(
