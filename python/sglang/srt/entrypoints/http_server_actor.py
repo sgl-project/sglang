@@ -13,7 +13,7 @@
 # ==============================================================================
 """Ray actor wrapper for SGLang HTTP Server.
 
-IMPORTANT: No sglang imports at module level. This module is imported
+No sglang imports at module level. This module is imported
 on the CPU-only head/driver node.
 
 Usage:
@@ -21,7 +21,7 @@ Usage:
     ray.init()
     from sglang.srt.entrypoints.http_server_actor import HttpServerActor
 
-    server = HttpServerActor(model_path="meta-llama/Llama-3-8B", tp_size=8, port=30000, use_ray=True)
+    server = HttpServerActor(model_path="meta-llama/Llama-3-8B", tp_size=8, port=30000)
     server.wait_until_ready()
     url = server.get_url()
     # ... use url for HTTP requests ...
@@ -88,9 +88,7 @@ class _InternalHttpServerActor:
             try:
                 r = requests.get(health_url, timeout=5)
                 if r.status_code == 200:
-                    logger.info(
-                        f"Server ready after {time.time() - start:.1f}s"
-                    )
+                    logger.info(f"Server ready after {time.time() - start:.1f}s")
                     return True
             except requests.exceptions.RequestException:
                 pass
@@ -136,13 +134,6 @@ class HttpServerActor:
     """Wrapper that manages a Ray actor running SGLang HTTP server.
 
     Safe to import and instantiate on CPU-only head nodes.
-
-    Usage:
-        server = HttpServerActor(model_path="...", tp_size=8, port=30000, use_ray=True)
-        server.wait_until_ready()
-        url = server.get_url()
-        # ... use url for HTTP requests ...
-        server.shutdown()
     """
 
     def __init__(self, **server_kwargs):
