@@ -113,6 +113,11 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config.get_total_num_kv_heads()
     )
 
+    # Llama-3.2-11B-Vision does not have `head_dim` item in its `config.json`
+    if model_config.hf_config.model_type == "mllama":
+        model_config.hf_config.text_config.head_dim = model_config.hf_config.text_config.hidden_size // model_config.hf_config.text_config.num_attention_heads
+        model_config.hf_config.vision_config.head_dim = model_config.hf_config.vision_config.hidden_size // model_config.hf_config.vision_config.attention_heads
+
     if (
         model_config.num_attention_heads % tp_size != 0
         or model_config.get_total_num_kv_heads() % tp_size != 0
