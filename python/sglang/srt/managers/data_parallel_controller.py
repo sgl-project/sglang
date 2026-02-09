@@ -482,6 +482,18 @@ class DataParallelController:
             return True
         return False
 
+    def _maybe_assign_fake_bootstrap_room(self, req: Req, increment_counter: bool):
+        """Assigns a bootstrap room in fake-decode mode if one is not already set."""
+        if (
+            req.bootstrap_room is None
+            and self.server_args.disaggregation_decode_enable_fake_auto
+        ):
+            req.bootstrap_room = self.round_robin_counter
+            if increment_counter:
+                self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                    self.workers
+                )
+
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
@@ -505,15 +517,7 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        # Set default bootstrap_room if in FAKE auto mode and room is None
-        if (
-            req.bootstrap_room is None
-            and self.server_args.disaggregation_decode_enable_fake_auto
-        ):
-            req.bootstrap_room = self.round_robin_counter
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+        self._maybe_assign_fake_bootstrap_room(req, increment_counter=True)
 
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
