@@ -49,12 +49,12 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 ```
 
 ```{note}
-- FlashAttention 4 is prefill-only for now.
+- FlashAttention 4 supports both prefill and decode on SM90+ (Hopper) and SM100+ (Blackwell). On SM90, paged KV requires `page_size` to be a multiple of the internal block size (e.g., 128). On SM100, `page_size` is fixed at 128.
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
 ```{note}
-For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-backend to run. Except for trtllm_mha being incompatible with FA4, all other decode backends behave as shown in the table.
+For FP4 KV cache scenarios, FA4 can be used as a prefill-only backend with a different `--decode-attention-backend`. Except for `trtllm_mha` being incompatible with FA4, all other decode backends behave as shown in the table. For MHA models on SM90+, FA4 can also handle both prefill and decode natively with `--attention-backend fa4 --page-size 128`.
 ```
 
 ```{tip}
@@ -204,6 +204,14 @@ python3 -m sglang.launch_server \
 
 - FlashAttention 4 (MHA & MLA)
 ```bash
+# FA4 for both prefill and decode on SM90+ (e.g., H100)
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 \
+  --attention-backend fa4 \
+  --page-size 128 \
+  --trust-remote-code
+
+# FA4 as prefill-only backend with separate decode backend (e.g., for FP4 KV cache)
 python3 -m sglang.launch_server \
   --tp 8 \
   --model deepseek-ai/DeepSeek-R1 \
