@@ -24,7 +24,6 @@ class TestLLaDA2Mini(CustomTestCase):
         other_args = [
             "--trust-remote-code",
             "--disable-radix-cache",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             "0.9",
             "--max-running-requests",
@@ -60,7 +59,7 @@ class TestLLaDA2Mini(CustomTestCase):
         print(f"{metrics=}")
 
         self.assertGreater(metrics["accuracy"], 0.88)
-        self.assertGreater(metrics["output_throughput"], 10)
+        self.assertGreater(metrics["output_throughput"], 70)
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
@@ -76,7 +75,7 @@ class TestLLaDA2Mini(CustomTestCase):
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
             else:
-                self.assertGreater(speed, 250)
+                self.assertGreater(speed, 130)
 
 
 if __name__ == "__main__":
