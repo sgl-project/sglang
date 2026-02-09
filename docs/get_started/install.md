@@ -39,7 +39,8 @@ cd sglang
 
 # Install the python packages
 pip install --upgrade pip
-pip install -e "python"
+pip install uv
+uv pip install -e python
 ```
 
 ### Quick fixes to common problems
@@ -209,5 +210,5 @@ echo "Build and push completed successfully!"
 ## Common Notes
 
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) is the default attention kernel backend. It only supports sm75 and above. If you encounter any FlashInfer-related issues on sm75+ devices (e.g., T4, A10, A100, L4, L40S, H100), please switch to other kernels by adding `--attention-backend triton --sampling-backend pytorch` and open an issue on GitHub.
-- To reinstall flashinfer locally, use the following command: `pip3 install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
+- To reinstall flashinfer locally, use the following command: `uv pip install --upgrade flashinfer-python --force-reinstall --no-deps` and then delete the cache with `rm -rf ~/.cache/flashinfer`.
 - When encountering `ptxas fatal   : Value 'sm_103a' is not defined for option 'gpu-name'` on B300/GB300, fix it with `export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`.
