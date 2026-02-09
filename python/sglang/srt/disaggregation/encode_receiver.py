@@ -461,6 +461,7 @@ class MMReceiverBase(ABC):
         pass
 
     async def recv_mm_data(self, img_data, mm_processor, prompt):
+        req_id = None
         try:
             if len(self.encode_urls) == 0:
                 return None
@@ -479,12 +480,25 @@ class MMReceiverBase(ABC):
             )
         except asyncio.TimeoutError:
             logger.warning(f"Embedding recv timeout for request {req_id}")
-            if hasattr(self, "embeddings_buffer") and req_id in self.embeddings_buffer:
-                del self.embeddings_buffer[req_id]
+            if req_id is not None:
+                self._cleanup_mooncake_buffer(req_id)
             return None
 
     def send_encode_request(self, obj):
         self._send_encode_request(obj)
+
+    def _cleanup_mooncake_buffer(self, req_id):
+        if self.encoder_transfer_backend != "mooncake":
+            return
+        if not hasattr(self, "embeddings_buffer"):
+            return
+        embeddings = self.embeddings_buffer.pop(req_id, None)
+        if embeddings is None:
+            return
+        try:
+            self.embeddings_engine.deregister(embeddings.data_ptr())
+        except Exception:
+            logger.exception("mooncake: failed to deregister buffer for req_id=%s", req_id)
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         if req_id is None:
@@ -504,6 +518,7 @@ class MMReceiverBase(ABC):
                         f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
                         f"error_code={getattr(recv_obj, 'error_code', None)}"
                     )
+                    self._cleanup_mooncake_buffer(req_id)
                     return None
                 logger.debug("recv_obj=%s", recv_obj)
                 if self.encoder_transfer_backend == "zmq_to_tokenizer":
