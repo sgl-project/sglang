@@ -8,6 +8,9 @@ from sglang.srt.utils import get_free_port, maybe_wrap_ipv6_address
 
 logger = logging.getLogger(__name__)
 
+# Module-level shared engine instance, set by init_mooncake_transfer_engine().
+_mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
+
 
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
     """
@@ -61,7 +64,8 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
                     gpu_mapping[gpu_key] = ib_devices.strip()
                 else:
                     raise ValueError(
-                        f"Invalid format: keys must be integers (or string representations of integers) and values must be strings"
+                        "Invalid format: keys must be integers (or string "
+                        "representations of integers) and values must be strings"
                     )
 
             if not gpu_mapping:
@@ -72,7 +76,8 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
                 return gpu_mapping[gpu_id]
             else:
                 raise ValueError(
-                    f"No IB devices configured for GPU {gpu_id}. Available GPUs: {list(gpu_mapping.keys())}"
+                    f"No IB devices configured for GPU {gpu_id}. "
+                    f"Available GPUs: {list(gpu_mapping.keys())}"
                 )
 
     except json.JSONDecodeError:
@@ -86,21 +91,27 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
 
 
 class MooncakeTransferEngine:
+    """Shared Mooncake transfer engine for RDMA/transfer operations."""
 
-    def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
+    def __init__(
+        self,
+        hostname: str,
+        gpu_id: Optional[int] = None,
+        ib_device: Optional[str] = None,
+    ):
         try:
             from mooncake.engine import TransferEngine
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
+                "https://kvcache-ai.github.io/Mooncake/getting_started/build.html "
                 "to run SGLang with MooncakeTransferEngine."
             ) from e
 
         self.engine = TransferEngine()
         self.hostname = hostname
-        self.gpu_id = gpu_id
-        self.ib_device = get_ib_devices_for_gpu(ib_device, gpu_id)
+        self.gpu_id = gpu_id if gpu_id is not None else 0
+        self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
 
         self.initialize(
             hostname=self.hostname,
@@ -139,8 +150,8 @@ class MooncakeTransferEngine:
             ret_value = -1
             if not hasattr(self.engine, "batch_register_memory"):
                 raise RuntimeError(
-                    "Mooncake's batch register requires a newer version of mooncake-transfer-engine. "
-                    "Please upgrade Mooncake."
+                    "Mooncake's batch register requires a newer version of "
+                    "mooncake-transfer-engine. Please upgrade Mooncake."
                 )
 
         if ret_value != 0:
@@ -193,17 +204,13 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified address."""
         try:
-            # the first time: based on session_id (which contains remote_ip) to construct a queue pair, and cache the queue pair
-            # later: based on the cached queue pair to send data
             ret = self.engine.transfer_sync_write(
                 session_id, buffer, peer_buffer_address, length
             )
         except Exception:
-            # Mark transfer request as failed
             ret = -1
 
         if ret < 0:
-            # Do not raise an exception here, since some transfer requests fail should be accepted and the execution thread should not be stopped.
             logger.debug(
                 "Failed to transfer data from %s to %s - %s.",
                 buffer,
@@ -227,16 +234,17 @@ class MooncakeTransferEngine:
             )
         except Exception:
             ret = -1
-            # Inform user to upgrade mooncake-transfer-engine >= 0.3.4.post2
             if not hasattr(self.engine, "batch_transfer_sync_write"):
                 raise RuntimeError(
-                    "Mooncake's batch transfer requires mooncake-transfer-engine >= 0.3.4.post2. "
-                    "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'"
+                    "Mooncake's batch transfer requires mooncake-transfer-engine "
+                    ">= 0.3.4.post2. Please upgrade Mooncake by "
+                    "'pip install mooncake-transfer-engine --upgrade'"
                 )
 
         if ret < 0:
             logger.debug(
-                "Failed to batch transfer data. Buffers: %s, Session: %s, Peer addresses: %s",
+                "Failed to batch transfer data. Buffers: %s, Session: %s, "
+                "Peer addresses: %s",
                 buffers,
                 session_id,
                 peer_buffer_addresses,
@@ -245,3 +253,31 @@ class MooncakeTransferEngine:
 
     def get_session_id(self):
         return self.session_id
+
+    def get_engine(self):
+        return self.engine.get_engine()
+
+
+def init_mooncake_transfer_engine(
+    hostname: str,
+    gpu_id: Optional[int] = None,
+    ib_device: Optional[str] = None,
+) -> MooncakeTransferEngine:
+    """
+    Initialize the shared MooncakeTransferEngine. Note: if already
+    initialized with the same (hostname, gpu_id, ib_device), returns existing
+    instance. Call from parallel_state when model parallel is set up and
+    mooncake transfer is needed.
+    """
+    global _mooncake_transfer_engine
+    if _mooncake_transfer_engine is not None:
+        return _mooncake_transfer_engine
+    _mooncake_transfer_engine = MooncakeTransferEngine(
+        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+    )
+    return _mooncake_transfer_engine
+
+
+def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:
+    """Return the shared MooncakeTransferEngine if initialized, else None."""
+    return _mooncake_transfer_engine
