@@ -5,45 +5,14 @@
 
 #include <cstdint>
 #include <limits>
-#include <mutex>
 #include <vector>
 
 #ifndef USE_ROCM
-#include <cuda.h>
 #define WARP_SIZE 32
 #include "pytorch_extension_utils.h"
 #else
 #include "pytorch_extension_utils_rocm.h"
 #include "utils.h"  // WARP_SIZE
-#endif
-
-#if !defined(USE_ROCM)
-using cudaMemcpyBatchAsync_t = cudaError_t (*)(
-    void** dsts,
-    void** srcs,
-    size_t* sizes,
-    size_t count,
-    cudaMemcpyAttributes* attrs,
-    size_t* attrsIdxs,
-    size_t numAttrs,
-    size_t* failIdx,
-    cudaStream_t stream);
-
-static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 12080
-  static cudaMemcpyBatchAsync_t fn = []() -> cudaMemcpyBatchAsync_t {
-    void* symbol = nullptr;
-    CUresult res = cuGetProcAddress("cudaMemcpyBatchAsync", &symbol, CUDART_VERSION, 0, nullptr);
-    if (res == CUDA_SUCCESS && symbol != nullptr) {
-      return reinterpret_cast<cudaMemcpyBatchAsync_t>(symbol);
-    }
-    return nullptr;
-  }();
-  return fn;
-#else
-  return nullptr;
-#endif
-}
 #endif
 
 __device__ __forceinline__ void
@@ -825,20 +794,22 @@ inline void transfer_kv_page_first_direct_impl(
 #if defined(USE_ROCM) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
   fallback_to_page_copy();
   return;
-#else
-  auto memcpy_batch_async = get_cudaMemcpyBatchAsync();
-  if (memcpy_batch_async == nullptr) {
-    fallback_to_page_copy();
-    return;
-  }
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+#else
   size_t num_copies = 0;
   std::vector<void*> batch_srcs;
   std::vector<void*> batch_dsts;
   std::vector<size_t> batch_sizes;
   std::vector<size_t> attrs_idxs(1, 0);
   cudaMemcpyAttributes attrs{};
+  const int device_id = at::cuda::current_device();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  auto append_copy = [&](void* src, void* dst, size_t size_bytes) {
+    batch_srcs.push_back(src);
+    batch_dsts.push_back(dst);
+    batch_sizes.push_back(size_bytes);
+  };
 
   if constexpr (IsLf2Pf) {
     const bool is_mla = dst_ptrs.size() == 1;
@@ -849,7 +820,6 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t src_stride0 = src_ptrs[0].stride(0);
     const int64_t elem_size = dst_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * src_stride0 * elem_size;
-    const int device_id = at::cuda::current_device();
     attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     attrs.srcLocHint.type = cudaMemLocationTypeDevice;
     attrs.srcLocHint.id = device_id;
@@ -870,18 +840,14 @@ inline void transfer_kv_page_first_direct_impl(
         const char* src_k_ptr = static_cast<const char*>(src_ptrs[j].data_ptr()) + s_index * src_stride0 * elem_size;
         char* dst_k_ptr = static_cast<char*>(dst_ptrs[0].data_ptr()) + d_index * dst_stride0 * elem_size +
                           (start_layer_id + j) * dst_stride1 * elem_size;
-        batch_srcs.push_back(const_cast<char*>(src_k_ptr));
-        batch_dsts.push_back(dst_k_ptr);
-        batch_sizes.push_back(copy_size_bytes);
+        append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
 
         if (!is_mla) {
           const char* src_v_ptr =
               static_cast<const char*>(src_ptrs[j + num_layers].data_ptr()) + s_index * src_stride0 * elem_size;
           char* dst_v_ptr = static_cast<char*>(dst_ptrs[1].data_ptr()) + d_index * dst_stride0 * elem_size +
                             (start_layer_id + j) * dst_stride1 * elem_size;
-          batch_srcs.push_back(const_cast<char*>(src_v_ptr));
-          batch_dsts.push_back(dst_v_ptr);
-          batch_sizes.push_back(copy_size_bytes);
+          append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
@@ -895,7 +861,6 @@ inline void transfer_kv_page_first_direct_impl(
     const int64_t dst_stride0 = dst_ptrs[0].stride(0);
     const int64_t elem_size = src_ptrs[0].element_size();
     const int64_t copy_size_bytes = page_size * dst_stride0 * elem_size;
-    const int device_id = at::cuda::current_device();
     attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     attrs.srcLocHint.type = cudaMemLocationTypeHost;
     attrs.srcLocHint.id = 0;
@@ -916,17 +881,13 @@ inline void transfer_kv_page_first_direct_impl(
         const char* src_k_ptr = static_cast<const char*>(src_ptrs[0].data_ptr()) + s_index * src_stride0 * elem_size +
                                 (start_layer_id + j) * src_stride1 * elem_size;
         char* dst_k_ptr = static_cast<char*>(dst_ptrs[j].data_ptr()) + d_index * dst_stride0 * elem_size;
-        batch_srcs.push_back(const_cast<char*>(src_k_ptr));
-        batch_dsts.push_back(dst_k_ptr);
-        batch_sizes.push_back(copy_size_bytes);
+        append_copy(const_cast<char*>(src_k_ptr), dst_k_ptr, copy_size_bytes);
 
         if (!is_mla) {
           const char* src_v_ptr = static_cast<const char*>(src_ptrs[1].data_ptr()) + s_index * src_stride0 * elem_size +
                                   (start_layer_id + j) * src_stride1 * elem_size;
           char* dst_v_ptr = static_cast<char*>(dst_ptrs[j + num_layers].data_ptr()) + d_index * dst_stride0 * elem_size;
-          batch_srcs.push_back(const_cast<char*>(src_v_ptr));
-          batch_dsts.push_back(dst_v_ptr);
-          batch_sizes.push_back(copy_size_bytes);
+          append_copy(const_cast<char*>(src_v_ptr), dst_v_ptr, copy_size_bytes);
         }
       }
     }
@@ -935,7 +896,7 @@ inline void transfer_kv_page_first_direct_impl(
   TORCH_CHECK(batch_srcs.size() == num_copies, "Batch memcpy count mismatch");
   if (num_copies > 0) {
     size_t fail_idx = std::numeric_limits<size_t>::max();
-    cudaError_t err = memcpy_batch_async(
+    cudaError_t err = cudaMemcpyBatchAsync(
         batch_dsts.data(),
         batch_srcs.data(),
         batch_sizes.data(),
