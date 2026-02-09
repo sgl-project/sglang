@@ -673,6 +673,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
+            num_token_non_padded_cpu=num_tokens,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )

@@ -807,6 +807,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_num_tokens = num_tokens
 
         # padding
+        self.num_token_non_padded_cpu = len(self.input_ids)
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
