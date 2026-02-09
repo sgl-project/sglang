@@ -276,7 +276,7 @@ python3 -m sglang.launch_server \
   --host 0.0.0.0 --port 8080 \
   --attention-backend hpc \
   --page-size 64   --mem-fraction-static 0.9 \
-  --disable-radix-cache  --disable-cuda-graph
+  --disable-radix-cache
 ```
 
 ## Steps to add a new attention backend
