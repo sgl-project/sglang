@@ -57,20 +57,20 @@ elif _is_hip:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+    # Note: vllm_ops is not needed for HIP when _use_aiter=False
+    # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
 
-# Try to import vllm_ops for platforms that may need it as fallback.
-# On HIP, vllm is used as an intermediate fallback when aiter is not enabled
-# (aiter -> vllm -> native/triton fallback).
+# Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
-if not _is_cuda and not _is_xpu and not _use_aiter:
+if not _is_cuda and not _is_hip and not _is_xpu:
     try:
         from vllm import _custom_ops as vllm_ops
 
         _has_vllm_ops = True
     except ImportError:
-        # Fallback: vllm not available, will use native PyTorch/triton implementations
+        # Fallback: vllm not available, will use native PyTorch implementations
         _has_vllm_ops = False
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
@@ -633,11 +633,6 @@ def fused_experts_impl(
         elif _is_hip:
             if _use_aiter:
                 moe_sum(
-                    intermediate_cache3.view(*intermediate_cache3.shape),
-                    out_hidden_states[begin_chunk_idx:end_chunk_idx],
-                )
-            elif _has_vllm_ops:
-                vllm_ops.moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states[begin_chunk_idx:end_chunk_idx],
                 )
