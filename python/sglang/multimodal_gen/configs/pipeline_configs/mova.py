@@ -61,6 +61,10 @@ class MOVAPipelineConfig(PipelineConfig):
         )
         tp_size = args.get("tp_size", 1)
         sp_degree = args.get("sp_degree", -1)
+        if sp_degree == -1:
+            ring_degree = args.get("ring_degree", 1) or 1
+            ulysses_degree = args.get("ulysses_degree", 1) or 1
+            sp_degree = ring_degree * ulysses_degree
         super().update_config_from_dict(args, prefix)
         if user_set or (tp_size not in (-1, 1)) or sp_degree <= 1:
             return
