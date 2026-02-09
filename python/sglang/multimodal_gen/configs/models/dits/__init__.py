@@ -5,6 +5,8 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
     Hunyuan3DPlainDiTConfig,
 )
 from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import HunyuanVideoConfig
+from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
+from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "WanVideoConfig",
     "Hunyuan3DDiTConfig",
     "Hunyuan3DPlainDiTConfig",
+    "MOVAAudioConfig",
+    "MOVAVideoConfig",
 ]
