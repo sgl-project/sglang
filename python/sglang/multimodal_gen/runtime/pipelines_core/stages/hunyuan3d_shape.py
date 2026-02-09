@@ -16,7 +16,9 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
-from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.mesh3d_utils import export_to_trimesh
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req

@@ -22,7 +22,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
-    set_default_dtype,
+    set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -199,7 +199,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         else:
             init_kwargs = params
 
-        with set_default_dtype(dtype), torch.device("meta"):
+        with set_default_torch_dtype(dtype), torch.device("meta"):
             model = target_cls(**init_kwargs)
 
         weight_iterator = ((k, v) for k, v in weights.items())
@@ -236,7 +236,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         target_cls = cls._resolve_class(cfg["target"])
         params = cfg.get("params", {})
 
-        with set_default_dtype(dtype):
+        with set_default_torch_dtype(dtype):
             component = target_cls(**params)
 
         if weights is not None:
