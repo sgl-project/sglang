@@ -996,6 +996,29 @@ class MMReceiverGrpc(MMReceiverBase):
             await asyncio.gather(*grpc_metadata_tasks)
 
 
+def _validate_transport_mode(transport_mode: str, encoder_urls):
+    if transport_mode == "grpc":
+        if any(url.startswith("http://") for url in encoder_urls):
+            raise ValueError(
+                "EPD MMReceiver: grpc mode requires grpc:// encoder URLs. "
+                "Use grpc:// encoder URLs or set "
+                "SGLANG_ENCODER_MM_RECEIVER_MODE=http for the prefill process."
+            )
+    elif transport_mode == "http":
+        if any(url.startswith("grpc://") for url in encoder_urls):
+            raise ValueError(
+                "EPD MMReceiver: http mode requires http:// encoder URLs. "
+                "Use http:// encoder URLs or set "
+                "SGLANG_ENCODER_MM_RECEIVER_MODE=grpc for the prefill process."
+            )
+
+
+_MM_RECEIVER_BY_MODE = {
+    "grpc": MMReceiverGrpc,
+    "http": MMReceiverHTTP,
+}
+
+
 def create_mm_receiver(
     server_args: ServerArgs,
     dtype: Optional[torch.dtype] = None,
@@ -1009,39 +1032,19 @@ def create_mm_receiver(
     if transport_mode is None:
         transport_mode = envs.SGLANG_ENCODER_MM_RECEIVER_MODE.get()
         logger.debug(f"MMReceiver transport_mode from env: {transport_mode}")
-    if transport_mode == "grpc":
-        if any(url.startswith("http://") for url in server_args.encoder_urls):
-            raise ValueError(
-                "EPD MMReceiver: grpc mode requires grpc:// encoder URLs. "
-                "Use grpc:// encoder URLs or set "
-                "SGLANG_ENCODER_MM_RECEIVER_MODE=http for the prefill process."
-            )
-    if transport_mode == "http":
-        if any(url.startswith("grpc://") for url in server_args.encoder_urls):
-            raise ValueError(
-                "EPD MMReceiver: http mode requires http:// encoder URLs. "
-                "Use http:// encoder URLs or set "
-                "SGLANG_ENCODER_MM_RECEIVER_MODE=grpc for the prefill process."
-            )
+
+    _validate_transport_mode(transport_mode, server_args.encoder_urls)
     logger.info(f"EPD MMReceiver: using transport_mode={transport_mode}")
-    if transport_mode == "grpc":
-        return MMReceiverGrpc(
-            server_args,
-            dtype=dtype,
-            hf_config=hf_config,
-            pp_rank=pp_rank,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
-            scheduler=scheduler,
-        )
-    if transport_mode == "http":
-        return MMReceiverHTTP(
-            server_args,
-            dtype=dtype,
-            hf_config=hf_config,
-            pp_rank=pp_rank,
-            tp_rank=tp_rank,
-            tp_group=tp_group,
-            scheduler=scheduler,
-        )
-    raise ValueError(f"Unsupported transport_mode: {transport_mode}")
+
+    receiver_cls = _MM_RECEIVER_BY_MODE.get(transport_mode)
+    if receiver_cls is None:
+        raise ValueError(f"Unsupported transport_mode: {transport_mode}")
+    return receiver_cls(
+        server_args,
+        dtype=dtype,
+        hf_config=hf_config,
+        pp_rank=pp_rank,
+        tp_rank=tp_rank,
+        tp_group=tp_group,
+        scheduler=scheduler,
+    )
