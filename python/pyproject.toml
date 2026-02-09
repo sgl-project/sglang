@@ -69,13 +69,12 @@ dependencies = [
   "torchao==0.9.0",
   "torchaudio==2.9.1",
   "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
-  "torchvision",
+  "torchvision==0.24.1",
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
   "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
@@ -92,14 +91,42 @@ name = "torch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
 explicit = true
 
+[[tool.uv.index]]
+name = "torch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [tool.uv.sources]
 torch = [
-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+  { index = "torch-cu130", extra = "cu130" },
+  { index = "torch-cu129", marker = "extra != 'cu130'" }
+]
+
+torchaudio = [
+  { index = "torch-cu130", extra = "cu130" },
+  { index = "torch-cu129", marker = "extra != 'cu130'" }
+]
+
+torchvision = [
+  { index = "torch-cu130", extra = "cu130" },
+  { index = "torch-cu129", marker = "extra != 'cu130'" }
+]
+
+sgl-kernel = [
+  { url = "https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_x86_64.whl", extra = "cu130", marker = "platform_machine == 'x86_64'" },
+  { url = "https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_aarch64.whl", extra = "cu130", marker = "platform_machine == 'aarch64'" }
 ]
 
 [project.optional-dependencies]
+cu130 = [
+  "torch",
+  "torchaudio",
+  "torchvision",
+  "sgl-kernel"
+]
+
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",

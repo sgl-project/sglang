@@ -4,7 +4,7 @@ You can install SGLang using one of the methods below.
 This page primarily applies to common NVIDIA GPU platforms.
 For other or newer platforms, please refer to the dedicated pages for [AMD GPUs](../platforms/amd_gpu.md), [Intel Xeon CPUs](../platforms/cpu_server.md), [TPU](../platforms/tpu.md), [NVIDIA DGX Spark](https://lmsys.org/blog/2025-11-03-gpt-oss-on-nvidia-dgx-spark/), [NVIDIA Jetson](../platforms/nvidia_jetson.md), [Ascend NPUs](../platforms/ascend_npu.md), and [Intel XPU](../platforms/xpu.md).
 
-## Method 1: With pip or uv
+## Method 1: Using uv
 
 It is recommended to use uv for faster installation:
 
@@ -16,29 +16,16 @@ uv pip install sglang
 
 ### For CUDA 13
 
-Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, follow these steps:
+Docker is recommended (see Method 3 note on B300/GB300/CUDA 13). If you do not have Docker access, you can use the `cu130` extra:
 
-1. Install PyTorch with CUDA 13 support first:
 ```bash
-# Replace X.Y.Z with the version by your SGLang install
-uv pip install torch==X.Y.Z torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
+uv pip install sglang[cu130]
 ```
 
-2. Install sglang:
-```bash
-uv pip install sglang
-```
+This installs PyTorch with CUDA 13 support and the correct `sgl-kernel` wheel automatically.
 
-3. Install the `sgl_kernel` wheel for CUDA 13 from [the sgl-project whl releases](https://github.com/sgl-project/whl/blob/gh-pages/cu130/sgl-kernel/index.html). Replace `X.Y.Z` with the `sgl_kernel` version required by your SGLang install (you can find this by running `uv pip show sgl_kernel`). Examples:
-```bash
-# x86_64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_x86_64.whl"
+### Quick fixes to common problems
 
-# aarch64
-uv pip install "https://github.com/sgl-project/whl/releases/download/vX.Y.Z/sgl_kernel-X.Y.Z+cu130-cp310-abi3-manylinux2014_aarch64.whl"
-```
-
-### **Quick fixes to common problems**
 - If you encounter `OSError: CUDA_HOME environment variable is not set`. Please set it to your CUDA install root with either of the following solutions:
   1. Use `export CUDA_HOME=/usr/local/cuda-<your-cuda-version>` to set the `CUDA_HOME` environment variable.
   2. Install FlashInfer first following [FlashInfer installation doc](https://docs.flashinfer.ai/installation.html), then install SGLang as described above.
@@ -55,7 +42,7 @@ pip install --upgrade pip
 pip install -e "python"
 ```
 
-**Quick fixes to common problems**
+### Quick fixes to common problems
 
 - If you want to develop SGLang, you can try the dev docker image. Please refer to [setup docker container](../developer_guide/development_guide_using_docker.md#setup-docker-container). The docker image is `lmsysorg/sglang:dev`.
 
