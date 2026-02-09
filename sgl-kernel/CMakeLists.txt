@@ -415,6 +415,9 @@ endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
+# Workaround: Py_LIMITED_API (set by scikit-build-core USE_SABI) hides internal
+# CPython APIs like _PyUnicodeWriter, but torch's pythoncapi_compat.h needs them.
+remove_definitions(-DPy_LIMITED_API)
 add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
