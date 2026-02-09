@@ -102,9 +102,6 @@ class TestLoRAEviction(CustomTestCase):
             enable_lora=True,
             max_lora_rank=256,
             lora_target_modules=["all"],
-            attention_backend="fa3",
-            disable_cuda_graph=True,
-            enable_deterministic_inference=True,
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]
 
