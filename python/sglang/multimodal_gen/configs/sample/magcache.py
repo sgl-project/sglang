@@ -4,56 +4,6 @@ import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import CacheParams
 
-
-@dataclass
-class MagCacheParams(CacheParams):
-    """
-    MagCache configuration for magnitude-ratio-based caching.
-
-    MagCache accelerates diffusion inference by skipping forward passes when
-    magnitude ratios of consecutive residuals are predictably similar.
-
-    Attributes:
-        threshold: Accumulated error threshold (default 0.06 from paper).
-                   Lower = higher quality but slower. Higher = faster but lower quality.
-        max_skip_steps: Maximum consecutive skips allowed (default 3).
-                        Prevents infinite skipping even if error is low.
-        retention_ratio: Fraction of initial steps to always compute (default 0.2).
-                         First 20% of steps are important, never skip them.
-    """
-
-    cache_type: str = "magcache"
-    threshold: float = 0.06
-    max_skip_steps: int = 3
-    retention_ratio: float = 0.2
-    # Note: mag_ratios calibration data would be added here in future
-    # mag_ratios: dict[int, float] = field(default_factory=dict)
-
-
-@dataclass
-class WanMagCacheParams(CacheParams):
-    """
-    Wan-specific MagCache parameters.
-
-    Wan uses special ret_steps and cutoff_steps logic similar to WanTeaCacheParams.
-    """
-
-    cache_type: str = "magcache"
-    threshold: float = 0.06
-    max_skip_steps: int = 3
-    use_ret_steps: bool = True
-
-    @property
-    def ret_steps(self) -> int:
-        """Retention steps (always compute first N steps)."""
-        return 5 * 2 if self.use_ret_steps else 1 * 2
-
-    def get_cutoff_steps(self, num_inference_steps: int) -> int:
-        """Cutoff steps (always compute last few steps)."""
-        return num_inference_steps * 2 if self.use_ret_steps else num_inference_steps * 2 - 2
-
-
-
 # from https://github.com/Zehong-Ma/MagCache/blob/df81cb181776c2c61477c08e1d21f87fda1cd938/MagCache4Wan2.1/magcache_generate.py#L912
 T2V_13B_MAG_RATIOS = torch.tensor([
     1.0, 1.0,
@@ -92,3 +42,54 @@ def get_interpolated_mag_ratios(sample_steps:int, raw_ratios=T2V_13B_MAG_RATIOS)
         # Zip them back together and flatten
         return torch.stack([mag_ratio_con, mag_ratio_ucon], dim=1).flatten()
     return raw_ratios
+
+
+
+@dataclass
+class MagCacheParams(CacheParams):
+    """
+    MagCache configuration for magnitude-ratio-based caching.
+
+    MagCache accelerates diffusion inference by skipping forward passes when
+    magnitude ratios of consecutive residuals are predictably similar.
+
+    Attributes:
+        threshold: Accumulated error threshold (default 0.06 from paper).
+                   Lower = higher quality but slower. Higher = faster but lower quality.
+        max_skip_steps: Maximum consecutive skips allowed (default 3).
+                        Prevents infinite skipping even if error is low.
+        retention_ratio: Fraction of initial steps to always compute (default 0.2).
+                         First 20% of steps are important, never skip them.
+    """
+
+    cache_type: str = "magcache"
+    threshold: float = 0.06
+    max_skip_steps: int = 3
+    retention_ratio: float = 0.2
+    # Note: mag_ratios calibration data would be added here in future
+    # mag_ratios: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass
+class WanMagCacheParams(CacheParams):
+    """
+    Wan-specific MagCache parameters.
+
+    Wan uses special ret_steps and cutoff_steps logic similar to WanTeaCacheParams.
+    Incorporates T2V 1.3B magnitude ratios for automatic interpolation.
+    """
+
+    cache_type: str = "magcache"
+    threshold: float = 0.06
+    max_skip_steps: int = 3
+    use_ret_steps: bool = True
+    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(50, T2V_13B_MAG_RATIOS) # hardcode for now
+
+    @property
+    def ret_steps(self) -> int:
+        """Retention steps (always compute first N steps)."""
+        return 5 * 2 if self.use_ret_steps else 1 * 2
+
+    def get_cutoff_steps(self, num_inference_steps: int) -> int:
+        """Cutoff steps (always compute last few steps)."""
+        return num_inference_steps * 2 if self.use_ret_steps else num_inference_steps * 2 - 2

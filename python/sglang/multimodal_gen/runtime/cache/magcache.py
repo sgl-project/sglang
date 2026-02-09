@@ -95,6 +95,7 @@ class MagCacheMixin:
         Checks if shared state is already initialized by TeaCacheMixin.
         If not, initializes shared state, then adds MagCache-specific state.
         """
+        ic('init magcache state')
         # Initialize shared state if not present (TeaCache might have already done this)
         if not hasattr(self, "previous_residual"):
             self.previous_residual: torch.Tensor | None = None
@@ -234,13 +235,20 @@ class MagCacheMixin:
 
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
+        ic(forward_context, forward_batch, forward_batch.enable_magcache)
 
         # Early return checks
         if forward_batch is None or not forward_batch.enable_magcache:
             return None
 
+        # Get magcache_params from forward_batch, or fall back to sampling_params
         magcache_params = forward_batch.magcache_params
+        if magcache_params is None and hasattr(forward_batch, 'sampling_params'):
+            magcache_params = getattr(forward_batch.sampling_params, 'magcache_params', None)
+        ic(magcache_params)
+
         if magcache_params is None:
+            ic("magcache_params is None even after fallback")
             return None
 
         # Reset at timestep 0

@@ -62,6 +62,7 @@ def _build_sampling_params_from_request(
     true_cfg_scale: Optional[float] = None,
     negative_prompt: Optional[str] = None,
     enable_teacache: Optional[bool] = None,
+    enable_magcache: Optional[bool] = None,
     num_frames: int = 1,
 ) -> SamplingParams:
     if size is None:
@@ -87,6 +88,7 @@ def _build_sampling_params_from_request(
         generator_device=generator_device,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
+        enable_magcache=enable_magcache,
         **({"guidance_scale": guidance_scale} if guidance_scale is not None else {}),
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
         **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
@@ -122,6 +124,7 @@ async def generations(
         true_cfg_scale=request.true_cfg_scale,
         negative_prompt=request.negative_prompt,
         enable_teacache=request.enable_teacache,
+        enable_magcache=request.enable_magcache,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
@@ -218,6 +221,7 @@ async def edits(
     true_cfg_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_magcache: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
     request_id = generate_request_id()
@@ -263,6 +267,7 @@ async def edits(
         true_cfg_scale=true_cfg_scale,
         num_inference_steps=num_inference_steps,
         enable_teacache=enable_teacache,
+        enable_magcache=enable_magcache,
         num_frames=num_frames,
     )
     batch = prepare_request(

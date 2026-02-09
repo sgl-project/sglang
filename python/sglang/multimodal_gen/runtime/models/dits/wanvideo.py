@@ -788,6 +788,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
+        self.enable_magcache = (
+            forward_batch is not None and forward_batch.enable_magcache
+        )
 
         orig_dtype = hidden_states.dtype
         if not isinstance(encoder_hidden_states, torch.Tensor):
@@ -920,6 +923,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         """Cache residual with CFG positive/negative separation."""
         ic("caching states")
         residual = hidden_states.squeeze(0) - original_hidden_states
+        ic(residual.shape)
         if not self.is_cfg_negative:
             self.previous_residual = residual
         else:
@@ -986,6 +990,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             ret_steps = magcache_params.ret_steps
             cutoff_steps = magcache_params.get_cutoff_steps(ctx.num_inference_steps)
+            ic(magcache_params, ret_steps, cutoff_steps)
 
             # Adjust for non-CFG
             if not ctx.do_cfg:
@@ -996,6 +1001,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             # Boundary detection
             is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
+            ic(is_boundary_step)
 
             # Need previous residual to make decision
             prev_residual = (

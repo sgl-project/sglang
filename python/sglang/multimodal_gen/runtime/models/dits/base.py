@@ -108,12 +108,12 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
-        self._init_teacache_state()  # Initializes shared state + TeaCache state
+        # self._init_teacache_state()  # Initializes shared state + TeaCache state
         self._init_magcache_state()  # Adds MagCache-specific state
 
     def reset_cache_state(self) -> None:
         """Reset both TeaCache and MagCache state."""
-        self.reset_teacache_state()  # Resets shared state + TeaCache state
+        # self.reset_teacache_state()  # Resets shared state + TeaCache state
         self.reset_magcache_state()  # Resets MagCache state
 
     def maybe_cache_states(
@@ -125,6 +125,7 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
         SHARED implementation - both TeaCache and MagCache cache residuals identically.
         """
         residual = hidden_states.squeeze(0) - original_hidden_states
+        ic(residual.shape)
         if not self.is_cfg_negative:
             self.previous_residual = residual
         else:
@@ -136,6 +137,7 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
 
         SHARED implementation - both TeaCache and MagCache retrieve identically.
         """
+        ic(hidden_states.shape)
         if not self.is_cfg_negative:
             return hidden_states + self.previous_residual
         else:

@@ -148,7 +148,6 @@ class Req:
 
     # MagCache parameters
     magcache_params: MagCacheParams | WanMagCacheParams | None = None
-    enable_magcache: bool = False
 
     # STA parameters
     STA_param: list | None = None
