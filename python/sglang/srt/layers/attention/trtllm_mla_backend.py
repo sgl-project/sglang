@@ -614,6 +614,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         ):
             bs = forward_batch.batch_size
             self.forward_decode_metadata = TRTLLMMLADecodeMetadata()
+            # This is necessary because the backend instance persists across forward passes,
+            # and forward_prefill_metadata from a previous regular extend call could still be set.
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            ):
+                self.forward_prefill_metadata = None            
             # Get maximum sequence length.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
@@ -955,10 +962,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if (
             self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.fallback_to_flashinfer_impl
-            and not (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-            )
         ):
             return super().forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
