@@ -990,7 +990,6 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             ret_steps = magcache_params.ret_steps
             cutoff_steps = magcache_params.get_cutoff_steps(ctx.num_inference_steps)
-            ic(magcache_params, ret_steps, cutoff_steps)
 
             # Adjust for non-CFG
             if not ctx.do_cfg:
@@ -1001,7 +1000,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
             # Boundary detection
             is_boundary_step = self.cnt < ret_steps or self.cnt >= cutoff_steps
-            ic(is_boundary_step)
+
+            ic(ret_steps, cutoff_steps, ctx.do_cfg, is_boundary_step)
 
             # Need previous residual to make decision
             prev_residual = (
@@ -1016,10 +1016,12 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # Use previous residual norm to decide
             should_calc = self._compute_magcache_decision(
                 residual=prev_residual,
-                is_boundary_step=is_boundary_step,
+                current_timestep=ctx.current_timestep,
+                mag_ratios=ctx.magcache_params.mag_ratios,
                 magcache_thresh=ctx.magcache_thresh,
                 max_skip_steps=ctx.max_skip_steps,
-                retention_steps=ret_steps,
+                retention_steps=ctx.retention_steps,
+                is_boundary_step=is_boundary_step,
             )
             ic(should_calc)
 

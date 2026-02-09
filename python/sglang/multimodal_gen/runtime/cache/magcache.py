@@ -95,7 +95,6 @@ class MagCacheMixin:
         Checks if shared state is already initialized by TeaCacheMixin.
         If not, initializes shared state, then adds MagCache-specific state.
         """
-        ic('init magcache state')
         # Initialize shared state if not present (TeaCache might have already done this)
         if not hasattr(self, "previous_residual"):
             self.previous_residual: torch.Tensor | None = None
@@ -137,24 +136,17 @@ class MagCacheMixin:
     def _compute_magcache_decision(
         self,
         residual: torch.Tensor,
-        is_boundary_step: bool,
+        current_timestep: int,
+        mag_ratios: torch.Tensor,
         magcache_thresh: float,
         max_skip_steps: int,
         retention_steps: int,
+        is_boundary_step: bool,
     ) -> bool:
         """
         Compute cache decision for MagCache.
-
-        Args:
-            residual: Current residual (output - input).
-            is_boundary_step: Force computation for boundary steps.
-            magcache_thresh: Threshold for accumulated error.
-            max_skip_steps: Maximum consecutive skips allowed.
-            retention_steps: Always compute for first N steps.
-
-        Returns:
-            True if should compute, False to use cache.
         """
+
         if not self.enable_magcache:
             return True
 
@@ -162,7 +154,7 @@ class MagCacheMixin:
             self._update_magcache_state(None, 0.0, 0)
             return True
 
-        # Get state for current CFG branch
+        # Select CFG branch state
         prev_norm = (
             self.magcache_previous_residual_norm_negative
             if self.is_cfg_negative
@@ -179,33 +171,33 @@ class MagCacheMixin:
             else self.magcache_consecutive_skips
         )
 
+        # First compute always
         if prev_norm == 0.0:
-            # First step, force compute and store norm
             current_norm = residual.norm(p=2).item()
             self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
-        # Compute magnitude ratio γ = ||residual_t||₂ / ||residual_{t-1}||₂
-        current_norm = residual.norm(p=2).item()
-        gamma = current_norm / prev_norm
+        # === MagCache core ===
+        branch_offset = 1 if self.is_cfg_negative else 0
+        idx = current_timestep * 2 + branch_offset
 
-        # Accumulate error: error += |1 - γ|
-        new_error = accum_error + abs(1.0 - gamma)
+        gamma_hat = mag_ratios[idx].item()
+        new_error = accum_error + abs(1.0 - gamma_hat)
 
-        # Skip conditions: all must be true to skip
         can_skip = (
             new_error <= magcache_thresh
             and consec_skips < max_skip_steps
             and self.cnt >= retention_steps
         )
 
-        # Update state
         if can_skip:
-            self._update_magcache_state(current_norm, new_error, consec_skips + 1)
-            return False  # Use cache
+            self._update_magcache_state(None, new_error, consec_skips + 1)
+            return False
         else:
+            current_norm = residual.norm(p=2).item()
             self._update_magcache_state(current_norm, 0.0, 0)
-            return True  # Compute
+            return True
+
 
     def _update_magcache_state(
         self, norm: float | None, error: float, skips: int
@@ -235,7 +227,6 @@ class MagCacheMixin:
 
         forward_context = get_forward_context()
         forward_batch = forward_context.forward_batch
-        ic(forward_context, forward_batch, forward_batch.enable_magcache)
 
         # Early return checks
         if forward_batch is None or not forward_batch.enable_magcache:
@@ -245,7 +236,6 @@ class MagCacheMixin:
         magcache_params = forward_batch.magcache_params
         if magcache_params is None and hasattr(forward_batch, 'sampling_params'):
             magcache_params = getattr(forward_batch.sampling_params, 'magcache_params', None)
-        ic(magcache_params)
 
         if magcache_params is None:
             ic("magcache_params is None even after fallback")
