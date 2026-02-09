@@ -27,9 +27,7 @@ def create_placement_groups(
 
     pgs = []
     for _ in range(nnodes):
-        pg = placement_group(
-            [{"GPU": 1}] * gpus_per_node, strategy="STRICT_PACK"
-        )
+        pg = placement_group([{"GPU": 1}] * gpus_per_node, strategy="STRICT_PACK")
         pgs.append(pg)
     ray.get([pg.ready() for pg in pgs])
     return pgs

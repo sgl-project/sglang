@@ -47,10 +47,7 @@ class SchedulerActor:
     ):
         import dataclasses
 
-        from sglang.srt.managers.scheduler import (
-            Scheduler,
-            configure_scheduler,
-        )
+        from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
 
         # Override dist_init_addr if provided (for multi-node)
         if dist_init_addr:
@@ -108,9 +105,7 @@ class SchedulerActor:
             "node_ip": ray.util.get_node_ip_address(),
             "tp_rank": self._tp_rank,
             "pp_rank": self._pp_rank,
-            "gpu_ids": ray.get_runtime_context().get_accelerator_ids().get(
-                "GPU", []
-            ),
+            "gpu_ids": ray.get_runtime_context().get_accelerator_ids().get("GPU", []),
         }
 
     def run_event_loop(self) -> None:
@@ -118,7 +113,5 @@ class SchedulerActor:
         try:
             self.scheduler.run_event_loop()
         except Exception as e:
-            logger.error(
-                f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}"
-            )
+            logger.error(f"Scheduler PP{self._pp_rank} TP{self._tp_rank} crashed: {e}")
             raise

@@ -3071,9 +3071,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    dp_rank = configure_scheduler(
-        server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
-    )
+    dp_rank = configure_scheduler(server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank)
 
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()

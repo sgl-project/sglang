@@ -1001,9 +1001,7 @@ def _launch_scheduler_processes(
         )
 
 
-def _calculate_rank_ranges(
-    server_args: ServerArgs, node_rank: Optional[int] = None
-):
+def _calculate_rank_ranges(server_args: ServerArgs, node_rank: Optional[int] = None):
     """Calculate pp_rank_range and tp_rank_range for a given node.
 
     Shared by both MP mode (uses server_args.node_rank) and
@@ -1137,9 +1135,6 @@ def _launch_scheduler_ray_actors(
 ) -> SchedulerLaunchResult:
     """Launch scheduler actors using Ray (unified single/multi-node).
 
-    Uses server_args.nnodes + arithmetic for topology (no discovery).
-    Reuses _calculate_rank_ranges() for rank assignment.
-
     Args:
         placement_groups: Per-node placement groups.
     """
@@ -1163,7 +1158,7 @@ def _launch_scheduler_ray_actors(
 
     logger.info(
         f"Ray cluster: {nnodes} nodes, "
-        f"{gpus_per_node} GPUs/node, world_size={world_size}"
+        f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
     )
 
     # Discover rank 0's node IP for torch.distributed init
@@ -1181,13 +1176,10 @@ def _launch_scheduler_ray_actors(
         )
         for pp_rank in pp_range:
             for tp_rank in tp_range:
-                local_gpu_idx = (
-                    (pp_rank % pp_per_node) * tp_per_node
-                    + (tp_rank % tp_per_node)
+                local_gpu_idx = (pp_rank % pp_per_node) * tp_per_node + (
+                    tp_rank % tp_per_node
                 )
-                moe_ep_rank = tp_rank // (
-                    server_args.tp_size // server_args.ep_size
-                )
+                moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
                 actor = SchedulerActor.options(
                     num_cpus=0,
