@@ -141,9 +141,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
         Returns:
             TritonRunnerOutput with combined base + LoRA output
         """
-        # If no LoRA, use base implementation
-        if lora_info is None:
-            return super().run(runner_input, quant_info, running_state)
 
         # Extract common variables
         hidden_states = runner_input.hidden_states
@@ -193,46 +190,6 @@ class TritonRunnerCoreWithLoRA(TritonRunnerCore):
             invoke_fused_moe_kernel,
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
-        )
-
-        hidden_states = runner_input.hidden_states
-        topk_weights = runner_input.topk_weights
-        topk_ids = runner_input.topk_ids
-        sorted_token_ids = runner_input.sorted_token_ids
-        expert_ids = runner_input.expert_ids
-        num_tokens_post_padded = runner_input.num_tokens_post_padded
-
-        w13 = quant_info.w13_weight
-        w2 = quant_info.w2_weight
-        b13 = quant_info.b13
-        b2 = quant_info.b2
-        a13_scale = quant_info.a13_scale
-        a2_scale = quant_info.a2_scale
-        w13_scale = quant_info.w13_scale
-        w2_scale = quant_info.w2_scale
-        w13_zp = quant_info.w13_zp
-        w2_zp = quant_info.w2_zp
-        block_shape = quant_info.block_shape
-        per_channel_quant = quant_info.per_channel_quant
-        use_fp8_w8a8 = quant_info.use_fp8_w8a8
-        use_int8_w8a8 = quant_info.use_int8_w8a8
-        use_int8_w8a16 = quant_info.use_int8_w8a16
-        use_int4_w4a16 = quant_info.use_int4_w4a16
-
-        activation = self.config.activation
-        no_combine = self.config.no_combine
-        inplace = self.config.inplace
-        gemm1_alpha = self.config.gemm1_alpha
-        gemm1_limit = self.config.gemm1_clamp_limit
-        routed_scaling_factor = self.config.routed_scaling_factor
-        apply_router_weight_on_input = self.config.apply_router_weight_on_input
-
-        assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
-
-        M = hidden_states.shape[0]
-        E, N, _ = w13.shape
-        compute_type = (
-            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
         # ============================================================
