@@ -13,12 +13,10 @@
 # ==============================================================================
 """Ray actor wrapper for SGLang Engine.
 
-This module is imported on the head/driver node which may be
-CPU-only. Do NOT add sglang imports at module level. All sglang imports
-happen inside _InternalEngineActor.__init__() on GPU worker nodes.
+No sglang imports at module level. This module is imported
+on the CPU-only head/driver node.
 
 Usage:
-
     from sglang.srt.entrypoints.engine_actor import EngineActor
 
     engine = EngineActor(model_path="meta-llama/Llama-2-7b", tp_size=4)

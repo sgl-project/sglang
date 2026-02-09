@@ -17,8 +17,6 @@ No sglang imports at module level. This module is imported
 on the CPU-only head/driver node.
 
 Usage:
-    import ray
-    ray.init()
     from sglang.srt.entrypoints.http_server_actor import HttpServerActor
 
     server = HttpServerActor(model_path="meta-llama/Llama-3-8B", tp_size=8, port=30000)
