@@ -2731,7 +2731,7 @@ class ServerArgs:
                 )
                 self.attention_backend = "ascend"
         elif not self.disable_cuda_graph:
-            elif self.attention_backend != "flashinfer":
+            if self.attention_backend != "flashinfer":
                 logger.warning(
                     "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
                 )
