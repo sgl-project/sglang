@@ -531,7 +531,7 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
 
         if return_path.endswith(".glb"):
             return_path = obj_path
-        return OutputBatch(output=[return_path], timings=batch.timings)
+        return OutputBatch(output_file_paths=[return_path], timings=batch.timings)
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

@@ -10,10 +10,7 @@ import torch
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VertexGenerateReqInput,
@@ -139,9 +136,7 @@ async def forward_to_scheduler(req_obj, sp):
         else:
             data = response if isinstance(response, dict) else vars(response)
 
-        if sp.data_type == DataType.MESH:
-            data["output"] = response.output
-        elif output_file_path:
+        if output_file_path:
             print(f"Processing output file: {output_file_path}")
             b64_video = encode_video_to_base64(output_file_path)
 
@@ -218,11 +213,12 @@ def create_app(server_args: ServerArgs):
     app.include_router(health_router)
     app.include_router(vertex_router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
 
     app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
+    app.include_router(mesh_api.router)
 
     app.state.server_args = server_args
     return app

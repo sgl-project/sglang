@@ -266,9 +266,11 @@ class DiffGenerator:
                         continue
 
                     if req.data_type == DataType.MESH:
-                        for output_idx, sample in enumerate(output_batch.output):
+                        for output_idx, sample in enumerate(
+                            output_batch.output_file_paths
+                        ):
                             result_item: dict[str, Any] = {
-                                "mesh_path": sample,
+                                "output_file_path": sample,
                                 "prompts": req.prompt,
                                 "generation_time": timer.duration,
                                 "peak_memory_mb": output_batch.peak_memory_mb,
@@ -346,7 +348,7 @@ class DiffGenerator:
         else:
             if requests[0].return_frames:
                 if requests[0].data_type == DataType.MESH:
-                    results = [r["mesh_path"] for r in results]
+                    results = [r["output_file_path"] for r in results]
                 else:
                     results = [r["frames"] for r in results]
             if len(results) == 1:

@@ -1074,10 +1074,25 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
                 glb_path = obj_path[:-4] + ".glb"
                 textured_mesh.export(glb_path)
                 return_path = glb_path
+                self._cleanup_obj_artifacts(obj_path)
         except Exception as e:
             logger.error(f"Mesh export failed: {e}")
 
-        return OutputBatch(output=[return_path], timings=batch.timings)
+        return OutputBatch(output_file_paths=[return_path], timings=batch.timings)
+
+    @staticmethod
+    def _cleanup_obj_artifacts(obj_path: str) -> None:
+        """Remove OBJ file and trimesh-generated material artifacts."""
+        obj_dir = os.path.dirname(obj_path) or "."
+        targets = [obj_path]
+        for f in os.listdir(obj_dir):
+            if f.endswith(".mtl") or (f.startswith("material") and f.endswith(".png")):
+                targets.append(os.path.join(obj_dir, f))
+        for path in targets:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()

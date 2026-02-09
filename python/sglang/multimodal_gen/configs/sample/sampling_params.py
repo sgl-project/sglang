@@ -73,7 +73,7 @@ class DataType(Enum):
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
-        return "obj"
+        return "glb"
 
 
 @dataclass

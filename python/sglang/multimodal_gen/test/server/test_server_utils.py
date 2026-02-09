@@ -1231,7 +1231,7 @@ def get_generate_fn(
             )
 
     def generate_mesh(case_id, client) -> str:
-        """I2M: Image to Mesh generation using HTTP API (same pattern as image_edit)."""
+        """I2M: Image to Mesh generation using async /v1/meshes API."""
         import requests as http_requests
 
         if not sampling_params.image_path:
@@ -1244,79 +1244,75 @@ def get_generate_fn(
         if not Path(image_path).exists():
             pytest.skip(f"{case_id}: image file missing: {image_path}")
 
-        # Get server base URL from client
         base_url = str(client.base_url).rstrip("/")
-        # Remove /v1 suffix if present to get the root URL
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
 
-        # Use /v1/images/edits endpoint (same as image_edit)
-        # Server routes based on model's data_type (MESH for Hunyuan3D)
-        url = f"{base_url}/v1/images/edits"
+        create_url = f"{base_url}/v1/meshes"
 
-        # Prepare multipart form data with identical parameters as reference script
-        # Reference: seed=0 (native default), guidance_scale=5.0, num_inference_steps=50
         with open(image_path, "rb") as img_file:
             files = {"image": (Path(image_path).name, img_file, "image/png")}
             data = {
-                "prompt": "generate 3d mesh",  # Required field, content not used for I2M
+                "prompt": "generate 3d mesh",
                 "model": model_path,
                 "seed": "0",
                 "guidance_scale": "5.0",
                 "num_inference_steps": "50",
-                "response_format": "url",  # Get file path in response
             }
 
-            logger.info(f"[Mesh Gen] Sending request to {url}")
+            logger.info(f"[Mesh Gen] Sending request to {create_url}")
 
             try:
                 response = http_requests.post(
-                    url,
-                    files=files,
-                    data=data,
-                    timeout=6000,  # 10 minute timeout for mesh generation
+                    create_url, files=files, data=data, timeout=60
                 )
-            except http_requests.exceptions.Timeout:
-                pytest.fail(f"{case_id}: mesh generation timed out after 600s")
             except Exception as e:
-                pytest.fail(f"{case_id}: mesh generation request failed: {e}")
+                pytest.fail(f"{case_id}: mesh creation request failed: {e}")
 
         if response.status_code != 200:
-            logger.error(
-                f"[Mesh Gen] Request failed with status {response.status_code}"
-            )
-            logger.error(f"[Mesh Gen] Response: {response.text}")
-            pytest.fail(f"{case_id}: mesh generation failed: {response.text}")
+            pytest.fail(f"{case_id}: mesh creation failed: {response.text}")
 
-        result = response.json()
+        job = response.json()
+        mesh_id = job.get("id")
+        if not mesh_id:
+            pytest.fail(f"{case_id}: no mesh id in response: {job}")
 
-        # Extract mesh file path from response
-        # For mesh, the output is returned as file_path in the response data
-        mesh_path = None
-        if "data" in result and len(result["data"]) > 0:
-            data_item = result["data"][0]
-            # Try different possible keys for the mesh path
-            mesh_path = (
-                data_item.get("file_path")
-                or data_item.get("url")
-                or data_item.get("revised_prompt")
-            )
+        poll_url = f"{base_url}/v1/meshes/{mesh_id}"
+        poll_interval = 5
+        max_wait = 6000
+        elapsed = 0
 
-        if not mesh_path or not Path(mesh_path).exists():
-            # Fallback: check if output is directly in result
-            mesh_path = result.get("output")
-            if isinstance(mesh_path, list) and len(mesh_path) > 0:
-                mesh_path = mesh_path[0]
+        while elapsed < max_wait:
+            import time as _time
 
-        if not mesh_path:
-            pytest.fail(f"{case_id}: no mesh path in response: {result}")
+            _time.sleep(poll_interval)
+            elapsed += poll_interval
 
-        if not Path(mesh_path).exists():
-            pytest.fail(f"{case_id}: mesh file not found at {mesh_path}")
+            try:
+                poll_resp = http_requests.get(poll_url, timeout=30)
+            except Exception as e:
+                logger.warning(f"[Mesh Gen] Poll failed: {e}")
+                continue
 
-        logger.info(f"[Mesh Gen] Mesh generated successfully at {mesh_path}")
+            if poll_resp.status_code != 200:
+                continue
 
-        return str(mesh_path)
+            status_data = poll_resp.json()
+            status = status_data.get("status", "")
+
+            if status == "completed":
+                mesh_path = status_data.get("file_path")
+                if not mesh_path:
+                    pytest.fail(f"{case_id}: completed but no file_path: {status_data}")
+                if not Path(mesh_path).exists():
+                    pytest.fail(f"{case_id}: mesh file not found at {mesh_path}")
+                logger.info(f"[Mesh Gen] Mesh generated successfully at {mesh_path}")
+                return str(mesh_path)
+            elif status == "failed":
+                error = status_data.get("error", {})
+                pytest.fail(f"{case_id}: mesh generation failed: {error}")
+
+        pytest.fail(f"{case_id}: mesh generation timed out after {max_wait}s")
 
     if modality == "3d":
         fn = generate_mesh

@@ -218,8 +218,6 @@ async def process_generation_batch(
         save_file_path_list = []
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-        elif batch.data_type == DataType.MESH:
-            save_file_path_list = list(result.output)
         else:
             audio_sample_rate = result.audio_sample_rate
             if batch.data_type == DataType.VIDEO:

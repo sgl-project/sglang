@@ -18,6 +18,7 @@ class Hunyuan3DSamplingParams(SamplingParams):
     paint_num_inference_steps: int = 30
     paint_guidance_scale: float = 2.0
     seed: int = 0
+    negative_prompt: str = ""
 
     def __post_init__(self):
         """Validate parameters after initialization."""
