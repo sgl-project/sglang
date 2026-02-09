@@ -100,7 +100,8 @@ If a test cannot run on 5090 due to any of the above, use `stage-b-test-large-1-
 **Per-Commit (CUDA)**:
 - Stage A: `stage-a-test-1` (locked), `stage-a-test-2`, `stage-a-test-cpu`
 - Stage B: `stage-b-test-small-1-gpu` (5090), `stage-b-test-large-1-gpu` (H100), `stage-b-test-large-2-gpu`
-- Stage C: `stage-c-test-large-4-gpu`, `stage-c-test-large-4-gpu-b200`, `stage-c-test-large-8-gpu-b200`
+- Stage C (4-GPU): `stage-c-test-4-gpu-h100`, `stage-c-test-4-gpu-b200`, `stage-c-test-4-gpu-gb200`, `stage-c-test-deepep-4-gpu`
+- Stage C (8-GPU): `stage-c-test-8-gpu-h20`, `stage-c-test-8-gpu-h200`, `stage-c-test-8-gpu-b200`, `stage-c-test-deepep-8-gpu-h200`
 
 **Per-Commit (AMD)**:
 - `stage-a-test-1`, `stage-b-test-small-1-gpu-amd`, `stage-b-test-large-2-gpu-amd`
