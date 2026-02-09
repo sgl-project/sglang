@@ -659,6 +659,21 @@ impl WorkerRegistry {
         (regular_count, pd_count)
     }
 
+    /// Get counts of regular and prefill workers for scheduler
+    /// Returns (regular_count, prefill_count) - decode workers are excluded
+    pub fn get_scheduler_worker_counts(&self) -> (usize, usize) {
+        let regular_count = self
+            .type_workers
+            .get(&WorkerType::Regular)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        // 只统计 Prefill workers，不包含 Decode
+        let prefill_count = self.get_prefill_workers().len();
+
+        (regular_count, prefill_count)
+    }
+
     /// Start a health checker for all workers in the registry
     /// This should be called once after the registry is populated with workers
     pub(crate) fn start_health_checker(&self, check_interval_secs: u64) -> HealthChecker {

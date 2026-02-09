@@ -112,8 +112,8 @@ impl ProportionScheduler {
             loop {
                 info!("开始调整================");
                 tokio::time::sleep(config.adjust_interval).await;
-                // 获取worker数量
-                let (regular_workers, pd_workers) = worker_registry.get_worker_distribution();
+                // 获取worker数量 (regular_count, prefill_count)
+                let (regular_workers, pd_workers) = worker_registry.get_scheduler_worker_counts();
                 {
                     // 简化写法全部采用http
                     let mut counts_guard = worker_counts.write().unwrap();
