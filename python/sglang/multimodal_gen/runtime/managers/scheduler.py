@@ -126,7 +126,6 @@ class Scheduler:
         return self.worker.list_loras()
 
     def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
-        logger.info("Received shutdown request. Stopping event loop.")
         self._running = False
         return OutputBatch()
 
@@ -388,7 +387,6 @@ class Scheduler:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
-        logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
             self.receiver.close()
         self.context.destroy(linger=0)

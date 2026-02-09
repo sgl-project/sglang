@@ -491,7 +491,6 @@ class DiffGenerator:
                 pass
 
         if self.local_scheduler_process:
-            logger.info("Waiting for local worker processes to terminate...")
             for process in self.local_scheduler_process:
                 process.join(timeout=10)
                 if process.is_alive():
