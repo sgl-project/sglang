@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
 from sglang.srt.models.kimi_vl_moonvit import MLP2
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import add_prefix
 
 KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
@@ -643,6 +644,15 @@ def vision_tower_forward_auto(
 
 
 class KimiK25ForConditionalGeneration(nn.Module):
+    # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
+    # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
+    # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/config.json
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "language_model.layers.": "language_model.model.layers.",
+        }
+    )
+
     def __init__(
         self,
         config: KimiK25Config,
@@ -652,6 +662,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
         # Create mm projector
@@ -710,7 +721,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
-        weights = list(weights)
+        mapper = getattr(self, "hf_to_sglang_mapper", None)
+        if mapper is not None:
+            weights = mapper.apply(weights)
 
         # Separate vision tower weights and language model weights
         vision_weights = []
