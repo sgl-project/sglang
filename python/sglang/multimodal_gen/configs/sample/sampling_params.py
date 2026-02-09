@@ -126,6 +126,7 @@ class SamplingParams:
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
+    cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
     # TeaCache parameters
@@ -151,6 +152,9 @@ class SamplingParams:
     adjust_frames: bool = True
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
+
+    return_file_paths_only: bool = True
+    enable_sequence_shard: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -275,6 +279,11 @@ class SamplingParams:
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
 
+        if self.cfg_normalization is None:
+            self.cfg_normalization = 0.0
+        elif isinstance(self.cfg_normalization, bool):
+            self.cfg_normalization = 1.0 if self.cfg_normalization else 0.0
+
         if self.boundary_ratio is not None:
             if isinstance(self.boundary_ratio, bool) or not isinstance(
                 self.boundary_ratio, (int, float)
@@ -358,6 +367,12 @@ class SamplingParams:
                         f"Supported resolutions: {supported_str}"
                     )
                     logger.warning(error_msg)
+
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -647,6 +662,13 @@ class SamplingParams:
             help="Guidance rescale factor",
         )
         parser.add_argument(
+            "--cfg-normalization",
+            type=float,
+            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
+            dest="cfg_normalization",
+            help=("CFG renormalization factor (for Z-Image). "),
+        )
+        parser.add_argument(
             "--boundary-ratio",
             type=float,
             default=SamplingParams.boundary_ratio,
@@ -725,6 +747,18 @@ class SamplingParams:
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action=StoreBoolean,
+            default=SamplingParams.return_file_paths_only,
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action=StoreBoolean,
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
+        )
         return parser
 
     @classmethod
@@ -793,9 +827,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass
