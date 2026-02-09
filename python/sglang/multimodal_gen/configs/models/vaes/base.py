@@ -42,8 +42,8 @@ class VAEConfig(ModelConfig):
     use_parallel_tiling: bool = True
     use_temporal_scaling_frames: bool = True
 
-    use_parallel_encode: bool = False
-    use_parallel_decode: bool = False
+    use_parallel_encode: bool = True
+    use_parallel_decode: bool = True
 
     def __post_init__(self):
         self.blend_num_frames = (

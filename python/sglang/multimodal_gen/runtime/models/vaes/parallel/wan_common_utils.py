@@ -413,9 +413,7 @@ def mid_block_forward(self, x):
     x = self.resnets[0](x)
 
     # Process through attention and residual blocks
-    for idx, (attn, resnet) in enumerate(
-        zip(self.attentions, self.resnets[1:], strict=True)
-    ):
+    for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
         if attn is not None:
             x = attn(x)
 
@@ -425,7 +423,7 @@ def mid_block_forward(self, x):
 
 
 def residual_down_block_forward(self, x):
-    x_copy = x.clone()
+    x_copy = x
     for resnet in self.resnets:
         x = resnet(x)
     if self.downsampler is not None:
@@ -436,7 +434,7 @@ def residual_down_block_forward(self, x):
 
 def residual_up_block_forward(self, x):
     if self.avg_shortcut is not None:
-        x_copy = x.clone()
+        x_copy = x
 
     for resnet in self.resnets:
         x = resnet(x)

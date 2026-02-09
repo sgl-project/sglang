@@ -383,18 +383,18 @@ class WanEncoder3d(nn.Module):
         self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
 
         self.gradient_checkpointing = False
+        self.world_size = 1
+        self.rank = 0
+        if dist.is_initialized():
+            self.world_size = get_sp_world_size()
+            self.rank = get_sp_parallel_rank()
 
     def forward(self, x):
-        world_size = 1
-        if dist.is_initialized():
-            world_size = get_sp_world_size()
-
         expected_local_height = None
         expected_height = None
-        if self.use_parallel_encode and world_size > 1:
-            rank = get_sp_parallel_rank()
+        if self.use_parallel_encode and self.world_size > 1:
             x, expected_height, expected_local_height = split_for_parallel_encode(
-                x, self.downsample_count, world_size, rank
+                x, self.downsample_count, self.world_size, self.rank
             )
 
         _feat_cache = feat_cache.get()
@@ -426,7 +426,7 @@ class WanEncoder3d(nn.Module):
             x = layer(x)
 
         ## middle
-        if self.use_parallel_encode and world_size > 1:
+        if self.use_parallel_encode and self.world_size > 1:
             x = ensure_local_height(x, expected_local_height)
         x = self.mid_block(x)
 
@@ -458,7 +458,7 @@ class WanEncoder3d(nn.Module):
         else:
             x = self.conv_out(x)
 
-        if self.use_parallel_encode and world_size > 1:
+        if self.use_parallel_encode and self.world_size > 1:
             x = gather_and_trim_height(x, expected_height)
         return x
 
@@ -689,17 +689,17 @@ class WanDecoder3d(nn.Module):
         self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
 
         self.gradient_checkpointing = False
+        self.world_size = 1
+        self.rank = 0
+        if dist.is_initialized():
+            self.world_size = get_sp_world_size()
+            self.rank = get_sp_parallel_rank()
 
     def forward(self, x):
-        world_size = 1
-        if dist.is_initialized():
-            world_size = get_sp_world_size()
-
         expected_height = None
-        if self.use_parallel_decode and world_size > 1:
-            rank = get_sp_parallel_rank()
+        if self.use_parallel_decode and self.world_size > 1:
             x, expected_height = split_for_parallel_decode(
-                x, self.upsample_count, world_size, rank
+                x, self.upsample_count, self.world_size, self.rank
             )
 
         ## conv1
@@ -761,7 +761,7 @@ class WanDecoder3d(nn.Module):
         else:
             x = self.conv_out(x)
 
-        if self.use_parallel_decode and world_size > 1:
+        if self.use_parallel_decode and self.world_size > 1:
             x = gather_and_trim_height(x, expected_height)
         return x
 
