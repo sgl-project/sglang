@@ -578,6 +578,7 @@ class Engine(EngineBase):
         named_tensors: List[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        is_draft_model: bool = False,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -592,6 +593,7 @@ class Engine(EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
+            is_draft_model=is_draft_model,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
@@ -631,9 +633,9 @@ class Engine(EngineBase):
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
-    def get_weights_by_name(self, name: str, truncate_size: int = 100):
+    def get_weights_by_name(self, name: str, truncate_size: int = 100, is_draft_model: bool = False):
         """Get weights by parameter name."""
-        obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
+        obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size, is_draft_model=is_draft_model)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )

@@ -11,6 +11,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
+    GPU_MEMORY_TYPE_WEIGHTS_DRAFTER,
 )
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
@@ -88,8 +89,11 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        worker = self.draft_worker or self.tp_worker
-        success, message = worker.update_weights_from_tensor(recv_req)
+        if self.spec_algorithm.is_eagle() and recv_req.is_draft_model:
+            success, message = self.draft_worker.update_weights_from_tensor(recv_req)
+        else:
+            assert not recv_req.is_draft_model, f"Draft model requested but the spec_algorithm is {self.spec_algorithm}"
+            success, message = self.tp_worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
@@ -115,7 +119,11 @@ class SchedulerUpdateWeightsMixin:
         return UpdateWeightsFromIPCReqOutput(success, message)
 
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
-        parameter = self.tp_worker.get_weights_by_name(recv_req)
+        if self.spec_algorithm.is_eagle() and recv_req.is_draft_model:
+            parameter = self.draft_worker.get_weights_by_name(recv_req)
+        else:
+            assert not recv_req.is_draft_model, f"Draft model requested but the spec_algorithm is {self.spec_algorithm}"
+            parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
 
     def release_memory_occupation(
@@ -128,7 +136,9 @@ class SchedulerUpdateWeightsMixin:
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
+            tags = list(GPU_MEMORY_ALL_TYPES)
+            if self.spec_algorithm.is_eagle():
+                tags.append(GPU_MEMORY_TYPE_WEIGHTS_DRAFTER)
 
         for tag in tags:
             self.offload_tags.add(tag)
@@ -157,7 +167,9 @@ class SchedulerUpdateWeightsMixin:
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
+            tags = list(GPU_MEMORY_ALL_TYPES)
+            if self.spec_algorithm.is_eagle():
+                tags.append(GPU_MEMORY_TYPE_WEIGHTS_DRAFTER)
 
         for tag in tags:
             self.offload_tags.remove(tag)

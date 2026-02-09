@@ -429,6 +429,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.spec_accepted_tokens += (
                 sum(1 for idx in accept_index_row if idx != -1) - 1
             )
+            # Track tokens generated during SD for accurate acceptance length metrics
+            req.sd_completion_tokens += num_accepted
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1

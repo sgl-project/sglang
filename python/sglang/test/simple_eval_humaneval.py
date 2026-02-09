@@ -11,6 +11,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
 
+import numpy as np
+
 try:
     from human_eval.data import read_problems
     from human_eval.evaluation import estimate_pass_at_k
@@ -128,4 +130,66 @@ class HumanEval(Eval):
         results = common.map_with_progress(
             fn, self.examples, num_threads=self._num_threads
         )
-        return common.aggregate_results(results)
+
+        aggregated = common.aggregate_results(results)
+
+        # Compute acceptance length (for speculative decoding)
+        # Access metadata from sampler if available
+        if (
+            hasattr(sampler, "last_response_metadata")
+            and sampler.last_response_metadata
+        ):
+            metadata_list = sampler.last_response_metadata
+            has_verify = any("spec_verify_ct" in meta for meta in metadata_list)
+
+            if has_verify:
+                num_sd_tokens = 0
+                num_sd_verify = 0
+                num_sd_answers = 0
+                num_non_sd_answers = 0
+                acceptance_lengths = []  # Per-question acceptance lengths
+
+                for meta in metadata_list:
+                    verify_ct = meta.get("spec_verify_ct") or 0
+
+                    # Use sd_completion_tokens if available (excludes non-SD tokens)
+                    # Otherwise fall back to completion_tokens for backwards compatibility
+                    if "sd_completion_tokens" in meta:
+                        sd_tokens = meta["sd_completion_tokens"] or 0
+                    else:
+                        # Fallback: only count completion_tokens if SD was used
+                        sd_tokens = (
+                            meta.get("completion_tokens", 0) if verify_ct > 0 else 0
+                        )
+
+                    # Only count answers where SD was actually used
+                    if verify_ct > 0:
+                        num_sd_tokens += sd_tokens
+                        num_sd_verify += verify_ct
+                        num_sd_answers += 1
+                        acceptance_lengths.append(sd_tokens / verify_ct)
+                    else:
+                        num_non_sd_answers += 1
+
+                print(
+                    f"[DEBUG] SD answers: {num_sd_answers}, Non-SD answers: {num_non_sd_answers}"
+                )
+                print(
+                    f"[DEBUG] SD tokens: {num_sd_tokens}, SD verify steps: {num_sd_verify}"
+                )
+
+                if acceptance_lengths:
+                    print(f"[DEBUG] Per-question acceptance length:")
+                    print(f"  Min: {min(acceptance_lengths):.2f}")
+                    print(f"  Max: {max(acceptance_lengths):.2f}")
+                    print(f"  Median: {np.median(acceptance_lengths):.2f}")
+                    print(f"  Mean: {np.mean(acceptance_lengths):.2f}")
+
+                if num_sd_verify > 0:
+                    accept_length = num_sd_tokens / num_sd_verify
+                    print(f"Acceptance length: {accept_length:.3f}")
+                else:
+                    accept_length = 1.0  # No SD was used
+                    print(f"Acceptance length: {accept_length:.3f} (No SD used)")
+
+        return aggregated

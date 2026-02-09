@@ -62,7 +62,11 @@ class EAGLEDraftCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner,
+            spec_min_bs=self.eagle_worker.strategy_min_bs,
+            spec_max_bs=self.eagle_worker.strategy_max_bs,
+        )
 
         # Attention backend
         self.num_tokens_per_bs = self.topk

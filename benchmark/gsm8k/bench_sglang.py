@@ -116,11 +116,62 @@ def main(args):
     )
     output_throughput = num_output_tokens / latency
 
+    # Compute acceptance length (for speculative decoding)
+    has_verify = "spec_verify_ct" in states[0].get_meta_info("answer")
+    if has_verify:
+        # Track SD-only answers
+        num_sd_tokens = 0
+        num_sd_verify = 0
+        num_sd_answers = 0
+        num_non_sd_answers = 0
+        acceptance_lengths = []  # Per-question acceptance lengths
+
+        for s in states:
+            meta = s.get_meta_info("answer")
+            verify_ct = meta.get("spec_verify_ct", 0)
+
+            # Use sd_completion_tokens if available (excludes non-SD tokens)
+            # Otherwise fall back to completion_tokens for backwards compatibility
+            if "sd_completion_tokens" in meta:
+                sd_tokens = meta["sd_completion_tokens"]
+            else:
+                # Fallback: only count completion_tokens if SD was used
+                sd_tokens = meta["completion_tokens"] if verify_ct > 0 else 0
+
+            # Only count answers where SD was actually used
+            if verify_ct > 0:
+                num_sd_tokens += sd_tokens
+                num_sd_verify += verify_ct
+                num_sd_answers += 1
+                acceptance_lengths.append(sd_tokens / verify_ct)
+            else:
+                num_non_sd_answers += 1
+
+        print(
+            f"\n[DEBUG] SD answers: {num_sd_answers}, Non-SD answers: {num_non_sd_answers}"
+        )
+        print(f"[DEBUG] SD tokens: {num_sd_tokens}, SD verify steps: {num_sd_verify}")
+
+        if acceptance_lengths:
+            print(f"[DEBUG] Per-question acceptance length:")
+            print(f"  Min: {min(acceptance_lengths):.2f}")
+            print(f"  Max: {max(acceptance_lengths):.2f}")
+            print(f"  Median: {np.median(acceptance_lengths):.2f}")
+            print(f"  Mean: {np.mean(acceptance_lengths):.2f}")
+
+        if num_sd_verify > 0:
+            accept_length = num_sd_tokens / num_sd_verify
+        else:
+            accept_length = 1.0  # No SD was used
+    else:
+        accept_length = 1.0
+
     # Print results
     print(f"Accuracy: {acc:.3f}")
     print(f"Invalid: {invalid:.3f}")
     print(f"Latency: {latency:.3f} s")
     print(f"Output throughput: {output_throughput:.3f} token/s")
+    print(f"Acceptance length: {accept_length:.3f}")
 
     # Dump results
     dump_state_text(f"tmp_output_{args.backend}.txt", states)

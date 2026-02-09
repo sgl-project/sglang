@@ -486,6 +486,7 @@ def select_top_k_tokens(
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
+        real_parents = None
     else:
         # The later decode steps
         expand_scores = torch.mul(
@@ -505,13 +506,15 @@ def select_top_k_tokens(
             ).repeat_interleave(topk)
             hidden_states = hidden_states[selected_input_index, :]
 
+        real_parents = topk_cs_index // topk
+
         tree_info = (
             expand_scores,  # shape: (b, topk, topk)
             topk_index,  # shape: (b, topk * topk)
             topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
         )
 
-    return input_ids, hidden_states, scores, tree_info
+    return input_ids, hidden_states, scores, tree_info, real_parents
 
 
 def generate_simulated_accept_index(

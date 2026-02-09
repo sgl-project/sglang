@@ -137,12 +137,21 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
             )
 
         self.logits_processor = LogitsProcessor(config)
+        self.stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
         self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
             if "lm_head" not in name:
-                name = "model." + name
+                if not name.startswith("model."):
+                    name = "model." + name
                 super().load_weights([(name, loaded_weight)])
 
 

@@ -484,10 +484,13 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                # Non-SD decode: don't increment sd_completion_tokens
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+                # SD decode: increment sd_completion_tokens
+                req.sd_completion_tokens += new_accepted_len
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)
@@ -934,6 +937,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
+        sd_completion_tokens = []
         spec_accepted_tokens = []
         retraction_counts = []
         output_hidden_states = None
@@ -1064,6 +1068,7 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
+                    sd_completion_tokens.append(req.sd_completion_tokens)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
 
                 if return_logprob:
@@ -1165,6 +1170,7 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
+                    sd_completion_tokens=sd_completion_tokens,
                     spec_accepted_tokens=spec_accepted_tokens,
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
