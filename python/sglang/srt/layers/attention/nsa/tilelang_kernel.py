@@ -797,7 +797,7 @@ def sparse_mla_fwd_decode_partial(
     Each block does one topk block, writes partial_o, partial_lse.
     """
 
-    assert is_causal == True, "non-casual is not supported"
+    assert is_causal == True, "non-causal is not supported"
     assert kv_group == 1
     assert topk % block_I == 0
 
@@ -856,7 +856,6 @@ def sparse_mla_fwd_decode_partial(
             s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
             topk_block_i = by
             q_i = s_i
-            max_kv_i = q_i
 
             H0 = 0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64
             H1 = H0 + H_per_block
