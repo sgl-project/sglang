@@ -83,6 +83,105 @@ def fused_add_rmsnorm(
     )
 
 
+def fused_add_rmsnorm_quant_fp8(
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> tuple:
+    r"""Fused add-RMSNorm + per-token FP8 quantization.
+
+    Combines ``fused_add_rmsnorm`` and ``per_token_quant_fp8`` into a single
+    kernel launch, eliminating the intermediate BF16 global memory round-trip.
+
+    Step 1: ``residual[i] += input[i]``
+    Step 2: ``norm[i] = (residual[i] / RMS(residual)) * weight[i]``
+    Step 3: ``scale = max(|norm|) / FP8_E4M3_MAX``
+    Step 4: ``output_q[i] = fp8(norm[i] / scale)``
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Input tensor, shape ``(num_tokens, hidden_size)``. Read-only.
+    residual : torch.Tensor
+        Residual tensor, shape ``(num_tokens, hidden_size)``. Updated in-place.
+    weight : torch.Tensor
+        RMSNorm weight tensor, shape ``(hidden_size,)``.
+    eps : float
+        Epsilon for numerical stability.
+    enable_pdl : Optional[bool]
+        Whether to enable programmatic dependent launch (SM90+).
+        If None, auto-detected based on architecture.
+
+    Returns
+    -------
+    output_q : torch.Tensor
+        Quantized output, shape ``(num_tokens, hidden_size)``, dtype ``torch.float8_e4m3fn``.
+    output_s : torch.Tensor
+        Per-token scales, shape ``(num_tokens, 1)``, dtype ``torch.float32``.
+    """
+    num_tokens = input.shape[0]
+    hidden_size = input.shape[1]
+    output_q = torch.empty(
+        (num_tokens, hidden_size), device=input.device, dtype=torch.float8_e4m3fn
+    )
+    output_s = torch.empty(
+        (num_tokens, 1), device=input.device, dtype=torch.float32
+    )
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.fused_add_rmsnorm_quant_fp8.default(
+        input, residual, weight, output_q, output_s, eps, enable_pdl
+    )
+    return output_q, output_s
+
+
+def fused_silu_mul_quant_fp8(
+    input: torch.Tensor,
+    enable_pdl: Optional[bool] = None,
+) -> tuple:
+    r"""Fused SiLU-Mul + per-token FP8 quantization.
+
+    Combines ``silu_and_mul`` and ``per_token_quant_fp8`` into a single kernel
+    launch, eliminating the intermediate BF16 global memory round-trip.
+
+    Step 1: ``act[i] = silu(gate[i]) * up[i]``  (gate/up from input halves)
+    Step 2: ``scale = max(|act|) / FP8_E4M3_MAX``
+    Step 3: ``output_q[i] = fp8(act[i] / scale)``
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Gate-up projection output, shape ``(num_tokens, 2 * intermediate_size)``.
+    enable_pdl : Optional[bool]
+        Whether to enable programmatic dependent launch (SM90+).
+        If None, auto-detected based on architecture.
+
+    Returns
+    -------
+    output_q : torch.Tensor
+        Quantized output, shape ``(num_tokens, intermediate_size)``,
+        dtype ``torch.float8_e4m3fn``.
+    output_s : torch.Tensor
+        Per-token scales, shape ``(num_tokens, 1)``, dtype ``torch.float32``.
+    """
+    num_tokens = input.size(0)
+    d = input.size(-1) // 2
+    output_q = torch.empty(
+        (num_tokens, d), device=input.device, dtype=torch.float8_e4m3fn
+    )
+    output_s = torch.empty(
+        (num_tokens, 1), device=input.device, dtype=torch.float32
+    )
+    if enable_pdl is None:
+        enable_pdl = is_arch_support_pdl()
+    torch.ops.sgl_kernel.fused_silu_mul_quant_fp8.default(
+        input, output_q, output_s, enable_pdl
+    )
+    return output_q, output_s
+
+
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,

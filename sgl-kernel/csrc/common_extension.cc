@@ -69,6 +69,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("fused_add_rmsnorm", torch::kCUDA, &sgl_fused_add_rmsnorm);
 
+  m.def(
+      "fused_add_rmsnorm_quant_fp8(Tensor input, Tensor! residual, Tensor weight,"
+      " Tensor! output_q, Tensor! output_s, float eps, bool enable_pdl) -> ()");
+  m.impl("fused_add_rmsnorm_quant_fp8", torch::kCUDA, &sgl_fused_add_rmsnorm_quant_fp8);
+
+  m.def(
+      "fused_silu_mul_quant_fp8(Tensor input,"
+      " Tensor! output_q, Tensor! output_s, bool enable_pdl) -> ()");
+  m.impl("fused_silu_mul_quant_fp8", torch::kCUDA, &sgl_fused_silu_mul_quant_fp8);
+
   m.def("gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
   m.impl("gemma_rmsnorm", torch::kCUDA, &gemma_rmsnorm);
 

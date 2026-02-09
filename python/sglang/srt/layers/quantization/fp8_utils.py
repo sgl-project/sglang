@@ -1079,7 +1079,7 @@ def _apply_fallback_scaled_mm(
 
 
 def apply_fp8_linear(
-    input: torch.Tensor,
+    input,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
@@ -1090,58 +1090,68 @@ def apply_fp8_linear(
     pad_output: Optional[bool] = None,
     compressed_tensor_quant: bool = False,
 ) -> torch.Tensor:
-    # Note: we pad the input because torch._scaled_mm is more performant
-    # for matrices with batch dimension > 16.
-    # This could change in the future.
-    # We also don't pad when using torch.compile,
-    # as it breaks with dynamic shapes.
-    if pad_output is None:
-        pad_output = not cutlass_fp8_supported and not get_bool_env_var(
-            "SGLANG_ENABLE_TORCH_COMPILE"
-        )
-    output_padding = 17 if pad_output else None
-
-    # View input as 2D matrix for fp8 methods
-    input_2d = input.view(-1, input.shape[-1])
-    output_shape = [*input.shape[:-1], weight.shape[1]]
-
-    if compressed_tensor_quant:
-        # Maybe apply padding to output, see comment in __init__
-        num_token_padding = output_padding
-        if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
-            num_token_padding = None
-        qinput, x_scale = scaled_fp8_quant(
-            input_2d,
-            input_scale,
-            num_token_padding=num_token_padding,
-            use_per_token_if_dynamic=use_per_token_if_dynamic,
-        )
+    # Pre-quantized (qinput, x_scale, out_dtype) from fused kernels
+    # (e.g., fused_add_rmsnorm_quant_fp8, fused_silu_mul_quant_fp8).
+    # Skip quantization and go directly to GEMM dispatch.
+    if isinstance(input, tuple):
+        qinput, x_scale, out_dtype = input
+        input_2d = qinput
+        output_shape = [*qinput.shape[:-1], weight.shape[1]]
     else:
-        # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
-        if input_scale is not None:
-            assert input_scale.numel() == 1
-            # broadcast per-tensor scale to per-token scale when supporting cutlass
-            qinput, x_scale = static_quant_fp8(
-                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
+        out_dtype = input.dtype
+        # Note: we pad the input because torch._scaled_mm is more performant
+        # for matrices with batch dimension > 16.
+        # This could change in the future.
+        # We also don't pad when using torch.compile,
+        # as it breaks with dynamic shapes.
+        if pad_output is None:
+            pad_output = (
+                not get_bool_env_var("SGLANG_ENABLE_TORCH_COMPILE")
+                and not cutlass_fp8_supported
+            )
+        output_padding = 17 if pad_output else None
+
+        # View input as 2D matrix for fp8 methods
+        input_2d = input.view(-1, input.shape[-1])
+        output_shape = [*input.shape[:-1], weight.shape[1]]
+
+        if compressed_tensor_quant:
+            # Maybe apply padding to output, see comment in __init__
+            num_token_padding = output_padding
+            if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
+                num_token_padding = None
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=num_token_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
             )
         else:
-            # default use per-token quantization if dynamic
-            if _is_cuda:
-                qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
+            # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
+            if input_scale is not None:
+                assert input_scale.numel() == 1
+                # broadcast per-tensor scale to per-token scale when supporting cutlass
+                qinput, x_scale = static_quant_fp8(
+                    input_2d, input_scale, repeat_scale=cutlass_fp8_supported
+                )
             else:
-                # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
-                # final solution should be: 1. add support to per-tensor activation scaling.
-                # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
-                if _is_hip and weight_scale.numel() == 1:
-                    qinput, x_scale = scaled_fp8_quant(
-                        input_2d,
-                        input_scale,
-                        use_per_token_if_dynamic=use_per_token_if_dynamic,
-                    )
+                # default use per-token quantization if dynamic
+                if _is_cuda:
+                    qinput, x_scale = sglang_per_token_quant_fp8(input_2d)
                 else:
-                    qinput, x_scale = per_token_group_quant_fp8(
-                        input_2d, group_size=input_2d.shape[1]
-                    )
+                    # TODO(kkhuang): temporarily enforce per-tensor activation scaling if weight is per-tensor scaling
+                    # final solution should be: 1. add support to per-tensor activation scaling.
+                    # 2. solve the torch.compile error from weight_scale.numel() == 1 and x_scale.numel() > 1 (below line#308)
+                    if _is_hip and weight_scale.numel() == 1:
+                        qinput, x_scale = scaled_fp8_quant(
+                            input_2d,
+                            input_scale,
+                            use_per_token_if_dynamic=use_per_token_if_dynamic,
+                        )
+                    else:
+                        qinput, x_scale = per_token_group_quant_fp8(
+                            input_2d, group_size=input_2d.shape[1]
+                        )
 
     if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
         cutlass_compatible_b = weight.shape[0] % 16 == 0 and weight.shape[1] % 16 == 0
@@ -1149,7 +1159,7 @@ def apply_fp8_linear(
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
-                qinput, weight, x_scale, weight_scale, input.dtype, bias
+                qinput, weight, x_scale, weight_scale, out_dtype, bias
             )
         else:
             output = fp8_scaled_mm(
@@ -1157,7 +1167,7 @@ def apply_fp8_linear(
                 weight,
                 x_scale,
                 weight_scale,
-                out_dtype=input.dtype,
+                out_dtype=out_dtype,
                 bias=bias,
             )
         return output.view(*output_shape)
@@ -1190,7 +1200,7 @@ def apply_fp8_linear(
                 WQ=weight.T,
                 x_scale=x_scale,
                 w_scale=weight_scale,
-                dtype=input.dtype,
+                dtype=out_dtype,
             )
             if bias is not None:
                 output += bias
@@ -1206,7 +1216,7 @@ def apply_fp8_linear(
             output = torch._scaled_mm(
                 qinput,
                 weight,
-                out_dtype=input.dtype,
+                out_dtype=out_dtype,
                 scale_a=x_scale,
                 scale_b=weight_scale.t(),
                 bias=bias,
@@ -1220,7 +1230,7 @@ def apply_fp8_linear(
         output = torch._scaled_mm(
             qinput,
             weight,
-            out_dtype=input.dtype,
+            out_dtype=out_dtype,
             scale_a=x_scale,
             scale_b=weight_scale,
             bias=bias,
@@ -1249,7 +1259,7 @@ def apply_fp8_linear(
         input_2d.shape,
         output_shape,
         bias,
-        input.dtype,
+        out_dtype,
     )
 
 

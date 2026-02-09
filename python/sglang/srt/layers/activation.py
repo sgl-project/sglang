@@ -49,7 +49,12 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 
 if _is_cuda or _is_xpu:
-    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
+    from sgl_kernel import (
+        fused_silu_mul_quant_fp8,
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
 
@@ -75,6 +80,16 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_fused_quant_fp8(self, x: torch.Tensor) -> tuple:
+        """Fused SiLU-Mul + per-token FP8 quantization.
+
+        Returns (fp8_output, scales, out_dtype) tuple consumable by
+        apply_fp8_linear.
+        """
+        out_dtype = x.dtype
+        output_q, output_s = fused_silu_mul_quant_fp8(x)
+        return (output_q, output_s, out_dtype)
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:

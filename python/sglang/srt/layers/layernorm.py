@@ -60,6 +60,7 @@ if _is_cuda or _is_xpu:
 
     from sgl_kernel import (
         fused_add_rmsnorm,
+        fused_add_rmsnorm_quant_fp8,
         gemma_fused_add_rmsnorm,
         gemma_rmsnorm,
         rmsnorm,
@@ -137,6 +138,25 @@ class RMSNorm(MultiPlatformOp):
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def forward_fused_quant_fp8(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> Tuple[tuple, torch.Tensor]:
+        """Fused AddRMSNorm + per-token FP8 quantization.
+
+        Returns ((fp8_output, scales, out_dtype), residual) where the first
+        element is a pre-quantized tuple consumable by apply_fp8_linear.
+        """
+        assert self.variance_size_override is None, (
+            "forward_fused_quant_fp8 does not support variance_size_override"
+        )
+        out_dtype = x.dtype
+        output_q, output_s = fused_add_rmsnorm_quant_fp8(
+            x, residual, self.weight.data, eps=self.variance_epsilon
+        )
+        return (output_q, output_s, out_dtype), residual
 
     def forward_npu(
         self,

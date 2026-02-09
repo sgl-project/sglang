@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -50,12 +51,24 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 Qwen2Config = None
 
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_fused_quant_fp8(quant_config: Optional[QuantizationConfig]) -> bool:
+    """Check if quant_config supports fused norm/activation + FP8 quantization."""
+    return (
+        _is_cuda
+        and quant_config is not None
+        and getattr(quant_config, "activation_scheme", None) == "dynamic"
+        and getattr(quant_config, "weight_block_size", None) is None
+        and get_global_server_args().rl_on_policy_target is None
+    )
 
 
 class Qwen2MLP(nn.Module):
@@ -88,13 +101,17 @@ class Qwen2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self._fuse_act_quant_fp8 = _supports_fused_quant_fp8(quant_config)
 
     def forward(self, x):
         if get_global_server_args().rl_on_policy_target is not None:
             x = x.bfloat16()
 
         gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self._fuse_act_quant_fp8:
+            x = self.act_fn.forward_fused_quant_fp8(gate_up)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -231,6 +248,7 @@ class Qwen2DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._fuse_norm_quant_fp8 = _supports_fused_quant_fp8(quant_config)
 
     def forward(
         self,
@@ -240,11 +258,24 @@ class Qwen2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
+        use_fused = (
+            self._fuse_norm_quant_fp8
+            and not is_batch_invariant_mode_enabled()
+        )
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if use_fused:
+                hidden_states, residual = (
+                    self.input_layernorm.forward_fused_quant_fp8(
+                        hidden_states, residual
+                    )
+                )
+            else:
+                hidden_states, residual = self.input_layernorm(
+                    hidden_states, residual
+                )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -252,7 +283,16 @@ class Qwen2DecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if use_fused:
+            hidden_states, residual = (
+                self.post_attention_layernorm.forward_fused_quant_fp8(
+                    hidden_states, residual
+                )
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
