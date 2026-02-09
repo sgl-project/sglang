@@ -54,6 +54,44 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
     return pad_size
 
 
+def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
+    # is_post_update: whether to update an existing config
+    from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+    # Linear attn check logic
+    if hasattr(model_config, "linear_num_key_heads") and hasattr(
+        model_config, "linear_num_value_heads"
+    ):
+        if (
+            model_config.linear_num_key_heads % tp_size != 0
+            or model_config.linear_num_value_heads % tp_size != 0
+        ):
+            pad_size = tp_size
+            linear_num_key_heads_cpu = pad_vocab_size(
+                model_config.linear_num_key_heads, pad_size
+            )
+            linear_num_value_heads_cpu = (
+                linear_num_key_heads_cpu
+                * model_config.linear_num_value_heads
+                // model_config.linear_num_key_heads
+            )
+            if is_post_update:
+                model_config.linear_num_key_heads_cpu = linear_num_key_heads_cpu
+                model_config.linear_num_value_heads_cpu = linear_num_value_heads_cpu
+            else:
+                model_config.linear_num_key_heads = linear_num_key_heads_cpu
+                model_config.linear_num_value_heads = linear_num_value_heads_cpu
+
+        else:
+            if is_post_update:
+                model_config.linear_num_key_heads_cpu = (
+                    model_config.linear_num_key_heads
+                )
+                model_config.linear_num_value_heads_cpu = (
+                    model_config.linear_num_value_heads
+                )
+
+
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
     attr_value = intermediate_padding_size
     if hasattr(model_config, "hf_config") and hasattr(
@@ -137,6 +175,8 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config.hf_config.num_attention_heads = num_attention_heads
         model_config.hf_text_config.num_attention_heads = num_attention_heads
 
+    adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
+
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
     model_config = update_intermediate_size(
         model_config, "moe_intermediate_size", intermediate_padding_size
@@ -146,6 +186,9 @@ def adjust_config_with_unaligned_cpu_tp(
     )
     model_config = update_intermediate_size(
         model_config, "intermediate_size_mlp", intermediate_padding_size
+    )
+    model_config = update_intermediate_size(
+        model_config, "shared_expert_intermediate_size", intermediate_padding_size
     )
     if (
         hasattr(model_config.hf_config, "vision_config")

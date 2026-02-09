@@ -64,11 +64,38 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
             capture_output=True,
             text=True,
         )
-        # Print captured output to maintain visibility of successful runs
-        if result.stdout:
-            print(result.stdout, end="")
-        if result.stderr:
-            print(result.stderr, end="")
+        # Check for errors in output even if exit code is 0
+        # lmms_eval sometimes returns 0 even when errors occur
+        combined_output = result.stdout + result.stderr
+        if _is_mmmu_parquet_corruption(combined_output):
+            print(
+                "Detected MMMU parquet corruption error in output. Attempting recovery..."
+            )
+            if _cleanup_mmmu_dataset_cache():
+                print("Retrying lmms_eval with fresh download...")
+                with temp_set_env(
+                    HF_HUB_OFFLINE="0",
+                    HF_DATASETS_DOWNLOAD_MODE="force_redownload",
+                ):
+                    retry_result = subprocess.run(
+                        cmd, check=True, timeout=timeout, capture_output=True, text=True
+                    )
+                    # Print retry output
+                    if retry_result.stdout:
+                        print(retry_result.stdout, end="")
+                    if retry_result.stderr:
+                        print(retry_result.stderr, end="")
+            else:
+                print(
+                    f"Failed to cleanup corrupted MMMU cache. Output from lmms_eval:\nStdout:\n{result.stdout}\nStderr:\n{result.stderr}"
+                )
+                raise RuntimeError("Failed to cleanup corrupted MMMU cache")
+        else:
+            # Print captured output to maintain visibility of successful runs
+            if result.stdout:
+                print(result.stdout, end="")
+            if result.stderr:
+                print(result.stderr, end="")
     except subprocess.CalledProcessError as e:
         error_output = e.stderr + e.stdout
         if _is_mmmu_parquet_corruption(error_output):
@@ -79,7 +106,14 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
                     HF_HUB_OFFLINE="0",
                     HF_DATASETS_DOWNLOAD_MODE="force_redownload",
                 ):
-                    subprocess.run(cmd, check=True, timeout=timeout)
+                    retry_result = subprocess.run(
+                        cmd, check=True, timeout=timeout, capture_output=True, text=True
+                    )
+                    # Print retry output
+                    if retry_result.stdout:
+                        print(retry_result.stdout, end="")
+                    if retry_result.stderr:
+                        print(retry_result.stderr, end="")
             else:
                 print(
                     f"Failed to cleanup corrupted MMMU cache. Error from lmms_eval:\nStdout:\n{e.stdout}\nStderr:\n{e.stderr}"
