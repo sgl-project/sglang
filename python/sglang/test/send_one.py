@@ -10,6 +10,7 @@ python3 -m sglang.test.send_one --profile --profile-by-stage
 import argparse
 import dataclasses
 import json
+from typing import Optional
 
 import requests
 import tabulate
@@ -22,6 +23,7 @@ class BenchArgs:
     host: str = "localhost"
     port: int = 30000
     batch_size: int = 1
+    different_prompts: bool = False
     temperature: float = 0.0
     max_new_tokens: int = 512
     frequency_penalty: float = 0.0
@@ -37,12 +39,18 @@ class BenchArgs:
     profile: bool = False
     profile_steps: int = 3
     profile_by_stage: bool = False
+    profile_prefix: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--host", type=str, default=BenchArgs.host)
         parser.add_argument("--port", type=int, default=BenchArgs.port)
         parser.add_argument("--batch-size", type=int, default=BenchArgs.batch_size)
+        parser.add_argument(
+            "--different-prompts",
+            action="store_true",
+            default=BenchArgs.different_prompts,
+        )
         parser.add_argument("--temperature", type=float, default=BenchArgs.temperature)
         parser.add_argument(
             "--max-new-tokens", type=int, default=BenchArgs.max_new_tokens
@@ -64,6 +72,9 @@ class BenchArgs:
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--profile-prefix", type=str, default=BenchArgs.profile_prefix
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -71,24 +82,25 @@ class BenchArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
 
-def send_one_prompt(args):
+def send_one_prompt(args: BenchArgs):
     base_url = f"http://{args.host}:{args.port}"
 
+    # Construct the input
     if args.image:
         args.prompt = (
             "Human: Describe this image in a very short sentence.\n\nAssistant:"
         )
-        image_data = "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+        image_data = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
     elif args.many_images:
         args.prompt = (
             "Human: I have one reference image and many images."
             "Describe their relationship in a very short sentence.\n\nAssistant:"
         )
         image_data = [
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
-            "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
+            "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png",
         ]
     else:
         image_data = None
@@ -106,7 +118,10 @@ def send_one_prompt(args):
         json_schema = None
 
     if args.batch_size > 1:
-        prompt = [prompt] * args.batch_size
+        if not args.different_prompts:
+            prompt = [prompt] * args.batch_size
+        else:
+            prompt = [f"Test case {i+1}: " + prompt for i in range(args.batch_size)]
 
     json_data = {
         "text": prompt,
@@ -127,14 +142,14 @@ def send_one_prompt(args):
     if args.profile:
         print(f"Running profiler with {args.profile_steps} steps...")
         run_profile(
-            base_url,
-            args.profile_steps,
-            ["CPU", "GPU"],
-            None,
-            None,
-            args.profile_by_stage,
+            url=base_url,
+            num_steps=args.profile_steps,
+            activities=["CPU", "GPU"],
+            profile_by_stage=args.profile_by_stage,
+            profile_prefix=args.profile_prefix,
         )
 
+    # Send the request
     response = requests.post(
         f"{base_url}/generate",
         json=json_data,
@@ -162,6 +177,7 @@ def send_one_prompt(args):
         print(ret)
         return 0, 0
 
+    # Print results
     if "spec_verify_ct" in ret["meta_info"] and ret["meta_info"]["spec_verify_ct"] > 0:
         acc_length = (
             ret["meta_info"]["completion_tokens"] / ret["meta_info"]["spec_verify_ct"]
@@ -188,6 +204,6 @@ def send_one_prompt(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     BenchArgs.add_cli_args(parser)
-    args = parser.parse_args()
+    args = BenchArgs.from_cli_args(parser.parse_args())
 
     send_one_prompt(args)

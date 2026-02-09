@@ -1,4 +1,4 @@
-ARG CANN_VERSION=8.2.rc1
+ARG CANN_VERSION=8.5.0
 ARG DEVICE_TYPE=a3
 ARG OS=ubuntu22.04
 ARG PYTHON_VERSION=py3.11
@@ -6,19 +6,31 @@ ARG PYTHON_VERSION=py3.11
 FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
 # Update pip & apt sources
+ARG TARGETARCH
+ARG CANN_VERSION
 ARG DEVICE_TYPE
 ARG PIP_INDEX_URL="https://pypi.org/simple/"
 ARG APTMIRROR=""
-ARG MEMFABRIC_URL=https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl
-ARG PYTORCH_VERSION=2.6.0
-ARG TORCHVISION_VERSION=0.21.0
-ARG PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/torch_npu-2.6.0.post2%2Bgit95d6260-cp311-cp311-linux_aarch64.whl"
-ARG VLLM_TAG=v0.8.5
-ARG TRITON_ASCEND_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend-3.2.0%2Bgitb0ea0850-cp311-cp311-linux_aarch64.whl"
-ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/Ascend-BiSheng-toolkit_aarch64.run"
+ARG PYTORCH_VERSION="2.8.0"
+ARG TORCHVISION_VERSION="0.23.0"
+ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_aarch64.whl"
+ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.0-pytorch2.8.0/torch_npu-2.8.0.post2-cp311-cp311-manylinux_2_28_x86_64.whl"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
+
+ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
+ARG DEVICE_TYPE
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      echo "Using x86_64 dependencies"; \
+      echo "PTA_URL=$PTA_URL_AMD64" >> /etc/environment_new; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+      echo "Using aarch64 dependencies"; \
+      echo "PTA_URL=$PTA_URL_ARM64" >> /etc/environment_new; \
+    else \
+      echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
+    fi
 
 WORKDIR /workspace
 
@@ -30,6 +42,7 @@ RUN if [ -n "$APTMIRROR" ];then sed -i "s|.*.ubuntu.com|$APTMIRROR|g" /etc/apt/s
 
 # Install development tools and utilities
 RUN apt-get update -y && apt upgrade -y && apt-get install -y \
+    unzip \
     build-essential \
     cmake \
     vim \
@@ -45,7 +58,6 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
     libssl-dev \
     pkg-config \
     ca-certificates \
-    protobuf-compiler \
     && rm -rf /var/cache/apt/* \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates \
@@ -54,53 +66,37 @@ RUN apt-get update -y && apt upgrade -y && apt-get install -y \
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
-ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Install dependencies
-# TODO: install from pypi released memfabric
-RUN pip install $MEMFABRIC_URL --no-cache-dir
 
-RUN pip install setuptools-rust wheel build --no-cache-dir
+### Install MemFabric
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.5
+### Install SGLang Model Gateway
+RUN ${PIP_INSTALL} sglang-router
 
-# install rustup from rustup.rs
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustc --version && cargo --version && protoc --version
 
-# Install vLLM
-RUN git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG && \
-    (cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v . --no-cache-dir) && rm -rf vllm
+### Install PyTorch and PTA
+RUN . /etc/environment_new && \
+    (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu) \
+    && (${PIP_INSTALL} ${PTA_URL})
 
-# TODO: install from pypi released triton-ascend
-RUN pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu --no-cache-dir \
-    && wget ${PTA_URL} && pip install "./torch_npu-2.6.0.post2+git95d6260-cp311-cp311-linux_aarch64.whl" --no-cache-dir \
-    && python3 -m pip install --no-cache-dir attrs==24.2.0 numpy==1.26.4 scipy==1.13.1 decorator==5.1.1 psutil==6.0.0 pytest==8.3.2 pytest-xdist==3.6.1 pyyaml pybind11 \
-    && pip install ${TRITON_ASCEND_URL} --no-cache-dir
+
+## Install triton-ascend
+RUN (${PIP_INSTALL} pybind11 triton-ascend)
 
 # Install SGLang
 RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG && \
-    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_other.toml pyproject.toml && pip install -v .[srt_npu] --no-cache-dir) && \
-    (cd sglang/sgl-router && python -m build && pip install --force-reinstall dist/*.whl) && \
+    (cd sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && ${PIP_INSTALL} -v .[all_npu]) && \
     rm -rf sglang
 
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
-RUN pip install wheel==0.45.1 && git clone  --branch $SGLANG_KERNEL_NPU_TAG https://github.com/sgl-project/sgl-kernel-npu.git \
-    && export LD_LIBRARY_PATH=${ASCEND_CANN_PATH}/latest/runtime/lib64/stub:$LD_LIBRARY_PATH && \
-    source ${ASCEND_CANN_PATH}/set_env.sh && \
-    cd sgl-kernel-npu && \
-    bash build.sh \
-    && pip install output/deep_ep*.whl output/sgl_kernel_npu*.whl --no-cache-dir \
+RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
+    && mkdir sgl-kernel-npu \
+    && cd sgl-kernel-npu \
+    && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
+    && unzip sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
+    && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl \
     && cd .. && rm -rf sgl-kernel-npu \
-    && cd "$(pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
-
-# Install CustomOps
-RUN wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp && \
-    wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
-    pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-
-# Install Bisheng
-RUN wget ${BISHENG_URL} && chmod a+x Ascend-BiSheng-toolkit_aarch64.run && ./Ascend-BiSheng-toolkit_aarch64.run --install && rm Ascend-BiSheng-toolkit_aarch64.run
+    && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -sf deep_ep/deep_ep_cpp*.so
 
 CMD ["/bin/bash"]

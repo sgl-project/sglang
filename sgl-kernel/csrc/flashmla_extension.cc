@@ -27,6 +27,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "is_fp8_kvcache, int? topk) -> Tensor[]");
   m.impl("get_mla_decoding_metadata", torch::kCUDA, &get_mla_decoding_metadata);
 
+  m.def("get_mla_decoding_metadata_dense_fp8(Tensor seqlens_k, int num_heads_per_head_k, int num_heads_k) -> Tensor[]");
+  m.impl("get_mla_decoding_metadata_dense_fp8", torch::kCUDA, &get_mla_decoding_metadata_dense_fp8);
+
   m.def(
       "fwd_kvcache_mla(Tensor q, Tensor kv_cache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "
       "softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits, bool is_fp8, Tensor? indices) "
@@ -41,6 +44,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("sparse_prefill_fwd(Tensor q, Tensor kv, Tensor indices, float sm_scale, int d_v) -> Tensor[]");
   m.impl("sparse_prefill_fwd", torch::kCUDA, &sparse_prefill_fwd);
+
+  m.def(
+      "fwd_kvcache_mla_fp8(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "
+      "softmax_scale, bool is_causal, Tensor tile_scheduler_metadata, Tensor num_splits, Tensor? descale_q, Tensor? "
+      "descale_k) -> Tensor[]");
+  m.impl("fwd_kvcache_mla_fp8", torch::kCUDA, &fwd_kvcache_mla_fp8);
 }
 
 REGISTER_EXTENSION(flashmla_ops)

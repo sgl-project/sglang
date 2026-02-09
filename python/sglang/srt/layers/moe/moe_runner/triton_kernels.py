@@ -90,6 +90,10 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
             triton_kernel_fused_experts_with_bias,
         )
 
+        assert (
+            self.config.is_gated
+        ), "Only gated MoEs are supported for Triton Kernels runner"
+
         hidden_states = runner_input.hidden_states
 
         common_kwargs = dict(

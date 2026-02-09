@@ -114,7 +114,7 @@ class _DpGatheredBufferWrapper:
 
     @classmethod
     def get_global_dp_buffer(cls) -> torch.Tensor:
-        with use_symmetric_memory(get_tp_group()):
+        with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
                 dtype=cls._dtype,
@@ -289,6 +289,10 @@ def initialize_dp_attention(
         _LOCAL_ATTN_DP_SIZE = 1
 
     tp_group = get_tp_group()
+    # Trick to solve circular references
+    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+
+    use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))
@@ -296,7 +300,7 @@ def initialize_dp_attention(
         ],
         tp_group.local_rank,
         torch.distributed.get_backend(tp_group.device_group),
-        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+        use_pynccl=use_pynccl,
         use_pymscclpp=False,
         use_custom_allreduce=False,
         use_torch_symm_mem_all_reduce=False,
@@ -463,9 +467,9 @@ def _dp_gather_via_all_reduce(
         not local_tokens.dtype.is_floating_point
         and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
     ):
-        torch.ops.sglang.inplace_all_reduce(
-            global_tokens, group_name=get_tp_group().unique_name
-        )
+        from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
 
     else:
         global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
@@ -558,6 +562,10 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_tp_group().reduce_scatter_tensor(output, input)
+
+
+def attn_tp_all_reduce(input: torch.Tensor):
+    return get_attention_tp_group().all_reduce(input)
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):

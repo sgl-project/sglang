@@ -1,25 +1,26 @@
-<div align="center">
-<img src=assets/logos/logo.svg width="30%"/>
+<div align="center"  style="display:block; margin:auto;">
+<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
 </div>
 
-**sgl-diffusion is an inference framework for accelerated image/video generation.**
+**SGLang diffusion is an inference framework for accelerated image/video generation.**
 
-sgl-diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new optimizations and techniques.
+SGLang diffusion features an end-to-end unified pipeline for accelerating diffusion models. It is designed to be modular and extensible, allowing users to easily add new models and optimizations.
 
 ## Key Features
 
-sgl-diffusion has the following features:
+SGLang Diffusion has the following features:
+  - Broad model support: Wan series, FastWan series, Hunyuan, Qwen-Image, Qwen-Image-Edit, Flux, Z-Image, GLM-Image
+  - Fast inference speed: enpowered by highly optimized kernel from sgl-kernel and efficient scheduler loop
+  - Ease of use: OpenAI-compatible api, CLI, and python sdk support
+  - Multi-platform support: NVIDIA GPUs (H100, H200, A100, B200, 4090) and AMD GPUs (MI300X, MI325X)
 
-- State-of-the-art performance optimizations for inference
-    - [Video Sparse Attention](https://arxiv.org/pdf/2505.13389)
-    - [Sliding Tile Attention](https://arxiv.org/pdf/2502.04507)
-    - [TeaCache](https://arxiv.org/pdf/2411.19108)
-    - [Sage Attention](https://arxiv.org/abs/2410.02367)
-    - USP
-    - CFG Parallel
-- Diverse hardware and OS support
-    - Supported hardware: H100, H200, A100, B200, 4090
-    - Supported OS: Linux, Windows, MacOS
+### AMD/ROCm Support
+
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [ROCm installation guide](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) for setup instructions.
+
+### Moore Threads/MUSA Support
+
+SGLang Diffusion supports Moore Threads GPUs (MTGPU) through the MUSA software stack. On MUSA platforms, we use the Torch SDPA backend for attention. See the [MUSA installation guide](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_musa.md) for setup instructions.
 
 ## Getting Started
 
@@ -27,8 +28,9 @@ sgl-diffusion has the following features:
 uv pip install 'sglang[diffusion]' --prerelease=allow
 ```
 
-For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
-
+For more installation methods (e.g. pypi, uv, docker), check [install.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install.md).
+* ROCm/AMD users should follow the [ROCm quickstart](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_rocm.md) that includes the additional kernel builds and attention backend settings we validated on MI300X.
+* MUSA/Moore Threads users should follow the [MUSA quickstart](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/install_musa.md) that includes the attention backend settings we validated on MTT S5000.
 
 ## Inference
 
@@ -44,15 +46,14 @@ def main():
         num_gpus=1,  # Adjust based on your hardware
     )
 
-    # Provide a prompt for your video
-    prompt = "A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest."
-
     # Generate the video
     video = generator.generate(
-        prompt,
-        return_frames=True,  # Also return frames from this call (defaults to False)
-        output_path="my_videos/",  # Controls where videos are saved
-        save_output=True
+        sampling_params_kwargs=dict(
+            prompt="A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest.",
+            return_frames=True,  # Also return frames from this call (defaults to False)
+            output_path="my_videos/",  # Controls where videos are saved
+            save_output=True
+        )
     )
 
 if __name__ == '__main__':
@@ -68,16 +69,29 @@ sglang generate --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --save-output
 ```
 
-For more information, check the [docs](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
+### LoRA support
+
+Apply LoRA adapters via `--lora-path`:
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image-Edit-2511 \
+  --lora-path prithivMLmods/Qwen-Image-Edit-2511-Anime \
+  --prompt "Transform into anime." \
+  --image-path "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png" \
+  --save-output
+```
+
+For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/cli.md).
 
 ## Contributing
 
-All contributions are welcome.
+All contributions are welcome. The contribution guide is available [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/contributing.md).
 
 ## Acknowledgement
 
 We learnt and reused code from the following projects:
 
-- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVide on Sept. 24, 2025.
+- [FastVideo](https://github.com/hao-ai-lab/FastVideo.git). The major components of this repo are based on a fork of FastVideo on Sept. 24, 2025.
 - [xDiT](https://github.com/xdit-project/xDiT). We used the parallelism library from it.
 - [diffusers](https://github.com/huggingface/diffusers) We used the pipeline design from it.

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -13,8 +14,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import generate_token_bitmask
 
 logger = logging.getLogger(__name__)
+
 
 USE_FULL_MASK = True
 
@@ -211,9 +214,18 @@ class NGRAMWorker:
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
+        spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
+        accept_lens = None
 
         if model_worker_batch.forward_mode.is_target_verify():
+            if batch.has_grammar:
+                retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
+                retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+                draft_tokens_cpu = spec_info.draft_token.view(
+                    spec_info.retrive_next_token.shape
+                ).cpu()
+
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
@@ -221,10 +233,35 @@ class NGRAMWorker:
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
-            verify_input = model_worker_batch.spec_info
+
+            verify_input: NgramVerifyInput = model_worker_batch.spec_info
+            vocab_mask = None
+            if batch.has_grammar:
+                # Generate the logit mask for structured output.
+                # Overlap the CPU operations for bitmask generation with the forward pass.
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    verify_input,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
+
+                if vocab_mask is not None:
+                    assert verify_input.grammar is not None
+                    vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
+                    # and will be applied to produce wrong results
+                    batch.sampling_info.vocab_mask = None
+
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-                batch, logits_output, self.page_size
+                batch, logits_output, self.page_size, vocab_mask
             )
+            # Store accept_lens for per-request metrics
+            accept_lens = verify_input.accept_length
+            if batch.return_logprob:
+                add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
             batch.forward_mode = ForwardMode.DECODE
 
@@ -243,4 +280,5 @@ class NGRAMWorker:
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
+            accept_lens=accept_lens,
         )

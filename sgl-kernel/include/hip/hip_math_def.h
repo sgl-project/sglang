@@ -29,7 +29,11 @@ template <typename T>
 __forceinline__ __device__ T shfl_xor_sync(unsigned mask, T var, int laneMask, int width = warpSize);
 
 template <typename srcDtype, typename destDtype>
-__forceinline__ __device__ destDtype cast(srcDtype val);
+__forceinline__ __device__ destDtype cast(srcDtype val) {
+  // Generic fallback used by most scalar types (int/float/double/etc).
+  // Specific types like fp16/bf16 have explicit specializations below.
+  return static_cast<destDtype>(val);
+}
 
 // specialization
 template <>
@@ -43,27 +47,27 @@ __forceinline__ __device__ int shfl_xor_sync(unsigned mask, int var, int laneMas
 }
 
 template <>
-__forceinline__ __device__ float cast(float val) {
+__forceinline__ __device__ float cast<float, float>(float val) {
   return val;
 }
 
 template <>
-__forceinline__ __device__ float cast(__half val) {
+__forceinline__ __device__ float cast<__half, float>(__half val) {
   return __half2float(val);
 }
 
 template <>
-__forceinline__ __device__ float cast(__hip_bfloat16 val) {
+__forceinline__ __device__ float cast<__hip_bfloat16, float>(__hip_bfloat16 val) {
   return __bfloat162float(val);
 }
 
 template <>
-__forceinline__ __device__ __half cast(float fval) {
+__forceinline__ __device__ __half cast<float, __half>(float fval) {
   return __float2half(fval);
 }
 
 template <>
-__forceinline__ __device__ __hip_bfloat16 cast(float fval) {
+__forceinline__ __device__ __hip_bfloat16 cast<float, __hip_bfloat16>(float fval) {
   return __float2bfloat16(fval);
 }
 

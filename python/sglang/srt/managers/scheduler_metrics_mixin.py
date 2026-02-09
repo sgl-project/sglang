@@ -93,6 +93,11 @@ class SchedulerMetricsMixin:
             self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
         )
 
+        # Metrics
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
+
         if self.enable_metrics:
             if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
                 engine_type = "prefill"
@@ -255,6 +260,8 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -426,6 +433,8 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate

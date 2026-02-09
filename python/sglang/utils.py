@@ -13,6 +13,7 @@ import time
 import traceback
 import urllib.request
 import weakref
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
@@ -25,6 +26,8 @@ import requests
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -357,9 +360,7 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
 
 
 def is_in_ci() -> bool:
-    import os
-
-    return os.environ.get("SGLANG_IS_IN_CI", "").lower() in ("true", "1")
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 def print_highlight(html_content: str):
@@ -407,10 +408,28 @@ def release_port(lock_socket):
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
     Execute a shell command and return its process handle.
+    Supports leading KEY=VALUE env vars (e.g. "VAR=1 python script.py") so that
+    notebook/CI commands work without requiring shell=True.
     """
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+    env = os.environ.copy()
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if "=" in part and not part.startswith("-") and not part.startswith("/"):
+            key, _, value = part.partition("=")
+            if key and value is not None and key.replace("_", "").isalnum():
+                env[key] = value
+                i += 1
+                continue
+        break
+    parts = parts[i:]
+    if not parts:
+        raise ValueError(
+            "Command contains only environment variable assignments, no executable"
+        )
+    return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT, env=env)
 
 
 def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
@@ -480,20 +499,44 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        self._mapping = mapping
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
         self._fallback_fn = None
 
     def add_fallback_fn(self, fallback_fn: Callable):
         self._fallback_fn = fallback_fn
 
     def __iadd__(self, other: "TypeBasedDispatcher"):
-        self._mapping.extend(other._mapping)
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
         return self
 
     def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
             if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
                 return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
 
         if self._fallback_fn is not None:
             return self._fallback_fn(obj)

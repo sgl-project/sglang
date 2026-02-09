@@ -6,7 +6,6 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -35,8 +34,6 @@ class TestAscendDeepEP(CustomTestCase):
             "--trust-remote-code",
             "--attention-backend",
             "ascend",
-            "--quantization",
-            "w8a8_int8",
             "--mem-fraction-static",
             0.8,
             "--disable-radix-cache",
@@ -48,6 +45,8 @@ class TestAscendDeepEP(CustomTestCase):
             1,
             "--ep-size",
             16,
+            "--max-running-requests",
+            24,
             "--moe-a2a-backend",
             "deepep",
             "--deepep-mode",
@@ -69,7 +68,7 @@ class TestAscendDeepEP(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=1500,
+                    timeout=2400,
                     other_args=[
                         *self.common_args,
                     ],

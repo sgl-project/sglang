@@ -17,7 +17,9 @@ from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 if _is_cuda:
-    from sgl_kernel import gptq_marlin_gemm, gptq_marlin_repack
+    from sgl_kernel import gptq_marlin_repack
+
+    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -62,7 +64,6 @@ def apply_fp8_marlin_linear(
         a=reshaped_x,
         c=None,
         b_q_weight=weight,
-        b_bias=bias,
         b_scales=weight_scale,
         global_scale=None,
         b_zeros=None,
@@ -76,6 +77,9 @@ def apply_fp8_marlin_linear(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
     )
+
+    if bias is not None:
+        output.add_(bias)
 
     return output.reshape(out_shape)
 

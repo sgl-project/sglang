@@ -9,6 +9,8 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
 
 import torch.nn as nn
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,8 +19,10 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
 
-    def register(self, package_name: str, overwrite: bool = False):
-        new_models = import_model_classes(package_name)
+    def register(
+        self, package_name: str, overwrite: bool = False, strict: bool = False
+    ):
+        new_models = import_model_classes(package_name, strict=strict)
         if overwrite:
             self.models.update(new_models)
         else:
@@ -86,14 +90,20 @@ class _ModelRegistry:
 
 
 @lru_cache()
-def import_model_classes(package_name: str):
+def import_model_classes(package_name: str, strict: bool = False):
     model_arch_name_to_cls = {}
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            if name.split(".")[-1] in envs.SGLANG_DISABLED_MODEL_ARCHS.get():
+                logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
+                continue
+
             try:
                 module = importlib.import_module(name)
             except Exception as e:
+                if strict:
+                    raise
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):
@@ -117,3 +127,6 @@ def import_model_classes(package_name: str):
 
 ModelRegistry = _ModelRegistry()
 ModelRegistry.register("sglang.srt.models")
+
+if external_pkg := envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get():
+    ModelRegistry.register(external_pkg, overwrite=True)

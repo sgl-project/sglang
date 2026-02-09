@@ -21,10 +21,10 @@
 # recompilation of the code every time we want to switch between different
 # versions. This current implementation, with a **pure** Python wrapper, is
 # more flexible. We can easily switch between different versions of NCCL by
-# changing the environment variable `SGL_DIFFUSION_NCCL_SO_PATH`, or the `so_file`
+# changing the environment variable `SGLANG_DIFFUSION_NCCL_SO_PATH`, or the `so_file`
 # variable in the code.
 
-# TODO(will): support SGL_DIFFUSION_NCCL_SO_PATH
+# TODO(will): support SGLANG_DIFFUSION_NCCL_SO_PATH
 
 import ctypes
 import platform
@@ -277,11 +277,11 @@ class NCCLLibrary:
         except Exception as e:
             logger.error(
                 "Failed to load NCCL library from %s ."
-                "It is expected if you are not running on NVIDIA/AMD GPUs."
+                "It is expected if you are not running on NVIDIA/AMD/MTHREADS GPUs."
                 "Otherwise, the nccl library might not exist, be corrupted "
                 "or it does not support the current platform %s."
                 "If you already have the library, please set the "
-                "environment variable SGL_DIFFUSION_NCCL_SO_PATH"
+                "environment variable SGLANG_DIFFUSION_NCCL_SO_PATH"
                 " to point to the correct nccl library path.",
                 so_file,
                 platform.platform(),

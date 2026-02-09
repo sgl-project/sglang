@@ -6,10 +6,27 @@ import math
 
 import torch
 import torch.nn as nn
+from diffusers.models.embeddings import (
+    CombinedTimestepGuidanceTextProjEmbeddings as _CombinedTimestepGuidanceTextProjEmbeddings,
+)
+from diffusers.models.embeddings import (
+    CombinedTimestepTextProjEmbeddings as _CombinedTimestepTextProjEmbeddings,
+)
+from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
+from diffusers.models.embeddings import Timesteps as _Timesteps
+from diffusers.models.embeddings import (
+    get_timestep_embedding as timestep_embedding_diffusers,
+)
 
+from sglang.jit_kernel.timestep_embedding import (
+    timestep_embedding as timestep_embedding_cuda,
+)
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_cuda = current_platform.is_cuda()
 
 
 class PatchEmbed(nn.Module):
@@ -66,6 +83,65 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class Timesteps(_Timesteps):
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        if _is_cuda:
+            return timestep_embedding_cuda(
+                timesteps,
+                self.num_channels,
+                flip_sin_to_cos=self.flip_sin_to_cos,
+                downscale_freq_shift=self.downscale_freq_shift,
+                scale=self.scale,
+            )
+        else:
+            return timestep_embedding_diffusers(
+                timesteps,
+                self.num_channels,
+                flip_sin_to_cos=self.flip_sin_to_cos,
+                downscale_freq_shift=self.downscale_freq_shift,
+                scale=self.scale,
+            )
+
+
+class CombinedTimestepGuidanceTextProjEmbeddings(
+    _CombinedTimestepGuidanceTextProjEmbeddings
+):
+    def __init__(self, embedding_dim, pooled_projection_dim):
+        nn.Module.__init__(self)
+
+        # use sgld op
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        # use diffusers op
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.guidance_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.text_embedder = PixArtAlphaTextProjection(
+            pooled_projection_dim, embedding_dim, act_fn="silu"
+        )
+
+
+class CombinedTimestepTextProjEmbeddings(_CombinedTimestepTextProjEmbeddings):
+    def __init__(self, embedding_dim, pooled_projection_dim):
+        nn.Module.__init__(self)
+
+        # use sgld op
+        self.time_proj = Timesteps(
+            num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
+        )
+        # use diffusers op
+        self.timestep_embedder = TimestepEmbedding(
+            in_channels=256, time_embed_dim=embedding_dim
+        )
+        self.text_embedder = PixArtAlphaTextProjection(
+            pooled_projection_dim, embedding_dim, act_fn="silu"
+        )
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -101,7 +177,11 @@ class TimestepEmbedder(nn.Module):
             t, self.frequency_embedding_size, self.max_period, dtype=self.freq_dtype
         ).to(self.mlp.fc_in.weight.dtype)
         if timestep_seq_len is not None:
-            t_freq = t_freq.unflatten(0, (1, timestep_seq_len))
+            assert (
+                t_freq.shape[0] % timestep_seq_len == 0
+            ), "timestep length is not divisible by timestep_seq_len"
+            batch_size = t_freq.shape[0] // timestep_seq_len
+            t_freq = t_freq.unflatten(0, (batch_size, timestep_seq_len))
         # t_freq = t_freq.to(self.mlp.fc_in.weight.dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
@@ -151,8 +231,12 @@ class ModulateProjection(nn.Module):
         super().__init__()
         self.factor = factor
         self.hidden_size = hidden_size
-        self.linear = ReplicatedLinear(
-            hidden_size, hidden_size * factor, bias=True, params_dtype=dtype
+        self.linear = ColumnParallelLinear(
+            hidden_size,
+            hidden_size * factor,
+            bias=True,
+            gather_output=True,
+            params_dtype=dtype,
         )
         self.act = get_act_fn(act_layer)
 

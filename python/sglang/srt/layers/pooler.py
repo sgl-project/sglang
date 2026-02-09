@@ -10,7 +10,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
-from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class PoolingType(IntEnum):

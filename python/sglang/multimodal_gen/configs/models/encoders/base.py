@@ -13,11 +13,13 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 @dataclass
 class EncoderArchConfig(ArchConfig):
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [])
     architectures: list[str] = field(default_factory=lambda: [])
     _supported_attention_backends: set[AttentionBackendEnum] = field(
         default_factory=lambda: {
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.SAGE_ATTN_3,
         }
     )
     output_hidden_states: bool = False
@@ -78,6 +80,11 @@ class EncoderConfig(ModelConfig):
 @dataclass
 class TextEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
+
+    # Use the SP Group of the transformer as the TP Group of T5.
+    parallel_folding: bool = False
+    # "sp" or "ulysses" or "ring"
+    parallel_folding_mode: str = "sp"
 
 
 @dataclass
