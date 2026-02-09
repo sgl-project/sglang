@@ -23,6 +23,9 @@ def create_placement_groups(
         List of placement groups, one per node.
     """
     world_size = tp_size * pp_size
+    assert (
+        world_size % nnodes == 0
+    ), f"world_size ({world_size} = tp_size * pp_size) must be divisible by nnodes ({nnodes})"
     gpus_per_node = world_size // nnodes
 
     pgs = []
