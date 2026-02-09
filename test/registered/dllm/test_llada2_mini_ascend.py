@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -17,6 +18,9 @@ from sglang.test.test_utils import (
 class TestLLaDA2Mini(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        cls._old_disable_acl = os.environ.get("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
+        os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = "1"
+
         cls.model = "inclusionAI/LLaDA2.0-mini"
         cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -43,6 +47,11 @@ class TestLLaDA2Mini(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+        if cls._old_disable_acl is None:
+            os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
+        else:
+            os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = cls._old_disable_acl
 
     def test_gsm8k(self):
         args = SimpleNamespace(
