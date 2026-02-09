@@ -14,8 +14,10 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_mooncake_transfer_engine,
+)
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Req
@@ -287,11 +289,7 @@ class MMReceiverHTTP(MMReceiverBase):
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
-            self.embeddings_engine = MooncakeTransferEngine(
-                hostname=get_local_ip_auto(),
-                gpu_id=None,
-                ib_device=server_args.disaggregation_ib_device,
-            )
+            self.embeddings_engine = get_mooncake_transfer_engine()
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
