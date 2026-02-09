@@ -111,16 +111,6 @@ class SchedulerLaunchResult:
     _procs: Optional[List] = None
     _pipe_readers: Optional[List] = None
 
-    @property
-    def actors(self) -> Optional[List]:
-        """Ray actors (None for mp mode). Exposed for Engine to store."""
-        return self._actors
-
-    @property
-    def event_loop_refs(self) -> Optional[List]:
-        """Ray event loop ObjectRefs (None for mp mode). Exposed for Engine to store."""
-        return self._event_loop_refs
-
     def wait_for_ready(self) -> None:
         """Wait for schedulers to be ready (mp mode only, no-op for Ray).
 
@@ -1001,23 +991,33 @@ def _launch_scheduler_processes(
         )
 
 
-def _calculate_rank_ranges(server_args: ServerArgs, node_rank: Optional[int] = None):
+def _calculate_rank_ranges(
+    nnodes: int, pp_size: int, tp_size: int, node_rank: int
+) -> Tuple[range, range, int, int]:
     """Calculate pp_rank_range and tp_rank_range for a given node.
 
-    Shared by both MP mode (uses server_args.node_rank) and
-    Ray mode (calls with explicit node_rank for each node).
-    """
-    node_rank = node_rank if node_rank is not None else server_args.node_rank
+    Args:
+        nnodes: Total number of nodes.
+        pp_size: Pipeline parallel size.
+        tp_size: Tensor parallel size.
+        node_rank: The rank of the node to compute ranges for.
 
-    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+    Returns:
+        A tuple of (pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node):
+        - pp_rank_range: range of pipeline-parallel ranks assigned to this node.
+        - tp_rank_range: range of tensor-parallel ranks assigned to this node.
+        - pp_size_per_node: number of PP ranks per node.
+        - tp_size_per_node: number of TP ranks per node.
+    """
+    pp_size_per_node = max(pp_size // nnodes, 1)
+    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
     pp_rank_range = range(
         pp_size_per_node * (node_rank // nnodes_per_pp_rank),
         pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
     )
 
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+    tp_size_per_node = tp_size // nnodes_per_tp_group
     tp_rank_range = range(
         tp_size_per_node * (node_rank % nnodes_per_tp_group),
         tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
@@ -1047,7 +1047,12 @@ def _launch_scheduler_processes_mp(
         scheduler_pipe_readers = []
 
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-            _calculate_rank_ranges(server_args)
+            _calculate_rank_ranges(
+                server_args.nnodes,
+                server_args.pp_size,
+                server_args.tp_size,
+                server_args.node_rank,
+            )
         )
 
         for pp_rank in pp_rank_range:
@@ -1172,7 +1177,7 @@ def _launch_scheduler_ray_actors(
 
     for node_idx in range(nnodes):
         pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-            server_args, node_rank=node_idx
+            nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
         )
         for pp_rank in pp_range:
             for tp_rank in tp_range:

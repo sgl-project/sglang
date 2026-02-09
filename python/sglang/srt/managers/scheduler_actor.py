@@ -92,11 +92,7 @@ class SchedulerActor:
 
     def get_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake."""
-        return {
-            "status": "ready",
-            "max_total_num_tokens": self.scheduler.max_total_num_tokens,
-            "max_req_input_len": self.scheduler.max_req_input_len,
-        }
+        return self.scheduler.get_init_info()
 
     def get_node_info(self) -> Dict[str, Any]:
         """Return node-specific information for coordination."""
