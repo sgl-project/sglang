@@ -24,11 +24,11 @@ SHAPE_MAP = {
 }
 SHAPES = [
     # (B, S, F, D)
-    (1, 1024, 8, 3072),
-    (4, 512, 16, 3072),
     (1, 115200, 1, 3072),  # Hunyuan
     (1, 32760, 1, 1536),  # Wan
     (1, 6, 1, 3072),  # Qwen
+    (1, 1024, 8, 3072),
+    (4, 512, 16, 3072),
 ]
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 NORM_TYPES = ["layer", "rms"]
