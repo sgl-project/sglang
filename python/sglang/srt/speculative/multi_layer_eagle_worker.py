@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -55,6 +55,9 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_npu = is_npu()
 
@@ -226,7 +229,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
                 )
 
-    def mtp_model_runner(self, layer_id: int):
+    def mtp_model_runner(self, layer_id: int) -> ModelRunner:
         return self.model_runner_list[layer_id]
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
@@ -354,8 +357,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         assert isinstance(spec_info, EagleDraftInput)
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = self.topk
-        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
@@ -596,8 +599,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
@@ -613,7 +616,9 @@ class MultiLayerEagleWorker(TpModelWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
-            logits_output, _ = self.mtp_model_runner(step).forward(forward_batch)
+            logits_output = (
+                self.mtp_model_runner(step).forward(forward_batch).logits_output
+            )
             if self.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -676,8 +681,8 @@ class MultiLayerEagleWorker(TpModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,
@@ -718,8 +723,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                     self.mtp_model_runner(step).attn_backend.init_forward_metadata(
                         forward_batch
                     )
-                logits_output, _ = self.mtp_model_runner(step).forward(
-                    forward_batch, skip_attn_backend_init=True
+                logits_output = (
+                    self.mtp_model_runner(step)
+                    .forward(forward_batch, skip_attn_backend_init=True)
+                    .logits_output
                 )
 
             if self.enable_nan_detection:
