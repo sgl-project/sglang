@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
+    ShutdownReq,
     UnmergeLoraWeightsReq,
     _parse_size,
     save_image_to_path,
@@ -87,6 +88,7 @@ class Scheduler:
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
+            ShutdownReq: self._handle_shutdown,
         }
 
         # FIFO, new reqs are appended
@@ -122,6 +124,11 @@ class Scheduler:
 
     def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
         return self.worker.list_loras()
+
+    def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info("Received shutdown request. Stopping event loop.")
+        self._running = False
+        return OutputBatch()
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
@@ -172,10 +179,10 @@ class Scheduler:
                 task_type = self.server_args.pipeline_config.task_type
 
                 if task_type in (
-                    ModelTaskType.I2I,
-                    ModelTaskType.TI2I,
-                    ModelTaskType.I2V,
-                    ModelTaskType.TI2V,
+                        ModelTaskType.I2I,
+                        ModelTaskType.TI2I,
+                        ModelTaskType.I2V,
+                        ModelTaskType.TI2V,
                 ):
                     uploads_dir = os.path.join("outputs", "uploads")
                     os.makedirs(uploads_dir, exist_ok=True)
@@ -384,7 +391,7 @@ class Scheduler:
         logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
             self.receiver.close()
-        self.context.term()
+        self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
         """Broadcast a task to all slave worker processes."""
