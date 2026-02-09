@@ -142,6 +142,7 @@ from sglang.srt.server_args import (
     get_global_server_args,
     set_global_server_args_for_scheduler,
 )
+from sglang.srt.speculative.dflash_utils import resolve_dflash_target_layer_ids
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -330,6 +331,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine_weight_info = None
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
+        self.dflash_use_aux_hidden_state = False
+        self.dflash_target_layer_ids = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -354,6 +357,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             except:
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
+
+        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            # Select target layers to capture for building DFlash context features.
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=(server_args.speculative_draft_model_path),
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
+            )
+            draft_num_layers = getattr(
+                draft_model_config.hf_config, "num_hidden_layers", None
+            )
+            target_num_layers = getattr(
+                self.model_config.hf_config, "num_hidden_layers", None
+            )
+            if draft_num_layers is None or target_num_layers is None:
+                raise ValueError(
+                    "DFLASH requires both draft and target to expose num_hidden_layers in config. "
+                    f"Got draft={draft_num_layers}, target={target_num_layers}."
+                )
+
+            trained_target_layers = getattr(
+                draft_model_config.hf_config, "num_target_layers", None
+            )
+            if (
+                trained_target_layers is not None
+                and trained_target_layers != target_num_layers
+            ):
+                logger.warning(
+                    "DFLASH draft config num_target_layers=%s differs from runtime target num_hidden_layers=%s; "
+                    "selecting capture layers based on the runtime target model.",
+                    trained_target_layers,
+                    target_num_layers,
+                )
+
+            self.dflash_use_aux_hidden_state = True
+            self.dflash_target_layer_ids = resolve_dflash_target_layer_ids(
+                draft_hf_config=draft_model_config.hf_config,
+                target_num_layers=int(target_num_layers),
+                draft_num_layers=int(draft_num_layers),
+            )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -608,6 +652,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.set_eagle3_layers_to_capture(
                 self.eagle_aux_hidden_state_layer_ids
             )
+
+        if self.dflash_use_aux_hidden_state:
+            if not hasattr(self.model, "set_dflash_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
+                    "which is required for DFLASH."
+                )
+            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
@@ -1757,6 +1809,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()
         ):
             return not self.is_draft_worker
 
@@ -1785,6 +1838,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_dflash()
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -1804,6 +1858,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
+        
+        if self.dflash_use_aux_hidden_state:
+            self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
         if require_gathered_buffer(self.server_args):
@@ -1941,12 +1998,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             lora_ids = None
 
+        # Use CPU copy to avoid GPU sync.
+        if buffers.seq_lens_cpu is not None:
+            seq_lens_sum = int(buffers.seq_lens_cpu.sum().item())
+        else:
+            seq_lens_sum = int(buffers.seq_lens.sum().item())
+
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
             input_ids=buffers.input_ids,
             req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
+            seq_lens=seq_lens_sum,
             seq_lens_cpu=buffers.seq_lens_cpu,
             next_token_logits_buffer=buffers.next_token_logits_buffer,
             orig_seq_lens=buffers.seq_lens,

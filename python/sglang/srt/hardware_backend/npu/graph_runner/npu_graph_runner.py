@@ -187,7 +187,10 @@ class NPUGraphRunner(CudaGraphRunner):
             self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
-        if isinstance(output, LogitsProcessorOutput):
+
+        if isinstance(output, torch.Tensor):
+            return output[: self.raw_num_token]
+        elif isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],
                 hidden_states=(
