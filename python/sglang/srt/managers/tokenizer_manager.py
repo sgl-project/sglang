@@ -1856,7 +1856,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 # Calculate acceptance rate: accepted / (steps * lookahead)
                 meta_info["spec_accept_rate"] = accepted_tokens / total_draft_tokens
                 meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
+                    recv_obj.spec_accepted_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
                 meta_info["spec_accept_token_num"] = accepted_tokens
                 meta_info["spec_draft_token_num"] = total_draft_tokens
