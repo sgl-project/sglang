@@ -42,6 +42,7 @@ static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
   return fn;
 #else
   return nullptr;
+#endif
 }
 #endif
 
