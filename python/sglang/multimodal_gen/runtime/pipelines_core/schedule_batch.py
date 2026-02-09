@@ -156,8 +156,6 @@ class Req:
 
     # results
     output: torch.Tensor | None = None
-    # quality control (1-100) for generated images or videos
-    output_compression: int | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
 

@@ -419,7 +419,8 @@ curl -sS -X POST "http://localhost:30000/v1/images/generations" \
         "prompt": "A detailed landscape photograph",
         "size": "1024x1024",
         "output_quality": "high",
-        "output_format": "jpeg"
+        "output_format": "jpeg",
+        "response_format": "b64_json"
       }'
 ```
 
@@ -433,7 +434,8 @@ curl -sS -X POST "http://localhost:30000/v1/images/generations" \
         "prompt": "A detailed landscape photograph",
         "size": "1024x1024",
         "output_compression": 85,
-        "output_format": "jpeg"
+        "output_format": "jpeg",
+        "response_format": "b64_json"
       }'
 ```
 
