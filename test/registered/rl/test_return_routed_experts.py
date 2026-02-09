@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=360, suite="stage-c-test-large-4-gpu")
+register_cuda_ci(est_time=360, suite="stage-c-test-4-gpu-h100")
 
 SHAREGPT_URL = (
     "https://huggingface.co/datasets/anon8231489123/"
@@ -215,15 +215,13 @@ async def make_request(session, url, payload):
 def extract_routed_experts_from_openai_response(response):
     if "error" in response:
         raise ValueError(f"OpenAI response error: {response['error']}")
-    choices = response.get("choices", [])
-    if not choices:
-        raise ValueError("OpenAI response has no choices.")
-    sgl_ext = choices[0].get("sgl_ext", None)
-    if sgl_ext is None:
-        raise ValueError("OpenAI response missing sgl_ext.")
-    routed_experts = sgl_ext.get("routed_experts", None)
+    # sglext is at response level (not in choices) as of PR #17648
+    sglext = response.get("sglext", None)
+    if sglext is None:
+        raise ValueError("OpenAI response missing sglext.")
+    routed_experts = sglext.get("routed_experts", None)
     if routed_experts is None:
-        raise ValueError("OpenAI response sgl_ext missing routed_experts.")
+        raise ValueError("OpenAI response sglext missing routed_experts.")
     return extract_routed_experts_from_meta_info(
         {"meta_info": {"routed_experts": routed_experts}}
     )

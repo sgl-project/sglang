@@ -320,9 +320,11 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,
         )
+        from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
         self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
         self.use_symmetric_memory = use_symmetric_memory
+        self.is_allocation_symmetric = is_allocation_symmetric
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -807,7 +809,9 @@ class GroupCoordinator:
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * world_size,) + input_size[1:]
         # Allocate output tensor.
-        with self.use_symmetric_memory(self):
+        with self.use_symmetric_memory(
+            self, disabled=not self.is_allocation_symmetric()
+        ):
             output_tensor = torch.empty(
                 output_size, dtype=input_.dtype, device=input_.device
             )
@@ -1427,6 +1431,18 @@ def get_pp_group() -> GroupCoordinator:
 
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
+
+
+def get_mooncake_transfer_engine():
+    """
+    Return the shared MooncakeTransferEngine if initialized in device_communicators,
+    else None. Used by disaggregation mooncake backend and mem_cache mooncake_store.
+    """
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        get_mooncake_transfer_engine as _get_engine,
+    )
+
+    return _get_engine()
 
 
 @contextmanager
