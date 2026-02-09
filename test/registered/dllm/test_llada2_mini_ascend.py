@@ -2,18 +2,17 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-
 
 class TestLLaDA2Mini(CustomTestCase):
     @classmethod
@@ -72,10 +71,7 @@ class TestLLaDA2Mini(CustomTestCase):
                 f"### test_bs_1_speed (llada2-mini) with tp1\n"
                 f"{speed=:.2f} token/s\n"
             )
-            if is_in_amd_ci():
-                self.assertGreater(speed, 10)
-            else:
-                self.assertGreater(speed, 130)
+            self.assertGreater(speed, 130)
 
 
 if __name__ == "__main__":
