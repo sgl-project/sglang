@@ -152,12 +152,15 @@ def load_jit(
     cuda_sources = [f'#include "{path}"' for path in cuda_paths]
     cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
 
+    # GPU architecture; adding the correct flag ensures a compatible binary.
+    device_gencode = _get_device_gencode_flags()
+
     return load_inline(
         "sgl_kernel_jit_" + "_".join(str(arg) for arg in args),
         cpp_sources=cpp_sources,
         cuda_sources=cuda_sources,
         extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + extra_cuda_cflags,
+        extra_cuda_cflags=DEFAULT_CUDA_CFLAGS + device_gencode + extra_cuda_cflags,
         extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
         extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
         build_directory=build_directory,
@@ -170,3 +173,16 @@ def is_arch_support_pdl() -> bool:
 
     device = torch.cuda.current_device()
     return torch.cuda.get_device_capability(device)[0] >= 9
+
+
+@cache_once
+def _get_device_gencode_flags() -> list[str]:
+    """
+    Get the correct CUDA gencode flags for the current GPU.
+    """
+    import torch
+
+    device = torch.cuda.current_device()
+    major, minor = torch.cuda.get_device_capability(device)
+    arch = f"{major}{minor}"
+    return [f"-gencode=arch=compute_{arch},code=sm_{arch}"]
