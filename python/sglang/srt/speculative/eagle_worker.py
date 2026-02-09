@@ -915,7 +915,6 @@ class EAGLEWorker(TpModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.spec_info.num_tokens_for_logprob_per_batch = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
@@ -929,6 +928,7 @@ class EAGLEWorker(TpModelWorker):
 
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
+        batch.spec_info.num_tokens_per_batch = model_worker_batch.input_ids.shape[0]
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner

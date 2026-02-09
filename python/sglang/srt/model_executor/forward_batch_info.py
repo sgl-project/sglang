@@ -797,7 +797,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.extend_logprob_start_lens_cpu = self.extend_prefix_lens_cpu
             else:
                 setattr(self, "_original_batch_size", self.batch_size)
-                if self.spec_info is not None:
+                if self.spec_info is not None and self.spec_info.num_tokens_per_batch != 0:
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_batch
                     )
