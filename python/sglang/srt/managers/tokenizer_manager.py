@@ -1528,10 +1528,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             field_name = field.name
             field_value = getattr(recv_obj, field_name, None)
 
-            # Skip None values
-            if field_value is None:
-                continue
-
             # Handle dict with list values (e.g., customized_info)
             if isinstance(field_value, dict):
                 chunk_dict[field_name] = {
@@ -1540,7 +1536,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Handle list/tuple types with slicing
             elif isinstance(field_value, (list, tuple)):
                 chunk_dict[field_name] = field_value[start_idx:end_idx]
-            # For other types (e.g., load object), copy as-is
+            # For None and other types (e.g., load object), copy as-is
             else:
                 chunk_dict[field_name] = field_value
 
@@ -1626,11 +1622,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     ]
 
             # Add optional outputs (batch-level checks)
-            if has_hidden_states:
+            if has_hidden_states and recv_obj.output_hidden_states:
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if has_routed_experts:
+            if has_routed_experts and recv_obj.routed_experts:
                 meta_info["routed_experts"] = recv_obj.routed_experts[i]
-            if has_customized_info:
+            if has_customized_info and recv_obj.customized_info:
                 customized_info = recv_obj.customized_info
                 for k in customized_info:
                     meta_info[k] = customized_info[k][i]
