@@ -1,11 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import multiprocessing as mp
 import os
 import time
-import gc
-
 from typing import List, Union
 
 import torch

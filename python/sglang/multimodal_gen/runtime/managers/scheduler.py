@@ -179,10 +179,10 @@ class Scheduler:
                 task_type = self.server_args.pipeline_config.task_type
 
                 if task_type in (
-                        ModelTaskType.I2I,
-                        ModelTaskType.TI2I,
-                        ModelTaskType.I2V,
-                        ModelTaskType.TI2V,
+                    ModelTaskType.I2I,
+                    ModelTaskType.TI2I,
+                    ModelTaskType.I2V,
+                    ModelTaskType.TI2V,
                 ):
                     uploads_dir = os.path.join("outputs", "uploads")
                     os.makedirs(uploads_dir, exist_ok=True)
