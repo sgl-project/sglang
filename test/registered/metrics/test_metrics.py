@@ -131,8 +131,9 @@ class TestEnableMetrics(CustomTestCase):
     def _verify_metrics_common(self, metrics_text, metrics):
         essential_metrics = [
             "sglang:num_running_reqs",
-            "sglang:num_used_tokens",
-            "sglang:token_usage",
+            "sglang:kv_cache_used_tokens",
+            "sglang:kv_cache_usage_perc",
+            "sglang:kv_cache_total_tokens",
             "sglang:gen_throughput",
             "sglang:num_queue_reqs",
             "sglang:num_grammar_queue_reqs",

@@ -87,17 +87,6 @@ class SchedulerMetricsMixin:
 
         self.stats = SchedulerStats()
         self.stats.max_total_num_tokens = self.max_total_num_tokens
-
-        # Metrics
-        self.current_scheduler_metrics_enabled = (
-            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
-        )
-
-        # Metrics
-        self.current_scheduler_metrics_enabled = (
-            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
-        )
-
         if self.enable_metrics:
             if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL:
                 engine_type = "prefill"

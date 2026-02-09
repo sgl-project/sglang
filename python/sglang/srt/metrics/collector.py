@@ -213,8 +213,6 @@ class SchedulerStats:
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
 
-    max_total_num_tokens: int = 0
-
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -308,32 +306,14 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
         self.num_used_tokens = Gauge(
-            name="sglang:num_used_tokens",
-            documentation="The number of used tokens.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.token_usage = Gauge(
-            name="sglang:token_usage",
-            documentation="The token usage.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.kv_cache_usage_perc = Gauge(
-            name="sglang:kv_cache_usage_perc",
-            documentation="KV cache usage percentage (0-1).",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.kv_cache_used_tokens = Gauge(
             name="sglang:kv_cache_used_tokens",
             documentation="Used KV cache tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.kv_cache_total_tokens = Gauge(
-            name="sglang:kv_cache_total_tokens",
-            documentation="Total KV cache token capacity.",
+        self.token_usage = Gauge(
+            name="sglang:kv_cache_usage_perc",
+            documentation="KV cache usage percentage (0-1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -393,8 +373,8 @@ class SchedulerMetricsCollector:
         )
 
         self.max_total_num_tokens = Gauge(
-            name="sglang:max_total_num_tokens",
-            documentation="Maximum total number of tokens in the KV cache pool.",
+            name="sglang:kv_cache_total_tokens",
+            documentation="Total KV cache token capacity.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -980,10 +960,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
-        self._log_gauge(self.kv_cache_usage_perc, stats.token_usage)
-        self._log_gauge(self.kv_cache_used_tokens, stats.num_used_tokens)
-        if stats.max_total_num_tokens > 0:
-            self._log_gauge(self.kv_cache_total_tokens, stats.max_total_num_tokens)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
