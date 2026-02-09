@@ -831,7 +831,6 @@ inline void transfer_kv_page_first_direct_impl(
     fallback_to_page_copy();
     return;
   }
-#endif
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   size_t num_copies = 0;
@@ -950,6 +949,7 @@ inline void transfer_kv_page_first_direct_impl(
       TORCH_CHECK(false, "cudaMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
     }
   }
+#endif
 }
 
 void transfer_kv_per_layer_direct_pf_lf(
