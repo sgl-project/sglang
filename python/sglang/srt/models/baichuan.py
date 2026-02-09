@@ -46,7 +46,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
 
 
 def _get_alibi_slopes(total_num_heads: int) -> torch.Tensor:
@@ -124,20 +126,19 @@ class BaiChuanAttention(nn.Module):
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         layer_id: int = 0,
+        dtype: Optional[torch.dtype] = torch.bfloat16,
         prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = hidden_size
-        tensor_model_parallel_world_size = get_tensor_model_parallel_world_size()
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tensor_model_parallel_world_size == 0
-        self.num_heads = self.total_num_heads // tensor_model_parallel_world_size
+        self.total_num_kv_heads = self.total_num_heads
+        assert self.total_num_heads % tp_size == 0
         self.head_dim = hidden_size // self.total_num_heads
-        self.postion_embedding = position_embedding
+        self.position_embedding = position_embedding
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-        self.total_num_kv_heads = self.num_heads
         if self.total_num_kv_heads >= tp_size:
             # Number of KV heads is greater than TP size, so we partition
             # the KV heads across multiple tensor parallel GPUs.
@@ -147,6 +148,7 @@ class BaiChuanAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads = self.num_kv_heads
 
         # pylint: disable=invalid-name
         self.W_pack = QKVParallelLinear(
@@ -156,30 +158,36 @@ class BaiChuanAttention(nn.Module):
             self.total_num_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("W_pack", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
+        self.scaling = self.head_dim**-0.5
+
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+        )
+
         # Create the alibi slopes and slice them.
-        if self.postion_embedding == "ALIBI":
+        if self.position_embedding == "ALIBI":
             tp_rank = get_tensor_model_parallel_rank()
             head_start = tp_rank * self.num_heads
             head_end = (tp_rank + 1) * self.num_heads
             alibi_slopes = _get_alibi_slopes(self.total_num_heads)
-            alibi_slopes = alibi_slopes[head_start:head_end].tolist()
-
-            scaling = self.head_dim**-0.5
-            self.attn = RadixAttention(
-                self.num_heads,
-                self.head_dim,
-                scaling,
-                num_kv_heads=self.num_kv_heads,
-                layer_id=layer_id,
-                quant_config=quant_config,
-                prefix=add_prefix("attn", prefix),
+            alibi_slopes = alibi_slopes[head_start:head_end]
+            self.alibi_slopes = torch.tensor(
+                alibi_slopes, dtype=dtype, device="npu" if _is_npu else "cuda"
             )
         else:
             self.rotary_emb = get_rope(
@@ -188,16 +196,10 @@ class BaiChuanAttention(nn.Module):
                 max_position=self.max_position_embeddings,
                 base=self.rope_theta,
             )
-            self.scaling = self.head_dim**-0.5
-            self.attn = RadixAttention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                num_kv_heads=self.num_kv_heads,
-                layer_id=layer_id,
-                quant_config=quant_config,
-                prefix=add_prefix("attn", prefix),
-            )
+
+        self.attn_kwargs = {}
+        if self.position_embedding == "ALIBI" and _is_npu:
+            self.attn_kwargs["slopes"] = self.alibi_slopes
 
     def forward(
         self,
@@ -207,9 +209,9 @@ class BaiChuanAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.W_pack(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        if self.postion_embedding != "ALIBI":
+        if self.position_embedding != "ALIBI":
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = self.attn(q, k, v, forward_batch, **self.attn_kwargs)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -292,6 +294,8 @@ class BaiChuanModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
@@ -342,7 +346,9 @@ class BaiChuanBaseForCausalLM(nn.Module):
         "gate_up_proj",
         "down_proj",
     ]
-    embedding_modules = {}
+    embedding_modules = {
+        "embed_tokens": ["embed_tokens"],
+    }
     embedding_padding_modules = []
 
     def __init__(

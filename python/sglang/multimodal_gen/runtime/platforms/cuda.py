@@ -15,6 +15,7 @@ import psutil
 import torch
 from typing_extensions import ParamSpec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -75,6 +76,10 @@ class CudaPlatformBase(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -123,6 +128,9 @@ class CudaPlatformBase(Platform):
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -243,6 +251,16 @@ class CudaPlatformBase(Platform):
         elif selected_backend == AttentionBackendEnum.SLA_ATTN:
             logger.info("Using Sparse Linear Attention backend")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.SAGE_SLA_ATTN:
+            logger.info("Using Sage Sparse Linear Attention backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_linear_attn.SageSparseLinearAttentionBackend"
+        elif selected_backend == AttentionBackendEnum.FA2:
+            from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2 import (  # noqa: F401
+                FlashAttention2Backend,
+            )
+
+            logger.info("Using FlashAttention2 backend")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
         elif selected_backend in [
             AttentionBackendEnum.FA,
         ]:

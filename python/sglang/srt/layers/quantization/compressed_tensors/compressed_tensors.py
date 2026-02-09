@@ -471,6 +471,19 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
 
+    def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+        input_quant_none = input_quant is None
+        is_symmetric = weight_quant.symmetric
+        is_mxint4 = (
+            weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 32
+        )
+        is_static = not weight_quant.dynamic
+
+        return is_mxint4 and input_quant_none and is_symmetric and is_static
+
     def _is_dynamic_token_w4(
         self, weight_quant: BaseModel, input_quant: BaseModel
     ) -> bool:
