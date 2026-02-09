@@ -23,11 +23,6 @@ try:
 except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
-# Disable runai_model_streamer on AMD/ROCm due to global state issues
-# that cause "Streamer is handling previous request" errors
-if torch.version.hip is not None:
-    HAS_RUNAI_MODEL_STREAMER = False
-
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

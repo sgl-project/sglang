@@ -354,9 +354,9 @@ class SchedulePolicy:
         last_node_to_reqs: Dict[TreeNode, List[Req]],
         q: List,
     ) -> None:
-        childs = [child for child in cur_node.children.values()]
-        childs.sort(key=lambda x: -node_to_priority[x])
-        for child in childs:
+        children = [child for child in cur_node.children.values()]
+        children.sort(key=lambda x: -node_to_priority[x])
+        for child in children:
             SchedulePolicy._get_dfs_priority(
                 child, node_to_priority, last_node_to_reqs, q
             )
