@@ -1,7 +1,7 @@
-from typing import List, Tuple, Union, Optional
+import math
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
-import math
 import torch
 import torch.nn.functional as F
 
@@ -14,13 +14,16 @@ from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
+
 def parallel_decoding_update_input_ids_vectorized(
-    input_ids_1d: torch.Tensor,          # [B*blk]
-    full_logits_2d: torch.Tensor,         # [B*blk, V]
+    input_ids_1d: torch.Tensor,  # [B*blk]
+    full_logits_2d: torch.Tensor,  # [B*blk, V]
     mask_id: int,
     block_size: int,
     threshold: float,
-    finished: Optional[torch.Tensor] = None,  # [B] bool, True means do NOT update this row
+    finished: Optional[
+        torch.Tensor
+    ] = None,  # [B] bool, True means do NOT update this row
     force_at_least_one: bool = True,
 ) -> None:
     """
@@ -36,12 +39,18 @@ def parallel_decoding_update_input_ids_vectorized(
       - Rows with no mask positions are left unchanged (equivalent to `continue`)
       - If `finished` is provided, finished rows are always left unchanged
     """
-    assert input_ids_1d.dim() == 1, f"input_ids_1d must be 1D, got {tuple(input_ids_1d.shape)}"
-    assert full_logits_2d.dim() == 2, f"full_logits_2d must be 2D, got {tuple(full_logits_2d.shape)}"
-    assert input_ids_1d.shape[0] == full_logits_2d.shape[0], \
-        f"len mismatch: {input_ids_1d.shape[0]} vs {full_logits_2d.shape[0]}"
-    assert input_ids_1d.shape[0] % block_size == 0, \
-        f"len(input_ids_1d) must be divisible by block_size, got {input_ids_1d.shape[0]}, block_size={block_size}"
+    assert (
+        input_ids_1d.dim() == 1
+    ), f"input_ids_1d must be 1D, got {tuple(input_ids_1d.shape)}"
+    assert (
+        full_logits_2d.dim() == 2
+    ), f"full_logits_2d must be 2D, got {tuple(full_logits_2d.shape)}"
+    assert (
+        input_ids_1d.shape[0] == full_logits_2d.shape[0]
+    ), f"len mismatch: {input_ids_1d.shape[0]} vs {full_logits_2d.shape[0]}"
+    assert (
+        input_ids_1d.shape[0] % block_size == 0
+    ), f"len(input_ids_1d) must be divisible by block_size, got {input_ids_1d.shape[0]}, block_size={block_size}"
     assert 0.0 < threshold <= 1.0, f"threshold should be in (0,1], got {threshold}"
 
     B = input_ids_1d.shape[0] // block_size
@@ -50,41 +59,43 @@ def parallel_decoding_update_input_ids_vectorized(
     dev = input_ids_1d.device
 
     # Views (no copy)
-    input_ids = input_ids_1d.view(B, blk)                 # [B, blk]
-    logits = full_logits_2d.view(B, blk, V)               # [B, blk, V]
+    input_ids = input_ids_1d.view(B, blk)  # [B, blk]
+    logits = full_logits_2d.view(B, blk, V)  # [B, blk, V]
 
     # Candidate mask
-    mask = input_ids.eq(mask_id)                          # [B, blk]
+    mask = input_ids.eq(mask_id)  # [B, blk]
     if finished is not None:
-        assert finished.shape == (B,), f"finished must be shape [B]={B}, got {tuple(finished.shape)}"
-        alive = (~finished).view(B, 1)                    # [B,1]
+        assert finished.shape == (
+            B,
+        ), f"finished must be shape [B]={B}, got {tuple(finished.shape)}"
+        alive = (~finished).view(B, 1)  # [B,1]
         eff_mask = mask & alive
     else:
         eff_mask = mask
 
     # Argmax token id per position and its log-prob.
     # logp = log softmax(logits)[argmax] = max_logit - logsumexp(logits)
-    max_logit, x = logits.max(dim=-1)                     # [B, blk], [B, blk]
-    lse = torch.logsumexp(logits, dim=-1)                 # [B, blk]
-    logp = max_logit - lse                                # [B, blk]
+    max_logit, x = logits.max(dim=-1)  # [B, blk], [B, blk]
+    lse = torch.logsumexp(logits, dim=-1)  # [B, blk]
+    logp = max_logit - lse  # [B, blk]
 
     neg_inf = torch.full_like(logp, float("-inf"))
-    confidence = torch.where(eff_mask, logp, neg_inf)     # [B, blk]
+    confidence = torch.where(eff_mask, logp, neg_inf)  # [B, blk]
 
     log_thr = math.log(threshold)
-    transfer = confidence > log_thr                       # [B, blk] bool
+    transfer = confidence > log_thr  # [B, blk] bool
 
     # Apply threshold updates first
-    new_ids = torch.where(transfer, x, input_ids)         # [B, blk]
+    new_ids = torch.where(transfer, x, input_ids)  # [B, blk]
 
     # Force-at-least-one (graph-friendly): unconditional sparse per-row write, gated to no-op when not needed
     if force_at_least_one:
-        row_has_any = eff_mask.any(dim=1)                 # [B]
-        hit_any = transfer.any(dim=1)                     # [B]
-        need_force = row_has_any & (~hit_any)             # [B]
+        row_has_any = eff_mask.any(dim=1)  # [B]
+        hit_any = transfer.any(dim=1)  # [B]
+        need_force = row_has_any & (~hit_any)  # [B]
 
         # Best idx per row (even if all -inf -> 0); gated by need_force
-        best_idx = confidence.argmax(dim=1)               # [B] long
+        best_idx = confidence.argmax(dim=1)  # [B] long
 
         # idx2: where to write per row:
         #   - need_force: best_idx
@@ -92,13 +103,13 @@ def parallel_decoding_update_input_ids_vectorized(
         zero_idx = torch.zeros_like(best_idx)
         idx2 = torch.where(need_force, best_idx, zero_idx)  # [B]
 
-        rows = torch.arange(B, device=dev)                # [B]
+        rows = torch.arange(B, device=dev)  # [B]
 
         # val2: what to write per row:
         #   - need_force: x[row, best_idx]
         #   - else: new_ids[row, 0] (no-op)
-        force_val = x[rows, best_idx]                     # [B]
-        noop_val = new_ids[rows, zero_idx]                # [B] == new_ids[:,0]
+        force_val = x[rows, best_idx]  # [B]
+        noop_val = new_ids[rows, zero_idx]  # [B] == new_ids[:,0]
         val2 = torch.where(need_force, force_val, noop_val)  # [B]
 
         # Single-point update per row (typically much cheaper than [B,blk] one-hot scatter_)
@@ -154,7 +165,9 @@ class LowConfidence(DllmAlgorithm):
                 break
 
             if _is_npu:
-                out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
+                out = model_runner.forward(
+                    forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
+                )
                 skip_attn_backend_init = True
             else:
                 out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
@@ -206,7 +219,9 @@ class LowConfidence(DllmAlgorithm):
                 block_input_ids[transfer_index] = x[transfer_index]
 
         if _is_npu:
-            out = model_runner.forward(forward_batch, skip_attn_backend_init, pp_proxy_tensors=None)
+            out = model_runner.forward(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
+            )
         else:
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph

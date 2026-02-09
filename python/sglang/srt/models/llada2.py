@@ -76,7 +76,13 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_npu, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    is_npu,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -84,7 +90,10 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
-    from sglang.srt.layers.rotary_embedding import split_qkv_rmsnorm_rope_pos_cache_half_npu
+    from sglang.srt.layers.rotary_embedding import (
+        split_qkv_rmsnorm_rope_pos_cache_half_npu,
+    )
+
 
 class LLaDA2MoeMLP(nn.Module):
     def __init__(
@@ -198,7 +207,7 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 "Only silu is supported for now."
             )
 
-        # fused_topk_npu() by defualt conduct norm before scale with routed_scaling_factor
+        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
         # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
         if _is_npu:
             self.norm_topk_prob = False
@@ -530,7 +539,7 @@ class LLaDA2MoeAttention(nn.Module):
                 rope_dim=self.rotary_dim,
             )
         else:
-            q, k, v= qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             if self.use_qk_norm:
                 q, k = apply_qk_norm(
                     q=q,

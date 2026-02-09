@@ -203,6 +203,7 @@ from sglang.srt.utils import (
     set_random_seed,
     suppress_other_loggers,
 )
+from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -210,7 +211,6 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,7 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+
 
 @dataclass
 class EmbeddingBatchResult:

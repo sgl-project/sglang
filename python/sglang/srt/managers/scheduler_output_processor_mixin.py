@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         Scheduler,
     )
 
-_is_npu=is_npu()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -404,28 +404,27 @@ class SchedulerOutputProcessorMixin:
         """
         if not next_token_ids:
             return
-    
+
         # If already finished, do nothing (matches check_finished early return behavior)
         if req.finished():
             return
-    
+
         # Append all at once
         req.output_ids.extend(next_token_ids)
-    
+
         # Single finished check: treat the whole block as newly accepted
         req.check_finished(new_accepted_len=len(next_token_ids))
-    
+
         # Truncate to stop position if finished_len is provided
         if req.finished_len is not None and len(req.output_ids) > req.finished_len:
-            del req.output_ids[req.finished_len:]
-    
+            del req.output_ids[req.finished_len :]
+
         # Now mirror the original post-check behavior:
         if req.finished():
             release_kv_cache(req, self.tree_cache)
             req.time_stats.completion_time = time.perf_counter()
         else:
             self.tree_cache.cache_unfinished_req(req)
-
 
     def process_batch_result_dllm(
         self: Scheduler,

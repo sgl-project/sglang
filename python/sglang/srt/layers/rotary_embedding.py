@@ -3210,8 +3210,8 @@ def fp32_to_bf16_rne(x):
 @triton.jit
 def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
     input_ptr,
-    pos_ptr,                  # [B]
-    cos_sin_cache_ptr,        # [max_seq, ROPE_DIM] layout: [cos_half, sin_half]
+    pos_ptr,  # [B]
+    cos_sin_cache_ptr,  # [max_seq, ROPE_DIM] layout: [cos_half, sin_half]
     q_ptr,
     k_ptr,
     v_ptr,
@@ -3220,25 +3220,20 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
     k_weight_ptr,
     k_bias_ptr,
     batch_size,
-
     q_hidden_size: tl.constexpr,
     kv_hidden_size: tl.constexpr,
     total_hidden_size: tl.constexpr,
     eps: tl.constexpr,
-
     Q_BLOCK_SIZE: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
-    Q_BLOCK_N: tl.constexpr,          # Q_BLOCK_SIZE // HEAD_DIM
-    K_BLOCK_N: tl.constexpr,          # KV_BLOCK_SIZE // HEAD_DIM
-
+    Q_BLOCK_N: tl.constexpr,  # Q_BLOCK_SIZE // HEAD_DIM
+    K_BLOCK_N: tl.constexpr,  # KV_BLOCK_SIZE // HEAD_DIM
     BIAS: tl.constexpr,
     NORMS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-
     ROPE_DIM: tl.constexpr,
     HALF_ROPE_DIM: tl.constexpr,
     COS_SIN_STRIDE0: tl.constexpr,
-
     CAST_NORM_TO_BF16: tl.constexpr,  # ONLY this cast uses fp32_to_bf16_rne
 ):
     row_pid = tl.program_id(0)
@@ -3284,23 +3279,40 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
         # y_base: fp32 or bf16
         if CAST_NORM_TO_BF16:
             # keep strict RNE here ONLY
-            y_base = fp32_to_bf16_rne(y)   # bf16
+            y_base = fp32_to_bf16_rne(y)  # bf16
         else:
-            y_base = y                     # fp32
+            y_base = y  # fp32
 
         # ---- load cos/sin half (fp32) ----
         p = tl.load(pos_ptr + row_idx).to(tl.int32)
         base = p * COS_SIN_STRIDE0
         offs = tl.arange(0, HALF_ROPE_DIM)
-        cos_f = tl.load(cos_sin_cache_ptr + base + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
-        sin_f = tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
+        cos_f = (
+            tl.load(cos_sin_cache_ptr + base + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
+        sin_f = (
+            tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
 
         # ---- RoPE half on first ROPE_DIM (fp32 math; casts use .to(bf16)) ----
-        y_rot = tl.extract_slice(y_base, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1))
+        y_rot = tl.extract_slice(
+            y_base, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
         y_rot_f = y_rot.to(tl.float32)
 
-        x1 = tl.extract_slice(y_rot_f, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
-        x2 = tl.extract_slice(y_rot_f, offsets=(0, HALF_ROPE_DIM), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+        x1 = tl.extract_slice(
+            y_rot_f, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        x2 = tl.extract_slice(
+            y_rot_f,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(Q_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
 
         o1 = x1 * cos_f - x2 * sin_f
         o2 = x2 * cos_f + x1 * sin_f
@@ -3308,17 +3320,29 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
         ro2 = o2.to(tl.bfloat16)
 
         roped = tl.zeros((Q_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
-        roped = tl.insert_slice(roped, ro1, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
-        roped = tl.insert_slice(roped, ro2, offsets=(0, HALF_ROPE_DIM), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+        roped = tl.insert_slice(
+            roped, ro1, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        roped = tl.insert_slice(
+            roped,
+            ro2,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(Q_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
 
         # output base bf16 (tail passthrough)
         if CAST_NORM_TO_BF16:
-            y_out = y_base                 # already bf16
+            y_out = y_base  # already bf16
         else:
-            y_out = y_base.to(tl.bfloat16) # fast cast
+            y_out = y_base.to(tl.bfloat16)  # fast cast
 
-        y_out = tl.insert_slice(y_out, roped, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1))
-        tl.store(q_ptr + outq_off + col, y_out.reshape(Q_BLOCK_SIZE).to(Q_TY), mask=mask)
+        y_out = tl.insert_slice(
+            y_out, roped, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
+        tl.store(
+            q_ptr + outq_off + col, y_out.reshape(Q_BLOCK_SIZE).to(Q_TY), mask=mask
+        )
 
         in_off += in_off_step
         outq_off += outq_off_step
@@ -3354,7 +3378,7 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
             y = x
 
         if CAST_NORM_TO_BF16:
-            y_base = fp32_to_bf16_rne(y)   # strict here only
+            y_base = fp32_to_bf16_rne(y)  # strict here only
         else:
             y_base = y
 
@@ -3362,15 +3386,32 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
         p = tl.load(pos_ptr + row_idx).to(tl.int32)
         base = p * COS_SIN_STRIDE0
         offs = tl.arange(0, HALF_ROPE_DIM)
-        cos_f = tl.load(cos_sin_cache_ptr + base + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
-        sin_f = tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs).to(tl.float32).reshape(1, HALF_ROPE_DIM)
+        cos_f = (
+            tl.load(cos_sin_cache_ptr + base + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
+        sin_f = (
+            tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
 
         # rope
-        y_rot = tl.extract_slice(y_base, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1))
+        y_rot = tl.extract_slice(
+            y_base, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
         y_rot_f = y_rot.to(tl.float32)
 
-        x1 = tl.extract_slice(y_rot_f, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
-        x2 = tl.extract_slice(y_rot_f, offsets=(0, HALF_ROPE_DIM), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+        x1 = tl.extract_slice(
+            y_rot_f, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        x2 = tl.extract_slice(
+            y_rot_f,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(K_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
 
         o1 = x1 * cos_f - x2 * sin_f
         o2 = x2 * cos_f + x1 * sin_f
@@ -3378,16 +3419,28 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
         ro2 = o2.to(tl.bfloat16)
 
         roped = tl.zeros((K_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
-        roped = tl.insert_slice(roped, ro1, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
-        roped = tl.insert_slice(roped, ro2, offsets=(0, HALF_ROPE_DIM), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1))
+        roped = tl.insert_slice(
+            roped, ro1, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        roped = tl.insert_slice(
+            roped,
+            ro2,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(K_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
 
         if CAST_NORM_TO_BF16:
             y_out = y_base
         else:
             y_out = y_base.to(tl.bfloat16)
 
-        y_out = tl.insert_slice(y_out, roped, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1))
-        tl.store(k_ptr + outk_off + col, y_out.reshape(KV_BLOCK_SIZE).to(K_TY), mask=mask)
+        y_out = tl.insert_slice(
+            y_out, roped, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
+        tl.store(
+            k_ptr + outk_off + col, y_out.reshape(KV_BLOCK_SIZE).to(K_TY), mask=mask
+        )
 
         in_off += in_off_step
         outk_off += outk_off_step
@@ -3409,9 +3462,9 @@ def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
 
 
 def split_qkv_rmsnorm_rope_pos_cache_half_npu(
-    input: torch.Tensor,            # [B, q_hidden + 2*kv_hidden]
-    positions: torch.Tensor,        # [B]
-    cos_sin_cache: torch.Tensor,    # [max_seq, rope_dim] layout [cos_half, sin_half]
+    input: torch.Tensor,  # [B, q_hidden + 2*kv_hidden]
+    positions: torch.Tensor,  # [B]
+    cos_sin_cache: torch.Tensor,  # [max_seq, rope_dim] layout [cos_half, sin_half]
     q_hidden_size: int,
     kv_hidden_size: int,
     head_dim: int,
@@ -3424,6 +3477,7 @@ def split_qkv_rmsnorm_rope_pos_cache_half_npu(
     cast_norm_to_bf16: bool = True,
 ):
     from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
     _, num_vectorcore = get_device_properties()
     assert input.dim() == 2
     B, total_hidden = input.shape
