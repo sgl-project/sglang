@@ -155,7 +155,7 @@ class Req:
     timings: Optional["RequestTimings"] = None
 
     # results
-    output: torch.Tensor | list[str] | None = None
+    output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
 
