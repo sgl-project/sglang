@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=131, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=51, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestAbort(CustomTestCase):
