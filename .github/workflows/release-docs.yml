@@ -14,6 +14,9 @@ concurrency:
   group: release-docs-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   execute-and-deploy:
     runs-on: 1-gpu-runner
@@ -24,7 +27,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          bash scripts/ci/ci_install_dependency.sh
+          bash scripts/ci/cuda/ci_install_dependency.sh
           pip install -r docs/requirements.txt
           apt-get update && apt-get install -y pandoc parallel retry
           ln -sf "$(which python3)" /usr/bin/python
@@ -41,12 +44,13 @@ jobs:
           make compile
 
       - name: Push HTML to sgl-project.github.io
-        timeout-minutes: 60
+        timeout-minutes: 30
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_DOCUMENTATION }}
         run: |
           cd docs
           make html
+          make markdown
           python3 wrap_run_llm.py
 
           cd _build/html

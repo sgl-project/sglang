@@ -47,19 +47,15 @@ convert_from_float_ext<at::BFloat16>(const Vectorized<float>& a, const Vectorize
 
 #define CVT_BF16_TO_FP32(a) _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
-#define CVT_FP16_TO_FP32(a) _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
+#define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
 
 // this doesn't handle NaN.
 inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {
   const __m512i x = _mm512_cvtepu8_epi16(fp8_vec);
-
-  const __m512i mant = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x07)), 4);
-  const __m512i raw_exp = _mm512_srli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x78)), 3);
-  const __m512i exp = _mm512_slli_epi16(_mm512_add_epi16(raw_exp, _mm512_set1_epi16(120)), 7);
-  const __m512i nonsign = _mm512_or_si512(exp, mant);
-
-  const __m512i sign = _mm512_slli_epi16(_mm512_and_si512(x, _mm512_set1_epi16(0x80)), 8);
-  const __m512i combined = _mm512_or_si512(nonsign, sign);
+  __m512i combined = _mm512_add_epi16(x, _mm512_set1_epi16(0x0780));
+  combined = _mm512_slli_epi16(combined, 4);
+  combined = _mm512_and_si512(combined, _mm512_set1_epi16(0x87f0));
+  combined = _mm512_add_epi16(combined, _mm512_set1_epi16(0x3c00));
 
   const __mmask32 is_nonzero = _mm512_cmpneq_epi16_mask(x, _mm512_setzero_si512());
   return (__m512bh)_mm512_maskz_mov_epi16(is_nonzero, combined);
@@ -125,10 +121,34 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 #endif
 }
 
+// faster version of float8_e4m3fn conversion to bfloat16
+//
+// we mapped cuda implementation from below link and vectorized with avx512:
+// https://github.com/thu-pacman/chitu/blob/1ed2078ec26581ebdca05b7306d4385f86edaa7c/csrc/cuda/marlin/marlin_gemm/dequant.h#L387
+//
+inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
+  const __m512i mask0 = _mm512_set1_epi16(0x80);  // sign bit
+  const __m512i mask1 = _mm512_set1_epi16(0x7F);  // exponent and mantissa
+  const __m512i mask2 = _mm512_set1_epi16(0x4000);
+
+  __m512i x = _mm512_cvtepu8_epi16(a);
+  __m512i vsign = _mm512_and_si512(x, mask0);
+  vsign = _mm512_slli_epi16(vsign, 8);
+
+  __m512i vexp_and_mant = _mm512_and_si512(x, mask1);
+  vexp_and_mant = _mm512_slli_epi16(vexp_and_mant, 4);
+
+  // _MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C: 0b11111110
+  return (__m512bh)(_mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
+}
+
+// bias for conversion of fp8 to bf16 1/256 in float32
+#define kFP8_BIAS 0x3b800000
+
 #endif
 
 // vector to scalar reduction
-#if defined(CPU_CAPABILITY_AVX512) && 0
+#if defined(CPU_CAPABILITY_AVX512)
 inline float vec_reduce_sum(const Vectorized<float>& a) {
   return _mm512_reduce_add_ps(__m512(a));
 }
@@ -303,6 +323,56 @@ inline std::tuple<__m512i, __m512i> transpose_2x32_16bit(__m512i r0, __m512i r1)
 }
 #pragma GCC diagnostic pop
 
+inline __attribute__((always_inline)) __m512 _mm512_fexp_u20_ps(const __m512 values) {
+  const __m512 vec_c0 = _mm512_set1_ps(0.00010703434948458272f);
+  const __m512 vec_c1 = _mm512_set1_ps(0.30354260500649682f);
+  const __m512 vec_c2 = _mm512_set1_ps(-0.22433836478672356);
+  const __m512 vec_c3 = _mm512_set1_ps(-0.079204240219773236);
+
+  const __m512 vec_exp_log2ef = _mm512_castsi512_ps(_mm512_set1_epi32(0x3fb8aa3b));  // log2(e)
+
+  const __m512 vec_a = _mm512_set1_ps(std::pow(2, 23) / std::log2(2));
+  const __m512 vec_b = _mm512_set1_ps(std::pow(2, 23) * 127.f);
+
+  const __m512 vec_ln_flt_min = _mm512_castsi512_ps(_mm512_set1_epi32(0xc2aeac50));
+  const __m512 vec_ln_flt_max = _mm512_castsi512_ps(_mm512_set1_epi32(0x42b17218));
+  __m512i vec_infinity = _mm512_set1_epi32(0x7F800000);
+  __m512i vec_zero = _mm512_setzero_epi32();
+
+  // Fast Exponential Computation on SIMD Architectures
+  // A. Cristiano I. Malossi, Yves Ineichen, Costas Bekas, and Alessandro
+  // Curioni exp(x) = 2**(x * log2(e))
+  //        = 2**xi * 2**xf   - TIPS we are using  the EEEE floating point
+  //        representation with identification to the exponent and the
+  //        mentissa
+  //  2**xf will be approximated to a polynomial of degree 3 computed with
+  //  Horner method
+  // mask for the boundary condition
+  auto min_mask = _mm512_cmp_ps_mask(values, vec_ln_flt_min, _CMP_LT_OS);
+  auto max_mask = _mm512_cmp_ps_mask(values, vec_ln_flt_max, _CMP_GT_OS);
+
+  // transformation with log2(e)
+  auto vec_src = _mm512_mul_ps(values, vec_exp_log2ef);
+  auto vec_fractional = _mm512_sub_ps(vec_src, _mm512_floor_ps(vec_src));
+
+  // compute polynomial using Horner Scheme, for superscalar processor
+  auto vec_res = _mm512_fmadd_ps(vec_fractional, vec_c3, vec_c2);
+  vec_res = _mm512_fmadd_ps(vec_fractional, vec_res, vec_c1);
+  vec_res = _mm512_fmadd_ps(vec_fractional, vec_res, vec_c0);
+
+  vec_src = _mm512_sub_ps(vec_src, vec_res);
+  // the tips is here, headache in perspective
+  auto tmp = _mm512_fmadd_ps(vec_a, vec_src, vec_b);
+  // headache bis - we loose precision with the cast but it "fits", but ok
+  // after f32 -> f16 later
+  __m512i casted_integer = _mm512_cvttps_epi32(tmp);
+  // boundary condition, lower than the min -> 0
+  casted_integer = _mm512_mask_mov_epi32(casted_integer, min_mask, vec_zero);
+  // boundary condition, larger than the max -> +oo
+  casted_integer = _mm512_mask_mov_epi32(casted_integer, max_mask, vec_infinity);
+  // final interpretation to float
+  return _mm512_castsi512_ps(casted_integer);
+}
 #endif
 
 }  // anonymous namespace

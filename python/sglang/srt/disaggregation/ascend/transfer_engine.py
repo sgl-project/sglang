@@ -1,9 +1,21 @@
 import logging
 import os
-from typing import List, Optional
+from typing import List
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    MooncakeTransferEngine,
+)
+
+try:
+    from memfabric_hybrid import TransferEngine
+
+    import_error = None
+except ImportError as e:
+    import_error = e
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -11,18 +23,24 @@ logger = logging.getLogger(__name__)
 class AscendTransferEngine(MooncakeTransferEngine):
 
     def __init__(
-        self, hostname: str, npu_id: int, disaggregation_mode: DisaggregationMode
+        self,
+        hostname: str,
+        npu_id: int,
+        disaggregation_mode: DisaggregationMode,
+        disaggregation_decode_enable_fake_auto: bool,
     ):
-        try:
-            from mf_adapter import TransferEngine
-        except ImportError as e:
-            raise ImportError(
-                "Please install mf_adapter, for details, see docs/backend/pd_disaggregation.md"
-            ) from e
+        if import_error is not None:
+            logger.warning(
+                "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
+            )
+            raise import_error
 
         self.engine = TransferEngine()
         self.hostname = hostname
         self.npu_id = npu_id
+        self.disaggregation_decode_enable_fake_auto = (
+            disaggregation_decode_enable_fake_auto
+        )
 
         # Centralized storage address of the AscendTransferEngine
         self.store_url = os.getenv("ASCEND_MF_STORE_URL")
@@ -37,12 +55,35 @@ class AscendTransferEngine(MooncakeTransferEngine):
         self.initialize()
 
     def initialize(self) -> None:
+        from sglang.srt.layers.dp_attention import (
+            get_tensor_model_parallel_world_size,
+            get_tp_group,
+        )
+
+        transfer_protocol = self._get_transfer_protocol()
+        if transfer_protocol is None or transfer_protocol == "sdma":
+            trans_op_type = TransferEngine.TransDataOpType.SDMA
+        else:
+            trans_op_type = TransferEngine.TransDataOpType.DEVICE_RDMA
+            """with device RDMA for PD transfer"""
+            tmp_tensor = torch.zeros(1, device="npu")
+            output_tensor_list = [
+                torch.empty_like(tmp_tensor)
+                for _ in range(get_tensor_model_parallel_world_size())
+            ]
+            # Initialize hccl in advance through all_gather to avoid conflicts with rdma initialization.
+            torch.distributed.all_gather(
+                output_tensor_list, tmp_tensor, group=get_tp_group().device_group
+            )
         """Initialize the ascend transfer instance."""
+        if self.disaggregation_decode_enable_fake_auto:
+            logger.info(
+                "Ascend Transfer Engine is not initialized in decode fake transfer mode."
+            )
+            return
+
         ret_value = self.engine.initialize(
-            self.store_url,
-            self.session_id,
-            self.role,
-            self.npu_id,
+            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
         )
         if ret_value != 0:
             logger.error("Ascend Transfer Engine initialization failed.")
@@ -56,3 +97,15 @@ class AscendTransferEngine(MooncakeTransferEngine):
             ret_value = -1
         if ret_value != 0:
             logger.debug(f"Ascend memory registration for ptr {ptrs} failed.")
+
+    @staticmethod
+    def _get_transfer_protocol():
+        protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
+        allowed_protocols = {"device_rdma", "sdma"}
+        if protocol and protocol.lower() in allowed_protocols:
+            return protocol.lower()
+        else:
+            logger.warning(
+                "Invalid or no transfer protocol specified, using default protocol."
+            )
+            return None
