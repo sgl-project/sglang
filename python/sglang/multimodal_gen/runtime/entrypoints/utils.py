@@ -266,6 +266,7 @@ def save_outputs(
     samples_out: Optional[list[Any]] = None,
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
+    output_compression: Optional[int] = None,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -281,6 +282,7 @@ def save_outputs(
             save_output,
             save_file_path,
             audio_sample_rate=audio_sample_rate,
+            output_compression=output_compression,
         )
         if samples_out is not None:
             samples_out.append(sample)
