@@ -512,7 +512,7 @@ class TboForwardBatchPreparer:
                     tbo_split_token_index=tbo_split_token_index,
                     num_token_non_padded=raw_num_token_non_padded_cpu,
                 )
-            )
+            ).cpu().tolist()
         else:
             ori_num_token_non_padded_a_cpu = ori_num_token_non_padded_b_cpu = None
 
@@ -625,7 +625,7 @@ class TboForwardBatchPreparer:
         end_seq_index: int,
         output_attn_backend: AttentionBackend,
         out_num_token_non_padded: torch.Tensor,
-        ori_num_token_non_padded_cpu: torch.Tensor,
+        ori_num_token_non_padded_cpu: int,
     ):
         assert (
             end_token_index >= start_token_index

@@ -95,11 +95,10 @@ def _compute_moe_deepseek_blog_prefill(layer):
     if _is_npu:
         device_properties = torch.npu.get_device_properties()
         total_num_sms = device_properties.cube_core_num
-        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
     else:
         device_properties = torch.cuda.get_device_properties(device="cuda")
         total_num_sms = device_properties.multi_processor_count
-        deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
+    deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
 
     return OperationsStrategy(
         deep_gemm_num_sms=deep_gemm_num_sms,
