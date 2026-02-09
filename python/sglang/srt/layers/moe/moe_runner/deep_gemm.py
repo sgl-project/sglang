@@ -35,7 +35,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if not (_is_npu or _is_hip):
+if not (_is_npu or _is_hip) and torch.cuda.is_available():
     from sgl_kernel import silu_and_mul
 
 
