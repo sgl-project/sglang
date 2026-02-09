@@ -132,6 +132,24 @@ class BaselineConfig:
             ),
         )
 
+    def update(self, path: Path):
+        """Load baseline configuration from JSON file."""
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        scenarios_new = {}
+        for name, cfg in data["scenarios"].items():
+            scenarios_new[name] = ScenarioConfig(
+                stages_ms=cfg["stages_ms"],
+                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            )
+
+        self.scenarios.update(scenarios_new)
+        return self
+
 
 @dataclass(frozen=True)
 class DiffusionServerArgs:
@@ -729,4 +747,6 @@ TWO_GPU_CASES_B = [
 ]
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+BASELINE_CONFIG = BaselineConfig.load(
+    Path(__file__).with_name("perf_baselines.json")
+).update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")

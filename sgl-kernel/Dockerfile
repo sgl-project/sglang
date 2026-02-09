@@ -96,8 +96,6 @@ COPY . /sgl-kernel/
 # Optional: enable CMake/Ninja profiling (pass non-empty via --build-arg ENABLE_*)
 ARG ENABLE_CMAKE_PROFILE
 ARG ENABLE_BUILD_PROFILE
-# Optional: cmake extra args for aarch64 full kernel build (pass non-empty via --build-arg CMAKE_EXTRA_ARGS)
-ARG CMAKE_EXTRA_ARGS
 ARG ARCH=x86_64
 ARG USE_CCACHE=1
 
@@ -130,9 +128,6 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
       export CMAKE_ARGS="--profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
     fi; \
-    # Merge Extra CMake options into CMAKE_ARGS \
-    export CMAKE_ARGS="${CMAKE_ARGS:+${CMAKE_ARGS} }${CMAKE_EXTRA_ARGS:-}"; \
-    echo "CMAKE_ARGS= [$CMAKE_ARGS]"; \
     ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation; \
     ./rename_wheels.sh; \
     if [ -n "${ENABLE_BUILD_PROFILE:-}" ] && [ -f /sgl-kernel/build/.ninja_log ]; then \
