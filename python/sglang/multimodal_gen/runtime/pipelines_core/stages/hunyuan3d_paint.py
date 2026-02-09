@@ -373,45 +373,13 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
 
         return image
 
-    def _recenter_image(self, image, border_ratio=0.2):
-        from PIL import Image as PILImage
-
-        if image.mode == "RGB":
-            return image
-        elif image.mode == "L":
-            image = image.convert("RGB")
-            return image
-
-        alpha_channel = np.array(image)[:, :, 3]
-        non_zero_indices = np.argwhere(alpha_channel > 0)
-        if non_zero_indices.size == 0:
-            raise ValueError("Image is fully transparent")
-
-        min_row, min_col = non_zero_indices.min(axis=0)
-        max_row, max_col = non_zero_indices.max(axis=0)
-
-        cropped_image = image.crop((min_col, min_row, max_col + 1, max_row + 1))
-
-        width, height = cropped_image.size
-        border_width = int(width * border_ratio)
-        border_height = int(height * border_ratio)
-
-        new_width = width + 2 * border_width
-        new_height = height + 2 * border_height
-        square_size = max(new_width, new_height)
-
-        new_image = PILImage.new("RGBA", (square_size, square_size), (255, 255, 255, 0))
-
-        paste_x = (square_size - new_width) // 2 + border_width
-        paste_y = (square_size - new_height) // 2 + border_height
-        new_image.paste(cropped_image, (paste_x, paste_y))
-        return new_image
-
     def _do_delight(self, batch: Req, server_args: ServerArgs) -> Req:
         from PIL import Image
 
+        from sglang.multimodal_gen.runtime.models.mesh3d_utils import recenter_image
+
         image = Image.open(batch.image_path)
-        image = self._recenter_image(image)
+        image = recenter_image(image)
 
         if not self.config.delight_enable:
             logger.info("Delight preprocessing disabled, using original image")
@@ -715,14 +683,8 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         camera_azims = batch.extra["camera_azims"]
         camera_elevs = batch.extra["camera_elevs"]
 
-        num_steps = (
-            getattr(batch, "paint_num_inference_steps", None)
-            or self.config.paint_num_inference_steps
-        )
-        guidance_scale = (
-            getattr(batch, "paint_guidance_scale", None)
-            or self.config.paint_guidance_scale
-        )
+        num_steps = self.config.paint_num_inference_steps
+        guidance_scale = self.config.paint_guidance_scale
         render_size = self.config.paint_resolution
         num_in_batch = len(normal_maps)
 

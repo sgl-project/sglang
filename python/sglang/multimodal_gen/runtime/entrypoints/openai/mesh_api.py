@@ -41,13 +41,15 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/meshes", tags=["meshes"])
 
 
+def _normalize_format(fmt: Optional[str]) -> str:
+    fmt = (fmt or "glb").lower()
+    return fmt if fmt in ("glb", "obj") else "glb"
+
+
 def _build_sampling_params_from_request(
     request_id: str, req: MeshGenerationsRequest, image_path: Optional[str] = None
 ) -> SamplingParams:
-    fmt = (req.output_format or "glb").lower()
-    if fmt not in ("glb", "obj"):
-        fmt = "glb"
-    ext = fmt
+    ext = _normalize_format(req.output_format)
 
     server_args = get_global_server_args()
     sampling_kwargs: Dict[str, Any] = {
@@ -67,28 +69,16 @@ def _build_sampling_params_from_request(
     if req.negative_prompt is not None:
         sampling_kwargs["negative_prompt"] = req.negative_prompt
 
-    sampling_params = SamplingParams.from_user_sampling_params_args(
+    return SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
         **sampling_kwargs,
     )
 
-    if req.num_inference_steps is not None:
-        sampling_params.num_inference_steps = req.num_inference_steps
-    if req.guidance_scale is not None:
-        sampling_params.guidance_scale = req.guidance_scale
-    if req.seed is not None:
-        sampling_params.seed = req.seed
-
-    return sampling_params
-
 
 def _mesh_job_from_sampling(
     request_id: str, req: MeshGenerationsRequest, sampling: SamplingParams
 ) -> Dict[str, Any]:
-    fmt = (req.output_format or "glb").lower()
-    if fmt not in ("glb", "obj"):
-        fmt = "glb"
     return {
         "id": request_id,
         "object": "mesh",
@@ -96,7 +86,7 @@ def _mesh_job_from_sampling(
         "status": "queued",
         "progress": 0,
         "created_at": int(time.time()),
-        "format": fmt,
+        "format": _normalize_format(req.output_format),
         "file_path": os.path.abspath(sampling.output_file_path()),
     }
 

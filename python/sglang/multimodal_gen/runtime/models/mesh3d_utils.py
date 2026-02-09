@@ -847,49 +847,6 @@ class MeshRender:
 
         return image
 
-    def render_depth(
-        self,
-        elev: float,
-        azim: float,
-        camera_distance: Optional[float] = None,
-        center: Optional[np.ndarray] = None,
-        resolution: Optional[Tuple[int, int]] = None,
-        return_type: str = "th",
-    ) -> Union[torch.Tensor, np.ndarray, Image.Image]:
-        """Render depth map from a viewpoint."""
-        pos_camera, pos_clip = self._get_pos_from_mvp(
-            elev, azim, camera_distance, center
-        )
-
-        if resolution is None:
-            resolution = self.default_resolution
-        if isinstance(resolution, (int, float)):
-            resolution = (int(resolution), int(resolution))
-
-        rast_out = self._rasterize(pos_clip, self.pos_idx, resolution)
-
-        pos_camera_3d = pos_camera[:, :3] / pos_camera[:, 3:4]
-        tex_depth = pos_camera_3d[:, 2].reshape(1, -1, 1).contiguous()
-
-        depth = self._interpolate(tex_depth, rast_out, self.pos_idx)
-
-        visible_mask = torch.clamp(rast_out[..., -1:], 0, 1)
-        depth_masked = depth[visible_mask > 0]
-        if depth_masked.numel() > 0:
-            depth_max, depth_min = depth_masked.max(), depth_masked.min()
-            depth = (depth - depth_min) / (depth_max - depth_min + 1e-8)
-        depth = depth * visible_mask
-
-        image = depth[0, ...]
-
-        if return_type == "np":
-            image = image.cpu().numpy()
-        elif return_type == "pl":
-            image = image.squeeze(-1).cpu().numpy() * 255
-            image = Image.fromarray(image.astype(np.uint8))
-
-        return image
-
     def render_normal_multiview(
         self,
         camera_elevs: List[float],
@@ -1175,6 +1132,45 @@ def array_to_tensor(np_array):
     return image_pts
 
 
+def recenter_image(image, border_ratio=0.2):
+    """Recenter a PIL image, cropping to non-transparent content with a border.
+
+    For RGB/L images, returns the image as-is (converted to RGB for L).
+    For RGBA images, crops to non-transparent region and re-centers with border.
+    """
+    from PIL import Image as PILImage
+
+    if image.mode == "RGB":
+        return image
+    elif image.mode == "L":
+        return image.convert("RGB")
+
+    alpha_channel = np.array(image)[:, :, 3]
+    non_zero_indices = np.argwhere(alpha_channel > 0)
+    if non_zero_indices.size == 0:
+        raise ValueError("Image is fully transparent")
+
+    min_row, min_col = non_zero_indices.min(axis=0)
+    max_row, max_col = non_zero_indices.max(axis=0)
+
+    cropped_image = image.crop((min_col, min_row, max_col + 1, max_row + 1))
+
+    width, height = cropped_image.size
+    border_width = int(width * border_ratio)
+    border_height = int(height * border_ratio)
+
+    new_width = width + 2 * border_width
+    new_height = height + 2 * border_height
+    square_size = max(new_width, new_height)
+
+    new_image = PILImage.new("RGBA", (square_size, square_size), (255, 255, 255, 0))
+
+    paste_x = (square_size - new_width) // 2 + border_width
+    paste_y = (square_size - new_height) // 2 + border_height
+    new_image.paste(cropped_image, (paste_x, paste_y))
+    return new_image
+
+
 class ImageProcessorV2:
     """Image processor for Hunyuan3D single-view input."""
 
@@ -1317,14 +1313,6 @@ class MVImageProcessorV2(ImageProcessorV2):
         return outputs
 
 
-IMAGE_PROCESSORS = {
-    "v2": ImageProcessorV2,
-    "mv_v2": MVImageProcessorV2,
-}
-
-DEFAULT_IMAGEPROCESSOR = "v2"
-
-
 # All tool classes available in this module for resolution
 TOOL_CLASSES = (
     ImageProcessorV2,
@@ -1369,11 +1357,10 @@ __all__ = [
     "linear_grid_put_2d",
     "MeshRender",
     # Hunyuan3D image processors
+    "recenter_image",
     "array_to_tensor",
     "ImageProcessorV2",
     "MVImageProcessorV2",
-    "IMAGE_PROCESSORS",
-    "DEFAULT_IMAGEPROCESSOR",
     "TOOL_CLASSES",
     "resolve_hunyuan3d_tool",
 ]
