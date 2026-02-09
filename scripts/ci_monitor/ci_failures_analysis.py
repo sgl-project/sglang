@@ -1894,6 +1894,57 @@ class SGLangFailuresAnalyzer:
                         )
                         summary_lines.append("")
 
+                # ==== PERFORMANCE REGRESSIONS (if available) ====
+                if perf_key:
+                    perf_results = report_data.get("performance", {}).get(perf_key, {})
+                    if perf_results and perf_results.get("regressions"):
+                        regressions = perf_results["regressions"]
+                        summary_lines.append("### 📊 Performance Regressions")
+                        summary_lines.append("")
+                        summary_lines.append(
+                            f"⚠️ **{len(regressions)} jobs with performance regressions detected**"
+                        )
+                        summary_lines.append("")
+                        summary_lines.append(
+                            "_Baseline = average of previous 10 runs, Recent = latest run_"
+                        )
+                        summary_lines.append("")
+
+                        # Table header
+                        summary_lines.append(
+                            "| Test File | Job | Metric | Baseline (Avg of 10 runs) | Recent | Delta |"
+                        )
+                        summary_lines.append(
+                            "|-----------|-----|--------|---------------------------|--------|-------|"
+                        )
+
+                        # Collect all regression entries for the table
+                        for job_name, job_perf in sorted(regressions.items()):
+                            # Extract test file and job index
+                            if " (" in job_name:
+                                test_file = job_name.split(" (")[0]
+                                job_index = "(" + job_name.split(" (")[1]
+                            else:
+                                test_file = job_name
+                                job_index = "-"
+
+                            # Add a row for each regression metric
+                            for metric in job_perf["metrics"]:
+                                if metric["is_regression"]:
+                                    metric_name = metric["metric"]
+                                    baseline = metric["baseline_avg"]
+                                    recent = metric["recent_value"]
+                                    change = metric["change_pct"]
+
+                                    emoji = "⬆️" if change > 0 else "⬇️"
+                                    delta_str = f"{emoji} {change:+.1f}%"
+
+                                    summary_lines.append(
+                                        f"| `{test_file}` | {job_index} | {metric_name} | {baseline:.2f} | {recent:.2f} | {delta_str} |"
+                                    )
+
+                        summary_lines.append("")
+
                 # ==== JOB-LEVEL SUMMARY (COLLAPSIBLE) ====
                 summary_lines.append("<details>")
                 summary_lines.append(
@@ -2044,46 +2095,6 @@ class SGLangFailuresAnalyzer:
 
                 summary_lines.append("</details>")
                 summary_lines.append("")
-
-                # ==== PERFORMANCE REGRESSIONS (if available) ====
-                if perf_key:
-                    perf_results = report_data.get("performance", {}).get(perf_key, {})
-                    if perf_results and perf_results.get("regressions"):
-                        regressions = perf_results["regressions"]
-                        summary_lines.append("### 📊 Performance Regressions")
-                        summary_lines.append("")
-                        summary_lines.append(
-                            f"⚠️ **{len(regressions)} jobs with performance regressions detected**"
-                        )
-                        summary_lines.append("")
-
-                        # Show each job with regressions
-                        for job_name, job_perf in sorted(regressions.items()):
-                            summary_lines.append(f"#### {job_name}")
-                            summary_lines.append(
-                                f"Run: #{job_perf['run_number']} ({job_perf['head_sha']})"
-                            )
-                            summary_lines.append("")
-                            summary_lines.append(
-                                "| Metric | Baseline | Recent | Change |"
-                            )
-                            summary_lines.append(
-                                "|--------|----------|--------|--------|"
-                            )
-
-                            for metric in job_perf["metrics"]:
-                                if metric["is_regression"]:
-                                    metric_name = metric["metric"]
-                                    baseline = metric["baseline_avg"]
-                                    recent = metric["recent_value"]
-                                    change = metric["change_pct"]
-
-                                    emoji = "⬆️" if change > 0 else "⬇️"
-                                    summary_lines.append(
-                                        f"| {metric_name} | {baseline:.2f} | {recent:.2f} | {emoji} {change:+.1f}% |"
-                                    )
-
-                            summary_lines.append("")
 
             # ========== RUNNERS (at the top) ==========
             summary_lines.append("---")

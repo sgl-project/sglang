@@ -73,11 +73,18 @@ def analyze_performance_regressions(
     """
     Analyze performance metrics from scheduled runs and detect regressions.
 
+    Compares the most recent run against a baseline calculated from previous runs:
+    - Baseline: Average of the 10 previous runs (configurable via baseline_window)
+    - Recent: The most recent run
+    - Regression: Detected when recent value deviates from baseline by > threshold
+
     Args:
         scheduled_runs: List of workflow runs (most recent first)
         get_jobs_func: Function to get jobs for a run (pass analyzer.get_jobs_for_run)
         get_logs_func: Function to get logs for a job (pass analyzer.get_job_logs)
         baseline_window: Number of older runs to use for baseline (default: 10)
+            The baseline is calculated as the average of runs [1:baseline_window+1]
+            where run [0] is the most recent run being tested
         regression_threshold: Percentage threshold for regression (default: 0.10 = 10%)
 
     Returns:
@@ -88,14 +95,14 @@ def analyze_performance_regressions(
             "regressions": {
                 "job_name": {
                     "job_name": str,
-                    "run_number": int,
-                    "head_sha": str,
+                    "run_number": int,  # The most recent run number
+                    "head_sha": str,    # The most recent run's commit SHA
                     "metrics": [
                         {
                             "metric": str,
-                            "baseline_avg": float,
-                            "recent_value": float,
-                            "change_pct": float,
+                            "baseline_avg": float,   # Average of previous N runs
+                            "recent_value": float,   # Value from most recent run
+                            "change_pct": float,     # Percentage change
                             "is_regression": bool
                         },
                         ...
@@ -162,10 +169,11 @@ def analyze_performance_regressions(
         if len(history) < baseline_window + 1:
             continue
 
-        # Most recent run is first (newest)
+        # RECENT: Most recent run is first (newest) - this is history[0]
         recent_run = history[0]
 
-        # Baseline: average of older runs (excluding the most recent)
+        # BASELINE: Average of older runs (excluding the most recent)
+        # Uses runs [1:baseline_window+1], typically the previous 10 runs
         baseline_runs = history[1 : baseline_window + 1]
 
         # Calculate baseline averages for each metric
@@ -255,12 +263,18 @@ def format_performance_summary_for_github(perf_summary: Dict) -> List[str]:
 
     regressions = perf_summary["regressions"]
     lines.append(f"⚠️ **Found regressions in {len(regressions)} jobs**\n")
+    lines.append("\n_Baseline = average of previous 10 runs, Recent = latest run_\n")
 
+    # Show each job with regressions
     for job_name, data in sorted(regressions.items()):
         lines.append(f"\n### 📉 {job_name}\n")
         lines.append(f"Run: #{data['run_number']} ({data['head_sha']})\n")
-        lines.append("\n| Metric | Baseline | Recent | Change |\n")
-        lines.append("|--------|----------|--------|--------|\n")
+        lines.append(
+            "\n| Metric | Baseline (avg of 10 runs) | Recent (latest run) | Change |\n"
+        )
+        lines.append(
+            "|--------|---------------------------|---------------------|--------|\n"
+        )
 
         for metric in data["metrics"]:
             if not metric["is_regression"]:
