@@ -69,9 +69,7 @@ def run_gh_command(args: list[str]) -> dict:
             text=True,
         )
     except FileNotFoundError:
-        raise Exception(
-            "gh CLI not found. Please install from https://cli.github.com/"
-        )
+        raise Exception("gh CLI not found. Please install from https://cli.github.com/")
 
     if result.returncode != 0:
         raise Exception(f"gh api failed: {result.stderr}")
@@ -189,8 +187,18 @@ def query_jobs(
             job_name = job.get("name", "")
 
             # Filter by job name
-            if job_filter.lower() not in job_name.lower():
+            # Use prefix matching to avoid e.g. "stage-c-test-large-8-gpu-amd"
+            # also matching "stage-c-test-large-8-gpu-amd-mi35x"
+            job_name_lower = job_name.lower()
+            filter_lower = job_filter.lower()
+            if not job_name_lower.startswith(filter_lower):
                 continue
+            # If there are characters after the filter, ensure it's not a
+            # continuation of the base job name (e.g., "-mi35x")
+            if len(job_name_lower) > len(filter_lower):
+                next_char = job_name_lower[len(filter_lower)]
+                if next_char not in (" ", "("):
+                    continue
 
             # Filter by status if specified
             if status_filter and job.get("status") != status_filter:
