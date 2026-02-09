@@ -1,0 +1,2 @@
+[submodule "external/sglang"]
+	url = https://github.com/rexxy-sasori/sglang.git
