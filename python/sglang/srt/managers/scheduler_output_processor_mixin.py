@@ -414,7 +414,7 @@ class SchedulerOutputProcessorMixin:
                 if req.multimodal_inputs is None:
                     continue
                 for mm_item in req.multimodal_inputs.mm_items:
-                    pixel_values = getattr(mm_item, "feature", None)
+                    pixel_values = mm_item.feature
                     if isinstance(pixel_values, torch.Tensor):
                         mm_item.feature = None
                         del pixel_values
