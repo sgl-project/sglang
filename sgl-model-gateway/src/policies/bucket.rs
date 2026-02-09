@@ -266,6 +266,7 @@ impl LoadBalancingPolicy for BucketPolicy {
             None => 0,
             Some(text) => text.chars().count(),
         };
+        info!("char_count ==> {:?}", char_count);
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
@@ -278,6 +279,7 @@ impl LoadBalancingPolicy for BucketPolicy {
         let prefill_url = if let Some(bucket) = bucket {
             let (choiced_url, chars_per_url_snapshot) = {
                 let buc = bucket.read().unwrap();
+                info!("boundary==> {:#?}", buc);
                 let chars_per_url_snapshot = buc.chars_per_url.lock().unwrap().clone();
                 let choiced_url = buc.find_boundary(char_count);
                 (choiced_url, chars_per_url_snapshot)
@@ -288,18 +290,19 @@ impl LoadBalancingPolicy for BucketPolicy {
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
             let is_imbalanced =
                 abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
-            debug!(
+            info!("chars_per_url_snapshot ==> {:#?}", chars_per_url_snapshot);
+            info!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
             );
-            debug!(
+            info!(
                  "Checking imbalance: max_load={}, min_load={}, abs_diff={}, conf_abs={}, conf_rel={}, calculated_rel_threshold={}, is_imbalanced={}",
                  max_load, min_load, abs_diff, self.config.balance_abs_threshold, self.config.balance_rel_threshold, rel_threshold, is_imbalanced
              );
 
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
-                debug!("select prefill instance by Load Balance policy");
+                info!("select prefill instance by Load Balance policy");
                 let min_url = chars_per_url_snapshot
                     .iter()
                     .min_by_key(|(_, &chars)| chars)
@@ -307,18 +310,18 @@ impl LoadBalancingPolicy for BucketPolicy {
                     .unwrap_or_else(|| {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let url = workers[healthy_indices[idx]].url();
-                        warn!("No URL found, randomly selecting: {}", url);
+                        info!("No URL found, randomly selecting: {}", url);
                         url.to_string()
                     });
                 min_url
             } else {
-                debug!("select prefill instance by Bucket policy");
+                info!("select prefill instance by Bucket policy");
                 match choiced_url {
                     Some(url) if !url.is_empty() => url,
                     _ => {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let selected_url = workers[healthy_indices[idx]].url();
-                        warn!("Boundary not found, randomly selection: {}", selected_url);
+                        info!("Boundary not found, randomly selection: {}", selected_url);
                         selected_url.to_string()
                     }
                 }
@@ -331,7 +334,7 @@ impl LoadBalancingPolicy for BucketPolicy {
 
             prefill_url
         } else {
-            warn!(
+            info!(
                 "No bucket found for model {}, randomly selecting healthy worker",
                 model_key
             );
@@ -341,6 +344,7 @@ impl LoadBalancingPolicy for BucketPolicy {
             let prefill_url = selected_worker.url().to_string();
             prefill_url
         };
+        info!("select_worker res ==> {:?}", prefill_url);
 
         workers.iter().position(|w| w.url() == prefill_url)
     }
