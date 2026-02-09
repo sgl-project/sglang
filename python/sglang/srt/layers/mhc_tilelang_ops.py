@@ -1,7 +1,7 @@
 """
 Fused CUDA kernels for multi-head composite (mHC) operators.
 
-This module provides high-performance fused CUDA kernel implementations
+This module provides high-performance fused kernel implementations
 for mHC operations using TileLang, including normalization, linear projection,
 sigmoid activation, aggregation, Sinkhorn-Knopp normalization, and residual merging.
 """
@@ -37,6 +37,7 @@ def norm_linear_splitk_kernel(
     Uses Atomic Add for accumulation.
     """
     in_dtype = "bfloat16"
+    weight_dtype = "float32"
     accum_dtype = "float32"
     
     # Define symbolic variables for dynamic shape
@@ -47,7 +48,7 @@ def norm_linear_splitk_kernel(
     @T.prim_func
     def norm_linear_splitk_func(
         X: T.Tensor[(M_pad, K), in_dtype], 
-        W: T.Tensor[(N, K), "float32"], 
+        W: T.Tensor[(N, K), weight_dtype],
         Y_accum: T.Tensor[(M, N), accum_dtype],      # Global Accumulator (FP32) - Real Shape
         SumSqX_accum: T.Tensor[(M, ), accum_dtype],  # Global Accumulator - Real Shape
     ):
@@ -175,15 +176,12 @@ def mhc_tilelang_norm_linear(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused RMS normalization and linear projection operation using Split-K strategy.
-    
     Args:
-        x: Input tensor of shape [M, K].
-            M = batch * seq_len, K = n_stream * hidden
-        weight: Weight tensor of shape [N, K].
-            N = 2 * n_stream + n_stream * n_stream, K = n_stream * hidden
-        
+        x: [M, n_streams, D], bf16
+        weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32
     Returns:
-        Tuple of (r, y) where r is the norm result (RMS) and y is the projection result (Linear).
+        r: [M, 1], fp32
+        proj: [M, 2 * n_streams + n_streams * n_streams], fp32
     """
     x_in = x.flatten(1)
     M, K = x_in.shape
@@ -328,19 +326,16 @@ def map_sigmoid_kernel(M, Dim, N, threads, block_M, block_Dim):
 def mhc_tilelang_map_sigmoid(r, proj, bias, alpha, n_streams):
     """
     Fused map and sigmoid operations.
-    
     Args:
-        r: Input r tensor of shape [M, 1].
-            M = batch * seq
-        proj: Projection tensor of shape [M, OutDim].
-            M = batch * seq, OutDim = 2 * n_streams + n_streams * n_streams
-        bias: Bias tensor of shape [OutDim].
-            OutDim = 2 * n_streams + n_streams * n_streams
-        alpha: Concatenated alpha parameter [alpha_pre * n, alpha_post * n , alpha_res * n * n].
-        n_streams: Number of streams.
-
+        r: [M, 1], fp32
+        proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+        bias: [2 * n_streams + n_streams * n_streams, ], fp32
+        alpha: [2 * n_streams + n_streams * n_streams, ], fp32
+        n_streams: int
     Returns:
-        Tuple of (h_pre, h_post, h_res) tensors.
+        h_pre: [M, n_streams], fp32
+        h_post: [M, n_streams], fp32
+        h_res: [M, n_streams, n_streams], fp32
     """
     OutDim = proj.shape[-1]
     M, _ = r.shape
@@ -460,20 +455,11 @@ def aggregate_kernel(M, n_streams, Dim, threads, block_M, block_D):
 def mhc_tilelang_aggregate(residuals, h_pre):
     """
     Fused aggregation operation.
-
     Args:
-        residuals: Residual tensor of shape [M, N, D].
-            M = batch_size * seq_len
-            N = number of streams (4 for Sinkhorn-Knop)
-            D = hidden dimension
-        h_pre: Pre-activation tensor of shape [M, N].
-            M = batch_size * seq_len
-            N = number of streams (4 for Sinkhorn-Knop)
-
+        residuals: [M, n_streams, D], bf16
+        h_pre: [M, n_streams], fp32
     Returns:
-        Aggregated output tensor of shape [M, D].
-            M = batch_size * seq_len
-            D = hidden dimension
+        out: [M, D], bf16
     """
     M, N, D = residuals.shape
     res_in = residuals
@@ -680,14 +666,11 @@ def sinkhorn_kernel(M, n_streams, threads, block_M):
 def mhc_tilelang_sinkhorn(logits: torch.Tensor, n_iters: int = 20) -> torch.Tensor:
     """
     Fused Sinkhorn-Knopp normalization.
-    
     Args:
-        logits: Input logits tensor of shape [M, N, N].
-            M = batch * seq_len, N = 4 (stream number)
-        n_iters: Number of Sinkhorn iterations.
-        
+        logits: [M, n_streams, n_streams], fp32
+        n_iters: int, default 20
     Returns:
-        Normalized output tensor of shape [M, N, N].
+        matrix: [M, n_streams, n_streams], fp32
     """
     M, N, _ = logits.shape
     logits_in = logits
@@ -858,19 +841,13 @@ def expand_merge_kernel(M, n_streams, HiddenDim, threads, block_M, block_D):
 def mhc_tilelang_expand_merge(residuals, layer_output, h_res, h_post):
     """
     Fused expand and merge operations.
-    
     Args:
-        residuals: Residual tensor of shape [M, N, D].
-            M = batch * seq, N = 4, D = hidden
-        layer_output: Layer output tensor of shape [M, D].
-            M = batch * seq, D = hidden
-        h_res: Residual mixing weights of shape [M, N, N].
-            M = batch * seq, N = 4
-        h_post: Post-activation tensor of shape [M, N].
-            M = batch * seq, N = 4
-        
+        residuals: [M, n_streams, D], bf16
+        layer_output: [M, D], bf16
+        h_res: [M, n_streams, n_streams], fp32
+        h_post: [M, n_streams], fp32
     Returns:
-        Merged output tensor.
+        mixed: [M, n_streams, D], bf16
     """
     M, N, D = residuals.shape
     h_res_in = h_res
