@@ -233,7 +233,7 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
     # uninstall existing aiter
-    docker exec ci_sglang pip uninstall -y aiter || true
+    docker exec ci_sglang pip uninstall -y amd-aiter || true
 
     # delete old aiter directory
     docker exec ci_sglang rm -rf /sgl-workspace/aiter
