@@ -136,18 +136,19 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
     )
     g_layout_bt: gl.constexpr = gl.SliceLayout(dim=1, parent=v_reg_layout)
 
-    if TRANSPOSE_STATE:
-        h0_tmem_layout_t: gl.constexpr = TensorMemoryLayout([BV, BK], col_stride=1)
-        h0_reg_layout_t: gl.constexpr = get_tmem_reg_layout(
-            gl.float32, [BV, BK], h0_tmem_layout_t, NUM_WARPS
-        )
-
     # Allocate tensor memory for MMA operations
     v_tmem = allocate_tensor_memory(gl.float32, [BT, BV], v_tmem_layout)
     kv_tmem = allocate_tensor_memory(gl.float32, [BK, BV], h_tmem_layout)
 
     # Initialize h accumulators
     b_h = gl.zeros([BK, BV], dtype=gl.float32, layout=h_reg_layout)
+
+    # Prologue: prefetch w[0] early (overlap with h0 load + transpose)
+    mbarrier.expect(tma_bar_w, w_desc.block_type.nbytes)
+    if IS_VARLEN:
+        tma.async_copy_global_to_shared(w_desc, [0, bos, i_h, 0], tma_bar_w, w_smem)
+    else:
+        tma.async_copy_global_to_shared(w_desc, [i_n, 0, i_h, 0], tma_bar_w, w_smem)
 
     # Load initial state
     if USE_INITIAL_STATE:
@@ -166,15 +167,15 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
         mbarrier.wait(tma_bar_h0, phase=tma_phase_h0)
         tma_phase_h0 ^= 1
         if TRANSPOSE_STATE:
-            # Load [BV, BK], permute to [BK, BV], convert layout
+            # smem permute: load [BV,BK] smem as [BK,BV] via permuted view
             h0_smem_2d = h0_smem.reshape([BV, BK])
-            b_h0 = h0_smem_2d.load(h0_reg_layout_t)
-            b_h0_t = gl.permute(b_h0, (1, 0))  # [BK, BV]
-            b_h0 = gl.convert_layout(b_h0_t, h_reg_layout)
+            h0_smem_t = h0_smem_2d.permute((1, 0))  # [BK, BV] view
+            b_h0 = h0_smem_t.load(h_reg_layout)
         else:
             h0_smem_2d = h0_smem.reshape([BK, BV])
             b_h0 = h0_smem_2d.load(h_reg_layout)
         b_h = b_h + b_h0
+        mbarrier.invalidate(tma_bar_h0)
 
     # Main Loop
     for i_t in range(NT):
@@ -183,16 +184,18 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
         else:
             i_b, i_t_h, i_t_kvw = i_n, i_t, i_t * BT
 
-        # Prefetch w
-        mbarrier.expect(tma_bar_w, w_desc.block_type.nbytes)
+        # Prefetch v and k early (max overlap with gate + h_store + w_wait + MMA1)
+        mbarrier.expect(tma_bar_v, v_desc.block_type.nbytes)
         tma.async_copy_global_to_shared(
-            w_desc, [i_b, i_t_kvw, i_h, 0], tma_bar_w, w_smem
+            v_desc, [i_b, i_t_kvw, i_h, i_v * BV], tma_bar_v, v_smem
+        )
+        mbarrier.expect(tma_bar_k, k_desc.block_type.nbytes)
+        tma.async_copy_global_to_shared(
+            k_desc, [i_b, i_t_kvw, i_hk, 0], tma_bar_k, k_smem
         )
 
-        # Apply gate: v_new *= exp(g_last - g), h *= exp(g_last)
-        # TODO: i_t == NT -1 or no-check
+        # Compute gating values (scalar ops, overlap with TMA in-flight)
         if USE_G:
-            # last_idx = gl.minimum((i_t + 1) * BT, T) - 1
             last_idx = T - 1 if i_t == NT - 1 else (i_t + 1) * BT - 1
             bg_last = gl.load(g + (bos + last_idx) * H + i_h)
             g_offset = i_t * BT + gl.arange(0, BT, layout=g_layout_bt)
@@ -201,45 +204,36 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
             bg_last_exp = gl.exp(bg_last)
 
         if SAVE_NEW_VALUE and IS_VARLEN:
-            # For varlen: use scatter to handle boundary correctly
             t_limit_right = gl.minimum(T - i_t * BT, BT)
             t_offsets = gl.arange(0, BT, layout=offsets_layout)
             row_valid = t_offsets < t_limit_right
             x_offsets = gl.where(row_valid, bos + i_t * BT + t_offsets, 0x7FFFFFFF)
 
-        # Store h_i
+        # Store h_i to smem
         h_smem_2d = h_smem.reshape([BK, BV])
         h_smem_2d.store(b_h.to(dtype))
 
-        # Prefetch v
-        mbarrier.expect(tma_bar_v, v_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(
-            v_desc, [i_b, i_t_kvw, i_h, i_v * BV], tma_bar_v, v_smem
-        )
-
-        # Prefetch k
-        mbarrier.expect(tma_bar_k, k_desc.block_type.nbytes)
-        tma.async_copy_global_to_shared(
-            k_desc, [i_b, i_t_kvw, i_hk, 0], tma_bar_k, k_smem
-        )
-
-        # wait w
+        # Wait for w (prefetched in prologue or previous iteration)
         mbarrier.wait(tma_bar_w, phase=tma_phase_w)
         tma_phase_w ^= 1
         w_smem_2d = w_smem.reshape([BT, BK])
 
-        # Store h_i
+        # TMA store h to global
         fence_async_shared()
         tma.async_copy_shared_to_global(h_desc, [i_b, i_t_h, i_h, 0, i_v * BV], h_smem)
-
         # w @ h: [BT, BK] @ [BK, BV] -> [BT, BV]
         tcgen05_mma(w_smem_2d, h_smem_2d, v_tmem, use_acc=False)
         tcgen05_commit(mma_bar)
-
         mbarrier.wait(mma_bar, phase=mma_phase)
         mma_phase ^= 1
 
-        # v_new = v - v_acc
+        # Prefetch w for next iteration (w_smem is free after MMA1 completes)
+        if i_t < NT - 1:
+            mbarrier.expect(tma_bar_w, w_desc.block_type.nbytes)
+            tma.async_copy_global_to_shared(
+                w_desc, [i_b, i_t_kvw + BT, i_h, 0], tma_bar_w, w_smem
+            )
+
         v_acc_reg = v_tmem.load(v_reg_layout)
         mbarrier.wait(tma_bar_v, phase=tma_phase_v)
         tma_phase_v ^= 1
@@ -247,7 +241,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
         v_reg = v_smem_2d.load(v_reg_layout_16)
         v_new_reg = v_reg - v_acc_reg
 
-        # store v_new
+        # store v_new to global
         if SAVE_NEW_VALUE:
             if IS_VARLEN:
                 v_new_smem.store(v_new_reg.to(dtype))
@@ -261,6 +255,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
                     v_new_desc, [i_b, i_t_kvw, i_h, i_v * BV], v_new_smem
                 )
 
+        # Apply gating
         if USE_G:
             if i_t == NT - 1:
                 v_new_reg = (
@@ -270,36 +265,34 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
                 v_new_reg = v_new_reg * gl.exp(bg_last - b_g)[:, None]
             b_h *= bg_last_exp
 
-        # Convert to dtype for MMA
+        # Store gated v_new back to v_smem
         v_new_reg = v_new_reg.to(dtype)
-        # Update h: h += k.T @ v_new
         v_smem_2d.store(v_new_reg)
 
+        # Wait for k
         mbarrier.wait(tma_bar_k, phase=tma_phase_k)
         tma_phase_k ^= 1
         k_smem_2d = k_smem.reshape([BT, BK])
-        # k.T @ v_new -> kv_tmem: [BK, BT] @ [BT, BV] -> [BK, BV]
         k_t = k_smem_2d.permute((1, 0))
 
         # fence v
         fence_async_shared()
+        # k.T @ v_new -> kv_tmem: [BK, BT] @ [BT, BV] -> [BK, BV]
         tcgen05_mma(k_t, v_smem_2d, kv_tmem, use_acc=False)
         tcgen05_commit(mma_bar)
         mbarrier.wait(mma_bar, phase=mma_phase)
         mma_phase ^= 1
+
         # h_i += k_i.T @ v_new
         b_kv = kv_tmem.load(h_reg_layout)
         b_h = b_h + b_kv
-        # tma.store_wait(pendings=0)
 
-    # Store final state
     if INPLACE_UPDATE:
         if TRANSPOSE_STATE:
-            # Permute [BK, BV] to [BV, BK], convert layout for store
-            b_h_t = gl.permute(b_h, (1, 0))  # [BV, BK]
-            b_h0 = gl.convert_layout(b_h_t, h0_reg_layout_t)
+            # smem permute: store [BK,BV] reg to [BV,BK] smem via permuted view
             h0_smem_2d = h0_smem.reshape([BV, BK])
-            h0_smem_2d.store(b_h0)
+            h0_smem_t = h0_smem_2d.permute((1, 0))  # [BK, BV] view
+            h0_smem_t.store(b_h)
             fence_async_shared()
             tma.async_copy_shared_to_global(h0_desc, [index, i_h, i_v * BV, 0], h0_smem)
         else:
@@ -308,8 +301,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon(
             fence_async_shared()
             tma.async_copy_shared_to_global(h0_desc, [index, i_h, 0, i_v * BV], h0_smem)
 
-    tma.store_wait(pendings=0)
     mbarrier.invalidate(tma_bar_k)
     mbarrier.invalidate(tma_bar_w)
     mbarrier.invalidate(tma_bar_v)
     mbarrier.invalidate(mma_bar)
+    tma.store_wait(pendings=0)

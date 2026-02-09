@@ -365,7 +365,7 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    if IS_GLUON_SUPPORTED and not transpose_state:
+    if IS_GLUON_SUPPORTED:
         BK = K
         BV = 64
         IS_VARLEN = cu_seqlens is not None
@@ -386,8 +386,14 @@ def chunk_gated_delta_rule_fwd_h(
 
         if initial_state is not None:
             if transpose_state:
-                # Create transposed view [N, H, V, K] to satisfy TMA alignment
-                h0_view = initial_state.transpose(-2, -1)
+                # transpose_state=True: state is stored in [V, K] physical layout.
+                # We need a view with shape [..., V, K] that is K-contiguous for TMA alignment.
+                if initial_state.stride(-1) == 1:
+                    # Already K-contiguous [..., V, K], use directly
+                    h0_view = initial_state
+                else:
+                    # [..., K, V] with K-stride==1 -> transpose to [..., V, K]
+                    h0_view = initial_state.transpose(-2, -1)
                 h0_layout = gl.NVMMASharedLayout.get_default_for(
                     [1, 1, BV, BK], gl.float32
                 )
