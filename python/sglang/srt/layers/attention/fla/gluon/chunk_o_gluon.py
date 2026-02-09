@@ -129,19 +129,16 @@ def chunk_fwd_kernel_o_gluon(
         h_smem_2d = h_smem.reshape([BK, BV])  # [1, 1, 1, BK, BV] -> [BK, BV]
         # [BT, BK] @ [BK, BV] -> [BT, BV]
         tcgen05_mma(q_smem_2d, h_smem_2d, o_tmem, use_acc=use_acc)
-        tcgen05_commit(mma_bar)
-        # wait k, compute A = q @ k_t
+        # wait k (overlaps with o MMA), compute A = q @ k_t
         mbarrier.wait(tma_bar_kv, phase=tma_phase)
         tma_phase ^= 1
         k_t = k_smem.reshape([BT, BK]).permute(
             (1, 0)
         )  # [1, BT, 1, BK] -> [BT, BK] -> [BK, BT]
-        mbarrier.wait(mma_bar, phase=mma_phase)
-        mma_phase ^= 1
         # [BT, BK] @ [BK, BT] -> [BT, BT]
         tcgen05_mma(q_smem_2d, k_t, A_tmem, use_acc=use_acc)
+        # single commit mma
         tcgen05_commit(mma_bar)
-        # complete this iteration
         mbarrier.wait(mma_bar, phase=mma_phase)
         mma_phase ^= 1
         use_acc = True
