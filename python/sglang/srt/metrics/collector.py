@@ -149,6 +149,7 @@ class SchedulerStats:
     # Basics
     num_running_reqs: int = 0
     num_used_tokens: int = 0
+    max_total_num_tokens: int = 0
     token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
@@ -213,6 +214,30 @@ class SchedulerMetricsCollector:
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_usage_perc = Gauge(
+            name="sglang:kv_cache_usage_perc",
+            documentation="KV cache usage percentage (0-1).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.gpu_cache_usage_perc = Gauge(
+            name="sglang:gpu_cache_usage_perc",
+            documentation="KV cache usage percentage (0-1).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_used_tokens = Gauge(
+            name="sglang:kv_cache_used_tokens",
+            documentation="Used KV cache tokens.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_total_tokens = Gauge(
+            name="sglang:kv_cache_total_tokens",
+            documentation="Total KV cache token capacity.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -586,6 +611,11 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.kv_cache_usage_perc, stats.token_usage)
+        self._log_gauge(self.gpu_cache_usage_perc, stats.token_usage)
+        self._log_gauge(self.kv_cache_used_tokens, stats.num_used_tokens)
+        if stats.max_total_num_tokens > 0:
+            self._log_gauge(self.kv_cache_total_tokens, stats.max_total_num_tokens)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
