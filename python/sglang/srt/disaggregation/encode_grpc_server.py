@@ -75,7 +75,6 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
 class SGLangEncoderServer(SGLangEncoderServicer):
     """
     gRPC service implementation for SGLang encoder.
-    Mirrors the HTTP endpoints in encode_server.py.
     """
 
     def __init__(
@@ -93,7 +92,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     ) -> sglang_encoder_pb2.EncodeResponse:
         """
         Encode multimodal items (images/videos/audio).
-        Mirrors handle_encode_request() from encode_server.py.
         """
         try:
             # Broadcast request to worker processes

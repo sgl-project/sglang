@@ -303,22 +303,9 @@ class WaitingImageRequest:
                 self.status = WaitingImageRequestStatus.FAIL
                 self.recv_socket.close()
                 return
-
-            if len(parts) < 2:
-                logger.error(
-                    "waiting recv expected 2-part message, got %d parts", len(parts)
-                )
-                self.status = WaitingImageRequestStatus.FAIL
-                self.error_msg = "missing embedding payload"
-                self.error_code = getattr(recv_obj, "error_code", None)
-                self.recv_socket.close()
-                return
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-            # Clone so we don't depend on ZMQ buffer after next recv.
-            recv_obj.embedding = (
-                torch.frombuffer(buffer, dtype=recv_obj.dtype)
-                .reshape(recv_obj.shape)
-                .clone()
+            recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
+                recv_obj.shape
             )
             recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
             if self.recv_embedding_data is None:
