@@ -267,8 +267,8 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         self.assertFalse(audio_kw.get("truncation", True))
         self.assertEqual(audio_kw.get("sample_rate"), 16000)
 
-    def test_midashenglm_preserves_truncation_false(self):
-        """Even with audio config, truncation=False must be preserved."""
+    def test_midashenglm_user_config_overrides_truncation(self):
+        """User config can override the default truncation=False."""
         from sglang.srt.multimodal.processors.midashenglm import (
             MiDashengLMMultimodalProcessor,
         )
