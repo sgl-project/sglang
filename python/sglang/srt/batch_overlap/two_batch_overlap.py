@@ -40,7 +40,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import (
+    BumpAllocator,
+    empty_context,
+    get_bool_env_var,
+    is_hip,
+    is_npu,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -507,12 +513,12 @@ class TboForwardBatchPreparer:
         if _is_npu:
             # AscendAttnBackend needs num_token_non_padded_cpu to split q, k, v
             raw_num_token_non_padded_cpu = batch.num_token_non_padded_cpu
-            ori_num_token_non_padded_a_cpu, ori_num_token_non_padded_b_cpu = (
-                cls.compute_tbo_children_num_token_non_padded_raw(
-                    tbo_split_token_index=tbo_split_token_index,
-                    num_token_non_padded=raw_num_token_non_padded_cpu,
-                )
-            ).cpu().tolist()
+            ori_num_token_non_padded_a_cpu = min(
+                tbo_split_token_index, raw_num_token_non_padded_cpu
+            )
+            ori_num_token_non_padded_b_cpu = max(
+                0, raw_num_token_non_padded_cpu - tbo_split_token_index
+            )
         else:
             ori_num_token_non_padded_a_cpu = ori_num_token_non_padded_b_cpu = None
 
