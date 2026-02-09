@@ -33,3 +33,5 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+
+    cache_ttl_seconds: Optional[float] = None
