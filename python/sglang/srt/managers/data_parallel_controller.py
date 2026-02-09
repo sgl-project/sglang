@@ -490,12 +490,7 @@ class DataParallelController:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
 
-                # Set default bootstrap_room if in FAKE auto mode and room is None
-                if (
-                    req.bootstrap_room is None
-                    and self.server_args.disaggregation_decode_enable_fake_auto
-                ):
-                    req.bootstrap_room = self.round_robin_counter
+                self._maybe_assign_fake_bootstrap_room(req, increment_counter=False)
 
                 self.workers[self.round_robin_counter].send_pyobj(req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
