@@ -323,6 +323,9 @@ class Scheduler(
                 self.dp_size,
             )
         )
+        self.current_scheduler_metrics_enabled = (
+            self.attn_tp_rank == 0 or self.enable_metrics_for_all_schedulers
+        )
 
         self.enable_kv_cache_events = bool(
             server_args.kv_events_config and self.attn_tp_rank == 0
