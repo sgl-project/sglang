@@ -1433,6 +1433,18 @@ def get_pp_group() -> GroupCoordinator:
 get_pipeline_model_parallel_group = get_pp_group
 
 
+def get_mooncake_transfer_engine():
+    """
+    Return the shared MooncakeTransferEngine if initialized in device_communicators,
+    else None. Used by disaggregation mooncake backend and mem_cache mooncake_store.
+    """
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        get_mooncake_transfer_engine as _get_engine,
+    )
+
+    return _get_engine()
+
+
 @contextmanager
 def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     """

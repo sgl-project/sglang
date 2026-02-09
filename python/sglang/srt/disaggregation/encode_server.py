@@ -24,8 +24,8 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.distributed.parallel_state import (
+    get_mooncake_transfer_engine,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -210,12 +210,7 @@ class MMEncoder:
 
             if self.server_args.encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
-
-                self.engine = MooncakeTransferEngine(
-                    hostname=self.local_ip,
-                    gpu_id=None,
-                    ib_device=server_args.disaggregation_ib_device,
-                )
+                self.engine = get_mooncake_transfer_engine()
 
             self.embedding_to_send = dict()
             self.background_tasks: Set[asyncio.Task] = set()
