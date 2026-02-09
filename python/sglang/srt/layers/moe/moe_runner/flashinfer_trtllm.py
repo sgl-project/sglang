@@ -42,6 +42,20 @@ else:
     fp4_quantize = None
 
 
+def _copy_or_rebind_param(module: Module, name: str, new_value: torch.Tensor) -> None:
+    """Keep parameter identities stable for CUDA graph reuse and hot reload."""
+    new_value = new_value.detach()
+    param = getattr(module, name, None)
+    if isinstance(param, Parameter):
+        if param.data.shape == new_value.shape and param.data.dtype == new_value.dtype:
+            param.data.copy_(new_value)
+        else:
+            param.data = new_value
+        param.requires_grad_(False)
+    else:
+        setattr(module, name, Parameter(new_value, requires_grad=False))
+
+
 def align_fp8_moe_weights_for_flashinfer_trtllm(
     layer: Module, swap_w13_halves: bool = False
 ) -> None:
@@ -151,34 +165,25 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     )
 
     # Set flashinfer parameters
-    layer.gemm1_weights_fp4_shuffled = Parameter(
-        gemm1_weights_fp4_shuffled, requires_grad=False
+    _copy_or_rebind_param(
+        layer, "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
     )
-    layer.gemm2_weights_fp4_shuffled = Parameter(
-        gemm2_weights_fp4_shuffled, requires_grad=False
+    _copy_or_rebind_param(
+        layer, "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
     )
-    layer.gemm1_scales_fp4_shuffled = Parameter(
-        gemm1_scales_fp4_shuffled, requires_grad=False
-    )
-    layer.gemm2_scales_fp4_shuffled = Parameter(
-        gemm2_scales_fp4_shuffled, requires_grad=False
-    )
+    _copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
+    _copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
 
     # Compute additional scaling factor needed for TRT-LLM
     w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
-    layer.g1_scale_c = Parameter(
+    _copy_or_rebind_param(
+        layer,
+        "g1_scale_c",
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
-        requires_grad=False,
     )
 
-    # Clean up weights that won't be used by TRT-LLM
-    del (
-        layer.w2_weight,
-        layer.w2_weight_scale,
-        layer.w13_weight,
-        layer.w13_weight_scale,
-    )
+    # Keep original weights/scales to support update_weights_from_disk.
 
 
 @dataclass
