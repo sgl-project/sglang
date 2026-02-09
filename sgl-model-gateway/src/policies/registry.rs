@@ -387,6 +387,22 @@ impl PolicyRegistry {
         }
     }
 
+    /// Initialize bucket policies for regular (non-disaggregated) workers
+    pub fn init_regular_bucket_policies(&self, regular_workers: &[Arc<dyn Worker>]) {
+        // Initialize default policy if it's bucket
+        if self.default_policy.name() == "bucket" {
+            if let Some(bucket) = self.default_policy.as_any().downcast_ref::<BucketPolicy>() {
+                if !regular_workers.is_empty() {
+                    debug!(
+                        "Initializing regular bucket policy with {} workers",
+                        regular_workers.len()
+                    );
+                    bucket.init_regular_worker_urls(regular_workers);
+                }
+            }
+        }
+    }
+
     /// Apply remote tree operation to cache-aware policy for a model
     /// This is called when receiving tree state updates from mesh
     pub fn apply_remote_tree_operation(

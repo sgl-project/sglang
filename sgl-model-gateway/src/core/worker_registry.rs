@@ -434,6 +434,20 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// Get all regular (non-disaggregated) workers
+    pub fn get_regular_workers(&self) -> Vec<Arc<dyn Worker>> {
+        self.workers
+            .iter()
+            .filter_map(|entry| {
+                let worker = entry.value();
+                match worker.worker_type() {
+                    WorkerType::Regular => Some(worker.clone()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Get all decode workers
     pub fn get_decode_workers(&self) -> Vec<Arc<dyn Worker>> {
         self.get_by_type(&WorkerType::Decode)

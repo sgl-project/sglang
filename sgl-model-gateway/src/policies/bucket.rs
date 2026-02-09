@@ -44,6 +44,7 @@ impl BucketPolicy {
     }
 
     pub fn with_config(config: BucketConfig) -> Self {
+        info!("Initializing BucketPolicy with config: {:?}", config);
         info!("执行bucket_with_config");
         let buckets = Arc::new(DashMap::<String, Arc<RwLock<Bucket>>>::new());
 
@@ -114,6 +115,46 @@ impl BucketPolicy {
                 bucket_guard.init_prefill_worker_urls(worker_urls);
             } else {
                 error!("Failed to acquire write lock for bucket initialization");
+            }
+        }
+    }
+
+    /// Initialize bucket boundaries for regular workers
+    /// Similar to init_prefill_worker_urls but for regular (non-disaggregated) workers
+    pub fn init_regular_worker_urls(&self, regular_workers: &[Arc<dyn Worker>]) {
+        info!("init_regular_worker_urls ==> {:#?}", regular_workers);
+        // Group workers by model
+        let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
+        for worker in regular_workers {
+            let model_key = normalize_model_key(worker.model_id());
+            model_workers
+                .entry(model_key.to_string())
+                .or_default()
+                .push(worker);
+        }
+        // Initialize bucket for each model
+        for (model_key, model_workers) in model_workers {
+            let bucket = self
+                .buckets
+                .entry(model_key)
+                .or_insert_with(|| {
+                    Arc::new(RwLock::new(Bucket::new(
+                        self.config.bucket_adjust_interval_secs * 1000,
+                    )))
+                })
+                .clone();
+
+            let worker_urls: Vec<String> = model_workers
+                .iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
+
+            let lock_result = bucket.write();
+            if let Ok(mut bucket_guard) = lock_result {
+                // Use the same init method as prefill - the bucket logic is the same
+                bucket_guard.init_prefill_worker_urls(worker_urls);
+            } else {
+                error!("Failed to acquire write lock for regular bucket initialization");
             }
         }
     }
@@ -251,6 +292,10 @@ impl LoadBalancingPolicy for BucketPolicy {
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
             );
+            debug!(
+                 "Checking imbalance: max_load={}, min_load={}, abs_diff={}, conf_abs={}, conf_rel={}, calculated_rel_threshold={}, is_imbalanced={}",
+                 max_load, min_load, abs_diff, self.config.balance_abs_threshold, self.config.balance_rel_threshold, rel_threshold, is_imbalanced
+             );
 
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
