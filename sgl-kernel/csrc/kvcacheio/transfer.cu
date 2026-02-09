@@ -17,6 +17,7 @@
 #include "utils.h"  // WARP_SIZE
 #endif
 
+#if !defined(USE_ROCM)
 using cudaMemcpyBatchAsync_t = cudaError_t (*)(
     void** dsts,
     void** srcs,
@@ -41,8 +42,8 @@ static inline cudaMemcpyBatchAsync_t get_cudaMemcpyBatchAsync() {
   return fn;
 #else
   return nullptr;
-#endif
 }
+#endif
 
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
@@ -820,16 +821,16 @@ inline void transfer_kv_page_first_direct_impl(
     }
   };
 
-#ifdef USE_ROCM
+#if defined(USE_ROCM) || !defined(CUDART_VERSION) || CUDART_VERSION < 12080
   fallback_to_page_copy();
   return;
-#endif
-
+#else
   auto memcpy_batch_async = get_cudaMemcpyBatchAsync();
   if (memcpy_batch_async == nullptr) {
     fallback_to_page_copy();
     return;
   }
+#endif
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   size_t num_copies = 0;
