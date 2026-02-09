@@ -289,8 +289,12 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         """
         if images:
             kwargs["images"] = images
+            if self.image_config:
+                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
+            if self.video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
 
         processor = self._processor
         if (

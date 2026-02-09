@@ -113,4 +113,4 @@ Use this flag when you have sufficient GPU memory and want to minimize latency f
 
 - **Use `--mm-process-config '{"image":{"max_pixels":1048576},"video":{"fps":3,"max_pixels":602112,"max_frames":60}}'`**: To set `image`, `video`, and `audio` input limits.
 
-This can reduce GPU memory usage, improve inference speed, and help to avoid OOM, but may impact model performance, thus set a proper value based on your specific use case. Currently, only `qwen_vl` supports this config. Please refer to [qwen_vl processor](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/multimodal/processors/qwen_vl.py) for understanding the meaning of each parameter.
+This can reduce GPU memory usage, improve inference speed, and help to avoid OOM, but may impact model performance, thus set a proper value based on your specific use case. The config entries are passed as `images_kwargs`, `videos_kwargs`, and `audio_kwargs` to the HuggingFace processor, so each modality's settings are kept separate and do not collide. Refer to the HuggingFace documentation for your model's processor to understand the available parameters.
