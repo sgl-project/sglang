@@ -45,6 +45,13 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+deep_gemm = None
+if _is_cuda:
+    try:
+        import deep_gemm
+    except ImportError as e:
+        deep_gemm = e
+
 if _is_hip:
     try:
         from aiter import (  # noqa: F401
@@ -601,9 +608,7 @@ class NativeSparseAttnBackend(
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
         ):
-            try:
-                import deep_gemm
-
+            if not isinstance(deep_gemm, ImportError):
                 # NOTE: DeepGEMM paged path uses block_size=64.
                 seqlens_32 = (
                     seqlens_expanded
@@ -616,7 +621,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            else:
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -884,9 +889,7 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
         ):
-            try:
-                import deep_gemm
-
+            if not isinstance(deep_gemm, ImportError):
                 seqlens_32 = (
                     seqlens_expanded
                     if (
@@ -898,7 +901,7 @@ class NativeSparseAttnBackend(
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
-            except (ImportError, ModuleNotFoundError):
+            else:
                 paged_mqa_schedule_metadata = None
 
         metadata = NSAMetadata(
@@ -1053,9 +1056,7 @@ class NativeSparseAttnBackend(
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
         ):
-            try:
-                import deep_gemm
-
+            if not isinstance(deep_gemm, ImportError):
                 seqlens_32 = (
                     seqlens_expanded
                     if (
@@ -1071,7 +1072,7 @@ class NativeSparseAttnBackend(
                     metadata.paged_mqa_schedule_metadata = new_schedule
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
-            except (ImportError, ModuleNotFoundError):
+            else:
                 metadata.paged_mqa_schedule_metadata = None
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
