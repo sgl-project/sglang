@@ -1835,12 +1835,6 @@ class ServerArgs:
                     f"changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
-            if (
-                self.attention_backend == "hpc"
-                or self.decode_attention_backend == "hpc"
-            ):
-                self.disable_cuda_graph = True
-
         if (
             self.attention_backend == "cutlass_mla"
             or self.decode_attention_backend == "cutlass_mla"
