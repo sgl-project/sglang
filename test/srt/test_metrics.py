@@ -55,7 +55,6 @@ class TestEnableMetrics(CustomTestCase):
                 "sglang:num_used_tokens",
                 "sglang:token_usage",
                 "sglang:kv_cache_usage_perc",
-                "sglang:gpu_cache_usage_perc",
                 "sglang:kv_cache_used_tokens",
                 "sglang:kv_cache_total_tokens",
                 "sglang:gen_throughput",

@@ -40,7 +40,6 @@ You'll be prompted to change the password on first login.
 
 Common Prometheus metrics exposed by SGLang:
 - `sglang:kv_cache_usage_perc` (KV cache usage ratio, 0-1)
-- `sglang:gpu_cache_usage_perc` (alias for KV cache usage ratio, 0-1)
 - `sglang:kv_cache_used_tokens`
 - `sglang:kv_cache_total_tokens`
 - `sglang:cache_hit_rate`

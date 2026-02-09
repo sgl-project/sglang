@@ -223,12 +223,6 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.gpu_cache_usage_perc = Gauge(
-            name="sglang:gpu_cache_usage_perc",
-            documentation="KV cache usage percentage (0-1).",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
         self.kv_cache_used_tokens = Gauge(
             name="sglang:kv_cache_used_tokens",
             documentation="Used KV cache tokens.",
@@ -612,7 +606,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
         self._log_gauge(self.kv_cache_usage_perc, stats.token_usage)
-        self._log_gauge(self.gpu_cache_usage_perc, stats.token_usage)
         self._log_gauge(self.kv_cache_used_tokens, stats.num_used_tokens)
         if stats.max_total_num_tokens > 0:
             self._log_gauge(self.kv_cache_total_tokens, stats.max_total_num_tokens)
