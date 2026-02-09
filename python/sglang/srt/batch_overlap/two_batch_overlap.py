@@ -40,7 +40,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
+from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 
 _tbo_debug = get_bool_env_var("SGLANG_TBO_DEBUG")
 
@@ -503,6 +504,17 @@ class TboForwardBatchPreparer:
         [out_num_token_non_padded_a, out_num_token_non_padded_b] = (
             tbo_children_num_token_non_padded
         )
+        if _is_npu:
+            # AscendAttnBackend needs num_token_non_padded_cpu to split q, k, v
+            raw_num_token_non_padded_cpu = batch.num_token_non_padded_cpu
+            ori_num_token_non_padded_a_cpu, ori_num_token_non_padded_b_cpu = (
+                cls.compute_tbo_children_num_token_non_padded_raw(
+                    tbo_split_token_index=tbo_split_token_index,
+                    num_token_non_padded=raw_num_token_non_padded_cpu,
+                )
+            )
+        else:
+            ori_num_token_non_padded_a_cpu = ori_num_token_non_padded_b_cpu = None
 
         child_a = cls.filter_batch(
             batch,
@@ -516,6 +528,7 @@ class TboForwardBatchPreparer:
             ),
             output_attn_backend=attn_backend_child_a,
             out_num_token_non_padded=out_num_token_non_padded_a,
+            ori_num_token_non_padded_cpu=ori_num_token_non_padded_a_cpu,
         )
         child_b = cls.filter_batch(
             batch,
@@ -525,6 +538,7 @@ class TboForwardBatchPreparer:
             end_seq_index=batch.batch_size,
             output_attn_backend=attn_backend_child_b,
             out_num_token_non_padded=out_num_token_non_padded_b,
+            ori_num_token_non_padded_cpu=ori_num_token_non_padded_b_cpu,
         )
 
         if is_enable_two_chunk:
@@ -611,6 +625,7 @@ class TboForwardBatchPreparer:
         end_seq_index: int,
         output_attn_backend: AttentionBackend,
         out_num_token_non_padded: torch.Tensor,
+        ori_num_token_non_padded_cpu: torch.Tensor,
     ):
         assert (
             end_token_index >= start_token_index
@@ -724,7 +739,7 @@ class TboForwardBatchPreparer:
                 attn_backend=output_attn_backend,
                 num_token_non_padded=out_num_token_non_padded,
                 # TODO: handle it when we need TBO + DeepSeek V3.2
-                num_token_non_padded_cpu=None,
+                num_token_non_padded_cpu=ori_num_token_non_padded_cpu,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
@@ -853,7 +868,7 @@ def _model_forward_tbo(
 
     context = (
         empty_context()
-        if _is_hip
+        if _is_hip or _is_npu
         else deep_gemm_wrapper.configure_deep_gemm_num_sms(
             operations_strategy.deep_gemm_num_sms
         )
