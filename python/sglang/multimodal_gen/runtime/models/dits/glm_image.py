@@ -483,10 +483,10 @@ class GlmImageTransformerBlock(nn.Module):
 
         # 2. Feedforward
         self.norm2 = ScaleResidualLayerNormScaleShift(
-            dim, norm_type="layer", eps=1e-5, elementwise_affine=False
+            dim, eps=1e-5, elementwise_affine=False
         )
         self.norm2_context = ScaleResidualLayerNormScaleShift(
-            dim, norm_type="layer", eps=1e-5, elementwise_affine=False
+            dim, eps=1e-5, elementwise_affine=False
         )
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
