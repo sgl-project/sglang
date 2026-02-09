@@ -3,8 +3,8 @@ import unittest
 import openai
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -28,7 +28,9 @@ class TestFimCompletion(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "/root/.cache/modelscope/hub/models/deepseek-ai/deepseek-coder-1.3b-base"
+        cls.model = (
+            "/root/.cache/modelscope/hub/models/deepseek-ai/deepseek-coder-1.3b-base"
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
