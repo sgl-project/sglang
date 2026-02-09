@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 """
-Multi-node benchmark for DeepEP Waterfill on EP16/EP32.
+Benchmark for DeepEP Waterfill on EP8/EP16/EP32.
 
-Measures decode throughput with bench_one_batch_server across
-baseline (no waterfill) and waterfill modes.
+Measures throughput with bench_one_batch_server across
+baseline, waterfill, eplb, and eplb_waterfill modes.
 
 Usage (run from node 0 inside sglang_eplb container):
-  # EP16 (2 nodes)
-  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 16
+  # EP8 (1 node) - all 4 modes
+  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 8 \
+      --modes baseline,waterfill,eplb,eplb_waterfill \
+      --init-expert-location /root/xutingz/output/eplb/ep8_logical_count.pt
 
-  # EP32 (4 nodes)
-  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 32
+  # EP16 (2 nodes) - all 4 modes
+  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 16 \
+      --modes baseline,waterfill,eplb,eplb_waterfill \
+      --init-expert-location /root/xutingz/output/eplb/ep16_logical_count.pt
 
-  # EP16 waterfill only
-  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 16 --modes waterfill
-
-  # EP16 with EPLB + waterfill
-  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 16 --modes baseline,waterfill,eplb_waterfill \
+  # EP16 - eplb vs eplb_waterfill only
+  python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 16 \
+      --modes eplb,eplb_waterfill \
       --init-expert-location /root/xutingz/output/eplb/ep16_logical_count.pt
 """
 
@@ -38,35 +40,41 @@ import requests
 
 # Cluster config
 NODE_IPS = {
+    8:  ["10.6.131.20"],
     16: ["10.6.131.20", "10.6.131.21"],
     32: ["10.6.131.20", "10.6.131.21", "10.6.131.22", "10.6.131.23"],
 }
 DIST_INIT_PORT = 20000
 MODEL_PATH = "/raid/model/DeepSeek-R1"
-CONTAINER = "sglang_eplb"
+CONTAINER = "sglang_lb"
 
-# EP config: label -> (actual_tp, actual_dp, nnodes)
+# EP config: actual_tp/actual_dp are what sglang --tp/--dp-size receive.
+# For EP8:  single node, 8 GPUs, tp=8, dp=8 (dp_attention)
+# For EP16: 2 nodes, tp=16, dp=16 (dp_attention)
+# For EP32: 4 nodes, tp=16, dp=2 (dp_attention)
 EP_CONFIG = {
-    16: {"tp": 16, "dp": 16, "actual_tp": 16, "actual_dp": 16, "nnodes": 2},
-    32: {"tp": 32, "dp": 32, "actual_tp": 16, "actual_dp": 2, "nnodes": 4},
+    8:  {"actual_tp": 8,  "actual_dp": 8,  "nnodes": 1},
+    16: {"actual_tp": 16, "actual_dp": 16, "nnodes": 2},
+    32: {"actual_tp": 16, "actual_dp": 2,  "nnodes": 4},
 }
 
 
 @dataclass(frozen=True)
 class BenchCase:
     name: str
-    batch_size: int  # global batch size
+    local_batch_size: int  # per-rank batch size
     input_len: int
     output_len: int
 
 
-# Benchmark cases: decode-heavy (output_len=1 to measure pure decode throughput)
+# Benchmark cases: output_len=1, local_bs is per DP rank.
+# Global batch size = local_bs * dp_size (computed at runtime).
+# deepep_mode = normal for all cases.
 BENCH_CASES = [
     BenchCase("bs128_il512", 128, 512, 1),
-    BenchCase("bs128_il1024", 128, 1024, 1),
-    BenchCase("bs256_il1024", 256, 1024, 1),
-    BenchCase("bs256_il2048", 256, 2048, 1),
-    BenchCase("bs512_il1024", 512, 1024, 1),
+    BenchCase("bs64_il1024", 64, 1024, 1),
+    BenchCase("bs32_il2048", 32, 2048, 1),
+    BenchCase("bs16_il4096", 16, 4096, 1),
 ]
 
 
@@ -88,7 +96,6 @@ def kill_servers(node_ips: List[str]) -> None:
 
     Uses specific patterns to avoid killing the benchmark script itself.
     """
-    # Patterns that match server/worker processes but NOT the benchmark script
     kill_patterns = [
         "sglang.launch_server",
         "sglang::scheduler",
@@ -102,17 +109,22 @@ def kill_servers(node_ips: List[str]) -> None:
             f"pkill -9 -f '{pat}' 2>/dev/null" for pat in kill_patterns
         )
         kill_cmds += "; pkill -9 -f bench_one_batch 2>/dev/null"
-        # Also clean up stale NCCL/NVSHMEM shared memory
         kill_cmds += (
             "; rm -f /dev/shm/nccl* 2>/dev/null"
             "; rm -f /dev/shm/nvshmem* 2>/dev/null"
         )
-        subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no", f"root@{ip}",
-             f"docker exec {CONTAINER} bash -c '{kill_cmds}'"],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    # Wait long enough for NCCL resources to fully release
+        if ip == node_ips[0]:
+            # Local node: run directly (we are inside the container)
+            subprocess.run(
+                ["bash", "-c", kill_cmds],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.run(
+                ["ssh", "-o", "StrictHostKeyChecking=no", f"root@{ip}",
+                 f"docker exec {CONTAINER} bash -c '{kill_cmds}'"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
     time.sleep(15)
 
 
@@ -126,7 +138,7 @@ def launch_server(
     log_dir: Path,
     dist_init_port: int = DIST_INIT_PORT,
 ) -> subprocess.Popen:
-    """Launch sglang server across multiple nodes. Returns the local server process."""
+    """Launch sglang server across nodes. Returns the local (node 0) server process."""
     cfg = EP_CONFIG[ep]
     dist_init_addr = f"{node_ips[0]}:{dist_init_port}"
 
@@ -139,7 +151,7 @@ def launch_server(
             "--tp", str(cfg["actual_tp"]),
             "--dp-size", str(cfg["actual_dp"]),
             "--moe-a2a-backend", "deepep",
-            "--deepep-mode", "auto",
+            "--deepep-mode", "normal",
             "--chunked-prefill-size", "-1",
             "--disable-radix-cache",
             "--max-prefill-tokens", "8192",
@@ -188,8 +200,9 @@ def launch_server(
         subprocess.Popen(ssh_cmd)
         time.sleep(2)
 
-    # Launch node 0 locally
-    time.sleep(3)
+    # Launch node 0 locally (inside the container)
+    if cfg["nnodes"] > 1:
+        time.sleep(3)
     local_cmd = _build_server_cmd(0)
     log_file = log_dir / "server_node0.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -216,9 +229,11 @@ def run_bench(
     base_url: str,
     case: BenchCase,
     result_file: Path,
+    dp_size: int = 1,
     dataset_path: Optional[str] = None,
 ) -> Optional[dict]:
     """Run bench_one_batch_server and return parsed result."""
+    global_batch_size = case.local_batch_size * dp_size
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "99"  # client on CPU
 
@@ -226,7 +241,7 @@ def run_bench(
         sys.executable, "-m", "sglang.bench_one_batch_server",
         "--model", "None",
         "--base-url", base_url,
-        "--batch-size", str(case.batch_size),
+        "--batch-size", str(global_batch_size),
         "--input-len", str(case.input_len),
         "--output-len", str(case.output_len),
         "--dataset-name", "random",
@@ -251,40 +266,30 @@ def run_bench(
     return None
 
 
-def parse_decode_throughput(log_path: Path) -> Optional[float]:
-    """Parse gen throughput from server log (last decode batch line)."""
-    pattern = re.compile(r"gen throughput.*?:\s*([0-9.]+)")
-    last_tp = None
-    if log_path.exists():
-        for line in log_path.read_text(errors="replace").splitlines():
-            m = pattern.search(line)
-            if m:
-                last_tp = float(m.group(1))
-    return last_tp
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Multi-node waterfill benchmark for EP16/EP32"
+        description="Waterfill benchmark for EP8/EP16/EP32"
     )
-    parser.add_argument("--ep", type=int, required=True, choices=[16, 32])
+    parser.add_argument("--ep", type=int, required=True, choices=[8, 16, 32])
     parser.add_argument(
         "--modes", type=str, default="baseline,waterfill",
-        help="Comma-separated modes: baseline,waterfill,eplb_waterfill"
+        help="Comma-separated modes: baseline,waterfill,eplb,eplb_waterfill"
     )
     parser.add_argument("--init-expert-location", type=str, default=None,
-                       help="EPLB .pt file for eplb_waterfill mode")
+                       help="EPLB .pt file for eplb/eplb_waterfill modes")
     parser.add_argument("--out-dir", type=str,
                        default="/root/xutingz/output/waterfill_bench")
     parser.add_argument("--dataset-path", type=str,
                        default="/root/xutingz/data/ShareGPT_V3_unfiltered_cleaned_split.json")
     parser.add_argument("--disable-cuda-graph", action="store_true",
-                       help="Disable CUDA graph (needed for EP32 4-node)")
+                       help="Disable CUDA graph")
     parser.add_argument("--cases", type=str, default=None,
-                       help="Override bench cases: 'bs:il' comma-separated, e.g. '128:1024,256:2048'")
+                       help="Override bench cases: 'local_bs:il' comma-separated, "
+                            "e.g. '128:512,64:1024'")
     args = parser.parse_args()
 
     ep = args.ep
+    cfg = EP_CONFIG[ep]
     node_ips = NODE_IPS[ep]
     modes = [m.strip() for m in args.modes.split(",")]
     out_dir = Path(args.out_dir) / f"ep{ep}"
@@ -302,6 +307,17 @@ def main() -> None:
     # Waterfill mode cannot use CUDA graph (DeepEP Buffer.sync() fails during
     # graph capture), so we disable it for all modes to keep the comparison fair.
     disable_cuda_graph = True
+
+    dp_size = cfg["actual_dp"]
+
+    print(f"\nEP{ep} Benchmark Config:", flush=True)
+    print(f"  Nodes: {node_ips}", flush=True)
+    print(f"  TP={cfg['actual_tp']}, DP={dp_size}, nnodes={cfg['nnodes']}", flush=True)
+    print(f"  Modes: {modes}", flush=True)
+    print(f"  Cases: {[c.name for c in cases]}", flush=True)
+    print(f"  CUDA graph: disabled", flush=True)
+    print(f"  DeepEP mode: normal", flush=True)
+    print(f"  Output dir: {out_dir}\n", flush=True)
 
     all_results: Dict[str, Dict[str, dict]] = {}
 
@@ -330,9 +346,7 @@ def main() -> None:
         # Kill any stale servers
         kill_servers(node_ips)
 
-        # Launch server
         # Use a different dist-init port per mode to avoid port conflicts
-        # from lingering rendezvous stores after kill
         mode_port = DIST_INIT_PORT + mode_idx
 
         print(f"[{mode}] Launching server (dist port {mode_port})...", flush=True)
@@ -354,13 +368,16 @@ def main() -> None:
 
             mode_results = {}
             for case in cases:
-                print(f"[{mode}] Running {case.name} (bs={case.batch_size}, "
-                      f"il={case.input_len}, ol={case.output_len})...", flush=True)
+                global_bs = case.local_batch_size * dp_size
+                print(f"[{mode}] Running {case.name} (local_bs={case.local_batch_size}, "
+                      f"global_bs={global_bs}, il={case.input_len}, ol={case.output_len})...",
+                      flush=True)
                 result_file = mode_dir / f"result_{case.name}.jsonl"
                 result = run_bench(
                     base_url=base_url,
                     case=case,
                     result_file=result_file,
+                    dp_size=dp_size,
                     dataset_path=args.dataset_path,
                 )
                 if result:
@@ -445,6 +462,23 @@ def main() -> None:
             if mode in all_results and case_name in all_results[mode]:
                 val = all_results[mode][case_name].get("input_throughput", 0)
                 row += f"| {val:>18.1f}  "
+                vals[mode] = val
+            else:
+                row += f"| {'N/A':>18}  "
+        if base_mode in vals and opt_mode in vals and vals[base_mode] > 0:
+            gain = (vals[opt_mode] - vals[base_mode]) / vals[base_mode] * 100
+            row += f"| {gain:>+8.1f}%  "
+        print(row, flush=True)
+
+    # Rows: latency
+    print("\n  Latency (s):", flush=True)
+    for case_name in sorted(all_case_names):
+        row = f"  {case_name:<18}"
+        vals = {}
+        for mode in modes:
+            if mode in all_results and case_name in all_results[mode]:
+                val = all_results[mode][case_name].get("latency", 0)
+                row += f"| {val:>18.3f}  "
                 vals[mode] = val
             else:
                 row += f"| {'N/A':>18}  "
