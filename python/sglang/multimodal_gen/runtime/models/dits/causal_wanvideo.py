@@ -301,12 +301,15 @@ class CausalWanTransformerBlock(nn.Module):
 
         # 2. Cross-attention
         # Only T2V for now
+        cross_attn_backends = {
+            b for b in supported_attention_backends if not b.is_sparse
+        }
         self.attn2 = WanT2VCrossAttention(
             dim,
             num_heads,
             qk_norm=qk_norm,
             eps=eps,
-            supported_attention_backends=supported_attention_backends,
+            supported_attention_backends=cross_attn_backends,
         )
         self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
             dim, eps=eps, elementwise_affine=False, dtype=torch.float32
