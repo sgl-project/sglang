@@ -203,6 +203,7 @@ def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -
 
 def _check_metrics_positive(test_case, metrics, metrics_to_check):
     for metric_name, labels in metrics_to_check:
+        print(f"[DEBUG] Checking metric: {metric_name=} {labels=}")
         value = _get_sample_value_by_labels(metrics[metric_name], labels)
         test_case.assertGreater(value, 0, f"{metric_name} {labels}")
 
