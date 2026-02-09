@@ -161,8 +161,8 @@ jobs:
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
-          pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host "${CACHING_URL}"
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
