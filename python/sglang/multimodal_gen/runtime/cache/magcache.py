@@ -74,14 +74,14 @@ class MagCacheMixin:
 
     Attributes:
         enable_magcache: Whether MagCache is enabled.
-        magcache_previous_residual_norm: Norm of previous residual for positive branch.
-        magcache_accumulated_error: Accumulated error for positive branch.
-        magcache_consecutive_skips: Consecutive skip counter for positive branch.
+        previous_residual_norm: Norm of previous residual for positive branch.
+        accumulated_error: Accumulated error for positive branch.
+        consecutive_skips: Consecutive skip counter for positive branch.
 
     CFG-specific attributes (only when _supports_cfg_cache is True):
-        magcache_previous_residual_norm_negative: Norm for negative branch.
-        magcache_accumulated_error_negative: Accumulated error for negative branch.
-        magcache_consecutive_skips_negative: Skip counter for negative branch.
+        previous_residual_norm_negative: Norm for negative branch.
+        accumulated_error_negative: Accumulated error for negative branch.
+        consecutive_skips_negative: Skip counter for negative branch.
     """
 
     # Models that support CFG cache separation (same as TeaCache)
@@ -106,32 +106,33 @@ class MagCacheMixin:
 
         # Always set magcache flag
         self.enable_magcache = True
+        self.calibrate_magcache = True
 
         # MagCache-specific state
-        self.magcache_previous_residual_norm: float = 0.0
-        self.magcache_accumulated_error: float = 0.0
-        self.magcache_consecutive_skips: int = 0
+        self.previous_residual_norm: float = 0.0
+        self.accumulated_error: float = 0.0
+        self.consecutive_skips: int = 0
 
         # CFG negative branch (only if supported)
         if self._supports_cfg_cache:
             if not hasattr(self, "previous_residual_negative"):
                 self.previous_residual_negative: torch.Tensor | None = None
 
-            self.magcache_previous_residual_norm_negative: float = 0.0
-            self.magcache_accumulated_error_negative: float = 0.0
-            self.magcache_consecutive_skips_negative: int = 0
+            self.previous_residual_norm_negative: float = 0.0
+            self.accumulated_error_negative: float = 0.0
+            self.consecutive_skips_negative: int = 0
 
     def reset_magcache_state(self) -> None:
         """Reset MagCache state at the start of each generation task."""
-        self.magcache_previous_residual_norm = 0.0
-        self.magcache_accumulated_error = 0.0
-        self.magcache_consecutive_skips = 0
+        self.previous_residual_norm = 0.0
+        self.accumulated_error = 0.0
+        self.consecutive_skips = 0
         self.enable_magcache = True
 
         if self._supports_cfg_cache:
-            self.magcache_previous_residual_norm_negative = 0.0
-            self.magcache_accumulated_error_negative = 0.0
-            self.magcache_consecutive_skips_negative = 0
+            self.previous_residual_norm_negative = 0.0
+            self.accumulated_error_negative = 0.0
+            self.consecutive_skips_negative = 0
 
     def _compute_magcache_decision(
         self,
@@ -151,24 +152,25 @@ class MagCacheMixin:
             return True
 
         if is_boundary_step:
-            self._update_magcache_state(None, 0.0, 0)
+            current_norm = residual.norm(p=2).item()
+            self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
         # Select CFG branch state
         prev_norm = (
-            self.magcache_previous_residual_norm_negative
+            self.previous_residual_norm_negative
             if self.is_cfg_negative
-            else self.magcache_previous_residual_norm
+            else self.previous_residual_norm
         )
         accum_error = (
-            self.magcache_accumulated_error_negative
+            self.accumulated_error_negative
             if self.is_cfg_negative
-            else self.magcache_accumulated_error
+            else self.accumulated_error
         )
         consec_skips = (
-            self.magcache_consecutive_skips_negative
+            self.consecutive_skips_negative
             if self.is_cfg_negative
-            else self.magcache_consecutive_skips
+            else self.consecutive_skips
         )
 
         # First compute always
@@ -177,9 +179,13 @@ class MagCacheMixin:
             self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
-        # === MagCache core ===
+
         branch_offset = 1 if self.is_cfg_negative else 0
         idx = current_timestep * 2 + branch_offset
+
+        # must compute if out of bounds (should not happen if mag_ratios is properly calibrated/interpolated)
+        if idx >= len(mag_ratios):
+            return True
 
         gamma_hat = mag_ratios[idx].item()
         new_error = accum_error + abs(1.0 - gamma_hat)
@@ -198,20 +204,41 @@ class MagCacheMixin:
             self._update_magcache_state(current_norm, 0.0, 0)
             return True
 
+    def _calibrate_magcache(self, residual: torch.Tensor) -> None:
+        """Calibration mode to collect magnitude ratios. save it json file"""
+        current_norm = residual.norm(p=2).item()
+
+        if self.previous_residual is not None:
+            prev_norm = (
+                self.previous_residual_norm_negative
+                if self.is_cfg_negative
+                else self.previous_residual_norm
+            )
+            ratio = current_norm / prev_norm if prev_norm > 0 else 1.0
+
+            # Store ratio in magcache_params for later use (e.g., interpolation)
+            # This is a simplified example; in practice, you might want to store
+            # these ratios externally or handle them differently.
+            if hasattr(self.magcache_params, "mag_ratios"):
+                self.magcache_params.mag_ratios.append(ratio)
+
+        self.previous_residual = residual.detach()
 
     def _update_magcache_state(
         self, norm: float | None, error: float, skips: int
     ) -> None:
         """Update MagCache state for active CFG branch."""
-        if norm is not None:
-            if not self.is_cfg_negative:
-                self.magcache_previous_residual_norm = norm
-                self.magcache_accumulated_error = error
-                self.magcache_consecutive_skips = skips
-            elif self._supports_cfg_cache:
-                self.magcache_previous_residual_norm_negative = norm
-                self.magcache_accumulated_error_negative = error
-                self.magcache_consecutive_skips_negative = skips
+
+        if not self.is_cfg_negative:
+            if norm is not None:
+                self.previous_residual_norm = norm
+            self.accumulated_error = error
+            self.consecutive_skips = skips
+        elif self._supports_cfg_cache:
+            if norm is not None:
+                self.previous_residual_norm_negative = norm
+            self.accumulated_error_negative = error
+            self.consecutive_skips_negative = skips
 
     def _get_magcache_context(self) -> MagCacheContext | None:
         """

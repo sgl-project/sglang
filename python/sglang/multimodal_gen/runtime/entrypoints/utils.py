@@ -347,11 +347,15 @@ def post_process_sample(
                 arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
             frames = list(arr)
 
+    ic(data_type, len(frames), type(frames[0]))
+    # data_type = DataType.VIDEO # this fixes the bug!
+
     # 2. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
             if data_type == DataType.VIDEO:
+                ic('Saving video to', save_file_path)
                 # TODO: make this configurable
                 quality = 5
                 imageio.mimsave(

@@ -370,11 +370,14 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+
         if pipeline_config.task_type.is_image_gen():
+            ic(self.num_frames, pipeline_config.task_type.is_image_gen())
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug(f"Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
+                ic('override here', self.num_frames)
 
         elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
@@ -422,6 +425,7 @@ class SamplingParams:
                     server_args.num_gpus,
                 )
                 self.num_frames = new_num_frames
+
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()

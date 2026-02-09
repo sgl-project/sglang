@@ -73,22 +73,23 @@ class MagCacheParams(CacheParams):
 @dataclass
 class WanMagCacheParams(CacheParams):
     """
-    Wan-specific MagCache parameters.
-
-    Wan uses special ret_steps and cutoff_steps logic similar to WanTeaCacheParams.
-    Incorporates T2V 1.3B magnitude ratios for automatic interpolation.
+    Wan-specific MagCache parameters aligned with command-line defaults.
     """
-
     cache_type: str = "magcache"
-    threshold: float = 0.06
-    max_skip_steps: int = 3
+    threshold: float = 0.12
+    max_skip_steps: int = 4
+    retention_ratio: float = 0.2
     use_ret_steps: bool = True
-    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(50, T2V_13B_MAG_RATIOS) # hardcode for now
+    num_steps: int = 50 # Hardcoded for now
+    mag_ratios: torch.Tensor = get_interpolated_mag_ratios(num_steps, T2V_13B_MAG_RATIOS)
 
     @property
     def ret_steps(self) -> int:
-        """Retention steps (always compute first N steps)."""
-        return 5 * 2 if self.use_ret_steps else 1 * 2
+        """
+        Calculation based on retention_ratio.
+        If ratio is 0.2 and steps are 50, it ensures the first 10 steps are never skipped.
+        """
+        return int(self.num_steps * self.retention_ratio) * 2 if self.use_ret_steps else 2
 
     def get_cutoff_steps(self, num_inference_steps: int) -> int:
         """Cutoff steps (always compute last few steps)."""

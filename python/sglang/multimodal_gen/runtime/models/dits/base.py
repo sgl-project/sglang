@@ -108,12 +108,12 @@ class CachableDiT(TeaCacheMixin, MagCacheMixin, BaseDiT):
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
         super().__init__(config, **kwargs)
-        # self._init_teacache_state()  # Initializes shared state + TeaCache state
+        self._init_teacache_state()  # Initializes shared state + TeaCache state
         self._init_magcache_state()  # Adds MagCache-specific state
 
     def reset_cache_state(self) -> None:
         """Reset both TeaCache and MagCache state."""
-        # self.reset_teacache_state()  # Resets shared state + TeaCache state
+        self.reset_teacache_state()  # Resets shared state + TeaCache state
         self.reset_magcache_state()  # Resets MagCache state
 
     def maybe_cache_states(

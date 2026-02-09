@@ -931,6 +931,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def should_skip_forward_for_cached_states(self, **kwargs) -> bool:
         """Check both TeaCache and MagCache (route between strategies)."""
+        # if self.calibrate_magcache: return False
+
         # Try TeaCache first
         if self.enable_teacache:
             ic('checking teacache')
