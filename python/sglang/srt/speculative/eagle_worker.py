@@ -76,7 +76,6 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorker(TpModelWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -129,14 +128,18 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
+        self.vocab_mapper = None
+
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -194,9 +197,11 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -287,9 +292,11 @@ class EAGLEWorker(TpModelWorker):
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -300,17 +307,21 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
@@ -664,7 +675,12 @@ class EAGLEWorker(TpModelWorker):
             ).logits_output
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+
+            next_token_logits = logits_output.next_token_logits
+            if self.vocab_mapper is not None:
+                self.vocab_mapper.mask_draft_logits_inplace(next_token_logits)
+
+            probs = torch.softmax(next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
                 topk_index = self.hot_token_id[topk_index]
@@ -682,6 +698,14 @@ class EAGLEWorker(TpModelWorker):
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
+
+        # Map draft tokens to target vocab BEFORE prepare_for_verify
+        # This ensures target model forward receives correct token IDs
+        if self.vocab_mapper is not None:
+            spec_info.draft_token = self.vocab_mapper.map_draft_to_target(
+                spec_info.draft_token
+            )
+
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
@@ -743,6 +767,7 @@ class EAGLEWorker(TpModelWorker):
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            vocab_mapper=self.vocab_mapper,
         )
 
         # Post process based on verified outputs.
@@ -864,9 +889,14 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # Map next_token_ids from target vocab to draft vocab for heterogeneous vocab
+        draft_token_ids = next_token_ids
+        if self.vocab_mapper is not None:
+            draft_token_ids = self.vocab_mapper.map_target_to_draft(next_token_ids)
+
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids,
+            verified_id=draft_token_ids,
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
         )
@@ -980,7 +1010,11 @@ class EAGLEWorker(TpModelWorker):
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
     ):
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        next_token_logits = logits_output.next_token_logits
+        if self.vocab_mapper is not None:
+            self.vocab_mapper.mask_draft_logits_inplace(next_token_logits)
+
+        probs = torch.softmax(next_token_logits, dim=-1)
         draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
         draft_input.hidden_states = logits_output.hidden_states
 

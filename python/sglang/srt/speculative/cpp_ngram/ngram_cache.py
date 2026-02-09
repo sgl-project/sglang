@@ -117,7 +117,7 @@ class NgramCache:
 
 # main function
 if __name__ == "__main__":
-    format = f"%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
+    format = "%(levelname)s %(asctime)s %(filename)s:%(lineno)d] %(message)s"
     logging.basicConfig(
         level=logging.DEBUG,
         format=format,

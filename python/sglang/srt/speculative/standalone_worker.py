@@ -8,10 +8,12 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
+from sglang.srt.speculative.vocab_intersection import create_vocab_mapper
 from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
@@ -22,7 +24,6 @@ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPRO
 
 
 class StandaloneWorker(EAGLEWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -70,7 +71,11 @@ class StandaloneWorker(EAGLEWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             TpModelWorker.__init__(
                 self,
                 server_args=server_args,
@@ -92,9 +97,29 @@ class StandaloneWorker(EAGLEWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+
+        # Initialize vocab mapper before cuda graphs (used in draft_forward)
+        if server_args.enable_heterogeneous_vocab:
+            # Load draft model's tokenizer separately for heterogeneous vocab
+            # self.tokenizer is inherited from TpModelWorker but uses target's tokenizer_path
+            draft_tokenizer = get_tokenizer(
+                server_args.speculative_draft_model_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+            )
+            self.vocab_mapper = create_vocab_mapper(
+                draft_tokenizer=draft_tokenizer,
+                target_tokenizer=target_worker.tokenizer,
+                device=self.device,
+            )
+        else:
+            self.vocab_mapper = None
+
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
