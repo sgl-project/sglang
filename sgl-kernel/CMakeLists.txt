@@ -554,7 +554,9 @@ set(DEEPGEMM_SOURCES
     "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
 )
 
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+# Note: USE_SABI is intentionally omitted here because DeepGEMM's python_api.cpp
+# uses pybind11 which requires the full (non-limited) Python C API.
+Python_add_library(deep_gemm_cpp MODULE WITH_SOABI ${DEEPGEMM_SOURCES})
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
 target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
