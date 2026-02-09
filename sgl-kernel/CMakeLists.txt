@@ -8,6 +8,9 @@ include(FetchContent)
 # CMake
 cmake_policy(SET CMP0169 OLD)
 cmake_policy(SET CMP0177 NEW)
+if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.35")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
 set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -56,7 +59,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
+    GIT_TAG        fc08e5775a5db960690a41248655168c55bef228
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
