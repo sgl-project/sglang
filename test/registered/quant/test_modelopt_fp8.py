@@ -32,14 +32,15 @@ class TestModeloptFP8(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
+        parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
             num_questions=200,
             max_new_tokens=512,
             parallel=200,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
+            host=f"{parsed_url.scheme}://{parsed_url.hostname}",
+            port=parsed_url.port,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
