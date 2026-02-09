@@ -51,11 +51,11 @@ CONTAINER = "sglang_lb"
 # EP config: actual_tp/actual_dp are what sglang --tp/--dp-size receive.
 # For EP8:  single node, 8 GPUs, tp=8, dp=8 (dp_attention)
 # For EP16: 2 nodes, tp=16, dp=16 (dp_attention)
-# For EP32: 4 nodes, tp=16, dp=2 (dp_attention)
+# For EP32: 4 nodes, tp=16, dp=32 (dp_attention), moe_dense_tp_size=1
 EP_CONFIG = {
     8:  {"actual_tp": 8,  "actual_dp": 8,  "nnodes": 1},
     16: {"actual_tp": 16, "actual_dp": 16, "nnodes": 2},
-    32: {"actual_tp": 16, "actual_dp": 2,  "nnodes": 4},
+    32: {"actual_tp": 16, "actual_dp": 32, "nnodes": 4, "moe_dense_tp_size": 1},
 }
 
 
@@ -175,6 +175,8 @@ def launch_server(
             cmd.append("--enable-deepep-waterfill")
         if init_expert_location:
             cmd.extend(["--init-expert-location", init_expert_location])
+        if cfg.get("moe_dense_tp_size") is not None:
+            cmd.extend(["--moe-dense-tp-size", str(cfg["moe_dense_tp_size"])])
         return cmd
 
     env_vars = (
