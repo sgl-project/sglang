@@ -13,7 +13,7 @@
 # ==============================================================================
 """Ray actor wrapper for SGLang Engine.
 
-IMPORTANT: This module is imported on the head/driver node which may be
+This module is imported on the head/driver node which may be
 CPU-only. Do NOT add sglang imports at module level. All sglang imports
 happen inside _InternalEngineActor.__init__() on GPU worker nodes.
 
@@ -21,28 +21,19 @@ Usage:
 
     from sglang.srt.entrypoints.engine_actor import EngineActor
 
-    engine = EngineActor(model_path="meta-llama/Llama-2-7b", tp_size=4, use_ray=True)
+    engine = EngineActor(model_path="meta-llama/Llama-2-7b", tp_size=4)
     result = engine.generate(prompt="Hello")
     engine.shutdown()
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict, Iterator, List, Optional, Union
-
 import ray
-
-logger = logging.getLogger(__name__)
 
 
 @ray.remote
 class _InternalEngineActor:
-    """Internal Ray actor that runs sglang.Engine on a GPU worker node.
-
-    sglang is imported HERE (inside __init__), not at module level,
-    because this code executes on a GPU worker node.
-    """
+    """Internal Ray actor that runs sglang.Engine on a GPU worker node."""
 
     def __init__(self, **engine_kwargs):
         from sglang import Engine
@@ -76,11 +67,6 @@ class EngineActor:
 
     Safe to import and instantiate on CPU-only head nodes.
     Does NOT import sglang - all sglang code runs on GPU workers.
-
-    Usage:
-        engine = EngineActor(model_path="meta-llama/Llama-2-7b", tp_size=4, use_ray=True)
-        result = engine.generate(prompt="Hello")
-        engine.shutdown()
     """
 
     def __init__(self, **engine_kwargs):
