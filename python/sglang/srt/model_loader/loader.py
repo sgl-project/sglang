@@ -531,18 +531,26 @@ class DefaultModelLoader(BaseModelLoader):
         if self.load_config.draft_model_idx is not None:
             import re
 
+            available_mtp_idx = set()
             pattern = r"model.mtp.layers.(\d+)."
             filtered_weights = []
+            draft_model_idx = self.load_config.draft_model_idx
             for name, tensor in weights_iterator:
                 group = re.match(pattern, name)
                 if group is not None:
                     idx = int(group.group(1))
-                    if idx != self.load_config.draft_model_idx:
+                    available_mtp_idx.add(idx)
+                    if idx != draft_model_idx:
                         continue
                     new_name = name.replace(group.group(), "model.mtp.layers.0.")
                 else:
                     new_name = name
                 filtered_weights.append((source.prefix + new_name, tensor))
+            if draft_model_idx not in available_mtp_idx:
+                raise ValueError(
+                    f"MTP idx {draft_model_idx=} is not available. "
+                    f"Available MTP idx: {available_mtp_idx}"
+                )
             return tuple(filtered_weights)
 
         if self.counter_before_loading_weights == 0.0:
