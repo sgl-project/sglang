@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
         ScheduleBatch,
         Scheduler,
     )
+
+_is_npu=is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +390,43 @@ class SchedulerOutputProcessorMixin:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+    def _append_block_and_finalize_req(
+        self: Scheduler,
+        req,
+        next_token_ids: list[int],
+    ):
+        """
+        Minimal-intrusion replacement for the per-token loop:
+          - append all tokens once
+          - check_finished once with new_accepted_len=len(block)
+          - truncate via finished_len if set
+          - then do release/cache exactly once (same net effect as original loop)
+        """
+        if not next_token_ids:
+            return
+    
+        # If already finished, do nothing (matches check_finished early return behavior)
+        if req.finished():
+            return
+    
+        # Append all at once
+        req.output_ids.extend(next_token_ids)
+    
+        # Single finished check: treat the whole block as newly accepted
+        req.check_finished(new_accepted_len=len(next_token_ids))
+    
+        # Truncate to stop position if finished_len is provided
+        if req.finished_len is not None and len(req.output_ids) > req.finished_len:
+            del req.output_ids[req.finished_len:]
+    
+        # Now mirror the original post-check behavior:
+        if req.finished():
+            release_kv_cache(req, self.tree_cache)
+            req.time_stats.completion_time = time.perf_counter()
+        else:
+            self.tree_cache.cache_unfinished_req(req)
+
+
     def process_batch_result_dllm(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -405,6 +445,11 @@ class SchedulerOutputProcessorMixin:
             req = batch.reqs[idx]
             next_token_ids = result.next_token_ids[idx].tolist()
             self.num_generated_tokens += len(next_token_ids)
+
+            # to accelerate decoding by check in blockwise-manner
+            if _is_npu:
+                self._append_block_and_finalize_req(req, next_token_ids)
+                continue
 
             for _token_idx, next_token_id in enumerate(next_token_ids):
                 req.output_ids.append(next_token_id)

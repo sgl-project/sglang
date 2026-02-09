@@ -392,7 +392,6 @@ class AscendAttnBackend(AttentionBackend):
                 device=seq_lens.device,
             )
         if forward_mode.is_dllm_extend():
-            extend_seq_lens = self.dllm_block_size
             extend_seq_lens_cpu_int = torch.tensor(
                 [self.dllm_block_size for i in range(bs)],
                 dtype=torch.int32,
@@ -425,13 +424,15 @@ class AscendAttnBackend(AttentionBackend):
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
         metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
-            // self.page_size
+           self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
+           // self.page_size
         )
+
         metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         metadata.block_tables[bs:, :].fill_(0)
+
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+           seq_lens = seq_lens + self.speculative_num_draft_tokens
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
 
         self.forward_metadata = metadata
@@ -1886,3 +1887,7 @@ class AscendAttnMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, call_fn)
+
+
+
+

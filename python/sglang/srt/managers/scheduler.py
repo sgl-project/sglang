@@ -210,6 +210,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,7 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
+_is_npu = is_npu()
 
 @dataclass
 class EmbeddingBatchResult:
@@ -403,7 +405,7 @@ class Scheduler(
             if self.server_args.dllm_algorithm is not None
             else None
         )
-        if self.dllm_config:
+        if _is_npu and self.dllm_config:
             # make sure the page size is not larger than block_size and chunked_prefill_size
             if self.dllm_config.block_size < self.page_size:
                 logger.warning(
