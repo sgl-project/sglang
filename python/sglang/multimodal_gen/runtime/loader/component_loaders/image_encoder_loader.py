@@ -2,7 +2,9 @@ import json
 import os
 
 from sglang.multimodal_gen.configs.models import ModelConfig
-from sglang.multimodal_gen.runtime.loader.text_encoder_loader import TextEncoderLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
+    TextEncoderLoader,
+)
 from sglang.multimodal_gen.runtime.loader.utils import _clean_hf_config_inplace
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
