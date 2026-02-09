@@ -159,6 +159,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.mm_receiver = None
+        if (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+
+            os.environ.setdefault("SGLANG_ENCODER_MM_RECEIVER_MODE", "grpc")
+            self.mm_receiver = create_mm_receiver(self.server_args)
 
         # Start the request manager's event loop using auto_create_handle_loop
         self.request_manager.auto_create_handle_loop()
@@ -176,6 +185,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         try:
             # Convert gRPC request to internal format
             tokenized_req = self._convert_generate_request(request)
+            self._handle_epd_disaggregation_encode_request(request, tokenized_req)
 
             # Submit to request manager (automatically handles n>1)
             response_generator = self.request_manager.generate_request(
@@ -533,6 +543,25 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             aggregate=_compute_aggregate_protobuf(loads),
         )
 
+    def _handle_epd_disaggregation_encode_request(
+        self,
+        grpc_req: sglang_scheduler_pb2.GenerateRequest,
+        tokenized_req: TokenizedGenerateReqInput,
+    ) -> None:
+        if not self.mm_receiver:
+            return
+
+        image_urls = list(grpc_req.mm_inputs.image_urls)
+        if not image_urls:
+            return
+
+        encode_req = self.mm_receiver.build_and_send_encode_request(
+            image_urls=image_urls,
+            rid=grpc_req.request_id,
+        )
+        tokenized_req.need_wait_for_encoder = bool(encode_req.need_wait_for_encoder)
+        tokenized_req.num_items_assigned = encode_req.num_items_assigned
+
     # Helper methods for request/response conversion
 
     def _convert_generate_request(
@@ -572,7 +601,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )  # Can be 0, don't use 'or None'
 
         # Create request
-        return TokenizedGenerateReqInput(
+        tokenized_req = TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
             input_text=input_text,
             input_ids=input_ids,
@@ -594,6 +623,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
         )
+
+        return tokenized_req
 
     def _convert_embed_request(
         self, grpc_req: sglang_scheduler_pb2.EmbedRequest

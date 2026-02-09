@@ -28,7 +28,6 @@ service SglangScheduler {
 
   // Get comprehensive load metrics
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
-
 }
 
 // =====================

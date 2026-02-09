@@ -16,15 +16,15 @@ use super::{
 };
 use crate::{
     core::Worker,
-    grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
+    grpc_client::sglang_proto::{InputLogProbs, MultimodalInputs, OutputLogProbs},
     observability::metrics::metrics_labels,
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::{
-            ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
-            ToolChoice, ToolChoiceValue, TopLogProb,
+            ChatLogProbs, ChatLogProbsContent, ContentPart, FunctionCallResponse, StringOrArray,
+            Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
         },
-        generate::GenerateFinishReason,
+        generate::{GenerateFinishReason, GenerateRequest},
     },
     reasoning_parser::{
         ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
@@ -394,6 +394,193 @@ pub(crate) fn filter_chat_request_by_tool_choice(
     std::borrow::Cow::Borrowed(body)
 }
 
+/// Extract multimodal inputs (images, videos, audio) from chat messages
+///
+/// Scans all messages for multimodal content parts and collects them into
+/// a `MultimodalInputs` struct for the EPD (Encode-Prefill-Decode) pipeline.
+///
+/// Supports:
+/// - image_url: URLs or base64 data URIs
+/// - video_url: URLs or base64 data URIs
+///
+/// Returns `None` if no multimodal content is found.
+fn extract_multimodal_from_messages(messages: &[ChatMessage]) -> Option<MultimodalInputs> {
+    let mut image_urls: Vec<String> = Vec::new();
+    let mut video_urls: Vec<String> = Vec::new();
+    let mut image_data: Vec<Vec<u8>> = Vec::new();
+    let mut video_data: Vec<Vec<u8>> = Vec::new();
+    let mut modalities: Vec<String> = Vec::new();
+
+    for message in messages {
+        let content = match message {
+            ChatMessage::User { content, .. } => Some(content),
+            ChatMessage::System { content, .. } => Some(content),
+            ChatMessage::Assistant { content, .. } => content.as_ref(),
+            ChatMessage::Tool { content, .. } => Some(content),
+            ChatMessage::Function { .. } => None,
+            ChatMessage::Developer { content, .. } => Some(content),
+        };
+
+        let Some(content) = content else { continue };
+
+        // Only Parts can contain multimodal content
+        let MessageContent::Parts(parts) = content else {
+            continue;
+        };
+
+        for part in parts {
+            match part {
+                ContentPart::ImageUrl { image_url } => {
+                    let url = &image_url.url;
+                    if let Some(base64_data) = parse_data_uri(url) {
+                        image_data.push(base64_data);
+                    } else {
+                        image_urls.push(url.clone());
+                    }
+                }
+                ContentPart::VideoUrl { video_url } => {
+                    let url = &video_url.url;
+                    if let Some(base64_data) = parse_data_uri(url) {
+                        video_data.push(base64_data);
+                    } else {
+                        video_urls.push(url.clone());
+                    }
+                }
+                ContentPart::Text { .. } => {
+                    // Skip text parts
+                }
+            }
+        }
+    }
+
+    // Return None if no multimodal content found
+    if image_urls.is_empty()
+        && video_urls.is_empty()
+        && image_data.is_empty()
+        && video_data.is_empty()
+    {
+        return None;
+    }
+
+    let image_count = image_urls.len() + image_data.len();
+    let video_count = video_urls.len() + video_data.len();
+    if video_count > 0 {
+        // Prefer "video" when mixed to match Python multimodal modality selection.
+        modalities.push("video".to_string());
+    } else if image_count > 1 {
+        modalities.push("multi-images".to_string());
+    } else if image_count == 1 {
+        modalities.push("image".to_string());
+    }
+
+    Some(MultimodalInputs {
+        image_urls,
+        video_urls,
+        audio_urls: Vec::new(),
+        processed_features: None,
+        image_data,
+        video_data,
+        audio_data: Vec::new(),
+        modalities,
+    })
+}
+
+fn extract_urls_from_value(value: &Value, urls: &mut Vec<String>) {
+    match value {
+        Value::String(url) => urls.push(url.clone()),
+        Value::Array(items) => {
+            for item in items {
+                extract_urls_from_value(item, urls);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::String(url)) = map.get("url") {
+                urls.push(url.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn build_multimodal_inputs_from_generate(
+    request: &GenerateRequest,
+) -> Option<MultimodalInputs> {
+    let mut image_urls = Vec::new();
+    let mut video_urls = Vec::new();
+
+    if let Some(image_data) = request.image_data.as_ref() {
+        extract_urls_from_value(image_data, &mut image_urls);
+    }
+    if let Some(video_data) = request.video_data.as_ref() {
+        extract_urls_from_value(video_data, &mut video_urls);
+    }
+
+    if image_urls.is_empty() && video_urls.is_empty() {
+        return None;
+    }
+
+    let mut modalities = Vec::new();
+    modalities.extend(std::iter::repeat_n("image".to_string(), image_urls.len()));
+    modalities.extend(std::iter::repeat_n("video".to_string(), video_urls.len()));
+
+    Some(MultimodalInputs {
+        image_urls,
+        video_urls,
+        modalities,
+        ..Default::default()
+    })
+}
+
+/// Parse a data URI and extract the base64-decoded bytes
+///
+/// Supports format: `data:<mediatype>;base64,<data>`
+/// Example: `data:image/jpeg;base64,/9j/4AAQ...`
+const MAX_DATA_URI_DECODED_SIZE: usize = 10 * 1024 * 1024; // 10 MiB guard for inline payloads
+
+/// Maximum encoded size that could decode to MAX_DATA_URI_DECODED_SIZE.
+/// Base64 uses 4 characters per 3 bytes, plus up to 2 padding characters.
+/// We add a small buffer for padding: (MAX / 3 * 4) + 4
+const MAX_DATA_URI_ENCODED_SIZE: usize = MAX_DATA_URI_DECODED_SIZE / 3 * 4 + 4;
+
+fn parse_data_uri(url: &str) -> Option<Vec<u8>> {
+    if !url.starts_with("data:") {
+        return None;
+    }
+
+    // Find the base64 marker
+    let base64_marker = ";base64,";
+    let base64_start = url.find(base64_marker)?;
+    let data_start = base64_start + base64_marker.len();
+    let encoded = &url[data_start..];
+
+    // Rejects obviously too-large inputs before allocation
+    if encoded.len() > MAX_DATA_URI_ENCODED_SIZE {
+        warn!(
+            function = "parse_data_uri",
+            encoded_len = encoded.len(),
+            limit = MAX_DATA_URI_ENCODED_SIZE,
+            "Data URI encoded payload exceeds allowed size"
+        );
+        return None;
+    }
+
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let decoded = STANDARD.decode(encoded).ok()?;
+
+    // 2. Final Validation: Strict check on actual data
+    if decoded.len() > MAX_DATA_URI_DECODED_SIZE {
+        warn!(
+            function = "parse_data_uri",
+            decoded_len = decoded.len(),
+            limit = MAX_DATA_URI_DECODED_SIZE,
+            "Data URI payload exceeds allowed size after decoding"
+        );
+        return None;
+    }
+
+    Some(decoded)
+}
+
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
 pub(crate) fn process_chat_messages(
@@ -506,8 +693,8 @@ pub(crate) fn process_chat_messages(
         );
     };
 
-    // Placeholder for multimodal inputs
-    let multimodal_inputs = None;
+    // Extract multimodal inputs from chat messages (images, videos, etc.)
+    let multimodal_inputs = extract_multimodal_from_messages(&request.messages);
 
     Ok(ProcessedMessages {
         text: formatted_text,
@@ -1237,5 +1424,224 @@ mod tests {
         assert_eq!(content_array.len(), 2);
         assert_eq!(content_array[0]["type"], "text");
         assert_eq!(content_array[1], json!({"type": "image"}));
+    }
+
+    // ===== Tests for multimodal extraction =====
+
+    #[test]
+    fn test_extract_multimodal_no_content() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Text("Hello, world!".to_string()),
+            name: None,
+        }];
+
+        let result = extract_multimodal_from_messages(&messages);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_multimodal_single_image_url() {
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "What's in this image?".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/cat.jpg".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = extract_multimodal_from_messages(&messages).unwrap();
+        assert_eq!(result.image_urls.len(), 1);
+        assert_eq!(result.image_urls[0], "https://example.com/cat.jpg");
+        assert!(result.video_urls.is_empty());
+        assert!(result.image_data.is_empty());
+        assert_eq!(result.modalities, vec!["image".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_multimodal_multiple_images() {
+        let messages = vec![
+            ChatMessage::User {
+                content: MessageContent::Parts(vec![
+                    ContentPart::Text {
+                        text: "Compare these images:".to_string(),
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "https://example.com/image1.jpg".to_string(),
+                            detail: None,
+                        },
+                    },
+                    ContentPart::ImageUrl {
+                        image_url: ImageUrl {
+                            url: "https://example.com/image2.jpg".to_string(),
+                            detail: Some("high".to_string()),
+                        },
+                    },
+                ]),
+                name: None,
+            },
+            ChatMessage::User {
+                content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/image3.jpg".to_string(),
+                        detail: None,
+                    },
+                }]),
+                name: None,
+            },
+        ];
+
+        let result = extract_multimodal_from_messages(&messages).unwrap();
+        assert_eq!(result.image_urls.len(), 3);
+        assert_eq!(result.image_urls[0], "https://example.com/image1.jpg");
+        assert_eq!(result.image_urls[1], "https://example.com/image2.jpg");
+        assert_eq!(result.image_urls[2], "https://example.com/image3.jpg");
+        assert_eq!(result.modalities, vec!["multi-images".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_multimodal_video_url() {
+        use crate::protocols::common::VideoUrl;
+
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "Describe this video:".to_string(),
+                },
+                ContentPart::VideoUrl {
+                    video_url: VideoUrl {
+                        url: "https://example.com/video.mp4".to_string(),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = extract_multimodal_from_messages(&messages).unwrap();
+        assert!(result.image_urls.is_empty());
+        assert_eq!(result.video_urls.len(), 1);
+        assert_eq!(result.video_urls[0], "https://example.com/video.mp4");
+        assert_eq!(result.modalities, vec!["video".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_multimodal_mixed_image_and_video() {
+        use crate::protocols::common::VideoUrl;
+
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/thumbnail.jpg".to_string(),
+                        detail: None,
+                    },
+                },
+                ContentPart::VideoUrl {
+                    video_url: VideoUrl {
+                        url: "https://example.com/video.mp4".to_string(),
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = extract_multimodal_from_messages(&messages).unwrap();
+        assert_eq!(result.image_urls.len(), 1);
+        assert_eq!(result.video_urls.len(), 1);
+        assert_eq!(result.modalities, vec!["video".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_multimodal_base64_image() {
+        // Simple base64 encoded PNG (1x1 red pixel)
+        let base64_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+        let messages = vec![ChatMessage::User {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: base64_png.to_string(),
+                    detail: None,
+                },
+            }]),
+            name: None,
+        }];
+
+        let result = extract_multimodal_from_messages(&messages).unwrap();
+        // Base64 data should go to image_data, not image_urls
+        assert!(result.image_urls.is_empty());
+        assert_eq!(result.image_data.len(), 1);
+        assert!(!result.image_data[0].is_empty());
+        assert_eq!(result.modalities, vec!["image".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_multimodal_from_system_message() {
+        let messages = vec![ChatMessage::System {
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "You are a helpful assistant.".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "https://example.com/logo.png".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        let result = extract_multimodal_from_messages(&messages).unwrap();
+        assert_eq!(result.image_urls.len(), 1);
+        assert_eq!(result.image_urls[0], "https://example.com/logo.png");
+    }
+
+    #[test]
+    fn test_parse_data_uri_valid() {
+        let data_uri = "data:image/jpeg;base64,/9j/4AAQ";
+        let result = parse_data_uri(data_uri);
+        assert!(result.is_some());
+        // /9j/4AAQ decodes to the JPEG magic bytes
+        let decoded = result.unwrap();
+        assert!(!decoded.is_empty());
+    }
+
+    #[test]
+    fn test_parse_data_uri_not_data_uri() {
+        let url = "https://example.com/image.jpg";
+        let result = parse_data_uri(url);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_data_uri_no_base64_marker() {
+        let url = "data:image/jpeg,raw_data_here";
+        let result = parse_data_uri(url);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_data_uri_invalid_base64() {
+        let url = "data:image/jpeg;base64,!!!invalid!!!";
+        let result = parse_data_uri(url);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_data_uri_too_large() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let oversized_bytes = vec![0u8; MAX_DATA_URI_DECODED_SIZE + 1];
+        let encoded = STANDARD.encode(&oversized_bytes);
+        let data_uri = format!("data:image/png;base64,{}", encoded);
+        let result = parse_data_uri(&data_uri);
+        assert!(result.is_none());
     }
 }

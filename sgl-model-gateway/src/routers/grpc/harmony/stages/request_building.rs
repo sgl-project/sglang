@@ -184,8 +184,18 @@ impl PipelineStage for HarmonyRequestBuildingStage {
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
-            if let Some(WorkerSelection::Dual { prefill, .. }) = ctx.state.workers.as_ref() {
-                helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
+            if let Some(prefill_worker) =
+                ctx.state
+                    .workers
+                    .as_ref()
+                    .and_then(|selection| match selection {
+                        WorkerSelection::Dual { prefill, .. } => Some(prefill),
+                        _ => None,
+                    })
+            {
+                // Inject PD bootstrap metadata for prefill->decode KV cache transfer.
+                // For EPD mode, encoder dispatch happens on prefill; bootstrap is prefill↔decode only.
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }
 

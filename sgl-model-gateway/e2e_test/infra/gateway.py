@@ -40,11 +40,12 @@ class Gateway:
     - Worker management (list, add, remove)
     - Health and metrics endpoints
 
-    Four startup modes:
+    Five startup modes:
     1. Regular mode: Start with worker URLs
     2. PD mode: Start with prefill/decode workers
-    3. IGW mode: Start empty, add workers via API
-    4. Cloud mode: Start with cloud backend (OpenAI, xAI)
+    3. EPD mode: Start with encode/prefill/decode workers
+    4. IGW mode: Start empty, add workers via API
+    5. Cloud mode: Start with cloud backend (OpenAI, xAI)
 
     Example (regular mode):
         gateway = Gateway()
@@ -102,6 +103,7 @@ class Gateway:
         self.model_path: str | None = None
         self.policy: str = "round_robin"
         self.pd_mode: bool = False
+        self.epd_mode: bool = False
         self.igw_mode: bool = False
         self.cloud_mode: bool = False
         self.cloud_backend: str | None = None
@@ -122,6 +124,8 @@ class Gateway:
         # PD mode arguments
         prefill_workers: list["ModelInstance"] | None = None,
         decode_workers: list["ModelInstance"] | None = None,
+        # EPD mode arguments
+        encode_workers: list["ModelInstance"] | None = None,
         # IGW mode arguments
         igw_mode: bool = False,
         # Cloud mode arguments
@@ -135,17 +139,19 @@ class Gateway:
     ) -> None:
         """Start the gateway.
 
-        Can be started in four modes:
+        Can be started in five modes:
         1. Regular mode: Provide worker_urls and model_path
         2. PD mode: Provide prefill_workers and decode_workers
-        3. IGW mode: Set igw_mode=True, add workers later via add_worker()
-        4. Cloud mode: Provide cloud_backend ("openai" or "xai")
+        3. EPD mode: Provide encode_workers, prefill_workers, and decode_workers
+        4. IGW mode: Set igw_mode=True, add workers later via add_worker()
+        5. Cloud mode: Provide cloud_backend ("openai" or "xai")
 
         Args:
             worker_urls: List of worker URLs for regular mode.
             model_path: Model path for regular mode.
             prefill_workers: List of prefill ModelInstance objects for PD mode.
             decode_workers: List of decode ModelInstance objects for PD mode.
+            encode_workers: List of encode ModelInstance objects for EPD mode.
             igw_mode: Start in IGW mode (no workers, add via API).
             cloud_backend: Cloud backend type ("openai" or "xai").
             history_backend: History backend for cloud mode ("memory" or "oracle").
@@ -162,24 +168,31 @@ class Gateway:
             raise RuntimeError("Gateway already started")
 
         # Determine mode based on arguments
-        is_pd_mode = prefill_workers is not None or decode_workers is not None
+        is_epd_mode = encode_workers is not None
+        is_pd_mode = (
+            prefill_workers is not None or decode_workers is not None
+        ) and not is_epd_mode
         is_regular_mode = worker_urls is not None
         is_igw_mode = igw_mode
         is_cloud_mode = cloud_backend is not None
 
         # Validate mode exclusivity
-        modes_specified = sum([is_pd_mode, is_regular_mode, is_igw_mode, is_cloud_mode])
+        modes_specified = sum(
+            [is_pd_mode, is_epd_mode, is_regular_mode, is_igw_mode, is_cloud_mode]
+        )
         if modes_specified > 1:
             raise ValueError(
                 "Cannot specify multiple modes. Choose one of: "
                 "worker_urls (regular), prefill/decode_workers (PD), "
+                "encode/prefill/decode_workers (EPD), "
                 "igw_mode, or cloud_backend"
             )
 
         if modes_specified == 0:
             raise ValueError(
                 "Must specify one mode: worker_urls (regular), "
-                "prefill/decode_workers (PD), igw_mode=True, or cloud_backend"
+                "prefill/decode_workers (PD), encode/prefill/decode_workers (EPD), "
+                "igw_mode=True, or cloud_backend"
             )
 
         if show_output is None:
@@ -190,6 +203,7 @@ class Gateway:
         if is_igw_mode:
             # IGW mode: start empty, add workers via API
             self.pd_mode = False
+            self.epd_mode = False
             self.igw_mode = True
             self._launch(
                 mode_args=["--enable-igw"],
@@ -201,6 +215,7 @@ class Gateway:
         elif is_pd_mode:
             # PD mode: prefill/decode disaggregation
             self.pd_mode = True
+            self.epd_mode = False
             self.igw_mode = False
             prefills = prefill_workers or []
             decodes = decode_workers or []
@@ -218,9 +233,52 @@ class Gateway:
                 extra_args=extra_args,
                 log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
             )
+        elif is_epd_mode:
+            # EPD mode: encode/prefill/decode disaggregation
+            self.pd_mode = False
+            self.epd_mode = True
+            self.igw_mode = False
+            encodes = encode_workers or []
+            prefills = prefill_workers or []
+            decodes = decode_workers or []
+
+            if not encodes or not prefills or not decodes:
+                raise ValueError(
+                    "EPD mode requires encode_workers, prefill_workers, and decode_workers"
+                )
+
+            if model_path is None:
+                model_path = encodes[0].model_path if encodes else None
+            if model_path is None:
+                raise ValueError("model_path is required for EPD mode")
+            self.model_path = model_path
+
+            mode_args = ["--epd-disaggregation", "--model-path", model_path]
+            for enc in encodes:
+                mode_args += ["--encode", enc.worker_url]
+            for pf in prefills:
+                if pf.bootstrap_port is None:
+                    mode_args += ["--prefill", pf.worker_url, "none"]
+                else:
+                    mode_args += ["--prefill", pf.worker_url, str(pf.bootstrap_port)]
+            for dc in decodes:
+                mode_args += ["--decode", dc.worker_url]
+
+            self._launch(
+                mode_args=mode_args,
+                timeout=timeout,
+                show_output=show_output,
+                extra_args=extra_args,
+                num_workers=len(encodes) + len(prefills) + len(decodes),
+                log_msg=(
+                    f"EPD gateway ({len(encodes)} encode, "
+                    f"{len(prefills)} prefill, {len(decodes)} decode)"
+                ),
+            )
         elif is_cloud_mode:
             # Cloud mode: OpenAI/xAI backend
             self.pd_mode = False
+            self.epd_mode = False
             self.igw_mode = False
             self.cloud_mode = True
             self.cloud_backend = cloud_backend
@@ -265,6 +323,7 @@ class Gateway:
                 raise ValueError("model_path is required for regular mode")
             self.model_path = model_path
             self.pd_mode = False
+            self.epd_mode = False
             self.igw_mode = False
 
             self._launch(

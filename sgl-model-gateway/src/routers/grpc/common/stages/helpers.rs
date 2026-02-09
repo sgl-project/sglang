@@ -14,6 +14,9 @@ use crate::{
 ///
 /// Used by both chat and generate request building stages when in PD mode.
 /// Only SGLang supports PD (prefill/decode) disaggregated mode.
+///
+/// Note: For EPD mode, encoder dispatch happens on the prefill side; bootstrap metadata
+/// only applies to prefill↔decode KV cache transfer.
 pub(crate) fn inject_bootstrap_metadata(
     request: &mut ProtoGenerateRequest,
     prefill_worker: &Arc<dyn Worker>,
@@ -24,20 +27,20 @@ pub(crate) fn inject_bootstrap_metadata(
     // Generate room ID for bootstrap
     let room_id = rand::rng().random_range(0..i32::MAX);
 
-    // Create DisaggregatedParams
+    // Create DisaggregatedParams with prefill worker metadata
     let disagg_params = DisaggregatedParams {
         bootstrap_host: hostname.to_string(),
         bootstrap_port: bootstrap_port as i32,
         bootstrap_room: room_id,
     };
 
+    debug!(
+        "Injected PD bootstrap metadata: host={}, port={}, room={}",
+        hostname, bootstrap_port, room_id
+    );
+
     // Inject metadata directly into SGLang request
     // (vLLM doesn't support PD mode, so this will panic if called with vLLM)
     let sglang_request = request.as_sglang_mut();
     sglang_request.disaggregated_params = Some(disagg_params);
-
-    debug!(
-        "Injected bootstrap metadata: host={}, port={}, room={}",
-        hostname, bootstrap_port, room_id
-    );
 }

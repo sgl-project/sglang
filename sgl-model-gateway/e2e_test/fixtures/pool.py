@@ -60,6 +60,7 @@ def model_pool(request: pytest.FixtureRequest) -> "ModelPool":
     - @pytest.mark.model("model-name")
     - @pytest.mark.workers(count=N) for regular workers
     - @pytest.mark.workers(prefill=N, decode=N) for PD workers
+    - @pytest.mark.workers(encode=N, prefill=N, decode=N) for EPD workers
 
     Environment variable overrides:
     - E2E_MODELS: Comma-separated model IDs (e.g., "llama-8b,qwen-7b")

@@ -28,7 +28,6 @@ service SglangScheduler {
 
   // Get comprehensive load metrics
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
-
 }
 
 // =====================
@@ -130,6 +129,7 @@ message GenerateRequest {
 
   // Whether client wants streaming response
   bool stream = 17;
+
 }
 
 message TokenizedInput {

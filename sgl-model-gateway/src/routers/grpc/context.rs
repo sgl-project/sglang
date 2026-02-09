@@ -181,6 +181,15 @@ impl LoadGuards {
     }
 }
 
+impl LoadGuards {
+    pub fn into_vec(self) -> Vec<WorkerLoadGuard> {
+        match self {
+            LoadGuards::Single { _guard } => vec![_guard],
+            LoadGuards::Dual { _prefill, _decode } => vec![_prefill, _decode],
+        }
+    }
+}
+
 /// Response processing state (Step 6)
 #[derive(Default)]
 pub(crate) struct ResponseState {
@@ -407,6 +416,10 @@ impl WorkerSelection {
 /// Some methods are kept for API completeness even if currently unused.
 #[allow(dead_code)]
 impl ClientSelection {
+    pub fn is_dual(&self) -> bool {
+        matches!(self, Self::Dual { .. })
+    }
+
     pub fn single(&self) -> Option<&GrpcClient> {
         match self {
             Self::Single { client } => Some(client),
@@ -428,20 +441,6 @@ impl ClientSelection {
         }
     }
 
-    pub fn prefill_client(&self) -> Option<&GrpcClient> {
-        match self {
-            Self::Dual { prefill, .. } => Some(prefill),
-            _ => None,
-        }
-    }
-
-    pub fn prefill_client_mut(&mut self) -> Option<&mut GrpcClient> {
-        match self {
-            Self::Dual { prefill, .. } => Some(prefill),
-            _ => None,
-        }
-    }
-
     pub fn decode_client(&self) -> Option<&GrpcClient> {
         match self {
             Self::Dual { decode, .. } => Some(decode),
@@ -459,6 +458,9 @@ impl ClientSelection {
 
 /// Result of request execution (streams from workers)
 /// Uses ProtoStream to automatically abort on cancellation
+///
+/// Note: EPD mode uses Dual (prefill + decode) since encode happens
+/// within the prefill runtime before streaming starts.
 pub(crate) enum ExecutionResult {
     Single {
         stream: ProtoStream,

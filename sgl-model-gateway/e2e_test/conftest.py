@@ -34,17 +34,19 @@ This module defines several pytest markers for configuring E2E tests:
         @pytest.mark.model("llama-8b")
         @pytest.mark.model("qwen-72b")
 
-@pytest.mark.workers(count=1, prefill=None, decode=None)
+@pytest.mark.workers(count=1, prefill=None, decode=None, encode=None)
     Configure worker topology for the test.
 
     Args:
         count: Number of regular workers (default: 1)
         prefill: Number of prefill workers for PD disaggregation
         decode: Number of decode workers for PD disaggregation
+        encode: Number of encode workers for EPD disaggregation
 
     Examples:
         @pytest.mark.workers(count=3)  # 3 regular workers
         @pytest.mark.workers(prefill=2, decode=2)  # PD mode
+        @pytest.mark.workers(encode=2, prefill=2, decode=2)  # EPD mode
 
 @pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None)
     Configure the gateway/router.
@@ -57,6 +59,14 @@ This module defines several pytest markers for configuring E2E tests:
     Examples:
         @pytest.mark.gateway(policy="random")
         @pytest.mark.gateway(extra_args=["--cache-routing"])
+
+@pytest.mark.epd_backend(name)
+    Configure the EPD KV transfer backend between prefill and decode workers
+    (e.g., "mooncake", "nixl", "ascend", "fake", "mori"). Encoder transfer
+    uses its own default and is not set by this marker.
+
+    Examples:
+        @pytest.mark.epd_backend("mooncake")
 
 @pytest.mark.e2e
     Mark test as an end-to-end test requiring GPU workers.
@@ -75,6 +85,23 @@ This module defines several pytest markers for configuring E2E tests:
     Examples:
         @pytest.mark.thread_unsafe
         @pytest.mark.thread_unsafe(reason="Modifies global state")
+
+Environment overrides
+---------------------
+EPD_KV_TRANSFER_BACKEND
+    Override KV transfer backend for EPD prefill/decode workers
+    (e.g., "mooncake", "nixl", "ascend", "fake", "mori").
+
+EPD_TRANSFER_BACKEND
+    Deprecated alias for EPD_KV_TRANSFER_BACKEND.
+
+EPD_ENCODER_TRANSFER_BACKEND
+    Override encoder transfer backend for EPD encode/prefill workers
+    (e.g., "zmq_to_scheduler", "zmq_to_tokenizer", "mooncake").
+
+E2E_IB_DEVICE
+    Override InfiniBand device used for disaggregation workers
+    (e.g., "erdma_0" or "mlx5_0").
 
 Fixtures
 --------

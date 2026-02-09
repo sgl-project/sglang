@@ -6,9 +6,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
@@ -33,6 +35,48 @@ from .model_specs import MODEL_SPECS, get_model_spec
 from .process_utils import detect_ib_device
 
 logger = logging.getLogger(__name__)
+_GRPC_PROTO_READY = False
+
+
+def _ensure_grpc_proto_generated() -> None:
+    """Generate gRPC stubs on-demand for gRPC worker launches."""
+    global _GRPC_PROTO_READY
+    if _GRPC_PROTO_READY:
+        return
+
+    repo_root = Path(__file__).resolve().parents[3]
+    grpc_dir = repo_root / "python" / "sglang" / "srt" / "grpc"
+    expected = [
+        grpc_dir / "sglang_encoder_pb2.py",
+        grpc_dir / "sglang_encoder_pb2_grpc.py",
+        grpc_dir / "sglang_encoder_pb2.pyi",
+        grpc_dir / "sglang_scheduler_pb2.py",
+        grpc_dir / "sglang_scheduler_pb2_grpc.py",
+        grpc_dir / "sglang_scheduler_pb2.pyi",
+    ]
+
+    if all(path.exists() for path in expected):
+        _GRPC_PROTO_READY = True
+        return
+
+    compile_script = grpc_dir / "compile_proto.py"
+    if not compile_script.exists():
+        raise RuntimeError("compile_proto.py missing; cannot generate gRPC stubs")
+
+    for proto_file in ("sglang_scheduler.proto", "sglang_encoder.proto"):
+        result = subprocess.run(
+            [sys.executable, str(compile_script), "--proto-file", proto_file],
+            cwd=grpc_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                f"Failed to generate gRPC stubs for {proto_file}: {detail}"
+            )
+
+    _GRPC_PROTO_READY = True
 
 
 @dataclass(frozen=True)
@@ -45,6 +89,7 @@ class WorkerIdentity:
     - llama-8b:http:prefill_0 (first prefill worker)
     - llama-8b:http:prefill_1 (second prefill worker)
     - llama-8b:http:decode_0 (first decode worker)
+    - qwen-vl-7b:grpc:encode_0 (first encode worker)
 
     Frozen/hashable so it can be used in sets and as dict keys for deduplication.
     """
@@ -58,6 +103,11 @@ class WorkerIdentity:
     def is_prefill(self) -> bool:
         """Check if this is a prefill worker."""
         return self.worker_type == WorkerType.PREFILL
+
+    @property
+    def is_encode(self) -> bool:
+        """Check if this is an encode worker."""
+        return self.worker_type == WorkerType.ENCODE
 
     @property
     def is_decode(self) -> bool:
@@ -103,6 +153,7 @@ class ModelInstance:
     key: str  # Unique instance key (e.g., "llama-8b:http:prefill_0")
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None  # For prefill workers in PD mode
+    transfer_backend: str | None = None  # For EPD prefill/decode workers
     last_used: float = 0.0  # Timestamp for MRU eviction
     _healthy: bool = False  # Track if initial health check passed
 
@@ -381,7 +432,9 @@ class ModelPool:
         )
 
         # Detect IB device once for PD workers
-        has_pd = any(r.is_prefill or r.is_decode for r in valid_requirements)
+        has_pd = any(
+            r.is_prefill or r.is_decode or r.is_encode for r in valid_requirements
+        )
         ib_device = detect_ib_device() if has_pd else None
         if ib_device:
             logger.info("Detected InfiniBand device: %s", ib_device)
@@ -463,6 +516,9 @@ class ModelPool:
         worker_type: WorkerType = WorkerType.REGULAR,
         bootstrap_port: int | None = None,
         ib_device: str | None = None,
+        encoder_urls: list[str] | None = None,
+        transfer_backend: str | None = None,
+        extra_args: list[str] | None = None,
         instance_key: str | None = None,
     ) -> ModelInstance:
         """Launch a model instance.
@@ -472,8 +528,11 @@ class ModelPool:
             mode: Connection mode (HTTP or GRPC).
             gpu_slot: GPU slot assignment, or None for auto.
             worker_type: Worker type (REGULAR, PREFILL, or DECODE).
-            bootstrap_port: Bootstrap port for prefill workers in PD mode.
+            bootstrap_port: Bootstrap port for prefill workers in PD/EPD mode.
             ib_device: InfiniBand device for PD disaggregation.
+            encoder_urls: Encoder worker URLs for EPD prefill workers.
+            transfer_backend: EPD transfer backend for prefill/decode workers.
+            extra_args: Additional CLI args for specialized workers.
             instance_key: Custom instance key, or None to auto-generate.
 
         Returns:
@@ -489,6 +548,9 @@ class ModelPool:
 
         # Build environment
         env = os.environ.copy()
+        spec_env = spec.get("env", {})
+        if spec_env:
+            env.update(spec_env)
         if gpu_slot:
             env["CUDA_VISIBLE_DEVICES"] = gpu_slot.cuda_visible_devices()
 
@@ -510,25 +572,33 @@ class ModelPool:
         ]
 
         if mode == ConnectionMode.GRPC:
+            _ensure_grpc_proto_generated()
             cmd.append("--grpc-mode")
 
         # Embedding model flag
         if "embedding" in features:
             cmd.append("--is-embedding")
 
-        # PD disaggregation arguments
+        # Disaggregation arguments
+        if worker_type == WorkerType.ENCODE:
+            cmd.append("--encoder-only")
         if worker_type == WorkerType.PREFILL:
             cmd.extend(["--disaggregation-mode", "prefill"])
             if bootstrap_port:
                 cmd.extend(["--disaggregation-bootstrap-port", str(bootstrap_port)])
             if ib_device:
                 cmd.extend(["--disaggregation-ib-device", ib_device])
+            if encoder_urls:
+                cmd.extend(["--encoder-urls", *encoder_urls])
         elif worker_type == WorkerType.DECODE:
             cmd.extend(["--disaggregation-mode", "decode"])
             # Base GPU ID 0 since CUDA_VISIBLE_DEVICES remaps the GPU
             cmd.extend(["--base-gpu-id", "0"])
             if ib_device:
                 cmd.extend(["--disaggregation-ib-device", ib_device])
+
+        if extra_args:
+            cmd.extend(extra_args)
 
         # Additional worker args from model spec (e.g., --context-length)
         worker_args = spec.get("worker_args", [])
@@ -569,6 +639,7 @@ class ModelPool:
             key=key,
             worker_type=worker_type,
             bootstrap_port=bootstrap_port,
+            transfer_backend=transfer_backend,
             last_used=time.time(),
         )
         self.instances[key] = instance
@@ -736,7 +807,7 @@ class ModelPool:
         Args:
             model_id: The model ID (e.g., "llama-8b")
             mode: The mode (ConnectionMode.HTTP or ConnectionMode.GRPC, or string)
-            worker_type: The worker type (REGULAR, PREFILL, DECODE). Defaults to REGULAR.
+            worker_type: The worker type (REGULAR, ENCODE, PREFILL, DECODE). Defaults to REGULAR.
             wait_for_gpus: If True, wait for GPUs to become available when all
                 are in use by other tests. Defaults to True.
             gpu_wait_timeout: Max seconds to wait for GPUs (default 5 min).
@@ -994,7 +1065,10 @@ class ModelPool:
         raise TimeoutError(f"Instance {key} did not become healthy within {timeout}s")
 
     def get_workers_by_type(
-        self, model_id: str, worker_type: WorkerType
+        self,
+        model_id: str,
+        worker_type: WorkerType,
+        mode: ConnectionMode | None = None,
     ) -> list[ModelInstance]:
         """Get all workers of a specific type for a model.
 
@@ -1005,6 +1079,7 @@ class ModelPool:
         Args:
             model_id: The model ID.
             worker_type: The worker type to filter by.
+            mode: Optional connection mode filter.
 
         Returns:
             List of matching ModelInstance objects (already acquired).
@@ -1013,7 +1088,9 @@ class ModelPool:
             workers = [
                 inst
                 for inst in self.instances.values()
-                if inst.model_id == model_id and inst.worker_type == worker_type
+                if inst.model_id == model_id
+                and inst.worker_type == worker_type
+                and (mode is None or inst.mode == mode)
             ]
             # Acquire all while holding lock to prevent race with eviction
             for worker in workers:
@@ -1027,6 +1104,8 @@ class ModelPool:
         allow_eviction: bool = True,
         wait_for_gpus: bool = True,
         gpu_wait_timeout: int = 300,
+        encoder_urls: list[str] | None = None,
+        epd_transfer_backend: str | None = None,
     ) -> list[ModelInstance]:
         """Launch workers of any type.
 
@@ -1042,6 +1121,8 @@ class ModelPool:
             wait_for_gpus: If True, wait for GPUs to become available when all
                 are in use by other tests (with eviction enabled).
             gpu_wait_timeout: Max seconds to wait for GPUs (default 5 min).
+            encoder_urls: Optional encoder URLs for EPD prefill workers.
+            epd_transfer_backend: Optional EPD transfer backend override.
 
         Returns:
             List of launched ModelInstance objects.
@@ -1052,7 +1133,11 @@ class ModelPool:
         while True:
             with self._lock:
                 result = self._launch_workers_unlocked(
-                    workers, startup_timeout, allow_eviction
+                    workers,
+                    startup_timeout,
+                    allow_eviction,
+                    encoder_urls=encoder_urls,
+                    epd_transfer_backend=epd_transfer_backend,
                 )
                 if result is not None:
                     return result
@@ -1081,6 +1166,8 @@ class ModelPool:
         workers: list[WorkerIdentity],
         startup_timeout: int = DEFAULT_STARTUP_TIMEOUT,
         allow_eviction: bool = True,
+        encoder_urls: list[str] | None = None,
+        epd_transfer_backend: str | None = None,
     ) -> list[ModelInstance] | None:
         """Internal launch logic. Caller must hold _lock.
 
@@ -1164,25 +1251,134 @@ class ModelPool:
                 f"Failed to allocate GPU slots for {len(valid_workers)} workers"
             )
 
-        # Detect IB device for PD workers
-        has_pd = any(w.is_prefill or w.is_decode for w in valid_workers)
+        # Detect IB device for disaggregated workers
+        has_pd = any(w.is_prefill or w.is_decode or w.is_encode for w in valid_workers)
         ib_device = detect_ib_device() if has_pd else None
 
         instances: list[ModelInstance] = []
-        for w in valid_workers:
-            # Each prefill worker needs its own bootstrap port for PD communication
-            bootstrap_port = get_open_port() if w.is_prefill else None
+        epd_mode = encoder_urls is not None or any(w.is_encode for w in valid_workers)
+        if epd_mode:
+            encodes = [w for w in valid_workers if w.is_encode]
+            prefills = [w for w in valid_workers if w.is_prefill]
+            decodes = [w for w in valid_workers if w.is_decode]
+            regulars = [w for w in valid_workers if w.is_regular]
 
-            instance = self._launch_model(
-                model_id=w.model_id,
-                mode=w.mode,
-                gpu_slot=slot_map.get(w.key),
-                worker_type=w.worker_type,
-                bootstrap_port=bootstrap_port,
-                ib_device=ib_device if (w.is_prefill or w.is_decode) else None,
-                instance_key=w.key,
+            epd_encoder_urls: list[str] = list(encoder_urls) if encoder_urls else []
+            new_encoder_urls: list[str] = []
+            encoder_transfer_backend = os.getenv(
+                "EPD_ENCODER_TRANSFER_BACKEND", "zmq_to_scheduler"
             )
-            instances.append(instance)
+            encode_extra_args = [
+                "--encoder-transfer-backend",
+                encoder_transfer_backend,
+            ]
+
+            for w in encodes:
+                instance = self._launch_model(
+                    model_id=w.model_id,
+                    mode=w.mode,
+                    gpu_slot=slot_map.get(w.key),
+                    worker_type=w.worker_type,
+                    ib_device=ib_device,
+                    extra_args=encode_extra_args,
+                    instance_key=w.key,
+                )
+                instances.append(instance)
+                new_encoder_urls.append(instance.worker_url)
+
+            if new_encoder_urls:
+                epd_encoder_urls.extend(new_encoder_urls)
+
+            transfer_backend = (
+                epd_transfer_backend
+                if epd_transfer_backend is not None
+                else os.getenv(
+                    "EPD_KV_TRANSFER_BACKEND",
+                    os.getenv("EPD_TRANSFER_BACKEND", "mooncake"),
+                )
+            )
+            epd_ib_device = ib_device if transfer_backend == "mooncake" else None
+            prefill_extra_args = [
+                "--disaggregation-transfer-backend",
+                transfer_backend,
+                "--encoder-transfer-backend",
+                encoder_transfer_backend,
+                "--mem-fraction-static",
+                "0.9",
+                "--disable-radix-cache",
+                "--chunked-prefill-size",
+                "8192",
+                "--language-only",
+                "--skip-server-warmup",
+                "--chat-template",
+                "chatml",
+            ]
+            decode_extra_args = [
+                "--disaggregation-transfer-backend",
+                transfer_backend,
+                "--encoder-transfer-backend",
+                encoder_transfer_backend,
+                "--mem-fraction-static",
+                "0.9",
+                "--skip-server-warmup",
+                "--chat-template",
+                "chatml",
+            ]
+
+            for w in prefills:
+                bootstrap_port = get_open_port()
+                instance = self._launch_model(
+                    model_id=w.model_id,
+                    mode=w.mode,
+                    gpu_slot=slot_map.get(w.key),
+                    worker_type=w.worker_type,
+                    bootstrap_port=bootstrap_port,
+                    ib_device=epd_ib_device,
+                    encoder_urls=epd_encoder_urls or None,
+                    transfer_backend=transfer_backend,
+                    extra_args=prefill_extra_args,
+                    instance_key=w.key,
+                )
+                instances.append(instance)
+
+            for w in decodes:
+                instance = self._launch_model(
+                    model_id=w.model_id,
+                    mode=w.mode,
+                    gpu_slot=slot_map.get(w.key),
+                    worker_type=w.worker_type,
+                    ib_device=epd_ib_device,
+                    transfer_backend=transfer_backend,
+                    extra_args=decode_extra_args,
+                    instance_key=w.key,
+                )
+                instances.append(instance)
+
+            for w in regulars:
+                instance = self._launch_model(
+                    model_id=w.model_id,
+                    mode=w.mode,
+                    gpu_slot=slot_map.get(w.key),
+                    worker_type=w.worker_type,
+                    ib_device=ib_device if (w.is_prefill or w.is_decode) else None,
+                    instance_key=w.key,
+                )
+                instances.append(instance)
+        else:
+            for w in valid_workers:
+                # Each prefill worker needs its own bootstrap port for PD communication
+                bootstrap_port = get_open_port() if w.is_prefill else None
+
+                instance = self._launch_model(
+                    model_id=w.model_id,
+                    mode=w.mode,
+                    gpu_slot=slot_map.get(w.key),
+                    worker_type=w.worker_type,
+                    bootstrap_port=bootstrap_port,
+                    ib_device=ib_device if (w.is_prefill or w.is_decode) else None,
+                    instance_key=w.key,
+                )
+                instances.append(instance)
 
         self._wait_all_healthy()
         return instances

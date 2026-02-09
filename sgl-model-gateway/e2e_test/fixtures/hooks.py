@@ -108,13 +108,13 @@ def pytest_collection_modifyitems(
             _worker_counts[key] = max(_worker_counts[key], count)
 
     def calculate_test_gpus(
-        model_id: str, prefill: int, decode: int, regular: int
+        model_id: str, encode: int, prefill: int, decode: int, regular: int
     ) -> int:
         """Calculate GPU requirement for a single test."""
         if model_id not in MODEL_SPECS:
             return 0
         tp = MODEL_SPECS[model_id].get("tp", 1)
-        return tp * (prefill + decode + regular)
+        return tp * (encode + prefill + decode + regular)
 
     for item in items:
         # Extract model from marker or use default
@@ -157,10 +157,12 @@ def pytest_collection_modifyitems(
 
         # Check for workers marker
         workers_marker = item.get_closest_marker("workers")
+        encode_count = 0
         prefill_count = 0
         decode_count = 0
         regular_count = 1
         if workers_marker:
+            encode_count = workers_marker.kwargs.get("encode") or 0
             prefill_count = workers_marker.kwargs.get("prefill") or 0
             decode_count = workers_marker.kwargs.get("decode") or 0
             regular_count = workers_marker.kwargs.get("count") or 1
@@ -182,7 +184,20 @@ def pytest_collection_modifyitems(
                     track_worker(model_id, mode, WorkerType.PREFILL, p_count)
                     track_worker(model_id, mode, WorkerType.DECODE, d_count)
                     test_gpus = max(
-                        test_gpus, calculate_test_gpus(model_id, p_count, d_count, 0)
+                        test_gpus,
+                        calculate_test_gpus(model_id, 0, p_count, d_count, 0),
+                    )
+                elif backend == "epd":
+                    mode = ConnectionMode.GRPC
+                    e_count = encode_count if encode_count > 0 else 1
+                    p_count = prefill_count if prefill_count > 0 else 1
+                    d_count = decode_count if decode_count > 0 else 1
+                    track_worker(model_id, mode, WorkerType.ENCODE, e_count)
+                    track_worker(model_id, mode, WorkerType.PREFILL, p_count)
+                    track_worker(model_id, mode, WorkerType.DECODE, d_count)
+                    test_gpus = max(
+                        test_gpus,
+                        calculate_test_gpus(model_id, e_count, p_count, d_count, 0),
                     )
                 else:
                     try:
@@ -196,19 +211,19 @@ def pytest_collection_modifyitems(
                         test_gpus = max(
                             test_gpus,
                             calculate_test_gpus(
-                                model_id, prefill_count, decode_count, 0
+                                model_id, 0, prefill_count, decode_count, 0
                             ),
                         )
                     else:
                         track_worker(model_id, mode, WorkerType.REGULAR, regular_count)
                         test_gpus = max(
                             test_gpus,
-                            calculate_test_gpus(model_id, 0, 0, regular_count),
+                            calculate_test_gpus(model_id, 0, 0, 0, regular_count),
                         )
 
         elif model_id and is_e2e:
             track_worker(model_id, ConnectionMode.HTTP, WorkerType.REGULAR, 1)
-            test_gpus = calculate_test_gpus(model_id, 0, 0, 1)
+            test_gpus = calculate_test_gpus(model_id, 0, 0, 0, 1)
 
         if test_gpus > _max_test_gpu_requirement:
             _max_test_gpu_requirement = test_gpus
@@ -247,17 +262,21 @@ def get_pool_requirements() -> list["WorkerIdentity"]:
     """
     from infra import DEFAULT_MODEL, ConnectionMode, WorkerIdentity, WorkerType
 
-    # Track which models have PD workers as their first requirement
+    # Track which models have disaggregated workers as their first requirement
     models_with_pd_first: set[str] = set()
     first_worker_type_per_model: dict[str, WorkerType] = {}
 
     for model_id, mode, worker_type in _first_seen_order:
         if model_id not in first_worker_type_per_model:
             first_worker_type_per_model[model_id] = worker_type
-            if worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
+            if worker_type in (
+                WorkerType.ENCODE,
+                WorkerType.PREFILL,
+                WorkerType.DECODE,
+            ):
                 models_with_pd_first.add(model_id)
                 logger.info(
-                    "Model %s has PD test first - skipping regular worker pre-launch",
+                    "Model %s has disaggregation test first - skipping regular worker pre-launch",
                     model_id,
                 )
 

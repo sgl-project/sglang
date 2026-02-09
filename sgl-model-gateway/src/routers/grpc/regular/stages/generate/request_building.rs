@@ -12,6 +12,7 @@ use crate::routers::{
         common::stages::{helpers, PipelineStage},
         context::{ClientSelection, RequestContext, WorkerSelection},
         proto_wrapper::ProtoGenerateRequest,
+        utils,
     },
 };
 
@@ -52,7 +53,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         let generate_request = ctx.generate_request_arc();
 
-        // Get client for building request (use prefill client if PD mode)
+        // Get client for building request (use upstream stage client for PD/EPD)
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
@@ -67,7 +68,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
         // Dispatch to the appropriate client based on backend type
         let mut proto_request = match builder_client {
             GrpcClient::Sglang(sglang_client) => {
-                let req = sglang_client
+                let mut req = sglang_client
                     .build_plain_generate_request(
                         request_id,
                         &generate_request,
@@ -78,6 +79,7 @@ impl PipelineStage for GenerateRequestBuildingStage {
                         error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
                         error::bad_request("build_request_failed", e)
                     })?;
+                req.mm_inputs = utils::build_multimodal_inputs_from_generate(&generate_request);
                 ProtoGenerateRequest::Sglang(Box::new(req))
             }
             GrpcClient::Vllm(vllm_client) => {
@@ -98,8 +100,18 @@ impl PipelineStage for GenerateRequestBuildingStage {
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
-            if let WorkerSelection::Dual { prefill, .. } = ctx.state.workers.as_ref().unwrap() {
-                helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
+            if let Some(prefill_worker) =
+                ctx.state
+                    .workers
+                    .as_ref()
+                    .and_then(|selection| match selection {
+                        WorkerSelection::Dual { prefill, .. } => Some(prefill),
+                        _ => None,
+                    })
+            {
+                // Inject PD bootstrap metadata for prefill->decode KV cache transfer.
+                // For EPD mode, encoder dispatch happens on prefill; bootstrap is prefill↔decode only.
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }
 

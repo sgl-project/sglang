@@ -14,6 +14,7 @@ class WorkerType(str, Enum):
     """Worker specialization type."""
 
     REGULAR = "regular"
+    ENCODE = "encode"
     PREFILL = "prefill"
     DECODE = "decode"
 
@@ -50,6 +51,7 @@ ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
 ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"
 ENV_SHOW_WORKER_LOGS = "SHOW_WORKER_LOGS"
+ENV_IB_DEVICE = "E2E_IB_DEVICE"
 
 # Network
 DEFAULT_HOST = "127.0.0.1"

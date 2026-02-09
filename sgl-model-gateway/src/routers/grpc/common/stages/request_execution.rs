@@ -244,40 +244,37 @@ impl RequestExecutionStage {
         workers.record_dual_outcomes(prefill_result.is_ok(), decode_result.is_ok());
 
         // Handle prefill result
-        let prefill_stream = match prefill_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch",
-                    error = %e,
-                    "Prefill worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "prefill_worker_failed_to_start",
-                    format!("Prefill worker failed to start: {}", e),
-                ));
-            }
-        };
+        let prefill_stream = prefill_result.map_err(|e| {
+            error!(
+                function = "execute_dual_dispatch",
+                error = %e,
+                "Prefill worker failed to start"
+            );
+            error::internal_error(
+                "prefill_worker_failed_to_start",
+                format!("Prefill worker failed to start: {}", e),
+            )
+        })?;
 
         // Handle decode result
-        let decode_stream = match decode_result {
-            Ok(s) => s,
-            Err(e) => {
-                error!(
-                    function = "execute_dual_dispatch",
-                    error = %e,
-                    "Decode worker failed to start"
-                );
-                return Err(error::internal_error(
-                    "decode_worker_failed_to_start",
-                    format!("Decode worker failed to start: {}", e),
-                ));
-            }
-        };
+        let decode_stream = decode_result.map_err(|e| {
+            error!(
+                function = "execute_dual_dispatch",
+                error = %e,
+                "Decode worker failed to start"
+            );
+            error::internal_error(
+                "decode_worker_failed_to_start",
+                format!("Decode worker failed to start: {}", e),
+            )
+        })?;
 
         Ok(ExecutionResult::Dual {
             prefill: prefill_stream,
             decode: Box::new(decode_stream),
         })
     }
+
+    // Intentionally no need_wait_for_encoder helper here:
+    // prefill gRPC server handles encoder dispatch and sets the flag internally.
 }
