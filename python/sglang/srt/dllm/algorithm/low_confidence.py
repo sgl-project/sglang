@@ -167,7 +167,7 @@ class LowConfidence(DllmAlgorithm):
                     mask_id=self.mask_id,
                     block_size=self.block_size,
                     threshold=self.threshold,
-                    finished=None,                 # 如果你有 finished mask，就传进来
+                    finished=None,
                     force_at_least_one=True,
                 )
                 continue

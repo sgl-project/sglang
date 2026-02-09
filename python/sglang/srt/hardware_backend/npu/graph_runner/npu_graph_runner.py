@@ -87,7 +87,6 @@ class NPUGraphRunner(CudaGraphRunner):
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
-                # AttentionArch.MHA: "context_lens",
             }
         else:
             self.attr_name: Dict[str, str] = {
