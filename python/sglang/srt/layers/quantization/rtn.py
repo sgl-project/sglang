@@ -3,13 +3,13 @@
 # Copyright © 2025, Oracle and/or its affiliates.
 
 import logging
-import os
 from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -41,12 +41,13 @@ from sglang.srt.utils import set_weight_attrs
 logger = logging.getLogger(__name__)
 
 
-# By default, use 8 bit as target precision, but it can be overridden by setting the RTN_NUM_BITS envvar
-NUM_BITS = os.getenv("RTN_NUM_BITS", "8")
+# By default, use 8 bit as target precision, but it can be overridden by
+# setting the SGLANG_RTN_NUM_BITS env var.
+NUM_BITS = envs.SGLANG_RTN_NUM_BITS.get()
 
-
-# By default, use group size of 128 parameters, but it can be overridden by setting the RTN_GROUP_SIZE envvar
-GROUP_SIZE = os.getenv("RTN_GROUP_SIZE", "128")
+# By default, use group size of 128 parameters, but it can be overridden by
+# setting the SGLANG_RTN_GROUP_SIZE env var.
+GROUP_SIZE = envs.SGLANG_RTN_GROUP_SIZE.get()
 
 ScalarType, scalar_types = get_scalar_types()
 
