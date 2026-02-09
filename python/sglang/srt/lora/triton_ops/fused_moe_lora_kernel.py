@@ -10,6 +10,8 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 
+from sglang.srt.utils.common import is_sm90_supported, is_blackwell_supported
+
 # Import SGLang's standard PDL support detection
 
 
@@ -98,7 +100,6 @@ def _fused_moe_lora_kernel(
     lora_idx = tl.program_id(axis=2)
     lora_id = tl.load(lora_ids + lora_idx)
 
-    USE_GDC = False  # TODO (Jonahcb): remove this
 
     if lora_id == -1:
         # Early exit for the no-lora case.
@@ -243,9 +244,7 @@ def _fused_moe_lora_shrink(
 ) -> None:
     w1_lora_a_stacked = lora_a_stacked[0]
 
-    # TODO (Jonahcb): investigate why relying on is_arch_support_pdl() is causing crash inside kernel
-    # use_gdc = is_arch_support_pdl()
-    use_gdc = False
+    use_gdc = (is_sm90_supported() or is_blackwell_supported())
     shrink_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
@@ -350,7 +349,7 @@ def _fused_moe_lora_expand(
         -1, a_intermediate_cache1.shape[3]
     )
 
-    use_gdc = is_arch_support_pdl()
+    use_gdc = (is_sm90_supported() or is_blackwell_supported())
     expand_config = {
         "BLOCK_SIZE_M": block_size_m,
         "BLOCK_SIZE_N": block_size_n,
