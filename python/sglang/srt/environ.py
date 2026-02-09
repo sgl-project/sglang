@@ -291,6 +291,8 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Forward native implementation for topk for model MiniMax-M2
+    SGLANG_NPU_FORWARD_NATIVE_TOPK = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -459,9 +461,6 @@ class Envs:
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
-
-    # Forward native implementation for topk for model MiniMax-M2
-    FORWARD_NATIVE_TOPK = EnvBool(False)
 
 
 envs = Envs()
