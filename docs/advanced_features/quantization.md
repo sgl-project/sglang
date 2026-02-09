@@ -247,9 +247,9 @@ If a pre-quantized checkpoint is not available for your model, you can create on
 
 **Key options in `hf_ptq.py`:**
 
-`--qformat` : Quantization formats `fp8`, `nvfp4`, `nvfp4_mlp_only`
+`--qformat`: Quantization formats `fp8`, `nvfp4`, `nvfp4_mlp_only`
 
-`--kv_cache_qformat` : KV cache quantization format (default: `fp8`)
+`--kv_cache_qformat`: KV cache quantization format (default: `fp8`)
 
 **Note:** The default `kv_cache_qformat` may not be optimal for all use cases. Consider setting this explicitly.
 
