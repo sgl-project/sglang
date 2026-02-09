@@ -57,6 +57,7 @@ class SchedulerMetricsMixin:
         self.kv_transfer_alloc_ms: float = 0.0
 
         self.stats = SchedulerStats()
+        self.stats.max_total_num_tokens = self.max_total_num_tokens
 
         if self.enable_metrics:
             engine_type = "unified"
@@ -161,7 +162,6 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs = running_bs
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
             self.stats.num_used_tokens = num_used
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
@@ -306,7 +306,6 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs = num_running_reqs
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
