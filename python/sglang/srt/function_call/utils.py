@@ -1,6 +1,6 @@
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -99,6 +99,109 @@ def _get_tool_schema(tool: Tool) -> dict:
         },
         "required": ["name", "parameters"],
     }
+
+
+def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+    """
+    Infer the primary type of a parameter from JSON Schema.
+
+    Supports complex JSON Schema structures including:
+    - Direct type field (including type arrays)
+    - anyOf/oneOf: parameter can be any of multiple types
+    - enum: parameter must be one of enum values
+    - allOf: parameter must satisfy all type definitions
+    - properties: inferred as object type
+    - items: inferred as array type
+
+    Args:
+        schema: JSON Schema definition
+
+    Returns:
+        Inferred type ('string', 'number', 'object', 'array', etc.) or None
+    """
+    if not isinstance(schema, dict):
+        return None
+
+    # Priority 1: Direct type field (including type arrays)
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            return type_value
+        elif isinstance(type_value, list) and type_value:
+            # Handle type arrays: return first non-null type
+            non_null_types = [t for t in type_value if t != "null"]
+            if non_null_types:
+                return non_null_types[0]
+            return "string"  # If only null, default to string
+
+    # Priority 2: Handle anyOf/oneOf
+    if "anyOf" in schema or "oneOf" in schema:
+        schemas = schema.get("anyOf") or schema.get("oneOf")
+        types = []
+
+        if isinstance(schemas, list):
+            for sub_schema in schemas:
+                inferred_type = infer_type_from_json_schema(sub_schema)
+                if inferred_type:
+                    types.append(inferred_type)
+
+            if types:
+                # If all types are the same, return unified type
+                if len(set(types)) == 1:
+                    return types[0]
+                # When types differ, prioritize string (safest)
+                if "string" in types:
+                    return "string"
+                # Otherwise return first type
+                return types[0]
+
+    # Priority 3: Handle enum (infer type from enum values)
+    if "enum" in schema and isinstance(schema["enum"], list):
+        if not schema["enum"]:
+            return "string"
+
+        # Infer type from enum values
+        enum_types = set()
+        for value in schema["enum"]:
+            if value is None:
+                enum_types.add("null")
+            elif isinstance(value, bool):
+                enum_types.add("boolean")
+            elif isinstance(value, int):
+                enum_types.add("integer")
+            elif isinstance(value, float):
+                enum_types.add("number")
+            elif isinstance(value, str):
+                enum_types.add("string")
+            elif isinstance(value, list):
+                enum_types.add("array")
+            elif isinstance(value, dict):
+                enum_types.add("object")
+
+        # If type is uniform, return that type
+        if len(enum_types) == 1:
+            return enum_types.pop()
+        # Mixed types, prioritize string
+        return "string"
+
+    # Priority 4: Handle allOf (must satisfy all types)
+    if "allOf" in schema and isinstance(schema["allOf"], list):
+        schemas = schema["allOf"]
+        for sub_schema in schemas:
+            inferred_type = infer_type_from_json_schema(sub_schema)
+            if inferred_type and inferred_type != "string":
+                return inferred_type
+        return "string"
+
+    # Priority 5: Infer object type
+    if "properties" in schema:
+        return "object"
+
+    # Priority 6: Infer array type
+    if "items" in schema:
+        return "array"
+
+    return None
 
 
 def get_json_schema_constraint(

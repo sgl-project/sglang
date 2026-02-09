@@ -34,6 +34,11 @@ import huggingface_hub
 import numpy as np
 import torch
 
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+    RemoteInstanceWeightLoaderBackend,
+    get_remote_instance_transfer_engine_info_per_rank,
+    register_memory_region,
+)
 from sglang.srt.server_args import get_global_server_args
 
 # Try to import accelerate (optional dependency)
@@ -84,12 +89,14 @@ from sglang.srt.environ import envs
 from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
     get_quant_config,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
+    maybe_add_mtp_safetensors,
     multi_thread_pt_weights_iterator,
     multi_thread_safetensors_weights_iterator,
     np_cache_weights_iterator,
@@ -252,6 +259,10 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping, remap_prefix
     )
+    hf_to_sglang_mapper = getattr(model_class, "hf_to_sglang_mapper", None)
+    # pass mappings by reference to quant_config
+    if hf_to_sglang_mapper is not None and quant_config is not None:
+        quant_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
     # Build kwargs conditionally
     kwargs = {
@@ -261,8 +272,11 @@ def _initialize_model(
 
     # Only add sparse head kwargs if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
     if envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
-        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.value
+        kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
+
+    if load_config.draft_model_idx is not None:
+        kwargs["draft_model_idx"] = load_config.draft_model_idx
 
     return model_class(**kwargs)
 
@@ -311,6 +325,9 @@ class DefaultModelLoader(BaseModelLoader):
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
 
+        model_config: Optional["ModelConfig"] = None
+        """The model configuration (for checking architecture, etc)."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -318,7 +335,11 @@ class DefaultModelLoader(BaseModelLoader):
                 model_config.revision,
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
+                model_config=model_config,
             )
+
+    counter_before_loading_weights: float = 0.0
+    counter_after_loading_weights: float = 0.0
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -377,7 +398,10 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format == LoadFormat.SAFETENSORS:
+        elif (
+            load_format == LoadFormat.SAFETENSORS
+            or load_format == LoadFormat.FASTSAFETENSORS
+        ):
             use_safetensors = True
             allow_patterns = ["*.safetensors"]
         elif load_format == LoadFormat.MISTRAL:
@@ -408,6 +432,13 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        server_args = get_global_server_args()
+        if server_args and server_args.model_checksum is not None:
+            from sglang.srt.utils.model_file_verifier import verify
+
+            checksums_source = server_args.model_checksum or model_name_or_path
+            verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:
@@ -451,6 +482,15 @@ class DefaultModelLoader(BaseModelLoader):
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
+
+        if use_safetensors and source.model_config is not None:
+            hf_weights_files = maybe_add_mtp_safetensors(
+                hf_weights_files,
+                hf_folder,
+                "model.safetensors.index.json",
+                source.model_config.hf_config,
+            )
+
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -465,7 +505,11 @@ class DefaultModelLoader(BaseModelLoader):
                 get_global_server_args().weight_loader_disable_mmap
             )
 
-            if extra_config.get("enable_multithread_load"):
+            if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                weights_iterator = fastsafetensors_weights_iterator(
+                    hf_weights_files,
+                )
+            elif extra_config.get("enable_multithread_load"):
                 weights_iterator = multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -489,6 +533,26 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
+        if self.load_config.draft_model_idx is not None:
+            import re
+
+            pattern = r"model.mtp.layers.(\d+)."
+            filtered_weights = []
+            for name, tensor in weights_iterator:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx != self.load_config.draft_model_idx:
+                        continue
+                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                filtered_weights.append((source.prefix + new_name, tensor))
+            return tuple(filtered_weights)
+
+        if self.counter_before_loading_weights == 0.0:
+            logger.info("Beginning to load weights")
+            self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -525,7 +589,9 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         hf_config = AutoConfig.from_pretrained(
-            model_config.model_path, trust_remote_code=True
+            model_config.model_path,
+            trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         with init_empty_weights():
             torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
@@ -558,6 +624,7 @@ class DefaultModelLoader(BaseModelLoader):
             device_map=device_map,
             **model_kwargs,
             trust_remote_code=True,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         # Handle both legacy modelopt_quant and unified quantization flags
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
@@ -605,6 +672,11 @@ class DefaultModelLoader(BaseModelLoader):
                 model, self._get_all_weights(model_config, model), target_device
             )
 
+        self.counter_after_loading_weights = time.perf_counter()
+        logger.info(
+            "Loading weights took %.2f seconds",
+            self.counter_after_loading_weights - self.counter_before_loading_weights,
+        )
         return model.eval()
 
     @staticmethod
@@ -1206,6 +1278,12 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
+                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
+                    if (
+                        hasattr(module, "is_weights_quantized")
+                        and module.is_weights_quantized()
+                    ):
+                        continue
                     quant_method.process_weights_after_loading(module)
 
             # NOTE(woosuk): For accurate performance evaluation, we assign
@@ -1987,6 +2065,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
             )
+        self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
@@ -2005,16 +2084,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             f"load format {load_config.load_format}"
         )
 
-        model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
-
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config)
 
+        if (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.NCCL
+        ):
+            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
             with create_remote_connector(model_weights, device_config.device) as client:
                 connector_type = get_connector_type(client)
                 if connector_type == ConnectorType.INSTANCE:
-                    self.load_model_from_remote_instance(
+                    self.load_model_from_remote_instance_by_nccl(
                         model, client, model_config, device_config
                     )
                 else:
@@ -2022,9 +2104,43 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                         f"Unsupported connector type {connector_type} for "
                         f"remote tensor model loading."
                     )
+        elif (
+            load_config.remote_instance_weight_loader_backend
+            == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+        ):
+            if load_config.remote_instance_weight_loader_transfer_engine is None:
+                raise RuntimeError(
+                    "Transfer engine is not initialized for remote instance "
+                    "model loader with `transfer_engine` backend. "
+                )
+            logger.info(
+                "TransferEngine registering memory regions (this may take a few seconds)..."
+            )
+            # register memory region
+            self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                model, load_config.remote_instance_weight_loader_transfer_engine
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
+            )
+
+            # transfer weights
+            success = self.load_model_from_remote_instance_by_transfer_engine(
+                model,
+                load_config.remote_instance_weight_loader_transfer_engine,
+                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+                load_config.tp_rank,
+            )
+            if not success:
+                raise RuntimeError(
+                    "Failed to load weights from remote instance via transfer engine."
+                )
+        else:
+            raise ValueError("Invalid remote instance weight loader backend.")
+
         return model.eval()
 
-    def load_model_from_remote_instance(
+    def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
         load_config = self.load_config
@@ -2074,6 +2190,63 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client._model_update_group
         )
         torch.cuda.empty_cache()
+
+    def load_model_from_remote_instance_by_transfer_engine(
+        self, model, transfer_engine, seed_url, tp_rank
+    ) -> bool:
+        # get remote weights metadata from source instance
+        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
+        )
+        if (
+            seed_transfer_engine_session_id is None
+            or seed_transfer_engine_weight_info is None
+        ):
+            logger.error("Cannot get transfer engine session or weight info.")
+            return False
+
+        # prepare local/remote RDMA keys
+        seed_ptr_list = []
+        client_ptr_list = []
+        client_len_list = []
+        for name, tensor in model.named_parameters():
+            weight_info = seed_transfer_engine_weight_info.get(name, None)
+            if weight_info is None:
+                logger.error(f"Cannot find weight info for {name}.")
+                return False
+
+            seed_ptr, seed_numel, seed_element_size = weight_info
+            if (
+                seed_numel != tensor.numel()
+                or seed_element_size != tensor.element_size()
+            ):
+                logger.error(
+                    f"Weight info does not match for {name}, "
+                    f"expected ({seed_numel}, {seed_element_size}), "
+                    f"got ({tensor.numel()}, {tensor.element_size()})"
+                )
+                return False
+            client_ptr = tensor.data_ptr()
+            client_len = tensor.numel() * tensor.element_size()
+            seed_ptr_list.append(seed_ptr)
+            client_ptr_list.append(client_ptr)
+            client_len_list.append(client_len)
+
+        # load weights from source instance through TransferEngine
+        ret = transfer_engine.batch_transfer_sync_read(
+            seed_transfer_engine_session_id,
+            client_ptr_list,
+            seed_ptr_list,
+            client_len_list,
+        )
+        if ret < 0:
+            logger.error(f"batch transfer failed, error: {ret}")
+            return False
+
+        if hasattr(model, "post_load_weights"):
+            model.post_load_weights()
+
+        return True
 
 
 class RemoteModelLoader(BaseModelLoader):

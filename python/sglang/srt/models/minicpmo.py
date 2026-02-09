@@ -1668,6 +1668,24 @@ class MiniCPMO(MiniCPMBaseModel):
             [item.audio_feature_lens for item in items if item.audio_feature_lens]
         )
 
+        # Ensure audio_feature_lens_raw is properly formatted as [[tensor], [tensor], ...]
+        if audio_feature_lens_raw:
+            if isinstance(audio_feature_lens_raw[0], torch.Tensor):
+                # Flat list of tensors, wrap each in a list
+                audio_feature_lens_raw = [[lens] for lens in audio_feature_lens_raw]
+            elif isinstance(audio_feature_lens_raw[0], list):
+                # Already nested, ensure all elements are properly formatted
+                # Flatten if needed
+                flattened = []
+                for item in audio_feature_lens_raw:
+                    if isinstance(item, list):
+                        flattened.extend(item)
+                    else:
+                        flattened.append(item)
+                audio_feature_lens_raw = [
+                    [item] if not isinstance(item, list) else item for item in flattened
+                ]
+
         final_audio_embeds = []
 
         assert isinstance(wavforms, list)
@@ -1675,7 +1693,14 @@ class MiniCPMO(MiniCPMBaseModel):
         # exist audio
         for wavform in wavforms:
             if len(wavform) > 0:
-                audio_feature_lens = torch.hstack(audio_feature_lens_raw)
+                # Flatten audio_feature_lens_raw to get a list of tensors
+                flattened_lens = []
+                for item in audio_feature_lens_raw:
+                    if isinstance(item, list):
+                        flattened_lens.extend(item)
+                    else:
+                        flattened_lens.append(item)
+                audio_feature_lens = torch.hstack(flattened_lens)
                 batch_size, _, max_mel_seq_len = wavform.shape
                 max_seq_len = (max_mel_seq_len - 1) // 2 + 1
 

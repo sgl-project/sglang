@@ -89,8 +89,15 @@ class SamplingBatchInfo:
         )
         sampling_seed = (
             torch.tensor(
-                [r.sampling_params.sampling_seed for r in reqs],
-                dtype=torch.int32,
+                [
+                    (
+                        r.sampling_params.sampling_seed
+                        if r.sampling_params.sampling_seed is not None
+                        else 42
+                    )
+                    for r in reqs
+                ],
+                dtype=torch.int64,
                 device=device,
             )
             if enable_deterministic
@@ -173,7 +180,16 @@ class SamplingBatchInfo:
             device=device,
             logit_bias=logit_bias,
         )
+        ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
+
+    # placeholder for override
+    def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
+        pass
+
+    # placeholder for override
+    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
+        pass
 
     def __len__(self):
         return len(self.temperatures)
@@ -359,6 +375,8 @@ class SamplingBatchInfo:
         self.need_top_p_sampling |= other.need_top_p_sampling
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
+
+        self.adjusted_merge_batch(other)
 
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later

@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 
+from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -23,7 +25,7 @@ logger = logging.getLogger(__name__)
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
-    next_token_ids: Optional[torch.Tensor] = None
+    next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
@@ -43,6 +45,9 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # metrics
+    expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
@@ -66,6 +71,9 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+
+        if (x := self.expert_distribution_metrics) is not None:
+            x.copy_to_cpu()
 
         self.copy_done.record()
 
@@ -169,3 +177,30 @@ def get_logprob_from_pp_outputs(
     ]
 
     return logits_output, extend_input_len_per_req, extend_logprob_start_len_per_req
+
+
+def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
+    if server_args is None:
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+
+    if server_args.speculative_algorithm is None:
+        return 1
+
+    # Spec v1:
+    # 1) alloc topk * num_steps when draft decoding and then restore the allocation
+    # 2) alloc num_draft_tokens when verifying the drafts
+    # Sepc v2: allocate max(topk * num_steps, num_draft_tokens)
+
+    spec_steps = server_args.speculative_num_steps or 1
+    spec_topk = server_args.speculative_eagle_topk or 1
+    spec_tokens = server_args.speculative_num_draft_tokens
+    page_size = server_args.page_size
+
+    if page_size == 1 or spec_topk == 1:
+        return max(spec_steps * spec_topk, spec_tokens)
+    else:
+        raise NotImplementedError(
+            "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
+        )

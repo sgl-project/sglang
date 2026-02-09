@@ -10,6 +10,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
+if _is_cuda or _is_hip:
+    from sgl_kernel import silu_and_mul
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
@@ -28,8 +34,12 @@ class SiluAndMul(CustomOp):
     def __init__(self) -> None:
         super().__init__()
 
-    def forward_cuda(self, *args, **kwargs) -> Any:
-        return self.forward_native(*args, **kwargs)
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        silu_and_mul(x, out)
+        return out
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""

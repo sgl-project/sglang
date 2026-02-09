@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
-    observability::metrics::{smg_labels, SmgMetrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
@@ -105,7 +105,7 @@ impl ToolCallMode {
 ///
 /// Returns an SSE stream that parses Harmony tokens incrementally and
 /// emits ChatCompletionChunk events for streaming responses.
-pub struct HarmonyStreamingProcessor;
+pub(crate) struct HarmonyStreamingProcessor;
 
 impl HarmonyStreamingProcessor {
     /// Create a new Harmony streaming processor
@@ -116,6 +116,9 @@ impl HarmonyStreamingProcessor {
     /// Process a streaming Harmony Chat Completion response
     ///
     /// Returns an SSE response with streaming token updates.
+    ///
+    /// Note: Caller should attach load guards to the returned response using
+    /// `WorkerLoadGuard::attach_to_response()` for proper RAII lifecycle management.
     pub fn process_streaming_chat_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
@@ -171,6 +174,19 @@ impl HarmonyStreamingProcessor {
 
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                error!("Harmony streaming not supported for embeddings");
+                let error_chunk = format!(
+                    "data: {}\n\n",
+                    json!({
+                        "error": {
+                            "message": "Embeddings not supported in Harmony streaming",
+                            "type": "invalid_request_error"
+                        }
+                    })
+                );
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
             }
         }
 
@@ -315,11 +331,11 @@ impl HarmonyStreamingProcessor {
         grpc_stream.mark_completed();
 
         // Record streaming metrics
-        SmgMetrics::record_streaming_metrics(StreamingMetricsParams {
-            router_type: smg_labels::ROUTER_GRPC,
-            backend_type: smg_labels::BACKEND_HARMONY,
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
-            endpoint: smg_labels::ENDPOINT_CHAT,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
             input_tokens: Some(total_prompt as u64),
@@ -474,11 +490,11 @@ impl HarmonyStreamingProcessor {
         }
 
         // Record streaming metrics
-        SmgMetrics::record_streaming_metrics(StreamingMetricsParams {
-            router_type: smg_labels::ROUTER_GRPC,
-            backend_type: smg_labels::BACKEND_HARMONY,
+        Metrics::record_streaming_metrics(StreamingMetricsParams {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
-            endpoint: smg_labels::ENDPOINT_CHAT,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: first_token_time.map(|t| t.duration_since(start_time)),
             generation_duration: start_time.elapsed(),
             input_tokens: Some(total_prompt as u64),
@@ -640,6 +656,9 @@ impl HarmonyStreamingProcessor {
                     mcp_tool_names,
                 )
                 .await
+            }
+            context::ExecutionResult::Embedding { .. } => {
+                Err("Embeddings not supported in Responses API streaming".to_string())
             }
         }
     }
@@ -805,7 +824,7 @@ impl HarmonyStreamingProcessor {
                             let call_index = tc_delta.index;
 
                             // Check if this is a new tool call (has id and name)
-                            if tc_delta.id.is_some() {
+                            if let Some(call_id) = &tc_delta.id {
                                 // Get tool name first to determine mode
                                 let tool_name = tc_delta
                                     .function
@@ -836,7 +855,6 @@ impl HarmonyStreamingProcessor {
                                     .insert(call_index, (output_index, item_id.clone(), tool_mode));
 
                                 // Emit output_item.added wrapper event
-                                let call_id = tc_delta.id.as_ref().unwrap();
                                 let mut item = json!({
                                     "id": item_id,
                                     "type": tool_mode.type_str(),
