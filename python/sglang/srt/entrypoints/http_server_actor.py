@@ -29,13 +29,23 @@ Usage:
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import ray
+
+if TYPE_CHECKING:
+    from multiprocessing.context import SpawnProcess
+
+    from ray.actor import ActorHandle
+    from ray.util.placement_group import PlacementGroup
 
 logger = logging.getLogger(__name__)
 
 
-def _run_http_server(server_kwargs, placement_groups=None):
+def _run_http_server(
+    server_kwargs: Dict[str, Any],
+    placement_groups: List[PlacementGroup],
+) -> None:
     """Module-level function for subprocess (picklable). Runs on ray worker."""
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.server_args import ServerArgs
@@ -48,14 +58,16 @@ def _run_http_server(server_kwargs, placement_groups=None):
 class _InternalHttpServerActor:
     """Internal Ray actor that runs SGLang HTTP server in a subprocess."""
 
-    def __init__(self, **server_kwargs):
+    def __init__(self, **server_kwargs: Any) -> None:
         import multiprocessing as mp
 
-        self._pgs = server_kwargs.pop("_ray_placement_groups", None)
-        self.port = server_kwargs.get("port", 30000)
-        self.node_ip = ray.util.get_node_ip_address()
+        self._pgs: List[PlacementGroup] = server_kwargs.pop(
+            "_ray_placement_groups"
+        )
+        self.port: int = server_kwargs.get("port", 30000)
+        self.node_ip: str = ray.util.get_node_ip_address()
         ctx = mp.get_context("spawn")
-        self._server_process = ctx.Process(
+        self._server_process: SpawnProcess = ctx.Process(
             target=_run_http_server,
             args=(server_kwargs, self._pgs),
             daemon=False,
@@ -107,7 +119,7 @@ class _InternalHttpServerActor:
         """Check if server process is running."""
         return self._server_process is not None and self._server_process.is_alive()
 
-    def get_status(self) -> dict:
+    def get_status(self) -> Dict[str, Union[str, bool]]:
         """Get server status in a single RPC call."""
         return {
             "url": self.get_url(),
@@ -115,7 +127,7 @@ class _InternalHttpServerActor:
             "alive": self.is_alive(),
         }
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Shutdown the server."""
         if self._server_process is not None and self._server_process.is_alive():
             logger.info("Shutting down HTTP server...")
@@ -134,19 +146,19 @@ class HttpServerActor:
     Safe to import and instantiate on CPU-only head nodes.
     """
 
-    def __init__(self, **server_kwargs):
+    def __init__(self, **server_kwargs: Any) -> None:
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         from sglang.srt.utils.ray_utils import create_placement_groups
 
-        pgs = create_placement_groups(
+        pgs: List[PlacementGroup] = create_placement_groups(
             tp_size=server_kwargs.get("tp_size", 1),
             pp_size=server_kwargs.get("pp_size", 1),
             nnodes=server_kwargs.get("nnodes", 1),
         )
-        self._placement_groups = pgs
+        self._placement_groups: List[PlacementGroup] = pgs
 
-        self._actor = _InternalHttpServerActor.options(
+        self._actor: Optional[ActorHandle] = _InternalHttpServerActor.options(
             num_cpus=0,
             num_gpus=0,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -155,16 +167,16 @@ class HttpServerActor:
             ),
         ).remote(_ray_placement_groups=pgs, **server_kwargs)
 
-    def wait_until_ready(self, timeout=600) -> bool:
+    def wait_until_ready(self, timeout: int = 600) -> bool:
         return ray.get(self._actor.wait_until_ready.remote(timeout))
 
     def get_url(self) -> str:
         return ray.get(self._actor.get_url.remote())
 
-    def get_status(self) -> dict:
+    def get_status(self) -> Dict[str, Union[str, bool]]:
         return ray.get(self._actor.get_status.remote())
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if self._actor is not None:
             ray.get(self._actor.shutdown.remote())
             self._actor = None
@@ -174,4 +186,4 @@ class HttpServerActor:
                     ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
-            self._placement_groups = None
+            self._placement_groups = []

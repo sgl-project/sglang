@@ -26,35 +26,52 @@ Usage:
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
+
 import ray
+
+if TYPE_CHECKING:
+    from ray.actor import ActorHandle
+    from ray.util.placement_group import PlacementGroup
+
+    from sglang.srt.entrypoints.engine import Engine
+
+logger = logging.getLogger(__name__)
 
 
 @ray.remote
 class _InternalEngineActor:
     """Internal Ray actor that runs sglang.Engine on a GPU worker node."""
 
-    def __init__(self, **engine_kwargs):
+    def __init__(self, **engine_kwargs: Any) -> None:
         from sglang import Engine
 
         pgs = engine_kwargs.pop("_ray_placement_groups", None)
-        self.engine = Engine(_ray_placement_groups=pgs, **engine_kwargs)
+        self.engine: Optional[Engine] = Engine(
+            _ray_placement_groups=pgs, **engine_kwargs
+        )
 
     def is_ready(self) -> bool:
         return self.engine is not None
 
-    def generate(self, **kwargs):
+    def generate(self, **kwargs: Any) -> Union[Dict, Iterator[Dict]]:
         return self.engine.generate(**kwargs)
 
-    def encode(self, prompt, **kwargs):
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        **kwargs: Any,
+    ) -> Dict:
         return self.engine.encode(prompt=prompt, **kwargs)
 
-    def get_server_info(self):
+    def get_server_info(self) -> Dict[str, Any]:
         return self.engine.get_server_info()
 
-    def flush_cache(self):
+    def flush_cache(self) -> None:
         return self.engine.flush_cache()
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if self.engine is not None:
             self.engine.shutdown()
             self.engine = None
@@ -67,19 +84,19 @@ class EngineActor:
     Does NOT import sglang - all sglang code runs on GPU workers.
     """
 
-    def __init__(self, **engine_kwargs):
+    def __init__(self, **engine_kwargs: Any) -> None:
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
         from sglang.srt.utils.ray_utils import create_placement_groups
 
-        pgs = create_placement_groups(
+        pgs: List[PlacementGroup] = create_placement_groups(
             tp_size=engine_kwargs.get("tp_size", 1),
             pp_size=engine_kwargs.get("pp_size", 1),
             nnodes=engine_kwargs.get("nnodes", 1),
         )
 
         # Launch internal actor on rank 0's node (co-location for ZMQ IPC)
-        self._actor = _InternalEngineActor.options(
+        self._actor: Optional[ActorHandle] = _InternalEngineActor.options(
             num_cpus=0,
             num_gpus=0,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
@@ -91,19 +108,23 @@ class EngineActor:
         # Wait for engine to initialize
         ray.get(self._actor.is_ready.remote())
 
-    def generate(self, **kwargs):
+    def generate(self, **kwargs: Any) -> Union[Dict, Iterator[Dict]]:
         return ray.get(self._actor.generate.remote(**kwargs))
 
-    def encode(self, prompt, **kwargs):
+    def encode(
+        self,
+        prompt: Union[str, List[str], List[Dict], List[List[Dict]]],
+        **kwargs: Any,
+    ) -> Dict:
         return ray.get(self._actor.encode.remote(prompt=prompt, **kwargs))
 
-    def get_server_info(self):
+    def get_server_info(self) -> Dict[str, Any]:
         return ray.get(self._actor.get_server_info.remote())
 
-    def flush_cache(self):
+    def flush_cache(self) -> None:
         return ray.get(self._actor.flush_cache.remote())
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if self._actor is not None:
             ray.get(self._actor.shutdown.remote())
             self._actor = None
