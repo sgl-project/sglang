@@ -69,7 +69,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     grammar: BaseGrammarObject = None
 
     # Shape info for padding
-    num_tokens_per_batch: int = -1
+    num_tokens_per_req: int = -1
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
@@ -634,8 +634,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     kv_indices: torch.Tensor = None
 
     # Shape info for padding
-    num_tokens_per_batch: int = -1
-    num_tokens_for_logprob_per_batch: int = -1
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = -1
 
     # Inputs for draft extend
     # shape: (b,)
@@ -652,7 +652,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         super().__init__(SpecInputType.EAGLE_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        return self.num_tokens_per_batch, self.num_tokens_for_logprob_per_batch
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
 
     def prepare_for_extend(self, batch: ScheduleBatch):
 
