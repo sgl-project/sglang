@@ -104,9 +104,6 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         
         hidden_states = self.fc(hidden_states)
         residual = None
-        # else:
-        #     # For pipeline parallel, hidden_states and residual are passed from previous stage
-        #     residual = None
 
         if self.num_mtp_layers == 1:
             hidden_states, residual = self.layers[0](
