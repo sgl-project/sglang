@@ -50,6 +50,8 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AbortReqACK,
     BatchFinishReqACK,
+    RetrieveTokenBackupReq,
+    RetrieveTokenBackupRes,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
@@ -478,6 +480,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 (HealthCheckOutput, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (BatchFinishReqACK, self.handle_batch_finish_req),
+                (RetrieveTokenBackupReq, self.handle_token_backup_req),
             ]
         )
         self.init_communicators(self.server_args)
@@ -2172,6 +2175,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
     # [Failover] Forward finish signal to DP Controller
     def handle_batch_finish_req(self, req: BatchFinishReqACK):
         self.send_to_scheduler.send_pyobj(req)
+
+    # [Failover] Retrieve backup tokens for recovery
+    def handle_token_backup_req(self, req: RetrieveTokenBackupReq):
+        token_ids = {}
+        for rid in req.rids:
+            if rid in self.rid_to_state:
+                state = self.rid_to_state[rid]
+                token_ids[rid] = list(state.output_ids)
+            else:
+                # If RID is missing, it implies the request has finished and state was deleted.
+                # We return None to signal "Finished/Not Found" to the Controller.
+                token_ids[rid] = None
+
+        # Send response to Controller (who listens on scheduler input port)
+        try:
+            self.send_to_scheduler.send_pyobj(RetrieveTokenBackupRes(token_ids=token_ids))
+        except Exception as e:
+            logger.error(f"[Failover] Failed to send backup tokens: {e}")
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
