@@ -530,6 +530,7 @@ class Req:
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_step_maps: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -693,6 +694,9 @@ class Req:
         self.temp_scaled_logprobs = False
         self.top_p_normalized_logprobs = False
 
+        # Diffusion LLM step maps
+        self.return_step_maps = return_step_maps
+
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False
@@ -739,6 +743,9 @@ class Req:
         )
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
+
+        # Diffusion LLM step maps
+        self.step_maps: Optional[List[torch.Tensor]] = None
 
         # Embedding (return values)
         self.embedding = None
@@ -1372,6 +1379,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
+    return_step_maps: bool = False
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -1389,6 +1397,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req: Optional[Req] = None,
         dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
+        return_step_maps: bool = False,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1415,6 +1424,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
+            return_step_maps=any(req.return_step_maps for req in reqs)
+            or return_step_maps,
         )
 
     def batch_size(self):
@@ -2286,6 +2297,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            return_step_maps=self.return_step_maps,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
@@ -2472,6 +2484,9 @@ class ModelWorkerBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+
+    # For diffusion LLM step maps
+    return_step_maps: bool = False
 
     # For mamba state tracking
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
