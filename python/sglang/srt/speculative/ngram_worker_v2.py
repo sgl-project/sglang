@@ -63,16 +63,6 @@ class NGRAMWorkerV2(NGRAMWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
-        prev_token_ids, prev_accept_lens = (
-            batch.spec_info.verified_tokens,
-            batch.spec_info.accept_lens,
-        )
-        if not prev_token_ids.is_cpu:
-            prev_token_ids = prev_token_ids.cpu()
-            prev_accept_lens = prev_accept_lens.cpu()
-        self.prev_token_ids = prev_token_ids.tolist()
-        self.prev_accept_lens = prev_accept_lens.tolist()
-
         self.ngram_cache.synchronize()
         batch_tokens = []
         assert len(batch.reqs) == len(self.prev_accept_lens)
@@ -174,9 +164,41 @@ class NGRAMWorkerV2(NGRAMWorker):
             is_spec_v2=True,
         )
 
+    def _update_verified_tokens_to_ngram_cache(self, batch: ModelWorkerBatch):
+        if batch.forward_mode.is_extend():
+            return
+
+        prev_token_ids, prev_accept_lens = (
+            batch.spec_info.verified_tokens,
+            batch.spec_info.accept_lens,
+        )
+        if not prev_token_ids.is_cpu:
+            prev_token_ids = prev_token_ids.cpu()
+            prev_accept_lens = prev_accept_lens.cpu()
+        self.prev_token_ids = prev_token_ids.tolist()
+        self.prev_accept_lens = prev_accept_lens.tolist()
+
+        stride = self.draft_token_num
+        i = 0
+        batch_tokens = []
+        for req in batch.reqs:
+            prev_tokens = self.prev_token_ids[
+                i * stride : i * stride + self.prev_accept_lens[i]
+            ]
+            # insert the verified tokens and at least insert 2 tokens to make sure the insertion succeeds.
+            put_ids = self._efficient_concat_last_n(
+                req.origin_input_ids,
+                req.output_ids + prev_tokens,
+                min(max(2, len(prev_tokens)), self.branch_length),
+            )
+            batch_tokens.append(put_ids)
+            i += 1
+        self.ngram_cache.batch_put(batch_tokens)
+
     def forward_batch_generation(
         self, model_worker_batch: ModelWorkerBatch
     ) -> GenerationBatchResult:
+        self._update_verified_tokens_to_ngram_cache(model_worker_batch)
         model_worker_batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
