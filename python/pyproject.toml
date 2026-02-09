@@ -21,7 +21,7 @@ dependencies = [
   "anthropic>=0.20.0",
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
-  "build",    
+  "build",
   "compressed-tensors",
   "cuda-python==12.9",
   "decord2",
