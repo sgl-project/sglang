@@ -30,6 +30,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ✅              | ❌              | ❌                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
 | **Intel AMX (CPU)**             | ❌                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
+| **HPC**                         | 64                            | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
 
 ### MLA Backends
 
@@ -260,6 +261,22 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend torch_native
+```
+
+- HPC (SM90 GPUs, e.g., H20)
+
+```{note}
+The HPC attention backend requires the external `hpc` package, which is not included in the default SGLang installation. Install it follow the [hpc-ops README.md](https://github.com/Tencent/hpc-ops/blob/main/README.md). It requires `--page-size 64` and only supports MHA models with specific configurations, you should check accuracy first to ensure it can run correctly with specific model. It does not support MLA or encoder-decoder models.
+If you find your model can not run correctly when using hpc as the decode attention backend, you should only use it for prefill phase.
+```
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path /models/Qwen3-235B-A22B --tp 8 \
+  --host 0.0.0.0 --port 8080 \
+  --attention-backend hpc \
+  --page-size 64   --mem-fraction-static 0.9 \
+  --disable-radix-cache  --disable-cuda-graph
 ```
 
 ## Steps to add a new attention backend
