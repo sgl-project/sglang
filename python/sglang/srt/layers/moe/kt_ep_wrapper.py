@@ -152,7 +152,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.gpu_method = gpu_method
         self.kt_config = kt_config
         self.gpu_experts_mask = kt_config.gpu_experts_mask
-        self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
+        self.num_gpu_experts = int(self.gpu_experts_mask.sum().item()) if self.gpu_experts_mask is not None else 0
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
