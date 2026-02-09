@@ -40,7 +40,6 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
     Hunyuan3DPlainDiTConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.encoders.hunyuan3d import (
     get_1d_sincos_pos_embed_from_grid,
@@ -870,6 +869,15 @@ def _flux_timestep_embedding(
     return embedding
 
 
+class _FluxGELU(nn.Module):
+    def __init__(self, approximate="tanh"):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.gelu(x, approximate=self.approximate)
+
+
 class _FluxMLPEmbedder(nn.Module):
     def __init__(self, in_dim: int, hidden_dim: int):
         super().__init__()
@@ -881,11 +889,23 @@ class _FluxMLPEmbedder(nn.Module):
         return self.out_layer(self.silu(self.in_layer(x)))
 
 
+class _FluxRMSNorm(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor):
+        x_dtype = x.dtype
+        x = x.float()
+        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+        return (x * rrms).to(dtype=x_dtype) * self.scale
+
+
 class _FluxQKNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.query_norm = RMSNorm(dim)
-        self.key_norm = RMSNorm(dim)
+        self.query_norm = _FluxRMSNorm(dim)
+        self.key_norm = _FluxRMSNorm(dim)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -992,7 +1012,7 @@ class _FluxDoubleStreamBlock(nn.Module):
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.img_mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
+            _FluxGELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
@@ -1008,7 +1028,7 @@ class _FluxDoubleStreamBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.txt_mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            nn.GELU(approximate="tanh"),
+            _FluxGELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
@@ -1108,7 +1128,7 @@ class _FluxSingleStreamBlock(nn.Module):
         self.hidden_size = hidden_size
         self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
 
-        self.mlp_act = nn.GELU(approximate="tanh")
+        self.mlp_act = _FluxGELU(approximate="tanh")
         self.modulation = _FluxModulation(hidden_size, double=False)
 
         if supported_attention_backends is None:
@@ -1173,9 +1193,7 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
 
-    param_names_mapping = {
-        r"(.+(?:query_norm|key_norm))\.scale$": r"\1.weight",
-    }
+    param_names_mapping = {}
 
     @classmethod
     def build_config_from_params(cls, params: dict) -> Hunyuan3DDiTConfig:
