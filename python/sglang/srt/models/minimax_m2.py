@@ -16,6 +16,7 @@
 """Inference-only MiniMax M2 model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import nullcontext
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -166,7 +167,14 @@ def rms_sumsq_serial(x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
     stride_x1 = x1.stride(0)
     stride_x2 = x2.stride(0)
 
-    sum_sq = torch.empty(B + B2, device=x1.device, dtype=torch.float32)
+    # We found that custom all-reduce `sglang::cross_device_reduce_1stage`
+    # is much faster than the nccl all-reduce in torch.
+    # However, `should_custom_ar` checks if the reduced buffer is 16-byte aligned.
+    # RMSNormTP reduces a [B, 2] fp32 tensor, so we pad the total element count to
+    # satisfy the alignment requirement.
+    B_padded = (B + B2 + 3) // 4 * 4
+
+    sum_sq = torch.empty(B_padded, device=x1.device, dtype=torch.float32)
 
     BLOCK_SIZE1 = triton.next_power_of_2(D1)
     BLOCK_SIZE2 = triton.next_power_of_2(D2)
@@ -285,7 +293,6 @@ class MiniMaxM2RMSNormTP(nn.Module):
         return x
 
     @staticmethod
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
     def forward_qk(
         q_norm: "MiniMaxM2RMSNormTP",
         k_norm: "MiniMaxM2RMSNormTP",
@@ -436,9 +443,14 @@ class MiniMaxM2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                )
+            )
+            with ctx:
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
@@ -469,9 +481,14 @@ class MiniMaxM2MoE(nn.Module):
     def op_dispatch_b(self, state):
         """Dispatch B operation for TBO - complete async dispatch"""
         if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
-                self.layer_id
-            ):
+            ctx = (
+                nullcontext()
+                if get_global_server_args().enable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(
+                    self.layer_id
+                )
+            )
+            with ctx:
                 state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
                     tbo_subbatch_index=state.get("tbo_subbatch_index"),
                 )
@@ -890,7 +907,12 @@ class MiniMaxM2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
-                with get_global_expert_distribution_recorder().with_current_layer(i):
+                ctx = (
+                    nullcontext()
+                    if get_global_server_args().enable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
                     if i in self.layers_to_capture:
                         aux_hidden_states.append(hidden_states + residual)
                     layer = self.layers[i]
