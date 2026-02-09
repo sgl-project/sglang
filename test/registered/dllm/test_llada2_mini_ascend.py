@@ -6,7 +6,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -40,7 +39,7 @@ class TestLLaDA2Mini(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=3600,  # downloading model takes time, may change back to DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH after caching the model locally
             other_args=other_args,
         )
 
