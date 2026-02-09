@@ -84,7 +84,7 @@ def create_kt_config_from_server_args(
 
     return KTConfig(
         layer_idx=layer_idx,
-        gpu_experts_mask=torch.tensor(server_args.kt_gpu_experts_mask),
+        gpu_experts_mask=torch.tensor(server_args.kt_gpu_experts_mask) if server_args.kt_gpu_experts_mask is not None else None,
         cpuinfer_threads=server_args.kt_cpuinfer,
         threadpool_count=server_args.kt_threadpool_count,
         weight_path=server_args.kt_weight_path,
