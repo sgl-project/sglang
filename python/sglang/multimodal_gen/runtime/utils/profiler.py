@@ -33,7 +33,11 @@ class SGLDiffusionProfiler:
         self.rank = rank
         self.full_profile = full_profile
 
-        self.log_dir = log_dir if log_dir is not None else os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        self.log_dir = (
+            log_dir
+            if log_dir is not None
+            else os.getenv("SGLANG_TORCH_PROFILER_DIR", "./logs")
+        )
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
