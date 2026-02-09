@@ -51,23 +51,27 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen2_moe import Qwen2MoeModel
 from sglang.srt.models.utils import (
+    apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    LazyValue,
     add_prefix,
     is_cuda,
     is_flashinfer_available,
@@ -281,6 +285,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             x.data
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
+            and filter_moe_weight_param_global_expert(
+                name, x, self.experts.num_local_experts
+            )
         ]
 
     def forward_normal(
@@ -498,31 +505,6 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # overlap qk norm
-        if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            with torch.cuda.stream(self.alt_stream):
-                k_by_head = k.reshape(-1, self.head_dim)
-                k_by_head = self.k_norm(k_by_head)
-            current_stream.wait_stream(self.alt_stream)
-            q = q_by_head.view(q.shape)
-            k = k_by_head.view(k.shape)
-            return q, k
-        else:
-            q_by_head = q.reshape(-1, self.head_dim)
-            q_by_head = self.q_norm(q_by_head)
-            k_by_head = k.reshape(-1, self.head_dim)
-            k_by_head = self.k_norm(k_by_head)
-        q = q_by_head.view(q.shape)
-        k = k_by_head.view(k.shape)
-        return q, k
-
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -542,18 +524,18 @@ class Qwen3MoeAttention(nn.Module):
         forward_batch: ForwardBatch,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn.layer_id == 0:
+        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
             self.rotary_emb.position_sin,
             self.rotary_emb.position_cos,
-            self.q_norm.weight,
-            self.k_norm.weight,
             self.q_size,
             self.kv_size,
             self.head_dim,
-            self.q_norm.variance_epsilon,
+            eps=self.q_norm.variance_epsilon,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
             q_bias=getattr(self.q_norm, "bias", None),
             k_bias=getattr(self.k_norm, "bias", None),
         )
@@ -604,7 +586,14 @@ class Qwen3MoeAttention(nn.Module):
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            q, k = self._apply_qk_norm(q, k)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
             q, k = self.rotary_emb(
                 positions,
                 q,
@@ -631,7 +620,7 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        if not _is_npu:
+        if not _is_npu or forward_batch.forward_mode.is_extend():
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -774,6 +763,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         hidden_states, residual = (
@@ -782,6 +772,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                **kwargs,
             )
         )
 
@@ -898,6 +889,14 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+
+    # Mapping from fused module names to their component weight names.
+    # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify
+    # which layers should be skipped based on the exclude_modules/ignore list.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -1129,14 +1128,16 @@ class Qwen3MoeForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-        # TODO mimic deepseek
-        # Lazy initialization of expert weights cache to avoid slowing down load_weights
         if not hasattr(self, "routed_experts_weights_of_layer"):
-            self.routed_experts_weights_of_layer = {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.start_layer, self.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
-            }
+            self.routed_experts_weights_of_layer = LazyValue(
+                lambda: {
+                    layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                    for layer_id in range(self.start_layer, self.end_layer)
+                    if isinstance(
+                        self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock
+                    )
+                }
+            )
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

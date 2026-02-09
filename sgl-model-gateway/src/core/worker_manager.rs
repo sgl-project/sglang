@@ -4,16 +4,13 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use axum::{
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::response::{IntoResponse, Response};
 use futures::{
     future,
     stream::{self, StreamExt},
 };
 use http::StatusCode;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
@@ -68,46 +65,6 @@ async fn fan_out(
         .buffer_unordered(MAX_CONCURRENT)
         .collect()
         .await
-}
-
-impl IntoResponse for FlushCacheResult {
-    fn into_response(self) -> Response {
-        let status = if self.failed.is_empty() {
-            StatusCode::OK
-        } else {
-            StatusCode::PARTIAL_CONTENT
-        };
-
-        let mut body = json!({
-            "status": if self.failed.is_empty() { "success" } else { "partial_success" },
-            "message": self.message,
-            "workers_flushed": self.successful.len(),
-            "total_http_workers": self.http_workers,
-            "total_workers": self.total_workers
-        });
-
-        if !self.failed.is_empty() {
-            body["successful"] = json!(self.successful);
-            body["failed"] = json!(self
-                .failed
-                .into_iter()
-                .map(|(url, err)| json!({"worker": url, "error": err}))
-                .collect::<Vec<_>>());
-        }
-
-        (status, Json(body)).into_response()
-    }
-}
-
-impl IntoResponse for WorkerLoadsResult {
-    fn into_response(self) -> Response {
-        let loads: Vec<Value> = self
-            .loads
-            .iter()
-            .map(|info| json!({"worker": &info.worker, "load": info.load}))
-            .collect();
-        Json(json!({"workers": loads})).into_response()
-    }
 }
 
 pub enum EngineMetricsResult {

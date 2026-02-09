@@ -33,8 +33,10 @@ static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
 /// Uses HarmonyGptOss encoding which supports the gpt-oss model family.
 pub(super) fn get_harmony_encoding() -> &'static HarmonyEncoding {
     HARMONY_ENCODING.get_or_init(|| {
-        openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-            .expect("Failed to load Harmony encoding")
+        tokio::task::block_in_place(|| {
+            openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+                .expect("Failed to load Harmony encoding")
+        })
     })
 }
 
@@ -111,7 +113,7 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
 /// stop tokens, and selection text for worker routing.
-pub struct HarmonyBuilder {
+pub(crate) struct HarmonyBuilder {
     encoding: &'static HarmonyEncoding,
 }
 

@@ -42,13 +42,16 @@ from sglang.srt.managers.data_parallel_controller import (
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
+    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
+    OpenSessionReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -91,94 +94,25 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _is_cuda = is_cuda()
 
 
-def _launch_subprocesses(
-    server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict, PortArgs]:
-    """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
-    """
-    # Configure global environment
-    configure_logger(server_args)
-    _set_envs_and_config(server_args)
-    server_args.check_server_args()
+def init_tokenizer_manager(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    TokenizerManagerClass: Optional[TokenizerManager] = None,
+) -> Tuple[TokenizerManager, TemplateManager]:
+    # Launch tokenizer process
+    TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
+    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
 
-    # Allocate ports for inter-process communications
-    if port_args is None:
-        port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
-
-    # Launch scheduler processes
-    scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
-        server_args=server_args,
-        port_args=port_args,
+    # Initialize templates
+    template_manager = TemplateManager()
+    template_manager.initialize_templates(
+        tokenizer_manager=tokenizer_manager,
+        model_path=server_args.model_path,
+        chat_template=server_args.chat_template,
+        completion_template=server_args.completion_template,
     )
 
-    if server_args.node_rank >= 1:
-        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-        # so they can just wait here.
-
-        for reader in scheduler_pipe_readers:
-            data = reader.recv()
-            assert data["status"] == "ready"
-
-        if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
-            # When using `Engine` as a Python API, we don't want to block here.
-            return None, None, None, port_args
-
-        launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
-        )
-
-        for proc in scheduler_procs:
-            proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
-            )
-        return None, None, None, port_args
-
-    # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process,
-        args=(
-            server_args,
-            port_args,
-        ),
-    )
-    detoken_proc.start()
-
-    # Init tokenizer manager first, as the bootstrap server is initialized here
-    if server_args.tokenizer_worker_num == 1:
-        tokenizer_manager, template_manager = _init_tokenizer_manager(
-            server_args, port_args
-        )
-    else:
-        # Launch multi-tokenizer router
-        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-        template_manager = None
-
-    # Wait for the model to finish loading
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        try:
-            data = scheduler_pipe_readers[i].recv()
-        except EOFError:
-            logger.error(
-                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
-            )
-            scheduler_procs[i].join()
-            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise
-
-        if data["status"] != "ready":
-            raise RuntimeError(
-                "Initialization failed. Please see the error messages above."
-            )
-        scheduler_infos.append(data)
-
-    # Get back some info from scheduler to tokenizer_manager
-    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
-
-    return tokenizer_manager, template_manager, scheduler_infos, port_args
+    return tokenizer_manager, template_manager
 
 
 class Engine(EngineBase):
@@ -197,8 +131,10 @@ class Engine(EngineBase):
 
     # Some fields to allow people to override the server args
     # and launch processes for their private forks.
-    launch_subprocesses_func: Callable = staticmethod(_launch_subprocesses)
     server_args_class: ServerArgs = ServerArgs
+    init_tokenizer_manager_func: Callable = staticmethod(init_tokenizer_manager)
+    run_scheduler_process_func: Callable = staticmethod(run_scheduler_process)
+    run_detokenizer_process_func: Callable = staticmethod(run_detokenizer_process)
 
     def __init__(self, **kwargs):
         """
@@ -224,7 +160,12 @@ class Engine(EngineBase):
 
         # Launch subprocesses
         tokenizer_manager, template_manager, scheduler_infos, port_args = (
-            self.launch_subprocesses_func(server_args=server_args)
+            _launch_subprocesses(
+                server_args=server_args,
+                init_tokenizer_manager_func=self.init_tokenizer_manager_func,
+                run_scheduler_process_func=self.run_scheduler_process_func,
+                run_detokenizer_process_func=self.run_detokenizer_process_func,
+            )
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
@@ -292,7 +233,9 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -328,7 +271,9 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -377,7 +322,9 @@ class Engine(EngineBase):
         bootstrap_port: Optional[Union[List[int], int]] = None,
         bootstrap_room: Optional[Union[List[int], int]] = None,
         data_parallel_rank: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        session_params: Optional[Dict] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
@@ -414,7 +361,9 @@ class Engine(EngineBase):
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             data_parallel_rank=data_parallel_rank,
+            external_trace_header=external_trace_header,
             rid=rid,
+            session_params=session_params,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
 
@@ -430,6 +379,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
@@ -442,6 +392,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            external_trace_header=external_trace_header,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -455,6 +406,7 @@ class Engine(EngineBase):
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
         dimensions: Optional[int] = None,
+        external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
     ) -> Dict:
         """
@@ -469,6 +421,7 @@ class Engine(EngineBase):
             audio_data=audio_data,
             video_data=video_data,
             dimensions=dimensions,
+            external_trace_header=external_trace_header,
             rid=rid,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -500,6 +453,37 @@ class Engine(EngineBase):
 
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
+
+    def open_session(
+        self,
+        capacity_of_str_len: int,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """Open a session for multi-turn conversation with shared context.
+
+        Args:
+            capacity_of_str_len: Maximum string length capacity for the session.
+            session_id: Optional session ID. If not provided, a UUID will be generated.
+
+        Returns:
+            The session ID (either the provided one or a newly generated UUID).
+        """
+        obj = OpenSessionReqInput(
+            capacity_of_str_len=capacity_of_str_len,
+            session_id=session_id,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.open_session(obj, None)
+        )
+
+    def close_session(self, session_id: str) -> None:
+        """Close a session and release its resources.
+
+        Args:
+            session_id: The session ID to close.
+        """
+        obj = CloseSessionReqInput(session_id=session_id)
+        self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(**kwargs))
@@ -652,6 +636,22 @@ class Engine(EngineBase):
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
         return self.loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
+        )
+
+    def load_lora_adapter_from_tensors(
+        self, lora_name: str, tensors: List[Tuple[str, torch.Tensor]], config_dict: Dict
+    ):
+        # Load LoRA adapter again
+        serialized_tensors = MultiprocessingSerializer.serialize(
+            tensors, output_str=True
+        )
+        lora_req = LoadLoRAAdapterFromTensorsReqInput(
+            lora_name=lora_name,
+            config_dict=config_dict,
+            serialized_tensors=serialized_tensors,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.load_lora_adapter_from_tensors(lora_req, None)
         )
 
     def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
@@ -837,7 +837,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.5.3",
+                "0.6.2",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -845,7 +845,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sgl-kernel",
-                "0.3.19",
+                "0.3.21",
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
@@ -873,32 +873,35 @@ def _set_envs_and_config(server_args: ServerArgs):
     mp.set_start_method("spawn", force=True)
 
 
-def _init_tokenizer_manager(
-    server_args: ServerArgs,
-    port_args: PortArgs,
-    TokenizerManagerClass: Optional[TokenizerManager] = None,
-) -> TokenizerManager:
-    # Launch tokenizer process
-    TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
-    tokenizer_manager = TokenizerManagerClass(server_args, port_args)
+def _wait_for_scheduler_ready(
+    scheduler_pipe_readers: List,
+    scheduler_procs: List,
+) -> List[Dict]:
+    """Wait for the model to finish loading and return scheduler infos."""
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        try:
+            data = scheduler_pipe_readers[i].recv()
+        except EOFError:
+            logger.error(
+                f"Rank {i} scheduler is dead. Please check if there are relevant logs."
+            )
+            scheduler_procs[i].join()
+            logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
+            raise
 
-    # Initialize templates
-    template_manager = TemplateManager()
-    template_manager.initialize_templates(
-        tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
-    )
-
-    return tokenizer_manager, template_manager
+        if data["status"] != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        scheduler_infos.append(data)
+    return scheduler_infos
 
 
 def _launch_scheduler_processes(
     server_args: ServerArgs,
     port_args: PortArgs,
-    run_scheduler_process_func: Callable = run_scheduler_process,
-    run_data_parallel_controller_process_func: Callable = run_data_parallel_controller_process,
+    run_scheduler_process_func: Callable,
 ):
     scheduler_procs = []
 
@@ -959,10 +962,94 @@ def _launch_scheduler_processes(
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_readers = [reader]
         proc = mp.Process(
-            target=run_data_parallel_controller_process_func,
-            args=(server_args, port_args, writer),
+            target=run_data_parallel_controller_process,
+            kwargs=dict(
+                server_args=server_args,
+                port_args=port_args,
+                pipe_writer=writer,
+                run_scheduler_process_func=run_scheduler_process_func,
+            ),
         )
         proc.start()
         scheduler_procs.append(proc)
 
     return scheduler_procs, scheduler_pipe_readers
+
+
+def _launch_subprocesses(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable,
+    run_scheduler_process_func: Callable,
+    run_detokenizer_process_func: Callable,
+    port_args: Optional[PortArgs] = None,
+) -> Tuple[TokenizerManager, TemplateManager, Tuple[Dict], PortArgs]:
+    """
+    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """
+    # Configure global environment
+    configure_logger(server_args)
+    _set_envs_and_config(server_args)
+    server_args.check_server_args()
+
+    # Allocate ports for inter-process communications
+    if port_args is None:
+        port_args = PortArgs.init_new(server_args)
+    logger.info(f"{server_args=}")
+
+    # Launch scheduler processes
+    scheduler_procs, scheduler_pipe_readers = _launch_scheduler_processes(
+        server_args=server_args,
+        port_args=port_args,
+        run_scheduler_process_func=run_scheduler_process_func,
+    )
+
+    if server_args.node_rank >= 1:
+        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
+        # so they can just wait here.
+
+        scheduler_infos = _wait_for_scheduler_ready(
+            scheduler_pipe_readers, scheduler_procs
+        )
+
+        if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            # When using `Engine` as a Python API, we don't want to block here.
+            return None, None, scheduler_infos, port_args
+
+        launch_dummy_health_check_server(
+            server_args.host, server_args.port, server_args.enable_metrics
+        )
+
+        for proc in scheduler_procs:
+            proc.join()
+            logger.error(
+                f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
+            )
+        return None, None, scheduler_infos, port_args
+
+    # Launch detokenizer process
+    detoken_proc = mp.Process(
+        target=run_detokenizer_process_func,
+        args=(
+            server_args,
+            port_args,
+        ),
+    )
+    detoken_proc.start()
+
+    # Init tokenizer manager first, as the bootstrap server is initialized here
+    if server_args.tokenizer_worker_num == 1:
+        tokenizer_manager, template_manager = init_tokenizer_manager_func(
+            server_args, port_args
+        )
+    else:
+        # Launch multi-tokenizer router
+        tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+        template_manager = None
+
+    # Wait for the model to finish loading
+    scheduler_infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+
+    # Get back some info from scheduler to tokenizer_manager
+    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+
+    return tokenizer_manager, template_manager, scheduler_infos, port_args

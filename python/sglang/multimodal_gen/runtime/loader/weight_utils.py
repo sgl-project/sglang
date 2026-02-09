@@ -23,11 +23,6 @@ try:
 except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
-# Disable runai_model_streamer on AMD/ROCm due to global state issues
-# that cause "Streamer is handling previous request" errors
-if torch.version.hip is not None:
-    HAS_RUNAI_MODEL_STREAMER = False
-
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -219,6 +214,26 @@ def safetensors_weights_iterator(
                     yield name, param
 
 
+def _load_pt_file(bin_file: str, device: str) -> dict:
+    """Load a PyTorch checkpoint file, handling legacy tar format.
+
+    PyTorch 2.6 changed the default of weights_only from False to True.
+    Legacy tar format files cannot be loaded with weights_only=True.
+    This function tries weights_only=True first, then falls back to False
+    for legacy tar format files from trusted sources (HuggingFace Hub).
+    """
+    try:
+        return torch.load(bin_file, map_location=device, weights_only=True)
+    except RuntimeError as e:
+        if "legacy .tar format" in str(e):
+            logger.warning(
+                "Loading %s with weights_only=False (legacy tar format)",
+                os.path.basename(bin_file),
+            )
+            return torch.load(bin_file, map_location=device, weights_only=False)
+        raise
+
+
 def pt_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
@@ -234,7 +249,7 @@ def pt_weights_iterator(
         disable=not enable_tqdm,
         bar_format=_BAR_FORMAT,
     ):
-        state = torch.load(bin_file, map_location=device, weights_only=True)
+        state = _load_pt_file(bin_file, device)
         yield from state.items()
         del state
 

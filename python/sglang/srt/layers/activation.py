@@ -22,13 +22,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -59,7 +59,7 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
-class SiluAndMul(CustomOp):
+class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
@@ -95,7 +95,7 @@ class SiluAndMul(CustomOp):
         return out
 
 
-class GeluAndMul(CustomOp):
+class GeluAndMul(MultiPlatformOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
@@ -140,7 +140,7 @@ class GeluAndMul(CustomOp):
         return y_npu
 
 
-class NewGELU(CustomOp):
+class NewGELU(MultiPlatformOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
@@ -161,7 +161,7 @@ class ReLU2(nn.Module):
         return x * x
 
 
-class QuickGELU(CustomOp):
+class QuickGELU(MultiPlatformOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
@@ -177,7 +177,7 @@ class QuickGELU(CustomOp):
         return torch_npu.npu_fast_gelu(x)
 
 
-class XIELU(CustomOp):
+class XIELU(MultiPlatformOp):
     """
     Applies the xIELU activation function introduced in https://arxiv.org/abs/2411.13010
     If the user has installed the nickjbrowning/XIELU, we import xIELU CUDA
@@ -378,15 +378,3 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
     else:
         # adapt bge-reranker
         return nn.Identity()
-
-
-if not (
-    _is_cuda or _is_npu or (_is_cpu and _is_cpu_amx_available) or _is_hip or _is_xpu
-):
-    logger.info(
-        "sgl-kernel is not available on Non-NV, Non-AMD platforms or Non-AMX CPUs. Fallback to other kernel libraries."
-    )
-    from vllm.model_executor.layers.activation import (  # noqa: F401
-        GeluAndMul,
-        SiluAndMul,
-    )
