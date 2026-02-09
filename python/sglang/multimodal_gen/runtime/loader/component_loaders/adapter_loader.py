@@ -1,7 +1,9 @@
 from safetensors.torch import load_file as safetensors_load_file
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     set_default_torch_dtype,

@@ -35,6 +35,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -822,6 +823,7 @@ class RadixCache(BasePrefixCache):
                         token_ids=page_tokens,
                         block_size=len(page_tokens),
                         lora_id=None,
+                        medium=MEDIUM_GPU,
                     )
                 )
 
@@ -843,7 +845,9 @@ class RadixCache(BasePrefixCache):
 
                 block_hash = hash_str_to_int64(node.hash_value[page_index])
 
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+                self.kv_event_queue.append(
+                    BlockRemoved(block_hashes=[block_hash], medium=MEDIUM_GPU)
+                )
 
                 page_index += 1
 
