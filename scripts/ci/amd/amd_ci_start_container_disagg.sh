@@ -143,7 +143,13 @@ find_latest_image() {
 }
 
 # Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
+#IMAGE=$(find_latest_image "${GPU_ARCH}")
+# Hardcoded prebuild image tags per GPU architecture
+case "${GPU_ARCH}" in
+  mi30x) IMAGE="rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-test-prebuild-031a652" ;;
+  mi35x) IMAGE="rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-test-prebuild-031a652" ;;
+  *)     echo "Error: unsupported GPU architecture '${GPU_ARCH}'" >&2; exit 1 ;;
+esac
 echo "Pulling Docker image: ${IMAGE}"
 docker pull "${IMAGE}"
 
