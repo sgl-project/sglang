@@ -518,6 +518,7 @@ class SRTRunner:
         torch_dtype: torch.dtype,
         model_type: str,
         tp_size: int = 1,
+        ep_size: int = 1,
         model_impl: str = "auto",
         port: int = DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
         lora_paths: Optional[Union[List[str], List[dict[str, str]]]] = None,
@@ -584,6 +585,7 @@ class SRTRunner:
         self.engine = Engine(
             model_path=model_path,
             tp_size=tp_size,
+            ep_size=ep_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
             model_impl=model_impl,
