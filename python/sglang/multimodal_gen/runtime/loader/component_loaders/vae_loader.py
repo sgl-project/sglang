@@ -1,8 +1,11 @@
 import importlib.util
 import os
 
+import torch
+import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -21,6 +24,25 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
+    """
+    Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
+    Returns the number of Conv3d modules converted.
+    """
+    if not hasattr(torch, "channels_last_3d"):
+        return 0
+    num_converted = 0
+    for m in module.modules():
+        if isinstance(m, nn.Conv3d):
+            try:
+                m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
+                num_converted += 1
+            except Exception:
+                # Best-effort; skip unsupported cases.
+                continue
+    return num_converted
 
 
 class VAELoader(ComponentLoader):
@@ -85,6 +107,16 @@ class VAELoader(ComponentLoader):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
+            if (
+                component_name in ("vae", "video_vae")
+                and torch.cuda.is_available()
+                and getattr(envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False)
+            ):
+                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                if n > 0:
+                    logger.info(
+                        "VAE: converted %d Conv3d weights to channels_last_3d", n
+                    )
             return vae
 
         # Load from ModelRegistry (standard VAE classes)
@@ -110,5 +142,14 @@ class VAELoader(ComponentLoader):
             logger.warning("VAE missing keys: %s", missing_keys)
         if unexpected_keys:
             logger.warning("VAE unexpected keys: %s", unexpected_keys)
+
+        if (
+            component_name in ("vae", "video_vae")
+            and torch.cuda.is_available()
+            and getattr(envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False)
+        ):
+            n = _convert_conv3d_weights_to_channels_last_3d(vae)
+            if n > 0:
+                logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 
         return vae
