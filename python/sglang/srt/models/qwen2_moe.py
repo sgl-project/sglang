@@ -98,6 +98,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
+from sglang.srt.true_on_policy import get_on_policy_rms_norm_kwargs
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -1150,7 +1151,10 @@ class Qwen2MoeModel(nn.Module):
             stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
