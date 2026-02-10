@@ -1823,7 +1823,6 @@ def launch_server(
     run_detokenizer_process_func: Callable = run_detokenizer_process,
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
-    _ray_placement_groups=None,
 ):
     """
     Launch SRT (SGLang Runtime) Server.
@@ -1844,16 +1843,16 @@ def launch_server(
     (
         tokenizer_manager,
         template_manager,
-        scheduler_infos,
         port_args,
-        _,  # scheduler_result not needed here, cleanup handled by process termination
+        scheduler_result,
     ) = _launch_workers(
         server_args=server_args,
         init_tokenizer_manager_func=init_tokenizer_manager_func,
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
-        _ray_placement_groups=_ray_placement_groups,
     )
+
+    scheduler_infos = scheduler_result.scheduler_infos
 
     # Parse info got from the schedulers
     remote_instance_transfer_engine_info = (

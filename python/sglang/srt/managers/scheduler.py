@@ -1057,8 +1057,8 @@ class Scheduler(
                 (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
-
-    def get_init_info(self) -> Dict[str, Any]:
+#TODO: 
+    def get_init_info(self) -> SchedulerInfo:
         """Return scheduler initialization info for handshake.
 
         This method provides the initialization info needed by the tokenizer manager

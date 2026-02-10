@@ -67,7 +67,7 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, ZMQ_TCP_PORT_DELTA
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -105,7 +105,6 @@ class SchedulerLaunchResult:
     # Ray mode fields
     _actors: Optional[List] = None
     _event_loop_refs: Optional[List] = None
-    _placement_groups: Optional[List] = None
 
     # mp mode fields
     _procs: Optional[List] = None
@@ -150,16 +149,6 @@ class SchedulerLaunchResult:
                 except Exception:
                     pass
             self._actors = None
-
-        if self._placement_groups is not None:
-            import ray
-
-            for pg in self._placement_groups:
-                try:
-                    ray.util.remove_placement_group(pg)
-                except Exception:
-                    pass
-            self._placement_groups = None
 
 
 def init_tokenizer_manager(
@@ -210,9 +199,6 @@ class Engine(EngineBase):
         Please refer to `ServerArgs` for the documentation.
         """
 
-        # Extract Ray-specific placement groups before passing to ServerArgs
-        _ray_placement_groups = kwargs.pop("_ray_placement_groups", None)
-
         # Parse server_args
         if "server_args" in kwargs:
             # Directly load server_args
@@ -236,7 +222,6 @@ class Engine(EngineBase):
         (
             tokenizer_manager,
             template_manager,
-            scheduler_infos,
             port_args,
             scheduler_result,
         ) = _launch_workers(
@@ -244,16 +229,15 @@ class Engine(EngineBase):
             init_tokenizer_manager_func=self.init_tokenizer_manager_func,
             run_scheduler_process_func=self.run_scheduler_process_func,
             run_detokenizer_process_func=self.run_detokenizer_process_func,
-            _ray_placement_groups=_ray_placement_groups,
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_infos[0]
+        self.scheduler_info = scheduler_result.scheduler_infos[0]
         self.port_args = port_args
         self._scheduler_result = scheduler_result
         self.remote_instance_transfer_engine_info = (
             parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_infos
+                scheduler_result.scheduler_infos
             )
         )
 
@@ -970,7 +954,6 @@ def _launch_scheduler_processes(
     server_args: ServerArgs,
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
-    placement_groups=None,
 ) -> SchedulerLaunchResult:
     """Launch schedulers using Ray actors or mp.Process.
 
@@ -983,7 +966,6 @@ def _launch_scheduler_processes(
         return _launch_scheduler_ray_actors(
             server_args,
             port_args,
-            placement_groups=placement_groups,
         )
     else:
         return _launch_scheduler_processes_mp(
@@ -1112,7 +1094,7 @@ def _launch_scheduler_processes_mp(
 def _get_rank0_node_ip(placement_group) -> str:
     """Get the IP address of the node where rank 0 will run.
 
-    Uses a probe task to discover the IP of the first placement group's node.
+    Uses a probe task to discover the IP of the placement group's first bundle node.
     This is needed because rank 0 starts the TCPStore server for torch.distributed,
     so dist_init_addr must be the IP of the node where rank 0 runs, not the driver node.
     """
@@ -1136,12 +1118,13 @@ def _get_rank0_node_ip(placement_group) -> str:
 def _launch_scheduler_ray_actors(
     server_args: ServerArgs,
     port_args: PortArgs,
-    placement_groups: list,
 ) -> SchedulerLaunchResult:
     """Launch scheduler actors using Ray (unified single/multi-node).
 
-    Args:
-        placement_groups: Per-node placement groups.
+    Auto-detects the current placement group via ``ray.util.get_current_placement_group()``.
+    The caller must schedule the enclosing actor/task onto a placement group with one
+    bundle per node, each bundle having ``gpus_per_node`` GPUs.  Multiple SchedulerActors
+    (``num_gpus=1`` each) share a bundle's GPU pool.
     """
     import uuid
 
@@ -1157,6 +1140,18 @@ def _launch_scheduler_ray_actors(
             "Set dp_size=1 or use_ray=False."
         )
 
+    pg = ray.util.get_current_placement_group()
+    if pg is None:
+        raise RuntimeError(
+            "use_ray=True requires a placement group, but none was detected. "
+            "Schedule the Engine actor onto a placement group with one bundle per node:\n"
+            "  pg = placement_group([{'GPU': gpus_per_node}] * nnodes, strategy='STRICT_PACK')\n"
+            "  ray.get(pg.ready())\n"
+            "  actor = MyActor.options(scheduling_strategy=\n"
+            "      PlacementGroupSchedulingStrategy(placement_group=pg, "
+            "placement_group_bundle_index=0)).remote(...)"
+        )
+
     world_size = server_args.tp_size * server_args.pp_size
     nnodes = server_args.nnodes
     gpus_per_node = world_size // nnodes
@@ -1167,12 +1162,11 @@ def _launch_scheduler_ray_actors(
     )
 
     # Discover rank 0's node IP for torch.distributed init
-    rank0_node_ip = _get_rank0_node_ip(placement_groups[0])
-    dist_init_addr = f"{rank0_node_ip}:{server_args.port + 233}"
+    rank0_node_ip = _get_rank0_node_ip(pg)
+    dist_init_addr = f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
     logger.info(f"dist_init_addr: {dist_init_addr}")
 
     # Create scheduler actors using shared rank calculation
-    instance_id = uuid.uuid4().hex[:8]
     scheduler_actors = []
 
     for node_idx in range(nnodes):
@@ -1186,15 +1180,7 @@ def _launch_scheduler_ray_actors(
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-                actor = SchedulerActor.options(
-                    num_cpus=0,
-                    num_gpus=1,
-                    name=f"sglang_scheduler_{instance_id}_pp{pp_rank}_tp{tp_rank}",
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=placement_groups[node_idx],
-                        placement_group_bundle_index=local_gpu_idx,
-                    ),
-                ).remote(
+                scheduler_kwargs = dict(
                     server_args=server_args,
                     port_args=port_args,
                     gpu_id=local_gpu_idx,
@@ -1202,6 +1188,18 @@ def _launch_scheduler_ray_actors(
                     moe_ep_rank=moe_ep_rank,
                     pp_rank=pp_rank,
                     dp_rank=0,
+                )
+
+                actor = SchedulerActor.options(
+                    num_cpus=0,
+                    num_gpus=1,
+                    name=f"sglang_scheduler_pp{pp_rank}_tp{tp_rank}",
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=pg,
+                        placement_group_bundle_index=node_idx,
+                    ),
+                ).remote(
+                    scheduler_kwargs=scheduler_kwargs,
                     dist_init_addr=dist_init_addr,
                 )
                 scheduler_actors.append(actor)
@@ -1226,7 +1224,6 @@ def _launch_scheduler_ray_actors(
         scheduler_infos=scheduler_infos,
         _actors=scheduler_actors,
         _event_loop_refs=event_loop_refs,
-        _placement_groups=placement_groups,
     )
 
 
@@ -1236,11 +1233,9 @@ def _launch_workers(
     run_scheduler_process_func: Callable,
     run_detokenizer_process_func: Callable,
     port_args: Optional[PortArgs] = None,
-    _ray_placement_groups=None,
 ) -> Tuple[
     TokenizerManager,
     TemplateManager,
-    Tuple[Dict],
     PortArgs,
     SchedulerLaunchResult,
 ]:
@@ -1248,11 +1243,8 @@ def _launch_workers(
     Launch the TokenizerManager in the main process, the Scheduler workers (as subprocesses
     or Ray actors), and the DetokenizerManager in another subprocess.
 
-    Args:
-        _ray_placement_groups: Pre-created per-node placement groups.
-
     Returns:
-        Tuple of (tokenizer_manager, template_manager, scheduler_infos, port_args, scheduler_result).
+        Tuple of (tokenizer_manager, template_manager, port_args, scheduler_result).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -1263,23 +1255,11 @@ def _launch_workers(
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
 
-    # Validate placement groups for Ray mode
-    if server_args.use_ray:
-        if _ray_placement_groups is None:
-            raise ValueError(
-                "use_ray=True requires pre-created placement groups. "
-                "Use EngineActor or HttpServerActor instead of Engine directly."
-            )
-        pgs = _ray_placement_groups
-    else:
-        pgs = None
-
     # Launch schedulers (unified interface for both mp and Ray modes)
     scheduler_result = _launch_scheduler_processes(
         server_args=server_args,
         port_args=port_args,
         run_scheduler_process_func=run_scheduler_process_func,
-        placement_groups=pgs,
     )
 
     if server_args.node_rank >= 1:
@@ -1294,7 +1274,6 @@ def _launch_workers(
             return (
                 None,
                 None,
-                scheduler_result.scheduler_infos,
                 port_args,
                 scheduler_result,
             )
@@ -1308,7 +1287,6 @@ def _launch_workers(
         return (
             None,
             None,
-            scheduler_result.scheduler_infos,
             port_args,
             scheduler_result,
         )
@@ -1344,7 +1322,6 @@ def _launch_workers(
     return (
         tokenizer_manager,
         template_manager,
-        scheduler_result.scheduler_infos,
         port_args,
         scheduler_result,
     )
