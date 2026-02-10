@@ -148,7 +148,7 @@ class HpcAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata: HpcAttentionMetadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
+                max_len = int(seq_lens_cpu.max().item()) if bs > 0 else 0
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
 
