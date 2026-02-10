@@ -46,9 +46,12 @@ class DecodeKVCacheOffloadManager:
         self.request_counter = 0
         self.tree_cache = tree_cache
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
-        self.offload_stride = (
-            env_stride if env_stride is not None and env_stride > 0 else self.page_size
-        )
+        if env_stride is None or env_stride <= 0:
+            self.offload_stride = self.page_size
+        else:
+            self.offload_stride = max(
+                self.page_size, (env_stride // self.page_size) * self.page_size
+            )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
             self.decode_host_mem_pool = MHATokenToKVPoolHost(
