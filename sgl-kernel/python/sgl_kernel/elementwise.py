@@ -83,6 +83,18 @@ def fused_add_rmsnorm(
     )
 
 
+def rms_norm_static_fp8_quant(out, input, weight, scale, epsilon):
+    return torch.ops.sgl_kernel.rms_norm_static_fp8_quant.default(
+        out, input, weight, scale, epsilon
+    )
+
+
+def fused_add_rms_norm_static_fp8_quant(out, input, residual, weight, scale, epsilon):
+    return torch.ops.sgl_kernel.fused_add_rms_norm_static_fp8_quant.default(
+        out, input, residual, weight, scale, epsilon
+    )
+
+
 def gemma_rmsnorm(
     input: torch.Tensor,
     weight: torch.Tensor,
