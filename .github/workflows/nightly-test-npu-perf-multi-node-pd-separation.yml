@@ -80,8 +80,8 @@ jobs:
           mkdir -p ${target_path}
           cp -r ${current_path}/* ${target_path}/
 
-          # sglang_source_path is host path
-          sglang_source_path=/data/ascend-ci-share-pkking-sglang/tests/sglang
+          # sglang_source_path is shared-disk path
+          sglang_source_path=ascend-ci-share-pkking-sglang/tests/sglang
           echo "Source code path: ${sglang_source_path}"
 
           # mkdir for output data

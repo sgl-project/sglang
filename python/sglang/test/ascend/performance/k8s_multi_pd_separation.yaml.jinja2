@@ -146,18 +146,20 @@ spec:
             mountPath: /data
           - name: cache
             mountPath: /root/.cache
+            subPath: ascend-ci-share-pkking-sglang
           - name: sglang-source-code
             mountPath: /root/sglang
+            subPath: {{ sglang_source_path }}
         volumes:
         - name: kube-config
           hostPath:
             path: /root/script
         - name: share
-          hostPath:
-            path: /data
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         - name: cache
-          hostPath:
-            path: /data/ascend-ci-share-pkking-sglang
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         - name: ascend-910-config
           configMap:
             name: rings-config-ascend-sglang-test
@@ -168,8 +170,8 @@ spec:
           hostPath:
             path: /etc/localtime
         - name: sglang-source-code
-          hostPath:
-            path: {{ sglang_source_path }}
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
@@ -231,18 +233,20 @@ spec:
             mountPath: /data
           - name: cache
             mountPath: /root/.cache
+            subPath: ascend-ci-share-pkking-sglang
           - name: sglang-source-code
             mountPath: /root/sglang
+            subPath: {{ sglang_source_path }}
         volumes:
         - name: kube-config
           hostPath:
             path: /root/script
         - name: share
-          hostPath:
-            path: /data
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         - name: cache
-          hostPath:
-            path: /data/ascend-ci-share-pkking-sglang
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         - name: ascend-910-config
           configMap:
             name: rings-config-ascend-sglang-test
@@ -253,8 +257,8 @@ spec:
           hostPath:
             path: /etc/localtime
         - name: sglang-source-code
-          hostPath:
-            path: {{ sglang_source_path }}
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
@@ -318,18 +322,20 @@ spec:
             mountPath: /data
           - name: cache
             mountPath: /root/.cache
+            subPath: ascend-ci-share-pkking-sglang
           - name: sglang-source-code
             mountPath: /root/sglang
+            subPath: {{ sglang_source_path }}
         volumes:
         - name: kube-config
           hostPath:
             path: /root/script
         - name: share
-          hostPath:
-            path: /data
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         - name: cache
-          hostPath:
-            path: /data/ascend-ci-share-pkking-sglang
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         - name: ascend-910-config
           configMap:
             name: rings-config-ascend-sglang-test
@@ -340,8 +346,8 @@ spec:
           hostPath:
             path: /etc/localtime
         - name: sglang-source-code
-          hostPath:
-            path: {{ sglang_source_path }}
+          persistentVolumeClaim:
+            claimName: sglang-guiyang004
         nodeSelector:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
