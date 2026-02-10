@@ -501,7 +501,7 @@ jobs:
           cd sgl-kernel
           ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
         env:
-          USE_CCACHE: 1
+          USE_CCACHE: 0
 
       - name: Verify wheel artifacts
         run: |
