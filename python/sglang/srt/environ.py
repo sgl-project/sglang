@@ -466,6 +466,10 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
+    # EPD
+    SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+
 
 envs = Envs()
 EnvField._allow_set_name = False
