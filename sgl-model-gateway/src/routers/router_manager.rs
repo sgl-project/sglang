@@ -37,7 +37,6 @@ use crate::{
     schedulers::{
         SchedulerPolicy,
         SelectRouterInfo,
-        proportion::ProportionScheduler,
         factory::SchedulerFactory,
     },
     tokenizer::registry::TokenizerRegistry, 

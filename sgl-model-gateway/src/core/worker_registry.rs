@@ -12,7 +12,6 @@
 //! Uses virtual nodes (150 per worker) for even distribution and blake3 for stable hashing.
 
 use std::sync::{Arc, RwLock};
-use tracing::info;
 
 use dashmap::DashMap;
 use uuid::Uuid;

@@ -1,12 +1,11 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tracing::info;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use async_trait::async_trait;
 use crate::schedulers::{SchedulerPolicy, SelectRouterInfo};
 use crate::routers::router_manager::{router_ids, RouterId};
-use crate::core::{WorkerRegistry, WorkerType};
+use crate::core::WorkerRegistry;
 
 /// Configuration for the ProportionScheduler.
 #[derive(Debug, Clone)]
@@ -56,24 +55,22 @@ struct RequestRecord {
 /// proportional load distribution.
 #[derive(Debug)]
 pub struct ProportionScheduler {
-    /// reguler pd分割线
     crossover_point: Arc<RwLock<usize>>,
-    /// 全局请求队列
     global_request_queue: Arc<RwLock<VecDeque<RequestRecord>>>,
-    /// 记录router负载
     router_loads: Arc<RwLock<std::collections::HashMap<RouterId, usize>>>,
-    /// 记录router下属worker数量
     worker_counts: Arc<RwLock<std::collections::HashMap<RouterId, usize>>>,
-    /// Scheduler configuration.
     config: ProportionSchedulerConfig,
-    /// 调整句柄
     _adjustment_handle: tokio::task::JoinHandle<()>,
-    // worker info
     worker_registry: Arc<WorkerRegistry>,
 }
 
 impl ProportionScheduler {
     pub fn new(config: ProportionSchedulerConfig, worker_registry: Arc<WorkerRegistry>) -> Self {
+        info!(
+            crossover_point = 512,
+            config = ?config,
+            "ProportionScheduler initialized."
+        );
         let crossover_point = Arc::new(RwLock::new(512));
         let global_request_queue = Arc::new(RwLock::new(VecDeque::new()));
         let router_loads = Arc::new(RwLock::new(std::collections::HashMap::new()));
@@ -110,12 +107,10 @@ impl ProportionScheduler {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             loop {
-                info!("开始调整================");
+                debug!("Starting periodic scheduler adjustment task");
                 tokio::time::sleep(config.adjust_interval).await;
-                // 获取worker数量 (regular_count, prefill_count)
                 let (regular_workers, pd_workers) = worker_registry.get_scheduler_worker_counts();
                 {
-                    // 简化写法全部采用http
                     let mut counts_guard = worker_counts.write().unwrap();
                     counts_guard.insert(router_ids::HTTP_REGULAR, regular_workers);
                     counts_guard.insert(router_ids::HTTP_PD, pd_workers);
@@ -124,14 +119,12 @@ impl ProportionScheduler {
                     let mut queue_guard = global_request_queue.write().unwrap();
                     let mut loads_guard = router_loads.write().unwrap();
                     let now = Instant::now();
-                    // 更新请求队列，超时请求需要清理
                     while let Some(req) = queue_guard.front() {
                         if now.duration_since(req.timestamp) > config.adjust_window {
                             if let Some(oldest_req) = queue_guard.pop_front() {
                                 if let Some(load) = loads_guard.get_mut(&oldest_req.router_id) {
                                     *load = load.saturating_sub(oldest_req.token_count);
                                 }
-                                info!("Cleaned_req: {:?}", oldest_req);
                             }
                         } else {
                             break;
@@ -139,18 +132,19 @@ impl ProportionScheduler {
                     }
                 }
 
-                // 计算CrossoverPoint
                 let counts_guard = worker_counts.read().unwrap();
                 let queue_guard = global_request_queue.read().unwrap();
 
                 let pd_workers = *counts_guard.get(&router_ids::HTTP_PD).unwrap_or(&0) + *counts_guard.get(&router_ids::GRPC_PD).unwrap_or(&0);
                 let regular_workers = *counts_guard.get(&router_ids::HTTP_REGULAR).unwrap_or(&0) + *counts_guard.get(&router_ids::GRPC_REGULAR).unwrap_or(&0);
-                // info!("queue_guard {:#?}", queue_guard);
-                // info!("pd_workers {:#?}", pd_workers);
-                // info!("regular_workers {:#?}", regular_workers);
 
                 if queue_guard.is_empty() || pd_workers == 0 || regular_workers == 0 {
-                    info!("queue_guard.is_empty() || pd_workers == 0 || regular_workers == 0");
+                    debug!(
+                        is_queue_empty = queue_guard.is_empty(),
+                        pd_workers,
+                        regular_workers,
+                        "Skipping adjustment due to empty queue or no workers."
+                    );
                     continue;
                 }
 
@@ -159,7 +153,7 @@ impl ProportionScheduler {
                 let total_weight = total_pd_weight + total_regular_weight;
 
                 if total_weight == 0.0 { 
-                    info!("total_weight == 0.0");
+                    debug!("Skipping adjustment due to zero total worker weight.");
                     continue; 
                 }
 
@@ -170,7 +164,7 @@ impl ProportionScheduler {
 
                 let total_global_load: usize = sorted_token_counts.iter().sum();
                 if total_global_load == 0 { 
-                    info!("total_global_load == 0");
+                    debug!("Skipping adjustment due to zero total load in queue.");
                     continue; 
                 }
 
@@ -186,10 +180,12 @@ impl ProportionScheduler {
                 }
                 
                 *crossover_point.write().unwrap() = new_crossover_point;
-
                 info!(
-                    "ProportionScheduler: Adjusted crossover point to {}. (Regular workers: {}, PD workers: {}, Queue size: {})",
-                    new_crossover_point, regular_workers, pd_workers, queue_guard.len()
+                    new_crossover_point,
+                    regular_workers,
+                    pd_workers,
+                    queue_size = queue_guard.len(),
+                    "Crossover point adjusted."
                 );
             }
         })
@@ -225,7 +221,7 @@ impl SchedulerPolicy for ProportionScheduler {
             let pd_workers = *counts_guard.get(&router_ids::HTTP_PD).unwrap_or(&0);
 
             if regular_workers == 0 && pd_workers == 0 {
-                info!("ProportionScheduler: No regular or PD workers available.");
+                warn!("No regular or PD workers available to select from.");
                 return None;
             }
 
@@ -235,16 +231,20 @@ impl SchedulerPolicy for ProportionScheduler {
             let norm_pd_load = if total_pd_weight > 0.0 { pd_load as f32 / total_pd_weight } else { f32::MAX };
             let norm_regular_load = if total_regular_weight > 0.0 { regular_load as f32 / total_regular_weight } else { f32::MAX };
 
-            info!("loads_guard {:#?}", loads_guard);
-            info!("counts_guard {:#?}", counts_guard);
-            info!("pd_load {:#?}", pd_load);
-            info!("regular_load {:#?}", regular_load);
-            info!("pd_workers {:#?}", pd_workers);
-            info!("regular_workers {:#?}", regular_workers);
-            info!("total_pd_weight {:#?}", total_pd_weight);
-            info!("total_regular_weight {:#?}", total_regular_weight);
-            info!("norm_pd_load {:#?}", norm_pd_load);
-            info!("norm_regular_load {:#?}", norm_regular_load);
+            debug!(
+                request_tokens = token_count,
+                load.regular = regular_load,
+                load.pd = pd_load,
+                load.normalized_regular = norm_regular_load,
+                load.normalized_pd = norm_pd_load,
+                workers.regular = regular_workers,
+                workers.pd = pd_workers,
+                weight.regular = total_regular_weight,
+                weight.pd = total_pd_weight,
+                all_loads = ?*loads_guard,
+                all_counts = ?*counts_guard,
+                "Evaluating router selection logic." 
+            );
 
             
             let select_best_available = |choices: &[RouterId]| -> Option<RouterId> {
@@ -254,7 +254,13 @@ impl SchedulerPolicy for ProportionScheduler {
             let imbalanced_choice = if (norm_pd_load - norm_regular_load).abs() > self.config.balance_abs_threshold as f32
                 && (norm_pd_load > norm_regular_load * self.config.balance_rel_threshold || norm_regular_load > norm_pd_load * self.config.balance_rel_threshold)
             {
-                debug!("Scheduler is imbalanced. Norm Regular: {}, Norm PD: {}", norm_regular_load, norm_pd_load);
+                debug!(
+                    norm_regular_load,
+                    norm_pd_load,
+                    threshold.abs = self.config.balance_abs_threshold,
+                    threshold.rel = self.config.balance_rel_threshold,
+                    "Imbalance detected, overriding crossover point logic."
+                );
                 if norm_regular_load < norm_pd_load {
                     select_best_available(&[router_ids::HTTP_REGULAR, router_ids::GRPC_REGULAR])
                 } else {
@@ -279,18 +285,26 @@ impl SchedulerPolicy for ProportionScheduler {
             
         }; 
         if let Some(ref chosen_id) = choice {
-            // 更新队列
             self.global_request_queue.write().unwrap().push_back(RequestRecord {
                 token_count,
                 timestamp: Instant::now(),
                 router_id: chosen_id.clone(),
             });
-            info!("global_request_queue info {:#?}", self.global_request_queue);
+            debug!(
+                request.tokens = token_count,
+                router.id = ?chosen_id,
+                "Request routed."
+            );
 
-            // 更新router负载
-            let mut loads_guard = self.router_loads.write().unwrap(); // 安全获取写锁
+            let mut loads_guard = self.router_loads.write().unwrap();
             *loads_guard.entry(chosen_id.clone()).or_insert(0) += token_count;
             info!("Updated load for {}: {}", chosen_id.as_str(), loads_guard.get(chosen_id).unwrap());
+        } else{
+            warn!(
+                request.tokens = token_count,
+                candidate_routers = ?candidate_routers,
+                "Failed to select any router for the request."
+            );
         }
         
         choice
