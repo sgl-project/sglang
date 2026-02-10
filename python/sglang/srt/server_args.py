@@ -1558,7 +1558,11 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for "
                         f"{model_arch}"
                     )
-        elif model_arch in ["Qwen3NextForCausalLM"]:
+        elif model_arch in [
+            "Qwen3NextForCausalLM",
+            "Qwen3_5MoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+        ]:
             if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
                 if self.quantization is None and quant_method is not None:
@@ -1573,7 +1577,7 @@ class ServerArgs:
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
                     logger.info(
-                        "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
+                        f"Use flashinfer_trtllm as MoE runner backend on sm100 for {model_arch}"
                     )
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
