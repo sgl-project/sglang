@@ -1196,7 +1196,7 @@ class AiterAttnBackend(AttentionBackend):
                             K = k.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
                         if v.dtype != fp8_dtype:
                             V = v.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
-                        one_scale = q_descale = torch.tensor(
+                        one_scale = torch.tensor(
                             1.0, dtype=torch.float32, device=q.device
                         )
 
