@@ -279,6 +279,30 @@ class SchedulerMetricsMixin:
             # Others
             self.calculate_utilization()
             self.update_lora_metrics()
+            # Update KV cache utilization metrics
+            try:
+                utilization_info = self.tree_cache.get_utilization_metrics()
+                if utilization_info:
+                    self.stats.kv_cache_avg_active_ratio = utilization_info.get("avg_active_ratio", 0.0)
+                    self.stats.kv_cache_avg_access_frequency = utilization_info.get("avg_access_frequency", 0.0)
+                    self.stats.kv_cache_total_nodes = utilization_info.get("total_nodes", 0)
+                    self.stats.kv_cache_total_slots = utilization_info.get("total_slots", 0)
+            except Exception:
+                pass
+            # Log eviction events
+            try:
+                if hasattr(self.tree_cache, "get_recent_evictions"):
+                    # Get recent evictions and log them
+                    eviction_records = self.tree_cache.get_recent_evictions(max_count=10)
+                    for record in eviction_records:
+                        # Only log evictions that haven't been logged before
+                        if hasattr(record, "logged") and record.logged:
+                            continue
+                        self.metrics_collector.log_eviction_stats(record.num_tokens, record.reason)
+                        # Mark the record as logged
+                        record.logged = True
+            except Exception:
+                pass
             self.metrics_collector.log_stats(self.stats)
             self._emit_kv_metrics()
         self._publish_kv_events()

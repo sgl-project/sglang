@@ -255,6 +255,12 @@ class SchedulerStats:
     routing_key_running_req_counts: List[int] = field(default_factory=list)
     routing_key_all_req_counts: List[int] = field(default_factory=list)
 
+    # KV cache utilization metrics
+    kv_cache_avg_active_ratio: float = 0.0
+    kv_cache_avg_access_frequency: float = 0.0
+    kv_cache_total_nodes: int = 0
+    kv_cache_total_slots: int = 0
+
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
 
@@ -341,6 +347,41 @@ class SchedulerMetricsCollector:
             documentation="The sum of all sequence lengths in decode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
+        )
+        # KV cache utilization metrics
+        self.kv_cache_avg_active_ratio = Gauge(
+            name="sglang:kv_cache_avg_active_ratio",
+            documentation="Average active ratio of KV cache slots.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_avg_access_frequency = Gauge(
+            name="sglang:kv_cache_avg_access_frequency",
+            documentation="Average access frequency of KV cache slots.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_total_nodes = Gauge(
+            name="sglang:kv_cache_total_nodes",
+            documentation="Total nodes in KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_total_slots = Gauge(
+            name="sglang:kv_cache_total_slots",
+            documentation="Total slots in KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_eviction_total = Counter(
+            name="sglang:kv_cache_eviction_total",
+            documentation="Total number of KV cache evictions.",
+            labelnames=[*labels.keys(), "reason"],
+        )
+        self.kv_cache_evicted_tokens_total = Counter(
+            name="sglang:kv_cache_evicted_tokens_total",
+            documentation="Total number of KV cache tokens evicted.",
+            labelnames=[*labels.keys(), "reason"],
         )
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
@@ -1039,6 +1080,12 @@ class SchedulerMetricsCollector:
             self.labels, stats.routing_key_all_req_counts
         )
 
+        # KV cache utilization metrics
+        self._log_gauge(self.kv_cache_avg_active_ratio, stats.kv_cache_avg_active_ratio)
+        self._log_gauge(self.kv_cache_avg_access_frequency, stats.kv_cache_avg_access_frequency)
+        self._log_gauge(self.kv_cache_total_nodes, stats.kv_cache_total_nodes)
+        self._log_gauge(self.kv_cache_total_slots, stats.kv_cache_total_slots)
+
         self.last_log_time = time.perf_counter()
 
     def log_grammar_stats(self, grammar_stats) -> None:
@@ -1065,6 +1112,11 @@ class SchedulerMetricsCollector:
                 grammar_stats.num_timeout
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
+
+    def log_eviction_stats(self, num_tokens: int, reason: str) -> None:
+        """Log KV cache eviction statistics."""
+        self.kv_cache_eviction_total.labels(**self.labels, reason=reason).inc(1)
+        self.kv_cache_evicted_tokens_total.labels(**self.labels, reason=reason).inc(num_tokens)
 
 
 class TokenizerMetricsCollector:
