@@ -137,6 +137,7 @@ class VAEConfig(ModelConfig):
             default=VAEConfig.use_parallel_tiling,
             help="Whether to use parallel tiling for VAE",
         )
+
         return parser
 
     def get_vae_scale_factor(self):
