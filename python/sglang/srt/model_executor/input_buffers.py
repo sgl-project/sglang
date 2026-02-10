@@ -8,9 +8,7 @@ import torch
 _forward_input_buffer_pool: Dict[str, torch.Tensor] = {}
 
 
-def _grouped_foreach_copy_(
-    dsts: list[torch.Tensor], srcs: list[torch.Tensor]
-) -> None:
+def _grouped_foreach_copy_(dsts: list[torch.Tensor], srcs: list[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
     groups: dict[tuple[torch.dtype, torch.dtype], tuple[list, list]] = {}
     for dst, src in zip(dsts, srcs):
