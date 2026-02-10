@@ -23,6 +23,11 @@ impl ConfigValidator {
 
         Self::validate_compatibility(config)?;
 
+        // 验证 scheduler 配置（如果提供）
+        if let Some(ref scheduler) = config.scheduler {
+            Self::validate_scheduler(scheduler)?;
+        }
+
         let retry_cfg = config.effective_retry_config();
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
@@ -531,6 +536,52 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    /// 验证 Scheduler 配置参数的合法性
+    fn validate_scheduler(scheduler: &SchedulerConfig) -> ConfigResult<()> {
+        match scheduler {
+            SchedulerConfig::Proportion {
+                adjust_interval,
+                adjust_window,
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                regular_worker_weight,
+            } => {
+                if *adjust_interval == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "scheduler.adjust_interval".to_string(),
+                        value: adjust_interval.to_string(),
+                        reason: "scheduler.adjust_interval must be > 0".to_string(),
+                    });
+                }
+
+                if *adjust_window == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "scheduler.adjust_window".to_string(),
+                        value: adjust_window.to_string(),
+                        reason: "scheduler.adjust_window must be> 0".to_string(),
+                    });
+                }
+
+                if *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "scheduler.balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "scheduler.balance_rel_threshold must be >= 1.0".to_string(),
+                    });
+                }
+
+                if *regular_worker_weight <= 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "scheduler.regular_worker_weight".to_string(),
+                        value: regular_worker_weight.to_string(),
+                        reason: "scheduler.regular_worker_weight must be >= 0".to_string(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
