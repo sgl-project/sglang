@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import threading
 import time
@@ -304,6 +305,8 @@ class DefaultModelLoader(BaseModelLoader):
     # default number of thread when enable multithread weight loading
     DEFAULT_NUM_THREADS = 8
 
+    _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
+
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
@@ -538,23 +541,20 @@ class DefaultModelLoader(BaseModelLoader):
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
-    @staticmethod
+    @classmethod
     def _filter_mtp_weights(
-        weights_iterator, prefix: str, draft_model_idx: int
+        cls, weights_iterator, prefix: str, draft_model_idx: int
     ) -> Tuple[Tuple[str, torch.Tensor], ...]:
         """Filter MTP (Multi-Token Prediction) weights to keep only the
         specified draft model layer and remap it to layer 0."""
-        import re
-
-        pattern = r"model.mtp.layers.(\d+)."
         filtered_weights = []
         for name, tensor in weights_iterator:
-            group = re.match(pattern, name)
-            if group is not None:
-                idx = int(group.group(1))
+            match = cls._MTP_PATTERN.match(name)
+            if match is not None:
+                idx = int(match.group(1))
                 if idx != draft_model_idx:
                     continue
-                new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                new_name = name.replace(match.group(), "model.mtp.layers.0.")
             else:
                 new_name = name
             filtered_weights.append((prefix + new_name, tensor))
