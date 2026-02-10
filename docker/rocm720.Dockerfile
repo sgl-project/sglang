@@ -342,6 +342,7 @@ RUN python3 -m pip install --no-cache-dir \
 
 # -----------------------
 # MORI (optional)
+ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 RUN /bin/bash -lc 'set -euo pipefail; \
   if [ "${ENABLE_MORI}" != "1" ]; then \
     echo "[MORI] Skipping (ENABLE_MORI=${ENABLE_MORI})"; \
