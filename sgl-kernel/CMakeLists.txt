@@ -415,9 +415,6 @@ endif()
 set(MSCCLPP_USE_CUDA ON)
 set(MSCCLPP_BYPASS_GPU_CHECK ON)
 set(MSCCLPP_BUILD_TESTS OFF)
-# Workaround: Py_LIMITED_API (set by scikit-build-core USE_SABI) hides internal
-# CPython APIs like _PyUnicodeWriter, but torch's pythoncapi_compat.h needs them.
-remove_definitions(-DPy_LIMITED_API)
 add_subdirectory(
     ${repo-mscclpp_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
@@ -554,10 +551,7 @@ set(DEEPGEMM_SOURCES
     "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
 )
 
-# Note: USE_SABI is intentionally omitted here because DeepGEMM's python_api.cpp
-# uses pybind11 which requires the full (non-limited) Python C API.
-Python_add_library(deep_gemm_cpp MODULE WITH_SOABI ${DEEPGEMM_SOURCES})
-# scikit-build-core may inject Py_LIMITED_API globally; force-undefine it for this target.
+Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 target_compile_options(deep_gemm_cpp PRIVATE "-UPy_LIMITED_API")
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
