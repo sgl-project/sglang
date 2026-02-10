@@ -173,6 +173,10 @@ class HiRadixCache(RadixCache):
 
         self.evictable_host_leaves = set()
 
+        # PIN infrastructure: reverse lookup and external pin tracking
+        self.block_hash_index: dict[int, TreeNode] = {}
+        self.external_pin_count: dict[int, int] = {}
+
         super().__init__(params=params)
 
     def shutdown(self):
@@ -585,6 +589,8 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self.block_hash_index.clear()
+        self.external_pin_count.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -862,6 +868,26 @@ class HiRadixCache(RadixCache):
 
     def evictable_size(self):
         return self.evictable_size_
+
+    ##### Block Hash Index (PIN infrastructure) #####
+
+    def _index_node_hashes(self, node: TreeNode):
+        """Add node's block hashes to reverse index."""
+        if node.hash_value is None:
+            return
+        for hash_str in node.hash_value:
+            block_hash = hash_str_to_int64(hash_str)
+            self.block_hash_index[block_hash] = node
+
+    def _unindex_node_hashes(self, node: TreeNode):
+        """Remove node's block hashes from reverse index."""
+        if node.hash_value is None:
+            return
+        for hash_str in node.hash_value:
+            block_hash = hash_str_to_int64(hash_str)
+            self.block_hash_index.pop(block_hash, None)
+
+    ##### PIN / UNPIN / FLUSH #####
 
     def flush(self) -> dict:
         """Flush unpinned cache from GPU and CPU, preserving pinned blocks."""

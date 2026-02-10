@@ -2084,9 +2084,11 @@ class Scheduler(
                 available = self.token_to_kv_pool_allocator.available_size()
 
                 # Check if the request is mathematically impossible to schedule
-                if protected > total - req_tokens:
+                if protected > total - req_tokens and hasattr(
+                    self.tree_cache, "unpin_blocks"
+                ):
                     pinned_hashes = list(
-                        self.tree_cache.external_pin_count.keys()
+                        getattr(self.tree_cache, "external_pin_count", {}).keys()
                     )
                     unpinned = self.tree_cache.unpin_blocks(pinned_hashes)
                     logger.warning(
@@ -2585,6 +2587,12 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def pin_blocks_wrapped(self, recv_req: PinBlocksReqInput):
+        if not hasattr(self.tree_cache, "pin_blocks"):
+            return PinBlocksReqOutput(
+                success=False,
+                pinned_count=0,
+                message="PIN requires --enable-hierarchical-cache",
+            )
         pinned = self.tree_cache.pin_blocks(recv_req.block_hashes)
         return PinBlocksReqOutput(
             success=True,
@@ -2593,6 +2601,12 @@ class Scheduler(
         )
 
     def unpin_blocks_wrapped(self, recv_req: UnpinBlocksReqInput):
+        if not hasattr(self.tree_cache, "unpin_blocks"):
+            return UnpinBlocksReqOutput(
+                success=False,
+                unpinned_count=0,
+                message="PIN requires --enable-hierarchical-cache",
+            )
         unpinned = self.tree_cache.unpin_blocks(recv_req.block_hashes)
         return UnpinBlocksReqOutput(
             success=True,
@@ -2630,7 +2644,7 @@ class Scheduler(
             self.cur_batch = None
             self.last_batch = None
 
-            if self.tree_cache.external_pin_count:
+            if getattr(self.tree_cache, "external_pin_count", {}):
                 # Selective flush: preserve pinned blocks
                 self.tree_cache.flush()
             else:
