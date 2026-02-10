@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -1287,6 +1288,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
 
+    # Pending accept info from last batch for overlapped grammar processing
+    # Tuple of (last_batch, last_result)
+    pending_accept_info: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
+
     # Whether to return hidden states
     return_hidden_states: bool = False
 
@@ -2215,6 +2220,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            pending_accept_info=self.pending_accept_info,
+            return_hidden_states_before_norm=self.return_hidden_states_before_norm,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2239,6 +2246,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2396,6 +2404,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+    # Pending accept info from last batch for overlapped grammar processing
+    # Tuple of (last_batch, last_result)
+    pending_accept_info: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
