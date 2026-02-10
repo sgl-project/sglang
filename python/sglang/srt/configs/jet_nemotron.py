@@ -3,7 +3,11 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape, mamba2_state_dtype
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 
 @dataclass

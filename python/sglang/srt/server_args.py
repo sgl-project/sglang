@@ -4108,7 +4108,7 @@ class ServerArgs:
             default=None,
             choices=MAMBA_SSM_DTYPE_CHOICES,
             help="The data type of the SSM states in mamba cache. "
-                 "If not set, will be read from model config (mamba_ssm_dtype).",
+            "If not set, will be read from model config (mamba_ssm_dtype).",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",

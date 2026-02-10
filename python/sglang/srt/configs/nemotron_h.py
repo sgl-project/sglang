@@ -19,7 +19,11 @@ import regex as re
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape, mamba2_state_dtype
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 logger = logging.get_logger(__name__)
 

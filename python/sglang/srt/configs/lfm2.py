@@ -20,7 +20,11 @@ from transformers import CONFIG_MAPPING
 from transformers import Lfm2Config as HFLfm2Config
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape, mamba2_state_dtype
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 logger = logging.get_logger(__name__)
 

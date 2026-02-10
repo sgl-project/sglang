@@ -47,16 +47,16 @@ class Mamba2StateDType:
 def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     """
     Get mamba2 state dtype from config or environment variable.
-    
+
     Priority:
     1. Default "float32"
     2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype) - if exists, override
     3. Environment variable SGLANG_MAMBA_SSM_DTYPE - if not None, override
-    
+
     Args:
         config: Optional config object (PretrainedConfig). If provided, will read
                 mamba_ssm_dtype from it. For VL models, reads from text_config.
-    
+
     Returns:
         Mamba2StateDType with conv and temporal dtypes
     """
@@ -66,20 +66,22 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         "float16": torch.float16,
     }
     conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
-    
+
     # Get SSM dtype: default -> config -> env var
     ssm_dtype = torch.float32  # Step 1: Default value
-    
+
     # Step 2: Try to read from config
     if config is not None:
         config_dtype = None
-        if hasattr(config, "text_config") and hasattr(config.text_config, "mamba_ssm_dtype"):
+        if hasattr(config, "text_config") and hasattr(
+            config.text_config, "mamba_ssm_dtype"
+        ):
             # VL model: read from text_config
             config_dtype = getattr(config.text_config, "mamba_ssm_dtype", None)
         elif hasattr(config, "mamba_ssm_dtype"):
             # Text model: read from root config
             config_dtype = getattr(config, "mamba_ssm_dtype", None)
-        
+
         if config_dtype is not None:
             if config_dtype not in dtype_map:
                 logger.warning(
@@ -88,7 +90,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
                 )
             else:
                 ssm_dtype = dtype_map[config_dtype]
-    
+
     # Step 3: Check environment variable, if not None, override
     env_ssm_dtype = envs.SGLANG_MAMBA_SSM_DTYPE.get()
     if env_ssm_dtype is not None:
@@ -99,7 +101,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
             )
         else:
             ssm_dtype = dtype_map[env_ssm_dtype]
-    
+
     logger.info(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
