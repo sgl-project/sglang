@@ -1626,10 +1626,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
-            if (
-                isinstance(kv_cache_quant_algo, str)
-                and kv_cache_quant_algo.upper() == "FP8"
-            ):
+            normalized_kv_cache_quant_algo = (
+                kv_cache_quant_algo.upper()
+                if isinstance(kv_cache_quant_algo, str)
+                else None
+            )
+            if normalized_kv_cache_quant_algo == "FP8":
                 if _is_hip:
                     self.kv_cache_dtype = fp8_dtype
                     self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
@@ -1640,6 +1642,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
                         self.kv_cache_dtype
                     ]
+            elif normalized_kv_cache_quant_algo in ("FP4", "FLOAT4", "NVFP4"):
+                if hasattr(torch, "float4_e2m1fn_x2"):
+                    self.kv_cache_dtype = torch.float4_e2m1fn_x2
+                    self.server_args.kv_cache_dtype = "fp4_e2m1"
+                    log_info_on_rank0(
+                        logger,
+                        "Auto-detected ModelOpt FP4 KV cache config "
+                        f"({normalized_kv_cache_quant_algo}) and mapped it to "
+                        "--kv-cache-dtype=fp4_e2m1.",
+                    )
+                else:
+                    logger.warning(
+                        "Model config indicates FP4 KV cache (%s), but this torch "
+                        "version does not support torch.float4_e2m1fn_x2. Falling "
+                        "back to model dtype for KV cache.",
+                        normalized_kv_cache_quant_algo,
+                    )
+                    self.kv_cache_dtype = self.dtype
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
