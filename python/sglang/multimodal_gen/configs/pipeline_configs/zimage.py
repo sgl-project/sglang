@@ -16,6 +16,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
@@ -49,7 +50,7 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
     vae_config: VAEConfig = field(default_factory=FluxVAEConfig)
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (TextEncoderConfig(),)
+        default_factory=lambda: (Qwen3TextConfig(),)
     )
 
     preprocess_text_funcs: tuple[Callable, ...] = field(
