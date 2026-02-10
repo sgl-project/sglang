@@ -4,11 +4,11 @@ import asyncio
 import os
 import sys
 
-from sglang.srt.utils import kill_process_tree, suppress_other_loggers
-
-suppress_other_loggers()
-
 from sglang.srt.server_args import prepare_server_args
+from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.common import suppress_noisy_warnings
+
+suppress_noisy_warnings()
 
 
 def run_server(server_args):

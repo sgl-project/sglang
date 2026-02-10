@@ -1057,7 +1057,8 @@ def encode_video(video_path, frame_count_limit=None):
     return frames
 
 
-def suppress_other_loggers():
+def suppress_noisy_warnings():
+    """Suppress known noisy warnings from third-party libraries."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -1071,6 +1072,10 @@ def suppress_other_loggers():
         message="The cuda.nvrtc module is deprecated",
         category=FutureWarning,
     )
+
+
+def suppress_other_loggers():
+    suppress_noisy_warnings()
 
     try:
         from vllm.logger import logger as vllm_default_logger
