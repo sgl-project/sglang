@@ -4,6 +4,10 @@
 # Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
 
 
+import os
+import tempfile
+from pathlib import Path
+
 import torch
 from torch import nn
 from torch.distributed._composable.fsdp import (
@@ -43,12 +47,23 @@ class BaseLayerWithLoRA(nn.Module):
         base_layer: nn.Module,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        weight_backup_mode: str = "cpu",
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
-        self.cpu_weight = base_layer.weight.to("cpu")
+        # weight_backup_mode: "cpu" (keep in CPU RAM), "disk" (offload to disk), "none" (no backup)
+        self.weight_backup_mode = weight_backup_mode
+        self.cpu_weight: torch.Tensor | None = None
+        self.disk_weight_path: str | None = None
+        
+        if weight_backup_mode == "cpu":
+            self.cpu_weight = base_layer.weight.to("cpu")
+        elif weight_backup_mode == "disk":
+            self._save_weight_to_disk(base_layer.weight)
+        # elif weight_backup_mode == "none": do nothing
+        
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
         # Default to True to prevent using uninitialized weights; set to False when weights are loaded
@@ -63,6 +78,27 @@ class BaseLayerWithLoRA(nn.Module):
 
         self.lora_A = None
         self.lora_B = None
+
+    def _save_weight_to_disk(self, weight: torch.Tensor) -> None:
+        """Save weight to a temporary file on disk."""
+        temp_dir = Path(tempfile.gettempdir()) / "sglang_lora_weights"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        self.disk_weight_path = str(temp_dir / f"weight_{id(self)}.pt")
+        torch.save(weight.cpu(), self.disk_weight_path)
+    
+    def _load_weight_from_disk(self) -> torch.Tensor:
+        """Load weight from disk."""
+        if self.disk_weight_path is None or not os.path.exists(self.disk_weight_path):
+            raise FileNotFoundError("Disk weight file not found")
+        return torch.load(self.disk_weight_path, weights_only=True)
+    
+    def __del__(self):
+        """Clean up disk weight file if it exists."""
+        if self.disk_weight_path and os.path.exists(self.disk_weight_path):
+            try:
+                os.remove(self.disk_weight_path)
+            except Exception:
+                pass
 
     @property
     def weight(self):
@@ -186,6 +222,11 @@ class BaseLayerWithLoRA(nn.Module):
             return
 
         if self.merged:
+            if self.weight_backup_mode == "none":
+                raise ValueError(
+                    "LoRA re-merge requires unmerge, which is disabled (no backup of original weights). "
+                    "Cannot re-merge with different strength; please restart the server."
+                )
             self.unmerge_lora_weights()
 
         # Use lora_weights_list if available, otherwise fall back to single LoRA for backward compatibility
@@ -255,22 +296,31 @@ class BaseLayerWithLoRA(nn.Module):
                 "LoRA weights not merged. Please merge them first before unmerging."
             )
 
+        # Get original weight based on backup mode
+        if self.weight_backup_mode == "none":
+            raise ValueError(
+                "LoRA unmerge is disabled (no backup of original weights). "
+                "Cannot unmerge; please restart the server."
+            )
+        
+        original_weight = self.cpu_weight if self.weight_backup_mode == "cpu" else self._load_weight_from_disk()
+        
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
             old_weight = self.base_layer.weight
-            new_weight_data = self.cpu_weight.to(device, non_blocking=True)
+            new_weight_data = original_weight.to(device, non_blocking=True)
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
         else:
             current_device = self.base_layer.weight.data.device
-            cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
-            self.base_layer.weight.data.copy_(cpu_weight_on_device)
+            weight_on_device = original_weight.to(current_device, non_blocking=True)
+            self.base_layer.weight.data.copy_(weight_on_device)
             if (
-                cpu_weight_on_device.data_ptr()
+                weight_on_device.data_ptr()
                 != self.base_layer.weight.data.data_ptr()
             ):
-                del cpu_weight_on_device
+                del weight_on_device
 
         self.merged = False
 
@@ -303,8 +353,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: ColumnParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        weight_backup_mode: str = "cpu",
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, weight_backup_mode)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         # duplicate the logic in ColumnParallelLinear
@@ -338,8 +389,9 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: MergedColumnParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        weight_backup_mode: str = "cpu",
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, weight_backup_mode)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A.to(self.base_layer.weight)
@@ -360,8 +412,9 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         base_layer: QKVParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        weight_backup_mode: str = "cpu",
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, weight_backup_mode)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -393,8 +446,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         base_layer: RowParallelLinear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        weight_backup_mode: str = "cpu",
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, weight_backup_mode)
 
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in RowParallelLinear
@@ -451,8 +505,9 @@ class LinearWithLoRA(BaseLayerWithLoRA):
         base_layer: nn.Linear,
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
+        weight_backup_mode: str = "cpu",
     ) -> None:
-        super().__init__(base_layer, lora_rank, lora_alpha)
+        super().__init__(base_layer, lora_rank, lora_alpha, weight_backup_mode)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -487,6 +542,7 @@ def wrap_with_lora_layer(
     layer: nn.Module,
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
+    weight_backup_mode: str = "cpu",
 ) -> BaseLayerWithLoRA | None:
     """
     transform the given layer to its corresponding LoRA layer
@@ -509,6 +565,7 @@ def wrap_with_lora_layer(
                 layer,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
+                weight_backup_mode=weight_backup_mode,
             )
             return ret
     return None

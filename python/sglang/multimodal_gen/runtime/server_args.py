@@ -286,6 +286,8 @@ class ServerArgs:
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
+    # Weight backup mode for LoRA: "cpu" (keep in CPU RAM), "disk" (offload to disk), "none" (no backup, disable hot-swapping)
+    lora_weight_backup_mode: str = "cpu"
 
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
@@ -747,6 +749,15 @@ class ServerArgs:
             type=float,
             default=ServerArgs.lora_scale,
             help="LoRA scale for merging (e.g., 0.125 for Hyper-SD). Same as lora_scale in Diffusers",
+        )
+        parser.add_argument(
+            "--lora-weight-backup-mode",
+            type=str,
+            choices=["cpu", "disk", "none"],
+            default=ServerArgs.lora_weight_backup_mode,
+            help='Weight backup mode for LoRA: "cpu" (keep in CPU RAM, fastest hot-swap), '
+            '"disk" (offload to disk, slower hot-swap but saves CPU RAM), '
+            '"none" (no backup, disable hot-swapping, minimal memory usage).',
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)

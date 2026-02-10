@@ -247,6 +247,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 layer,
                 lora_rank=self.lora_rank,
                 lora_alpha=self.lora_alpha,
+                weight_backup_mode=self.server_args.lora_weight_backup_mode,
             )
             if lora_layer is not None:
                 target_lora_layers[name] = lora_layer
@@ -594,6 +595,11 @@ class LoRAPipeline(ComposedPipelineBase):
         Load LoRA adapter(s) into the pipeline and apply them to the specified transformer(s).
         Supports both single LoRA (backward compatible) and multiple LoRA adapters.
         """
+        if self.server_args.lora_weight_backup_mode == "none" and self.is_lora_set("all"):
+            raise ValueError(
+                "LoRA hot-switching is disabled (lora_weight_backup_mode='none'). "
+                "Please restart the server to remove/switch LoRA."
+            )
         # Normalize inputs to lists for multi-LoRA support
         lora_nicknames, lora_paths, strengths, targets = self._normalize_lora_params(
             lora_nickname, lora_path, strength, target
@@ -721,6 +727,11 @@ class LoRAPipeline(ComposedPipelineBase):
                     "transformer_2", "critic".
             strength: LoRA strength for merge, default 1.0.
         """
+        if self.server_args.lora_weight_backup_mode == "none":
+            raise ValueError(
+                "LoRA hot-switching is disabled (lora_weight_backup_mode='none'). "
+                "Please restart the server to merge LoRA."
+            )
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("merge_lora_weights: %s", error)
@@ -775,6 +786,11 @@ class LoRAPipeline(ComposedPipelineBase):
             target: Which transformer(s) to unmerge. One of "all", "transformer",
                     "transformer_2", "critic".
         """
+        if self.server_args.lora_weight_backup_mode == "none":
+            raise ValueError(
+                "LoRA hot-switching is disabled (lora_weight_backup_mode='none'). "
+                "Please restart the server to unmerge LoRA."
+            )
         target_modules, error = self._get_target_lora_layers(target)
         if error:
             logger.warning("unmerge_lora_weights: %s", error)
