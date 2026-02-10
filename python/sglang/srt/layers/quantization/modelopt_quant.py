@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    dequantize_mxfp8,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -1964,19 +1965,6 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         super().__init__()
         self.quant_config = quant_config
 
-    @staticmethod
-    def _dequantize_mxfp8(data: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
-        """Dequantize MXFP8 tensor with UE8M0 scales back to bf16."""
-        group_size = 32
-        m, k = data.shape
-        n_groups = k // group_size
-        scales_f32 = torch.pow(
-            2.0, scale_u8.to(dtype=torch.float32, device=data.device) - 127.0
-        )
-        data_f32 = data.to(torch.float32).view(m, n_groups, group_size)
-        scales_f32 = scales_f32.view(m, n_groups, 1)
-        return (data_f32 * scales_f32).view(m, k).to(torch.bfloat16)
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -2029,7 +2017,7 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         # Checkpoint MXFP8 stores raw FP8 data and per-block UE8M0 scales.
         # Reconstruct bf16 values first, then requantize to flashinfer swizzled
         # scales so mm_mxfp8 can consume them directly.
-        weight_bf16 = self._dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
+        weight_bf16 = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
         weight_q, weight_scale = mxfp8_quantize(
             weight_bf16, is_sf_swizzled_layout=True, backend="cuda"
         )
@@ -2061,7 +2049,7 @@ class ModelOptMxfp8LinearMethod(LinearMethodBase):
         if isinstance(x, tuple):
             input_scale = x[1]
             if input_scale.dim() == 2:
-                input_2d = self._dequantize_mxfp8(
+                input_2d = dequantize_mxfp8(
                     input_2d,
                     input_scale.view(-1, input_scale.shape[-1]),
                 )
@@ -2184,9 +2172,7 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs_block)
 
     @staticmethod
-    def _swizzle_mxfp8_scales(
-        weight_shape: tuple, scale: torch.Tensor
-    ) -> torch.Tensor:
+    def _swizzle_mxfp8_scales(weight_shape: tuple, scale: torch.Tensor) -> torch.Tensor:
         """Swizzle uint8 UE8M0 scales for CUTLASS MXFP8 MoE kernel."""
         from triton_kernels.tensor import convert_layout, wrap_torch_tensor
         from triton_kernels.tensor_details import layout
@@ -2270,16 +2256,16 @@ class ModelOptMxfp8MoEMethod(FusedMoEMethodBase):
         self.c_strides2 = torch.full(
             (num_experts,), hidden_size, device=device, dtype=torch.int64
         )
-        self.workspace = torch.empty(90000, device=device, dtype=torch.uint8)
+        from sglang.srt.layers.moe.cutlass_moe import CUTLASS_MOE_WORKSPACE_BYTES
+
+        self.workspace = torch.empty(
+            CUTLASS_MOE_WORKSPACE_BYTES, device=device, dtype=torch.uint8
+        )
         self.a_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
         self.b_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
         self.out_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
-        self.a_scales_ptr = torch.empty(
-            num_experts, device=device, dtype=torch.int64
-        )
-        self.b_scales_ptr = torch.empty(
-            num_experts, device=device, dtype=torch.int64
-        )
+        self.a_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
+        self.b_scales_ptr = torch.empty(num_experts, device=device, dtype=torch.int64)
         self.expert_offsets = torch.empty(
             num_experts + 1, device=device, dtype=torch.int32
         )

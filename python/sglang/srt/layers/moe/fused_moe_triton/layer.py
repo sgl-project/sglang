@@ -784,6 +784,11 @@ class FusedMoE(torch.nn.Module):
                         expert_data=expert_data,
                         tp_rank=tp_rank,
                     )
+                else:
+                    logger.warning(
+                        "MXFP8 MoE: ignoring unrecognized weight %s",
+                        weight_name,
+                    )
                 return
 
             # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
