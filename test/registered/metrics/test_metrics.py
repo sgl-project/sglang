@@ -46,10 +46,13 @@ class TestEnableMetrics(CustomTestCase):
                     "sglang:dp_cooperation_realtime_tokens_total",
                     {"mode": "prefill_compute"},
                 ),
-                ("sglang:dp_cooperation_realtime_tokens_total", {"mode": "decode"}),
+                (
+                    "sglang:dp_cooperation_realtime_tokens_total",
+                    {"mode": "decode"},
+                ),
                 (
                     "sglang:dp_cooperation_gpu_execution_seconds_total",
-                    {"category": "forward_prefill"},
+                    {"category": "forward_extend"},
                 ),
                 (
                     "sglang:dp_cooperation_gpu_execution_seconds_total",
