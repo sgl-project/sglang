@@ -130,8 +130,7 @@ else
   docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
-  #docker exec -w / ci_sglang git clone https://github.com/merrymercy/human-eval.git
-  git_clone_with_retry https://github.com/merrymercy/human-eval.git human-eval
+  git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
   docker cp human-eval ci_sglang:/
   install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
