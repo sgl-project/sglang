@@ -8,7 +8,7 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW8A8Int8DynamicMoEMethod,
 )
-from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
+from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ __all__ = [
 ]
 
 
-class ModelSlimW8A8Int8MoE(ModelSlimScheme):
+class ModelSlimW8A8Int8MoE(ModelSlimMoEScheme):
 
     def __init__(
         self,

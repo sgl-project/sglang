@@ -1,24 +1,22 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
-__all__ = ["ModelSlimLinearScheme", "ModelSlimMoEScheme"]
+__all__ = ["BaseLinearScheme", "BaseMoEScheme"]
 
 
-class ModelSlimLinearScheme(BaseLinearScheme):
+class BaseLinearScheme(ABC):
     """
     Abstract class used to describe the weight creation and forward pass
-    of different quantization schemes supported by ModelSlim.
+    of different quantization schemes.
     """
 
     @abstractmethod
@@ -54,10 +52,10 @@ class ModelSlimLinearScheme(BaseLinearScheme):
         raise NotImplementedError
 
 
-class ModelSlimMoEScheme(BaseMoEScheme):
+class BaseMoEScheme(ABC):
     """
     Abstract class used to describe the weight creation and forward pass
-    of different quantization schemes supported by ModelSlim.
+    of different quantization schemes.
     """
 
     @abstractmethod
@@ -69,6 +67,12 @@ class ModelSlimMoEScheme(BaseMoEScheme):
         raise NotImplementedError
 
     @abstractmethod
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        raise NotImplementedError
+
+    @abstractmethod
     def process_weights_after_loading(self, layer: torch.nn.Module):
         """
         Called after weight loading is complete for any cleanup that
@@ -76,15 +80,10 @@ class ModelSlimMoEScheme(BaseMoEScheme):
         """
         raise NotImplementedError
 
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
-    ):
-        raise NotImplementedError
-
     @abstractmethod
     def apply_weights(
         self,
-        layer,
+        layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
     ):
         """

@@ -30,7 +30,11 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
-    from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimScheme
+    from sglang.srt.layers.quantization.modelslim.schemes import (
+        ModelSlimLinearScheme,
+        ModelSlimMoEScheme,
+    )
+
 logger = logging.getLogger(__name__)
 
 
@@ -158,7 +162,9 @@ class ModelSlimConfig(QuantizationConfig):
 
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
-            scheme = self.get_scheme(layer=layer, layer_name=prefix_in_quant_config)
+            scheme = self.get_linear_scheme(
+                layer=layer, layer_name=prefix_in_quant_config
+            )
             layer.scheme = scheme
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
@@ -169,7 +175,7 @@ class ModelSlimConfig(QuantizationConfig):
     def _get_scheme_from_parts(
         self,
         layer_name: str,
-    ) -> ModelSlimScheme:
+    ) -> ModelSlimLinearScheme:
 
         quant_type = self.quant_description.get(layer_name + ".weight", "")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
@@ -182,9 +188,9 @@ class ModelSlimConfig(QuantizationConfig):
             )
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
-    def get_scheme(
+    def get_linear_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
-    ) -> Optional[ModelSlimScheme]:
+    ) -> Optional[ModelSlimLinearScheme]:
         """
         get_scheme method adjusted for modelslim, taken from
         python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
@@ -201,8 +207,9 @@ class ModelSlimConfig(QuantizationConfig):
         self,
         layer: torch.nn.Module,
         prefix: str,
-    ) -> Optional[ModelSlimScheme]:
-        # TODO: @dsikka: check if the layer is being ignored.
+    ) -> Optional[ModelSlimMoEScheme]:
+        # TODO: @dsikka: refactor this to use schemes as other kernels
+        # are supported + check if the layer is being ignored.
 
         prefix_in_quant_config = prefix + ".0.down_proj.weight"
         is_moe_w4a8_dynamic = (
@@ -281,7 +288,7 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the ModelSlimScheme associated with each layer to create
+        Use the ModelSlimLinearScheme associated with the layer to create
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
@@ -303,7 +310,7 @@ class ModelSlimLinearMethod(_NPULinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ):
         """
-        Use the output of create_weights and the ModelSlimScheme
+        Use the output of create_weights and the ModelSlimLinearScheme
         associated with the layer to apply the forward pass with the
         layer input.  See LinearMethodBase for param details
 
@@ -333,7 +340,7 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the ModelSlimScheme associated with each layer to create
+        Use the ModelSlimMoEScheme associated with the layer to create
         the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
@@ -357,9 +364,9 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         """
-        Use the output of create_weights and the ModelSlimScheme
+        Use the output of create_weights and the ModelSlimMoEScheme
         associated with the layer to apply the forward pass with the
-        layer input.  See LinearMethodBase for param details
+        layer input.  See FusedMoEMethodBase for param details
 
         """
         scheme = layer.scheme
