@@ -46,34 +46,45 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
 
-def update_wheel_index_rocm(rocm_version):
-    index_dir = pathlib.Path(f"sgl-whl/rocm{rocm_version}/sgl-kernel")
+def _update_non_cuda_wheel_index(backend, version):
+    index_dir = pathlib.Path(f"sgl-whl/{backend}{version}/sgl-kernel")
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
     for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
-        # Skip the wheel if not rocm
-        if re.search(f"rocm", path.name) is None:
+        # Skip the wheel if not for this backend
+        if re.search(f"{backend}", path.name) is None:
             continue
         with open(path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
         ver = re.findall(
-            r"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+rocm[0-9]+)?-", path.name
+            rf"sgl_kernel-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-", path.name
         )[0]
         full_url = f"{base_url}/v{ver}/{path.name}#sha256={sha256}"
         with (index_dir / "index.html").open("a") as f:
             f.write(f'<a href="{full_url}">{path.name}</a><br>\n')
 
 
+def update_wheel_index_rocm(rocm_version):
+    _update_non_cuda_wheel_index("rocm", rocm_version)
+
+
+def update_wheel_index_musa(musa_version):
+    _update_non_cuda_wheel_index("musa", musa_version)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cuda", type=str, default=DEFAULT_CUDA_VERSION)
     parser.add_argument("--rocm", type=str, default=None)
+    parser.add_argument("--musa", type=str, default=None)
     args = parser.parse_args()
-    if args.rocm is None:
-        update_wheel_index(args.cuda)
-    else:
+    if args.musa is not None:
+        update_wheel_index_musa(args.musa)
+    elif args.rocm is not None:
         update_wheel_index_rocm(args.rocm)
+    else:
+        update_wheel_index(args.cuda)
 
 
 if __name__ == "__main__":
