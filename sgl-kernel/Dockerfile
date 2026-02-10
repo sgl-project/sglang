@@ -13,7 +13,7 @@ ARG PYTHON_TAG=cp310-cp310
 ARG CMAKE_VERSION_MAJOR=3.31
 ARG CMAKE_VERSION_MINOR=1
 # Install ccache 4.12.1 from source for CUDA support (yum provides old 3.7.7)
-ARG USE_CCACHE=1
+ARG USE_CCACHE=${USE_CCACHE:1}
 ARG CCACHE_VERSION=4.12.1
 ARG GITHUB_ARTIFACTORY=github.com
 ARG PYTORCH_MIRROR=download.pytorch.org
@@ -97,7 +97,7 @@ COPY . /sgl-kernel/
 ARG ENABLE_CMAKE_PROFILE
 ARG ENABLE_BUILD_PROFILE
 ARG ARCH=x86_64
-ARG USE_CCACHE=1
+ARG USE_CCACHE=${USE_CCACHE:1}
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
