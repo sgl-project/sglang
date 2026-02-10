@@ -31,6 +31,14 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     NSATokenToKVPoolHost,
 )
+from sglang.srt.disaggregation.kv_events import (
+    MEDIUM_CPU_TIER1,
+    MEDIUM_CPU_TIER2,
+    MEDIUM_GPU,
+    BlockRemoved,
+    BlockStored,
+)
+from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
@@ -164,6 +172,10 @@ class HiRadixCache(RadixCache):
         atexit.register(self.shutdown)
 
         self.evictable_host_leaves = set()
+
+        # PIN infrastructure: reverse lookup and external pin tracking
+        self.block_hash_index: dict[int, TreeNode] = {}
+        self.external_pin_count: dict[int, int] = {}
 
         super().__init__(params=params)
 
@@ -581,6 +593,8 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self.block_hash_index.clear()
+        self.external_pin_count.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -612,6 +626,137 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def _record_tier_store_event(self, node: TreeNode, medium: str):
+        """Record BlockStored events for tier transition.
+
+        Args:
+            node: The TreeNode being stored
+            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU_TIER1, etc.)
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        # Compute hash_value lazily if not already set
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        # Maintain block_hash_index for PIN/EVICT lookups
+        if medium == MEDIUM_GPU:
+            self._index_node_hashes(node)
+
+        # Get parent's last hash value for first page
+        parent_block_hash = None
+        if node.parent is not None and node.parent != self.root_node:
+            if (
+                node.parent.hash_value is not None
+                and len(node.parent.hash_value) > 0
+            ):
+                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                )
+            )
+
+            parent_block_hash = block_hash
+            page_index += 1
+
+    def _record_tier_remove_event(self, node: TreeNode, medium: str):
+        """Record BlockRemoved events for tier transition.
+
+        Args:
+            node: The TreeNode being removed
+            medium: The storage tier (MEDIUM_GPU, MEDIUM_CPU_TIER1, etc.)
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        # Compute hash_value lazily if not already set
+        if node.hash_value is None:
+            node.hash_value = compute_node_hash_values(node, self.page_size)
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+
+            self.kv_event_queue.append(
+                BlockRemoved(block_hashes=[block_hash], medium=medium)
+            )
+
+            page_index += 1
+
+    def _record_prefetch_store_events(
+        self,
+        token_ids: List[int],
+        hash_values: List[str],
+        parent_hash: Optional[str],
+        medium: str,
+    ):
+        """Record BlockStored events for data fetched from storage.
+
+        This is used when data arrives from remote storage (L3) to host memory (L2).
+        Unlike _record_tier_store_event which operates on TreeNode, this method
+        works directly with token_ids and hash_values from prefetch operations.
+
+        Args:
+            token_ids: List of token IDs that were fetched
+            hash_values: List of hash values for each page (one per page_size tokens)
+            parent_hash: Hash value of the parent block (for chaining)
+            medium: The storage tier where data is being stored
+        """
+        if not self.enable_kv_cache_events:
+            return
+
+        if not token_ids or not hash_values:
+            return
+
+        parent_block_hash = None
+        if parent_hash is not None:
+            parent_block_hash = hash_str_to_int64(parent_hash)
+
+        page_index = 0
+        for start in range(0, len(token_ids), self.page_size):
+            if page_index >= len(hash_values):
+                break
+
+            page_tokens = token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(hash_values[page_index])
+
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                    medium=medium,
+                )
+            )
+
+            parent_block_hash = block_hash
+            page_index += 1
+
     def write_backup(self, node: TreeNode, write_back=False):
         host_indices = self.cache_controller.write(
             device_indices=node.value,
@@ -630,6 +775,11 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
+            # Emit BlockStored for CPU_TIER1 - block is now ALSO in L2
+            # Note: We don't emit BlockRemoved(GPU) here because the GPU memory
+            # is still allocated. BlockRemoved(GPU) is emitted in _evict_backuped()
+            # when the GPU memory is actually freed.
+            self._record_tier_store_event(node, MEDIUM_CPU_TIER1)
         else:
             return 0
 
@@ -647,6 +797,9 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+
+        # Emit tier transition event: CPU_TIER1 -> CPU_TIER2 (L2 -> L3)
+        self._record_tier_store_event(node, MEDIUM_CPU_TIER2)
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -720,6 +873,109 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    ##### Block Hash Index (PIN infrastructure) #####
+
+    def _index_node_hashes(self, node: TreeNode):
+        """Add node's block hashes to reverse index."""
+        if node.hash_value is None:
+            return
+        for hash_str in node.hash_value:
+            block_hash = hash_str_to_int64(hash_str)
+            self.block_hash_index[block_hash] = node
+
+    def _unindex_node_hashes(self, node: TreeNode):
+        """Remove node's block hashes from reverse index."""
+        if node.hash_value is None:
+            return
+        for hash_str in node.hash_value:
+            block_hash = hash_str_to_int64(hash_str)
+            self.block_hash_index.pop(block_hash, None)
+
+    ##### PIN / UNPIN / FLUSH #####
+
+    def flush(self) -> dict:
+        """Flush unpinned cache from GPU and CPU, preserving pinned blocks."""
+        # Evict everything evictable from GPU
+        gpu_before = self.evictable_size_
+        if gpu_before > 0:
+            self.evict(EvictParams(num_tokens=gpu_before))
+        gpu_evicted = gpu_before - self.evictable_size_
+
+        # Evict everything evictable from host (pin_count blocks are skipped)
+        host_before = len(self.evictable_host_leaves)
+        self.evict_host(2**31)
+        host_after = len(self.evictable_host_leaves)
+
+        pinned = len(self.external_pin_count)
+        logger.info(
+            f"[PIN] flush: GPU evicted {gpu_evicted} tokens, "
+            f"host leaves {host_before}->{host_after}, "
+            f"{pinned} pinned blocks preserved"
+        )
+        return {
+            "gpu_evicted": gpu_evicted,
+            "host_leaves_before": host_before,
+            "host_leaves_after": host_after,
+            "pinned_blocks": pinned,
+        }
+
+    def pin_blocks(self, block_hashes: List[int]) -> int:
+        """Tier-aware pin: protects from CPU eviction, allows GPU eviction."""
+        if self.disable:
+            return 0
+
+        pinned = 0
+        for h in block_hashes:
+            node = self.block_hash_index.get(h)
+            if node is None:
+                continue
+            prev = self.external_pin_count.get(h, 0)
+            if prev == 0:
+                node.pin_count += 1
+                self._update_host_leaf_status(node)
+            self.external_pin_count[h] = prev + 1
+            pinned += 1
+        pinned_on_gpu = sum(
+            1 for h in block_hashes
+            if (n := self.block_hash_index.get(h)) is not None and not n.evicted
+        )
+        pinned_on_host = sum(
+            1 for h in block_hashes
+            if (n := self.block_hash_index.get(h)) is not None and n.evicted and n.backuped
+        )
+        logger.info(
+            f"[PIN] tier-aware pin_blocks: {pinned}/{len(block_hashes)} pinned "
+            f"(gpu={pinned_on_gpu}, host={pinned_on_host}, "
+            f"index_size={len(self.block_hash_index)})"
+        )
+        return pinned
+
+    def unpin_blocks(self, block_hashes: List[int]) -> int:
+        """Tier-aware unpin: restores CPU evictability."""
+        if self.disable:
+            return 0
+
+        unpinned = 0
+        for h in block_hashes:
+            count = self.external_pin_count.get(h, 0)
+            if count <= 0:
+                continue
+            node = self.block_hash_index.get(h)
+            if node is None:
+                self.external_pin_count.pop(h, None)
+                continue
+            if count == 1:
+                node.pin_count -= 1
+                self._update_host_leaf_status(node)
+                self.external_pin_count.pop(h, None)
+            else:
+                self.external_pin_count[h] = count - 1
+            unpinned += 1
+        logger.info(
+            f"[PIN] tier-aware unpin_blocks: {unpinned}/{len(block_hashes)} unpinned"
+        )
+        return unpinned
+
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -757,8 +1013,13 @@ class HiRadixCache(RadixCache):
         return delta
 
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if not node.evicted or node.lock_ref > 0 or node.pin_count > 0:
             if node in self.evictable_host_leaves:
+                if node.pin_count > 0:
+                    logger.debug(
+                        f"[PIN] _update_host_leaf_status: node {node.id} removed from "
+                        f"evictable_host_leaves (pin_count={node.pin_count})"
+                    )
                 self.evictable_host_leaves.remove(node)
             return
 
@@ -788,7 +1049,23 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
-            if not x.backuped:
+            if x.pin_count > 0:
+                # Pinned node: MUST backup to CPU before GPU eviction.
+                # Never pass to _evict_regular which deletes from tree.
+                if not x.backuped:
+                    logger.info(
+                        f"[PIN] evict: pinned node {x.id} (pin_count={x.pin_count}) "
+                        f"not yet backed up, force write_backup to CPU"
+                    )
+                    num_evicted += self.write_backup(x, write_back=True)
+                    write_back_nodes.append(x)
+                else:
+                    logger.info(
+                        f"[PIN] evict: pinned node {x.id} (pin_count={x.pin_count}) "
+                        f"already on CPU, evicting GPU copy via _evict_backuped"
+                    )
+                    num_evicted += self._evict_backuped(x)
+            elif not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     num_evicted += self.write_backup(x, write_back=True)
@@ -808,7 +1085,7 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-        if self.cache_controller.write_policy == "write_back":
+        if write_back_nodes:
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
@@ -819,6 +1096,8 @@ class HiRadixCache(RadixCache):
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
+        # Emit BlockRemoved(GPU) before freeing - block is leaving GPU tier
+        self._record_tier_remove_event(node, MEDIUM_GPU)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
@@ -831,6 +1110,9 @@ class HiRadixCache(RadixCache):
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host
+        # Emit BlockRemoved(GPU) before freeing - block is being deleted from GPU
+        self._record_tier_remove_event(node, MEDIUM_GPU)
+        self._unindex_node_hashes(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -855,8 +1137,18 @@ class HiRadixCache(RadixCache):
             # node is protected from eviction as it has ongoing prefetch or backup to storage
             if x.host_ref_counter > 0:
                 continue
+            if x.pin_count > 0:
+                logger.info(
+                    f"[PIN] evict_host: skipping pinned node {x.id} "
+                    f"(pin_count={x.pin_count})"
+                )
+                continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
+
+            # Emit BlockRemoved event for host memory (L2) eviction
+            self._record_tier_remove_event(x, MEDIUM_CPU_TIER1)
+            self._unindex_node_hashes(x)
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -913,11 +1205,25 @@ class HiRadixCache(RadixCache):
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
+        pinned_count = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
+            if node.pin_count > 0:
+                pinned_count += 1
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        if pinned_count > 0:
+            logger.info(
+                f"[PIN] load_back: loaded {len(nodes_to_load)} nodes "
+                f"({len(device_indices)} tokens) back to GPU, "
+                f"{pinned_count} are pinned"
+            )
+
+        # Emit BlockStored events for nodes loaded back to GPU
+        for node in nodes_to_load:
+            self._record_tier_store_event(node, MEDIUM_GPU)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
@@ -1101,6 +1407,28 @@ class HiRadixCache(RadixCache):
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
+        # Emit BlockStored events for data that arrived from storage (L3 -> L2)
+        if loaded_from_storage > 0:
+            # Get hash values for the newly loaded data (after matched_length)
+            start_page = matched_length // self.page_size
+            end_page = min_completed_tokens // self.page_size
+            new_hash_values = hash_value[start_page:end_page]
+            new_token_ids = fetched_token_ids[matched_length:]
+
+            # Get parent hash from the matched prefix
+            parent_hash = None
+            if start_page > 0 and len(hash_value) > 0:
+                parent_hash = hash_value[start_page - 1]
+            elif (
+                last_host_node.hash_value is not None
+                and len(last_host_node.hash_value) > 0
+            ):
+                parent_hash = last_host_node.hash_value[-1]
+
+            self._record_prefetch_store_events(
+                new_token_ids, new_hash_values, parent_hash, MEDIUM_CPU_TIER1
+            )
+
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
@@ -1272,6 +1600,7 @@ class HiRadixCache(RadixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
+        new_node.pin_count = child.pin_count
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
@@ -1330,6 +1659,8 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
+                    # Emit BlockStored(GPU) for restored node
+                    self._record_tier_store_event(node, MEDIUM_GPU)
                 else:
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
@@ -1345,6 +1676,8 @@ class HiRadixCache(RadixCache):
                     self._update_host_leaf_status(new_node)
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
+                    # Emit BlockStored(GPU) for restored split node
+                    self._record_tier_store_event(new_node, MEDIUM_GPU)
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
@@ -1369,6 +1702,9 @@ class HiRadixCache(RadixCache):
             # Compute hash_value if storage is enabled
             if self.enable_storage:
                 new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+
+            # Emit BlockStored(GPU) for new node
+            self._record_tier_store_event(new_node, MEDIUM_GPU)
 
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)

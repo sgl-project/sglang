@@ -1247,6 +1247,34 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
+class PinBlocksReqInput(BaseReq):
+    """Pin blocks to resist eviction."""
+
+    block_hashes: List[int] = field(default_factory=list)
+
+
+@dataclass
+class PinBlocksReqOutput(BaseReq):
+    success: bool
+    pinned_count: int = 0
+    message: str = ""
+
+
+@dataclass
+class UnpinBlocksReqInput(BaseReq):
+    """Unpin blocks to allow normal eviction."""
+
+    block_hashes: List[int] = field(default_factory=list)
+
+
+@dataclass
+class UnpinBlocksReqOutput(BaseReq):
+    success: bool
+    unpinned_count: int = 0
+    message: str = ""
+
+
+@dataclass
 class PauseGenerationReqInput(BaseReq):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.

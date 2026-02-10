@@ -108,6 +108,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    PinBlocksReqInput,
+    PinBlocksReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -123,6 +125,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnpinBlocksReqInput,
+    UnpinBlocksReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1018,6 +1022,8 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (PinBlocksReqInput, self.pin_blocks_wrapped),
+                (UnpinBlocksReqInput, self.unpin_blocks_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2552,6 +2558,34 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
+    def pin_blocks_wrapped(self, recv_req: PinBlocksReqInput):
+        if not hasattr(self.tree_cache, "pin_blocks"):
+            return PinBlocksReqOutput(
+                success=False,
+                pinned_count=0,
+                message="PIN requires --enable-hierarchical-cache",
+            )
+        pinned = self.tree_cache.pin_blocks(recv_req.block_hashes)
+        return PinBlocksReqOutput(
+            success=True,
+            pinned_count=pinned,
+            message=f"Pinned {pinned}/{len(recv_req.block_hashes)} blocks",
+        )
+
+    def unpin_blocks_wrapped(self, recv_req: UnpinBlocksReqInput):
+        if not hasattr(self.tree_cache, "unpin_blocks"):
+            return UnpinBlocksReqOutput(
+                success=False,
+                unpinned_count=0,
+                message="PIN requires --enable-hierarchical-cache",
+            )
+        unpinned = self.tree_cache.unpin_blocks(recv_req.block_hashes)
+        return UnpinBlocksReqOutput(
+            success=True,
+            unpinned_count=unpinned,
+            message=f"Unpinned {unpinned}/{len(recv_req.block_hashes)} blocks",
+        )
+
     def _is_no_request(self):
         no_request = (
             self.running_batch.is_empty()
@@ -2573,13 +2607,24 @@ class Scheduler(
         return no_request
 
     def flush_cache(self):
-        """Flush the memory pool and cache."""
+        """Flush the memory pool and cache.
+
+        If there are pinned blocks, selectively evicts unpinned entries
+        while preserving pinned blocks. Otherwise does a full reset.
+        """
         if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
+
+            if getattr(self.tree_cache, "external_pin_count", {}):
+                # Selective flush: preserve pinned blocks
+                self.tree_cache.flush()
+            else:
+                # Nuclear flush: no pins, reset everything
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+
             self.grammar_manager.clear()
             self.reset_metrics()
 

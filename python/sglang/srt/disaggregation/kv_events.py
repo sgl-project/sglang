@@ -59,6 +59,8 @@ class KVCacheEvent(
 # Medium values for hicache storage tiers
 MEDIUM_GPU = "GPU"
 MEDIUM_CPU = "CPU_PINNED"
+MEDIUM_CPU_TIER1 = "CPU_TIER1"
+MEDIUM_CPU_TIER2 = "CPU_TIER2"
 
 
 class BlockStored(KVCacheEvent):

@@ -104,6 +104,8 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
+        # pin_count: protects from CPU/host eviction only (external PIN API via HiRadixCache).
+        self.pin_count = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
