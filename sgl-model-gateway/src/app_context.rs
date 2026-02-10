@@ -5,7 +5,6 @@ use std::{
 
 use reqwest::Client;
 use tracing::debug;
-use tracing::info;
 
 use crate::{
     config::RouterConfig,
@@ -426,7 +425,6 @@ impl AppContextBuilder {
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
         self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
-        info!("with_policy_registry ==> {:#?}", self.policy_registry );
         self
     }
 

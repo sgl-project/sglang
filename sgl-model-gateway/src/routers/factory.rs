@@ -1,7 +1,6 @@
 //! Factory for creating router instances
 
 use std::sync::Arc;
-use tracing::info;
 
 use super::{
     grpc::{pd_router::GrpcPDRouter, router::GrpcRouter},
@@ -66,8 +65,6 @@ impl RouterFactory {
     pub async fn create_regular_router(
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
-        info!("regular_ctx ==> {:#?}", ctx);
-        info!("regular_ctx.policy_registry = {:#?}", ctx.policy_registry);
         let router = Router::new(ctx).await?;
 
         Ok(Box::new(router))
@@ -87,10 +84,6 @@ impl RouterFactory {
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
-        info!("pd_ctx ==> {:#?}", ctx);
-        info!("pd_ctx.policy_registry = {:#?}", ctx.policy_registry);
-        info!("pf_prefill_policy = {:#?}", ctx.policy_registry.get_prefill_policy());
-        info!("pf_decode_policy = {:#?}", ctx.policy_registry.get_decode_policy());
 
         let router = PDRouter::new(ctx).await?;
 

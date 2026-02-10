@@ -102,7 +102,6 @@ impl RouterManager {
             app_context.tokenizer_registry.clone(),
         );
         manager.enable_igw = config.router_config.enable_igw;
-        // 仅当用户显式配置了 scheduler 时才创建，否则走默认路由选择逻辑
         if let Some(ref scheduler_config) = config.router_config.scheduler {
             let scheduler = SchedulerFactory::create_from_config(scheduler_config, app_context);
             manager.scheduler = Some(scheduler);
@@ -186,7 +185,6 @@ impl RouterManager {
                 "RouterManager initialized with {} routers for multi-router mode",
                 manager.router_count(),
             );
-
         } else {
             info!("Initializing RouterManager in single-router mode");
 
@@ -301,7 +299,6 @@ impl RouterManager {
 
     pub fn get_router_for_model(&self, model_id: &str) -> Option<Arc<dyn RouterTrait>> {
         let workers = self.worker_registry.get_by_model(model_id);
-        // info!("get_router_for_model == > workers {:#?}", workers);
 
         // Find the best router ID based on worker capabilities
         // Priority: external (OpenAI) > grpc-pd > http-pd > grpc-regular > http-regular
@@ -369,7 +366,6 @@ impl RouterManager {
                 return self.routers.get(default_id).map(|r| r.clone());
             }
         }
-        info!("begin to select router.");
         let prefer_pd = headers
             .and_then(|h| {
                 h.get("x-prefer-pd")
@@ -386,8 +382,6 @@ impl RouterManager {
         let is_router_valid =
             |is_pd: bool| (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
         
-
-        // 默认的选择逻辑
         if self.scheduler.is_none() {
             if let Some(model) = model_id {
                 // Efficient Single Lookup for Specific Model
@@ -425,13 +419,10 @@ impl RouterManager {
         }
         info!("Using scheduler to select router.");
         let candidate_routers: Vec<RouterId> = (*self.routers).iter().map(|entry| entry.key().clone()).collect();
-        info!("candidate_routers ==> {:#?}", candidate_routers);
         if candidate_routers.is_empty() {
             warn!("No candidate routers available for scheduling.");
             return None;
         }
-        // 根据模型id获取tokens
-        info!("根据模型id:{:?},选择tokenizer",model_id);
         let mut tokens = None;
         if let (Some(mid), Some(text)) = (model_id, prompt_text) {
             if let Some(tokenizer) = self.tokenizer_registry.get(mid) {
@@ -442,7 +433,6 @@ impl RouterManager {
                     Err(e) => warn!("Failed to encode prompt for model '{}': {}", mid, e),
                 }
             } else {
-                info!("没找到合适的tokenizer");
                 warn!(
                     "Tokenizer for model '{}' not found in registry. Scheduling will be based on 0 tokens.",
                     mid
@@ -455,7 +445,6 @@ impl RouterManager {
             tokens: tokens.as_deref(),
             model_id,
         };
-        // info!("SelectRouterInfo {:#?}", info);
 
         let selected_router_id = self
             .scheduler
@@ -648,7 +637,6 @@ impl RouterTrait for RouterManager {
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
-        info!("进入route_completion方法");
         let effective_model_id = if self.enable_igw {
             // Use provided model_id or fall back to body.model
             let model = model_id.or(Some(&body.model));
@@ -660,7 +648,6 @@ impl RouterTrait for RouterManager {
             None
         };
 
-        // 获取prompt字符串
         let prompt_text_buffer;
         let prompt_text_slice = match &body.prompt {
             StringOrArray::String(s) => Some(s.as_str()),
