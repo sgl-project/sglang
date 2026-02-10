@@ -127,7 +127,7 @@ class AiterAttnBackend(AttentionBackend):
         # After AITER is rebuilt with hdim=256 tiles, CK works natively.
         # Without the rebuild, fall back to triton extend_attention_fwd.
         self._needs_triton_fallback = False
-        if not self.use_mla and self.head_dim > 128:
+        if not skip_prefill and (not self.use_mla) and self.head_dim > 128:
             try:
                 # Use a small but non-trivial (q_len=2) shape to avoid generating the
                 # special nmask kernel variant (max_seqlen_q == 1) which has been seen
