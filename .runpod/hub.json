@@ -1,0 +1,449 @@
+{
+  "title": "SGLang",
+  "description": "A fast serving framework for large language models and vision language models.",
+  "type": "serverless",
+  "category": "language",
+  "iconUrl": "https://avatars.githubusercontent.com/u/147780389?v=4",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 100,
+    "gpuIds": "ADA_24",
+    "gpuCount": 1,
+    "allowedCudaVersions": ["12.7", "12.6", "12.5", "12.4"],
+    "env": [
+      {
+        "key": "MODEL_PATH",
+        "input": {
+          "name": "Model Path",
+          "type": "huggingface",
+          "description": "Hugging Face model name or path to load",
+          "required": true
+        }
+      },
+      {
+        "key": "TOKENIZER_PATH",
+        "input": {
+          "name": "Tokenizer Path",
+          "type": "string",
+          "description": "Path of the tokenizer",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "TOKENIZER_MODE",
+        "input": {
+          "name": "Tokenizer Mode",
+          "type": "string",
+          "description": "Tokenizer mode",
+          "default": "auto",
+          "required": false,
+          "options": [
+            { "value": "auto", "label": "auto" },
+            { "value": "slow", "label": "slow" }
+          ],
+          "advanced": true
+        }
+      },
+      {
+        "key": "LOAD_FORMAT",
+        "input": {
+          "name": "Load Format",
+          "type": "string",
+          "description": "Format of model weights to load",
+          "default": "auto",
+          "required": false,
+          "options": [
+            { "value": "auto", "label": "auto" },
+            { "value": "pt", "label": "pt" },
+            { "value": "safetensors", "label": "safetensors" },
+            { "value": "npcache", "label": "npcache" },
+            { "value": "dummy", "label": "dummy" }
+          ],
+          "advanced": true
+        }
+      },
+      {
+        "key": "DTYPE",
+        "input": {
+          "name": "Data Type",
+          "type": "string",
+          "description": "Data type for weights and activations",
+          "default": "auto",
+          "required": false,
+          "options": [
+            { "value": "auto", "label": "auto" },
+            { "value": "half", "label": "half" },
+            { "value": "float16", "label": "float16" },
+            { "value": "bfloat16", "label": "bfloat16" },
+            { "value": "float", "label": "float" },
+            { "value": "float32", "label": "float32" }
+          ],
+          "advanced": true
+        }
+      },
+      {
+        "key": "CONTEXT_LENGTH",
+        "input": {
+          "name": "Context Length",
+          "type": "number",
+          "description": "Model's maximum context length",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "QUANTIZATION",
+        "input": {
+          "name": "Quantization",
+          "type": "string",
+          "description": "Quantization method",
+          "default": "",
+          "required": false,
+          "options": [
+            { "value": "awq", "label": "AWQ" },
+            { "value": "fp8", "label": "FP8" },
+            { "value": "gptq", "label": "GPTQ" },
+            { "value": "marlin", "label": "Marlin" },
+            { "value": "gptq_marlin", "label": "GPTQ Marlin" },
+            { "value": "awq_marlin", "label": "AWQ Marlin" },
+            { "value": "squeezellm", "label": "SqueezeLLM" },
+            { "value": "bitsandbytes", "label": "BitsAndBytes" }
+          ],
+          "advanced": true
+        }
+      },
+      {
+        "key": "SERVED_MODEL_NAME",
+        "input": {
+          "name": "Served Model Name",
+          "type": "string",
+          "description": "Override model name in API",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "CHAT_TEMPLATE",
+        "input": {
+          "name": "Chat Template",
+          "type": "string",
+          "description": "Chat template name or path",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "MEM_FRACTION_STATIC",
+        "input": {
+          "name": "Memory Fraction Static",
+          "type": "number",
+          "description": "Fraction of memory for static allocation",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "MAX_RUNNING_REQUESTS",
+        "input": {
+          "name": "Max Running Requests",
+          "type": "number",
+          "description": "Maximum number of running requests",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "MAX_TOTAL_TOKENS",
+        "input": {
+          "name": "Max Total Tokens",
+          "type": "number",
+          "description": "Maximum tokens in memory pool",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "CHUNKED_PREFILL_SIZE",
+        "input": {
+          "name": "Chunked Prefill Size",
+          "type": "number",
+          "description": "Max tokens in chunk for chunked prefill",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "MAX_PREFILL_TOKENS",
+        "input": {
+          "name": "Max Prefill Tokens",
+          "type": "number",
+          "description": "Max tokens in prefill batch",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "SCHEDULE_POLICY",
+        "input": {
+          "name": "Schedule Policy",
+          "type": "string",
+          "description": "Request scheduling policy",
+          "default": "",
+          "required": false,
+          "options": [
+            { "value": "lpm", "label": "LPM" },
+            { "value": "random", "label": "Random" },
+            { "value": "fcfs", "label": "FCFS" },
+            { "value": "dfs-weight", "label": "DFS Weight" }
+          ],
+          "advanced": true
+        }
+      },
+      {
+        "key": "SCHEDULE_CONSERVATIVENESS",
+        "input": {
+          "name": "Schedule Conservativeness",
+          "type": "number",
+          "description": "Conservativeness of schedule policy",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "TENSOR_PARALLEL_SIZE",
+        "input": {
+          "name": "Tensor Parallel Size",
+          "type": "number",
+          "description": "Tensor parallelism size",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "STREAM_INTERVAL",
+        "input": {
+          "name": "Stream Interval",
+          "type": "number",
+          "description": "Streaming interval in token length",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "RANDOM_SEED",
+        "input": {
+          "name": "Random Seed",
+          "type": "number",
+          "description": "Random seed",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "LOG_LEVEL",
+        "input": {
+          "name": "Log Level",
+          "type": "string",
+          "description": "Logging level for all loggers",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "LOG_LEVEL_HTTP",
+        "input": {
+          "name": "HTTP Log Level",
+          "type": "string",
+          "description": "Logging level for HTTP server",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "API_KEY",
+        "input": {
+          "name": "API Key",
+          "type": "string",
+          "description": "API key for the server",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "FILE_STORAGE_PATH",
+        "input": {
+          "name": "File Storage Path",
+          "type": "string",
+          "description": "Path of file storage in backend",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "DATA_PARALLEL_SIZE",
+        "input": {
+          "name": "Data Parallel Size",
+          "type": "number",
+          "description": "Data parallelism size",
+          "default": "",
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "LOAD_BALANCE_METHOD",
+        "input": {
+          "name": "Load Balance Method",
+          "type": "string",
+          "description": "Load balancing strategy",
+          "default": "",
+          "required": false,
+          "options": [
+            { "value": "round_robin", "label": "Round Robin" },
+            { "value": "shortest_queue", "label": "Shortest Queue" }
+          ],
+          "advanced": true
+        }
+      },
+      {
+        "key": "SKIP_TOKENIZER_INIT",
+        "input": {
+          "name": "Skip Tokenizer Init",
+          "type": "boolean",
+          "description": "Skip tokenizer init",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "TRUST_REMOTE_CODE",
+        "input": {
+          "name": "Trust Remote Code",
+          "type": "boolean",
+          "description": "Allow custom models from Hub",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "LOG_REQUESTS",
+        "input": {
+          "name": "Log Requests",
+          "type": "boolean",
+          "description": "Log inputs and outputs of requests",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "SHOW_TIME_COST",
+        "input": {
+          "name": "Show Time Cost",
+          "type": "boolean",
+          "description": "Show time cost of custom marks",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "DISABLE_RADIX_CACHE",
+        "input": {
+          "name": "Disable Radix Cache",
+          "type": "boolean",
+          "description": "Disable RadixAttention for prefix caching",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "DISABLE_CUDA_GRAPH",
+        "input": {
+          "name": "Disable CUDA Graph",
+          "type": "boolean",
+          "description": "Disable cuda graph",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "DISABLE_OUTLINES_DISK_CACHE",
+        "input": {
+          "name": "Disable Outlines Disk Cache",
+          "type": "boolean",
+          "description": "Disable disk cache of outlines",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "ENABLE_TORCH_COMPILE",
+        "input": {
+          "name": "Enable Torch Compile",
+          "type": "boolean",
+          "description": "Optimize model with torch.compile",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "ENABLE_P2P_CHECK",
+        "input": {
+          "name": "Enable P2P Check",
+          "type": "boolean",
+          "description": "Enable P2P check for GPU access",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "ENABLE_FLASHINFER_MLA",
+        "input": {
+          "name": "Enable FlashInfer MLA",
+          "type": "boolean",
+          "description": "Enable FlashInfer Multi-head Latent Attention",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      },
+      {
+        "key": "TRITON_ATTENTION_REDUCE_IN_FP32",
+        "input": {
+          "name": "Triton Attention Reduce in FP32",
+          "type": "boolean",
+          "description": "Cast Triton attention results to fp32",
+          "default": false,
+          "required": false,
+          "advanced": true
+        }
+      }
+    ]
+  }
+}

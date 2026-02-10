@@ -1,0 +1,29 @@
+{
+  "tests": [
+    {
+      "name": "basic_test",
+      "input": {
+        "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        "messages": [
+          { "role": "user", "content": "What is the capital of France?" }
+        ]
+      },
+      "timeout": 500000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA GeForce RTX 4090",
+    "gpuCount": 1,
+    "env": [
+      {
+        "key": "TRUST_REMOTE_CODE",
+        "value": "true"
+      },
+      {
+        "key": "MODEL_PATH",
+        "value": "HuggingFaceTB/SmolLM2-1.7B-Instruct"
+      }
+    ],
+    "allowedCudaVersions": ["12.7", "12.6", "12.5", "12.4"]
+  }
+}
