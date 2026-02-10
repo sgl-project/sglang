@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
+from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -20,7 +21,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class HpcAttentionMetadata:
     cache_seqlens_int32: torch.Tensor = None  # [bs] int32
@@ -30,6 +30,85 @@ class HpcAttentionMetadata:
     cu_seqlens_k: torch.Tensor = None  # [bs+1] int32
     page_table: torch.Tensor = None  # [bs, max_blocks] int32
 
+
+def _pad_to(x: int, m: int) -> int:
+    return ((x + m - 1) // m) * m
+
+import triton
+import triton.language as tl
+
+@triton.jit
+def pack_scale_th_kernel(
+    scale_ptr, cu_ptr, out_ptr,
+    H: tl.constexpr,
+    PAD: tl.constexpr,
+    stride_s0: tl.constexpr,
+    stride_s1: tl.constexpr,
+    stride_o0: tl.constexpr,
+    stride_o1: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    pid = tl.program_id(2)
+
+    start = tl.load(cu_ptr + b).to(tl.int32)
+    end = tl.load(cu_ptr + b + 1).to(tl.int32)
+    L = end - start
+
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask_pad = offs < PAD
+    mask_len = offs < L
+
+    tok = start + offs
+    val = tl.load(
+        scale_ptr + tok * stride_s0 + h * stride_s1,
+        mask=mask_len,
+        other=0.0,
+    ).to(tl.float32)
+
+    tl.store(
+        out_ptr + b * stride_o0 + h * stride_o1 + offs,
+        val,
+        mask=mask_pad,
+    )
+
+@torch.no_grad()
+def pack_scale_th_triton(
+    scale_th: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seq_len_q: int,
+    pad_multiple: int = 128,
+    block: int = 256,
+) -> torch.Tensor:
+
+    assert scale_th.is_cuda and cu_seqlens_q.is_cuda
+    assert scale_th.dim() == 2
+
+    T, H = scale_th.shape
+    cu = cu_seqlens_q.to(torch.int32).contiguous()
+    bs = cu.numel() - 1
+
+    pad = _pad_to(int(max_seq_len_q), pad_multiple)
+    out = torch.empty(bs, H, pad, device=scale_th.device, dtype=torch.float32)
+
+    stride_s0 = scale_th.stride(0)
+    stride_s1 = scale_th.stride(1)
+    stride_o0 = out.stride(0)
+    stride_o1 = out.stride(1)
+
+    grid = (bs, H, triton.cdiv(pad, block))
+
+    pack_scale_th_kernel[grid](
+        scale_th, cu, out,
+        H=H, PAD=pad,
+        stride_s0=stride_s0, stride_s1=stride_s1,
+        stride_o0=stride_o0, stride_o1=stride_o1,
+        BLOCK=block,
+        num_warps=4,
+    )
+
+    return out
 
 class HpcAttentionBackend(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
@@ -45,6 +124,8 @@ class HpcAttentionBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.forward_metadata: HpcAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Initialize CUDA graph state for the attention backend.
@@ -245,7 +326,7 @@ class HpcAttentionBackend(AttentionBackend):
         """Save KV cache, reshape Q, and prepare KV cache views."""
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
+                layer, forward_batch.out_cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
         tp_q_head_num = layer.tp_q_head_num
@@ -280,15 +361,49 @@ class HpcAttentionBackend(AttentionBackend):
         )
         metadata = self.forward_metadata
 
-        o = hpc.attention_with_kvcache_prefill_bf16(
-            q=q_3d,
-            kcache=key_cache,
-            vcache=value_cache,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            block_ids=metadata.page_table,
-            seqlens_kvcache=metadata.cache_seqlens_int32,
-            max_seqlens_q=metadata.max_seq_len_q,
-        )
+        if self.kv_cache_dtype_str == "fp8_e4m3":
+            T, H, D = q_3d.shape
+            x = q_3d.view(T, H * D)
+
+            x_fp8, scale_th = sglang_per_token_group_quant_fp8(
+                x,
+                group_size=D,
+                column_major_scales=False,
+                scale_tma_aligned=True,
+            )
+
+            q_fp8 = x_fp8.view(T, H, D)
+
+            qscale = pack_scale_th_triton(
+                scale_th=scale_th,                       # [T, H]
+                cu_seqlens_q=metadata.cu_seqlens_q,      # [bs+1]
+                max_seq_len_q=metadata.max_seq_len_q,    # int
+                pad_multiple=128,
+                block=256,
+            )
+
+            o = hpc.attention_with_kvcache_prefill_fp8(
+                q=q_fp8,
+                kcache=key_cache,
+                vcache=value_cache,
+                qkscale=(qscale * layer.k_scale.view(1, 1, 1)).contiguous(),
+                vscale=layer.v_scale,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                block_ids=metadata.page_table,
+                seqlens_kvcache=metadata.cache_seqlens_int32,
+                max_seqlens_q=metadata.max_seq_len_q,
+            )
+        else:
+
+            o = hpc.attention_with_kvcache_prefill_bf16(
+                q=q_3d,
+                kcache=key_cache,
+                vcache=value_cache,
+                cu_seqlens_q=metadata.cu_seqlens_q,
+                block_ids=metadata.page_table,
+                seqlens_kvcache=metadata.cache_seqlens_int32,
+                max_seqlens_q=metadata.max_seq_len_q,
+            )
 
         return o.view(-1, tp_q_head_num * v_head_dim)
 
@@ -308,14 +423,40 @@ class HpcAttentionBackend(AttentionBackend):
         )
         metadata = self.forward_metadata
 
-        o = hpc.attention_decode_bf16(
-            q=q_3d,
-            kcache=key_cache,
-            vcache=value_cache,
-            block_ids=metadata.page_table,
-            num_seq_kvcache=metadata.cache_seqlens_int32,
-            new_kv_included=True,
-            splitk=True,
-        )
+        if self.kv_cache_dtype_str == "fp8_e4m3":
+            bs, H, D = q_3d.shape
+            x = q_3d.reshape(bs, H * D).contiguous()
+
+            x_fp8, qscale = sglang_per_token_group_quant_fp8(
+                x,
+                group_size=D,
+                column_major_scales=False,   # qscale: [bs, H]
+                scale_tma_aligned=True,
+            )
+
+            q_fp8 = x_fp8.reshape(bs, H, D)
+
+            o = hpc.attention_decode_fp8(
+                q=q_fp8,
+                kcache=key_cache,
+                vcache=value_cache,
+                block_ids=metadata.page_table,
+                num_seq_kvcache=metadata.cache_seqlens_int32,
+                qscale=qscale,
+                kscale=layer.k_scale,
+                vscale=layer.v_scale,
+                new_kv_included=True,
+                splitk=True,
+            )
+        else:
+            o = hpc.attention_decode_bf16(
+                q=q_3d,
+                kcache=key_cache,
+                vcache=value_cache,
+                block_ids=metadata.page_table,
+                num_seq_kvcache=metadata.cache_seqlens_int32,
+                new_kv_included=True,
+                splitk=True,
+            )
 
         return o.view(-1, tp_q_head_num * v_head_dim)
