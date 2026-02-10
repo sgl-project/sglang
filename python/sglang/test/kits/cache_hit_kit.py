@@ -137,6 +137,7 @@ def run_multiturn_cache_hit_test(
     num_rounds: int = 3,
     request_length: int = 256,
     output_length: int = 32,
+    miss_tolerance: int = 1,
     sub_question_input_length: int = 0,
     lora_path: str = "",
     dataset_path: str = "",
@@ -151,7 +152,7 @@ def run_multiturn_cache_hit_test(
     The expected cache hit rate is self-computed from the workload structure:
     - Round 0: expected cached_tokens = 0 (cold start after flush)
     - Round r (r >= 1): each client's prefix from round r-1 should be cached,
-      minus up to 1 page of alignment loss.
+      minus up to previous round's (prompt_len + decoding output - miss_tolerance) // page * page.
 
     Returns metrics dict with per-round and overall cache_hit_rate.
     """
@@ -226,7 +227,7 @@ def run_multiturn_cache_hit_test(
                 # Previous round's prompt + output are in cache.
                 # Radix cache aligns to page_size, so the last partial page
                 # may not be cached.
-                cacheable = prev_prompt_lens[i] + output_length
+                cacheable = prev_prompt_lens[i] + output_length - miss_tolerance
                 expected_cached = (cacheable // page_size) * page_size
 
             assert resp.cached_tokens >= expected_cached - page_size, (
