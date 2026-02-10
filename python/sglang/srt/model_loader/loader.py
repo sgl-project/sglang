@@ -546,7 +546,6 @@ class DefaultModelLoader(BaseModelLoader):
             return tuple(filtered_weights)
 
         if self.counter_before_loading_weights == 0.0:
-            logger.info("Beginning to load weights")
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -670,10 +669,6 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
-        logger.info(
-            "Loading weights took %.2f seconds",
-            self.counter_after_loading_weights - self.counter_before_loading_weights,
-        )
         return model.eval()
 
     @staticmethod

@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -3016,6 +3017,14 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Suppress FutureWarning from deprecated cuda.cudart and cuda.nvrtc modules
+    warnings.filterwarnings(
+        "ignore", message="The cuda.cudart module is deprecated", category=FutureWarning
+    )
+    warnings.filterwarnings(
+        "ignore", message="The cuda.nvrtc module is deprecated", category=FutureWarning
+    )
+
     # Generate the logger prefix
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:

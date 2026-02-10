@@ -3,6 +3,15 @@
 import asyncio
 import os
 import sys
+import warnings
+
+# Suppress FutureWarning from deprecated cuda.cudart and cuda.nvrtc modules
+warnings.filterwarnings(
+    "ignore", message="The cuda.cudart module is deprecated", category=FutureWarning
+)
+warnings.filterwarnings(
+    "ignore", message="The cuda.nvrtc module is deprecated", category=FutureWarning
+)
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
