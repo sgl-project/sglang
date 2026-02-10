@@ -20,6 +20,7 @@ import addict
 import yaml
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -362,6 +363,16 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_pipeline_config(self):
+        # enable parallel folding when SP is enabled
+        sp_degree = self.sp_degree
+        if (self.tp_size not in (-1, 1)) or sp_degree <= 1:
+            return
+        for text_encoder_config in self.pipeline_config.text_encoder_configs:
+            if isinstance(text_encoder_config, T5Config):
+                text_encoder_config.parallel_folding = True
+                text_encoder_config.parallel_folding_mode = "sp"
+
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
             logger.info(
@@ -429,6 +440,7 @@ class ServerArgs:
         configure_logger(server_args=self)
 
         self.adjust_offload()
+        self.adjust_pipeline_config()
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"

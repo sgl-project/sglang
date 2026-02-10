@@ -52,30 +52,6 @@ class MOVAPipelineConfig(PipelineConfig):
     time_division_factor: int = 4
     time_division_remainder: int = 1
 
-    def update_config_from_dict(self, args: dict, prefix: str = "") -> None:
-        tp_size = args.get("tp_size", 1)
-        sp_degree = args.get("sp_degree", -1)
-        if sp_degree == -1:
-            ring_degree = args.get("ring_degree", 1) or 1
-            ulysses_degree = args.get("ulysses_degree", 1) or 1
-            sp_degree = ring_degree * ulysses_degree
-        super().update_config_from_dict(args, prefix)
-        if (tp_size not in (-1, 1)) or sp_degree <= 1:
-            return
-        enabled = False
-        for text_encoder_config in self.text_encoder_configs:
-            if isinstance(text_encoder_config, T5Config):
-                text_encoder_config.parallel_folding = True
-                text_encoder_config.parallel_folding_mode = "sp"
-                enabled = True
-        if enabled:
-            logger.info(
-                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
-                self.__class__.__name__,
-                tp_size,
-                sp_degree,
-            )
-
     def _center_crop_and_resize(
         self, image: torch.Tensor | Image.Image, target_height: int, target_width: int
     ) -> torch.Tensor | Image.Image:
