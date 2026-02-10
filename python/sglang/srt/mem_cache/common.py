@@ -136,7 +136,7 @@ def write_cache_indices(
                 seq_lens_tp = extend_lens_tp = tp_seq_len
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_lens_tp)),
-                    tp_out_loc[pt : pt + extend_lens_tp]
+                    tp_out_loc[pt : pt + extend_lens_tp],
                 )
                 pt += extend_lens_tp
             else:
@@ -402,7 +402,7 @@ def alloc_tp_paged_token_slots_extend(
     # padding -1 to origin input lenth, skip this loc-1 when set_kv_buffer
     len_sum = sum(l.item() for l in seq_lens)
     padded_out_loc = torch.full(
-        (len_sum,), -1, dtype = tp_out_loc.dtype, device = batch.device
+        (len_sum,), -1, dtype=tp_out_loc.dtype, device=batch.device
     )
 
     flatten_seq_start = 0
@@ -417,7 +417,7 @@ def alloc_tp_paged_token_slots_extend(
         out_loc_start = out_loc_start + (token_num_tensor[i - 1] if i >= 1 else 0)
         out_loc_end = out_loc_start + token_num_tensor[i]
         padded_out_loc[padded_out_loc_start:padded_out_loc_end] = tp_out_loc[
-            out_loc_start : out_loc_end
+            out_loc_start:out_loc_end
         ]
 
     return tp_out_loc, padded_out_loc

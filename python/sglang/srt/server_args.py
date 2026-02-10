@@ -2435,7 +2435,8 @@ class ServerArgs:
             )
             self.enable_kv_storage_optimization_mla = False
         if (
-            self.enable_kv_storage_optimization_mla and self.disaggregation_mode == "null"
+            self.enable_kv_storage_optimization_mla
+            and self.disaggregation_mode == "null"
         ):
             raise ValueError(
                 "The argument enable_kv_storage_optimization_mla and self.disaggregation_mode(null) are mutuially exclusive"
