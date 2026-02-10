@@ -2332,6 +2332,7 @@ class ServerArgs:
                 "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
+                "BailingMoeV2_5ForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
             ]:
@@ -5679,6 +5680,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
