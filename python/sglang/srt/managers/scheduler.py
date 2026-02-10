@@ -2621,13 +2621,24 @@ class Scheduler(
         return no_request
 
     def flush_cache(self):
-        """Flush the memory pool and cache."""
+        """Flush the memory pool and cache.
+
+        If there are pinned blocks, selectively evicts unpinned entries
+        while preserving pinned blocks. Otherwise does a full reset.
+        """
         if self._is_no_request():
             self.cur_batch = None
             self.last_batch = None
-            self.tree_cache.reset()
-            self.req_to_token_pool.clear()
-            self.token_to_kv_pool_allocator.clear()
+
+            if self.tree_cache.external_pin_count:
+                # Selective flush: preserve pinned blocks
+                self.tree_cache.flush()
+            else:
+                # Nuclear flush: no pins, reset everything
+                self.tree_cache.reset()
+                self.req_to_token_pool.clear()
+                self.token_to_kv_pool_allocator.clear()
+
             self.grammar_manager.clear()
             self.reset_metrics()
 

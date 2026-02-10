@@ -104,6 +104,9 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
+        # pin_count: protects from CPU/host eviction only (external PIN API).
+        # Separate from lock_ref which protects from both GPU and CPU eviction.
+        self.pin_count = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
@@ -691,6 +694,20 @@ class RadixCache(BasePrefixCache):
                 self.external_pin_count[h] = count - 1
             unpinned += 1
         return unpinned
+
+    def flush(self) -> dict:
+        """Flush all unpinned cache entries, preserving pinned blocks.
+        Returns stats about what was flushed vs preserved."""
+        evictable = self.evictable_size_
+        if evictable > 0:
+            self.evict(EvictParams(num_tokens=evictable))
+        remaining = self.evictable_size_
+        pinned = len(self.external_pin_count)
+        logger.info(
+            f"[PIN] flush: evicted {evictable - remaining} tokens from GPU, "
+            f"{pinned} pinned blocks preserved"
+        )
+        return {"gpu_evicted": evictable - remaining, "pinned_blocks": pinned}
 
     def evictable_size(self):
         return self.evictable_size_

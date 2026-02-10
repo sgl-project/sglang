@@ -356,11 +356,163 @@ Earlier benchmark measuring only system prompt (turn 0) TTFT across 3 reps.
 
 10. **KV event collector must start BEFORE warmup**: BlockStored events are emitted when blocks are first inserted. If the collector starts after warmup, re-sending the same prompt finds everything cached and emits no events. No block hashes are collected, and pinning fails silently.
 
+11. **sglang install mismatch**: The `dynamo` venv's default `python3` may have sglang installed from a different repo (`~/sglang/`) than the working tree (`~/sglang-poc-pin/`). Servers started with `python -m sglang.launch_server` will use the installed version, silently ignoring local modifications. Symptoms: no `[PIN]` logs, `flush_cache` goes nuclear despite pins being set, `HiRadixCache.flush` method doesn't exist. Fix: `cd ~/sglang-poc-pin && uv pip install -e "python"` to install the working tree into the active venv.
+
+12. **`flush_cache` returns 400 during write-through**: With `write_through` policy, `_inc_hit_count()` triggers background `write_backup()` operations that keep `running_req > 0` for seconds after the warmup request completes. `flush_cache` checks `_is_no_request()` and returns 400 if requests are in flight. Fixed with a retry loop (up to 60 attempts at 1s intervals).
+
+13. **`cached_tokens_total` is a counter, not a gauge**: The `/metrics` endpoint's `sglang:cached_tokens_total` is monotonically increasing (cumulative tokens ever served from cache). It does NOT reflect current cache occupancy and won't decrease after flush. Use the `sglext.cached_tokens_details` field (non-streaming, `return_cached_tokens_details: true`) for per-request tier breakdown.
+
+---
+
+## Step 2: Tier-Aware PIN for HiRadixCache
+
+**Branch**: `idhanani/dyn-1986-tier-aware-pin` (off `idhanani/dyn-1986-poc-pin`)
+
+### Problem
+
+Step 1 PIN uses `inc_lock_ref()` which removes nodes from both `evictable_leaves` (GPU) and `evictable_host_leaves` (CPU). This is too aggressive for HiRadixCache -- pinned blocks are frozen on GPU forever, defeating tiered memory management.
+
+### Design
+
+Introduced `pin_count` on `TreeNode`, separate from `lock_ref`:
+- `lock_ref` = protects from GPU eviction (used by active requests, prefetch, backup)
+- `pin_count` = protects from CPU/host eviction only (used by external PIN API)
+
+Pinned blocks CAN be GPU-evicted (demoted to CPU via `write_backup`) but CANNOT be CPU-evicted (deleted from tree via `evict_host`). This lets HiCache manage GPU memory freely while guaranteeing pinned prefixes are always available (at most a CPU->GPU `load_back` away).
+
+### Changes
+
+| File | Changes |
+|------|---------|
+| `radix_cache.py:108` | Added `self.pin_count = 0` to `TreeNode.__init__` |
+| `hiradix_cache.py:632` | `_record_tier_store_event` calls `_index_node_hashes(node)` for GPU medium |
+| `hiradix_cache.py:1029` | `_evict_regular` calls `_unindex_node_hashes(node)` before tree deletion |
+| `hiradix_cache.py:1061` | `evict_host` calls `_unindex_node_hashes(x)` before tree deletion |
+| `hiradix_cache.py:866-905` | `pin_blocks()` / `unpin_blocks()` overridden -- uses `pin_count`, not `lock_ref` |
+| `hiradix_cache.py:944` | `_update_host_leaf_status` gates on `pin_count > 0` (primary CPU protection) |
+| `hiradix_cache.py:975-999` | `evict()` forces backup for pinned un-backed-up nodes; post-loop unconditional |
+| `hiradix_cache.py:1055` | Defensive `pin_count > 0` skip in `evict_host()` |
+| `hiradix_cache.py:1504` | `_split_node` copies `pin_count` to new parent node |
+
+### How It Works
+
+```
+Warmup -> PIN (pin_count, not lock_ref) -> Flood
+                                            |
+                              Pinned blocks get GPU-evicted
+                              but survive on CPU (pin_count protects)
+                                            |
+Measure -> match_prefix() finds host-backed nodes
+         -> load_back() restores CPU->GPU (memcpy)
+         -> Prefill uses restored blocks (cache hit)
+```
+
+### Key Design Decisions
+
+1. **`pin_count` not `lock_ref`**: `lock_ref` gates both `evictable_leaves` and `evictable_host_leaves`. We only want to gate the latter. Separate counter decouples GPU and CPU eviction protection.
+
+2. **`block_hash_index` wired into `_record_tier_store_event`**: HiRadixCache bypasses base RadixCache's `_record_store_event()` (which populates the index). Without this fix, `block_hash_index` would always be empty under HiCache and `pin_blocks()` would find nothing. Gated behind `enable_kv_cache_events` since PIN is a Dynamo feature that requires KV events.
+
+3. **`evict()` forces backup for pinned nodes**: Regardless of write policy, a pinned node that isn't backed up gets force-backed-up during GPU eviction. This prevents `_evict_regular()` from deleting pinned nodes from the tree. Post-loop `writing_check` made unconditional (was gated on `write_policy == "write_back"`) to handle write-through mode.
+
+4. **Ancestor protection is natural**: GPU eviction is bottom-up (leaf first via `_update_leaf_status`), so parents can't be GPU-evicted while children are on GPU. CPU eviction checks children (`_update_host_leaf_status`), so parents can't be CPU-evicted while children are on host. No explicit ancestor walk needed.
+
+5. **Split copies `pin_count` to both halves**: Conservative -- over-protection is harmless for correctness. One half may become permanently pinned (can't be unpinned because `block_hash_index` isn't re-indexed on split). Known limitation, acceptable for POC.
+
+### HiCache Write Policy Reference
+
+| Policy | Backup trigger | During evict() if not backed up |
+|--------|---------------|-------------------------------|
+| `write_through` (default) | On first cache hit (threshold=1) | `_evict_regular()` deletes from tree |
+| `write_through_selective` | On second cache hit (threshold=2) | `_evict_regular()` deletes from tree |
+| `write_back` | On GPU eviction | `write_backup()` then `_evict_backuped()` |
+
+With tier-aware PIN, pinned nodes always take the `write_backup() + _evict_backuped()` path regardless of write policy, preventing tree deletion.
+
+### Additional Changes (this branch)
+
+#### Pin-Aware `flush_cache` (`scheduler.py`, `radix_cache.py`, `hiradix_cache.py`)
+
+Modified the existing `/flush_cache` endpoint to respect pinned blocks:
+
+- **Scheduler** (`flush_cache()`): When `external_pin_count` is non-empty, calls `tree_cache.flush()` (selective eviction preserving pins). When empty, falls through to nuclear `reset()` + pool clears.
+- **RadixCache** (`flush()`): Evicts all evictable GPU tokens, returns stats.
+- **HiRadixCache** (`flush()`): Evicts GPU tokens via `evict()`, then CPU tokens via `evict_host(2**31)`. Pinned blocks survive both passes -- `evict()` backs them up to CPU, `evict_host()` skips them via `pin_count > 0` check.
+
+#### Verbose `[PIN]` Logging (`hiradix_cache.py`)
+
+Added `logger.info`/`logger.debug` calls tagged with `[PIN]` to every PIN-related code path:
+
+| Location | Log |
+|----------|-----|
+| `pin_blocks()` | Summary: count pinned, GPU vs host breakdown |
+| `unpin_blocks()` | Summary: count unpinned |
+| `evict()` | Per-node: pinned node force-backup or GPU-evict |
+| `evict_host()` | Per-node: skipping pinned node |
+| `_update_host_leaf_status()` | Debug: node removed from evictable_host_leaves due to pin_count |
+| `flush()` | Summary: GPU evicted, host leaves before/after, pinned preserved |
+| `load_back()` | Summary: nodes loaded back, count pinned |
+
+Tail with: `tail -f /tmp/sglang_server_30001.log | grep --line-buffered "\[PIN\]"`
+
+### Verification Status
+
+- 11 existing unit tests pass (base RadixCache behavior preserved)
+- HiRadixCache-specific tests: TODO
+- E2E benchmark (v6): DONE -- see results below
+
+### V6 Tier-Aware Benchmark Results
+
+**Model**: Qwen/Qwen3-14B-FP8, TP=1, page_size=64
+**Cache**: ~42K tokens (mem_fraction=0.50)
+**HiCache**: write_through, ratio=2.0 (both baseline and tier-pin)
+**Eviction method**: `/flush_cache` (pin-aware selective flush)
+**Hardware**: 2x GPU (baseline on GPU 0, tier-pin on GPU 1)
+
+| Phase | Depth | TTFT | cached% | host_hits | Blocks Pinned |
+|-------|-------|------|---------|-----------|---------------|
+| baseline | 10 | 1683.7ms | 0% | 0 | 0 |
+| tier-pin | 10 | 219.4ms | 89% | 9664 | 168 |
+
+**Speedup: 7.7x** (1683.7ms -> 219.4ms)
+
+**`sglext` response confirms tier breakdown:**
+```json
+{
+  "cached_tokens_details": {
+    "device": 0,
+    "host": 9664
+  }
+}
+```
+
+All 9664 cached tokens came from host (CPU) via `load_back`. After flush, pinned blocks had no GPU copies (`device: 0`) -- they were restored from CPU on demand.
+
+**Full PIN lifecycle from server logs:**
+```
+[PIN] pin_blocks: 168/168 pinned (gpu=168, host=0, index_size=265)
+[PIN] evict: pinned node 9 (pin_count=40) already on CPU, evicting GPU copy via _evict_backuped
+[PIN] evict: pinned node 8 (pin_count=64) already on CPU, evicting GPU copy via _evict_backuped
+[PIN] evict_host: skipping pinned node 10 (pin_count=7)
+[PIN] evict_host: skipping pinned node 11 (pin_count=9)
+[PIN] evict_host: skipping pinned node 12 (pin_count=2)
+[PIN] flush: GPU evicted 16128 tokens, host leaves 8->0, 168 pinned blocks preserved
+[PIN] load_back: loaded 3 nodes (9664 tokens) back to GPU, 3 are pinned
+[PIN] load_back: loaded 1 nodes (448 tokens) back to GPU, 1 are pinned
+[PIN] unpin_blocks: 168/168 unpinned
+```
+
+### New Files (this branch)
+
+| File | Purpose |
+|------|---------|
+| `docs/design/pin_benchmark_v6.py` | V6 tier-aware benchmark script with `--flush` mode, HiCache-aware flood calc, parallel GPU support |
+
 ---
 
 ## What's NOT Done Yet
 
 - **No EVICT (evict_descendants)**: The second cache control operation. Same layer, not yet implemented.
-- **No HiRadixCache-specific testing**: Tests use RadixCache.create_simulated(). HiRadixCache has additional tier transition logic (L1/L2/L3) that may need index maintenance hooks.
 - **Radix tree cache state inspection**: No out-of-band way to query the radix tree state (pinned blocks, eviction pressure, tree structure). Would help diagnose prefix matching issues and support Dynamo router decision-making.
 - **Hash-based block lookup**: Current prefix matching stops at the first token divergence, losing all subsequent pinned blocks. A hash-based lookup (using the existing `block_hash_index`) could find blocks regardless of prefix ordering, but would require changes to KV attention (currently assumes contiguous cached prefixes).
+- **HiRadixCache-specific unit tests**: PIN behavior with tier transitions (GPU->CPU->GPU) not covered by existing unit tests.

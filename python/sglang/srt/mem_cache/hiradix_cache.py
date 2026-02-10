@@ -630,6 +630,10 @@ class HiRadixCache(RadixCache):
         if node.hash_value is None:
             node.hash_value = compute_node_hash_values(node, self.page_size)
 
+        # Maintain block_hash_index for PIN/EVICT lookups
+        if medium == MEDIUM_GPU:
+            self._index_node_hashes(node)
+
         # Get parent's last hash value for first page
         parent_block_hash = None
         if node.parent is not None and node.parent != self.root_node:
@@ -859,6 +863,89 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
+    def flush(self) -> dict:
+        """Flush unpinned cache from GPU and CPU, preserving pinned blocks."""
+        # Evict everything evictable from GPU
+        gpu_before = self.evictable_size_
+        if gpu_before > 0:
+            self.evict(EvictParams(num_tokens=gpu_before))
+        gpu_evicted = gpu_before - self.evictable_size_
+
+        # Evict everything evictable from host (pin_count blocks are skipped)
+        host_before = len(self.evictable_host_leaves)
+        self.evict_host(2**31)
+        host_after = len(self.evictable_host_leaves)
+
+        pinned = len(self.external_pin_count)
+        logger.info(
+            f"[PIN] flush: GPU evicted {gpu_evicted} tokens, "
+            f"host leaves {host_before}->{host_after}, "
+            f"{pinned} pinned blocks preserved"
+        )
+        return {
+            "gpu_evicted": gpu_evicted,
+            "host_leaves_before": host_before,
+            "host_leaves_after": host_after,
+            "pinned_blocks": pinned,
+        }
+
+    def pin_blocks(self, block_hashes: List[int]) -> int:
+        """Tier-aware pin: protects from CPU eviction, allows GPU eviction."""
+        if self.disable:
+            return 0
+
+        pinned = 0
+        for h in block_hashes:
+            node = self.block_hash_index.get(h)
+            if node is None:
+                continue
+            prev = self.external_pin_count.get(h, 0)
+            if prev == 0:
+                node.pin_count += 1
+                self._update_host_leaf_status(node)
+            self.external_pin_count[h] = prev + 1
+            pinned += 1
+        pinned_on_gpu = sum(
+            1 for h in block_hashes
+            if (n := self.block_hash_index.get(h)) is not None and not n.evicted
+        )
+        pinned_on_host = sum(
+            1 for h in block_hashes
+            if (n := self.block_hash_index.get(h)) is not None and n.evicted and n.backuped
+        )
+        logger.info(
+            f"[PIN] tier-aware pin_blocks: {pinned}/{len(block_hashes)} pinned "
+            f"(gpu={pinned_on_gpu}, host={pinned_on_host}, "
+            f"index_size={len(self.block_hash_index)})"
+        )
+        return pinned
+
+    def unpin_blocks(self, block_hashes: List[int]) -> int:
+        """Tier-aware unpin: restores CPU evictability."""
+        if self.disable:
+            return 0
+
+        unpinned = 0
+        for h in block_hashes:
+            count = self.external_pin_count.get(h, 0)
+            if count <= 0:
+                continue
+            node = self.block_hash_index.get(h)
+            if node is None:
+                self.external_pin_count.pop(h, None)
+                continue
+            if count == 1:
+                node.pin_count -= 1
+                self._update_host_leaf_status(node)
+                self.external_pin_count.pop(h, None)
+            else:
+                self.external_pin_count[h] = count - 1
+            unpinned += 1
+        logger.info(
+            f"[PIN] tier-aware unpin_blocks: {unpinned}/{len(block_hashes)} unpinned"
+        )
+        return unpinned
+
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -896,8 +983,13 @@ class HiRadixCache(RadixCache):
         return delta
 
     def _update_host_leaf_status(self, node: TreeNode):
-        if not node.evicted or node.lock_ref > 0:
+        if not node.evicted or node.lock_ref > 0 or node.pin_count > 0:
             if node in self.evictable_host_leaves:
+                if node.pin_count > 0:
+                    logger.debug(
+                        f"[PIN] _update_host_leaf_status: node {node.id} removed from "
+                        f"evictable_host_leaves (pin_count={node.pin_count})"
+                    )
                 self.evictable_host_leaves.remove(node)
             return
 
@@ -927,7 +1019,23 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
-            if not x.backuped:
+            if x.pin_count > 0:
+                # Pinned node: MUST backup to CPU before GPU eviction.
+                # Never pass to _evict_regular which deletes from tree.
+                if not x.backuped:
+                    logger.info(
+                        f"[PIN] evict: pinned node {x.id} (pin_count={x.pin_count}) "
+                        f"not yet backed up, force write_backup to CPU"
+                    )
+                    num_evicted += self.write_backup(x, write_back=True)
+                    write_back_nodes.append(x)
+                else:
+                    logger.info(
+                        f"[PIN] evict: pinned node {x.id} (pin_count={x.pin_count}) "
+                        f"already on CPU, evicting GPU copy via _evict_backuped"
+                    )
+                    num_evicted += self._evict_backuped(x)
+            elif not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     num_evicted += self.write_backup(x, write_back=True)
@@ -947,7 +1055,7 @@ class HiRadixCache(RadixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-        if self.cache_controller.write_policy == "write_back":
+        if write_back_nodes:
             self.writing_check(write_back=True)
             for node in write_back_nodes:
                 assert node.backuped
@@ -974,6 +1082,7 @@ class HiRadixCache(RadixCache):
         # evict a node not initiated write to host
         # Emit BlockRemoved(GPU) before freeing - block is being deleted from GPU
         self._record_tier_remove_event(node, MEDIUM_GPU)
+        self._unindex_node_hashes(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
         self._delete_leaf(node)
@@ -998,11 +1107,18 @@ class HiRadixCache(RadixCache):
             # node is protected from eviction as it has ongoing prefetch or backup to storage
             if x.host_ref_counter > 0:
                 continue
+            if x.pin_count > 0:
+                logger.info(
+                    f"[PIN] evict_host: skipping pinned node {x.id} "
+                    f"(pin_count={x.pin_count})"
+                )
+                continue
 
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             # Emit BlockRemoved event for host memory (L2) eviction
             self._record_tier_remove_event(x, MEDIUM_CPU_TIER1)
+            self._unindex_node_hashes(x)
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -1059,11 +1175,21 @@ class HiRadixCache(RadixCache):
 
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
+        pinned_count = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)]
             offset += len(node.host_value)
+            if node.pin_count > 0:
+                pinned_count += 1
         self.evictable_size_ += len(device_indices)
         self.inc_lock_ref(last_hit_node)
+
+        if pinned_count > 0:
+            logger.info(
+                f"[PIN] load_back: loaded {len(nodes_to_load)} nodes "
+                f"({len(device_indices)} tokens) back to GPU, "
+                f"{pinned_count} are pinned"
+            )
 
         # Emit BlockStored events for nodes loaded back to GPU
         for node in nodes_to_load:
@@ -1444,6 +1570,7 @@ class HiRadixCache(RadixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
+        new_node.pin_count = child.pin_count
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
