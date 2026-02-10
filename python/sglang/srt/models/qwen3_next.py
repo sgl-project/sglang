@@ -617,7 +617,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = getattr(config, "rope_theta", 10000)
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = getattr(config, "rope_scaling", None)
+        if "rope_parameters" in config:
+            self.rope_scaling = getattr(config, "rope_parameters", None)
+        else:
+            self.rope_scaling = getattr(config, "rope_scaling", None)
         self.partial_rotary_factor = config.partial_rotary_factor
         self.layer_id = layer_id
 
