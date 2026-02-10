@@ -1308,10 +1308,20 @@ class ServerArgs:
                 ):
                     if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
                         self.speculative_moe_runner_backend = "deep_gemm"
-                        self.speculative_moe_a2a_backend = "deepep"
-                        logger.info(
-                            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
-                        )
+                        # deepep only supports expert parallelism
+                        if self.ep_size > 1:
+                            self.speculative_moe_a2a_backend = "deepep"
+                            logger.info(
+                                "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+                            )
+                        else:
+                            self.speculative_moe_a2a_backend = "none"
+                            logger.warning(
+                                "Expert parallelism is not enabled (ep_size=1), falling back to 'none' a2a backend instead of 'deepep' for speculative MoE."
+                            )
+                            logger.info(
+                                "Use deep_gemm moe runner and none a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+                            )
                     else:
                         self.speculative_moe_runner_backend = "triton"
                         self.speculative_moe_a2a_backend = "none"
