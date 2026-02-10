@@ -224,6 +224,8 @@ class SchedulerMetricsMixin:
         else:
             msg += f"input throughput (token/s): {self.last_input_throughput:.2f}, "
 
+        if self.server_args.language_only:
+            msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
         graph_backend = defaultdict(
             lambda: "cuda graph",
             {
@@ -397,6 +399,9 @@ class SchedulerMetricsMixin:
             msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
+
+        if self.server_args.language_only:
+            msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
 
         graph_backend = defaultdict(
             lambda: "cuda graph",
