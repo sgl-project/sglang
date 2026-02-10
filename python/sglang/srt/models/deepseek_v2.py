@@ -1663,7 +1663,22 @@ class DeepseekV2MoE(nn.Module):
                 op=torch.distributed.ReduceOp.SUM,
                 group=get_moe_ep_group().device_group,
             )
-            topk_output = self.topk.empty_topk_output(device)
+            # Waterfill uses expanded topk with 9 columns (8 routed + 1 shared).
+            # The standard empty_topk_output only generates 8 columns (top_k -
+            # num_fused_shared_experts), which causes a shape mismatch in the
+            # DeepEP dispatcher that was initialized for 9-column topk.
+            # Build the correct expanded empty topk output directly.
+            expanded_top_k = self.experts.top_k  # 9 in waterfill mode
+            topk_weights = torch.empty(
+                (0, expanded_top_k), dtype=torch.float32, device=device
+            )
+            topk_ids = torch.full(
+                (0, expanded_top_k), -1, dtype=torch.int32, device=device
+            )
+            router_logits = torch.empty(
+                (0, expanded_top_k), dtype=torch.float32, device=device
+            )
+            topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
             return self.experts(hidden_states=hidden_states, topk_output=topk_output)
 
         # ---------------- Debug-only: profile waterfill path timings ----------------
