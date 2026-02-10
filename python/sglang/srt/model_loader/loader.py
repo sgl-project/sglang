@@ -351,11 +351,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
-    ) -> Optional[str]:
+    ) -> str:
         """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
 
-        Returns the path to the downloaded model, or None if the model is not
-        downloaded from ModelScope."""
+        Returns the path to the downloaded model, or the original model path if
+        not downloaded from ModelScope."""
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
@@ -373,7 +373,7 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 model_path = model
             return model_path
-        return None
+        return model
 
     def _prepare_weights(
         self, model_name_or_path: str, revision: Optional[str], fall_back_to_pt: bool
@@ -381,9 +381,8 @@ class DefaultModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
-        model_name_or_path = (
-            self._maybe_download_from_modelscope(model_name_or_path, revision)
-            or model_name_or_path
+        model_name_or_path = self._maybe_download_from_modelscope(
+            model_name_or_path, revision
         )
 
         is_local = os.path.isdir(model_name_or_path)
@@ -474,6 +473,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
+        use_multithread = extra_config.get("enable_multithread_load", False)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
@@ -504,7 +504,7 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
                 )
-            elif extra_config.get("enable_multithread_load"):
+            elif use_multithread:
                 weights_iterator = multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -518,7 +518,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
         else:
-            if extra_config.get("enable_multithread_load"):
+            if use_multithread:
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -529,26 +529,36 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
         if self.load_config.draft_model_idx is not None:
-            import re
-
-            pattern = r"model.mtp.layers.(\d+)."
-            filtered_weights = []
-            for name, tensor in weights_iterator:
-                group = re.match(pattern, name)
-                if group is not None:
-                    idx = int(group.group(1))
-                    if idx != self.load_config.draft_model_idx:
-                        continue
-                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
-                else:
-                    new_name = name
-                filtered_weights.append((source.prefix + new_name, tensor))
-            return tuple(filtered_weights)
+            return self._filter_mtp_weights(
+                weights_iterator, source.prefix, self.load_config.draft_model_idx
+            )
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @staticmethod
+    def _filter_mtp_weights(
+        weights_iterator, prefix: str, draft_model_idx: int
+    ) -> Tuple[Tuple[str, torch.Tensor], ...]:
+        """Filter MTP (Multi-Token Prediction) weights to keep only the
+        specified draft model layer and remap it to layer 0."""
+        import re
+
+        pattern = r"model.mtp.layers.(\d+)."
+        filtered_weights = []
+        for name, tensor in weights_iterator:
+            group = re.match(pattern, name)
+            if group is not None:
+                idx = int(group.group(1))
+                if idx != draft_model_idx:
+                    continue
+                new_name = name.replace(group.group(), "model.mtp.layers.0.")
+            else:
+                new_name = name
+            filtered_weights.append((prefix + new_name, tensor))
+        return tuple(filtered_weights)
 
     def _get_all_weights(
         self,
