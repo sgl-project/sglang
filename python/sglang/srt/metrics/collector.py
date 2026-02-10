@@ -260,6 +260,12 @@ class SchedulerStats:
     kv_cache_avg_access_frequency: float = 0.0
     kv_cache_total_nodes: int = 0
     kv_cache_total_slots: int = 0
+    # KV cache memory metrics
+    kv_cache_available_slots: int = 0
+    kv_cache_used_slots: int = 0
+    kv_cache_total_slots_memory: int = 0
+    kv_cache_evictable_size: int = 0
+    kv_cache_total_size: int = 0
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
@@ -373,6 +379,37 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        # KV cache memory metrics
+        self.kv_cache_available_slots = Gauge(
+            name="sglang:kv_cache_available_slots",
+            documentation="Available slots in KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_used_slots = Gauge(
+            name="sglang:kv_cache_used_slots",
+            documentation="Used slots in KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_total_slots_memory = Gauge(
+            name="sglang:kv_cache_total_slots_memory",
+            documentation="Total slots in KV cache (memory perspective).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_evictable_size = Gauge(
+            name="sglang:kv_cache_evictable_size",
+            documentation="Evictable size in KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_cache_total_size = Gauge(
+            name="sglang:kv_cache_total_size",
+            documentation="Total size in KV cache.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.kv_cache_eviction_total = Counter(
             name="sglang:kv_cache_eviction_total",
             documentation="Total number of KV cache evictions.",
@@ -382,6 +419,11 @@ class SchedulerMetricsCollector:
             name="sglang:kv_cache_evicted_tokens_total",
             documentation="Total number of KV cache tokens evicted.",
             labelnames=[*labels.keys(), "reason"],
+        )
+        self.kv_cache_idle_time_before_eviction_total = Counter(
+            name="sglang:kv_cache_idle_time_before_eviction_total",
+            documentation="Total idle time before eviction in seconds.",
+            labelnames=[*labels.keys()],
         )
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
@@ -1085,6 +1127,12 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.kv_cache_avg_access_frequency, stats.kv_cache_avg_access_frequency)
         self._log_gauge(self.kv_cache_total_nodes, stats.kv_cache_total_nodes)
         self._log_gauge(self.kv_cache_total_slots, stats.kv_cache_total_slots)
+        # KV cache memory metrics
+        self._log_gauge(self.kv_cache_available_slots, stats.kv_cache_available_slots)
+        self._log_gauge(self.kv_cache_used_slots, stats.kv_cache_used_slots)
+        self._log_gauge(self.kv_cache_total_slots_memory, stats.kv_cache_total_slots_memory)
+        self._log_gauge(self.kv_cache_evictable_size, stats.kv_cache_evictable_size)
+        self._log_gauge(self.kv_cache_total_size, stats.kv_cache_total_size)
 
         self.last_log_time = time.perf_counter()
 
@@ -1113,10 +1161,12 @@ class SchedulerMetricsCollector:
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
-    def log_eviction_stats(self, num_tokens: int, reason: str) -> None:
+    def log_eviction_stats(self, num_tokens: int, reason: str, idle_time: float = 0.0) -> None:
         """Log KV cache eviction statistics."""
         self.kv_cache_eviction_total.labels(**self.labels, reason=reason).inc(1)
         self.kv_cache_evicted_tokens_total.labels(**self.labels, reason=reason).inc(num_tokens)
+        if idle_time > 0:
+            self.kv_cache_idle_time_before_eviction_total.labels(**self.labels).inc(idle_time)
 
 
 class TokenizerMetricsCollector:

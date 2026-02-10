@@ -408,11 +408,6 @@ class RadixCache(BasePrefixCache):
         total_slots = 0
         
         for node in all_nodes:
-            # Update active time for current access
-            if node.last_access_time != node.creation_time:
-                node.active_time += current_time - node.last_access_time
-                node.last_access_time = current_time
-            
             total_active_time += node.active_time
             total_lifetime += current_time - node.creation_time
             total_access_count += node.hit_count
@@ -656,6 +651,7 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         eviction_ts = time.time()
+        current_time = time.monotonic()
         num_tokens = params.num_tokens
         leaves = self._collect_leaves()
         eviction_heap = [
@@ -666,9 +662,14 @@ class RadixCache(BasePrefixCache):
         num_evicted = 0
         evicted_indices = []
         evicted_nodes = []
+        total_idle_time_before_eviction = 0.0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
             evicted_nodes.append(x)
+
+            # Calculate idle time before eviction
+            idle_time = current_time - x.last_access_time
+            total_idle_time_before_eviction += idle_time
 
             # Track evicted indices for debugging
             if x.value is not None and len(x.value) > 0:
@@ -688,26 +689,28 @@ class RadixCache(BasePrefixCache):
         utilization_metrics = None
         if evicted_nodes:
             total_active_time = sum(node.active_time for node in evicted_nodes)
-            total_lifetime = sum(time.monotonic() - node.creation_time for node in evicted_nodes)
+            total_lifetime = sum(current_time - node.creation_time for node in evicted_nodes)
             total_access_count = sum(node.hit_count for node in evicted_nodes)
             
             utilization_metrics = {
                 "avg_active_ratio": total_active_time / total_lifetime if total_lifetime > 0 else 0,
                 "avg_access_frequency": total_access_count / total_lifetime if total_lifetime > 0 else 0,
-                "total_nodes_evicted": len(evicted_nodes)
+                "total_nodes_evicted": len(evicted_nodes),
+                "total_idle_time_before_eviction": total_idle_time_before_eviction
             }
 
         # Record eviction for debugging
         if num_evicted > 0:
-            self.eviction_history.append(
-                EvictionRecord(
-                    timestamp=eviction_ts,
-                    evicted_indices=evicted_indices,
-                    num_tokens=num_evicted,
-                    reason="memory_pressure",
-                    utilization_metrics=utilization_metrics,
-                )
+            eviction_record = EvictionRecord(
+                timestamp=eviction_ts,
+                evicted_indices=evicted_indices,
+                num_tokens=num_evicted,
+                reason="memory_pressure",
+                utilization_metrics=utilization_metrics,
             )
+            # Add idle time to the eviction record
+            eviction_record.idle_time_before_eviction = total_idle_time_before_eviction
+            self.eviction_history.append(eviction_record)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)

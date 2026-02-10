@@ -289,6 +289,20 @@ class SchedulerMetricsMixin:
                     self.stats.kv_cache_total_slots = utilization_info.get("total_slots", 0)
             except Exception:
                 pass
+            # Update KV cache memory metrics
+            try:
+                allocator = self.token_to_kv_pool_allocator
+                available = allocator.available_size()
+                evictable = self.tree_cache.evictable_size()
+                used = self.max_total_num_tokens - available - evictable
+                
+                self.stats.kv_cache_available_slots = available
+                self.stats.kv_cache_used_slots = used
+                self.stats.kv_cache_total_slots_memory = self.max_total_num_tokens
+                self.stats.kv_cache_evictable_size = evictable
+                self.stats.kv_cache_total_size = self.tree_cache.total_size()
+            except Exception:
+                pass
             # Log eviction events
             try:
                 if hasattr(self.tree_cache, "get_recent_evictions"):
@@ -298,7 +312,9 @@ class SchedulerMetricsMixin:
                         # Only log evictions that haven't been logged before
                         if hasattr(record, "logged") and record.logged:
                             continue
-                        self.metrics_collector.log_eviction_stats(record.num_tokens, record.reason)
+                        # Get idle time from record if available
+                        idle_time = getattr(record, "idle_time_before_eviction", 0.0)
+                        self.metrics_collector.log_eviction_stats(record.num_tokens, record.reason, idle_time)
                         # Mark the record as logged
                         record.logged = True
             except Exception:
