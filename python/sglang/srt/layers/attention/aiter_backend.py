@@ -53,8 +53,8 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
-# FP8 prefill: mla_prefill_ps_asm_fwd + mla_reduce_v1
-_use_mla_prefill_ps_asm = get_bool_env_var("SGLANG_AITER_MLA_PREFILL_PS_ASM", "False")
+# Use fp8 prefill
+_use_fp8_prefill_attn = get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True")
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
@@ -692,7 +692,7 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map = None
                 reduce_partial_map = None
 
-                if _use_mla_prefill_ps_asm:
+                if _use_fp8_prefill_attn:
                     tile_q = 256
                     qlen_granularity = tile_q // (self.num_head // self.num_kv_head)
                     (
@@ -1183,15 +1183,10 @@ class AiterAttnBackend(AttentionBackend):
             ):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
                 if kv_indices.shape[0] == 0 or extend_no_prefix:
-                    if _use_mla_prefill_ps_asm:
+                    if _use_fp8_prefill_attn:
                         total_s = q.shape[0]
                         nhead = layer.tp_q_head_num
                         v_head_dim = layer.v_head_dim
-
-                        # from aiter import per_tensor_quant
-                        # q, q_descale = per_tensor_quant(q, quant_dtype=fp8_dtype)
-                        # k, k_descale = per_tensor_quant(k, quant_dtype=fp8_dtype)
-                        # v, v_descale = per_tensor_quant(v[:, :, :v_head_dim].contiguous(), quant_dtype=fp8_dtype)
 
                         fp8_max = 448
                         fp8_min = -448
@@ -1253,9 +1248,6 @@ class AiterAttnBackend(AttentionBackend):
                             one_scale,
                             one_scale,
                             one_scale,
-                            # q_descale,
-                            # k_descale,
-                            # v_descale,
                         )
                         mla_reduce_v1(
                             logits,
