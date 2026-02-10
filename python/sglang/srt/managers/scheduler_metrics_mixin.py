@@ -872,10 +872,18 @@ class SchedulerMetricsMixin:
                                 evicted_indices=er.evicted_indices,
                                 num_tokens=er.num_tokens,
                                 reason=er.reason,
+                                utilization_metrics=er.utilization_metrics,
                             )
                         )
                 except Exception:
                     pass
+
+        # Calculate overall utilization metrics
+        utilization_info = None
+        try:
+            utilization_info = self.tree_cache.get_utilization_metrics()
+        except Exception:
+            pass
 
         return GetKVCacheStateReqOutput(
             dp_rank=self.dp_rank,
@@ -884,6 +892,7 @@ class SchedulerMetricsMixin:
             memory=memory_info,
             requests=requests_info,
             recent_evictions=recent_evictions,
+            utilization=utilization_info,
         )
 
     @contextmanager

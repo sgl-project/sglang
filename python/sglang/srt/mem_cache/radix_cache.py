@@ -72,6 +72,7 @@ class EvictionRecord:
     evicted_indices: List[int]
     num_tokens: int
     reason: str  # memory_pressure, explicit_flush, reset
+    utilization_metrics: Optional[dict] = None  # Utilization metrics for evicted nodes
 
 
 class RadixKey:
@@ -118,6 +119,7 @@ class TreeNode:
         self.creation_time = time.monotonic()
 
         self.hit_count = 0
+        self.active_time = 0.0  # Total time node was actively used
         # indicating the node is locked to protect from eviction
         # incremented when the node is referenced by a storage operation
         self.host_ref_counter = 0
@@ -375,6 +377,54 @@ class RadixCache(BasePrefixCache):
         records.reverse()
         return records[:max_count]
 
+    def get_utilization_metrics(self) -> dict:
+        """Calculate overall KV cache utilization metrics.
+
+        Returns:
+            Dict containing utilization metrics
+        """
+        # Collect all nodes
+        all_nodes = []
+        stack = [self.root_node]
+        
+        while stack:
+            node = stack.pop()
+            if not node.evicted:
+                all_nodes.append(node)
+            stack.extend(node.children.values())
+        
+        if not all_nodes:
+            return {
+                "avg_active_ratio": 0.0,
+                "avg_access_frequency": 0.0,
+                "total_nodes": 0,
+                "total_slots": 0
+            }
+        
+        current_time = time.monotonic()
+        total_active_time = 0
+        total_lifetime = 0
+        total_access_count = 0
+        total_slots = 0
+        
+        for node in all_nodes:
+            # Update active time for current access
+            if node.last_access_time != node.creation_time:
+                node.active_time += current_time - node.last_access_time
+                node.last_access_time = current_time
+            
+            total_active_time += node.active_time
+            total_lifetime += current_time - node.creation_time
+            total_access_count += node.hit_count
+            total_slots += len(node.key)
+        
+        return {
+            "avg_active_ratio": total_active_time / total_lifetime if total_lifetime > 0 else 0.0,
+            "avg_access_frequency": total_access_count / total_lifetime if total_lifetime > 0 else 0.0,
+            "total_nodes": len(all_nodes),
+            "total_slots": total_slots
+        }
+
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
@@ -615,8 +665,10 @@ class RadixCache(BasePrefixCache):
 
         num_evicted = 0
         evicted_indices = []
+        evicted_nodes = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+            evicted_nodes.append(x)
 
             # Track evicted indices for debugging
             if x.value is not None and len(x.value) > 0:
@@ -632,6 +684,19 @@ class RadixCache(BasePrefixCache):
 
             self._record_remove_event(x)
 
+        # Calculate utilization metrics for evicted nodes
+        utilization_metrics = None
+        if evicted_nodes:
+            total_active_time = sum(node.active_time for node in evicted_nodes)
+            total_lifetime = sum(time.monotonic() - node.creation_time for node in evicted_nodes)
+            total_access_count = sum(node.hit_count for node in evicted_nodes)
+            
+            utilization_metrics = {
+                "avg_active_ratio": total_active_time / total_lifetime if total_lifetime > 0 else 0,
+                "avg_access_frequency": total_access_count / total_lifetime if total_lifetime > 0 else 0,
+                "total_nodes_evicted": len(evicted_nodes)
+            }
+
         # Record eviction for debugging
         if num_evicted > 0:
             self.eviction_history.append(
@@ -640,6 +705,7 @@ class RadixCache(BasePrefixCache):
                     evicted_indices=evicted_indices,
                     num_tokens=num_evicted,
                     reason="memory_pressure",
+                    utilization_metrics=utilization_metrics,
                 )
             )
 
@@ -699,15 +765,14 @@ class RadixCache(BasePrefixCache):
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        access_time = time.monotonic()
-        node.last_access_time = access_time
+        self._update_access_metrics(node)
 
         child_key = self.get_child_key_fn(key)
 
         value = []
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
-            child.last_access_time = access_time
+            self._update_access_metrics(child)
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -749,8 +814,7 @@ class RadixCache(BasePrefixCache):
         # Convert None priority to 0
         if priority is None:
             priority = 0
-        access_time = time.monotonic()
-        node.last_access_time = access_time
+        self._update_access_metrics(node)
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
@@ -761,7 +825,7 @@ class RadixCache(BasePrefixCache):
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
-            node.last_access_time = access_time
+            self._update_access_metrics(node)
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -894,6 +958,22 @@ class RadixCache(BasePrefixCache):
                 self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
 
                 page_index += 1
+
+    def _update_access_metrics(self, node: TreeNode):
+        """Update utilization metrics when a node is accessed.
+        
+        Args:
+            node: The TreeNode being accessed
+        """
+        current_time = time.monotonic()
+        
+        # Accumulate active time (time since last access)
+        if node.last_access_time != node.creation_time:
+            node.active_time += current_time - node.last_access_time
+        
+        # Update access metrics
+        node.last_access_time = current_time
+        node.hit_count += 1
 
     def _record_all_cleared_event(self):
         if self.enable_kv_cache_events:

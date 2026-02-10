@@ -1945,6 +1945,7 @@ class KVCacheEvictionInfo:
     evicted_indices: List[int]  # KV cache slot indices that were evicted
     num_tokens: int  # Number of tokens evicted
     reason: str  # memory_pressure, explicit_flush, etc.
+    utilization_metrics: Optional[dict] = None  # Utilization metrics for evicted nodes
 
 
 @dataclass
@@ -1978,6 +1979,7 @@ class GetKVCacheStateReqOutput(BaseReq):
     memory: Optional[KVCacheMemoryInfo] = None
     requests: Optional[List[KVCacheRequestInfo]] = None
     recent_evictions: Optional[List[KVCacheEvictionInfo]] = None
+    utilization: Optional[dict] = None  # Overall utilization metrics
 
 
 @dataclass

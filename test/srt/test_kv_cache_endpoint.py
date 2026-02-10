@@ -50,6 +50,7 @@ def test_kv_cache_endpoint(base_url: str, verbose: bool = True):
         state = data["kv_cache_state"][0]
         assert "dp_rank" in state, "Missing 'dp_rank'"
         assert "timestamp" in state, "Missing 'timestamp'"
+        assert "utilization" in state, "Missing 'utilization' metrics"
         log(f"✓ Basic call passed. Got state for dp_rank={state['dp_rank']}")
         results["passed"] += 1
     except Exception as e:
@@ -151,6 +152,29 @@ def test_kv_cache_endpoint(base_url: str, verbose: bool = True):
         results["passed"] += 1
     except Exception as e:
         log(f"✗ Full dump failed: {e}")
+        results["failed"] += 1
+        results["errors"].append(str(e))
+
+    # Test 6: Utilization metrics structure
+    log("\n=== Test 6: Utilization metrics structure ===")
+    try:
+        resp = requests.get(f"{base_url}/v1/kv_cache", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        state = data["kv_cache_state"][0]
+        utilization = state["utilization"]
+        assert isinstance(utilization, dict), "Utilization should be a dict"
+        expected_fields = ["avg_active_ratio", "avg_access_frequency", "total_nodes", "total_slots"]
+        for field in expected_fields:
+            assert field in utilization, f"Missing '{field}' in utilization metrics"
+            assert isinstance(utilization[field], (int, float)), f"{field} should be numeric"
+            assert utilization[field] >= 0, f"{field} should be non-negative"
+        log("✓ Utilization metrics structure is correct")
+        if verbose:
+            log(f"  Utilization metrics: {json.dumps(utilization, indent=2)}")
+        results["passed"] += 1
+    except Exception as e:
+        log(f"✗ Utilization metrics test failed: {e}")
         results["failed"] += 1
         results["errors"].append(str(e))
 

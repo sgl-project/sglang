@@ -5,6 +5,7 @@ FROM ${BASE_IMAGE}
 
 # Copy local sglang source (with your changes)
 COPY python /opt/sglang/python
+COPY test /opt/sglang/test
 
 # Uninstall base image's sglang and reinstall from local source
 WORKDIR /opt/sglang
@@ -18,5 +19,3 @@ RUN pip uninstall -y sglang && \
     'opentelemetry-exporter-otlp>=1.26.0,<1.27.0' \
     'opentelemetry-semantic-conventions-ai>=0.4.1,<0.5.0'
 
-# Reset workdir
-WORKDIR /
