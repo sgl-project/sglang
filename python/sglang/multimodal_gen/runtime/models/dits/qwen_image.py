@@ -5,6 +5,7 @@
 import functools
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import aiter
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,9 +40,12 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 _is_cuda = current_platform.is_cuda()
+_is_hip = current_platform.is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 
 def _get_qkv_projections(
@@ -557,47 +561,102 @@ class QwenImageCrossAttention(nn.Module):
         txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
         txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
 
-        # Apply QK normalization
-        if self.qk_norm:
-            img_query, img_key = apply_qk_norm(
-                q=img_query,
-                k=img_key,
-                q_norm=self.norm_q,
-                k_norm=self.norm_k,
-                head_dim=img_query.shape[-1],
-                allow_inplace=True,
-            )
-            txt_query, txt_key = apply_qk_norm(
-                q=txt_query,
-                k=txt_key,
-                q_norm=self.norm_added_q,
-                k_norm=self.norm_added_k,
-                head_dim=txt_query.shape[-1],
-                allow_inplace=True,
-            )
+        use_fused_rope_rms = (
+            _use_aiter
+            and envs.SGLANG_ENABLE_FUSED_ROPE_RMS_2WAY.get()
+            and image_rotary_emb is not None
+            and isinstance(self.norm_q, RMSNorm)
+            and isinstance(self.norm_k, RMSNorm)
+            and isinstance(self.norm_added_q, RMSNorm)
+            and isinstance(self.norm_added_k, RMSNorm)
+            and img_query.is_cuda
+            and txt_query.is_cuda
+        )
 
-        # Apply RoPE
-        if image_rotary_emb is not None:
-            if not (
-                isinstance(image_rotary_emb[0], torch.Tensor)
-                and image_rotary_emb[0].dim() == 2
-            ):
-                raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
-
-            img_cache, txt_cache = image_rotary_emb
-
-            img_query, img_key = apply_flashinfer_rope_qk_inplace(
-                img_query, img_key, img_cache, is_neox=False
+        if use_fused_rope_rms:
+            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+            txt_cos_sin = torch.cat([txt_cos, txt_sin], dim=-1).contiguous()
+            img_cos_sin = torch.cat([img_cos, img_sin], dim=-1).contiguous()
+            batch_size = img_query.shape[0]
+            seq_len_img = img_query.shape[1]
+            num_heads_q = img_query.shape[2]
+            num_heads_k = img_key.shape[2]
+            head_size = img_query.shape[3]
+            joint_query = torch.empty(
+                (batch_size, seq_len_txt + seq_len_img, num_heads_q, head_size),
+                dtype=img_query.dtype,
+                device=img_query.device,
             )
-            txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
-                txt_query, txt_key, txt_cache, is_neox=False
+            joint_key = torch.empty(
+                (batch_size, seq_len_txt + seq_len_img, num_heads_k, head_size),
+                dtype=img_key.dtype,
+                device=img_key.device,
             )
+            joint_value = torch.cat([txt_value, img_value], dim=1)
+            aiter.fused_rope_rms_2way(
+                txt_query.contiguous(),
+                txt_key.contiguous(),
+                img_query.contiguous(),
+                img_key.contiguous(),
+                self.norm_added_q.weight,
+                self.norm_added_k.weight,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                txt_cos_sin,
+                img_cos_sin,
+                batch_size,
+                seq_len_txt,
+                seq_len_img,
+                num_heads_q,
+                num_heads_k,
+                head_size,
+                True,
+                self.eps,
+                joint_query,
+                joint_key,
+            )
+        else:
+            # Apply QK normalization
+            if self.qk_norm:
+                img_query, img_key = apply_qk_norm(
+                    q=img_query,
+                    k=img_key,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=img_query.shape[-1],
+                    allow_inplace=True,
+                )
+                txt_query, txt_key = apply_qk_norm(
+                    q=txt_query,
+                    k=txt_key,
+                    q_norm=self.norm_added_q,
+                    k_norm=self.norm_added_k,
+                    head_dim=txt_query.shape[-1],
+                    allow_inplace=True,
+                )
 
-        # Concatenate for joint attention
-        # Order: [text, image]
-        joint_query = torch.cat([txt_query, img_query], dim=1)
-        joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+            # Apply RoPE
+            if image_rotary_emb is not None:
+                if not (
+                    isinstance(image_rotary_emb[0], torch.Tensor)
+                    and image_rotary_emb[0].dim() == 2
+                ):
+                    raise RuntimeError("image_rotary_emb must be cos_sin_cache tensors")
+
+                img_cache, txt_cache = image_rotary_emb
+
+                img_query, img_key = apply_flashinfer_rope_qk_inplace(
+                    img_query, img_key, img_cache, is_neox=False
+                )
+                txt_query, txt_key = apply_flashinfer_rope_qk_inplace(
+                    txt_query, txt_key, txt_cache, is_neox=False
+                )
+
+            # Concatenate for joint attention
+            # Order: [text, image]
+            joint_query = torch.cat([txt_query, img_query], dim=1)
+            joint_key = torch.cat([txt_key, img_key], dim=1)
+            joint_value = torch.cat([txt_value, img_value], dim=1)
 
         # Compute joint attention
         joint_hidden_states = self.attn(
