@@ -1,8 +1,12 @@
 # Diffusion Language Models
 
+> This page covers **text generation** using diffusion-based LLMs. For **image and video generation**, see [Diffusion Models](../image_generation/diffusion_models.md).
+
 Diffusion language models have shown promise for non-autoregressive text generation with parallel decoding capabilities. Unlike auto-regressive language models, different diffusion language models require different decoding strategies.
 
 ## Example Launch Command
+
+SGLang supports different DLLM algorithms such as `LowConfidence` and `JointThreshold`.
 
 ```shell
 python3 -m sglang.launch_server \
@@ -15,6 +19,10 @@ python3 -m sglang.launch_server \
 
 ## Example Configuration File
 
+Depending on the algorithm selected, the configuration parameters vary.
+
+LowConfidence Config:
+
 ```yaml
 # Confidence threshold for accepting predicted tokens
 # - Higher values: More conservative, better quality but slower
@@ -25,6 +33,26 @@ threshold: 0.95
 # Default: 32, for LLaDA2MoeModelLM
 block_size: 32
 ```
+
+JointThreshold Config:
+
+```yaml
+# Decoding threshold for Mask-to-Token (M2T) phase
+# - Higher values: More conservative, better quality but slower
+# - Lower values: More aggressive, faster but potentially lower quality
+# Range: 0.0 - 1.0
+threshold: 0.5
+# Decoding threshold for Token-to-Token (T2T) phase
+# Range: 0.0 - 1.0
+# Setting to 0.0 allows full editing (recommended for most cases).
+edit_threshold: 0.0
+# Max extra T2T steps after all masks are removed. Prevents infinite loops.
+max_post_edit_steps: 16
+# 2-gram repetition penalty (default 0).
+# An empirical value of 3 is often sufficient to mitigate most repetitions.
+penalty_lambda: 0
+```
+
 ## Example Client Code Snippet
 
 Just like other supported models, diffusion language models can be used via the REST API or Python client.
@@ -78,6 +106,6 @@ curl -X POST "http://127.0.0.1:30000/generate" \
 
 Below the supported models are summarized in a table.
 
-| Model Family                               | Example Model                          | Description                                                                 |
-| ------------------------------------------ | -------------------------------------- | --------------------------------------------------------------------------- |
+| Model Family               | Example Model                | Description                                                                                          |
+| -------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------- |
 | **LLaDA2.0 (mini, flash)** | `inclusionAI/LLaDA2.0-flash` | LLaDA2.0-flash is a diffusion language model featuring a 100B Mixture-of-Experts (MoE) architecture. |
