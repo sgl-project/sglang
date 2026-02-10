@@ -365,13 +365,23 @@ class ServerArgs:
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
-        sp_degree = self.sp_degree
-        if (self.tp_size not in (-1, 1)) or sp_degree <= 1:
+        if (self.tp_size not in (-1, 1)) or self.sp_degree <= 1:
             return
+
+        enabled = False
         for text_encoder_config in self.pipeline_config.text_encoder_configs:
             if isinstance(text_encoder_config, T5Config):
                 text_encoder_config.parallel_folding = True
+                enabled = True
                 text_encoder_config.parallel_folding_mode = "sp"
+
+        if enabled:
+            logger.info(
+                "Enabled T5 text encoder parallel folding (mode=sp) for %s (tp_size=%s, sp_degree=%s).",
+                self.__class__.__name__,
+                self.tp_size,
+                self.sp_degree,
+            )
 
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
