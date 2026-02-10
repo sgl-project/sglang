@@ -246,6 +246,10 @@ class PiecewiseCudaGraphRunner:
             with patch_model(
                 language_model.model, self.compile_config.compiler
             ) as patched_model:
+
+                # Dummy warmup for jit kernel
+                self.warmup_compile(num_tokens=self.capture_num_tokens[0])
+
                 install_torch_compiled(
                     patched_model,
                     fullgraph=True,
@@ -265,7 +269,7 @@ class PiecewiseCudaGraphRunner:
                             compile_range.set_description(
                                 f"Compiling num tokens ({num_tokens=})"
                             )
-                        self.warmup_torch_compile(num_tokens=num_tokens)
+                        self.warmup_compile(num_tokens=num_tokens)
 
                 set_global_graph_memory_pool(self.device_module.graph_pool_handle())
                 set_graph_pool_id(get_global_graph_memory_pool())
@@ -282,7 +286,7 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
-    def warmup_torch_compile(self, num_tokens: int):
+    def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
         input_ids = self.input_ids[:num_tokens]
         input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
