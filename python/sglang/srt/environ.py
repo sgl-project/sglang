@@ -163,6 +163,7 @@ class Envs:
     SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
     SGLANG_LOG_REQUEST_EXCEEDED_MS = EnvInt(-1)
+    SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
 
@@ -249,6 +250,7 @@ class Envs:
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
     SGLANG_QUEUED_TIMEOUT_MS = EnvInt(-1)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
+    SGLANG_FORWARD_TIMEOUT_MS = EnvInt(-1)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -332,11 +334,14 @@ class Envs:
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
+    SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+
+    # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
 
     # DeepEP
@@ -348,6 +353,7 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+    SGLANG_NSA_FORCE_MLA = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -460,6 +466,10 @@ class Envs:
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
+
+    # EPD
+    SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
 
 
 envs = Envs()

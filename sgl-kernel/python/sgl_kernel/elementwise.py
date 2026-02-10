@@ -404,35 +404,3 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
-
-
-def timestep_embedding(
-    t: torch.Tensor,
-    dim: int,
-    flip_sin_to_cos: bool = False,
-    downscale_freq_shift: float = 0.0,
-    scale: float = 1,
-    max_period: int = 10000,
-    dtype: torch.dtype = torch.float32,
-):
-    """
-    Create sinusoidal timestep embeddings.
-
-    # TODO: review, output dtype always be float32. According to python code:
-    #  sglang/python/sglang/multimodal_gen/runtime/layers/visual_embedding.py
-
-    Args:
-        t: Tensor of shape [B] with timesteps
-        dim: Embedding dimension
-        max_period: Controls the minimum frequency of the embeddings
-
-    Returns:
-        Tensor of shape [B, dim] with embeddings
-    """
-    dtype = torch.float32
-
-    batch_size = t.shape[0]
-    output = torch.empty((batch_size, dim), dtype=dtype, device=t.device)
-    return torch.ops.sgl_kernel.timestep_embedding(
-        t, output, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period
-    )

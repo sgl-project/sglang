@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=131, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=51, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=300, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestAbort(CustomTestCase):
@@ -281,6 +281,42 @@ class TestAbortWithQueueTimeout(CustomTestCase):
                     error_count += 1
                     self.assertEqual(result["code"], 503)
             self.assertEqual(error_count, 1)
+
+
+class TestAbortWithForwardTimeout(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_FORWARD_TIMEOUT_MS.override(
+            1
+        ), envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=["--skip-server-warmup"],
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_forward_timeout(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Today is ",
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 512,
+                    "ignore_eos": True,
+                },
+            },
+        )
+        result = response.json()
+        self.assertEqual(result["object"], "error")
+        self.assertEqual(result["code"], 503)
 
 
 if __name__ == "__main__":
