@@ -1081,6 +1081,16 @@ class Qwen3NextForCausalLM(nn.Module):
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
+            # Load KV cache scales directly, bypassing stacked params mapping
+            if name.endswith(".k_scale") or name.endswith(".v_scale"):
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
