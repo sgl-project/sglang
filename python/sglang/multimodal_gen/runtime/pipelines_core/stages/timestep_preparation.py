@@ -74,6 +74,7 @@ class TimestepPreparationStage(PipelineStage):
         n_tokens = batch.n_tokens
 
         sigmas = server_args.pipeline_config.prepare_sigmas(sigmas, num_inference_steps)
+        batch.sigmas = sigmas
 
         # Prepare extra kwargs for set_timesteps
         extra_set_timesteps_kwargs = {}
@@ -87,6 +88,8 @@ class TimestepPreparationStage(PipelineStage):
             key, value = callee(batch, server_args)
             assert isinstance(key, str)
             extra_set_timesteps_kwargs[key] = value
+            if key == "mu":
+                batch.extra["mu"] = value
 
         # Handle custom timesteps or sigmas
         if timesteps is not None and sigmas is not None:

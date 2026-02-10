@@ -16,6 +16,9 @@ use axum::{
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use smg_mesh::{
+    rate_limit_window::RateLimitWindow, MeshServerConfig, MeshServerHandler, MeshSyncManager,
+};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 
@@ -24,20 +27,10 @@ use crate::{
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
-        steps::WorkflowEngines,
+        steps::{TokenizerConfigRequest, WorkflowEngines},
         worker::WorkerType,
         worker_manager::WorkerManager,
         Job,
-    },
-    mesh::{
-        endpoints::{
-            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
-            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
-            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
-        },
-        rate_limit_window::RateLimitWindow,
-        service::{MeshServerConfig, MeshServerHandler},
-        sync::MeshSyncManager,
     },
     middleware::{self, AuthConfig, QueuedRequest},
     observability::{
@@ -58,8 +51,19 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
-    routers::{conversations, parse, router_manager::RouterManager, tokenize, RouterTrait},
+    routers::{
+        conversations,
+        mesh::{
+            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
+            get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
+            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
+        },
+        parse,
+        router_manager::RouterManager,
+        tokenize, RouterTrait,
+    },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    tokenizer::TokenizerRegistry,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     workflow::LoggingSubscriber,
 };
@@ -829,6 +833,42 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "Workflow engines initialized (health check timeout: {}s)",
         config.router_config.health_check.timeout_secs
     );
+
+    // Submit startup tokenizer job if tokenizer path is configured
+    // This runs before worker initialization to ensure tokenizer is available
+    if let Some(tokenizer_source) = config
+        .router_config
+        .tokenizer_path
+        .as_ref()
+        .or(config.router_config.model_path.as_ref())
+    {
+        info!("Loading startup tokenizer from: {}", tokenizer_source);
+
+        let job_queue = app_context
+            .worker_job_queue
+            .get()
+            .expect("JobQueue should be initialized");
+
+        let tokenizer_config = TokenizerConfigRequest {
+            id: TokenizerRegistry::generate_id(),
+            name: tokenizer_source.clone(),
+            source: tokenizer_source.clone(),
+            chat_template_path: config.router_config.chat_template.clone(),
+            cache_config: config.router_config.tokenizer_cache.to_option(),
+            fail_on_duplicate: false,
+        };
+
+        let job = Job::AddTokenizer {
+            config: Box::new(tokenizer_config),
+        };
+
+        job_queue
+            .submit(job)
+            .await
+            .map_err(|e| format!("Failed to submit startup tokenizer job: {}", e))?;
+
+        info!("Startup tokenizer job submitted (will complete in background)");
+    }
 
     info!(
         "Initializing workers for routing mode: {:?}",

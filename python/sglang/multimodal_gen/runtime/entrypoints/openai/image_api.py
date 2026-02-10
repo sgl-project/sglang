@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageResponse,
     ImageResponseData,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -136,38 +137,63 @@ async def generations(
     )
     save_file_path = save_file_path_list[0]
 
+    resp_format = (request.response_format or "b64_json").lower()
+    b64_data = None
+
+    # 1. Read content first if needed (while file exists)
+    if resp_format == "b64_json":
+        with open(save_file_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    # 2. Upload and Delete local file
+    cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
+    # 3. Update Database
     await IMAGE_STORE.upsert(
         request_id,
         {
             "id": request_id,
             "created_at": int(time.time()),
-            "file_path": save_file_path,
+            "file_path": None if cloud_url else save_file_path,
+            "url": cloud_url,
         },
     )
 
-    resp_format = (request.response_format or "b64_json").lower()
-
+    # 4. Return Response
     if resp_format == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
         response_kwargs = {
             "data": [
                 ImageResponseData(
-                    b64_json=b64,
+                    b64_json=b64_data,
+                    revised_prompt=request.prompt,
+                )
+            ]
+        }
+    elif resp_format == "url":
+        if not cloud_url:
+            raise HTTPException(
+                status_code=400,
+                detail="response_format='url' requires cloud storage to be configured.",
+            )
+        response_kwargs = {
+            "data": [
+                ImageResponseData(
+                    url=cloud_url,
                     revised_prompt=request.prompt,
                     file_path=os.path.abspath(save_file_path),
                 )
             ],
         }
-        response_kwargs = add_common_data_to_response(
-            response_kwargs, request_id=request_id, result=result
-        )
-        return ImageResponse(**response_kwargs)
     else:
         # Return error, not supported
         raise HTTPException(
-            status_code=400, detail="response_format=url is not supported"
+            status_code=400, detail=f"response_format={resp_format} is not supported"
         )
+
+    response_kwargs = add_common_data_to_response(
+        response_kwargs, request_id=request_id, result=result
+    )
+    return ImageResponse(**response_kwargs)
 
 
 @router.post("/edits", response_model=ImageResponse)
@@ -248,38 +274,54 @@ async def edits(
         async_scheduler_client, batch
     )
     save_file_path = save_file_path_list[0]
+
+    resp_format = (response_format or "b64_json").lower()
+    b64_data = None
+
+    # 1. Read content first if needed (while file exists)
+    if resp_format == "b64_json":
+        with open(save_file_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    # 2. Upload and Delete local file
+    cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
+    # 3. Update Database
     await IMAGE_STORE.upsert(
         request_id,
         {
             "id": request_id,
             "created_at": int(time.time()),
-            "file_path": save_file_path,
+            "file_path": None if cloud_url else save_file_path,
+            "url": cloud_url,
             "input_image_paths": input_paths,  # Store all input image paths
             "num_input_images": len(input_paths),
         },
     )
 
-    # Default to b64_json to align with gpt-image-1 behavior in OpenAI examples
+    # 4. Return Response
     if (response_format or "b64_json").lower() == "b64_json":
         response_kwargs = {"data": []}
-        for save_file_path in save_file_path_list:
-            with open(save_file_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-                response_kwargs["data"].append(
-                    ImageResponseData(
-                        b64_json=b64,
-                        revised_prompt=prompt,
-                        file_path=os.path.abspath(save_file_path),
-                    )
+        for path in save_file_path_list:
+            if path == save_file_path and b64_data is not None:
+                b64 = b64_data
+            else:
+                with open(path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("utf-8")
+            response_kwargs["data"].append(
+                ImageResponseData(
+                    b64_json=b64,
+                    revised_prompt=prompt,
+                    file_path=os.path.abspath(path),
                 )
+            )
         if result.peak_memory_mb and result.peak_memory_mb > 0:
             response_kwargs["peak_memory_mb"] = result.peak_memory_mb
     else:
-        url = f"/v1/images/{request_id}/content"
         response_kwargs = {
             "data": [
                 ImageResponseData(
-                    url=url,
+                    url=cloud_url if cloud_url else f"/v1/images/{request_id}/content",
                     revised_prompt=prompt,
                     file_path=os.path.abspath(save_file_path),
                 )
@@ -289,7 +331,6 @@ async def edits(
     response_kwargs = add_common_data_to_response(
         response_kwargs, request_id=request_id, result=result
     )
-
     return ImageResponse(**response_kwargs)
 
 
@@ -300,6 +341,12 @@ async def download_image_content(
     item = await IMAGE_STORE.get(image_id)
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
+
+    if item.get("url"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image has been uploaded to cloud storage. Please use the cloud URL: {item.get('url')}",
+        )
 
     file_path = item.get("file_path")
     if not file_path or not os.path.exists(file_path):
