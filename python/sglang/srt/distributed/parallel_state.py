@@ -543,9 +543,6 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
-        if input_.numel() == 0:
-            return input_
-
         # On AMD, use the deterministic 1-stage kernel when:
         # - SGLANG_USE_1STAGE_ALLREDUCE=1 (explicitly enabled), OR
         # - SGLANG_USE_1STAGE_ALLREDUCE not set AND --enable-deterministic-inference is on
@@ -1756,6 +1753,9 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+            use_mscclpp_allreduce=False,
+            use_custom_allreduce=False,
+            use_torch_symm_mem_allreduce=False,
             group_name="attention_tp",
         )
 
