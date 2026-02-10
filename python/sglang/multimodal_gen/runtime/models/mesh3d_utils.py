@@ -14,7 +14,6 @@ Adapted from Hunyuan3D-2: https://github.com/Tencent/Hunyuan3D-2
 from __future__ import annotations
 
 import math
-import os
 from typing import Any, List, Optional, Tuple, Union
 
 import cv2
@@ -170,141 +169,34 @@ def export_to_trimesh(mesh_output: Any) -> Any:
         return trimesh.Trimesh(mesh_output.mesh_v, mesh_output.mesh_f)
 
 
-def load_mesh(path: str) -> Any:
-    """Load a mesh from file.
-
-    Args:
-        path: Path to mesh file (OBJ, GLB, etc.).
-
-    Returns:
-        Loaded trimesh object.
-    """
-    return trimesh.load(path)
-
-
-def save_mesh(
-    mesh: Any,
-    path: str,
-    file_type: Optional[str] = None,
-) -> str:
-    """Save a mesh to file.
-
-    Args:
-        mesh: trimesh.Trimesh object.
-        path: Output path.
-        file_type: Optional file type override.
-
-    Returns:
-        Path to saved file.
-    """
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    mesh.export(path, file_type=file_type)
-    return path
-
-
-def convert_obj_to_glb(obj_path: str, glb_path: Optional[str] = None) -> str:
-    """Convert OBJ file to GLB format.
-
-    Args:
-        obj_path: Path to input OBJ file.
-        glb_path: Optional output GLB path. Defaults to same name with .glb extension.
-
-    Returns:
-        Path to output GLB file.
-    """
-    if glb_path is None:
-        glb_path = obj_path.rsplit(".", 1)[0] + ".glb"
-
-    mesh = load_mesh(obj_path)
-    return save_mesh(mesh, glb_path)
-
-
 def mesh_uv_wrap(mesh: Any) -> Any:
-    """Apply UV unwrapping to mesh.
-
-    Args:
-        mesh: Input trimesh object.
-
-    Returns:
-        Mesh with UV coordinates.
-    """
+    """Apply UV unwrapping to mesh. In-place like native Hunyuan3D-2 for same layout."""
     try:
         import xatlas
     except ImportError:
         logger.warning("xatlas not available, skipping UV unwrap")
         return mesh
 
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+
+    if len(mesh.faces) > 500000000:
+        raise ValueError(
+            "The mesh has more than 500,000,000 faces, which is not supported."
+        )
+
     vmapping, indices, uvs = xatlas.parametrize(mesh.vertices, mesh.faces)
 
-    # Remap vertices according to xatlas output
-    # vmapping contains indices into the original vertex array
-    new_vertices = mesh.vertices[vmapping]
-    new_faces = indices
-
-    # Create new mesh with remapped vertices and faces
-    try:
-        # Try to get existing material
-        if hasattr(mesh.visual, "material") and mesh.visual.material is not None:
-            material = mesh.visual.material
-        else:
-            # Create a default material
-            material = trimesh.visual.material.SimpleMaterial()
-
-        # Create new mesh with UV coordinates
-        new_mesh = trimesh.Trimesh(
-            vertices=new_vertices,
-            faces=new_faces,
-            process=False,  # Don't merge vertices
+    mesh.vertices = mesh.vertices[vmapping]
+    mesh.faces = indices
+    if not hasattr(mesh.visual, "uv"):
+        mesh.visual = trimesh.visual.TextureVisuals(
+            uv=uvs, material=trimesh.visual.material.SimpleMaterial()
         )
-        new_mesh.visual = trimesh.visual.TextureVisuals(uv=uvs, material=material)
+    else:
+        mesh.visual.uv = uvs
 
-        return new_mesh
-
-    except Exception as e:
-        logger.warning(f"Failed to create UV-mapped mesh: {e}")
-        # Fallback: try to just add UVs to original mesh
-        try:
-            mesh.visual = trimesh.visual.TextureVisuals(uv=uvs[: len(mesh.vertices)])
-            return mesh
-        except Exception as e2:
-            logger.warning(f"Failed to apply UV mapping: {e2}")
-            return mesh
-
-
-def remesh_mesh(
-    input_path: str,
-    output_path: str,
-    target_faces: int = 50000,
-) -> str:
-    """Remesh a mesh to target face count.
-
-    Args:
-        input_path: Path to input mesh.
-        output_path: Path to output mesh.
-        target_faces: Target number of faces.
-
-    Returns:
-        Path to remeshed mesh.
-    """
-    try:
-        import pymeshlab
-    except ImportError:
-        logger.warning("pymeshlab not available, copying mesh without remeshing")
-        import shutil
-
-        shutil.copy(input_path, output_path)
-        return output_path
-
-    ms = pymeshlab.MeshSet()
-    ms.load_new_mesh(input_path)
-
-    # Simplify mesh
-    current_faces = ms.current_mesh().face_number()
-    if current_faces > target_faces:
-        ms.meshing_decimation_quadric_edge_collapse(targetfacenum=target_faces)
-
-    ms.save_current_mesh(output_path)
-    return output_path
+    return mesh
 
 
 # =============================================================================
@@ -621,24 +513,17 @@ class MeshRender:
             self.scale_factor = scale_factor
 
     def save_mesh(self) -> trimesh.Trimesh:
-        """Save mesh with current texture."""
+        """Save mesh with current texture, reusing the original mesh object."""
         texture_data = self.get_texture()
         texture_img = Image.fromarray((texture_data * 255).astype(np.uint8))
 
-        # Get mesh data with inverse transformation
-        vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
-
-        mesh = trimesh.Trimesh(
-            vertices=vtx_pos,
-            faces=pos_idx,
-            process=False,
+        material = trimesh.visual.material.SimpleMaterial(
+            image=texture_img, diffuse=(255, 255, 255)
         )
-
-        if vtx_uv is not None:
-            material = trimesh.visual.material.SimpleMaterial(image=texture_img)
-            mesh.visual = trimesh.visual.TextureVisuals(uv=vtx_uv, material=material)
-
-        return mesh
+        self.mesh_copy.visual = trimesh.visual.TextureVisuals(
+            uv=self.mesh_copy.visual.uv, image=texture_img, material=material
+        )
+        return self.mesh_copy
 
     def get_mesh(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Get mesh data with inverse coordinate transformation."""
@@ -1094,7 +979,10 @@ class MeshRender:
 
         if mask_np.ndim == 3:
             mask_np = mask_np.squeeze(-1)
-        mask_uint8 = (mask_np.astype(np.float32) * 255).astype(np.uint8)
+        if mask_np.dtype == np.uint8:
+            mask_uint8 = mask_np
+        else:
+            mask_uint8 = ((mask_np > 0) * 255).astype(np.uint8)
 
         # Get mesh data for mesh-aware inpainting
         vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
@@ -1344,11 +1232,7 @@ __all__ = [
     "get_perspective_projection_matrix",
     # Mesh I/O utilities
     "export_to_trimesh",
-    "load_mesh",
-    "save_mesh",
-    "convert_obj_to_glb",
     "mesh_uv_wrap",
-    "remesh_mesh",
     # Mesh inpainting (C++ extension)
     "meshVerticeInpaint",
     # Rendering utilities

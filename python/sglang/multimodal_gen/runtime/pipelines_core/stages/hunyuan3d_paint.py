@@ -12,6 +12,9 @@ from typing import Any
 
 import numpy as np
 import torch
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import (
+    retrieve_timesteps,
+)
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -22,9 +25,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import (
-    retrieve_timesteps,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
