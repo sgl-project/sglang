@@ -438,6 +438,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build diffusion
+          docker exec ci_sglang pip install amdsmi
 
       - name: Setup kernel caches
         run: |
@@ -567,6 +568,7 @@ jobs:
       - name: Install dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build diffusion
+          docker exec ci_sglang pip install amdsmi
 
       - name: Setup kernel caches
         run: |
