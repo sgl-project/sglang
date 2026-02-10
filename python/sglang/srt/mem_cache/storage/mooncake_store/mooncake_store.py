@@ -353,7 +353,7 @@ class MooncakeStore(HiCacheStorage):
             self.split_factor = 0
             if self.storage_config.should_split_heads:
                 self.split_factor = (
-                    self.storage_config.tp_size // self.storage_config.tp_gcd_size
+                    self.storage_config.tp_lcm_size // self.storage_config.tp_size
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]

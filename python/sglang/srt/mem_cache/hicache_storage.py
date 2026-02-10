@@ -52,7 +52,7 @@ class HiCacheStorageConfig:
     is_mla_model: bool
     is_page_first_layout: bool
     model_name: Optional[str]
-    tp_gcd_size: Optional[int] = None
+    tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
 
