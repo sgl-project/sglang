@@ -43,6 +43,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestServerArgsSecurity(unittest.TestCase):
+    def test_server_args_repr_hides_api_keys(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            api_key="sk-test-secret",
+            admin_api_key="adm-test-secret",
+        )
+
+        server_args_repr = repr(server_args)
+        self.assertNotIn("sk-test-secret", server_args_repr)
+        self.assertNotIn("adm-test-secret", server_args_repr)
+        self.assertNotIn("api_key=", server_args_repr)
+        self.assertNotIn("admin_api_key=", server_args_repr)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
