@@ -319,6 +319,13 @@ class ModelConfig:
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -1193,10 +1200,13 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
+    "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",

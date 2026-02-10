@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.encode_receiver import MMReceiverHTTP
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    release_req_to_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
@@ -485,7 +486,12 @@ class Scheduler(
             )[0]
 
     def init_moe_gemm_config(self):
-        if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
+        # For the MM models, check the text_config for MoE settings
+        config_to_check = getattr(
+            self.model_config.hf_config, "text_config", self.model_config.hf_config
+        )
+
+        if hasattr(config_to_check, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
@@ -599,6 +605,11 @@ class Scheduler(
                 f"max_running_requests={self.max_running_requests}, "
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+            )
+
+        if self.enable_metrics and hasattr(self, "metrics_collector"):
+            self.metrics_collector.emit_cache_config_info(
+                self.page_size, self.max_total_num_tokens // self.page_size
             )
 
     def init_cache_with_memory_pool(self):
@@ -1415,6 +1426,10 @@ class Scheduler(
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
+            # For session requests, keep mm_inputs for the next request
+            if req.session_id:
+                continue
+            # For non-session requests, clear features and mm_inputs
             for item in mm_inputs.mm_items:
                 item.feature = None
             req.multimodal_inputs = None
@@ -1507,6 +1522,19 @@ class Scheduler(
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+
+            # For session requests, adjust mm_inputs offsets by the prefix length.
+            # Session.create_req prepends previous context to origin_input_ids,
+            # so offsets from the new prompt need to be shifted.
+            if len(recv_req.input_ids) < len(req.origin_input_ids):
+                assert recv_req.session_params.id in self.sessions
+                prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+                for mm_item in image_inputs.mm_items:
+                    if mm_item.offsets:
+                        mm_item.offsets = [
+                            (start + prefix_len, end + prefix_len)
+                            for start, end in mm_item.offsets
+                        ]
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
@@ -2704,6 +2732,11 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
+            # For disaggregation prefill mode, free the metadata buffer index
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                release_req_to_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
 
             # For mamba radix cache
             if (
