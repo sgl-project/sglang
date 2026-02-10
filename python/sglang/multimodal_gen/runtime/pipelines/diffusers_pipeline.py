@@ -31,6 +31,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor im
 from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
     SyncExecutor,
 )
+from sglang.multimodal_gen.runtime.pipelines.patches.contracts import RolloutRequest
+from sglang.multimodal_gen.runtime.pipelines.patches.registry import resolve_adapter
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -52,31 +54,113 @@ class DiffusersExecutionStage(PipelineStage):
         """Execute the diffusers pipeline."""
 
         kwargs = self._build_pipeline_kwargs(batch, server_args)
-
-        # Filter kwargs to only those supported by the pipeline, warn about ignored args
-        kwargs, _ = self._filter_pipeline_kwargs(kwargs)
+        batch.rollout_metadata = None
 
         # Request tensor output for cleaner handling
         if "output_type" not in kwargs:
             kwargs["output_type"] = "pt"
 
-        with torch.no_grad(), warnings.catch_warnings(record=True):
-            warnings.simplefilter("always")
-            try:
-                output = self.diffusers_pipe(**kwargs)
-            except TypeError as e:
-                # Some pipelines don't support output_type="pt"
-                if "output_type" in str(e):
-                    kwargs.pop("output_type", None)
+        rollout_request = self._extract_rollout_request(batch)
+        adapter_result = self._run_with_rollout_adapter(
+            batch=batch, kwargs=kwargs, request=rollout_request
+        )
+
+        if adapter_result is not None:
+            output = adapter_result.output
+            batch.rollout_metadata = adapter_result.rollout_metadata
+        else:
+            # Filter kwargs to only those supported by the pipeline, warn about ignored args
+            kwargs, _ = self._filter_pipeline_kwargs(kwargs)
+
+            with torch.no_grad(), warnings.catch_warnings(record=True):
+                warnings.simplefilter("always")
+                try:
                     output = self.diffusers_pipe(**kwargs)
-                else:
-                    raise
+                except TypeError as e:
+                    # Some pipelines don't support output_type="pt"
+                    if "output_type" in str(e):
+                        kwargs.pop("output_type", None)
+                        output = self.diffusers_pipe(**kwargs)
+                    else:
+                        raise
 
         batch.output = self._extract_output(output)
         if batch.output is not None:
             batch.output = self._postprocess_output(batch.output)
 
         return batch
+
+    def _extract_rollout_request(self, batch: Req) -> RolloutRequest | None:
+        if not batch.extra:
+            return None
+
+        request = batch.extra.get("rollout_request")
+        if isinstance(request, dict):
+            rollout_request: RolloutRequest = dict(request)
+            rollout_request.setdefault("enabled", True)
+            rollout_request.setdefault("mode", "logprob_rollout")
+            rollout_request.setdefault("adapter", "auto")
+            rollout_request.setdefault("strict", False)
+            if not rollout_request.get("enabled", False):
+                return None
+            return rollout_request
+
+        # Backward compatibility for previous ad-hoc kwargs style.
+        diffusers_kwargs = batch.extra.get("diffusers_kwargs", {})
+        if not isinstance(diffusers_kwargs, dict):
+            return None
+        if not diffusers_kwargs.get("enable_logprob_trajectory", False):
+            return None
+
+        return {
+            "enabled": True,
+            "mode": "logprob_rollout",
+            "adapter": str(diffusers_kwargs.get("rollout_adapter", "sd3")),
+            "strict": bool(diffusers_kwargs.get("rollout_strict", True)),
+            "params": {
+                "noise_level": float(diffusers_kwargs.get("noise_level", 0.7)),
+                "return_prev_latents_mean": bool(
+                    diffusers_kwargs.get(
+                        "return_prev_latents_mean",
+                        diffusers_kwargs.get("return_prev_sample_mean", False),
+                    )
+                ),
+            },
+        }
+
+    def _run_with_rollout_adapter(
+        self,
+        batch: Req,
+        kwargs: dict[str, Any],
+        request: RolloutRequest | None,
+    ):
+        if request is None:
+            return None
+
+        strict = bool(request.get("strict", False))
+        adapter = resolve_adapter(self.diffusers_pipe, request)
+        if adapter is None:
+            msg = (
+                f"No diffusion rollout adapter matched pipeline "
+                f"{type(self.diffusers_pipe).__name__} for request={request}"
+            )
+            if strict:
+                raise RuntimeError(msg)
+            logger.warning(msg)
+            return None
+
+        try:
+            return adapter.run(
+                pipe=self.diffusers_pipe,
+                batch=batch,
+                kwargs=kwargs,
+                request=request,
+            )
+        except Exception as exc:
+            if strict:
+                raise
+            logger.warning("Rollout adapter '%s' failed, fallback to base pipeline: %s", adapter.name, exc)
+            return None
 
     def _filter_pipeline_kwargs(
         self, kwargs: dict, *, strict: bool = False

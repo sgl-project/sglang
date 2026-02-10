@@ -134,6 +134,7 @@ class Req:
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_audio_latents: torch.Tensor | None = None
+    rollout_metadata: dict[str, torch.Tensor] | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations
     extra: dict[str, Any] = field(default_factory=dict)
@@ -324,6 +325,7 @@ class OutputBatch:
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
+    rollout_metadata: dict[str, torch.Tensor] | None = None
     error: str | None = None
 
     # logged timings info, directly from Req.timings
