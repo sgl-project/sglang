@@ -15,9 +15,6 @@ from packaging import version
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
-if torch.version.hip is not None:
-    triton.knobs.amd.use_buffer_ops = False
-
 
 @triton.jit
 def _chunk_scan_fwd_kernel(
