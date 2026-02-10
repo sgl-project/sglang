@@ -375,6 +375,82 @@ constexpr int THREADS_PER_BLOCK = 256;
 constexpr int MAX_GRID_SIZE = 1024;  // Limit to prevent excessive resource usage
 
 /**
+ * Helper function to extract a typed data pointer from a TensorView.
+ * Performs runtime type checking and returns the properly cast pointer.
+ *
+ * @tparam T The expected element type (e.g., int32_t)
+ * @param tensor The TensorView to extract the pointer from
+ * @param name The name of the tensor (for error reporting)
+ * @return Typed pointer to the tensor data
+ */
+template <typename T>
+inline const T* unwrap_data_ptr(const tvm::ffi::TensorView& tensor, const char* name) {
+  using namespace host;
+  if (tensor.data_ptr()) {
+    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+  }
+  return static_cast<const T*>(tensor.data_ptr());
+}
+
+/**
+ * Helper function to extract a typed mutable data pointer from a TensorView.
+ * Performs runtime type checking and returns the properly cast pointer.
+ *
+ * @tparam T The expected element type (e.g., int32_t)
+ * @param tensor The TensorView to extract the pointer from
+ * @param name The name of the tensor (for error reporting)
+ * @return Typed mutable pointer to the tensor data
+ */
+template <typename T>
+inline T* unwrap_data_ptr_mut(const tvm::ffi::TensorView& tensor, const char* name) {
+  using namespace host;
+  if (tensor.data_ptr()) {
+    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+  }
+  return static_cast<T*>(tensor.data_ptr());
+}
+
+/**
+ * Helper function to extract a typed data pointer from an Optional TensorView.
+ * Returns nullptr if the optional has no value, otherwise performs type checking.
+ *
+ * @tparam T The expected element type (e.g., int32_t)
+ * @param optional_tensor The Optional TensorView to extract the pointer from
+ * @param name The name of the tensor (for error reporting)
+ * @return Typed pointer to the tensor data, or nullptr if optional has no value
+ */
+template <typename T>
+inline const T* unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
+  using namespace host;
+  if (!optional_tensor.has_value()) {
+    return nullptr;
+  }
+  const auto& tensor = optional_tensor.value();
+  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+  return static_cast<const T*>(tensor.data_ptr());
+}
+
+/**
+ * Helper function to extract a typed mutable data pointer from an Optional TensorView.
+ * Returns nullptr if the optional has no value, otherwise performs type checking.
+ *
+ * @tparam T The expected element type (e.g., int32_t)
+ * @param optional_tensor The Optional TensorView to extract the pointer from
+ * @param name The name of the tensor (for error reporting)
+ * @return Typed mutable pointer to the tensor data, or nullptr if optional has no value
+ */
+template <typename T>
+inline T* unwrap_optional_data_ptr_mut(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
+  using namespace host;
+  if (!optional_tensor.has_value()) {
+    return nullptr;
+  }
+  const auto& tensor = optional_tensor.value();
+  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have dtype matching ", typeid(T).name());
+  return static_cast<T*>(tensor.data_ptr());
+}
+
+/**
  * Calculate kernel launch configuration.
  *
  * @param total_work Total number of work items
@@ -416,91 +492,52 @@ struct FusedMetadataCopyKernel {
       const tvm::ffi::TensorView cu_seqlens_k_src,
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView nsa_cache_seqlens_src,
-      const tvm::ffi::TensorView seqlens_expanded_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> seqlens_expanded_src,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_src,
-      const tvm::ffi::TensorView real_page_table_src,
-      const tvm::ffi::TensorView flashmla_num_splits_src,
-      const tvm::ffi::TensorView flashmla_metadata_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_src,
       const tvm::ffi::TensorView cache_seqlens_dst,
       const tvm::ffi::TensorView cu_seqlens_k_dst,
       const tvm::ffi::TensorView page_table_1_dst,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst,
-      const tvm::ffi::TensorView seqlens_expanded_dst,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> seqlens_expanded_dst,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst,
-      const tvm::ffi::TensorView real_page_table_dst,
-      const tvm::ffi::TensorView flashmla_num_splits_dst,
-      const tvm::ffi::TensorView flashmla_metadata_dst,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst,
       int bs,
       int max_len,
       int max_seqlen_k,
       int seqlens_expanded_size) {
     using namespace host;
 
-    // Verify all tensors are int32_t dtype (without checking shapes)
-    auto verify_int32 = [](const tvm::ffi::TensorView& t, const char* name) {
-      if (t.data_ptr() && !is_type<int32_t>(t.dtype())) {
-        throw std::runtime_error(std::string("Tensor ") + name + " must have dtype int32");
-      }
-    };
-
-    verify_int32(cache_seqlens_src, "cache_seqlens_src");
-    verify_int32(cu_seqlens_k_src, "cu_seqlens_k_src");
-    verify_int32(page_indices_src, "page_indices_src");
-    verify_int32(nsa_cache_seqlens_src, "nsa_cache_seqlens_src");
-    verify_int32(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src");
-    verify_int32(cache_seqlens_dst, "cache_seqlens_dst");
-    verify_int32(cu_seqlens_k_dst, "cu_seqlens_k_dst");
-    verify_int32(page_table_1_dst, "page_table_1_dst");
-    verify_int32(nsa_cache_seqlens_dst, "nsa_cache_seqlens_dst");
-    verify_int32(nsa_cu_seqlens_k_dst, "nsa_cu_seqlens_k_dst");
-    verify_int32(seqlens_expanded_src, "seqlens_expanded_src");
-    verify_int32(seqlens_expanded_dst, "seqlens_expanded_dst");
-    verify_int32(real_page_table_src, "real_page_table_src");
-    verify_int32(real_page_table_dst, "real_page_table_dst");
-    verify_int32(flashmla_num_splits_src, "flashmla_num_splits_src");
-    verify_int32(flashmla_metadata_src, "flashmla_metadata_src");
-    verify_int32(flashmla_num_splits_dst, "flashmla_num_splits_dst");
-    verify_int32(flashmla_metadata_dst, "flashmla_metadata_dst");
-
     // Build parameter struct with nested source/destination pointers
+    // unwrap_data_ptr and unwrap_optional_data_ptr perform dtype validation
     const auto params = FusedMetadataCopyParams{
         .src =
             {
-                .cache_seqlens = static_cast<const int32_t*>(cache_seqlens_src.data_ptr()),
-                .cu_seqlens_k = static_cast<const int32_t*>(cu_seqlens_k_src.data_ptr()),
-                .page_indices = static_cast<const int32_t*>(page_indices_src.data_ptr()),
-                .nsa_cache_seqlens = static_cast<const int32_t*>(nsa_cache_seqlens_src.data_ptr()),
-                .seqlens_expanded = seqlens_expanded_src.data_ptr()
-                                        ? static_cast<const int32_t*>(seqlens_expanded_src.data_ptr())
-                                        : nullptr,
-                .nsa_cu_seqlens_k = static_cast<const int32_t*>(nsa_cu_seqlens_k_src.data_ptr()),
-                .real_page_table = real_page_table_src.data_ptr()
-                                       ? static_cast<const int32_t*>(real_page_table_src.data_ptr())
-                                       : nullptr,
-                .flashmla_num_splits = flashmla_num_splits_src.data_ptr()
-                                           ? static_cast<const int32_t*>(flashmla_num_splits_src.data_ptr())
-                                           : nullptr,
-                .flashmla_metadata = flashmla_metadata_src.data_ptr()
-                                         ? static_cast<const int32_t*>(flashmla_metadata_src.data_ptr())
-                                         : nullptr,
+                .cache_seqlens = unwrap_data_ptr<int32_t>(cache_seqlens_src, "cache_seqlens_src"),
+                .cu_seqlens_k = unwrap_data_ptr<int32_t>(cu_seqlens_k_src, "cu_seqlens_k_src"),
+                .page_indices = unwrap_data_ptr<int32_t>(page_indices_src, "page_indices_src"),
+                .nsa_cache_seqlens = unwrap_data_ptr<int32_t>(nsa_cache_seqlens_src, "nsa_cache_seqlens_src"),
+                .seqlens_expanded = unwrap_optional_data_ptr<int32_t>(seqlens_expanded_src, "seqlens_expanded_src"),
+                .nsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src"),
+                .real_page_table = unwrap_optional_data_ptr<int32_t>(real_page_table_src, "real_page_table_src"),
+                .flashmla_num_splits = unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
+                .flashmla_metadata = unwrap_optional_data_ptr<int32_t>(flashmla_metadata_src, "flashmla_metadata_src"),
             },
         .dst =
             {
-                .cache_seqlens = static_cast<int32_t*>(cache_seqlens_dst.data_ptr()),
-                .cu_seqlens_k = static_cast<int32_t*>(cu_seqlens_k_dst.data_ptr()),
-                .page_table_1 = static_cast<int32_t*>(page_table_1_dst.data_ptr()),
-                .nsa_cache_seqlens = static_cast<int32_t*>(nsa_cache_seqlens_dst.data_ptr()),
-                .seqlens_expanded =
-                    seqlens_expanded_dst.data_ptr() ? static_cast<int32_t*>(seqlens_expanded_dst.data_ptr()) : nullptr,
-                .nsa_cu_seqlens_k = static_cast<int32_t*>(nsa_cu_seqlens_k_dst.data_ptr()),
-                .real_page_table =
-                    real_page_table_dst.data_ptr() ? static_cast<int32_t*>(real_page_table_dst.data_ptr()) : nullptr,
-                .flashmla_num_splits = flashmla_num_splits_dst.data_ptr()
-                                           ? static_cast<int32_t*>(flashmla_num_splits_dst.data_ptr())
-                                           : nullptr,
-                .flashmla_metadata = flashmla_metadata_dst.data_ptr()
-                                         ? static_cast<int32_t*>(flashmla_metadata_dst.data_ptr())
-                                         : nullptr,
+                .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst, "cache_seqlens_dst"),
+                .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst, "cu_seqlens_k_dst"),
+                .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst, "page_table_1_dst"),
+                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst, "nsa_cache_seqlens_dst"),
+                .seqlens_expanded = unwrap_optional_data_ptr_mut<int32_t>(seqlens_expanded_dst, "seqlens_expanded_dst"),
+                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst, "nsa_cu_seqlens_k_dst"),
+                .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst, "real_page_table_dst"),
+                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst, "flashmla_num_splits_dst"),
+                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst, "flashmla_metadata_dst"),
             },
         .forward_mode = FORWARD_MODE,
         .bs = bs,
@@ -509,11 +546,11 @@ struct FusedMetadataCopyKernel {
         .seqlens_expanded_size = seqlens_expanded_size,
         .page_indices_rows = static_cast<int>(page_indices_src.shape()[0]),
         .page_table_1_stride = static_cast<int>(page_table_1_dst.shape()[1]),
-        .real_page_table_cols = real_page_table_src.data_ptr() ? static_cast<int>(real_page_table_src.shape()[1]) : 0,
+        .real_page_table_cols = real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
         .real_page_table_dst_stride =
-            real_page_table_dst.data_ptr() ? static_cast<int>(real_page_table_dst.stride(0)) : 0,
+            real_page_table_dst.has_value() ? static_cast<int>(real_page_table_dst.value().stride(0)) : 0,
         .flashmla_metadata_size =
-            flashmla_metadata_src.data_ptr() ? static_cast<int>(flashmla_metadata_src.numel()) : 0,
+            flashmla_metadata_src.has_value() ? static_cast<int>(flashmla_metadata_src.value().numel()) : 0,
     };
 
     // Calculate grid configuration
@@ -564,158 +601,98 @@ struct FusedMetadataCopyMultiKernel {
       const tvm::ffi::TensorView page_indices_src,
       const tvm::ffi::TensorView nsa_cache_seqlens_src,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_src,
-      const tvm::ffi::TensorView real_page_table_src,
-      const tvm::ffi::TensorView flashmla_num_splits_src,
-      const tvm::ffi::TensorView flashmla_metadata_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_src,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_src,
       const tvm::ffi::TensorView cache_seqlens_dst0,
       const tvm::ffi::TensorView cu_seqlens_k_dst0,
       const tvm::ffi::TensorView page_table_1_dst0,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst0,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst0,
-      const tvm::ffi::TensorView real_page_table_dst0,
-      const tvm::ffi::TensorView flashmla_num_splits_dst0,
-      const tvm::ffi::TensorView flashmla_metadata_dst0,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst0,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst0,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst0,
       const tvm::ffi::TensorView cache_seqlens_dst1,
       const tvm::ffi::TensorView cu_seqlens_k_dst1,
       const tvm::ffi::TensorView page_table_1_dst1,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst1,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst1,
-      const tvm::ffi::TensorView real_page_table_dst1,
-      const tvm::ffi::TensorView flashmla_num_splits_dst1,
-      const tvm::ffi::TensorView flashmla_metadata_dst1,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst1,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst1,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst1,
       const tvm::ffi::TensorView cache_seqlens_dst2,
       const tvm::ffi::TensorView cu_seqlens_k_dst2,
       const tvm::ffi::TensorView page_table_1_dst2,
       const tvm::ffi::TensorView nsa_cache_seqlens_dst2,
       const tvm::ffi::TensorView nsa_cu_seqlens_k_dst2,
-      const tvm::ffi::TensorView real_page_table_dst2,
-      const tvm::ffi::TensorView flashmla_num_splits_dst2,
-      const tvm::ffi::TensorView flashmla_metadata_dst2,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> real_page_table_dst2,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_num_splits_dst2,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> flashmla_metadata_dst2,
       int bs,
       int max_len,
       int seqlens_expanded_size) {
     using namespace host;
 
-    // Verify all tensors are int32_t dtype (without checking shapes)
-    auto verify_int32 = [](const tvm::ffi::TensorView& t, const char* name) {
-      if (t.data_ptr() && !is_type<int32_t>(t.dtype())) {
-        throw std::runtime_error(std::string("Tensor ") + name + " must have dtype int32");
-      }
-    };
-
-    verify_int32(cache_seqlens_src, "cache_seqlens_src");
-    verify_int32(cu_seqlens_k_src, "cu_seqlens_k_src");
-    verify_int32(page_indices_src, "page_indices_src");
-    verify_int32(nsa_cache_seqlens_src, "nsa_cache_seqlens_src");
-    verify_int32(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src");
-    verify_int32(cache_seqlens_dst0, "cache_seqlens_dst0");
-    verify_int32(cu_seqlens_k_dst0, "cu_seqlens_k_dst0");
-    verify_int32(page_table_1_dst0, "page_table_1_dst0");
-    verify_int32(nsa_cache_seqlens_dst0, "nsa_cache_seqlens_dst0");
-    verify_int32(nsa_cu_seqlens_k_dst0, "nsa_cu_seqlens_k_dst0");
-    verify_int32(cache_seqlens_dst1, "cache_seqlens_dst1");
-    verify_int32(cu_seqlens_k_dst1, "cu_seqlens_k_dst1");
-    verify_int32(page_table_1_dst1, "page_table_1_dst1");
-    verify_int32(nsa_cache_seqlens_dst1, "nsa_cache_seqlens_dst1");
-    verify_int32(nsa_cu_seqlens_k_dst1, "nsa_cu_seqlens_k_dst1");
-    verify_int32(cache_seqlens_dst2, "cache_seqlens_dst2");
-    verify_int32(cu_seqlens_k_dst2, "cu_seqlens_k_dst2");
-    verify_int32(page_table_1_dst2, "page_table_1_dst2");
-    verify_int32(nsa_cache_seqlens_dst2, "nsa_cache_seqlens_dst2");
-    verify_int32(nsa_cu_seqlens_k_dst2, "nsa_cu_seqlens_k_dst2");
-    verify_int32(real_page_table_src, "real_page_table_src");
-    verify_int32(real_page_table_dst0, "real_page_table_dst0");
-    verify_int32(real_page_table_dst1, "real_page_table_dst1");
-    verify_int32(real_page_table_dst2, "real_page_table_dst2");
-    verify_int32(flashmla_num_splits_src, "flashmla_num_splits_src");
-    verify_int32(flashmla_metadata_src, "flashmla_metadata_src");
-    verify_int32(flashmla_num_splits_dst0, "flashmla_num_splits_dst0");
-    verify_int32(flashmla_metadata_dst0, "flashmla_metadata_dst0");
-    verify_int32(flashmla_num_splits_dst1, "flashmla_num_splits_dst1");
-    verify_int32(flashmla_metadata_dst1, "flashmla_metadata_dst1");
-    verify_int32(flashmla_num_splits_dst2, "flashmla_num_splits_dst2");
-    verify_int32(flashmla_metadata_dst2, "flashmla_metadata_dst2");
-
     // Build parameter struct with nested source/destination pointers
+    // unwrap_data_ptr and unwrap_optional_data_ptr perform dtype validation
     const auto params = FusedMetadataCopyMultiParams{
         .src =
             {
-                .cache_seqlens = static_cast<const int32_t*>(cache_seqlens_src.data_ptr()),
-                .cu_seqlens_k = static_cast<const int32_t*>(cu_seqlens_k_src.data_ptr()),
-                .page_indices = static_cast<const int32_t*>(page_indices_src.data_ptr()),
-                .nsa_cache_seqlens = static_cast<const int32_t*>(nsa_cache_seqlens_src.data_ptr()),
+                .cache_seqlens = unwrap_data_ptr<int32_t>(cache_seqlens_src, "cache_seqlens_src"),
+                .cu_seqlens_k = unwrap_data_ptr<int32_t>(cu_seqlens_k_src, "cu_seqlens_k_src"),
+                .page_indices = unwrap_data_ptr<int32_t>(page_indices_src, "page_indices_src"),
+                .nsa_cache_seqlens = unwrap_data_ptr<int32_t>(nsa_cache_seqlens_src, "nsa_cache_seqlens_src"),
                 .seqlens_expanded = nullptr,  // Not used in multi-backend DECODE mode
-                .nsa_cu_seqlens_k = static_cast<const int32_t*>(nsa_cu_seqlens_k_src.data_ptr()),
-                .real_page_table = real_page_table_src.data_ptr()
-                                       ? static_cast<const int32_t*>(real_page_table_src.data_ptr())
-                                       : nullptr,
-                .flashmla_num_splits = flashmla_num_splits_src.data_ptr()
-                                           ? static_cast<const int32_t*>(flashmla_num_splits_src.data_ptr())
-                                           : nullptr,
-                .flashmla_metadata = flashmla_metadata_src.data_ptr()
-                                         ? static_cast<const int32_t*>(flashmla_metadata_src.data_ptr())
-                                         : nullptr,
+                .nsa_cu_seqlens_k = unwrap_data_ptr<int32_t>(nsa_cu_seqlens_k_src, "nsa_cu_seqlens_k_src"),
+                .real_page_table = unwrap_optional_data_ptr<int32_t>(real_page_table_src, "real_page_table_src"),
+                .flashmla_num_splits = unwrap_optional_data_ptr<int32_t>(flashmla_num_splits_src, "flashmla_num_splits_src"),
+                .flashmla_metadata = unwrap_optional_data_ptr<int32_t>(flashmla_metadata_src, "flashmla_metadata_src"),
             },
         .dst0 =
             {
-                .cache_seqlens = static_cast<int32_t*>(cache_seqlens_dst0.data_ptr()),
-                .cu_seqlens_k = static_cast<int32_t*>(cu_seqlens_k_dst0.data_ptr()),
-                .page_table_1 = static_cast<int32_t*>(page_table_1_dst0.data_ptr()),
-                .nsa_cache_seqlens = static_cast<int32_t*>(nsa_cache_seqlens_dst0.data_ptr()),
+                .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst0, "cache_seqlens_dst0"),
+                .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst0, "cu_seqlens_k_dst0"),
+                .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst0, "page_table_1_dst0"),
+                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst0, "nsa_cache_seqlens_dst0"),
                 .seqlens_expanded = nullptr,
-                .nsa_cu_seqlens_k = static_cast<int32_t*>(nsa_cu_seqlens_k_dst0.data_ptr()),
-                .real_page_table =
-                    real_page_table_dst0.data_ptr() ? static_cast<int32_t*>(real_page_table_dst0.data_ptr()) : nullptr,
-                .flashmla_num_splits = flashmla_num_splits_dst0.data_ptr()
-                                           ? static_cast<int32_t*>(flashmla_num_splits_dst0.data_ptr())
-                                           : nullptr,
-                .flashmla_metadata = flashmla_metadata_dst0.data_ptr()
-                                         ? static_cast<int32_t*>(flashmla_metadata_dst0.data_ptr())
-                                         : nullptr,
+                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst0, "nsa_cu_seqlens_k_dst0"),
+                .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst0, "real_page_table_dst0"),
+                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst0, "flashmla_num_splits_dst0"),
+                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst0, "flashmla_metadata_dst0"),
             },
         .dst1 =
             {
-                .cache_seqlens = static_cast<int32_t*>(cache_seqlens_dst1.data_ptr()),
-                .cu_seqlens_k = static_cast<int32_t*>(cu_seqlens_k_dst1.data_ptr()),
-                .page_table_1 = static_cast<int32_t*>(page_table_1_dst1.data_ptr()),
-                .nsa_cache_seqlens = static_cast<int32_t*>(nsa_cache_seqlens_dst1.data_ptr()),
+                .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst1, "cache_seqlens_dst1"),
+                .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst1, "cu_seqlens_k_dst1"),
+                .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst1, "page_table_1_dst1"),
+                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst1, "nsa_cache_seqlens_dst1"),
                 .seqlens_expanded = nullptr,
-                .nsa_cu_seqlens_k = static_cast<int32_t*>(nsa_cu_seqlens_k_dst1.data_ptr()),
-                .real_page_table =
-                    real_page_table_dst1.data_ptr() ? static_cast<int32_t*>(real_page_table_dst1.data_ptr()) : nullptr,
-                .flashmla_num_splits = flashmla_num_splits_dst1.data_ptr()
-                                           ? static_cast<int32_t*>(flashmla_num_splits_dst1.data_ptr())
-                                           : nullptr,
-                .flashmla_metadata = flashmla_metadata_dst1.data_ptr()
-                                         ? static_cast<int32_t*>(flashmla_metadata_dst1.data_ptr())
-                                         : nullptr,
+                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst1, "nsa_cu_seqlens_k_dst1"),
+                .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst1, "real_page_table_dst1"),
+                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst1, "flashmla_num_splits_dst1"),
+                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst1, "flashmla_metadata_dst1"),
             },
         .dst2 =
             {
-                .cache_seqlens = static_cast<int32_t*>(cache_seqlens_dst2.data_ptr()),
-                .cu_seqlens_k = static_cast<int32_t*>(cu_seqlens_k_dst2.data_ptr()),
-                .page_table_1 = static_cast<int32_t*>(page_table_1_dst2.data_ptr()),
-                .nsa_cache_seqlens = static_cast<int32_t*>(nsa_cache_seqlens_dst2.data_ptr()),
+                .cache_seqlens = unwrap_data_ptr_mut<int32_t>(cache_seqlens_dst2, "cache_seqlens_dst2"),
+                .cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(cu_seqlens_k_dst2, "cu_seqlens_k_dst2"),
+                .page_table_1 = unwrap_data_ptr_mut<int32_t>(page_table_1_dst2, "page_table_1_dst2"),
+                .nsa_cache_seqlens = unwrap_data_ptr_mut<int32_t>(nsa_cache_seqlens_dst2, "nsa_cache_seqlens_dst2"),
                 .seqlens_expanded = nullptr,
-                .nsa_cu_seqlens_k = static_cast<int32_t*>(nsa_cu_seqlens_k_dst2.data_ptr()),
-                .real_page_table =
-                    real_page_table_dst2.data_ptr() ? static_cast<int32_t*>(real_page_table_dst2.data_ptr()) : nullptr,
-                .flashmla_num_splits = flashmla_num_splits_dst2.data_ptr()
-                                           ? static_cast<int32_t*>(flashmla_num_splits_dst2.data_ptr())
-                                           : nullptr,
-                .flashmla_metadata = flashmla_metadata_dst2.data_ptr()
-                                         ? static_cast<int32_t*>(flashmla_metadata_dst2.data_ptr())
-                                         : nullptr,
+                .nsa_cu_seqlens_k = unwrap_data_ptr_mut<int32_t>(nsa_cu_seqlens_k_dst2, "nsa_cu_seqlens_k_dst2"),
+                .real_page_table = unwrap_optional_data_ptr_mut<int32_t>(real_page_table_dst2, "real_page_table_dst2"),
+                .flashmla_num_splits = unwrap_optional_data_ptr_mut<int32_t>(flashmla_num_splits_dst2, "flashmla_num_splits_dst2"),
+                .flashmla_metadata = unwrap_optional_data_ptr_mut<int32_t>(flashmla_metadata_dst2, "flashmla_metadata_dst2"),
             },
         .bs = bs,
         .max_len = max_len,
         .seqlens_expanded_size = seqlens_expanded_size,
         .page_table_1_stride = static_cast<int>(page_table_1_dst0.shape()[1]),
-        .real_page_table_cols = real_page_table_src.data_ptr() ? static_cast<int>(real_page_table_src.shape()[1]) : 0,
+        .real_page_table_cols = real_page_table_src.has_value() ? static_cast<int>(real_page_table_src.value().shape()[1]) : 0,
         .real_page_table_dst_stride =
-            real_page_table_dst0.data_ptr() ? static_cast<int>(real_page_table_dst0.stride(0)) : 0,
+            real_page_table_dst0.has_value() ? static_cast<int>(real_page_table_dst0.value().stride(0)) : 0,
         .flashmla_metadata_size =
-            flashmla_metadata_src.data_ptr() ? static_cast<int>(flashmla_metadata_src.numel()) : 0,
+            flashmla_metadata_src.has_value() ? static_cast<int>(flashmla_metadata_src.value().numel()) : 0,
     };
 
     dim3 grid = get_launch_config(bs * max_len);
