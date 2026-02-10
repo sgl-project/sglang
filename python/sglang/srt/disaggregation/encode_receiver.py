@@ -7,6 +7,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from enum import IntEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
@@ -302,6 +303,7 @@ class WaitingImageRequest:
                 self.status = WaitingImageRequestStatus.FAIL
                 self.recv_socket.close()
                 return
+
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
             recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
                 recv_obj.shape
@@ -407,6 +409,7 @@ class MMReceiverBase(ABC):
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             self.scheduler = scheduler
+            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -470,9 +473,6 @@ class MMReceiverBase(ABC):
                 self._cleanup_mooncake_buffer(req_id)
             return None
 
-    def send_encode_request(self, obj):
-        self._send_encode_request(obj)
-
     def _cleanup_mooncake_buffer(self, req_id):
         if self.encoder_transfer_backend != "mooncake":
             return
@@ -493,6 +493,7 @@ class MMReceiverBase(ABC):
             return None
 
         recv_embedding = None
+
         recv_embedding_data: EmbeddingData = None
 
         try:
@@ -549,81 +550,8 @@ class MMReceiverBase(ABC):
         finally:
             recv_socket.close()
 
-    def _process_waiting_requests(self, recv_reqs, waiting_cls):
-        new_recv_reqs = []
-        for recv_req in recv_reqs:
-            if (
-                isinstance(recv_req, TokenizedGenerateReqInput)
-                and recv_req.need_wait_for_image is True
-            ):
-                waiting_req = waiting_cls(
-                    rid=recv_req.rid,
-                    recv_req=recv_req,
-                    mm_processor=self.mm_processor,
-                    encoder_urls=self.encode_urls,
-                    host_name=self.hostname,
-                    receive_count=self.tp_size,
-                )
-                waiting_req.send_encode_request()
-                self.waiting_list.append(waiting_req)
-            else:
-                new_recv_reqs.append(recv_req)
-
-        if len(self.waiting_list) == 0:
-            return new_recv_reqs, []
-
-        local_status = []
-        for waiting_req in self.waiting_list:
-            waiting_req._try_recv_mm_data()
-            local_status.append(waiting_req.status)
-
-        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
-
-        torch.distributed.all_reduce(
-            local_status,
-            op=torch.distributed.ReduceOp.MIN,
-            group=self.tp_group.cpu_group,
-        )
-
-        new_waiting = []
-        abort_reqs = []
-        for i, waiting_req in enumerate(self.waiting_list):
-            status_value = local_status[i].item()
-            if status_value == WaitingImageRequestStatus.SUCCESS:
-                new_recv_reqs.append(waiting_req.recv_req)
-            elif status_value == WaitingImageRequestStatus.FAIL:
-                logger.error(
-                    f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
-                )
-                abort_reqs.append(
-                    (
-                        self.create_req(waiting_req.recv_req),
-                        waiting_req.error_msg,
-                        waiting_req.error_code,
-                    )
-                )
-            else:  # status_value == WaitingImageRequestStatus.PENDING
-                new_waiting.append(waiting_req)
-
-        self.waiting_list = new_waiting
-        return new_recv_reqs, abort_reqs
-
-    def _run_encode_in_thread(
-        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
-    ):
-        try:
-            asyncio.run(
-                self.encode(
-                    req_id=req_id,
-                    img_data=img_data,
-                    embedding_port=embedding_port,
-                    endpoint_encode=endpoint_encode,
-                    endpoint_send=None,
-                    num_items_assigned=num_items_assigned,
-                )
-            )
-        except Exception as e:
-            logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
+    def send_encode_request(self, obj):
+        self._send_encode_request(obj)
 
     def _send_encode_request(self, obj):
         if obj.image_data is None:
@@ -655,6 +583,97 @@ class MMReceiverBase(ABC):
                 daemon=True,
             )
             encode_thread.start()
+
+    # For zmq_to_scheduler
+    def _process_waiting_requests(self, recv_reqs, waiting_cls):
+        new_recv_reqs = []
+        for recv_req in recv_reqs:
+            if (
+                isinstance(recv_req, TokenizedGenerateReqInput)
+                and recv_req.need_wait_for_image is True
+            ):
+                waiting_req = waiting_cls(
+                    rid=recv_req.rid,
+                    recv_req=recv_req,
+                    mm_processor=self.mm_processor,
+                    encoder_urls=self.encode_urls,
+                    host_name=self.hostname,
+                    receive_count=self.tp_size,
+                )
+                waiting_req.send_encode_request()
+                self.waiting_list.append(waiting_req)
+            else:
+                new_recv_reqs.append(recv_req)
+
+        if len(self.waiting_list) == 0:
+            return new_recv_reqs, []
+
+        current_time = time.time()
+        local_status = []
+        for waiting_req in self.waiting_list:
+            waiting_req._try_recv_mm_data()
+            if current_time - waiting_req.start_time > self.wait_timeout:
+                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
+            local_status.append(waiting_req.status)
+
+        local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
+
+        torch.distributed.all_reduce(
+            local_status,
+            op=torch.distributed.ReduceOp.MIN,
+            group=self.tp_group.cpu_group,
+        )
+
+        new_waiting = []
+        abort_reqs = []
+        for i, waiting_req in enumerate(self.waiting_list):
+            status_value = local_status[i].item()
+            if status_value == WaitingImageRequestStatus.SUCCESS:
+                new_recv_reqs.append(waiting_req.recv_req)
+            elif status_value == WaitingImageRequestStatus.FAIL:
+                logger.error(
+                    f"Waiting request {waiting_req.rid} failed: {waiting_req.error_msg} {waiting_req.error_code = }"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        waiting_req.error_msg,
+                        waiting_req.error_code,
+                    )
+                )
+            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+                logger.error(
+                    f"Timed out waiting for image embeddings for request {waiting_req.rid}"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
+                    )
+                )
+            else:  # status_value == WaitingImageRequestStatus.PENDING
+                new_waiting.append(waiting_req)
+
+        self.waiting_list = new_waiting
+        return new_recv_reqs, abort_reqs
+
+    def _run_encode_in_thread(
+        self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
+    ):
+        try:
+            asyncio.run(
+                self.encode(
+                    req_id=req_id,
+                    img_data=img_data,
+                    embedding_port=embedding_port,
+                    endpoint_encode=endpoint_encode,
+                    endpoint_send=None,
+                    num_items_assigned=num_items_assigned,
+                )
+            )
+        except Exception as e:
+            logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
 
     def create_req(self, recv_req):
         req = Req(
@@ -877,10 +896,6 @@ class MMReceiverGrpc(MMReceiverBase):
     def process_waiting_requests(self, recv_reqs):
         return self._process_waiting_requests(recv_reqs, WaitingImageRequestGrpc)
 
-    # For zmq_to_tokenizer and mooncake
-    async def recv_mm_data(self, img_data, mm_processor, prompt):
-        return await super().recv_mm_data(img_data, mm_processor, prompt)
-
     async def encode(
         self,
         req_id,
@@ -986,6 +1001,10 @@ class MMReceiverGrpc(MMReceiverBase):
 
         if grpc_metadata_tasks:
             await asyncio.gather(*grpc_metadata_tasks)
+
+    # For zmq_to_tokenizer and mooncake
+    async def recv_mm_data(self, img_data, mm_processor, prompt):
+        return await super().recv_mm_data(img_data, mm_processor, prompt)
 
 
 def _validate_transport_mode(transport_mode: str, encoder_urls):
