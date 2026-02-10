@@ -26,7 +26,7 @@ standard LLM support:
 
 3. **Multimodal Data Processor**:
    Define a new `Processor` class that inherits from `BaseMultimodalProcessor` and register this processor as your
-   model's dedicated processor.
+   model’s dedicated processor.
    See [multimodal_processor.py](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/multimodal/processors)
    for more details.
 
@@ -39,7 +39,7 @@ standard LLM support:
    Implement a `get_image_feature` function for your new model, which extracts image features from raw image data and converts them into the embeddings used by the language model.
 
 6. **Adapt to Vision Attention**:
-   Adapt the multi-headed `Attention` of ViT with SGLang's `VisionAttention`.
+   Adapt the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.
 
 You can refer to [Qwen2VL](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/qwen2_vl.py) or
 other mllm implementations. These models demonstrate how to correctly handle both multimodal and textual inputs.
@@ -84,7 +84,7 @@ ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerati
 ## Port a Model from vLLM to SGLang
 
 The [vLLM Models Directory](https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/models) is a valuable
-resource, as vLLM covers many models. SGLang reuses vLLM's interface and some layers, making it easier to port models
+resource, as vLLM covers many models. SGLang reuses vLLM’s interface and some layers, making it easier to port models
 from vLLM to SGLang.
 
 To port a model from vLLM to SGLang:
@@ -93,9 +93,9 @@ To port a model from vLLM to SGLang:
   - [SGLang Llama Implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/llama.py)
   - [vLLM Llama Implementation](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/llama.py)
 - The major differences include:
-  - **Replace vLLM's `Attention` with `RadixAttention`** (ensure you pass `layer_id` to `RadixAttention`).
-  - **Replace vLLM's `LogitsProcessor` with SGLang's `LogitsProcessor`.**
-  - **Replace the multi-headed `Attention` of ViT with SGLang's `VisionAttention`.**
+  - **Replace vLLM’s `Attention` with `RadixAttention`** (ensure you pass `layer_id` to `RadixAttention`).
+  - **Replace vLLM’s `LogitsProcessor` with SGLang’s `LogitsProcessor`.**
+  - **Replace the multi-headed `Attention` of ViT with SGLang’s `VisionAttention`.**
   - **Replace other vLLM layers** (such as `RMSNorm`, `SiluAndMul`) with SGLang layers.
   - **Remove `Sample`.**
   - **Change the `forward()` functions** and add a `forward_batch()` method.
@@ -285,7 +285,7 @@ def main():
     sampling_params = {"temperature": 0.2, "top_k": 5}
     prompts = [
         "Write a short, neutral self-introduction for a fictional character. Hello, my name is",
-        "Provide a concise factual statement about France's capital city. The capital of France is",
+        "Provide a concise factual statement about France’s capital city. The capital of France is",
         "Explain possible future trends in artificial intelligence. The future of AI is",
     ]
 
