@@ -23,10 +23,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HpcAttentionMetadata:
-    cache_seqlens_int32: torch.Tensor = None
-    max_seqlen_q: int = 1
-    cu_seqlens_q: torch.Tensor = None
-    page_table: torch.Tensor = None
+    cache_seqlens_int32: torch.Tensor = None  # [bs] int32
+    max_seq_len_q: int = 1
+    max_seq_len_k: int = 0
+    cu_seqlens_q: torch.Tensor = None  # [bs+1] int32
+    cu_seqlens_k: torch.Tensor = None  # [bs+1] int32
+    page_table: torch.Tensor = None  # [bs, max_blocks] int32
 
 
 def _pad_to(x: int, m: int) -> int:
