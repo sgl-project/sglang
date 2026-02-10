@@ -193,6 +193,13 @@ class ModelSlimConfig(QuantizationConfig):
     ):
         # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
         proj_name = prefix.split(".")[-1]
+        quant_description = {}
+        for prefix_, value in self.quant_description.items():
+            prefix_ = prefix_.replace("language_model.", "")
+            if "visual" in prefix_:
+                prefix_ = prefix_.replace("model.", "")
+            quant_description[prefix_] = value
+        self.quant_description = quant_description
         if proj_name in fused_mapping:
             shard_prefixes = [
                 prefix.replace(proj_name, shard_proj_name)

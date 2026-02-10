@@ -328,7 +328,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
         elif config.model_type == "qwen3_5_text":
             self.mlp = Qwen2MoeMLP(
@@ -336,7 +336,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
