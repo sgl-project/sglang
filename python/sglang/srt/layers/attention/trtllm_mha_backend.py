@@ -127,7 +127,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.num_q_heads = config.num_attention_heads // model_runner.tp_size
         self.head_dim = config.head_dim
 
-
     def init_cuda_graph_state(
         self,
         max_bs: int,
