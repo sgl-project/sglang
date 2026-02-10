@@ -543,6 +543,9 @@ class GroupCoordinator:
         if self.world_size == 1:
             return input_
 
+        if input_.numel() == 0:
+            return input_
+
         # On AMD, use the deterministic 1-stage kernel when:
         # - SGLANG_USE_1STAGE_ALLREDUCE=1 (explicitly enabled), OR
         # - SGLANG_USE_1STAGE_ALLREDUCE not set AND --enable-deterministic-inference is on
