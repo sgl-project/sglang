@@ -46,14 +46,13 @@ echo "PYTHON_TAG:     ${PY_TAG}"
 echo "Output:         ${DIST_DIR}/"
 echo "Buildx cache:   ${BUILDX_CACHE_DIR}"
 echo "Builder:        ${BUILDER_NAME}"
+echo "USE_CCACHE:     ${USE_CCACHE}"
 echo "----------------------------------------"
 
-BUILD_ARGS=()
 # Optional profiling build-args (empty string disables)
+BUILD_ARGS=()
 [ -n "${ENABLE_CMAKE_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE}")
 [ -n "${ENABLE_BUILD_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE}")
-# Optional extra cmake build-args (empty string disables)
-[ -n "${CMAKE_EXTRA_ARGS:-}" ] && BUILD_ARGS+=(--build-arg CMAKE_EXTRA_ARGS="${CMAKE_EXTRA_ARGS}")
 
 docker buildx build \
   --builder "${BUILDER_NAME}" \
@@ -63,6 +62,7 @@ docker buildx build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  --build-arg USE_CCACHE="${USE_CCACHE}" \
   "${BUILD_ARGS[@]}" \
   --cache-from type=local,src=${BUILDX_CACHE_DIR} \
   --cache-to type=local,dest=${BUILDX_CACHE_DIR},mode=max \
