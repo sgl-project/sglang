@@ -1194,9 +1194,15 @@ class ServerArgs:
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
+                if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
+                    envs.SGLANG_NSA_FORCE_MLA.set(True)
+                    logger.warning(
+                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on SM100."
+                    )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
@@ -2323,6 +2329,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -2652,6 +2659,7 @@ class ServerArgs:
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
+                        "GlmMoeDsaForCausalLM",
                     ]
                 except Exception:
                     pass
@@ -5648,6 +5656,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
