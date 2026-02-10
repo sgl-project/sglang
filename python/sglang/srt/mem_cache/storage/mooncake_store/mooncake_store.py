@@ -325,7 +325,15 @@ class MooncakeStore(HiCacheStorage):
                     self._shared_mooncake_transfer_engine = None
                     logger.debug("Failed to reuse initialized mooncake transfer engine")
 
-                if self._shared_mooncake_transfer_engine is not None:
+                # Only reuse the shared MooncakeTransferEngine when its
+                # configuration matches the one used by MooncakeStore.
+                if (
+                    self._shared_mooncake_transfer_engine is not None
+                    and device_name
+                    == self._shared_mooncake_transfer_engine.get_ib_device()
+                    and self.config.metadata_server == "P2PHANDSHAKE"
+                    and self.config.protocol == "rdma"
+                ):
                     client_hostname = (
                         self._shared_mooncake_transfer_engine.get_session_id()
                     )
