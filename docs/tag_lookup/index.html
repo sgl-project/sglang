@@ -477,33 +477,42 @@
         }
 
         const repoUrl = "https://github.com/sgl-project/sglang";
-        let html = '';
+        resultDiv.innerHTML = ''; // Clear previous results
 
         for (const tagRef of tagRefs) {
             const tagInfo = getTagInfo(tagRef);
             const dateStr = formatDate(tagInfo.date);
-            const tagUrl = `${repoUrl}/releases/tag/${tagInfo.name}`;
+            const tagUrl = `${repoUrl}/releases/tag/${encodeURIComponent(tagInfo.name)}`;
             const badgeClass = tagInfo.type === 'gateway' ? 'badge-gateway' : 'badge-main';
 
-            html += `
-                <div class="result-content result-success" style="margin-bottom: 0.75rem;">
-                    <div class="result-row">
-                        <span class="result-label">Release</span>
-                        <a href="${tagUrl}" target="_blank" class="tag-link">${tagInfo.name}</a>
-                    </div>
-                    <div class="result-row">
-                        <span class="result-label">Date</span>
-                        <span>${dateStr}</span>
-                    </div>
-                    <div class="result-row">
-                        <span class="result-label">Module</span>
-                        <span class="badge ${badgeClass}">${tagInfo.type}</span>
-                    </div>
+            const container = document.createElement('div');
+            container.className = 'result-content result-success';
+            container.style.marginBottom = '0.75rem';
+
+            container.innerHTML = `
+                <div class="result-row">
+                    <span class="result-label">Release</span>
+                    <a target="_blank" class="tag-link"></a>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Date</span>
+                    <span class="date-value"></span>
+                </div>
+                <div class="result-row">
+                    <span class="result-label">Module</span>
+                    <span class="badge ${badgeClass} module-value"></span>
                 </div>
             `;
-        }
 
-        resultDiv.innerHTML = html;
+            // Set dynamic content safely via textContent
+            const link = container.querySelector('.tag-link');
+            link.href = tagUrl;
+            link.textContent = tagInfo.name;
+            container.querySelector('.date-value').textContent = dateStr;
+            container.querySelector('.module-value').textContent = tagInfo.type;
+
+            resultDiv.appendChild(container);
+        }
     }
 </script>
 
