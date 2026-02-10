@@ -6,24 +6,24 @@
 
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
-
-#include <algorithm>
-#include <cstdint>
-#include <cstring>
 
 #include "fast_hadamard_transform.h"
 #include "fast_hadamard_transform_common.h"
 #include "fast_hadamard_transform_special.h"
 #include "static_switch.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 namespace {
 
-using ::HadamardParamsBase;
 using ::bf16_t;
 using ::fp16_t;
+using ::HadamardParamsBase;
 
 constexpr inline int ceil_log2(int val) {
   int log = 0;
@@ -74,20 +74,16 @@ struct FastHadamardMNKernelTraits {
 };
 
 template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard12NTraits =
-    FastHadamardMNKernelTraits<kNThreads_, kLogN_, 12, 12 * 1024, 24 * 1024, input_t_>;
+using FastHadamard12NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 12, 12 * 1024, 24 * 1024, input_t_>;
 
 template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard20NTraits =
-    FastHadamardMNKernelTraits<kNThreads_, kLogN_, 20, 20 * 1024, 40 * 1024, input_t_>;
+using FastHadamard20NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 20, 20 * 1024, 40 * 1024, input_t_>;
 
 template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard28NTraits =
-    FastHadamardMNKernelTraits<kNThreads_, kLogN_, 28, 28 * 1024, 28 * 1024, input_t_>;
+using FastHadamard28NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 28, 28 * 1024, 28 * 1024, input_t_>;
 
 template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard40NTraits =
-    FastHadamardMNKernelTraits<kNThreads_, kLogN_, 40, 40 * 1024, 40 * 1024, input_t_>;
+using FastHadamard40NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 40, 40 * 1024, 40 * 1024, input_t_>;
 
 template <int kNChunks>
 SGL_DEVICE void hadamard_mult_thread_chunk_12(float x[kNChunks][12]) {
@@ -382,13 +378,14 @@ inline void fast_hadamard_transform_40N_cuda(HadamardParamsBase& params, DLDevic
   }
 }
 
-inline void set_hadamard_params(HadamardParamsBase& params,
-                               int64_t batch,
-                               int64_t dim,
-                               int64_t multiple,
-                               const tvm::ffi::TensorView x,
-                               const tvm::ffi::TensorView out,
-                               float scale) {
+inline void set_hadamard_params(
+    HadamardParamsBase& params,
+    int64_t batch,
+    int64_t dim,
+    int64_t multiple,
+    const tvm::ffi::TensorView x,
+    const tvm::ffi::TensorView out,
+    float scale) {
   std::memset(&params, 0, sizeof(params));
   params.batch = static_cast<int>(batch);
   params.dim = static_cast<int>(dim);
