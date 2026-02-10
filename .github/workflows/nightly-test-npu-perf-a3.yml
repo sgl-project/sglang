@@ -1,8 +1,6 @@
-name: 'ascend test / nightly-test-npu-perf-a3'
+name: nightly-test-npu-perf-a3
 
 on:
-  schedule:
-    - cron: '0 30 * * *'
   pull_request:
     branches:
       - main
