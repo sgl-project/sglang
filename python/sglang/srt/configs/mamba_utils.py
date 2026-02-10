@@ -48,10 +48,10 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     """
     Get mamba2 state dtype from config or environment variable.
 
-    Priority:
-    1. Default "float32"
-    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype) - if exists, override
-    3. Environment variable SGLANG_MAMBA_SSM_DTYPE - if not None, override
+    Priority (from highest to lowest):
+    1. Environment variable SGLANG_MAMBA_SSM_DTYPE
+    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype)
+    3. Default "float32"
 
     Args:
         config: Optional config object (PretrainedConfig). If provided, will read
