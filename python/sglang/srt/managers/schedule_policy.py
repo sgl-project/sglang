@@ -753,6 +753,11 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                logger.info(
+                    f"[PIN] schedule_policy: load_back host_hit={req.host_hit_length}, "
+                    f"prefix_indices_before={len(req.prefix_indices)}, "
+                    f"fill_ids={len(req.fill_ids)}"
+                )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     req.last_host_node, req.host_hit_length
                 )
@@ -760,6 +765,12 @@ class PrefillAdder:
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+                logger.info(
+                    f"[PIN] schedule_policy: after load_back "
+                    f"new_indices={len(new_indices)}, "
+                    f"prefix_indices_after={len(req.prefix_indices)}, "
+                    f"extend_input_len={req.extend_input_len}"
+                )
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 

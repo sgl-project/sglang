@@ -2616,11 +2616,23 @@ class Scheduler(
             self.cur_batch = None
             self.last_batch = None
 
-            if getattr(self.tree_cache, "external_pin_count", {}):
+            pin_count = getattr(self.tree_cache, "external_pin_count", {})
+            evictable = getattr(self.tree_cache, "evictable_size_", "N/A")
+            logger.info(
+                f"[PIN] flush_cache: pin_count={len(pin_count)}, "
+                f"evictable_size={evictable}, "
+                f"req_to_token_pool.size={self.req_to_token_pool.size}, "
+                f"tp_rank={self.tp_rank}"
+            )
+
+            if pin_count:
                 # Selective flush: preserve pinned blocks
                 self.tree_cache.flush()
             else:
                 # Nuclear flush: no pins, reset everything
+                logger.info(
+                    f"[PIN] flush_cache: nuclear reset (no pins), tp_rank={self.tp_rank}"
+                )
                 self.tree_cache.reset()
                 self.req_to_token_pool.clear()
                 self.token_to_kv_pool_allocator.clear()
