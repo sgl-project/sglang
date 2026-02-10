@@ -179,7 +179,7 @@ class VisionSdpaAttention(nn.Module):
     def generate_patch_attention_mask(
         self,
         s: int,
-        cu_seqlens: Optional[torch.Tensor],
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
         flatten_batch: bool = False,
     ) -> Optional[torch.Tensor]:
         r"""
@@ -193,7 +193,10 @@ class VisionSdpaAttention(nn.Module):
         """
         if cu_seqlens is None:
             return None
-
+        if isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                return None
+            cu_seqlens = cu_seqlens.get_data()
         cu_seqlens_tuple = tuple(cu_seqlens.cpu().tolist())
 
         return self._generate_mask_cache(s, flatten_batch, cu_seqlens_tuple)
