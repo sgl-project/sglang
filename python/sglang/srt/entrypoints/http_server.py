@@ -1625,7 +1625,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     for _ in range(120):
         time.sleep(1)
         try:
-            res = requests.get(url + "/model_info", timeout=5, headers=headers)
+            res = requests.get(url + "/model_info", timeout=86400, headers=headers)  # wili, 86400 for debug, default value is 5
             assert res.status_code == 200, f"{res=}, {res.text=}"
             success = True
             break
@@ -1706,6 +1706,8 @@ def _execute_server_warmup(server_args: ServerArgs):
         json_data["sampling_params"]["max_new_tokens"] = 0
 
     # Send a warmup request
+    # wili, skip the warmup request for debug
+    wili="""
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
@@ -1761,7 +1763,7 @@ def _execute_server_warmup(server_args: ServerArgs):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
-
+    """
     # Debug print
     # logger.info(f"warmup request returns: {res.json()=}")
     return success

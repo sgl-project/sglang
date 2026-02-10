@@ -29,6 +29,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
 
+import nvtx  # wili
+
 _is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
@@ -568,11 +570,16 @@ def _get_chunked_prefill_embedding(
         items_offset = items_offset_list[i]
         assert items_offset is not None, items_offset
         # if all items has been prefixed, we do not need to calculate embedding
-        if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
-            continue
-        item_hashes = [item.hash for item in embedding_items_per_req]
-        embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-        embedding_per_req = embedding_cache.get(item_hashes)
+        if False:  # wili, original code
+            if all([offset_end < prefix_length[i] for _, offset_end in items_offset]):
+                continue
+            item_hashes = [item.hash for item in embedding_items_per_req]
+            embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
+            embedding_per_req = embedding_cache.get(item_hashes)
+        else:  # wili, disable the image cache for benchmark
+            item_hashes = [item.hash for item in embedding_items_per_req]
+            embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
+            embedding_per_req = None
         if embedding_per_req is None:
             embedding = data_embedding_func(embedding_items_per_req)
             embedding_per_req = (
@@ -1131,12 +1138,21 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    hidden_states = language_model(
-        input_ids=None,
-        forward_batch=forward_batch,
-        input_embeds=input_embeds,
-        **kwargs,
-    )
+    # start = torch.cuda.Event(enable_timing=True)  # wili
+    # end   = torch.cuda.Event(enable_timing=True)  # wili
+    # torch.cuda.synchronize()  # wili
+    # start.record()  # wili
+    with nvtx.annotate(f"LanguageModel,len={forward_batch.input_ids.shape[0]}", color="green"):  # wili
+        hidden_states = language_model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
+    # end.record()  # wili
+    # torch.cuda.synchronize()  # wili
+    # elapsed_ms = start.elapsed_time(end)  # wili
+    # print(f"LanguageModel, len={forward_batch.input_ids.shape[0]},{elapsed_ms=:.3f}ms")  # wili
     return hidden_states
 
 

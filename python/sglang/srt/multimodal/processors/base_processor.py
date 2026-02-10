@@ -35,7 +35,8 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
     MmItemMemoryPool,
 )
 
-_is_cpu = is_cpu()
+import nvtx  # wili
+
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
@@ -343,23 +344,24 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
-
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
-        if not self.server_args.keep_mm_feature_on_device:
-            # move feature tensors to cpu
-            for feature_name in self.FEATURE_NAMES:
-                if SGL_USE_CUDA_IPC:
-                    pass
-                else:
-                    if feature_name in result and isinstance(
-                        result[feature_name], torch.Tensor
-                    ):
-                        result[feature_name] = result[feature_name].to("cpu")
+        with nvtx.annotate(f"process_mm_data", color="green"):  # wili
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
+        with nvtx.annotate("not self.server_args.keep_mm_feature_on_device", color="green"):  # wili
+            if not self.server_args.keep_mm_feature_on_device:
+                # move feature tensors to cpu
+                for feature_name in self.FEATURE_NAMES:
+                    if SGL_USE_CUDA_IPC:
+                        pass
+                    else:
+                        if feature_name in result and isinstance(
+                            result[feature_name], torch.Tensor
+                        ):
+                            result[feature_name] = result[feature_name].to("cpu")
 
         return result
 
@@ -423,8 +425,10 @@ class BaseMultimodalProcessor(ABC):
                 return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data)
-                if discard_alpha_channel and img.mode != "RGB":
+                with nvtx.annotate("load_image", color="green"):  # wili
+                    img, _ = load_image(data)
+                if discard_alpha_channel and img.mode != "RGB" and not isinstance(img, torch.Tensor):  # wili
+                #if discard_alpha_channel and img.mode != "RGB":  # wili, original code
                     img = img.convert("RGB")
                 return img
             elif modality == Modality.VIDEO:
@@ -966,8 +970,10 @@ class BaseMultimodalProcessor(ABC):
             input_text=input_text, images=images, audios=audios, videos=videos, **kwargs
         )
 
-        input_ids = ret["input_ids"].flatten()
-        collected_items = self.collect_mm_items_from_processor_output(ret)
+        with nvtx.annotate('ret["input_ids"].flatten()', color="green"):  # wili
+            input_ids = ret["input_ids"].flatten()
+        with nvtx.annotate("collect_mm_items_from_processor_output", color="green"):  # wili
+            collected_items = self.collect_mm_items_from_processor_output(ret)
 
         return collected_items, input_ids, ret
 
@@ -1051,14 +1057,15 @@ class BaseMultimodalProcessor(ABC):
             ).input_ids.flatten()
 
         # Add offsets to all items
-        for mm_item in all_collected_items:
-            mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
-            if mm_token_id is None:
-                raise ValueError(f"No token id found for modality: {mm_item.modality}")
-            mm_item.offsets = self.get_mm_items_offset(
-                input_ids=input_ids,
-                mm_token_id=mm_token_id,
-            )
+        with nvtx.annotate("get_mm_items_offset", color="green"):  # wili
+            for mm_item in all_collected_items:
+                mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
+                if mm_token_id is None:
+                    raise ValueError(f"No token id found for modality: {mm_item.modality}")
+                mm_item.offsets = self.get_mm_items_offset(
+                    input_ids=input_ids,
+                    mm_token_id=mm_token_id,
+                )
 
         """
         solution for cuda-ipc memory-leak:
@@ -1068,47 +1075,48 @@ class BaseMultimodalProcessor(ABC):
         4. copy
         """
 
-        if SGL_USE_CUDA_IPC:
-            # post-process
-            for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.feature
+        with nvtx.annotate("cuda-ipc post-process", color="green"):  # wili
+            if SGL_USE_CUDA_IPC:
+                # post-process
+                for item in all_collected_items:
+                    if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
+                        sync_flag, available_slice = (
+                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                                item.feature
+                            )
                         )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.feature.view(torch.int8).view(-1), non_blocking=True
-                        )
-                        item.feature = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.feature,
-                            sync_buffer_meta=sync_flag,
-                        )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.feature = item.feature.cpu()
-                elif (
-                    isinstance(item.precomputed_embeddings, torch.Tensor)
-                    and item.precomputed_embeddings.is_cuda
-                ):
+                        if isinstance(available_slice, torch.Tensor):
+                            available_slice.copy_(
+                                item.feature.view(torch.int8).view(-1), non_blocking=True
+                            )
+                            item.feature = CudaIpcTensorTransportProxy(
+                                data=available_slice,
+                                info_data=item.feature,
+                                sync_buffer_meta=sync_flag,
+                            )
+                        elif not self.server_args.keep_mm_feature_on_device:
+                            item.feature = item.feature.cpu()
+                    elif (
+                        isinstance(item.precomputed_embeddings, torch.Tensor)
+                        and item.precomputed_embeddings.is_cuda
+                    ):
 
-                    sync_flag, available_slice = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.precomputed_embeddings
+                        sync_flag, available_slice = (
+                            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
+                                item.precomputed_embeddings
+                            )
                         )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.precomputed_embeddings.view(torch.int8).view(-1),
-                            non_blocking=True,
-                        )
-                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.precomputed_embeddings,
-                            sync_buffer_meta=sync_flag,
-                        )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.precomputed_embeddings = item.precomputed_embeddings.cpu()
+                        if isinstance(available_slice, torch.Tensor):
+                            available_slice.copy_(
+                                item.precomputed_embeddings.view(torch.int8).view(-1),
+                                non_blocking=True,
+                            )
+                            item.precomputed_embeddings = CudaIpcTensorTransportProxy(
+                                data=available_slice,
+                                info_data=item.precomputed_embeddings,
+                                sync_buffer_meta=sync_flag,
+                            )
+                        elif not self.server_args.keep_mm_feature_on_device:
+                            item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
         return all_collected_items, input_ids, ret

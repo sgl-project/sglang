@@ -29,6 +29,8 @@ from sglang.srt.utils.multi_stream_utils import (
     with_multi_stream,
 )
 
+import os  # wili
+
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
@@ -597,8 +599,13 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
-        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
+        self.enable_vfly = bool(int(os.environ.get('ENABLE_VFLY', '0')))  # wili
+        if self.enable_vfly:  # wili, reuse TP group but keep TP size as 1
+            self.tp_size = 1
+            self.tp_rank = 0
+        else:  # wili, original code
+            self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+            self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
@@ -927,16 +934,25 @@ class VisionAttention(nn.Module):
             else:
                 q, k = self._apply_qk_norm(q, k)
 
-        output = self.qkv_backend.forward(
-            q=q,
-            k=k,
-            v=v,
-            bsz=bsz,
-            seq_len=s,
-            cu_seqlens=cu_seqlens,
-            attention_mask=attention_mask,
-            output_ws=attn_output_ws,
-        )
+
+        if self.enable_vfly:  # wili
+            assert attention_mask is None  # wili, `attention_mask` is always None in our workflow
+            q = q.unsqueeze(0)  # wili, vfly needs input as [batch_size, sequence_length, num_head, head_dim]
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+            output = self.processor(q, k, v, cu_seqlens)
+            output = output[0]
+        else:  # wili, original code
+            output = self.qkv_backend.forward(
+                q=q,
+                k=k,
+                v=v,
+                bsz=bsz,
+                seq_len=s,
+                cu_seqlens=cu_seqlens,
+                attention_mask=attention_mask,
+                output_ws=attn_output_ws,
+            )
 
         assert output.dim() == 3, output.shape
 
