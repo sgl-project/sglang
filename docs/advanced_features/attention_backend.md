@@ -30,7 +30,7 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ✅              | ❌              | ❌                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
 | **Intel AMX (CPU)**             | ❌                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
-| **HPC**                         | 64                            | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
+| **HPC**                         | 32, 64                      | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
 
 ### MLA Backends
 
@@ -69,6 +69,7 @@ Page size controls how many tokens are grouped into a KV cache block. For the pr
 Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
 
 MLA page-size constraints:
+
 - FlashInfer MLA: page_size = 1.
 - FlashMLA: page_size = 64.
 - Cutlass MLA: page_size = 128.
@@ -106,7 +107,6 @@ Constraints when combining hybrid attention with speculative decoding:
 - For paged MHA backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
-
 ```{tip}
 If you set only one of `--prefill-attention-backend` or `--decode-attention-backend`, the unspecified phase inherits `--attention-backend`.
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
@@ -119,21 +119,23 @@ If the `--attention-backend` argument is not specified, SGLang automatically sel
 ### Automatic Selection Logic
 
 **1. MHA Models (e.g., Llama, Qwen)**
+
 - **Hopper (e.g., H100, H200)**: Defaults to `fa3` if using CUDA 12.3+ and the model configuration is supported.
 - **Blackwell (e.g., B200)**: Defaults to `trtllm_mha`, unless using speculative decoding with `topk > 1`.
 - **Other Architectures (Ampere, Ada, etc.)**: Defaults to `flashinfer` if available; otherwise falls back to `triton`.
 
 **2. MLA Models (e.g., DeepSeek V3)**
+
 - **Hopper**: Defaults to `fa3` (requires CUDA 12.3+).
 - **Blackwell**: Defaults to `trtllm_mla`.
 - **Other Architectures**: Defaults to `triton`.
-
 
 ## User Guide
 
 ### Launch Command for Different Attention Backends
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -146,6 +148,7 @@ python3 -m sglang.launch_server \
 ```
 
 - FlashAttention 3 (Default for Hopper Machines, e.g., H100, H200, H20)
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -158,6 +161,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Triton
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -170,6 +174,7 @@ python3 -m sglang.launch_server \
 ```
 
 - FlashMLA
+
 ```bash
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -185,6 +190,7 @@ python3 -m sglang.launch_server \
 ```
 
 - TRTLLM MLA (Optimized for Blackwell Architecture, e.g., B200)
+
 ```bash
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -194,6 +200,7 @@ python3 -m sglang.launch_server \
 ```
 
 - TRTLLM MLA with FP8 KV Cache (Higher concurrency, lower memory footprint)
+
 ```bash
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -204,6 +211,7 @@ python3 -m sglang.launch_server \
 ```
 
 - FlashAttention 4 (MHA & MLA)
+
 ```bash
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -213,6 +221,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Cutlass MLA
+
 ```bash
 python3 -m sglang.launch_server \
   --tp 8 \
@@ -222,6 +231,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Ascend
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -229,6 +239,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Intel XPU
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -236,6 +247,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Wave
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -243,6 +255,7 @@ python3 -m sglang.launch_server \
 ```
 
 - FlexAttention
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -250,6 +263,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Dual Chunk FlashAttention
+
 ```bash
 python3 -m sglang.launch_server \
   --model Qwen/Qwen2.5-14B-Instruct-1M \
@@ -257,6 +271,7 @@ python3 -m sglang.launch_server \
 ```
 
 - Torch Native
+
 ```bash
 python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -280,6 +295,7 @@ python3 -m sglang.launch_server \
 ```
 
 ## Steps to add a new attention backend
+
 To add a new attention backend, you can learn from the existing backends
 (`python/sglang/srt/layers/attention/triton_backend.py`, `python/sglang/srt/layers/attention/flashattention_backend.py`)
 and follow the steps below.
