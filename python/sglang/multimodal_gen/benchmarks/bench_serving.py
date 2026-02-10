@@ -1005,15 +1005,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--warmup-requests",
         type=int,
-        default=0,
+        default=1,
         help="Number of warmup requests to run before the benchmark. "
-        "Warmup requests are not profiled. Default is 0 (no warmup).",
+        "Default is 1 (warmup request).",
     )
     parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable full pipeline profiling. "
-        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR (default: ./logs/). ",
+        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
     )
     parser.add_argument(
         "--log-level",
