@@ -192,6 +192,7 @@ class Qwen3NextConfig(PretrainedConfig):
         partial_rotary_factor=0.25,
         attention_bias=False,
         attention_dropout=0.0,
+        full_attention_interval=4,
         head_dim=256,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=128,
@@ -227,6 +228,7 @@ class Qwen3NextConfig(PretrainedConfig):
         self.partial_rotary_factor = partial_rotary_factor
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.full_attention_interval = full_attention_interval
         self.head_dim = head_dim
 
         # linear attention (gdn now part)
