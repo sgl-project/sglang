@@ -158,7 +158,7 @@ def fused_recurrent_sigmoid_update_kernel_128x32_col(
         bos = 0
         state_idx = gIndices[batch_idx]
 
-    if state_idx >=0:
+    if state_idx >= 0:
         blk_coord_H = ((None, None, None, None), (state_idx, head_idx, None, bidx))
         blkH = gH[blk_coord_H]
 
@@ -247,7 +247,9 @@ def fused_recurrent_sigmoid_update_kernel_128x32_col(
                 )
 
             tGrGexp = cute.math.exp(tGrG, fastmath=True)[0]
-            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+            for reg_H_idx in cutlass.range_constexpr(
+                0, ELEM_H_X * ELEM_H_Y, 2, unroll=2
+            ):
                 tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
                     (tHrH_i[reg_H_idx], tHrH_i[reg_H_idx + 1]),
                     (tGrGexp, tGrGexp),
@@ -255,7 +257,9 @@ def fused_recurrent_sigmoid_update_kernel_128x32_col(
 
             # b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
             # b_h * b_k[:, None]
-            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+            for reg_H_idx in cutlass.range_constexpr(
+                0, ELEM_H_X * ELEM_H_Y, 2, unroll=2
+            ):
                 tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1] = mul_packed_f32x2(
                     (tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1]),
                     (tKrK[reg_H_idx % ELEM_H_X], tKrK[(reg_H_idx + 1) % ELEM_H_X]),
@@ -302,7 +306,9 @@ def fused_recurrent_sigmoid_update_kernel_128x32_col(
                         ),
                     )
 
-            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+            for reg_H_idx in cutlass.range_constexpr(
+                0, ELEM_H_X * ELEM_H_Y, 2, unroll=2
+            ):
                 tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
                     (tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1]),
                     (tQrQ[reg_H_idx % ELEM_H_X], tQrQ[(reg_H_idx + 1) % ELEM_H_X]),
@@ -588,7 +594,7 @@ def fused_recurrent_update_kernel_128x32_col(
 
     state_idx = gIndices[batch_idx]
 
-    if state_idx >=0:
+    if state_idx >= 0:
         cache_idx = -1
         if const_expr(CACHE_INTERMEDIATE_STATES):
             cache_idx = gInterIndices[batch_idx]
@@ -697,7 +703,9 @@ def fused_recurrent_update_kernel_128x32_col(
                 ):
                     tHrH_g[reg_H_idx] = tHrHk[reg_H_idx]
 
-            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+            for reg_H_idx in cutlass.range_constexpr(
+                0, ELEM_H_X * ELEM_H_Y, 2, unroll=2
+            ):
                 tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1] = mul_packed_f32x2(
                     (tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1]),
                     (tKrK[reg_H_idx % ELEM_H_X], tKrK[(reg_H_idx + 1) % ELEM_H_X]),
@@ -761,7 +769,9 @@ def fused_recurrent_update_kernel_128x32_col(
                         tIgI[reg_I_idx] = tHrHk[reg_I_idx].to(tIgI.element_type)
 
         if const_expr(not DISABLE_STATE_UPDATE):
-            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 1, unroll=4):
+            for reg_H_idx in cutlass.range_constexpr(
+                0, ELEM_H_X * ELEM_H_Y, 1, unroll=4
+            ):
                 tHgH[reg_H_idx] = tHrHk[reg_H_idx].to(tHgH.element_type)
 
 
