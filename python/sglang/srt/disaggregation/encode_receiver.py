@@ -7,7 +7,6 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from enum import IntEnum
-from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
