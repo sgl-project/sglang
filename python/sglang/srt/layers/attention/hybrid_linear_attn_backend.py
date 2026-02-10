@@ -33,13 +33,11 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
+from sglang.srt.utils.common import is_hip
 from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
-    from sglang.jit_kernel.cutedsl_gdn import (
-        cutedsl_fused_sigmoid_gating_delta_rule_update,
-    )
     from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
@@ -47,11 +45,22 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.kda import chunk_kda
 
 if is_cuda():
+    # cutedsl_gdn requires NVIDIA CUTLASS (not available on ROCm/HIP)
+    from sglang.jit_kernel.cutedsl_gdn import (
+        cutedsl_fused_sigmoid_gating_delta_rule_update,
+    )
+
+if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
+elif is_hip():
+    # On ROCm/HIP, sgl_kernel.causal_conv1d_fwd is not available.
+    # Use the triton-based causal_conv1d_fn already imported above from
+    # causal_conv1d_triton (lines 17-21) — no override needed.
+    pass
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
@@ -819,7 +828,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
+        use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get() and is_cuda()
         rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
         self._kernel_func = (
             cutedsl_fused_sigmoid_gating_delta_rule_update
