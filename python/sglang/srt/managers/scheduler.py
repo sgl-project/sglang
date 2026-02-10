@@ -58,7 +58,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import (
@@ -144,7 +144,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
-    DllmStagingReqs,
     PrefillAdder,
     SchedulePolicy,
 )
@@ -255,6 +254,7 @@ class Scheduler(
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
+    SchedulerDllmMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -399,11 +399,6 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
-        self.dllm_config = (  # For diffusion LLM
-            DllmConfig.from_server_args(self.server_args)
-            if self.server_args.dllm_algorithm is not None
-            else None
-        )
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -607,6 +602,11 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
+        if self.enable_metrics and hasattr(self, "metrics_collector"):
+            self.metrics_collector.emit_cache_config_info(
+                self.page_size, self.max_total_num_tokens // self.page_size
+            )
+
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
@@ -757,9 +757,6 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
-
-    def init_diffusion_llm(self):
-        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=self.dllm_config)
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
@@ -1318,7 +1315,7 @@ class Scheduler(
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
-                or self.dllm_staging_reqs.non_empty()
+                or self.dllm_manager.any_staging_reqs()
                 or not self.running_batch.is_empty()
                 or len(self.offload_tags) > 0
             ):
@@ -1825,20 +1822,15 @@ class Scheduler(
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_queued_timeout()
         if self.dllm_config is not None:
-            self.dllm_staging_reqs.filter_finished_reqs()
+            self.dllm_manager.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
 
-        if self.dllm_config is not None:
-            assert (
-                self.chunked_req is None
-            ), "chunked_req should be None when dllm_config is set"
-
-            if self.dllm_staging_reqs.non_empty():
-                chunked_req_to_exclude.update(self.dllm_staging_reqs)
-                for req in self.dllm_staging_reqs:
-                    self.stash_chunked_request(req)
+        if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
+            chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
+            for req in self.dllm_manager.staging_queue:
+                self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
@@ -1852,8 +1844,8 @@ class Scheduler(
                 # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
-            if self.last_batch.dllm_staging_reqs.non_empty():
-                chunked_req_to_exclude.update(self.last_batch.dllm_staging_reqs)
+            if self.dllm_config is not None and self.last_batch.reqs:
+                chunked_req_to_exclude.update(self.last_batch.reqs)
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
@@ -1872,7 +1864,10 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        if self.dllm_config is not None:
+            new_batch = self.get_new_batch_dllm()
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1942,9 +1937,9 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        if (self.running_batch.batch_is_full or len(self.waiting_queue) == 0) and (
-            not self.dllm_staging_reqs.non_empty() and self.chunked_req is None
-        ):
+        if (
+            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+        ) and self.chunked_req is None:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -1955,7 +1950,7 @@ class Scheduler(
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
-            and (self.dllm_staging_reqs.empty() or self.chunked_req is not None)
+            and self.chunked_req is not None
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -1996,17 +1991,6 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
         )
-
-        if self.dllm_config is not None:
-            assert (
-                self.chunked_req is None
-            ), "chunked_req should be None when dllm_config is set"
-
-            if self.dllm_staging_reqs.non_empty():
-                self.dllm_staging_reqs.init_next_round()
-                for req in self.dllm_staging_reqs:
-                    adder.add_chunked_req(req)
-                self.dllm_staging_reqs.add_reqs(adder.dllm_staging_reqs)
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -2061,9 +2045,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
-                has_chunked_req=(
-                    self.dllm_staging_reqs.non_empty() or self.chunked_req is not None
-                ),
+                has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
@@ -2098,14 +2080,6 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if self.dllm_config is not None:
-            assert (
-                self.chunked_req is None
-            ), "chunked_req should be None when dllm_config is set"
-
-            if adder.dllm_staging_reqs.non_empty():
-                self.dllm_staging_reqs.add_reqs(adder.dllm_staging_reqs)
-
         if adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
@@ -2113,9 +2087,6 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
-
-        if self.dllm_staging_reqs.non_empty():
-            self.dllm_staging_reqs.update_chunked_status()
 
         # Record for logging prefill stats after forward
         self.adder = adder
@@ -2141,8 +2112,6 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
-            dllm_staging_reqs=self.dllm_staging_reqs,
-            dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
