@@ -36,6 +36,7 @@ add_SGLangEncoderServicer_to_server = (
     sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server
 )
 
+
 class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
     """
     Standard gRPC health check service for encoder server.
