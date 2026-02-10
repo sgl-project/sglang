@@ -58,6 +58,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
+from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -507,7 +508,7 @@ class RequestStage(str, enum.Enum):
     DECODE_QUICK_FINISH = "quick_finish"
 
 
-class Req:
+class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -804,9 +805,7 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
-        self.dllm_ids = []
-        self.dllm_block_offset = 0
-        self.dllm_config = dllm_config
+        self.init_diffusion_llm(dllm_config)
 
     @property
     def seqlen(self) -> int:
@@ -868,23 +867,10 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
-    def is_dllm(self):
-        return self.dllm_config is not None
-
-    def _init_fill_ids_for_dllm(self):
-        if not self.dllm_ids:
-            self.dllm_ids = (
-                self.origin_input_ids
-                + [self.dllm_config.mask_id] * self.dllm_config.block_size
-            )
-        else:
-            self.dllm_block_offset += self.dllm_config.block_size
-            self.dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
-        self.fill_ids = self.dllm_ids
-
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
+            self.determine_dllm_phase()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
@@ -1194,62 +1180,6 @@ class Req:
         )
 
 
-class DllmStagingReqs:
-    def __init__(self, dllm_config: Optional[DllmConfig] = None):
-        self.dllm_config = dllm_config
-        self.max_running_reqs = (
-            dllm_config.max_running_requests if dllm_config is not None else 1
-        )
-        self.reqs: List[Req] = []
-
-    def add_reqs(self, req: Union[Req, List[Req], "DllmStagingReqs"]):
-        assert self.dllm_config is not None, "Diffusion LLM config is not set."
-
-        if isinstance(req, DllmStagingReqs):
-            reqs_to_add = req.reqs
-        elif isinstance(req, list):
-            reqs_to_add = req
-        else:
-            reqs_to_add = [req]
-
-        num_to_add = len(reqs_to_add)
-
-        # Sanity check:
-        if self.check_redundant_reqs(reqs_to_add):
-            raise RuntimeError("Redundant requests detected in dLLM requests.")
-
-        if len(self.reqs) + num_to_add > self.max_running_reqs:
-            raise RuntimeError(
-                f"Exceeding maximum number of concurrent diffusion LLM requests: {self.max_running_reqs}"
-            )
-
-        self.reqs.extend(reqs_to_add)
-
-    def check_redundant_reqs(self, reqs: List[Req]) -> bool:
-        existing_rids: Set[str] = {r.rid for r in self.reqs}
-        return any(req.rid in existing_rids for req in reqs)
-
-    def init_next_round(self):
-        for req in self.reqs:
-            req.init_next_round_input()
-
-    def non_empty(self) -> bool:
-        return self.dllm_config is not None and len(self.reqs) > 0
-
-    def empty(self) -> bool:
-        return self.dllm_config is None or len(self.reqs) == 0
-
-    def update_chunked_status(self):
-        for req in self.reqs:
-            req.is_chunked += 1
-
-    def filter_finished_reqs(self):
-        self.reqs = [req for req in self.reqs if not req.finished()]
-
-    def __iter__(self):
-        return iter(self.reqs)
-
-
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1370,7 +1300,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     hicache_consumer_index: int = -1
 
     # Diffusion LLM
-    dllm_staging_reqs: Optional[DllmStagingReqs] = None
     dllm_config: Optional[DllmConfig] = None
 
     # Metrics
@@ -1387,7 +1316,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
-        dllm_staging_reqs: Optional[DllmStagingReqs] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1413,7 +1341,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
-            dllm_staging_reqs=dllm_staging_reqs,
             dllm_config=dllm_config,
         )
 

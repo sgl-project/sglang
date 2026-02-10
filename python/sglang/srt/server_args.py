@@ -2758,6 +2758,24 @@ class ServerArgs:
             )
             self.pp_size = 1
 
+        if self.enable_lora:
+            logger.warning(
+                "Currently LoRA is not supported by diffusion LLM inference."
+            )
+            self.enable_lora = False
+
+        if self.disaggregation_mode != "null":
+            logger.warning(
+                "Currently disaggregation is not supported by diffusion LLM inference."
+            )
+            self.disaggregation_mode = "null"
+
+        if self.enable_mixed_chunk:
+            logger.warning(
+                "Mixed chunked prefill is disabled because of using diffusion LLM inference."
+            )
+            self.enable_mixed_chunk = False
+
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
