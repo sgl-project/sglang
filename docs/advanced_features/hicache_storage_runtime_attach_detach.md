@@ -2,12 +2,18 @@
 
 This document explains how to **dynamically attach/detach the HiCache L3 storage backend at runtime** (e.g., `mooncake` / `hf3fs` / `nixl` / `file` / `aibrix` / `eic`) while **SGLang is already running and serving traffic**, without restarting the process.
 
-For safety and consistency, the current implementation **strictly requires** these operations to happen only when the service is **idle**:
+For safety and consistency, the default implementation **strictly requires** these operations to happen only when the service is **idle**:
 
 - **No running requests**
 - **No waiting/queued requests**
 
 If the idle condition is not met, the API will fail fast (HTTP 400) and **will not modify** the current service state.
+
+You can optionally enable a **force mode** to switch even under load. In force mode:
+
+- Requests **do not use** the storage backend during the switch (read treated as miss; write skipped).
+- The switch waits for **existing storage operations to drain** before actual attach/detach.
+- Any failure will return an error without crashing the server, and the IO block is rolled back.
 
 ---
 
@@ -99,7 +105,8 @@ curl -s -X PUT http://127.0.0.1:30000/hicache/storage-backend \
   -d '{
     "hicache_storage_backend": "mooncake",
     "hicache_storage_backend_extra_config_json": "{\"master_server_address\":\"127.0.0.1:50051\",\"protocol\":\"tcp\",\"global_segment_size\":\"4gb\",\"prefetch_threshold\":256}",
-    "hicache_storage_prefetch_policy": "timeout"
+    "hicache_storage_prefetch_policy": "timeout",
+    "force": true
   }'
 ```
 
@@ -113,6 +120,14 @@ Notes:
 
 ```bash
 curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend
+```
+
+```bash
+curl -s -X DELETE http://127.0.0.1:30000/hicache/storage-backend \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "force": true
+  }'
 ```
 
 Notes:

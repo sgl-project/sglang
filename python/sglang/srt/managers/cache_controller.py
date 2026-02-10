@@ -274,6 +274,7 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.fault_reporter = None
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -284,6 +285,7 @@ class HiCacheController:
         # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
+        self.storage_io_blocked = threading.Event()
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
@@ -396,6 +398,21 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    def set_storage_io_blocked(self, blocked: bool):
+        if blocked:
+            self.storage_io_blocked.set()
+        else:
+            self.storage_io_blocked.clear()
+
+    def is_storage_io_blocked(self) -> bool:
+        return self.storage_io_blocked.is_set()
+
+    def set_fault_reporter(self, reporter):
+        self.fault_reporter = reporter
+        if hasattr(self, "storage_backend") and self.storage_backend is not None:
+            if hasattr(self.storage_backend, "set_fault_reporter"):
+                self.storage_backend.set_fault_reporter(reporter)
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -444,6 +461,10 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.mem_pool_host
             )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            if self.fault_reporter is not None and hasattr(
+                self.storage_backend, "set_fault_reporter"
+            ):
+                self.storage_backend.set_fault_reporter(self.fault_reporter)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -769,6 +790,8 @@ class HiCacheController:
         """
         Prefetch KV caches from storage backend to host memory.
         """
+        if self.storage_io_blocked.is_set():
+            return None
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
@@ -967,6 +990,8 @@ class HiCacheController:
         """
         Write KV caches from host memory to storage backend.
         """
+        if self.storage_io_blocked.is_set():
+            return None
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
