@@ -40,6 +40,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.true_on_policy import should_use_tp_invariant_row_linear
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1650,7 +1651,27 @@ class RowParallelLinear(LinearBase):
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            if output_tensor is None:
+            from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+            is_tuple = isinstance(input_parallel, tuple)
+            is_fp8 = isinstance(self.quant_method, Fp8LinearMethod)
+            k_size = (
+                input_parallel[0].shape[-1] if is_tuple else input_parallel.shape[-1]
+            )
+            if should_use_tp_invariant_row_linear(k_size):
+                if output_tensor is not None:
+                    raise RuntimeError(
+                        "tp-invariant row linear cannot write into a caller-owned "
+                        "output tensor"
+                    )
+                if is_fp8:
+                    raise NotImplementedError(
+                        "FP8 tp-invariant row-linear not yet supported"
+                    )
+                output_parallel = torch.ops.tp_inv_ops.matmul_tp_inv(
+                    input_parallel, self.weight.t(), bias_
+                )
+            elif output_tensor is None:
                 output_parallel = self.quant_method.apply(
                     self, input_parallel, bias=bias_
                 )

@@ -49,6 +49,10 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
 )
 from sglang.srt.layers.moe import is_moe_input_scattered_across_dp_ranks
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.true_on_policy import (
+    should_disable_mlp_allreduce_fusion_for_on_policy,
+    should_disable_reduce_scatter_for_on_policy,
+)
 
 
 def _variants():
@@ -92,8 +96,13 @@ def _ffn_decl(
             "boundary_reduction must be resolved before model construction"
         )
     can_move_output = output_transform is None or output_transform.before_reduce_scatter
-    use_reduce_scatter = strategy in ("rs", "rs+rsv") and can_move_output
-    use_reduce_scatterv = strategy in ("rsv", "rs+rsv") and can_move_output
+    allow_reduce_scatter = not should_disable_reduce_scatter_for_on_policy()
+    use_reduce_scatter = (
+        strategy in ("rs", "rs+rsv") and can_move_output and allow_reduce_scatter
+    )
+    use_reduce_scatterv = (
+        strategy in ("rsv", "rs+rsv") and can_move_output and allow_reduce_scatter
+    )
     cp_shards = _generic_prefill_cp_shards_tokens()
     axes, attention, local, full = _rows(variant)
     on_local = (
@@ -165,6 +174,7 @@ def _ffn_decl(
             rows,
             group=group,
             leaves_for_next_layer=may_leave
+            and not should_disable_mlp_allreduce_fusion_for_on_policy()
             and not terminal
             and not update.at_producer
             and update.can_defer_across_layers
