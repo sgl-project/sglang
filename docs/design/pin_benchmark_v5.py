@@ -477,7 +477,7 @@ def main():
     parser.add_argument("--aiperf-model", default="qwen3-14b-fp8")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--mem-fraction", type=float, default=0.65)
+    parser.add_argument("--mem-fraction", type=float, default=0.50)
     parser.add_argument("--context-length", type=int, default=32768)
     parser.add_argument("--depths", type=int, nargs="+", default=[0, 2, 6, 10, 16],
                         help="Turn indices to test (must be even, ending on assistant turn)")
