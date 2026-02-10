@@ -71,7 +71,7 @@ jobs:
             decode_size: 2
             router_size: 1
             test_case: test/manual/ascend/performance/test_ascend_qwen3_480b_w8a8_1p1d_24p_in3k5_out1k5_50ms.py
-    uses: nightly-test-npu-perf-multi-node-pd-separation.yml
+    uses: nightly-test-npu-perf-multi-node-pd-separation.yml@main
     with:
       runner: linux-aarch64-a3-0
       test_config_name: ${{ matrix.test_config.name }}
@@ -97,7 +97,7 @@ jobs:
           - name: test_ascend_qwen3_480b_w8a8_16p_in3k5_out1k5_50ms
             node_size: 2
             test_case: test/manual/ascend/performance/test_ascend_qwen3_480b_w8a8_16p_in3k5_out1k5_50ms.py
-    uses: nightly-test-npu-perf-multi-node-pd-mix.yml
+    uses: nightly-test-npu-perf-multi-node-pd-mix.yml@main
     with:
       runner: linux-aarch64-a3-0
       test_config_name: ${{ matrix.test_config.name }}
@@ -157,7 +157,7 @@ jobs:
           - name: test_ascend_deepseek_r1_w4a8_8p_in3k5_out1k5_50ms
             test_case: test/registered/ascend/performance/test_ascend_deepseek_r1_w4a8_8p_in3k5_out1k5_50ms.py
             runner: linux-aarch64-a3-16
-    uses: nightly-test-npu-perf-single-node.yml
+    uses: nightly-test-npu-perf-single-node.yml@main
     with:
       runner: ${{ matrix.test_config.runner }}
       test_config_name: ${{ matrix.test_config.name }}
