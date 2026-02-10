@@ -561,7 +561,7 @@ impl ConfigValidator {
                     return Err(ConfigError::InvalidValue {
                         field: "scheduler.adjust_window".to_string(),
                         value: adjust_window.to_string(),
-                        reason: "scheduler.adjust_window must be> 0".to_string(),
+                        reason: "scheduler.adjust_window must be > 0".to_string(),
                     });
                 }
 
@@ -577,7 +577,7 @@ impl ConfigValidator {
                     return Err(ConfigError::InvalidValue {
                         field: "scheduler.regular_worker_weight".to_string(),
                         value: regular_worker_weight.to_string(),
-                        reason: "scheduler.regular_worker_weight must be >= 0".to_string(),
+                        reason: "scheduler.regular_worker_weight must be > 0".to_string(),
                     });
                 }
             }
