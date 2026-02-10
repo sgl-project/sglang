@@ -298,6 +298,7 @@ class Scheduler(
         self.max_loras_per_batch = server_args.max_loras_per_batch
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
+        self.enable_pp_sleep_on_idle = server_args.enable_pp_sleep_on_idle
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
         self.enable_metrics_for_all_schedulers = (
@@ -446,6 +447,40 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+        self.pp_idle_wakeup_listener_socket = None
+        self.pp_idle_wakeup_notifier_socket = None
+
+        if self.enable_pp_sleep_on_idle:
+            # Listen for wake signals
+            if (
+                self.dp_rank,
+                self.pp_rank,
+            ) in port_args.pp_idle_wakeup_listeners_ipc_names:
+                self.pp_idle_wakeup_listener_socket = get_zmq_socket(
+                    context,
+                    zmq.PULL,
+                    port_args.pp_idle_wakeup_listeners_ipc_names[
+                        self.dp_rank, self.pp_rank
+                    ],
+                    True,
+                )
+                # Set 1-second timeout for periodic maintenance
+                self.pp_idle_wakeup_listener_socket.setsockopt(zmq.RCVTIMEO, 1000)
+
+            # Notify with wake signals
+            if (
+                self.dp_rank,
+                self.pp_rank,
+            ) in port_args.pp_idle_wakeup_notifiers_ipc_names:
+                self.pp_idle_wakeup_notifier_socket = get_zmq_socket(
+                    context,
+                    zmq.PUSH,
+                    port_args.pp_idle_wakeup_notifiers_ipc_names[
+                        self.dp_rank, self.pp_rank
+                    ],
+                    False,
+                )
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1209,6 +1244,14 @@ class Scheduler(
                 recv_reqs = None
         else:
             if self.attn_tp_rank == 0:
+                # Wait for wake signal
+                if self.pp_idle_wakeup_listener_socket:
+                    try:
+                        self.pp_idle_wakeup_listener_socket.recv()
+                    except zmq.Again:
+                        return []
+
+                # There is work to be done now
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
                 recv_reqs = point_to_point_pyobj(
                     [],
