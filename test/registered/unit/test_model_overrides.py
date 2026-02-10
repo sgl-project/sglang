@@ -3614,10 +3614,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             _data_parallelism_defaults(
                 ResolvedView(
-                    SimpleNamespace(dp_size=1, attn_dp_size=1, ep_join_mode=None)
+                    SimpleNamespace(
+                        dp_size=1,
+                        attn_dp_size=1,
+                        ep_join_mode=None,
+                        enable_dp_lm_head=True,
+                        attn_cp_size=1,
+                    )
                 )
             ),
             {"enable_dp_lm_head": False},
+        )
+        # An attention-CP deployment keeps its context-parallel LM head.
+        self.assertEqual(
+            _data_parallelism_defaults(
+                ResolvedView(
+                    SimpleNamespace(
+                        dp_size=1,
+                        attn_dp_size=1,
+                        ep_join_mode=None,
+                        enable_dp_lm_head=True,
+                        attn_cp_size=2,
+                    )
+                )
+            ),
+            {},
         )
         for dp_size, attn_dp_size in ((2, 1), (1, 2)):
             with self.subTest(dp_size=dp_size, attn_dp_size=attn_dp_size):
