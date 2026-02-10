@@ -1,0 +1,112 @@
+{
+  "results": [
+    {
+      "depth": 0,
+      "pinned": {
+        "depth": 0,
+        "pin": true,
+        "warmup_turns": 1,
+        "measure_turns": 2,
+        "warmup_tokens": 2992,
+        "blocks_pinned": 46,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 53.085063002072275,
+        "prompt_tokens": 3158,
+        "cached_tokens": 2944,
+        "cache_hit_pct": 93.22355921469284
+      }
+    },
+    {
+      "depth": 2,
+      "pinned": {
+        "depth": 2,
+        "pin": true,
+        "warmup_turns": 3,
+        "measure_turns": 4,
+        "warmup_tokens": 4774,
+        "blocks_pinned": 74,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 244.7985130129382,
+        "prompt_tokens": 4810,
+        "cached_tokens": 3136,
+        "cache_hit_pct": 65.1975051975052
+      }
+    },
+    {
+      "depth": 6,
+      "pinned": {
+        "depth": 6,
+        "pin": true,
+        "warmup_turns": 7,
+        "measure_turns": 8,
+        "warmup_tokens": 7322,
+        "blocks_pinned": 114,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 231.55526298796758,
+        "prompt_tokens": 7347,
+        "cached_tokens": 5952,
+        "cache_hit_pct": 81.0126582278481
+      }
+    },
+    {
+      "depth": 10,
+      "pinned": {
+        "depth": 10,
+        "pin": true,
+        "warmup_turns": 11,
+        "measure_turns": 12,
+        "warmup_tokens": 10782,
+        "blocks_pinned": 168,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 227.4046650272794,
+        "prompt_tokens": 10826,
+        "cached_tokens": 9664,
+        "cache_hit_pct": 89.26658045446149
+      }
+    },
+    {
+      "depth": 16,
+      "pinned": {
+        "depth": 16,
+        "pin": true,
+        "warmup_turns": 17,
+        "measure_turns": 18,
+        "warmup_tokens": 14956,
+        "blocks_pinned": 233,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 248.1219180044718,
+        "prompt_tokens": 15002,
+        "cached_tokens": 13888,
+        "cache_hit_pct": 92.57432342354352
+      }
+    }
+  ],
+  "params": {
+    "model": "Qwen/Qwen3-14B-FP8",
+    "aiperf_model": "qwen3-14b-fp8",
+    "port": 30001,
+    "tp_size": 1,
+    "mem_fraction": 0.5,
+    "context_length": 32768,
+    "depths": [
+      0,
+      2,
+      6,
+      10,
+      16
+    ],
+    "flood_concurrency": 8,
+    "flood_requests": 300,
+    "vip_dataset": "/home/ubuntu/datasets/claude_history_sonnet.jsonl",
+    "flood_dataset": "/home/ubuntu/datasets/long_multiturn_opus.jsonl",
+    "output_dir": "/tmp/pin_v5_final_pin",
+    "phase": "pinned",
+    "gpu": 1,
+    "zmq_port": 5558
+  }
+}

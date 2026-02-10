@@ -304,6 +304,12 @@ class RadixCache(BasePrefixCache):
             )
 
         self.evictable_leaves = set()
+
+        # Reverse lookup: int64 block hash -> TreeNode (for PIN/EVICT commands)
+        self.block_hash_index: dict[int, TreeNode] = {}
+        # Track externally-pinned blocks: int64 block hash -> pin count
+        self.external_pin_count: dict[int, int] = {}
+
         self.reset()
 
     @classmethod
@@ -337,6 +343,8 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self.block_hash_index.clear()
+        self.external_pin_count.clear()
         self._record_all_cleared_event()
 
     def maybe_bigram_convert(
@@ -625,6 +633,65 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
+    ##### Block Hash Index #####
+
+    def _index_node_hashes(self, node: TreeNode):
+        """Add node's block hashes to reverse index."""
+        if node.hash_value is None:
+            return
+        for hash_str in node.hash_value:
+            block_hash = hash_str_to_int64(hash_str)
+            self.block_hash_index[block_hash] = node
+
+    def _unindex_node_hashes(self, node: TreeNode):
+        """Remove node's block hashes from reverse index."""
+        if node.hash_value is None:
+            return
+        for hash_str in node.hash_value:
+            block_hash = hash_str_to_int64(hash_str)
+            self.block_hash_index.pop(block_hash, None)
+
+    ##### PIN / UNPIN #####
+
+    def pin_blocks(self, block_hashes: List[int]) -> int:
+        """Pin blocks by hash to resist eviction. Returns count pinned."""
+        if self.disable:
+            return 0
+
+        pinned = 0
+        for h in block_hashes:
+            node = self.block_hash_index.get(h)
+            if node is None:
+                continue
+            prev = self.external_pin_count.get(h, 0)
+            if prev == 0:
+                self.inc_lock_ref(node)
+            self.external_pin_count[h] = prev + 1
+            pinned += 1
+        return pinned
+
+    def unpin_blocks(self, block_hashes: List[int]) -> int:
+        """Unpin blocks by hash. Returns count unpinned."""
+        if self.disable:
+            return 0
+
+        unpinned = 0
+        for h in block_hashes:
+            count = self.external_pin_count.get(h, 0)
+            if count <= 0:
+                continue
+            node = self.block_hash_index.get(h)
+            if node is None:
+                self.external_pin_count.pop(h, None)
+                continue
+            if count == 1:
+                self.dec_lock_ref(node)
+                self.external_pin_count.pop(h, None)
+            else:
+                self.external_pin_count[h] = count - 1
+            unpinned += 1
+        return unpinned
+
     def evictable_size(self):
         return self.evictable_size_
 
@@ -799,6 +866,9 @@ class RadixCache(BasePrefixCache):
             if node.hash_value is None:
                 node.hash_value = compute_node_hash_values(node, self.page_size)
 
+            # Maintain reverse index for PIN/EVICT lookups
+            self._index_node_hashes(node)
+
             # Get parent's last hash value for first page
             parent_block_hash = None
             if node.parent is not None and node.parent != self.root_node:
@@ -832,6 +902,7 @@ class RadixCache(BasePrefixCache):
 
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.
+        self._unindex_node_hashes(node)
         if self.enable_kv_cache_events:
             # Compute hash_value lazily if not already set (must match what was stored)
             if node.hash_value is None:

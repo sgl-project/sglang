@@ -1,0 +1,107 @@
+{
+  "results": [
+    {
+      "depth": 0,
+      "baseline": {
+        "depth": 0,
+        "pin": false,
+        "warmup_turns": 1,
+        "measure_turns": 2,
+        "warmup_tokens": 2992,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 421.47785401903093,
+        "prompt_tokens": 3158,
+        "cached_tokens": 0,
+        "cache_hit_pct": 0.0
+      }
+    },
+    {
+      "depth": 2,
+      "baseline": {
+        "depth": 2,
+        "pin": false,
+        "warmup_turns": 3,
+        "measure_turns": 4,
+        "warmup_tokens": 4774,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 671.8763730023056,
+        "prompt_tokens": 4810,
+        "cached_tokens": 0,
+        "cache_hit_pct": 0.0
+      }
+    },
+    {
+      "depth": 6,
+      "baseline": {
+        "depth": 6,
+        "pin": false,
+        "warmup_turns": 7,
+        "measure_turns": 8,
+        "warmup_tokens": 7322,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 1055.1092170062475,
+        "prompt_tokens": 7347,
+        "cached_tokens": 0,
+        "cache_hit_pct": 0.0
+      }
+    },
+    {
+      "depth": 10,
+      "baseline": {
+        "depth": 10,
+        "pin": false,
+        "warmup_turns": 11,
+        "measure_turns": 12,
+        "warmup_tokens": 10782,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 1816.7398850200698,
+        "prompt_tokens": 10826,
+        "cached_tokens": 0,
+        "cache_hit_pct": 0.0
+      }
+    },
+    {
+      "depth": 16,
+      "baseline": {
+        "depth": 16,
+        "pin": false,
+        "warmup_turns": 17,
+        "measure_turns": 18,
+        "warmup_tokens": 14956,
+        "cache_capacity": 42816,
+        "flood_requests": 857,
+        "ttft_ms": 2745.0719960033894,
+        "prompt_tokens": 15002,
+        "cached_tokens": 0,
+        "cache_hit_pct": 0.0
+      }
+    }
+  ],
+  "params": {
+    "model": "Qwen/Qwen3-14B-FP8",
+    "aiperf_model": "qwen3-14b-fp8",
+    "port": 30000,
+    "tp_size": 1,
+    "mem_fraction": 0.5,
+    "context_length": 32768,
+    "depths": [
+      0,
+      2,
+      6,
+      10,
+      16
+    ],
+    "flood_concurrency": 8,
+    "flood_requests": 300,
+    "vip_dataset": "/home/ubuntu/datasets/claude_history_sonnet.jsonl",
+    "flood_dataset": "/home/ubuntu/datasets/long_multiturn_opus.jsonl",
+    "output_dir": "/tmp/pin_v5_final_bl",
+    "phase": "baseline",
+    "gpu": 0,
+    "zmq_port": 5557
+  }
+}

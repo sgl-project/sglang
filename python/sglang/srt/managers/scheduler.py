@@ -107,6 +107,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    PinBlocksReqInput,
+    PinBlocksReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -122,6 +124,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnpinBlocksReqInput,
+    UnpinBlocksReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1014,6 +1018,8 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
+                (PinBlocksReqInput, self.pin_blocks_wrapped),
+                (UnpinBlocksReqInput, self.unpin_blocks_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2061,6 +2067,35 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            # Detect requests that can NEVER be scheduled because pinned
+            # blocks consume too much cache. If protected_size > total - req,
+            # no amount of eviction can free enough space. Auto-unpin to
+            # prevent permanent deadlock.
+            if (
+                len(self.waiting_queue) > 0
+                and self.running_batch.is_empty()
+                and hasattr(self.tree_cache, "protected_size")
+                and self.tree_cache.protected_size() > 0
+            ):
+                protected = self.tree_cache.protected_size()
+                total = self.max_total_num_tokens
+                first_req = self.waiting_queue[0]
+                req_tokens = getattr(first_req, "extend_input_len", 0)
+                available = self.token_to_kv_pool_allocator.available_size()
+
+                # Check if the request is mathematically impossible to schedule
+                if protected > total - req_tokens:
+                    pinned_hashes = list(
+                        self.tree_cache.external_pin_count.keys()
+                    )
+                    unpinned = self.tree_cache.unpin_blocks(pinned_hashes)
+                    logger.warning(
+                        f"Request unschedulable due to pinned KV cache: "
+                        f"request needs {req_tokens} tokens, "
+                        f"but {protected}/{total} tokens are pinned "
+                        f"(only {total - protected} unpinnable). "
+                        f"Auto-unpinned {unpinned} blocks."
+                    )
             return None
 
         if self.enable_metrics:
@@ -2548,6 +2583,22 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def pin_blocks_wrapped(self, recv_req: PinBlocksReqInput):
+        pinned = self.tree_cache.pin_blocks(recv_req.block_hashes)
+        return PinBlocksReqOutput(
+            success=True,
+            pinned_count=pinned,
+            message=f"Pinned {pinned}/{len(recv_req.block_hashes)} blocks",
+        )
+
+    def unpin_blocks_wrapped(self, recv_req: UnpinBlocksReqInput):
+        unpinned = self.tree_cache.unpin_blocks(recv_req.block_hashes)
+        return UnpinBlocksReqOutput(
+            success=True,
+            unpinned_count=unpinned,
+            message=f"Unpinned {unpinned}/{len(recv_req.block_hashes)} blocks",
+        )
 
     def _is_no_request(self):
         no_request = (

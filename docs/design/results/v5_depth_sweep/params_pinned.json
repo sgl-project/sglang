@@ -1,0 +1,23 @@
+{
+  "model": "Qwen/Qwen3-14B-FP8",
+  "aiperf_model": "qwen3-14b-fp8",
+  "port": 30001,
+  "tp_size": 1,
+  "mem_fraction": 0.5,
+  "context_length": 32768,
+  "depths": [
+    0,
+    2,
+    6,
+    10,
+    16
+  ],
+  "flood_concurrency": 8,
+  "flood_requests": 300,
+  "vip_dataset": "/home/ubuntu/datasets/claude_history_sonnet.jsonl",
+  "flood_dataset": "/home/ubuntu/datasets/long_multiturn_opus.jsonl",
+  "output_dir": "/tmp/pin_v5_final_pin",
+  "phase": "pinned",
+  "gpu": 1,
+  "zmq_port": 5558
+}
