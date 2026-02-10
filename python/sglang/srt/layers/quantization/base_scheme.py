@@ -19,13 +19,6 @@ class BaseLinearScheme(ABC):
     of different quantization schemes supported by CompressedTensors.
     """
 
-    @classmethod
-    def get_min_capability(cls) -> int:
-        """
-        Get minimum device capability.
-        """
-        raise NotImplementedError
-
     @abstractmethod
     def create_weights(self, *args, **kwargs):
         """
@@ -64,13 +57,6 @@ class BaseMoEScheme(ABC):
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes supported by CompressedTensors.
     """
-
-    @classmethod
-    def get_min_capability(cls) -> int:
-        """
-        Get minimum device capability.
-        """
-        raise NotImplementedError
 
     @abstractmethod
     def create_weights(self, *args, **kwargs):
