@@ -512,7 +512,10 @@ class Engine(EngineBase):
 
     def _cleanup_processes(self):
         """Clean up Ray actors, placement groups, and child processes."""
-        if hasattr(self, "_scheduler_init_result") and self._scheduler_init_result is not None:
+        if (
+            hasattr(self, "_scheduler_init_result")
+            and self._scheduler_init_result is not None
+        ):
             self._scheduler_init_result.cleanup()
         kill_process_tree(os.getpid(), include_parent=False)
 
