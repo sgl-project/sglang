@@ -12,7 +12,7 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 - Requests are distributed/scattered across replicas
 - No inter-replica communication during one request's inference (for simple DP)
 
-> **Note for MLA models (e.g., DeepSeek)**: Standard DP works for MLA models too. If you want independent replicas with duplicated KV cache (simpler setup), just use `--dp-size` without `--enable-dp-attention`. DPA is only needed when you want to eliminate KV cache duplication for better memory efficiency.
+**Standard DP for MLA models**: If you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG.
 
 
 ## Data Parallelism Attention (DPA)
@@ -72,11 +72,14 @@ For MoE models like DeepSeek, DPA is **often** paired with Expert Parallelism (E
 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-V3 \
     --tp 8 \
+    --dp-size 8 \
     --ep 8 \
     --enable-dp-attention \
     --moe-a2a-backend deepep \
     --moe-runner-backend deep_gemm
 ```
+
+> **Note**: `--dp-size` must be explicitly set when using `--enable-dp-attention`. If `dp_size` is 1 (default), DPA will be disabled.
 
 For detailed EP configuration (DeepEP, Two-Batch Overlap, EPLB), see [Expert Parallelism](expert_parallelism.md).
 
@@ -99,36 +102,41 @@ To enable DPA, add `--enable-dp-attention` to your server launch command.
 
 ### Activation Logic
 
-DPA is enabled explicitly via server arguments (CLI or config). You can enable DPA using the `--enable-dp-attention` flag:
+DPA is enabled explicitly via server arguments (CLI or config). You must set both `--dp-size` and `--enable-dp-attention`:
 
 ```bash
 python -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-V3 \
     --tp 8 \
+    --dp-size 8 \
     --enable-dp-attention
 ```
+
+**Important**: `--dp-size` must be greater than 1 for DPA to work. When `dp_size == 1` (default), `--enable-dp-attention` is automatically disabled. The constraint `tp_size % dp_size == 0` must also be satisfied.
 
 ---
 
 ## Native DP vs. SGLang Model Gateway (SMG)
 
-### Native DP Mode
+### Native DP Mode (Development/Testing Only)
 
-Native DP (built-in Data Parallelism) in SGLang creates multiple worker processes within a single server instance:
+> **Warning**: Native DP is **not recommended for production use**. Use SGLang Model Gateway (SMG) for production deployments.
+
+Native DP (built-in Data Parallelism) in SGLang creates multiple worker processes within a single server instance. It is useful for quick prototyping and development, but lacks advanced features:
 
 ```bash
-# Native DP mode
+# Native DP mode (for development only)
 python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --dp-size 4
 ```
 
-**Characteristics:**
-- Single server process manages all workers
-- Simple round-robin or basic load balancing
-- Workers share the same memory pool configuration
-- Limited load balancing intelligence
+**Limitations:**
+- Built-in in-process load balancing only (e.g., `round_robin`, `total_requests`, `total_tokens`)
 - No cache-aware routing
+- Limited observability and metrics
+- No fault tolerance or circuit breakers
+- Not suitable for production workloads
 
 ### SMG-Based DP (Recommended)
 
@@ -145,7 +153,7 @@ python -m sglang_router.launch_server \
 
 | Feature | Native DP | SMG-Based DP |
 |---------|-----------|--------------|
-| **Load Balancing** | Basic round-robin | Advanced policies (cache-aware, power-of-two, etc.) |
+| **Load Balancing** | Built-in in-process methods | Advanced policies (cache-aware, power-of-two, etc.) |
 | **Cache Awareness** | ❌ No | ✅ Yes - significantly higher cache hit rate |
 | **Throughput** | Baseline | Significant improvement |
 | **Multi-Node Support** | Limited | ✅ Full support |
@@ -329,9 +337,9 @@ curl http://localhost:30000/get_loads
 
 ```bash
 # Key metrics to check
-sglang_router_requests_total{worker="..."}
-sglang_router_cache_hit_rate
-sglang_router_worker_load{worker="..."}
+smg_router_requests_total{model="..."}
+smg_worker_requests_active{worker="..."}
+sglang_cache_hit_rate{source="..."}
 ```
 
 For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentation](sgl_model_gateway.md).
@@ -342,13 +350,13 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentati
 
 | Strategy | Use Case | Key Benefit |
 |----------|----------|-------------|
-| **Native DP** (`--dp-size`) | Development, simple workloads | Easy to configure, single process |
-| **SMG-Based DP** | Production, multi-node | Cache-aware routing, high availability |
-| **DPA** | DeepSeek/MLA models | Eliminates KV cache duplication, improved throughput |
+| **Native DP** (`--dp-size`) | Development/testing only | Easy to configure, single process |
+| **SMG-Based DP** | **Production (recommended)** | Cache-aware routing, high availability |
+| **DPA** (`--dp-size N --enable-dp-attention`) | DeepSeek/MLA models | Eliminates KV cache duplication, improved throughput |
 | **DPA + EP** | DeepSeek MoE models | Significant throughput improvement vs vanilla TP |
 
 **Recommended production setup for DeepSeek:**
-1. Enable **DPA** for attention layers (`--enable-dp-attention`)
+1. Enable **DPA** for attention layers (`--dp-size 8 --enable-dp-attention`)
 2. Enable **EP** for MoE layers (`--ep 8 --moe-a2a-backend deepep`)
 3. Use **SMG** with **cache_aware** policy
 
