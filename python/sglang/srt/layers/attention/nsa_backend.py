@@ -1401,13 +1401,8 @@ class NativeSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            if self.dcp_size > 1:
-                q_nope = get_dcp_group().all_gather(q_nope.contiguous(), dim=1)
-                q_rope = get_dcp_group().all_gather(q_rope.contiguous(), dim=1)
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            if self.dcp_size > 1:
-                q_all = get_dcp_group().all_gather(q_all, dim=1)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
@@ -1570,13 +1565,8 @@ class NativeSparseAttnBackend(
             q_rope = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            if self.dcp_size > 1:
-                q_nope = get_dcp_group().all_gather(q_nope.contiguous(), dim=1)
-                q_rope = get_dcp_group().all_gather(q_rope.contiguous(), dim=1)
         else:
             q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            if self.dcp_size > 1:
-                q_all = get_dcp_group().all_gather(q_all, dim=1)
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
@@ -1720,6 +1710,9 @@ class NativeSparseAttnBackend(
         sm_scale: float,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if self.dcp_size > 1:
+            q_all = get_dcp_group().all_gather(q_all.contiguous(), dim=1)
+
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
@@ -1758,6 +1751,8 @@ class NativeSparseAttnBackend(
         # Trim output back to original num_heads if we padded
         if need_padding:
             o = o[:, :num_heads, :]
+            if self.dcp_size > 1:
+                o = o.contiguous()
 
         return (o, lse) if return_softmax_lse else o
 
@@ -1772,6 +1767,9 @@ class NativeSparseAttnBackend(
         page_table_1,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
+        if self.dcp_size > 1:
+            q_all = get_dcp_group().all_gather(q_all.contiguous(), dim=1)
+
         from sgl_kernel.flash_mla import flash_mla_with_kvcache
 
         cache_seqlens = metadata.nsa_cache_seqlens_int32
