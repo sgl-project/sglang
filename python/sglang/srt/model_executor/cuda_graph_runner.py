@@ -62,7 +62,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    _grouped_foreach_copy_,
+)
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -234,34 +237,42 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
 
-        # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        self.positions[:raw_num_token].copy_(forward_batch.positions)
+        # Build batched copy lists for all GPU tensors.
+        dsts = [
+            self.input_ids[:raw_num_token],
+            self.req_pool_indices[:raw_bs],
+            self.seq_lens[:raw_bs],
+            self.out_cache_loc[:raw_num_token],
+            self.positions[:raw_num_token],
+        ]
+        srcs = [
+            forward_batch.input_ids,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+        ]
 
         if (
             self.mamba_track_indices is not None
             and forward_batch.mamba_track_indices is not None
         ):
-            self.mamba_track_indices[:raw_bs].copy_(forward_batch.mamba_track_indices)
+            dsts.append(self.mamba_track_indices[:raw_bs])
+            srcs.append(forward_batch.mamba_track_indices)
         if (
             self.mamba_track_mask is not None
             and forward_batch.mamba_track_mask is not None
         ):
-            self.mamba_track_mask[:raw_bs].copy_(forward_batch.mamba_track_mask)
-
-        if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            dsts.append(self.mamba_track_mask[:raw_bs])
+            srcs.append(forward_batch.mamba_track_mask)
 
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
-            self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
+            dsts.append(self.encoder_lens[:raw_bs])
+            srcs.append(forward_batch.encoder_lens)
 
         if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+            dsts.append(self.mrope_positions[:, :raw_num_token])
+            srcs.append(forward_batch.mrope_positions)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
@@ -274,16 +285,28 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
                     num_tokens_per_dp=num_tokens_per_dp,
                 )
-                self.num_token_non_padded.copy_(local)
+                dsts.append(self.num_token_non_padded)
+                srcs.append(local)
             else:
-                self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+                dsts.append(self.num_token_non_padded)
+                srcs.append(forward_batch.num_token_non_padded)
 
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
                 src = pp_proxy_tensors.tensors[key]
                 dim = src.shape[0]
-                buf[:dim].copy_(src)
+                dsts.append(buf[:dim])
+                srcs.append(src)
+
+        # Batch all GPU copies, grouped by dtype pair.
+        _grouped_foreach_copy_(dsts, srcs)
+
+        # CPU tensor copy (cannot be batched with GPU tensors).
+        if forward_batch.seq_lens_cpu is not None:
+            if bs != raw_bs:
+                self.seq_lens_cpu.fill_(seq_len_fill_value)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
 
 # Detect whether the current forward pass is in capture mode
