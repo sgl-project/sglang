@@ -2148,6 +2148,8 @@ class Scheduler(
             chunked_req=self.chunked_req,
             dllm_staging_reqs=self.dllm_staging_reqs,
             dllm_config=self.dllm_config,
+            split_kv_size=self.attn_tp_size,
+            split_kv_rank=self.attn_tp_rank,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
