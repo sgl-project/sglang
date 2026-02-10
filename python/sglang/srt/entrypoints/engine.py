@@ -84,7 +84,6 @@ from sglang.srt.utils import (
     numa_utils,
     set_prometheus_multiproc_dir,
     set_ulimit,
-    suppress_other_loggers,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.version import __version__
@@ -989,7 +988,6 @@ def _launch_subprocesses(
     """
     # Configure global environment
     configure_logger(server_args)
-    suppress_other_loggers()
     _set_envs_and_config(server_args)
     server_args.check_server_args()
 
