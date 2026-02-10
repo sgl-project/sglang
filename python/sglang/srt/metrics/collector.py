@@ -276,8 +276,12 @@ class DPCooperationInfo:
     @staticmethod
     def create(forward_modes: List[int]):
         return DPCooperationInfo(
+            # Count ranks that are doing any extend-like work
+            # Wprefill can appear as MIXED rather than EXTEND
             num_prefill_ranks=sum(
-                1 for mode in forward_modes if mode == ForwardMode.EXTEND.value
+                1
+                for mode in forward_modes
+                if ForwardMode(mode).is_extend(include_draft_extend_v2=True)
             ),
         )
 
@@ -944,6 +948,8 @@ class SchedulerMetricsCollector:
             ("prefill_cache", prefill_cache_tokens),
             ("decode", decode_tokens),
         ]:
+            if delta == 0:
+                continue
             self.realtime_tokens_total.labels(**self.labels, mode=mode).inc(delta)
             if dp_cooperation_info is not None:
                 self.dp_cooperation_realtime_tokens_total.labels(

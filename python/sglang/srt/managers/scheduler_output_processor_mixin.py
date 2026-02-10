@@ -348,6 +348,7 @@ class SchedulerOutputProcessorMixin:
                 running_bs=self.running_bs,
                 running_bs_offline_batch=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def _resolve_spec_overlap_token_ids(
@@ -427,6 +428,7 @@ class SchedulerOutputProcessorMixin:
                 running_bs=self.running_bs,
                 running_bs_offline_batch=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
             )
 
     def process_batch_result_decode(

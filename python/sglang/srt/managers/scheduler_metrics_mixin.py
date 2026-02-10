@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.metrics.collector import (
+    DPCooperationInfo,
     SchedulerMetricsCollector,
     SchedulerStats,
     compute_routing_key_stats,
@@ -153,6 +154,7 @@ class SchedulerMetricsMixin:
         running_bs: int,
         running_bs_offline_batch: int,
         can_run_cuda_graph: bool,
+        dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
         gap_latency = time.perf_counter() - self.last_prefill_stats_tic
         self.last_prefill_stats_tic = time.perf_counter()
@@ -163,6 +165,7 @@ class SchedulerMetricsMixin:
         self.temp_prefill_info = dict(
             adder_log_input_tokens=adder.log_input_tokens,
             adder_log_hit_tokens=adder.log_hit_tokens,
+            dp_cooperation_info=dp_cooperation_info,
         )
 
         # TODO: generalize this for various memory pools
@@ -298,11 +301,15 @@ class SchedulerMetricsMixin:
         info = self.temp_prefill_info
         self.temp_prefill_info = None
 
-        if self.enable_metrics and batch is not None and info is not None:
+        if self.enable_metrics and info is not None:
+            dp_cooperation_info = info.get("dp_cooperation_info")
+            if dp_cooperation_info is None and batch is not None:
+                dp_cooperation_info = batch.dp_cooperation_info
+
             self.metrics_collector.increment_realtime_tokens(
                 prefill_compute_tokens=info["adder_log_input_tokens"],
                 prefill_cache_tokens=info["adder_log_hit_tokens"],
-                dp_cooperation_info=batch.dp_cooperation_info,
+                dp_cooperation_info=dp_cooperation_info,
             )
 
     def log_decode_stats(
