@@ -19,6 +19,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -53,8 +54,10 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
-# Use fp8 prefill
-_use_fp8_prefill_attn = get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True")
+# Use fp8 prefill only on gfx95
+_use_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+)
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
