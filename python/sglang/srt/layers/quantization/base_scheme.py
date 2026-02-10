@@ -16,7 +16,7 @@ __all__ = ["BaseLinearScheme", "BaseMoEScheme"]
 class BaseLinearScheme(ABC):
     """
     Abstract class used to describe the weight creation and forward pass
-    of different quantization schemes supported by CompressedTensors.
+    of different quantization schemes.
     """
 
     @abstractmethod
@@ -55,7 +55,7 @@ class BaseLinearScheme(ABC):
 class BaseMoEScheme(ABC):
     """
     Abstract class used to describe the weight creation and forward pass
-    of different quantization schemes supported by CompressedTensors.
+    of different quantization schemes.
     """
 
     @abstractmethod
