@@ -60,10 +60,13 @@ class ChunkCache(BasePrefixCache):
         )
 
     def process_split_kv_indices(self, req: Req, kv_indices):
-        if get_global_server_args().enable_kv_storage_optimization_mla and get_global_server_args().disaggregation_mode == "prefill":
+        if (
+            get_global_server_args().enable_kv_storage_optimization_mla
+            and get_global_server_args().disaggregation_mode == "prefill"
+        ):
             kv_indices = self.req_to_token_pool.req_to_token[
-                         req.req_pool_idx, :req.tp_seq_len
-                         ]
+                req.req_pool_idx, : req.tp_seq_len
+            ]
         return kv_indices
 
     def insert(self, params: InsertParams) -> InsertResult:

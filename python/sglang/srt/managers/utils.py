@@ -7,13 +7,12 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -104,6 +103,7 @@ def recalculate_request_max_len(max_len):
         attn_tp_size = get_attention_tp_size()
         new_max_len *= attn_tp_size
     return new_max_len
+
 
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool

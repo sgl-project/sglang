@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import support_triton, get_split_kv_page_range
+from sglang.srt.utils import get_split_kv_page_range, support_triton
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -113,7 +113,7 @@ def write_cache_indices(
             out_cache_loc,
             req_to_token_pool.req_to_token.shape[1],
             tp_out_loc,
-            tp_seq_lens_tensor
+            tp_seq_lens_tensor,
         )
     else:
         pt = 0
@@ -130,20 +130,19 @@ def write_cache_indices(
             )
             req_to_token_pool.write(
                 (req_idx, slice(prefix_len, seq_len)),
-                out_cache_loc[pt: pt + extend_len],
+                out_cache_loc[pt : pt + extend_len],
             )
             if get_global_server_args().enable_kv_storage_optimization_mla:
-                seq_lens_tp = tp_seq_len
-                extend_lens_tp = tp_seq_len
+                seq_lens_tp = extend_lens_tp = tp_seq_len
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_lens_tp)),
-                    tp_out_loc[pt:pt + extend_lens_tp]
+                    tp_out_loc[pt : pt + extend_lens_tp]
                 )
                 pt += extend_lens_tp
             else:
                 req_to_token_pool.write(
                     (req_idx, slice(prefix_len, seq_len)),
-                    out_cache_loc[pt:pt + extend_len],
+                    out_cache_loc[pt : pt + extend_len],
                 )
                 pt += extend_len
 
@@ -371,7 +370,9 @@ def alloc_tp_paged_token_slots_extend(
         page_num = (seq_lens[i].item() + page_size - 1) // page_size
         last_page_token_num = seq_lens[i] - (page_num - 1) * page_size
 
-        start_page, end_page = get_split_kv_page_range(split_kv_size, split_kv_rank, page_num)
+        start_page, end_page = get_split_kv_page_range(
+            split_kv_size, split_kv_rank, page_num
+        )
         page_count = end_page - start_page + 1
 
         # The last page may be incomplete
@@ -400,18 +401,24 @@ def alloc_tp_paged_token_slots_extend(
 
     # padding -1 to origin input lenth, skip this loc-1 when set_kv_buffer
     len_sum = sum(l.item() for l in seq_lens)
-    padded_out_loc = torch.full((len_sum,), -1, dtype=tp_out_loc.dtype, device=batch.device)
+    padded_out_loc = torch.full(
+        (len_sum,), -1, dtype = tp_out_loc.dtype, device = batch.device
+    )
 
     flatten_seq_start = 0
     out_loc_start = 0
     for i in range(bs):
-        flatten_seq_start = flatten_seq_start + (seq_lens[i - 1].item() if i >= 1 else 0)
+        flatten_seq_start = flatten_seq_start + (
+            seq_lens[i - 1].item() if i >= 1 else 0
+        )
         padded_out_loc_start = flatten_seq_start + tp_seq_start[i]
         padded_out_loc_end = padded_out_loc_start + token_num_tensor[i].item()
 
         out_loc_start = out_loc_start + (token_num_tensor[i - 1] if i >= 1 else 0)
         out_loc_end = out_loc_start + token_num_tensor[i]
-        padded_out_loc[padded_out_loc_start:padded_out_loc_end] = tp_out_loc[out_loc_start:out_loc_end]
+        padded_out_loc[padded_out_loc_start:padded_out_loc_end] = tp_out_loc[
+            out_loc_start : out_loc_end
+        ]
 
     return tp_out_loc, padded_out_loc
 
@@ -472,7 +479,7 @@ def alloc_for_extend(
             tp_seq_lens = torch.tensor(
                 [req.tp_seq_len for req in batch.reqs],
                 dtype=torch.int32,
-                device=batch.device
+                device=batch.device,
             )
         else:
             out_cache_loc = alloc_paged_token_slots_extend(

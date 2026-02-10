@@ -1385,8 +1385,10 @@ class MooncakeKVReceiver(CommonKVReceiver):
         for idx, bootstrap_info in enumerate(self.bootstrap_infos):
             # tp_rank in decode notifies the kvcache in prefill to transfer 1/tp for each_tp_rank
             if self.prefill_kv_split_size > 1:
-                start_page, end_page = get_split_kv_page_range(self.prefill_kv_split_size, idx, len(kv_indices_origin))
-                kv_indices = kv_indices_origin[start_page:end_page + 1]
+                start_page, end_page = get_split_kv_page_range(
+                    self.prefill_kv_split_size, idx, len(kv_indices_origin)
+                )
+                kv_indices = kv_indices_origin[start_page : end_page + 1]
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
 

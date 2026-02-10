@@ -42,20 +42,20 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
     Req,
     RequestStage,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import recalculate_request_max_len
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
 from sglang.srt.utils import get_split_kv_page_range
-from sglang.srt.managers.utils import recalculate_request_max_len
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -304,7 +304,9 @@ class PrefillBootstrapQueue:
                 rank = get_attention_tp_rank()
                 page_size = self.token_to_kv_pool.page_size
                 total_page_num = (num_kv_indices + page_size - 1) // page_size
-                start_page, end_page = get_split_kv_page_range(size, rank, total_page_num)
+                start_page, end_page = get_split_kv_page_range(
+                    size, rank, total_page_num
+                )
                 num_pages = end_page - start_page + 1
 
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)

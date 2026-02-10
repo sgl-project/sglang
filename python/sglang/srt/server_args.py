@@ -2430,9 +2430,13 @@ class ServerArgs:
             self.custom_weight_loader = []
 
         if self.tp_size == 1 and self.enable_kv_storage_optimization_mla:
-            logger.warning("enable_kv_storage_optimization_mla is adjust tp False when tp_size=1")
+            logger.warning(
+                "enable_kv_storage_optimization_mla is adjust tp False when tp_size=1"
+            )
             self.enable_kv_storage_optimization_mla = False
-        if self.enable_kv_storage_optimization_mla and self.disaggregation_mode == "null":
+        if (
+            self.enable_kv_storage_optimization_mla and self.disaggregation_mode == "null"
+        ):
             raise ValueError(
                 "The argument enable_kv_storage_optimization_mla and self.disaggregation_mode(null) are mutuially exclusive"
             )
