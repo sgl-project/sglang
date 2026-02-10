@@ -20,8 +20,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-BLOCK_SIZE = 64
-
 
 @dataclass
 class HpcAttentionMetadata:
@@ -38,8 +36,8 @@ class HpcAttentionBackend(AttentionBackend):
         super().__init__()
 
         self.page_size = model_runner.server_args.page_size
-        assert self.page_size == BLOCK_SIZE, (
-            f"HPC attention backend requires page_size={BLOCK_SIZE}, "
+        assert self.page_size in [32, 64], (
+            f"HPC attention backend requires page_size = 32 or 64, "
             f"got {self.page_size}"
         )
 
@@ -183,11 +181,11 @@ class HpcAttentionBackend(AttentionBackend):
         bs = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
-        max_num_blocks = (max_seq_len_k + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (max_seq_len_k + self.page_size - 1) // self.page_size
 
         # Sample one token position per block: 0, 64, 128, ...
         sample_positions = torch.arange(
-            0, max_num_blocks * BLOCK_SIZE, BLOCK_SIZE, device=device
+            0, max_num_blocks * self.page_size, self.page_size, device=device
         )
 
         # Get the flat slot indices at those positions
@@ -196,7 +194,7 @@ class HpcAttentionBackend(AttentionBackend):
         ]  # [bs, max_num_blocks]
 
         # Convert flat slot indices to page IDs
-        block_ids = (raw // BLOCK_SIZE).to(torch.int32)
+        block_ids = (raw // self.page_size).to(torch.int32)
         return block_ids
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -259,9 +257,9 @@ class HpcAttentionBackend(AttentionBackend):
         # Get KV cache and reshape to [num_pages, page_size, kv_heads, dim]
         key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        key_cache = key_cache.view(-1, BLOCK_SIZE, key_cache.shape[-2], head_dim)
+        key_cache = key_cache.view(-1, self.page_size, key_cache.shape[-2], head_dim)
         value_cache = value_cache.view(
-            -1, BLOCK_SIZE, value_cache.shape[-2], v_head_dim
+            -1, self.page_size, value_cache.shape[-2], v_head_dim
         )
 
         return q_3d, key_cache, value_cache, tp_q_head_num, v_head_dim

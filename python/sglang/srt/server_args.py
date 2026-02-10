@@ -1829,12 +1829,12 @@ class ServerArgs:
             or self.decode_attention_backend == "hpc"
             or self.prefill_attention_backend == "hpc"
         ):
-            if self.page_size != 64:
+            if self.page_size not in [32, 64]:
                 logger.info(
-                    f"HPC attention backend requires page_size=64, "
-                    f"changing page_size from {self.page_size} to 64."
+                    f"HPC attention backend requires page_size=64 or 32, "
+                    f"changing page_size from {self.page_size} to 32."
                 )
-                self.page_size = 64
+                self.page_size = 32
         if (
             self.attention_backend == "cutlass_mla"
             or self.decode_attention_backend == "cutlass_mla"
