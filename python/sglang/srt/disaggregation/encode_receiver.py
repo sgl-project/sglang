@@ -303,6 +303,7 @@ class WaitingImageRequest:
                 self.status = WaitingImageRequestStatus.FAIL
                 self.recv_socket.close()
                 return
+
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
             recv_obj.embedding = torch.frombuffer(buffer, dtype=recv_obj.dtype).reshape(
                 recv_obj.shape
@@ -447,14 +448,16 @@ class MMReceiverBase(ABC):
     def process_waiting_requests(self, recv_reqs):
         pass
 
+    def send_encode_request(self, obj):
+        self._send_encode_request(obj)
+
     async def recv_mm_data(self, img_data, mm_processor, prompt):
-        req_id = None
         try:
             if len(self.encode_urls) == 0:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            if not isinstance(img_data, list):
+            if type(img_data) != list:
                 img_data = [img_data.url]
             else:
                 img_data = [img.url for img in img_data]
@@ -471,24 +474,7 @@ class MMReceiverBase(ABC):
                 self._cleanup_mooncake_buffer(req_id)
             return None
 
-    def send_encode_request(self, obj):
-        self._send_encode_request(obj)
-
-    def _cleanup_mooncake_buffer(self, req_id):
-        if self.encoder_transfer_backend != "mooncake":
-            return
-        if not hasattr(self, "embeddings_buffer"):
-            return
-        embeddings = self.embeddings_buffer.pop(req_id, None)
-        if embeddings is None:
-            return
-        try:
-            self.embeddings_engine.deregister(embeddings.data_ptr())
-        except Exception:
-            logger.exception(
-                "mooncake: failed to deregister buffer for req_id=%s", req_id
-            )
-
+    # For zmq_to_tokenizer and mooncake
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         if req_id is None:
             return None
@@ -496,59 +482,34 @@ class MMReceiverBase(ABC):
         recv_embedding = None
         recv_embedding_data: EmbeddingData = None
 
-        try:
-            while recv_embedding_data is None or not recv_embedding_data.ready:
-                parts = await recv_socket.recv_multipart(copy=False)
-                if not parts:
-                    continue
-                recv_obj: EmbeddingData = pickle.loads(parts[0])
-                if getattr(recv_obj, "error_msg", None) is not None:
-                    logger.warning(
-                        f"Encoder error for req_id={req_id}: {recv_obj.error_msg} "
-                        f"error_code={getattr(recv_obj, 'error_code', None)}"
-                    )
-                    self._cleanup_mooncake_buffer(req_id)
-                    return None
-                logger.debug("recv_obj=%s", recv_obj)
-                if self.encoder_transfer_backend == "zmq_to_tokenizer":
-                    if len(parts) < 2:
-                        logger.error(
-                            "zmq_to_tokenizer expected 2-part message, got %d parts",
-                            len(parts),
-                        )
-                        return None
-                    buffer = (
-                        parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
-                    )
-                    # Clone so we don't depend on ZMQ buffer after next recv.
-                    recv_obj.embedding = (
-                        torch.frombuffer(buffer, dtype=recv_obj.dtype)
-                        .reshape(recv_obj.shape)
-                        .clone()
-                    )
-                if recv_embedding_data is None:
-                    recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
-                    recv_embedding_data = recv_obj
-                else:
-                    recv_embedding_data.add(recv_obj)
+        while recv_embedding_data is None or not recv_embedding_data.ready:
+            parts = await recv_socket.recv_multipart(copy=False)
 
-            if self.encoder_transfer_backend == "mooncake":
-                if req_id not in self.embeddings_buffer:
-                    logger.error(
-                        "mooncake: embeddings_buffer missing req_id=%s", req_id
-                    )
-                    return None
-                recv_embedding = self.embeddings_buffer[req_id]
-                del self.embeddings_buffer[req_id]
-                self.embeddings_engine.deregister(recv_embedding.data_ptr())
-            elif self.encoder_transfer_backend == "zmq_to_tokenizer":
-                recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+            recv_obj: EmbeddingData = pickle.loads(parts[0])
+            if self.encoder_transfer_backend == "zmq_to_tokenizer":
+                buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
+                recv_obj.embedding = torch.formbuffer(
+                    buffer, dtype=recv_obj.dtype
+                ).reshape(recv_obj.shape)
+            if recv_embedding_data is None:
+                recv_obj.embedding_list[recv_obj.part_idx] = recv_obj.embedding
+                recv_embedding_data = recv_obj
+            else:
+                recv_embedding_data.add(recv_obj)
 
-            img_grid_thw = recv_embedding_data.get_img_grid()
-            mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
-            return mm_inputs
-        finally:
-            recv_socket.close()
+        if self.encoder_transfer_backend == "mooncake":
+            recv_embedding = self.embeddings_buffer[req_id]
+            del self.embeddings_buffer[req_id]
+            self.embeddings_engine.deregister(recv_embedding.data_ptr())
+        elif self.encoder_transfer_backend == "zmq_to_tokenizer":
+            recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
+
+        recv_socket.close()
+
+        img_grid_thw = recv_embedding_data.get_img_grid()
+
+        mm_inputs = mm_processor.get_mm_data(prompt, recv_embedding, img_grid_thw)
+        return mm_inputs
 
     def _process_waiting_requests(self, recv_reqs, waiting_cls):
         new_recv_reqs = []
@@ -609,6 +570,7 @@ class MMReceiverBase(ABC):
         self.waiting_list = new_waiting
         return new_recv_reqs, abort_reqs
 
+    # For zmq_to_scheduler
     def _run_encode_in_thread(
         self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
     ):
@@ -626,16 +588,15 @@ class MMReceiverBase(ABC):
         except Exception as e:
             logger.error(f"Encode failed for request {req_id}: {e}", exc_info=True)
 
+    # For zmq_to_scheduler
     def _send_encode_request(self, obj):
-        if obj.image_data is None:
-            image_urls = []
-        elif not isinstance(obj.image_data, list):
+        if type(obj.image_data) != list:
             image_urls = [obj.image_data.url]
         else:
             image_urls = [img.url for img in obj.image_data]
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
-        if image_urls and self.encode_urls:
+        if image_urls and len(image_urls) > 0:
             logger.info(f"Processing {len(image_urls)} images for request {obj.rid}")
             obj.need_wait_for_image = True
 
