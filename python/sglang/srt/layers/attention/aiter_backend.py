@@ -1193,9 +1193,9 @@ class AiterAttnBackend(AttentionBackend):
                         if q.dtype != fp8_dtype:
                             q = q.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
                         if k.dtype != fp8_dtype:
-                            K = k.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
+                            k = k.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
                         if v.dtype != fp8_dtype:
-                            V = v.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
+                            v = v.float().clamp(fp8_min, fp8_max).to(fp8_dtype)
                         one_scale = torch.tensor(
                             1.0, dtype=torch.float32, device=q.device
                         )
@@ -1232,8 +1232,8 @@ class AiterAttnBackend(AttentionBackend):
 
                         mla_prefill_ps_asm_fwd(
                             q,
-                            K,
-                            V,
+                            k,
+                            v,
                             qo_indptr,
                             kv_indptr_asm,
                             kv_indices_asm,
