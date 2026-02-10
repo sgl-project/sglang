@@ -359,6 +359,7 @@ class USPAttention(nn.Module):
         ), "USPAttention does not support replicated_qkv."
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
+
         if get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
@@ -366,7 +367,9 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S, H_local, D]
+            # [B, S_local, H, D] -> [B, S_global, H_local, D]
+            # S_global = S_local * ulysses_degree
+            # H_local = H / ulysses_degree
             q = _usp_input_all_to_all(q, head_dim=2)
             k = _usp_input_all_to_all(k, head_dim=2)
             v = _usp_input_all_to_all(v, head_dim=2)
@@ -387,7 +390,6 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S_local, H, D]
+            # [B, S_global, H_local, D] -> [B, S_local, H, D]
             out = _usp_output_all_to_all(out, head_dim=2)
-
         return out

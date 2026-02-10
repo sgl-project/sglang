@@ -16,6 +16,10 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+)
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -1021,6 +1025,57 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             timestep = torch.cat([timestep, self.timestep_zero], dim=0)
             device = timestep.device
             modulate_index = self.build_modulate_index(to_hashable(img_shapes), device)
+            # Shard modulate_index for SP to match sharded hidden_states.
+            #
+            # Important: In the pipeline, `hidden_states` is built by concatenating
+            # sharded noisy latents and sharded condition-image latents:
+            #   hidden_states_local = [noisy_local, cond_local]
+            # i.e. the sharding is applied *per segment* (noisy/cond) before concat.
+            # Therefore, modulate_index must be sharded in the same per-segment way,
+            # not as a single contiguous global sequence.
+            sp_world_size = get_sp_world_size()
+            if sp_world_size > 1:
+                sp_rank = get_sp_parallel_rank()
+
+                def _pad_and_shard_1d(
+                    x_1d: torch.Tensor, pad_value: int
+                ) -> torch.Tensor:
+                    # x_1d: [L]
+                    L = int(x_1d.shape[0])
+                    if L % sp_world_size != 0:
+                        pad_len = sp_world_size - (L % sp_world_size)
+                        pad = torch.full(
+                            (pad_len,),
+                            pad_value,
+                            dtype=x_1d.dtype,
+                            device=x_1d.device,
+                        )
+                        x_1d = torch.cat([x_1d, pad], dim=0)
+                        L = int(x_1d.shape[0])
+                    local_len = L // sp_world_size
+                    return x_1d[sp_rank * local_len : (sp_rank + 1) * local_len]
+
+                local_indices: list[torch.Tensor] = []
+                for b in range(modulate_index.shape[0]):
+                    # img_shapes is a nested list/tuple per sample; first entry is the noisy image.
+                    noisy_len = int(
+                        img_shapes[b][0][0] * img_shapes[b][0][1] * img_shapes[b][0][2]
+                    )
+                    total_len = int(modulate_index.shape[1])
+                    cond_len = total_len - noisy_len
+                    if cond_len < 0:
+                        raise RuntimeError(
+                            f"Invalid img_shapes: noisy_len({noisy_len}) > total_len({total_len})"
+                        )
+
+                    noisy_idx = modulate_index[b, :noisy_len]
+                    cond_idx = modulate_index[b, noisy_len : noisy_len + cond_len]
+
+                    noisy_local = _pad_and_shard_1d(noisy_idx, pad_value=0)
+                    cond_local = _pad_and_shard_1d(cond_idx, pad_value=1)
+                    local_indices.append(torch.cat([noisy_local, cond_local], dim=0))
+
+                modulate_index = torch.stack(local_indices, dim=0)
         else:
             modulate_index = None
 

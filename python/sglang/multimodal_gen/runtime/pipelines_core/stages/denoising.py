@@ -21,10 +21,7 @@ from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
-from sglang.multimodal_gen.configs.pipeline_configs.wan import (
-    Wan2_2_TI2V_5B_Config,
-    WanI2V480PConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -778,10 +775,36 @@ class DenoisingStage(PipelineStage):
                 for manager in dit.layerwise_offload_managers:
                     manager.release_all()
 
+    def _shard_text_embeds_for_sp(self, embeds_list, sp_world_size, rank):
+        """Shard text embeddings along sequence dimension for SP."""
+        if embeds_list is None:
+            return None
+        sharded_list = []
+        for embed in embeds_list:
+            if embed is None:
+                sharded_list.append(None)
+                continue
+            seq_len = embed.shape[1]
+            # Pad if needed
+            if seq_len % sp_world_size != 0:
+                pad_len = sp_world_size - (seq_len % sp_world_size)
+                pad = torch.zeros(
+                    (*embed.shape[:1], pad_len, *embed.shape[2:]),
+                    dtype=embed.dtype,
+                    device=embed.device,
+                )
+                embed = torch.cat([embed, pad], dim=1)
+            local_len = embed.shape[1] // sp_world_size
+            sharded_list.append(embed[:, rank * local_len : (rank + 1) * local_len, :])
+        return sharded_list
+
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
         if get_sp_world_size() <= 1:
             return
+
+        sp_world_size = get_sp_world_size()
+        rank = get_sp_parallel_rank()
 
         if batch.latents is not None:
             (
@@ -792,15 +815,20 @@ class DenoisingStage(PipelineStage):
         else:
             batch.did_sp_shard_latents = False
 
-        # For I2I tasks like QwenImageEdit, where the image latents is provided as condition, the image_latent (input image) should be
-        # replicated on all SP ranks, not sharded, as it provides global context.
-        # For Wan2_2_TI2V_5B_Config, it has very special settings
-        if (
-            isinstance(server_args.pipeline_config, WanI2V480PConfig)
-            and batch.image_latent is not None
-        ):
+        if batch.image_latent is not None:
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
+            )
+
+        if batch.prompt_embeds is not None:
+            # Save original txt seq len before sharding for RoPE generation
+            batch.original_txt_seq_len = batch.prompt_embeds[0].shape[1]
+            batch.prompt_embeds = self._shard_text_embeds_for_sp(
+                batch.prompt_embeds, sp_world_size, rank
+            )
+        if batch.negative_prompt_embeds is not None:
+            batch.negative_prompt_embeds = self._shard_text_embeds_for_sp(
+                batch.negative_prompt_embeds, sp_world_size, rank
             )
 
     def _postprocess_sp_latents(
