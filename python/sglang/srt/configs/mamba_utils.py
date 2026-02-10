@@ -74,13 +74,13 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     if config is not None:
         config_dtype = None
         if hasattr(config, "text_config") and hasattr(
-            config.text_config, "mamba_ssm_dtype"
-        ):
+        config_dtype = None
+        if hasattr(config, "text_config") and hasattr(config.text_config, "mamba_ssm_dtype"):
             # VL model: read from text_config
-            config_dtype = getattr(config.text_config, "mamba_ssm_dtype", None)
+            config_dtype = config.text_config.mamba_ssm_dtype
         elif hasattr(config, "mamba_ssm_dtype"):
             # Text model: read from root config
-            config_dtype = getattr(config, "mamba_ssm_dtype", None)
+            config_dtype = config.mamba_ssm_dtype
 
         if config_dtype is not None:
             if config_dtype not in dtype_map:
