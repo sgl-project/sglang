@@ -56,7 +56,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
+    GIT_TAG        fc08e5775a5db960690a41248655168c55bef228
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -548,10 +548,21 @@ set(DEEPGEMM_SOURCES
     "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
 )
 
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+Python_add_library(deep_gemm_cpp MODULE WITH_SOABI ${DEEPGEMM_SOURCES})
+
+# DeepGEMM's Python package (`deep_gemm/__init__.py`) expects the extension module name to be `_C`,
+# i.e. it does `from . import _C`. Make sure the built module is importable as `deep_gemm._C`.
+set_target_properties(deep_gemm_cpp PROPERTIES
+    OUTPUT_NAME "_C"
+    PREFIX ""
+)
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+find_library(TORCH_PYTHON_LIB
+    NAMES torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib" "${TORCH_INSTALL_PREFIX}/lib64"
+)
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIB}" c10 cuda nvrtc mscclpp_static)
 
 # Add include directories needed by DeepGEMM.
 target_include_directories(deep_gemm_cpp PRIVATE
