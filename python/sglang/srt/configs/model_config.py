@@ -302,6 +302,8 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
         ):
             self.hf_config.architectures[0] = "MiMoV2MTP"
+        if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
+            self.hf_config.architectures[0] = "Step3p5MTP"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -315,6 +317,13 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ]:
+            self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
@@ -605,6 +614,11 @@ class ModelConfig:
         """Similar to get_num_kv_heads(), but for SWA."""
         if hasattr(self.hf_text_config, "swa_num_key_value_heads"):
             total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
+            return max(1, total_num_kv_heads // tensor_parallel_size)
+        elif hasattr(self.hf_text_config, "attention_other_setting"):  # For step3p5
+            total_num_kv_heads = self.hf_text_config.attention_other_setting.get(
+                "num_attention_groups"
+            )
             return max(1, total_num_kv_heads // tensor_parallel_size)
         else:
             return self.get_num_kv_heads(tensor_parallel_size)
@@ -1186,10 +1200,13 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
+    "Qwen3_5MoeForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
     "InternS1ForConditionalGeneration",
+    "InternS1ProForConditionalGeneration",
     "Phi4MMForCausalLM",
     "Step3VLForConditionalGeneration",
     "POINTSV15ChatModel",
@@ -1268,6 +1285,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "Step3p5ForCausalLM",
+        "Step3p5MTP",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1301,6 +1320,21 @@ def get_hybrid_layer_ids(
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
     elif "MiMoV2MTP" in model_architectures:
+        swa_attention_layer_ids = [0]
+        full_attention_layer_ids = []
+    elif "Step3p5ForCausalLM" in model_architectures:
+        layer_types = hf_text_config.layer_types
+        swa_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "sliding_attention" and i < num_hidden_layers
+        ]
+        full_attention_layer_ids = [
+            i
+            for i, x in enumerate(layer_types)
+            if x == "full_attention" and i < num_hidden_layers
+        ]
+    elif "Step3p5MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []
     else:

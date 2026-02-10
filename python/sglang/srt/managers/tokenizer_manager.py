@@ -1536,6 +1536,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
+                # Add detailed cache breakdown if available
+                if (
+                    hasattr(recv_obj, "cached_tokens_details")
+                    and recv_obj.cached_tokens_details
+                ):
+                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
+                        i
+                    ]
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
@@ -1974,6 +1982,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 else 0
             )
 
+            # Get detailed cache breakdown if available
+            cached_tokens_details = None
+            if (
+                hasattr(recv_obj, "cached_tokens_details")
+                and recv_obj.cached_tokens_details
+            ):
+                cached_tokens_details = recv_obj.cached_tokens_details[i]
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -1982,6 +1998,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                cached_tokens_details,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

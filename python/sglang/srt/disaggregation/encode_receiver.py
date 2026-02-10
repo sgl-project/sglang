@@ -4,10 +4,12 @@ import logging
 import pickle
 import random
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from enum import IntEnum
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import aiohttp
@@ -16,8 +18,11 @@ import zmq
 import zmq.asyncio
 from transformers import PretrainedConfig
 
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    get_mooncake_transfer_engine,
+)
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
@@ -265,6 +270,7 @@ class WaitingImageRequestStatus(IntEnum):
     FAIL = -1
     PENDING = 0
     SUCCESS = 1
+    TIMEOUT = -2
 
 
 def create_part_req_id(original_req_id: str, part_idx: int) -> str:
@@ -332,6 +338,7 @@ class WaitingImageRequest:
         self.status = WaitingImageRequestStatus.PENDING
         self.error_msg = None
         self.error_code = None
+        self.start_time = time.time()
 
     def send_encode_request(self):
         async def _send_single_request(session, url, payload):
@@ -510,11 +517,7 @@ class MMReceiverHTTP(MMReceiverBase):
         self.host = get_local_ip_auto(server_args.host)
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
-            self.embeddings_engine = MooncakeTransferEngine(
-                hostname=get_local_ip_auto(),
-                gpu_id=None,
-                ib_device=server_args.disaggregation_ib_device,
-            )
+            self.embeddings_engine = get_mooncake_transfer_engine()
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
@@ -525,6 +528,7 @@ class MMReceiverHTTP(MMReceiverBase):
             self.hostname = get_local_ip_auto()
             self.waiting_list: List[WaitingImageRequest] = []
             self.scheduler = scheduler
+            self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -619,9 +623,12 @@ class MMReceiverHTTP(MMReceiverBase):
         if len(self.waiting_list) == 0:
             return new_recv_reqs, []
 
+        current_time = time.time()
         local_status = []
         for waiting_req in self.waiting_list:
             waiting_req._try_recv_mm_data()
+            if current_time - waiting_req.start_time > self.wait_timeout:
+                waiting_req.status = WaitingImageRequestStatus.TIMEOUT
             local_status.append(waiting_req.status)
 
         local_status = torch.tensor(local_status, device="cpu", dtype=torch.int32)
@@ -647,6 +654,17 @@ class MMReceiverHTTP(MMReceiverBase):
                         self.create_req(waiting_req.recv_req),
                         waiting_req.error_msg,
                         waiting_req.error_code,
+                    )
+                )
+            elif status_value == WaitingImageRequestStatus.TIMEOUT:
+                logger.error(
+                    f"Timed out waiting for image embeddings for request {waiting_req.rid}"
+                )
+                abort_reqs.append(
+                    (
+                        self.create_req(waiting_req.recv_req),
+                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
             else:  # status_value == WaitingImageRequestStatus.PENDING
