@@ -18,7 +18,7 @@ The forward pass is decomposed at layer boundaries using PyTorch FX's `split_mod
 
 Each piece goes through three phases:
 
-1. **Compile** — The piece is compiled using torch.compile with the selected compiler backend (`eager` or `inductor`).
+1. **Compile** — The piece is compiled using `torch.compile` with the selected compiler backend (`eager` or `inductor`).
 2. **Warmup** — The compiled piece runs once to ensure CUDA kernels are loaded and ready for graph capture.
 3. **Capture and replay** — A `torch.cuda.CUDAGraph` is created, the piece runs within the graph context to capture all kernel launches, and subsequent calls replay the captured graph directly.
 
@@ -31,7 +31,7 @@ Each piece goes through three phases:
 
 ### Shape scheduling
 
-Piecewise CUDA graph pre-captures graphs for a set of token counts. At runtime, the actual token count is rounded up to the nearest captured size (via binary search), and the corresponding graph is replayed.
+Piecewise CUDA graph pre-captures graphs for a set of token counts. At runtime, the actual token count is rounded up to the nearest captured size (via binary search), and the corresponding graph is replayed. If the token count exceeds the largest captured size, the runtime falls back to the normal (non-graph) forward path.
 
 The default capture schedule is auto-generated with increasing granularity:
 
@@ -92,16 +92,18 @@ Capture piecewise CUDA graph end. Time elapsed: XX.XX s. mem usage=XX.XX GB. ava
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--enable-piecewise-cuda-graph` | bool flag | `False` | Enable piecewise CUDA graph for extend/prefill. Must be explicitly set. |
-| `--piecewise-cuda-graph-tokens` | space-separated ints | auto-generated | Custom capture sizes. Example: `--piecewise-cuda-graph-tokens 128 256 512 1024` |
+| `--enable-piecewise-cuda-graph` | bool flag (set to enable) | `False` | Enable piecewise CUDA graph for extend/prefill. Must be explicitly set. |
+| `--piecewise-cuda-graph-tokens` | `List[int]` (space-separated on CLI) | auto-generated | Custom capture sizes (must be ascending). Example: `--piecewise-cuda-graph-tokens 128 256 512 1024` |
 | `--piecewise-cuda-graph-compiler` | `eager` or `inductor` | `eager` | Compiler backend for graph pieces. |
 | `--piecewise-cuda-graph-max-tokens` | int | dynamic | Maximum token count for capture. Default is `chunked_prefill_size` for non-MLA models, `2048` for MLA backend models. |
+
+For the full list of server arguments, see [Server Arguments](server_arguments.md).
 
 ## Compatibility
 
 ### Works with
 
-- **ViT CUDA graph**: Can be combined with `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` for multimodal models:
+- **ViT CUDA graph**: Can be combined with `SGLANG_VIT_ENABLE_CUDA_GRAPH=1` for multimodal models (see [CUDA Graph for Multi-Modal Encoder](cuda_graph_for_multi_modal_encoder.md)):
 
 ```bash
 SGLANG_VIT_ENABLE_CUDA_GRAPH=1 \
@@ -116,14 +118,14 @@ python3 -m sglang.launch_server \
 
 When explicitly enabled, MLA backend models (DeepSeek V3/R1/V3.1, Qwen MLA variants) auto-configure:
 - Max tokens defaults to `2048` (to avoid kernel dispatch differences compared to the original mode)
-- Attention method switches to MLA for prefill
+- DeepSeek attention method switches to MLA for prefill paths
 
 ### Disabled when
 
 Piecewise CUDA graph is automatically disabled under these conditions (some paths emit log messages):
 
 - **Draft workers** — disabled on draft workers
-- **torch.compile** — has fundamental conflicts with piecewise CUDA graph
+- **`torch.compile`** — has fundamental conflicts with piecewise CUDA graph
 - **Pipeline parallelism (PP > 1)** — not yet supported
 - **DeepEP or Mooncake MOE A2A backends** — compilation errors prevent usage
 - **Non-standard GQA layers** — all layers must use standard Grouped Query Attention
@@ -132,3 +134,19 @@ Piecewise CUDA graph is automatically disabled under these conditions (some path
 
 - **Extend/prefill only** — piecewise CUDA graph applies to extend (prefill) operations, not decode.
 - **Experimental feature** — the API and behavior may change in future releases.
+
+## Code References
+
+- Graph splitting and compilation backend: `python/sglang/srt/compilation/backend.py`
+- Per-piece CUDA graph capture and replay: `python/sglang/srt/compilation/cuda_piecewise_backend.py`
+- Warmup, capture orchestration, and runtime replay: `python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py`
+- Context state tracking: `python/sglang/srt/compilation/piecewise_context_manager.py`
+- Compilation config: `python/sglang/srt/compilation/compilation_config.py`
+
+## Troubleshooting
+
+If CUDA graph capture fails during startup (e.g., out-of-memory errors), try:
+
+1. Lower `--piecewise-cuda-graph-max-tokens` (e.g., `512`) to reduce the number and size of captured graphs.
+2. Lower `--mem-fraction-static` (e.g., `0.8` or `0.7`) to reserve more memory for graph capture.
+3. Disable the feature by removing `--enable-piecewise-cuda-graph`.
