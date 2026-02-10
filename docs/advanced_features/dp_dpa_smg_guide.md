@@ -211,7 +211,7 @@ python -m sglang_router.launch_server \
 
 For distributed deployments across multiple machines:
 
-**Step 1: Launch workers on each node**
+1. Launch workers on each node
 
 ```bash
 # Node 1
@@ -225,7 +225,7 @@ python -m sglang.launch_server \
     --port 8000
 ```
 
-**Step 2: Launch SMG pointing to workers**
+2. Launch SMG pointing to workers
 
 ```bash
 python -m sglang_router.launch_router \
