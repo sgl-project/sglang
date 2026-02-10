@@ -169,6 +169,24 @@ class TestUpdateWeightsFromDisk:
         # The test verifies the API handles target_modules parameter
         assert status_code == 200
 
+    def test_update_weights_nonexistent_module(
+        self, diffusion_server_for_weight_update: ServerContext
+    ):
+        """Test that requesting a non-existent module name fails with a clear error."""
+        base_url = self._get_base_url(diffusion_server_for_weight_update)
+
+        result, status_code = self._update_weights(
+            base_url,
+            DEFAULT_DIFFUSION_MODEL,
+            target_modules=["nonexistent_module"],
+            timeout=60,
+        )
+        logger.info(f"Update nonexistent module result: {result}")
+
+        assert status_code == 400, f"Expected 400, got {status_code}"
+        assert not result.get("success", True), "Should fail for nonexistent module"
+        assert "not found in pipeline" in result.get("message", "")
+
 
 class TestUpdateWeightsFromDiskWithOffload:
     """Test update_weights_from_disk with layerwise offload enabled."""

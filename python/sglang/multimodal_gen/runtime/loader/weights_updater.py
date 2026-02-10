@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -62,6 +63,23 @@ except ImportError:
     distribute_tensor = None
 
 logger = init_logger(__name__)
+
+
+def get_updatable_modules(pipeline) -> dict[str, torch.nn.Module]:
+    """Return updatable nn.Module components for the given pipeline.
+
+    Works with both the native ComposedPipelineBase backend and the
+    DiffusersPipeline wrapper.
+    """
+    if isinstance(pipeline, DiffusersPipeline):
+        diffusers_pipe = pipeline.get_module("diffusers_pipeline")
+        if diffusers_pipe is not None and diffusers_pipe.components is not None:
+            raw = diffusers_pipe.components
+        else:
+            raw = {}
+    else:
+        raw = pipeline.modules
+    return {n: m for n, m in raw.items() if isinstance(m, torch.nn.Module)}
 
 
 class WeightsUpdater:
@@ -100,12 +118,17 @@ class WeightsUpdater:
         self._original_model_path = original_model_path
         logger.info(f"Updating weights from disk: {model_path}")
 
-        modules_to_update = self._collect_modules(target_modules)
+        try:
+            modules_to_update = self._collect_modules(target_modules)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
         if not modules_to_update:
-            available = list(self.pipeline.modules.keys())
             error_msg = (
                 f"No matching modules found for update. "
-                f"Requested: {target_modules}. Available in pipeline: {available}"
+                f"Requested: {target_modules}. "
+                f"Available nn.Module(s): {list(get_updatable_modules(self.pipeline).keys())}"
             )
             logger.error(error_msg)
             return False, error_msg
@@ -154,39 +177,23 @@ class WeightsUpdater:
     ) -> list[tuple[str, torch.nn.Module]]:
         """Resolve target_modules to (name, module) pairs.
 
-        For ComposedPipelineBase pipelines, modules are looked up via
-        pipeline.modules.  For DiffusersPipeline (where pipeline.modules
-        is empty), we fall back to diffusers_pipe.components.
+        Raises:
+            ValueError: If target_modules contains names not found in the pipeline.
         """
-        available = self.pipeline.modules.keys()
+        components = get_updatable_modules(self.pipeline)
+
         if target_modules is None or target_modules == ["all"]:
-            names = [
-                n
-                for n in available
-                if isinstance(self.pipeline.get_module(n), torch.nn.Module)
-            ]
+            names = list(components.keys())
         else:
+            unknown = [n for n in target_modules if n not in components]
+            if unknown:
+                raise ValueError(
+                    f"Module(s) requested for update not found in pipeline: {unknown}. "
+                    f"Available Module(s): {list(components.keys())}"
+                )
             names = target_modules
 
-        result: list[tuple[str, torch.nn.Module]] = []
-        for name in names:
-            module = self.pipeline.get_module(name)
-            if module is not None and isinstance(module, torch.nn.Module):
-                result.append((name, module))
-
-        # Fallback for DiffusersPipeline: modules live on the diffusers pipe,
-        # not in self.pipeline.modules.
-        if not result:
-            diffusers_pipe = self.pipeline.get_module("diffusers_pipeline")
-            if diffusers_pipe is not None and hasattr(diffusers_pipe, "components"):
-                components = diffusers_pipe.components
-                if target_modules is None or target_modules == ["all"]:
-                    names = list(components.keys())
-                for name in names:
-                    module = components.get(name)
-                    if module is not None and isinstance(module, torch.nn.Module):
-                        result.append((name, module))
-        return result
+        return [(name, components[name]) for name in names]
 
     def _apply_weights(
         self,
@@ -202,10 +209,17 @@ class WeightsUpdater:
                 _load_weights_into_module(module, weights_iter)
                 updated_modules.append(module_name)
             except Exception as e:
-                error_msg = f"Failed to update {module_name}: {e}. Rolling back."
-                logger.error(error_msg, exc_info=True)
+                logger.error(
+                    f"Weight update failed for module '{module_name}': {e}. "
+                    f"Rolling back {len(updated_modules)} already updated module(s): "
+                    f"{updated_modules}.",
+                    exc_info=True,
+                )
                 self._rollback(updated_modules)
-                return False, error_msg
+                return False, (
+                    f"Failed to update module '{module_name}': {e}. "
+                    f"All modules rolled back to original weights."
+                )
 
         names = ", ".join(updated_modules)
         return True, f"Updated {len(updated_modules)} modules ({names})."
@@ -291,10 +305,8 @@ def _get_offload_managers(module: torch.nn.Module) -> list:
 def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     """Load weights into a module, handling offload-managed parameters.
 
-    When layerwise offload is active, block-layer parameters are stored as
-    small placeholders on GPU while the real weights live in consolidated
-    CPU buffers.  This function updates those CPU buffers directly and
-    falls back to the normal in-place copy for non-offloaded parameters.
+    For offloaded modules, updates CPU buffers directly via
+    update_cpu_weights(); non-offloaded parameters use in-place copy.
     """
     offload_managers = _get_offload_managers(module)
     if offload_managers:
@@ -309,14 +321,7 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
 
 
 def load_weights_into_model(weights_iter, model_params: dict) -> None:
-    """Copy weights from weights_iter into model_params in-place.
-
-    Handles DTensor parameters by re-distributing the loaded weight
-    according to the existing device mesh and placements.
-
-    Raises:
-        ValueError: On shape mismatch between model parameter and loaded weight.
-    """
+    """Copy weights from weights_iter into model_params in-place."""
     for name, loaded_weight in weights_iter:
         if name not in model_params:
             continue
