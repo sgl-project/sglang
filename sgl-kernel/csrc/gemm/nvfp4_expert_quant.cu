@@ -127,7 +127,7 @@ cvt_fp16_to_fp4(
     int32_t* mask,
     int n_experts,
     bool low_latency,
-    bool use_silu_and_mul = false) {
+    bool use_silu_and_mul) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -343,7 +343,7 @@ cvt_fp16_to_fp4(
     uint32_t* output_scale_offset_by_experts,
     int32_t* mask,
     int n_experts,
-    bool use_silu_and_mul = false) {
+    bool use_silu_and_mul) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   using PackedVec = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF = (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
