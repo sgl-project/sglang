@@ -36,4 +36,21 @@ def get_algorithm(config: DllmConfig):
         raise RuntimeError(f"Unknown diffusion LLM algorithm: {name}")
 
 
+def get_algorithm_fdfo_requirement(algorithm_name: str) -> bool:
+    """Query whether an algorithm requires first_done_first_out_mode.
+
+    Determines the requirement by reading the algorithm class's requires_fdfo_mode
+    class attribute, avoiding hardcoding algorithm names in config.py.
+
+    Args:
+        algorithm_name: The name of the algorithm
+
+    Returns:
+        True if the algorithm requires FDFO mode, False otherwise
+    """
+    if algorithm_name in algo_name_to_cls:
+        return getattr(algo_name_to_cls[algorithm_name], "requires_fdfo_mode", False)
+    return False
+
+
 algo_name_to_cls = import_algorithms()
