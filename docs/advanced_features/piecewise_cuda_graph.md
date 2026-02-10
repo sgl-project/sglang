@@ -125,7 +125,7 @@ When explicitly enabled, MLA backend models (DeepSeek V3/R1/V3.1, Qwen MLA varia
 Piecewise CUDA graph is automatically disabled under these conditions (some paths emit log messages):
 
 - **Draft workers** — disabled on draft workers
-- **`torch.compile`** — has fundamental conflicts with piecewise CUDA graph
+- **Global `torch.compile`** — The global `torch.compile` feature (enabled via `--enable-torch-compile`) has fundamental conflicts with piecewise CUDA graph.
 - **Pipeline parallelism (PP > 1)** — not yet supported
 - **DeepEP or Mooncake MOE A2A backends** — compilation errors prevent usage
 - **Non-standard GQA layers** — all layers must use standard Grouped Query Attention
