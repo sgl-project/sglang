@@ -557,6 +557,8 @@ set(DEEPGEMM_SOURCES
 # Note: USE_SABI is intentionally omitted here because DeepGEMM's python_api.cpp
 # uses pybind11 which requires the full (non-limited) Python C API.
 Python_add_library(deep_gemm_cpp MODULE WITH_SOABI ${DEEPGEMM_SOURCES})
+# scikit-build-core may inject Py_LIMITED_API globally; force-undefine it for this target.
+target_compile_options(deep_gemm_cpp PRIVATE "-UPy_LIMITED_API")
 
 # Link against necessary libraries, including nvrtc for JIT compilation.
 target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
