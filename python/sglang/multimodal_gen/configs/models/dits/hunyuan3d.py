@@ -8,6 +8,15 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 class Hunyuan3DDiTArchConfig(DiTArchConfig):
     """Architecture config for Hunyuan3D DiT (Flux-style for Hunyuan3D-2.0)."""
 
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"(.*)\.img_mlp\.0\.(.*)$": r"\1.img_mlp.fc_in.\2",
+            r"(.*)\.img_mlp\.2\.(.*)$": r"\1.img_mlp.fc_out.\2",
+            r"(.*)\.txt_mlp\.0\.(.*)$": r"\1.txt_mlp.fc_in.\2",
+            r"(.*)\.txt_mlp\.2\.(.*)$": r"\1.txt_mlp.fc_out.\2",
+        }
+    )
+
     in_channels: int = 64
     hidden_size: int = 1024
     num_attention_heads: int = 16

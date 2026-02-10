@@ -149,8 +149,6 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         self.config = config
 
     def _validate_input(self, batch: Req, server_args: ServerArgs) -> None:
-        if server_args.num_gpus != 1:
-            raise ValueError("Hunyuan3D pipeline only supports num_gpus=1.")
         if batch.image_path is None:
             raise ValueError("Hunyuan3D requires 'image_path' input.")
         if isinstance(batch.image_path, list):

@@ -38,13 +38,43 @@ from sglang.multimodal_gen.configs.models.dits.hunyuan3d import (
     Hunyuan3DDiTArchConfig,
     Hunyuan3DDiTConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import divide
+from sglang.multimodal_gen.runtime.distributed.parallel_state import get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+class MixedRowParallelLinear(RowParallelLinear):
+    """RowParallel for inputs concatenated from multiple separately-sharded sources."""
+
+    def __init__(self, input_sizes: list[int], output_size: int, **kwargs):
+        self.input_sizes = input_sizes
+        super().__init__(sum(input_sizes), output_size, **kwargs)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        input_dim = getattr(param, "input_dim", None)
+        if input_dim is not None:
+            shards = []
+            offset = 0
+            for sz in self.input_sizes:
+                part = loaded_weight.narrow(input_dim, offset, sz)
+                per_rank = sz // self.tp_size
+                shard = part.narrow(input_dim, self.tp_rank * per_rank, per_rank)
+                shards.append(shard)
+                offset += sz
+            param.data.copy_(torch.cat(shards, dim=input_dim))
+        else:
+            param.data.copy_(loaded_weight)
 
 
 def _flux_timestep_embedding(
@@ -129,12 +159,16 @@ class _FluxSelfAttention(nn.Module):
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
     ):
         super().__init__()
+        tp_size = get_tp_world_size()
         self.num_heads = num_heads
+        self.local_num_heads = divide(num_heads, tp_size)
         self.head_dim = dim // num_heads
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = MergedColumnParallelLinear(
+            dim, [dim, dim, dim], bias=qkv_bias, gather_output=False
+        )
         self.norm = _FluxQKNorm(self.head_dim)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = RowParallelLinear(dim, dim, bias=True, input_is_parallel=True)
 
         if supported_attention_backends is None:
             supported_attention_backends = {
@@ -142,16 +176,16 @@ class _FluxSelfAttention(nn.Module):
                 AttentionBackendEnum.TORCH_SDPA,
             }
         self.local_attn = LocalAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
         )
 
     def forward(self, x: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
-        qkv = self.qkv(x)
+        qkv, _ = self.qkv(x)
         B, L, _ = qkv.shape
-        qkv = qkv.view(B, L, 3, self.num_heads, self.head_dim)
+        qkv = qkv.view(B, L, 3, self.local_num_heads, self.head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -161,7 +195,7 @@ class _FluxSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         x = self.local_attn(q, k, v)
         x = x.flatten(2)
-        x = self.proj(x)
+        x, _ = self.proj(x)
         return x
 
 
@@ -202,7 +236,9 @@ class _FluxDoubleStreamBlock(nn.Module):
     ):
         super().__init__()
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        tp_size = get_tp_world_size()
         self.num_heads = num_heads
+        self.local_num_heads = divide(num_heads, tp_size)
         self.hidden_size = hidden_size
         self.head_dim = hidden_size // num_heads
         self.img_mod = _FluxModulation(hidden_size, double=True)
@@ -215,11 +251,7 @@ class _FluxDoubleStreamBlock(nn.Module):
         )
 
         self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.img_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            _FluxGELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        self.img_mlp = MLP(hidden_size, mlp_hidden_dim, act_type="gelu_pytorch_tanh")
 
         self.txt_mod = _FluxModulation(hidden_size, double=True)
         self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -231,11 +263,7 @@ class _FluxDoubleStreamBlock(nn.Module):
         )
 
         self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.txt_mlp = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
-            _FluxGELU(approximate="tanh"),
-            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
-        )
+        self.txt_mlp = MLP(hidden_size, mlp_hidden_dim, act_type="gelu_pytorch_tanh")
 
         if supported_attention_backends is None:
             supported_attention_backends = {
@@ -243,7 +271,7 @@ class _FluxDoubleStreamBlock(nn.Module):
                 AttentionBackendEnum.TORCH_SDPA,
             }
         self.local_attn_joint = LocalAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -260,8 +288,8 @@ class _FluxDoubleStreamBlock(nn.Module):
         img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
 
         B, img_L, _ = img_modulated.shape
-        img_qkv = self.img_attn.qkv(img_modulated)
-        img_qkv = img_qkv.view(B, img_L, 3, self.num_heads, self.head_dim)
+        img_qkv, _ = self.img_attn.qkv(img_modulated)
+        img_qkv = img_qkv.view(B, img_L, 3, self.local_num_heads, self.head_dim)
         img_q, img_k, img_v = img_qkv[:, :, 0], img_qkv[:, :, 1], img_qkv[:, :, 2]
         img_q_t = img_q.transpose(1, 2)
         img_k_t = img_k.transpose(1, 2)
@@ -273,8 +301,8 @@ class _FluxDoubleStreamBlock(nn.Module):
         txt_modulated = self.txt_norm1(txt)
         txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
         txt_L = txt_modulated.shape[1]
-        txt_qkv = self.txt_attn.qkv(txt_modulated)
-        txt_qkv = txt_qkv.view(B, txt_L, 3, self.num_heads, self.head_dim)
+        txt_qkv, _ = self.txt_attn.qkv(txt_modulated)
+        txt_qkv = txt_qkv.view(B, txt_L, 3, self.local_num_heads, self.head_dim)
         txt_q, txt_k, txt_v = txt_qkv[:, :, 0], txt_qkv[:, :, 1], txt_qkv[:, :, 2]
         txt_q_t = txt_q.transpose(1, 2)
         txt_k_t = txt_k.transpose(1, 2)
@@ -292,12 +320,14 @@ class _FluxDoubleStreamBlock(nn.Module):
 
         txt_attn, img_attn = attn[:, :txt_L], attn[:, txt_L:]
 
-        img = img + img_mod1.gate * self.img_attn.proj(img_attn)
+        img_proj, _ = self.img_attn.proj(img_attn)
+        img = img + img_mod1.gate * img_proj
         img = img + img_mod2.gate * self.img_mlp(
             (1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift
         )
 
-        txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
+        txt_proj, _ = self.txt_attn.proj(txt_attn)
+        txt = txt + txt_mod1.gate * txt_proj
         txt = txt + txt_mod2.gate * self.txt_mlp(
             (1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift
         )
@@ -320,13 +350,26 @@ class _FluxSingleStreamBlock(nn.Module):
     ):
         super().__init__()
 
+        tp_size = get_tp_world_size()
         self.hidden_dim = hidden_size
         self.num_heads = num_heads
+        self.local_num_heads = divide(num_heads, tp_size)
         self.head_dim = hidden_size // num_heads
+        self.tp_size = tp_size
 
         self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim)
-        self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size)
+        self.linear1 = MergedColumnParallelLinear(
+            hidden_size,
+            [hidden_size, hidden_size, hidden_size, self.mlp_hidden_dim],
+            bias=True,
+            gather_output=False,
+        )
+        self.linear2 = MixedRowParallelLinear(
+            [hidden_size, self.mlp_hidden_dim],
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+        )
 
         self.norm = _FluxQKNorm(self.head_dim)
 
@@ -342,7 +385,7 @@ class _FluxSingleStreamBlock(nn.Module):
                 AttentionBackendEnum.TORCH_SDPA,
             }
         self.local_attn = LocalAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             causal=False,
             supported_attention_backends=supported_attention_backends,
@@ -354,12 +397,13 @@ class _FluxSingleStreamBlock(nn.Module):
         mod, _ = self.modulation(vec)
 
         x_mod = (1 + mod.scale) * self.pre_norm(x) + mod.shift
-        qkv, mlp = torch.split(
-            self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
-        )
+        linear1_out, _ = self.linear1(x_mod)
+        local_qkv_dim = 3 * self.head_dim * self.local_num_heads
+        local_mlp_dim = self.mlp_hidden_dim // self.tp_size
+        qkv, mlp = torch.split(linear1_out, [local_qkv_dim, local_mlp_dim], dim=-1)
 
         B, L, _ = qkv.shape
-        qkv = qkv.view(B, L, 3, self.num_heads, self.head_dim)
+        qkv = qkv.view(B, L, 3, self.local_num_heads, self.head_dim)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
@@ -371,7 +415,7 @@ class _FluxSingleStreamBlock(nn.Module):
         attn = self.local_attn(q, k, v)
         attn = attn.flatten(2)
 
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        output, _ = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         return x + mod.gate * output
 
 
@@ -398,7 +442,7 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
 
-    param_names_mapping = {}
+    param_names_mapping = Hunyuan3DDiTConfig().param_names_mapping
 
     @classmethod
     def build_config_from_params(cls, params: dict) -> Hunyuan3DDiTConfig:
