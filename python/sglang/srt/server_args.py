@@ -513,7 +513,7 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
-    mamba_ssm_dtype: str = "float32"
+    mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -1194,9 +1194,15 @@ class ServerArgs:
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2, GlmMoeDsaForCausalLM
+                if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
+                    envs.SGLANG_NSA_FORCE_MLA.set(True)
+                    logger.warning(
+                        "Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on SM100."
+                    )
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
@@ -2323,6 +2329,7 @@ class ServerArgs:
                 "DeepseekV3ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
+                "GlmMoeDsaForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
                 "MistralLarge3ForCausalLM",
@@ -2593,7 +2600,8 @@ class ServerArgs:
 
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
-        envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        if self.mamba_ssm_dtype is not None:
+            envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
@@ -2652,6 +2660,7 @@ class ServerArgs:
                         "DeepseekV32ForCausalLM",
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
+                        "GlmMoeDsaForCausalLM",
                     ]
                 except Exception:
                     pass
@@ -2749,6 +2758,24 @@ class ServerArgs:
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
             self.pp_size = 1
+
+        if self.enable_lora:
+            logger.warning(
+                "Currently LoRA is not supported by diffusion LLM inference."
+            )
+            self.enable_lora = False
+
+        if self.disaggregation_mode != "null":
+            logger.warning(
+                "Currently disaggregation is not supported by diffusion LLM inference."
+            )
+            self.disaggregation_mode = "null"
+
+        if self.enable_mixed_chunk:
+            logger.warning(
+                "Mixed chunked prefill is disabled because of using diffusion LLM inference."
+            )
+            self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -4104,9 +4131,10 @@ class ServerArgs:
         parser.add_argument(
             "--mamba-ssm-dtype",
             type=str,
-            default=ServerArgs.mamba_ssm_dtype,
+            default=None,
             choices=MAMBA_SSM_DTYPE_CHOICES,
-            help="The data type of the SSM states in mamba cache.",
+            help="The data type of the SSM states in mamba cache. "
+            "If not set, will be read from model config (mamba_ssm_dtype).",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
@@ -5648,6 +5676,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GptOssForCausalLM",
         "Glm4MoeForCausalLM",
         "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",
