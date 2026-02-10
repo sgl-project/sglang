@@ -156,8 +156,15 @@ class AiterAttnBackend(AttentionBackend):
                 _indptr = torch.tensor([0, 2], dtype=torch.int32, device=self.device)
                 _indices = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
                 mha_batch_prefill_func(
-                    _test_q, _test_k, _test_v,
-                    _indptr, _indptr, _indices, 2, 2, causal=True,
+                    _test_q,
+                    _test_k,
+                    _test_v,
+                    _indptr,
+                    _indptr,
+                    _indices,
+                    2,
+                    2,
+                    causal=True,
                 )
             except RuntimeError:
                 self._needs_triton_fallback = True
@@ -1365,9 +1372,9 @@ class AiterAttnBackend(AttentionBackend):
                     self.qo_indptr[:bs0],
                     self.forward_metadata.kv_indptr[:bs0],
                     self.forward_metadata.kv_indices,
-                    None,   # custom_mask
-                    True,   # is_causal
-                    None,   # mask_indptr
+                    None,  # custom_mask
+                    True,  # is_causal
+                    None,  # mask_indptr
                     self.forward_metadata.max_q_len,
                     layer.scaling,
                     logit_cap=self.logits_soft_cap,
