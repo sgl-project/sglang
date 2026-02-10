@@ -12,6 +12,21 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 
 
+def _grouped_foreach_copy_(
+    dsts: list[torch.Tensor], srcs: list[torch.Tensor]
+) -> None:
+    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+    groups: dict[tuple[torch.dtype, torch.dtype], tuple[list, list]] = {}
+    for dst, src in zip(dsts, srcs):
+        key = (dst.dtype, src.dtype)
+        if key not in groups:
+            groups[key] = ([], [])
+        groups[key][0].append(dst)
+        groups[key][1].append(src)
+    for group_dsts, group_srcs in groups.values():
+        torch._foreach_copy_(group_dsts, group_srcs)
+
+
 @dataclass
 class GraphInputBuffers:
     input_ids: torch.Tensor
@@ -152,36 +167,42 @@ class GraphInputBuffers:
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
 
-        # Common inputs
-        self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
-        self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        self.positions[:raw_num_token].copy_(forward_batch.positions)
+        # Build batched copy lists for all GPU tensors.
+        dsts = [
+            self.input_ids[:raw_num_token],
+            self.req_pool_indices[:raw_bs],
+            self.seq_lens[:raw_bs],
+            self.out_cache_loc[:raw_num_token],
+            self.positions[:raw_num_token],
+        ]
+        srcs = [
+            forward_batch.input_ids,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+        ]
 
         if (
             self.mamba_track_indices is not None
             and forward_batch.mamba_track_indices is not None
         ):
-            self.mamba_track_indices[:raw_bs].copy_(forward_batch.mamba_track_indices)
+            dsts.append(self.mamba_track_indices[:raw_bs])
+            srcs.append(forward_batch.mamba_track_indices)
         if (
             self.mamba_track_mask is not None
             and forward_batch.mamba_track_mask is not None
         ):
-            self.mamba_track_mask[:raw_bs].copy_(forward_batch.mamba_track_mask)
-
-        seq_lens_cpu: Optional[torch.Tensor] = None
-        if forward_batch.seq_lens_cpu is not None:
-            if bs != raw_bs:
-                self.seq_lens_cpu.fill_(seq_len_fill_value)
-            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-            seq_lens_cpu = self.seq_lens_cpu[:bs]
+            dsts.append(self.mamba_track_mask[:raw_bs])
+            srcs.append(forward_batch.mamba_track_mask)
 
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
-            self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
+            dsts.append(self.encoder_lens[:raw_bs])
+            srcs.append(forward_batch.encoder_lens)
 
         if forward_batch.mrope_positions is not None:
-            self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+            dsts.append(self.mrope_positions[:, :raw_num_token])
+            srcs.append(forward_batch.mrope_positions)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
@@ -194,15 +215,29 @@ class GraphInputBuffers:
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
                     num_tokens_per_dp=num_tokens_per_dp,
                 )
-                self.num_token_non_padded.copy_(local)
+                dsts.append(self.num_token_non_padded)
+                srcs.append(local)
             else:
-                self.num_token_non_padded.copy_(forward_batch.num_token_non_padded)
+                dsts.append(self.num_token_non_padded)
+                srcs.append(forward_batch.num_token_non_padded)
 
         # Pipeline-parallel proxy tensors.
         if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
             for key, buf in self.pp_proxy_tensors.items():
                 src = pp_proxy_tensors.tensors[key]
                 dim = src.shape[0]
-                buf[:dim].copy_(src)
+                dsts.append(buf[:dim])
+                srcs.append(src)
+
+        # Batch all GPU copies, grouped by dtype pair.
+        _grouped_foreach_copy_(dsts, srcs)
+
+        # CPU tensor copy (cannot be batched with GPU tensors).
+        seq_lens_cpu: Optional[torch.Tensor] = None
+        if forward_batch.seq_lens_cpu is not None:
+            if bs != raw_bs:
+                self.seq_lens_cpu.fill_(seq_len_fill_value)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            seq_lens_cpu = self.seq_lens_cpu[:bs]
 
         return seq_lens_cpu
