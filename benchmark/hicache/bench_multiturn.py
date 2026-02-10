@@ -6,21 +6,13 @@ import random
 import threading
 import time
 from datetime import datetime
-from typing import Optional
 
-import aiohttp
 import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-from sglang.bench_serving import (
-    RequestFuncOutput,
-    get_tokenizer,
-    remove_prefix,
-    sample_random_requests,
-)
-
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+from sglang.bench_serving import get_tokenizer, sample_random_requests
+from sglang.test.kits.cache_hit_kit import async_request_sglang_generate, gen_payload
 
 
 def parse_args():
@@ -141,95 +133,6 @@ def parse_args():
         help="String of LoRA path. Currently we only support benchmarking on a single LoRA adaptor.",
     )
     return parser.parse_args()
-
-
-async def async_request_sglang_generate(
-    payload,
-    url,
-    pbar: Optional[tqdm] = None,
-):
-    """
-    Sends a streaming request to the server. Gathers text token-by-token.
-    """
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
-        headers = {}
-        generated_text = ""
-        ttft = 0.0
-        st = time.perf_counter()
-        most_recent_timestamp = st
-        output = RequestFuncOutput()
-
-        try:
-            async with session.post(url=url, json=payload, headers=headers) as response:
-                if response.status == 200:
-                    prompt_tokens = 0
-                    cached_tokens = 0
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                        latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
-
-                            if data["text"]:
-                                timestamp = time.perf_counter()
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-                                    prompt_tokens = (data.get("meta_info") or {}).get(
-                                        "prompt_tokens", 0
-                                    )
-                                    cached_tokens = (data.get("meta_info") or {}).get(
-                                        "cached_tokens", 0
-                                    )
-
-                                # Decoding phase
-                                else:
-                                    output.itl.append(timestamp - most_recent_timestamp)
-
-                                most_recent_timestamp = timestamp
-                                generated_text = data["text"]
-
-                    output.generated_text = generated_text
-                    output.success = True
-                    output.latency = latency
-                    output.prompt_len = prompt_tokens
-                    output.cached_tokens = cached_tokens
-                    output.generated_len = len(output.itl) + 1
-                else:
-                    output.error = response.reason or ""
-                    output.success = False
-        except Exception as e:
-            output.success = False
-            output.error = str(e)
-            print(f"Request failed: {e}")
-
-    if pbar:
-        pbar.update(1)
-    return output
-
-
-def gen_payload(prompt, output_len, lora_path=""):
-    payload = {
-        "text": prompt,
-        "sampling_params": {
-            "temperature": 0.0,
-            "max_new_tokens": output_len,
-            "ignore_eos": True,
-        },
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "lora_path": lora_path,
-        "return_logprob": False,
-        "logprob_start_len": -1,
-    }
-    return payload
 
 
 def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
