@@ -442,7 +442,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         is_static = not weight_quant.dynamic
 
-        return is_channel_group and input_quant_none and is_symmetric and is_static
+        return is_channel_group and input_quant_none and is_static
 
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
