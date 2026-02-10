@@ -11,3 +11,4 @@ Ascend NPUs
    mindspore_backend.md
    ascend_contribution_guide.md
    ascend_npu_best_practice.md
+   ascend_npu_environment_variables.md
