@@ -13,7 +13,8 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
-    pub scheduler: SchedulerConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<SchedulerConfig>,
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
@@ -231,18 +232,6 @@ pub enum SchedulerConfig {
         balance_abs_threshold: usize,
         balance_rel_threshold: f32,
         regular_worker_weight: f32,
-    }
-}
-
-impl Default for SchedulerConfig {
-    fn default() -> Self {
-        Self::Proportion {
-            adjust_interval: 1,
-            adjust_window: 2,
-            balance_abs_threshold: 20,
-            balance_rel_threshold: 1.001,
-            regular_worker_weight: 0.4,
-        }
     }
 }
 
@@ -505,7 +494,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
-            scheduler: SchedulerConfig::default(),
+            scheduler: None,
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912,     // 512MB

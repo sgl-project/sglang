@@ -97,14 +97,16 @@ impl RouterManager {
     ) -> Result<Arc<Self>, String> {
         use crate::routers::RouterFactory;
 
-        let scheduler_config = &config.router_config.scheduler;
-        let scheduler = SchedulerFactory::create_from_config(scheduler_config, app_context);
         let mut manager = Self::new(
             app_context.worker_registry.clone(),
             app_context.tokenizer_registry.clone(),
         );
         manager.enable_igw = config.router_config.enable_igw;
-        manager.scheduler = Some(scheduler);
+        // 仅当用户显式配置了 scheduler 时才创建，否则走默认路由选择逻辑
+        if let Some(ref scheduler_config) = config.router_config.scheduler {
+            let scheduler = SchedulerFactory::create_from_config(scheduler_config, app_context);
+            manager.scheduler = Some(scheduler);
+        }
         let manager = Arc::new(manager);
 
         if config.router_config.enable_igw {

@@ -25,7 +25,7 @@ class RouterArgs:
     decode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # scheduler strategy
-    scheduler_strategy: str = "proportion"
+    scheduler_strategy: Optional[str] = None
     scheduler_balance_abs_threshold: int = 100
     scheduler_balance_rel_threshold: float = 1.1
     scheduler_regular_worker_weight: float = 0.4
@@ -261,7 +261,7 @@ class RouterArgs:
         scheduling_group.add_argument(
             f"--{prefix}scheduler-strategy",
             type=str,
-            default=RouterArgs.scheduler_strategy,
+            default=None,
             choices=["proportion"],
             help="Load balancing scheduler strategy to use. In enable IGW (Inference-Gateway) mode, this is used for both regular and pd router unless overridden",
         )

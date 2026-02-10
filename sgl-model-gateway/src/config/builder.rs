@@ -43,7 +43,7 @@ impl RouterConfigBuilder {
 
     // ==================== Scheduler ====================
 
-    pub fn scheduler(mut self, scheduler: SchedulerConfig) -> Self {
+    pub fn scheduler(mut self, scheduler: Option<SchedulerConfig>) -> Self {
         self.config.scheduler = scheduler;
         self
     }

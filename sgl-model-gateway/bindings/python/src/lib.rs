@@ -346,7 +346,7 @@ struct Router {
     host: String,
     port: u16,
     worker_urls: Vec<String>,
-    scheduler_strategy: SchedulerPolicyType,
+    scheduler_strategy: Option<SchedulerPolicyType>,
     scheduler_balance_abs_threshold: usize,
     scheduler_balance_rel_threshold: f32,
     scheduler_regular_worker_weight: f32,
@@ -449,15 +449,17 @@ impl Router {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode, SchedulerConfig
         };
-        let convert_scheduler_policy = |scheduler: &SchedulerPolicyType| -> SchedulerConfig {
-            match scheduler{
-                SchedulerPolicyType::Proportion => SchedulerConfig::Proportion {
+        // 将 Option<SchedulerPolicyType> 转换为 Option<SchedulerConfig>
+        let convert_scheduler_policy = |scheduler: &Option<SchedulerPolicyType>| -> Option<SchedulerConfig> {
+            match scheduler {
+                Some(SchedulerPolicyType::Proportion) => Some(SchedulerConfig::Proportion {
                     balance_abs_threshold: self.scheduler_balance_abs_threshold,
                     balance_rel_threshold: self.scheduler_balance_rel_threshold,
                     regular_worker_weight: self.scheduler_regular_worker_weight,
                     adjust_interval: self.scheduler_adjust_interval_secs,
                     adjust_window: self.scheduler_adjust_window_secs,
-                },
+                }),
+                None => None,
             }
         };
 
@@ -523,6 +525,7 @@ impl Router {
         let policy = convert_policy(&self.policy);
 
         let scheduler_policy = convert_scheduler_policy(&self.scheduler_strategy);
+
 
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -668,7 +671,7 @@ impl Router {
     #[new]
     #[pyo3(signature = (
         worker_urls,
-        scheduler_strategy = SchedulerPolicyType::Proportion,
+        scheduler_strategy = None,
         scheduler_balance_abs_threshold = 100,
         scheduler_balance_rel_threshold = 1.1,
         scheduler_regular_worker_weight = 0.4,
@@ -760,7 +763,7 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     fn new(
         worker_urls: Vec<String>,
-        scheduler_strategy: SchedulerPolicyType,
+        scheduler_strategy: Option<SchedulerPolicyType>,
         scheduler_balance_abs_threshold: usize,
         scheduler_balance_rel_threshold: f32,
         scheduler_regular_worker_weight: f32,
