@@ -3,7 +3,8 @@ name: Build and Push CUDA 13 Docker Images
 # release this manually via workflow_dispatch for now
 on:
     workflow_dispatch:
-
+    schedule:
+      - cron: "0 0 * * *"
 jobs:
     build-dev:
         if: ${{ github.repository == 'sgl-project/sglang' }}
@@ -15,13 +16,13 @@ jobs:
                       platform: linux/amd64
                       build_type: all
                       grace_blackwell: 0
-                      tag: dev-x86-cu13-$(date +%Y%m%d)
+                      tag: dev-x86-cu13
                       version: 13.0.1
                     - runner: arm-docker-build-node
                       platform: linux/arm64
                       build_type: all
                       grace_blackwell: 1
-                      tag: dev-arm64-cu13-$(date +%Y%m%d)
+                      tag: dev-arm64-cu13
                       version: 13.0.1
         steps:
             - name: Delete huge unnecessary tools folder
@@ -62,6 +63,7 @@ jobs:
                     --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
                     --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
                     --build-arg USE_LATEST_SGLANG=1 \
+                    --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
                     -t lmsysorg/sglang:${{ matrix.tag }} \
                     --no-cache \
                     .

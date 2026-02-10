@@ -34,13 +34,13 @@ use axum::{
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{
-    common::load_conversation_history, context::ResponsesContext, conversions, non_streaming,
-    streaming,
-};
+use super::{common::load_conversation_history, conversions, non_streaming, streaming};
 use crate::{
     protocols::responses::ResponsesRequest,
-    routers::{error, grpc::common::responses::ensure_mcp_connection},
+    routers::{
+        error,
+        grpc::common::responses::{ensure_mcp_connection, ResponsesContext},
+    },
 };
 
 /// Main handler for POST /v1/responses
@@ -110,11 +110,17 @@ async fn route_responses_streaming(
     };
 
     // 2. Check MCP connection and get whether MCP tools are present
-    let has_mcp_tools =
+    let (has_mcp_tools, server_keys) =
         match ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await {
-            Ok(has_mcp) => has_mcp,
+            Ok(result) => result,
             Err(response) => return response,
         };
+
+    // Set the server keys in the context
+    {
+        let mut servers = ctx.requested_servers.write().unwrap();
+        *servers = server_keys;
+    }
 
     if has_mcp_tools {
         debug!("MCP tools detected in streaming mode, using streaming tool loop");

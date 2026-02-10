@@ -187,7 +187,9 @@ class AiterAttnBackend(AttentionBackend):
 
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
-            if self.kv_cache_dtype is not fp8_dtype and self.enable_dp_attention:
+            # only use mla_ps_kernel when fp8 kv_cache
+            # for non-fp8 kv_cache, use non-persist kernel to avoid performance degradation
+            if self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
@@ -266,6 +268,7 @@ class AiterAttnBackend(AttentionBackend):
         self,
         qo_indptr,
         kv_indptr,
+        kv_last_page_len,
         work_metadata,
         work_info_set,
         work_indptr,
@@ -279,12 +282,13 @@ class AiterAttnBackend(AttentionBackend):
     ):
 
         nhead_kv = 1
-        page_size = 1
+        page_size = self.page_size
         dtype = self.kv_cache_dtype
 
         meta = get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
+            kv_last_page_len,
             self.num_head // nhead_kv,
             nhead_kv,
             True,
@@ -365,6 +369,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         qo_indptr,
                         kv_indptr,
+                        kv_last_page_len,
                         work_metadata,
                         work_info_set,
                         work_indptr,
@@ -421,6 +426,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         qo_indptr,
                         kv_indptr,
+                        self.kv_last_page_len[:bs],
                         work_metadata,
                         work_info_set,
                         work_indptr,
@@ -516,6 +522,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         qo_indptr,
                         kv_indptr,
+                        self.kv_last_page_len[:bs],
                         work_metadata,
                         work_info_set,
                         work_indptr,
@@ -714,6 +721,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         qo_indptr,
                         kv_indptr,
+                        kv_last_page_len,
                         self.work_metadata,
                         self.work_info_set,
                         self.work_indptr,
@@ -784,6 +792,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         qo_indptr,
                         kv_indptr,
+                        kv_last_page_len,
                         self.work_metadata,
                         self.work_info_set,
                         self.work_indptr,
@@ -870,6 +879,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.make_mla_meta_data(
                     qo_indptr,
                     kv_indptr,
+                    kv_last_page_len,
                     self.work_metadata,
                     self.work_info_set,
                     self.work_indptr,
@@ -1142,6 +1152,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_last_page_len,
                         work_metadata,
                         work_info_set,
                         work_indptr,
@@ -1163,8 +1174,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.forward_metadata.kv_indices,
                     self.forward_metadata.kv_last_page_len,
                     self.forward_metadata.max_q_len,
-                    layer.scaling,
-                    layer.logit_cap,
+                    sm_scale=layer.scaling,
+                    logit_cap=layer.logit_cap,
                     work_meta_data=work_metadata,
                     work_indptr=work_indptr,
                     work_info_set=work_info_set,
@@ -1193,6 +1204,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.make_mla_meta_data(
                         self.forward_metadata.qo_indptr,
                         self.forward_metadata.kv_indptr,
+                        self.forward_metadata.kv_last_page_len,
                         work_metadata,
                         work_info_set,
                         work_indptr,
@@ -1230,8 +1242,8 @@ class AiterAttnBackend(AttentionBackend):
                         self.forward_metadata.kv_indices,
                         self.forward_metadata.kv_last_page_len,
                         self.forward_metadata.max_q_len,
-                        layer.scaling,
-                        layer.logit_cap,
+                        sm_scale=layer.scaling,
+                        logit_cap=layer.logit_cap,
                         work_meta_data=work_metadata,
                         work_indptr=work_indptr,
                         work_info_set=work_info_set,
@@ -1260,8 +1272,8 @@ class AiterAttnBackend(AttentionBackend):
                         self.forward_metadata.kv_indices,
                         self.forward_metadata.kv_last_page_len,
                         self.forward_metadata.max_q_len,
-                        layer.scaling,
-                        layer.logit_cap,
+                        sm_scale=layer.scaling,
+                        logit_cap=layer.logit_cap,
                         work_meta_data=work_metadata,
                         work_indptr=work_indptr,
                         work_info_set=work_info_set,
@@ -1351,6 +1363,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.make_mla_meta_data(
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
+                    self.forward_metadata.kv_last_page_len,
                     work_metadata,
                     work_info_set,
                     work_indptr,
@@ -1372,8 +1385,8 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.kv_indices,
                 self.forward_metadata.kv_last_page_len,
                 self.forward_metadata.max_q_len,
-                layer.scaling,
-                layer.logit_cap,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
                 work_meta_data=work_metadata,
                 work_indptr=work_indptr,
                 work_info_set=work_info_set,
@@ -1654,7 +1667,6 @@ class AiterMultiStepDraftBackend:
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
-        assert self.page_size == 1, "Page size must be 1"
 
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int

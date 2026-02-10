@@ -66,7 +66,6 @@ impl PipelineStage for DispatchMetadataStage {
             model,
             created,
             weight_version: Some(weight_version),
-            is_streaming: ctx.is_streaming(),
         });
 
         Ok(None)

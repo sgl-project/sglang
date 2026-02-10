@@ -14,7 +14,6 @@ use super::{
         build_mcp_tool_names_set, build_next_request_with_tools, inject_mcp_metadata,
         load_previous_messages, McpCallTracking,
     },
-    context::HarmonyResponsesContext,
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
 };
 use crate::{
@@ -29,7 +28,9 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::responses::{ensure_mcp_connection, persist_response_if_needed},
+            common::responses::{
+                ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
+            },
             harmony::processor::ResponsesIterationResult,
         },
         mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
@@ -47,7 +48,7 @@ use crate::{
 ///    - Repeat from step 1 (full pipeline re-execution)
 /// 4. If no tool calls, return final response
 pub(crate) async fn serve_harmony_responses(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     // Clone request for persistence
@@ -57,8 +58,14 @@ pub(crate) async fn serve_harmony_responses(
     let current_request = load_previous_messages(ctx, request).await?;
 
     // Check MCP connection and get whether MCP tools are present
-    let has_mcp_tools =
+    let (has_mcp_tools, server_keys) =
         ensure_mcp_connection(&ctx.mcp_manager, current_request.tools.as_deref()).await?;
+
+    // Set the server keys in the context
+    {
+        let mut servers = ctx.requested_servers.write().unwrap();
+        *servers = server_keys;
+    }
 
     let response = if has_mcp_tools {
         execute_with_mcp_loop(ctx, current_request).await?
@@ -84,7 +91,7 @@ pub(crate) async fn serve_harmony_responses(
 ///
 /// Automatically executes MCP tools in a loop until no more tool calls or max iterations
 async fn execute_with_mcp_loop(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     let mut iteration_count = 0;
@@ -96,8 +103,11 @@ async fn execute_with_mcp_loop(
     // Extract user's max_tool_calls limit (if set)
     let max_tool_calls = current_request.max_tool_calls.map(|n| n as usize);
 
-    // Add static MCP tools from inventory to the request
-    let mcp_tools = ctx.mcp_manager.list_tools();
+    // Add filtered MCP tools (static + requested dynamic) to the request
+    let mcp_tools = {
+        let servers = ctx.requested_servers.read().unwrap();
+        ctx.mcp_manager.list_tools_for_servers(&servers)
+    };
     if !mcp_tools.is_empty() {
         let mcp_response_tools = convert_mcp_tools_to_response_tools(&mcp_tools);
 
@@ -216,7 +226,7 @@ async fn execute_with_mcp_loop(
 
                     // Inject MCP metadata if any calls were executed
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_tools);
                     }
 
                     return Ok(response);
@@ -258,7 +268,7 @@ async fn execute_with_mcp_loop(
 
                     // Inject MCP metadata for all executed calls
                     if mcp_tracking.total_calls() > 0 {
-                        inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                        inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_tools);
                     }
 
                     return Ok(response);
@@ -291,7 +301,7 @@ async fn execute_with_mcp_loop(
                 );
 
                 // Inject MCP metadata into final response
-                inject_mcp_metadata(&mut response, &mcp_tracking, &ctx.mcp_manager);
+                inject_mcp_metadata(&mut response, &mcp_tracking, &mcp_tools);
 
                 debug!(
                     mcp_calls = mcp_tracking.total_calls(),
@@ -310,7 +320,7 @@ async fn execute_with_mcp_loop(
 ///
 /// For function tools or no tools - executes pipeline once and returns
 async fn execute_without_mcp_loop(
-    ctx: &HarmonyResponsesContext,
+    ctx: &ResponsesContext,
     current_request: ResponsesRequest,
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");

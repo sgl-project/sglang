@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
-register_cuda_ci(est_time=300, suite="stage-c-test-large-4-gpu-b200")
+register_cuda_ci(est_time=300, suite="stage-c-test-4-gpu-b200")
 
 
 def test_gsm8k(base_url: str):
@@ -80,7 +80,7 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
     def test_a_gsm8k(self):
         metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
         self.assertGreater(metrics["accuracy"], 0.64)
-        self.assertGreater(avg_spec_accept_length, 1.4)
+        self.assertGreater(avg_spec_accept_length, 2.7)
 
 
 if __name__ == "__main__":

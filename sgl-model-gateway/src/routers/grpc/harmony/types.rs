@@ -15,6 +15,7 @@ pub(crate) struct HarmonyMessage {
     pub content: String,
 }
 
+/// Some methods are kept for API completeness even if currently unused.
 #[allow(dead_code)]
 impl HarmonyMessage {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
@@ -110,7 +111,6 @@ pub(crate) struct HarmonyChannelOutput {
 ///
 /// Represents incremental updates as tokens are parsed from the stream.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct HarmonyChannelDelta {
     /// Delta for analysis/reasoning content
     pub analysis_delta: Option<String>,
@@ -122,6 +122,7 @@ pub(crate) struct HarmonyChannelDelta {
     pub final_delta: Option<String>,
 
     /// Whether this is the final delta
+    #[allow(dead_code)]
     pub is_final: bool,
 }
 
