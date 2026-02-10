@@ -16,9 +16,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import ray
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import PortArgs, ServerArgs
 
 
 logger = logging.getLogger(__name__)
@@ -34,21 +37,22 @@ class SchedulerActor:
 
     def __init__(
         self,
-        scheduler_kwargs: dict,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        moe_ep_rank: int,
+        pp_rank: int,
+        dp_rank: Optional[int],
         dist_init_addr: Optional[str] = None,
     ):
         import dataclasses
 
         from sglang.srt.managers.scheduler import Scheduler, configure_scheduler
 
-        server_args = scheduler_kwargs["server_args"]
-        tp_rank = scheduler_kwargs["tp_rank"]
-        gpu_id = scheduler_kwargs["gpu_id"]
-        pp_rank = scheduler_kwargs.get("pp_rank", 0)
-
         # Override dist_init_addr if provided (for multi-node)
         if dist_init_addr:
-            scheduler_kwargs["server_args"] = dataclasses.replace(
+            server_args = dataclasses.replace(
                 server_args, dist_init_addr=dist_init_addr
             )
 
@@ -67,17 +71,19 @@ class SchedulerActor:
 
         # Configure worker (logging, process title, etc.)
         dp_rank = configure_scheduler(
-            scheduler_kwargs["server_args"],
-            tp_rank,
-            scheduler_kwargs["moe_ep_rank"],
-            pp_rank,
-            scheduler_kwargs.get("dp_rank"),
+            server_args, tp_rank, moe_ep_rank, pp_rank, dp_rank
         )
 
         # Create scheduler (loads model into GPU, initializes NCCL)
-        scheduler_kwargs["gpu_id"] = actual_gpu_id
-        scheduler_kwargs["dp_rank"] = dp_rank
-        self.scheduler = Scheduler(**scheduler_kwargs)
+        self.scheduler = Scheduler(
+            server_args=server_args,
+            port_args=port_args,
+            gpu_id=actual_gpu_id,
+            tp_rank=tp_rank,
+            moe_ep_rank=moe_ep_rank,
+            pp_rank=pp_rank,
+            dp_rank=dp_rank,
+        )
 
         self._tp_rank = tp_rank
         self._pp_rank = pp_rank

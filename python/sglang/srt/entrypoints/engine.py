@@ -1180,16 +1180,6 @@ def _launch_scheduler_ray_actors(
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
 
-                scheduler_kwargs = dict(
-                    server_args=server_args,
-                    port_args=port_args,
-                    gpu_id=local_gpu_idx,
-                    tp_rank=tp_rank,
-                    moe_ep_rank=moe_ep_rank,
-                    pp_rank=pp_rank,
-                    dp_rank=0,
-                )
-
                 actor = SchedulerActor.options(
                     num_cpus=0,
                     num_gpus=1,
@@ -1199,7 +1189,13 @@ def _launch_scheduler_ray_actors(
                         placement_group_bundle_index=node_idx,
                     ),
                 ).remote(
-                    scheduler_kwargs=scheduler_kwargs,
+                    server_args=server_args,
+                    port_args=port_args,
+                    gpu_id=local_gpu_idx,
+                    tp_rank=tp_rank,
+                    moe_ep_rank=moe_ep_rank,
+                    pp_rank=pp_rank,
+                    dp_rank=0,
                     dist_init_addr=dist_init_addr,
                 )
                 scheduler_actors.append(actor)
