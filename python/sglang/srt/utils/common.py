@@ -1061,6 +1061,16 @@ def suppress_other_loggers():
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.cudart module is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="The cuda.nvrtc module is deprecated",
+        category=FutureWarning,
+    )
 
     try:
         from vllm.logger import logger as vllm_default_logger
