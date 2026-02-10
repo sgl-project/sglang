@@ -11,7 +11,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
+from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
@@ -34,7 +34,7 @@ if _use_aiter:
     from sglang.srt.layers.moe.rocm_moe_utils import rocm_fused_experts_tkw1
 
 
-class QuarkW8A8FP8MoE(QuarkScheme):
+class QuarkW8A8FP8MoE(QuarkMoEScheme):
 
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.is_static_input_scheme: bool = False

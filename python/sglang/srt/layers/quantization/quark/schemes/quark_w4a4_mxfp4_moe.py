@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
+from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
@@ -39,7 +39,7 @@ if _use_aiter:
 OCP_MX_BLOCK_SIZE = 32
 
 
-class QuarkW4A4MXFp4MoE(QuarkScheme):
+class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
     def __init__(self, weight_config: dict[str, Any], input_config: dict[str, Any]):
         self.weight_quant = weight_config

@@ -16,7 +16,8 @@ from sglang.srt.layers.quantization.base_config import (  # noqa: E501
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.quark.schemes import (
-    QuarkScheme,
+    QuarkLinearScheme,
+    QuarkMoEScheme,
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
     QuarkW8A8Fp8,
@@ -83,7 +84,7 @@ class QuarkConfig(QuantizationConfig):
             return None
 
         if isinstance(layer, LinearBase):
-            scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             layer.scheme = scheme
             return QuarkLinearMethod(self)
 
@@ -315,7 +316,7 @@ class QuarkConfig(QuantizationConfig):
             )
             return global_quant_config
 
-    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkScheme":
+    def _get_scheme_from_config(self, config: dict[str, Any]) -> "QuarkLinearScheme":
         if config.get("output_tensors") or config.get("bias"):
             raise NotImplementedError(
                 "Currently, Quark models with output_tensors "
@@ -339,7 +340,9 @@ class QuarkConfig(QuantizationConfig):
             f"Input config: {input_config}"
         )
 
-    def get_scheme(self, layer: torch.nn.Module, layer_name: str) -> "QuarkScheme":
+    def get_linear_scheme(
+        self, layer: torch.nn.Module, layer_name: str
+    ) -> "QuarkLinearScheme":
 
         layer_quant_config = self._find_matched_config(layer_name, layer)
 
@@ -356,7 +359,7 @@ class QuarkConfig(QuantizationConfig):
         self,
         module: torch.nn.Module,
         layer_name: str,
-    ) -> "QuarkScheme":
+    ) -> "QuarkMoEScheme":
         layer_quant_config = self._find_matched_config(layer_name, module)
 
         if layer_quant_config.get("output_tensors") or layer_quant_config.get("bias"):
@@ -398,7 +401,7 @@ class QuarkLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the QuarkScheme associated with each layer to create
+        Use the QuarkLinearScheme associated with the layer to create
         the necessary parameters for the layer. See LinearMethodBase for param
         details
         """
@@ -420,7 +423,7 @@ class QuarkLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ):
         """
-        Use the output of create_weights and the QuarkScheme
+        Use the output of create_weights and the QuarkLinearScheme
         associated with the layer to apply the forward pass with the
         layer input.  See LinearMethodBase for param details
 
@@ -449,7 +452,7 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         """
-        Use the QuarkScheme associated with each layer to create
+        Use the QuarkMoEScheme associated with the layer to create
         the necessary parameters for the layer. See FusedMoEMethodBase for param
         details
         """
@@ -473,7 +476,7 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
         dispatch_output: "StandardDispatchOutput",
     ):
         """
-        Use the output of create_weights and the QuarkScheme
+        Use the output of create_weights and the QuarkMoEScheme
         associated with the layer to apply the forward pass with the
         fused MoE layer. See FusedMoEMethodBase for param details
 
