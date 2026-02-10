@@ -646,15 +646,12 @@ impl WorkerRegistry {
             .get(&WorkerType::Regular)
             .map(|v| v.len())
             .unwrap_or(0);
-        info!("get_worker_distribution ==> regular_count {}",regular_count);
 
         // Get total workers count efficiently from DashMap
         let total_workers = self.workers.len();
-        info!("get_worker_distribution ==> total_workers {}",total_workers);
 
         // PD workers are any workers that are not Regular
         let pd_count = total_workers.saturating_sub(regular_count);
-        info!("get_worker_distribution ==> pd_count {}",pd_count);
 
         (regular_count, pd_count)
     }
@@ -668,7 +665,6 @@ impl WorkerRegistry {
             .map(|v| v.len())
             .unwrap_or(0);
 
-        // 只统计 Prefill workers，不包含 Decode
         let prefill_count = self.get_prefill_workers().len();
 
         (regular_count, prefill_count)

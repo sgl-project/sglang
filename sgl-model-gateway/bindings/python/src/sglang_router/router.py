@@ -39,8 +39,6 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "consistent_hashing": PolicyType.ConsistentHashing,
         "prefix_hash": PolicyType.PrefixHash,
     }
-    print(1111111)
-    print(policy_map[policy_str])
     return policy_map[policy_str]
 
 
@@ -322,8 +320,6 @@ class Router:
         ]
         for field in fields_to_remove:
             args_dict.pop(field, None)
-
-        print(args_dict)
 
         return Router(_Router(**args_dict))
 

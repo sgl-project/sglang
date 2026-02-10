@@ -23,7 +23,6 @@ impl ConfigValidator {
 
         Self::validate_compatibility(config)?;
 
-        // 验证 scheduler 配置（如果提供）
         if let Some(ref scheduler) = config.scheduler {
             Self::validate_scheduler(scheduler)?;
         }
@@ -539,7 +538,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// 验证 Scheduler 配置参数的合法性
     fn validate_scheduler(scheduler: &SchedulerConfig) -> ConfigResult<()> {
         match scheduler {
             SchedulerConfig::Proportion {

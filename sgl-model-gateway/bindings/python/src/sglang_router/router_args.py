@@ -251,13 +251,6 @@ class RouterArgs:
             help="List of worker URLs. Supports IPv4 and IPv6 addresses (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)",
         )
         
-        # TODO
-        # Scheduler policy configuation
-        # scheduler_balance_abs_threshold: int = 100
-        # scheduler_balance_rel_threshold: float = 1.1
-        # scheduler_regular_worker_weight: float = 0.4
-        # scheduler_adjust_interval_secs: int = 5
-        # scheduler_adjust_window_secs: int = 10
         scheduling_group.add_argument(
             f"--{prefix}scheduler-strategy",
             type=str,

@@ -44,8 +44,6 @@ impl BucketPolicy {
     }
 
     pub fn with_config(config: BucketConfig) -> Self {
-        info!("Initializing BucketPolicy with config: {:?}", config);
-        info!("执行bucket_with_config");
         let buckets = Arc::new(DashMap::<String, Arc<RwLock<Bucket>>>::new());
 
         let adjustment_handle = {
@@ -61,7 +59,6 @@ impl BucketPolicy {
                     let bucket = bucket_ref.value();
                     match bucket.write() {
                         Ok(mut bucket_guard) => {
-                            info!("触发adjust_boundary");
                             bucket_guard.adjust_boundary();
                         }
                         Err(e) => {
@@ -83,7 +80,6 @@ impl BucketPolicy {
     }
 
     pub fn init_prefill_worker_urls(&self, prefill_workers: &[Arc<dyn Worker>]) {
-        info!("init_prefill_worker_urls ==> {:#?}", prefill_workers);
         // Group workers by model
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in prefill_workers {
@@ -122,7 +118,6 @@ impl BucketPolicy {
     /// Initialize bucket boundaries for regular workers
     /// Similar to init_prefill_worker_urls but for regular (non-disaggregated) workers
     pub fn init_regular_worker_urls(&self, regular_workers: &[Arc<dyn Worker>]) {
-        info!("init_regular_worker_urls ==> {:#?}", regular_workers);
         // Group workers by model
         let mut model_workers: HashMap<String, Vec<&Arc<dyn Worker>>> = HashMap::new();
         for worker in regular_workers {
@@ -160,7 +155,6 @@ impl BucketPolicy {
     }
 
     pub fn add_prefill_url(&self, worker: &dyn Worker) {
-        info!("==========add_prefill_url");
         let model_key = normalize_model_key(worker.model_id());
         let bucket = self
             .buckets
@@ -266,7 +260,6 @@ impl LoadBalancingPolicy for BucketPolicy {
             None => 0,
             Some(text) => text.chars().count(),
         };
-        info!("char_count ==> {:?}", char_count);
 
         // Determine the model for this set of workers (router pre-filters by model)
         // All workers should be from the same model
@@ -279,7 +272,6 @@ impl LoadBalancingPolicy for BucketPolicy {
         let prefill_url = if let Some(bucket) = bucket {
             let (choiced_url, chars_per_url_snapshot) = {
                 let buc = bucket.read().unwrap();
-                info!("boundary==> {:#?}", buc);
                 let chars_per_url_snapshot = buc.chars_per_url.lock().unwrap().clone();
                 let choiced_url = buc.find_boundary(char_count);
                 (choiced_url, chars_per_url_snapshot)
@@ -290,19 +282,18 @@ impl LoadBalancingPolicy for BucketPolicy {
             let rel_threshold = self.config.balance_rel_threshold * min_load as f32;
             let is_imbalanced =
                 abs_diff > self.config.balance_abs_threshold && max_load as f32 > rel_threshold;
-            info!("chars_per_url_snapshot ==> {:#?}", chars_per_url_snapshot);
-            info!(
+            debug!(
                 "Current PD instance status | is_imbalanced={}",
                 is_imbalanced
             );
-            info!(
+            debug!(
                  "Checking imbalance: max_load={}, min_load={}, abs_diff={}, conf_abs={}, conf_rel={}, calculated_rel_threshold={}, is_imbalanced={}",
                  max_load, min_load, abs_diff, self.config.balance_abs_threshold, self.config.balance_rel_threshold, rel_threshold, is_imbalanced
              );
 
             let mut rng = rand::rng();
             let prefill_url = if is_imbalanced {
-                info!("select prefill instance by Load Balance policy");
+                debug!("select prefill instance by Load Balance policy");
                 let min_url = chars_per_url_snapshot
                     .iter()
                     .min_by_key(|(_, &chars)| chars)
@@ -310,18 +301,18 @@ impl LoadBalancingPolicy for BucketPolicy {
                     .unwrap_or_else(|| {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let url = workers[healthy_indices[idx]].url();
-                        info!("No URL found, randomly selecting: {}", url);
+                        warn!("No URL found, randomly selecting: {}", url);
                         url.to_string()
                     });
                 min_url
             } else {
-                info!("select prefill instance by Bucket policy");
+                debug!("select prefill instance by Bucket policy");
                 match choiced_url {
                     Some(url) if !url.is_empty() => url,
                     _ => {
                         let idx = rng.random_range(0..healthy_indices.len());
                         let selected_url = workers[healthy_indices[idx]].url();
-                        info!("Boundary not found, randomly selection: {}", selected_url);
+                        warn!("Boundary not found, randomly selection: {}", selected_url);
                         selected_url.to_string()
                     }
                 }
@@ -334,7 +325,7 @@ impl LoadBalancingPolicy for BucketPolicy {
 
             prefill_url
         } else {
-            info!(
+            warn!(
                 "No bucket found for model {}, randomly selecting healthy worker",
                 model_key
             );
@@ -344,7 +335,6 @@ impl LoadBalancingPolicy for BucketPolicy {
             let prefill_url = selected_worker.url().to_string();
             prefill_url
         };
-        info!("select_worker res ==> {:?}", prefill_url);
 
         workers.iter().position(|w| w.url() == prefill_url)
     }

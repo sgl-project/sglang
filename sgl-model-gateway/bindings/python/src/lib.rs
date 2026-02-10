@@ -449,7 +449,6 @@ impl Router {
         use config::{
             DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode, SchedulerConfig
         };
-        // 将 Option<SchedulerPolicyType> 转换为 Option<SchedulerConfig>
         let convert_scheduler_policy = |scheduler: &Option<SchedulerPolicyType>| -> Option<SchedulerConfig> {
             match scheduler {
                 Some(SchedulerPolicyType::Proportion) => Some(SchedulerConfig::Proportion {
@@ -501,7 +500,6 @@ impl Router {
         };
 
         let mode = if self.enable_igw {
-            // 这里需要加载pd策略 regular策略
             RoutingMode::Regular {
                 worker_urls: vec![],
             }
