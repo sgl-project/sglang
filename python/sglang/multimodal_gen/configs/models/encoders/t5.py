@@ -8,7 +8,6 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-from sglang.multimodal_gen.utils import StoreBoolean
 
 
 def _is_transformer_layer(n: str, m) -> bool:
@@ -95,19 +94,4 @@ class T5Config(TextEncoderConfig):
     def add_cli_args(
         parser: argparse.ArgumentParser, prefix: str = "t5-config"
     ) -> argparse.ArgumentParser:
-        parser.add_argument(
-            f"--{prefix}.parallel-folding",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.parallel_folding",
-            default=T5Config.parallel_folding,
-            help="Whether to use parallel folding for T5",
-        )
-        parser.add_argument(
-            f"--{prefix}.parallel-folding-mode",
-            type=str,
-            choices=["sp", "ulysses", "ring"],
-            dest=f"{prefix.replace('-', '_')}.parallel_folding_mode",
-            default=T5Config.parallel_folding_mode,
-            help="Parallel folding mode for T5",
-        )
         return parser

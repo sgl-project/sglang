@@ -88,12 +88,6 @@ class WanT2V480PConfig(PipelineConfig):
     # WanConfig-specific added parameters
 
     def update_config_from_dict(self, args: dict, prefix: str = "") -> None:
-        prefix_with_dot = f"{prefix}." if (prefix.strip() != "") else ""
-        # Do not override if user explicitly sets T5 parallel folding options.
-        user_set = (
-            f"{prefix_with_dot}t5_config.parallel_folding" in args
-            or f"{prefix_with_dot}t5_config.parallel_folding_mode" in args
-        )
         tp_size = args.get("tp_size", 1)
         sp_degree = args.get("sp_degree", -1)
         if sp_degree == -1:
@@ -101,7 +95,7 @@ class WanT2V480PConfig(PipelineConfig):
             ulysses_degree = args.get("ulysses_degree", 1) or 1
             sp_degree = ring_degree * ulysses_degree
         super().update_config_from_dict(args, prefix)
-        if user_set or (tp_size not in (-1, 1)) or sp_degree <= 1:
+        if (tp_size not in (-1, 1)) or sp_degree <= 1:
             return
         for text_encoder_config in self.text_encoder_configs:
             if isinstance(text_encoder_config, T5Config):
