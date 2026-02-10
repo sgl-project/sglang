@@ -36,9 +36,6 @@ add_SGLangEncoderServicer_to_server = (
     sglang_encoder_pb2_grpc.add_SglangEncoderServicer_to_server
 )
 
-# Shared scheduler receive URL state (use encode_server globals).
-
-
 class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
     """
     Standard gRPC health check service for encoder server.
@@ -58,7 +55,6 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         self._serving = False
 
     async def Check(self, request, context) -> health_pb2.HealthCheckResponse:
-        """Standard health check for Kubernetes probes."""
         if self._serving:
             return health_pb2.HealthCheckResponse(
                 status=health_pb2.HealthCheckResponse.SERVING
@@ -68,7 +64,6 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
         )
 
     async def Watch(self, request, context):
-        """Streaming health check."""
         yield await self.Check(request, context)
 
 
@@ -90,11 +85,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     async def Encode(
         self, request: sglang_encoder_pb2.EncodeRequest, context
     ) -> sglang_encoder_pb2.EncodeResponse:
-        """
-        Encode multimodal items (images/videos/audio).
-        """
         try:
-            # Broadcast request to worker processes
             request_dict = {
                 "mm_items": list(request.mm_items),
                 "req_id": request.req_id,
@@ -104,7 +95,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
             for socket in self.send_sockets:
                 socket.send_pyobj(request_dict)
 
-            # Perform encoding
             (
                 nbytes,
                 embedding_len,
@@ -122,9 +112,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 context.set_details(error_msg)
                 return sglang_encoder_pb2.EncodeResponse()
 
-            # Handle different transfer backends
             if self.server_args.encoder_transfer_backend == "mooncake":
-                # Return embedding metadata for mooncake backend
                 return sglang_encoder_pb2.EncodeResponse(
                     embedding_size=nbytes,
                     embedding_len=embedding_len,
@@ -134,10 +122,8 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 embedding_ports = list(request.embedding_port)
                 logger.info(f"embedding_port = {embedding_ports}")
                 if not embedding_ports:
-                    # Dynamic endpoint discovery
                     await self.encoder.send_with_url(req_id=request.req_id)
                 else:
-                    # Send to specified ports
                     tasks = []
                     for embedding_port in embedding_ports:
                         tasks.append(
@@ -151,7 +137,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                     self.encoder.embedding_to_send.pop(request.req_id, None)
                 return sglang_encoder_pb2.EncodeResponse()
             elif self.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
-                # Send directly to tokenizer
                 embedding_port = (
                     request.embedding_port[0] if request.embedding_port else 0
                 )
@@ -175,10 +160,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     async def Send(
         self, request: sglang_encoder_pb2.SendRequest, context
     ) -> sglang_encoder_pb2.SendResponse:
-        """
-        Send encoded embeddings to prefill server (mooncake backend).
-        Mirrors handle_send_request() from encode_server.py.
-        """
         try:
             await self.encoder.send(
                 req_id=request.req_id,
@@ -202,10 +183,6 @@ class SGLangEncoderServer(SGLangEncoderServicer):
     async def SchedulerReceiveUrl(
         self, request: sglang_encoder_pb2.SchedulerReceiveUrlRequest, context
     ) -> sglang_encoder_pb2.SchedulerReceiveUrlResponse:
-        """
-        Register scheduler receive URL (zmq_to_scheduler backend).
-        Mirrors handle_scheduler_receive_url_request() from encode_server.py.
-        """
         try:
             await handle_scheduler_receive_url_request(
                 {
@@ -225,21 +202,16 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
 
 async def serve_grpc_encoder(server_args: ServerArgs):
-    """Start the gRPC encoder server."""
-
-    # Initialize multiprocessing context and ZMQ
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
 
-    # Determine distributed init method
     if server_args.dist_init_addr:
         dist_init_method = f"tcp://{server_args.dist_init_addr}"
     else:
         dist_init_method = f"tcp://127.0.0.1:{port_args.nccl_port}"
 
-    # Launch worker processes for tensor parallelism
     send_sockets: List[zmq.Socket] = []
     for rank in range(1, server_args.tp_size):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
@@ -252,10 +224,8 @@ async def serve_grpc_encoder(server_args: ServerArgs):
             daemon=True,
         ).start()
 
-    # Create main encoder (rank 0)
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
 
-    # Create gRPC server
     server = grpc.aio.server(
         futures.ThreadPoolExecutor(max_workers=10),
         options=[
@@ -264,11 +234,9 @@ async def serve_grpc_encoder(server_args: ServerArgs):
         ],
     )
 
-    # Create and register health service
     health_servicer = EncoderHealthServicer()
     health_pb2_grpc.add_HealthServicer_to_server(health_servicer, server)
 
-    # Create and register encoder service
     encoder_servicer = SGLangEncoderServer(
         encoder=encoder,
         send_sockets=send_sockets,
@@ -276,7 +244,6 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     )
     add_SGLangEncoderServicer_to_server(encoder_servicer, server)
 
-    # Enable reflection for debugging
     SERVICE_NAMES = (
         sglang_encoder_pb2.DESCRIPTOR.services_by_name["SglangEncoder"].full_name,
         "grpc.health.v1.Health",
@@ -284,17 +251,14 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     )
     reflection.enable_server_reflection(SERVICE_NAMES, server)
 
-    # Start server
     listen_addr = f"{server_args.host}:{server_args.port}"
     server.add_insecure_port(listen_addr)
 
     await server.start()
     logger.info(f"gRPC encoder server listening on {listen_addr}")
 
-    # Mark as serving
     health_servicer.set_serving()
 
-    # Wait for termination
     try:
         await server.wait_for_termination()
     except KeyboardInterrupt:
