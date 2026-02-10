@@ -195,7 +195,7 @@ pip install sglang-router
 pip install "sglang[all]"
 ```
 
-**Option 1: Co-launch Workers and SMG (Simplest)**
+**Option A: Co-launch Workers and SMG (Simplest)**
 
 This is the easiest way to get started - SMG and workers are launched together:
 
@@ -207,7 +207,7 @@ python -m sglang_router.launch_server \
     --port 30000
 ```
 
-**Option 2: Separate Launch (Multi-Node)**
+**Option B: Separate Launch (Multi-Node)**
 
 For distributed deployments across multiple machines:
 
@@ -235,7 +235,7 @@ python -m sglang_router.launch_router \
     --port 30000
 ```
 
-**Option 3: Dynamic Worker Registration**
+**Option C: Dynamic Worker Registration**
 
 For elastic deployments where workers can be added/removed dynamically:
 
