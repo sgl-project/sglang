@@ -122,18 +122,18 @@ impl RouterManager {
                 }
             }
 
-            // // Always create gRPC Regular router in IGW mode
-            // match RouterFactory::create_grpc_router(app_context).await {
-            //     Ok(grpc_regular) => {
-            //         info!("Created gRPC Regular router");
-            //         manager.register_router(router_ids::GRPC_REGULAR, Arc::from(grpc_regular));
-            //     }
-            //     Err(e) => {
-            //         warn!("Failed to create gRPC Regular router: {e}");
-            //     }
-            // }
+            // Always create gRPC Regular router in IGW mode
+            match RouterFactory::create_grpc_router(app_context).await {
+                Ok(grpc_regular) => {
+                    info!("Created gRPC Regular router");
+                    manager.register_router(router_ids::GRPC_REGULAR, Arc::from(grpc_regular));
+                }
+                Err(e) => {
+                    warn!("Failed to create gRPC Regular router: {e}");
+                }
+            }
 
-            // info!("PD disaggregation auto-enabled for IGW mode, creating PD routers");
+            info!("PD disaggregation auto-enabled for IGW mode, creating PD routers");
 
             // Create HTTP PD router
             match RouterFactory::create_pd_router(
@@ -154,33 +154,33 @@ impl RouterManager {
             }
 
             // Create gRPC PD router
-            // match RouterFactory::create_grpc_pd_router(
-            //     None,
-            //     None,
-            //     &config.router_config.policy,
-            //     app_context,
-            // )
-            // .await
-            // {
-            //     Ok(grpc_pd) => {
-            //         info!("Created gRPC PD router");
-            //         manager.register_router(router_ids::GRPC_PD, Arc::from(grpc_pd));
-            //     }
-            //     Err(e) => {
-            //         warn!("Failed to create gRPC PD router: {e}");
-            //     }
-            // }
+            match RouterFactory::create_grpc_pd_router(
+                None,
+                None,
+                &config.router_config.policy,
+                app_context,
+            )
+            .await
+            {
+                Ok(grpc_pd) => {
+                    info!("Created gRPC PD router");
+                    manager.register_router(router_ids::GRPC_PD, Arc::from(grpc_pd));
+                }
+                Err(e) => {
+                    warn!("Failed to create gRPC PD router: {e}");
+                }
+            }
 
             // Create OpenAI router for external OpenAI-compatible backends
-            // match RouterFactory::create_openai_router(app_context).await {
-            //     Ok(openai) => {
-            //         info!("Created OpenAI router");
-            //         manager.register_router(router_ids::HTTP_OPENAI, Arc::from(openai));
-            //     }
-            //     Err(e) => {
-            //         warn!("Failed to create OpenAI router: {e}");
-            //     }
-            // }
+            match RouterFactory::create_openai_router(app_context).await {
+                Ok(openai) => {
+                    info!("Created OpenAI router");
+                    manager.register_router(router_ids::HTTP_OPENAI, Arc::from(openai));
+                }
+                Err(e) => {
+                    warn!("Failed to create OpenAI router: {e}");
+                }
+            }
 
             info!(
                 "RouterManager initialized with {} routers for multi-router mode",
