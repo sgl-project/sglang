@@ -4,11 +4,12 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 
 ## Data Parallelism (DP)
 
-**Data Parallelism (DP)** is the most common parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests. With dedicated routing strategies, as we will introduce later, the throughput of your serving system could be multiplied near linearly.
+**Data Parallelism (DP)** is the most common parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests. With dedicated routing strategies, as we will introduce later, with those proper routing algorithms in SGLang Model Gateway, the throughput of your serving system could be multiplied nearly linearly.
 
 **Key characteristics:**
+
 - Each replica has a full copy of the model
-- Requests are distributed across replicas
+- Requests are distributed/scattered across replicas
 - No inter-replica communication during one request's inference (for simple DP)
 
 > **Note for MLA models (e.g., DeepSeek)**: Standard DP works for MLA models too. If you want independent replicas with duplicated KV cache (simpler setup), just use `--dp-size` without `--enable-dp-attention`. DPA is only needed when you want to eliminate KV cache duplication for better memory efficiency.
