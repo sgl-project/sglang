@@ -5,6 +5,7 @@ import logging
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
@@ -295,6 +296,10 @@ class ModelOptQuantConfig(QuantizationConfig):
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
+            # Check if MoE layer should be excluded from quantization
+            # (e.g., MTP layers that have no quantization scales in checkpoint)
+            if self.is_layer_excluded(prefix):
+                return None  # Falls back to default unquantized MoE
             return Moe(self)
         return None
 
@@ -376,19 +381,19 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             # Flat format (config.json quantization_config)
-            # For kv_cache, check if kv_cache_scheme exists and extract algo
+            # Derive kv_cache quant from kv_cache_scheme dict
             kv_cache_scheme = config.get("kv_cache_scheme")
-            if (
-                kv_cache_scheme
-                and kv_cache_scheme.get("type") == "float"
-                and kv_cache_scheme.get("num_bits") == 8
-            ):
-                kv_cache_quant_method = "FP8"
+            if isinstance(kv_cache_scheme, dict):
+                if (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_method = "FP8"
 
             # Map 'ignore' field to 'exclude_modules'
             exclude_modules = config.get("ignore")
         else:
-            # Fall back to nested format (hf_quant_config.json - legacy format)
+            # Fall back to nested format (hf_quant_config.json - will be deprecated)
             try:
                 quantization_section = cls.get_from_keys(config, ["quantization"])
                 quant_method = quantization_section.get("quant_algo")
@@ -420,14 +425,22 @@ class ModelOptFp8Config(ModelOptQuantConfig):
     def is_layer_excluded(self, prefix: str) -> bool:
         if len(self.exclude_modules) == 0:
             return False
-        return any(
-            module in prefix
-            or (
-                prefix.startswith("language_model.")
-                and module in prefix.removeprefix("language_model.")
-            )
-            for module in self.exclude_modules
-        )
+
+        # Build prefix variants: some models wrap layers under "language_model."
+        prefixes_to_check = [prefix]
+        if prefix.startswith("language_model."):
+            prefixes_to_check.append(prefix.removeprefix("language_model."))
+
+        for pattern in self.exclude_modules:
+            # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*")
+            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+            for pfx in prefixes_to_check:
+                if re.fullmatch(regex_str, pfx):
+                    return True
+                for part in pfx.split("."):
+                    if re.fullmatch(regex_str, part):
+                        return True
+        return False
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -958,30 +971,26 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         quant_method = config.get("quant_algo")
         if quant_method is not None:
             # Flat format (config.json quantization_config)
-            # Note: FP4 models in config.json format may not have all the detailed fields
-            # that are present in hf_quant_config.json, so we need to handle defaults
-            kv_cache_quant_algo = config.get("kv_cache_quant_algo")
-            if not kv_cache_quant_algo:
-                # For config.json format, derive from kv_cache_scheme if available
-                kv_cache_scheme = config.get("kv_cache_scheme")
-                if isinstance(kv_cache_scheme, dict):
-                    if (
-                        kv_cache_scheme.get("type") == "float"
-                        and kv_cache_scheme.get("num_bits") == 8
-                    ):
-                        kv_cache_quant_algo = "FP8"
-                    else:
-                        kv_cache_quant_algo = "auto"
-                elif isinstance(kv_cache_scheme, str):
-                    scheme_name = kv_cache_scheme.strip().upper()
-                    if scheme_name in ("FP8", "FLOAT8"):
-                        kv_cache_quant_algo = "FP8"
-                    elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
-                        kv_cache_quant_algo = "NVFP4"
-                    else:
-                        kv_cache_quant_algo = "auto"
+            # Derive kv_cache_quant_algo from kv_cache_scheme dict
+            kv_cache_scheme = config.get("kv_cache_scheme")
+            if isinstance(kv_cache_scheme, dict):
+                if (
+                    kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
                 else:
                     kv_cache_quant_algo = "auto"
+            elif isinstance(kv_cache_scheme, str):
+                scheme_name = kv_cache_scheme.strip().upper()
+                if scheme_name in ("FP8", "FLOAT8"):
+                    kv_cache_quant_algo = "FP8"
+                elif scheme_name in ("FP4", "FLOAT4", "NVFP4"):
+                    kv_cache_quant_algo = "NVFP4"
+                else:
+                    kv_cache_quant_algo = "auto"
+            else:
+                kv_cache_quant_algo = "auto"
 
             group_size = config.get("group_size")
             # If group_size is not at top level, try to extract from config_groups
@@ -1037,8 +1046,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         )
 
     def is_layer_excluded(self, prefix: str):
-        import regex as re
-
         fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
         prefix_split = prefix.split(".")
         for pattern in self.exclude_modules:
@@ -1046,7 +1053,12 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             pattern_split = pattern.split(".")
             if re.fullmatch(regex_str, prefix):
                 return True
-            elif (
+            # Part-by-part check: handles wildcards like "mtp*" matching
+            # the "mtp_layers" part in "model.mtp_layers.0.lm_head"
+            for part in prefix_split:
+                if re.fullmatch(regex_str, part):
+                    return True
+            if (
                 pattern_split[-1] in fused_patterns
                 and pattern_split[-1] in prefix_split[-1]
             ):
