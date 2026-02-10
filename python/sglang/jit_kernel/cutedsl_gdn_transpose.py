@@ -158,159 +158,160 @@ def fused_recurrent_sigmoid_update_kernel_128x32_col(
         bos = 0
         state_idx = gIndices[batch_idx]
 
-    blk_coord_H = ((None, None, None, None), (state_idx, head_idx, None, bidx))
-    blkH = gH[blk_coord_H]
+    if state_idx >=0:
+        blk_coord_H = ((None, None, None, None), (state_idx, head_idx, None, bidx))
+        blkH = gH[blk_coord_H]
 
-    tidfrgH = cute.composition(blkH, tv_layout_h)
+        tidfrgH = cute.composition(blkH, tv_layout_h)
 
-    tArA = gA[head_idx].to(cute.Float32)
-    tDrD = gdt_bias[head_idx].to(cute.Float32)
+        tArA = gA[head_idx].to(cute.Float32)
+        tDrD = gdt_bias[head_idx].to(cute.Float32)
 
-    thrQ_coord = (tidx % x_threads, None)
-    thrK_coord = (tidx % x_threads, None)
-    thrV_coord = (bidx * y_threads + tidx // x_threads, None)
-    thrH_coord = (tidx, None)
-    thrO_coord = (bidx * y_threads + tidx // x_threads, None)
+        thrQ_coord = (tidx % x_threads, None)
+        thrK_coord = (tidx % x_threads, None)
+        thrV_coord = (bidx * y_threads + tidx // x_threads, None)
+        thrH_coord = (tidx, None)
+        thrO_coord = (bidx * y_threads + tidx // x_threads, None)
 
-    tHgH = tidfrgH[thrH_coord]
+        tHgH = tidfrgH[thrH_coord]
 
-    tHrH_i = tHgH.load().to(cute.Float32)
-    tHrH_g = cute.make_rmem_tensor_like(tHgH, cute.Float32)
-    tHrHk = cute.make_rmem_tensor_like(tHgH, cute.Float32)
+        tHrH_i = tHgH.load().to(cute.Float32)
+        tHrH_g = cute.make_rmem_tensor_like(tHgH, cute.Float32)
+        tHrHk = cute.make_rmem_tensor_like(tHgH, cute.Float32)
 
-    for t_idx in cutlass.range(0, 1, 1, unroll=1):
-        blk_coord_a = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
-        blk_coord_B = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
-        blk_coord_Q = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
-        )
-        blk_coord_K = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
-        )
-        blk_coord_V = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx, None),
-        )
-        blk_coord_O = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx, None),
-        )
-
-        blka = ga[blk_coord_a]
-        blkQ = gQ[blk_coord_Q]
-        blkK = gK[blk_coord_K]
-        blkV = gV[blk_coord_V]
-        blkO = gO[blk_coord_O]
-        blkB = gB[blk_coord_B]
-
-        tidfrgQ = cute.composition(blkQ, tv_layout_k)
-        tidfrgK = cute.composition(blkK, tv_layout_k)
-        tidfrgV = cute.composition(blkV, tv_layout_v)
-        tidfrgO = cute.composition(blkO, tv_layout_v)
-
-        tQgQ = tidfrgQ[thrQ_coord]
-        tKgK = tidfrgK[thrK_coord]
-        tVgV = tidfrgV[thrV_coord]
-        tOgO = tidfrgO[thrO_coord]
-
-        tBrBeta = blkB.load()[0].to(cute.Float32)
-        tMrMa = blka.load().to(cute.Float32)
-        tVrU = cute.make_rmem_tensor_like(tVgV, cute.Float32)
-        tVrV = tVgV.load().to(cute.Float32)
-
-        # sigmoid
-        x = tMrMa + tDrD
-        beta_x = softplus_beta * x
-        softplux_x = cute.where(
-            beta_x <= softplus_threshold,
-            (1.0 / softplus_beta) * cute.math.log(1.0 + cute.math.exp(beta_x)),
-            x,
-        )
-
-        tGrG = -cute.math.exp(tArA) * softplux_x
-        tBrB = 1.0 / (1.0 + cute.math.exp(-tBrBeta))
-
-        if const_expr(USE_QK_L2NORM_IN_KERNEL):
-            tQrQ = L2Norm(tQgQ, ELEM_H_X)
-            tKrK = L2Norm(tKgK, ELEM_H_X)
-        else:
-            tQrQ = tQgQ.load().to(cute.Float32)
-            tKrK = tKgK.load().to(cute.Float32)
-
-        for reg_Q_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
-            tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1] = mul_packed_f32x2(
-                (tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1]),
-                (scale, scale),
+        for t_idx in cutlass.range(0, 1, 1, unroll=1):
+            blk_coord_a = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
+            blk_coord_B = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
+            blk_coord_Q = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
+            )
+            blk_coord_K = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
+            )
+            blk_coord_V = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx, None),
+            )
+            blk_coord_O = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx, None),
             )
 
-        tGrGexp = cute.math.exp(tGrG, fastmath=True)[0]
-        for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
-            tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
-                (tHrH_i[reg_H_idx], tHrH_i[reg_H_idx + 1]),
-                (tGrGexp, tGrGexp),
+            blka = ga[blk_coord_a]
+            blkQ = gQ[blk_coord_Q]
+            blkK = gK[blk_coord_K]
+            blkV = gV[blk_coord_V]
+            blkO = gO[blk_coord_O]
+            blkB = gB[blk_coord_B]
+
+            tidfrgQ = cute.composition(blkQ, tv_layout_k)
+            tidfrgK = cute.composition(blkK, tv_layout_k)
+            tidfrgV = cute.composition(blkV, tv_layout_v)
+            tidfrgO = cute.composition(blkO, tv_layout_v)
+
+            tQgQ = tidfrgQ[thrQ_coord]
+            tKgK = tidfrgK[thrK_coord]
+            tVgV = tidfrgV[thrV_coord]
+            tOgO = tidfrgO[thrO_coord]
+
+            tBrBeta = blkB.load()[0].to(cute.Float32)
+            tMrMa = blka.load().to(cute.Float32)
+            tVrU = cute.make_rmem_tensor_like(tVgV, cute.Float32)
+            tVrV = tVgV.load().to(cute.Float32)
+
+            # sigmoid
+            x = tMrMa + tDrD
+            beta_x = softplus_beta * x
+            softplux_x = cute.where(
+                beta_x <= softplus_threshold,
+                (1.0 / softplus_beta) * cute.math.log(1.0 + cute.math.exp(beta_x)),
+                x,
             )
 
-        # b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
-        # b_h * b_k[:, None]
-        for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
-            tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1] = mul_packed_f32x2(
-                (tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1]),
-                (tKrK[reg_H_idx % ELEM_H_X], tKrK[(reg_H_idx + 1) % ELEM_H_X]),
-            )
+            tGrG = -cute.math.exp(tArA) * softplux_x
+            tBrB = 1.0 / (1.0 + cute.math.exp(-tBrBeta))
 
-        reduce_dim0(tHrHk, tVrU, ELEM_H_X, ELEM_H_Y)
+            if const_expr(USE_QK_L2NORM_IN_KERNEL):
+                tQrQ = L2Norm(tQgQ, ELEM_H_X)
+                tKrK = L2Norm(tKgK, ELEM_H_X)
+            else:
+                tQrQ = tQgQ.load().to(cute.Float32)
+                tKrK = tKgK.load().to(cute.Float32)
 
-        # b_v - sum(b_h*b_k)
-        for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
-            tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = sub_packed_f32x2(
-                (tVrV[reg_V_idx], tVrV[reg_V_idx + 1]),
-                (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
-            )
+            for reg_Q_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+                tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1] = mul_packed_f32x2(
+                    (tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1]),
+                    (scale, scale),
+                )
 
-            tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = mul_packed_f32x2(
-                (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
-                (tBrB, tBrB),
-            )
+            tGrGexp = cute.math.exp(tGrG, fastmath=True)[0]
+            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+                tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
+                    (tHrH_i[reg_H_idx], tHrH_i[reg_H_idx + 1]),
+                    (tGrGexp, tGrGexp),
+                )
 
-        # b_h = b_k[:, None] * b_v
-        for reg_K_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
-            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_Y, 2, unroll=2):
-                (
-                    tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx],
-                    tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
-                ) = fma_packed_f32x2(
-                    (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
+            # b_v = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))
+            # b_h * b_k[:, None]
+            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+                tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1] = mul_packed_f32x2(
+                    (tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1]),
+                    (tKrK[reg_H_idx % ELEM_H_X], tKrK[(reg_H_idx + 1) % ELEM_H_X]),
+                )
+
+            reduce_dim0(tHrHk, tVrU, ELEM_H_X, ELEM_H_Y)
+
+            # b_v - sum(b_h*b_k)
+            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+                tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = sub_packed_f32x2(
+                    (tVrV[reg_V_idx], tVrV[reg_V_idx + 1]),
                     (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
-                    (
-                        tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx],
-                        tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
-                    ),
                 )
 
-                (
-                    tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
-                    tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
-                ) = fma_packed_f32x2(
-                    (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
-                    (tVrU[reg_V_idx + 1], tVrU[reg_V_idx]),
-                    (
-                        tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
-                        tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
-                    ),
+                tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = mul_packed_f32x2(
+                    (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
+                    (tBrB, tBrB),
                 )
 
-        for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
-            tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
-                (tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1]),
-                (tQrQ[reg_H_idx % ELEM_H_X], tQrQ[(reg_H_idx + 1) % ELEM_H_X]),
-            )
+            # b_h = b_k[:, None] * b_v
+            for reg_K_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+                for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_Y, 2, unroll=2):
+                    (
+                        tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx],
+                        tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
+                    ) = fma_packed_f32x2(
+                        (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
+                        (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
+                        (
+                            tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx],
+                            tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
+                        ),
+                    )
 
-        reduce_dim0(tHrH_g, tOgO, ELEM_H_X, ELEM_H_Y)
+                    (
+                        tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
+                        tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
+                    ) = fma_packed_f32x2(
+                        (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
+                        (tVrU[reg_V_idx + 1], tVrU[reg_V_idx]),
+                        (
+                            tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
+                            tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
+                        ),
+                    )
 
-    for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 1, unroll=4):
-        tHgH[reg_H_idx] = tHrHk[reg_H_idx].to(tHgH.element_type)
+            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+                tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
+                    (tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1]),
+                    (tQrQ[reg_H_idx % ELEM_H_X], tQrQ[(reg_H_idx + 1) % ELEM_H_X]),
+                )
+
+            reduce_dim0(tHrH_g, tOgO, ELEM_H_X, ELEM_H_Y)
+
+        for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 1, unroll=4):
+            tHgH[reg_H_idx] = tHrHk[reg_H_idx].to(tHgH.element_type)
 
 
 @cute.jit
@@ -587,180 +588,181 @@ def fused_recurrent_update_kernel_128x32_col(
 
     state_idx = gIndices[batch_idx]
 
-    cache_idx = -1
-    if const_expr(CACHE_INTERMEDIATE_STATES):
-        cache_idx = gInterIndices[batch_idx]
-
-    if const_expr(cu_seqlens is not None):
-        batch_idx = 0
-
-    blk_coord_H = ((None, None, None, None), (state_idx, head_idx, None, bidx))
-
-    blkH = gH[blk_coord_H]
-
-    tidfrgH = cute.composition(blkH, tv_layout_h)
-
-    thrQ_coord = (tidx % x_threads, None)
-    thrK_coord = (tidx % x_threads, None)
-    thrV_coord = (bidx * y_threads + tidx // x_threads, None)
-    thrH_coord = (tidx, None)
-    thrI_coord = (tidx, None)
-    thrO_coord = (bidx * y_threads + tidx // x_threads, None)
-
-    tHgH = tidfrgH[thrH_coord]
-    tHrH_i = tHgH.load().to(cute.Float32)
-    tHrH_g = cute.make_rmem_tensor_like(tHgH, cute.Float32)
-    tHrHk = cute.make_rmem_tensor_like(tHgH, cute.Float32)
-
-    # Initialize tHrHk with tHrH_i to avoid dominance issues
-    for reg_H_idx in cutlass.range_constexpr(
-        0, ELEM_H_X * ELEM_H_Y, 1, unroll=ELEM_H_X * ELEM_H_Y
-    ):
-        tHrHk[reg_H_idx] = tHrH_i[reg_H_idx].to(tHrHk.element_type)
-
-    for t_idx in cutlass.range(0, T, 1, unroll=1):
-        blk_coord_B = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
-        blk_coord_G = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
-        blk_coord_Q = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
-        )
-        blk_coord_K = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
-        )
-        blk_coord_V = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx, None),
-        )
-        blk_coord_O = (
-            (None, None, None, None),
-            (batch_idx, bos + t_idx, head_idx, None),
-        )
-
-        blkQ = gQ[blk_coord_Q]
-        blkK = gK[blk_coord_K]
-        blkV = gV[blk_coord_V]
-        blkO = gO[blk_coord_O]
-        blkB = gB[blk_coord_B]
-        blkG = gG[blk_coord_G]
-
-        tIgI = 0.0
+    if state_idx >=0:
+        cache_idx = -1
         if const_expr(CACHE_INTERMEDIATE_STATES):
-            blk_coord_I = (
-                (None, None, None, None, None),
-                (cache_idx, t_idx, head_idx, None, bidx),
+            cache_idx = gInterIndices[batch_idx]
+
+        if const_expr(cu_seqlens is not None):
+            batch_idx = 0
+
+        blk_coord_H = ((None, None, None, None), (state_idx, head_idx, None, bidx))
+
+        blkH = gH[blk_coord_H]
+
+        tidfrgH = cute.composition(blkH, tv_layout_h)
+
+        thrQ_coord = (tidx % x_threads, None)
+        thrK_coord = (tidx % x_threads, None)
+        thrV_coord = (bidx * y_threads + tidx // x_threads, None)
+        thrH_coord = (tidx, None)
+        thrI_coord = (tidx, None)
+        thrO_coord = (bidx * y_threads + tidx // x_threads, None)
+
+        tHgH = tidfrgH[thrH_coord]
+        tHrH_i = tHgH.load().to(cute.Float32)
+        tHrH_g = cute.make_rmem_tensor_like(tHgH, cute.Float32)
+        tHrHk = cute.make_rmem_tensor_like(tHgH, cute.Float32)
+
+        # Initialize tHrHk with tHrH_i to avoid dominance issues
+        for reg_H_idx in cutlass.range_constexpr(
+            0, ELEM_H_X * ELEM_H_Y, 1, unroll=ELEM_H_X * ELEM_H_Y
+        ):
+            tHrHk[reg_H_idx] = tHrH_i[reg_H_idx].to(tHrHk.element_type)
+
+        for t_idx in cutlass.range(0, T, 1, unroll=1):
+            blk_coord_B = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
+            blk_coord_G = ((None, None, None), (batch_idx, bos + t_idx, head_idx))
+            blk_coord_Q = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
             )
-            blkI = gInterState[blk_coord_I]
-            tidfrgI = cute.composition(blkI, tv_layout_h)
-            tIgI = tidfrgI[thrI_coord]
-
-        tidfrgQ = cute.composition(blkQ, tv_layout_k)
-        tidfrgK = cute.composition(blkK, tv_layout_k)
-        tidfrgV = cute.composition(blkV, tv_layout_v)
-        tidfrgO = cute.composition(blkO, tv_layout_v)
-
-        tQgQ = tidfrgQ[thrQ_coord]
-        tKgK = tidfrgK[thrK_coord]
-        tVgV = tidfrgV[thrV_coord]
-        tOgO = tidfrgO[thrO_coord]
-        tBrB = blkB.load()[0].to(cute.Float32)
-        tGrG = blkG.load()[0].to(cute.Float32)
-
-        tVrU = cute.make_rmem_tensor_like(tVgV, cute.Float32)
-        tVrV = tVgV.load().to(cute.Float32)
-
-        if const_expr(USE_QK_L2NORM_IN_KERNEL):
-            tQrQ = L2Norm(tQgQ, ELEM_H_X)
-            tKrK = L2Norm(tKgK, ELEM_H_X)
-        else:
-            tQrQ = tQgQ.load().to(cute.Float32)
-            tKrK = tKgK.load().to(cute.Float32)
-
-        for reg_Q_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
-            tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1] = mul_packed_f32x2(
-                (tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1]),
-                (scale, scale),
+            blk_coord_K = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx // (HV // HK), None),
             )
-
-        if const_expr(gG is not None):
-            tGrGexp = cute.math.exp(tGrG, fastmath=True)
-            for reg_H_idx in cutlass.range_constexpr(
-                0, ELEM_H_X * ELEM_H_Y, 1, unroll=1
-            ):
-                tHrH_g[reg_H_idx] = tHrHk[reg_H_idx] * tGrGexp
-        else:
-            for reg_H_idx in cutlass.range_constexpr(
-                0, ELEM_H_X * ELEM_H_Y, 1, unroll=1
-            ):
-                tHrH_g[reg_H_idx] = tHrHk[reg_H_idx]
-
-        for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
-            tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1] = mul_packed_f32x2(
-                (tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1]),
-                (tKrK[reg_H_idx % ELEM_H_X], tKrK[(reg_H_idx + 1) % ELEM_H_X]),
+            blk_coord_V = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx, None),
+            )
+            blk_coord_O = (
+                (None, None, None, None),
+                (batch_idx, bos + t_idx, head_idx, None),
             )
 
-        reduce_dim0(tHrHk, tVrU, ELEM_H_X, ELEM_H_Y)
+            blkQ = gQ[blk_coord_Q]
+            blkK = gK[blk_coord_K]
+            blkV = gV[blk_coord_V]
+            blkO = gO[blk_coord_O]
+            blkB = gB[blk_coord_B]
+            blkG = gG[blk_coord_G]
 
-        for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
-            tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = sub_packed_f32x2(
-                (tVrV[reg_V_idx], tVrV[reg_V_idx + 1]),
-                (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
-            )
+            tIgI = 0.0
+            if const_expr(CACHE_INTERMEDIATE_STATES):
+                blk_coord_I = (
+                    (None, None, None, None, None),
+                    (cache_idx, t_idx, head_idx, None, bidx),
+                )
+                blkI = gInterState[blk_coord_I]
+                tidfrgI = cute.composition(blkI, tv_layout_h)
+                tIgI = tidfrgI[thrI_coord]
 
-            tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = mul_packed_f32x2(
-                (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
-                (tBrB, tBrB),
-            )
+            tidfrgQ = cute.composition(blkQ, tv_layout_k)
+            tidfrgK = cute.composition(blkK, tv_layout_k)
+            tidfrgV = cute.composition(blkV, tv_layout_v)
+            tidfrgO = cute.composition(blkO, tv_layout_v)
 
-        for reg_K_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
-            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_Y, 2, unroll=2):
-                (
-                    tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx],
-                    tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
-                ) = fma_packed_f32x2(
-                    (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
-                    (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
-                    (
-                        tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx],
-                        tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
-                    ),
+            tQgQ = tidfrgQ[thrQ_coord]
+            tKgK = tidfrgK[thrK_coord]
+            tVgV = tidfrgV[thrV_coord]
+            tOgO = tidfrgO[thrO_coord]
+            tBrB = blkB.load()[0].to(cute.Float32)
+            tGrG = blkG.load()[0].to(cute.Float32)
+
+            tVrU = cute.make_rmem_tensor_like(tVgV, cute.Float32)
+            tVrV = tVgV.load().to(cute.Float32)
+
+            if const_expr(USE_QK_L2NORM_IN_KERNEL):
+                tQrQ = L2Norm(tQgQ, ELEM_H_X)
+                tKrK = L2Norm(tKgK, ELEM_H_X)
+            else:
+                tQrQ = tQgQ.load().to(cute.Float32)
+                tKrK = tKgK.load().to(cute.Float32)
+
+            for reg_Q_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+                tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1] = mul_packed_f32x2(
+                    (tQrQ[reg_Q_idx], tQrQ[reg_Q_idx + 1]),
+                    (scale, scale),
                 )
 
-                (
-                    tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
-                    tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
-                ) = fma_packed_f32x2(
-                    (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
-                    (tVrU[reg_V_idx + 1], tVrU[reg_V_idx]),
-                    (
-                        tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
-                        tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
-                    ),
-                )
-
-        if const_expr(not DISABLE_OUTPUT_CALCULATION):
-            for reg_H_idx in cutlass.range_constexpr(
-                0, ELEM_H_X * ELEM_H_Y, 2, unroll=2
-            ):
-                tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
-                    (tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1]),
-                    (tQrQ[reg_H_idx % ELEM_H_X], tQrQ[(reg_H_idx + 1) % ELEM_H_X]),
-                )
-
-            reduce_dim0(tHrH_g, tOgO, ELEM_H_X, ELEM_H_Y)
-
-        if const_expr(CACHE_INTERMEDIATE_STATES):
-            if cache_idx >= 0:
-                for reg_I_idx in cutlass.range_constexpr(
-                    0, ELEM_H_X * ELEM_H_Y, 1, unroll=4
+            if const_expr(gG is not None):
+                tGrGexp = cute.math.exp(tGrG, fastmath=True)
+                for reg_H_idx in cutlass.range_constexpr(
+                    0, ELEM_H_X * ELEM_H_Y, 1, unroll=1
                 ):
-                    tIgI[reg_I_idx] = tHrHk[reg_I_idx].to(tIgI.element_type)
+                    tHrH_g[reg_H_idx] = tHrHk[reg_H_idx] * tGrGexp
+            else:
+                for reg_H_idx in cutlass.range_constexpr(
+                    0, ELEM_H_X * ELEM_H_Y, 1, unroll=1
+                ):
+                    tHrH_g[reg_H_idx] = tHrHk[reg_H_idx]
 
-    if const_expr(not DISABLE_STATE_UPDATE):
-        for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 1, unroll=4):
-            tHgH[reg_H_idx] = tHrHk[reg_H_idx].to(tHgH.element_type)
+            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 2, unroll=2):
+                tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1] = mul_packed_f32x2(
+                    (tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1]),
+                    (tKrK[reg_H_idx % ELEM_H_X], tKrK[(reg_H_idx + 1) % ELEM_H_X]),
+                )
+
+            reduce_dim0(tHrHk, tVrU, ELEM_H_X, ELEM_H_Y)
+
+            for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+                tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = sub_packed_f32x2(
+                    (tVrV[reg_V_idx], tVrV[reg_V_idx + 1]),
+                    (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
+                )
+
+                tVrU[reg_V_idx], tVrU[reg_V_idx + 1] = mul_packed_f32x2(
+                    (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
+                    (tBrB, tBrB),
+                )
+
+            for reg_K_idx in cutlass.range_constexpr(0, ELEM_H_X, 2, unroll=2):
+                for reg_V_idx in cutlass.range_constexpr(0, ELEM_H_Y, 2, unroll=2):
+                    (
+                        tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx],
+                        tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
+                    ) = fma_packed_f32x2(
+                        (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
+                        (tVrU[reg_V_idx], tVrU[reg_V_idx + 1]),
+                        (
+                            tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx],
+                            tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx + 1],
+                        ),
+                    )
+
+                    (
+                        tHrHk[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
+                        tHrHk[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
+                    ) = fma_packed_f32x2(
+                        (tKrK[reg_K_idx], tKrK[reg_K_idx + 1]),
+                        (tVrU[reg_V_idx + 1], tVrU[reg_V_idx]),
+                        (
+                            tHrH_g[(reg_V_idx + 1) * ELEM_H_X + reg_K_idx],
+                            tHrH_g[reg_V_idx * ELEM_H_X + reg_K_idx + 1],
+                        ),
+                    )
+
+            if const_expr(not DISABLE_OUTPUT_CALCULATION):
+                for reg_H_idx in cutlass.range_constexpr(
+                    0, ELEM_H_X * ELEM_H_Y, 2, unroll=2
+                ):
+                    tHrH_g[reg_H_idx], tHrH_g[reg_H_idx + 1] = mul_packed_f32x2(
+                        (tHrHk[reg_H_idx], tHrHk[reg_H_idx + 1]),
+                        (tQrQ[reg_H_idx % ELEM_H_X], tQrQ[(reg_H_idx + 1) % ELEM_H_X]),
+                    )
+
+                reduce_dim0(tHrH_g, tOgO, ELEM_H_X, ELEM_H_Y)
+
+            if const_expr(CACHE_INTERMEDIATE_STATES):
+                if cache_idx >= 0:
+                    for reg_I_idx in cutlass.range_constexpr(
+                        0, ELEM_H_X * ELEM_H_Y, 1, unroll=4
+                    ):
+                        tIgI[reg_I_idx] = tHrHk[reg_I_idx].to(tIgI.element_type)
+
+        if const_expr(not DISABLE_STATE_UPDATE):
+            for reg_H_idx in cutlass.range_constexpr(0, ELEM_H_X * ELEM_H_Y, 1, unroll=4):
+                tHgH[reg_H_idx] = tHrHk[reg_H_idx].to(tHgH.element_type)
 
 
 @cute.jit
