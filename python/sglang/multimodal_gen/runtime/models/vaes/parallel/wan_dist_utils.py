@@ -199,11 +199,10 @@ class WanDistConv2d(nn.Conv2d):
         self.padding = (0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
+        self.rank = get_sp_parallel_rank()
+        self.world_size = get_sp_world_size()
 
     def forward(self, x):
-        rank = get_sp_parallel_rank()
-        world_size = get_sp_world_size()
-
         x = F.pad(x, self._padding)
 
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
@@ -215,7 +214,7 @@ class WanDistConv2d(nn.Conv2d):
 
         pad_top = self.height_pad_top
         stride = self.stride[-2]
-        global_start = rank * x.shape[-2]
+        global_start = self.rank * x.shape[-2]
         if self.height_halo_size > 0 and stride > 1:
             shift = (global_start - self.height_halo_size + pad_top) % stride
             if shift:
@@ -228,7 +227,7 @@ class WanDistConv2d(nn.Conv2d):
             return out
 
         local_height = x.shape[-2]
-        global_height = local_height * world_size
+        global_height = local_height * self.world_size
         halo = self.height_halo_size
         pad_bottom = self.height_pad_bottom
         kernel = self.kernel_size[-2]
@@ -289,11 +288,10 @@ class WanDistCausalConv3d(nn.Conv3d):
         self.padding = (0, 0, 0)
         self._halo_recv_top_buf: torch.Tensor | None = None
         self._halo_recv_bottom_buf: torch.Tensor | None = None
+        self.rank = get_sp_parallel_rank()
+        self.world_size = get_sp_world_size()
 
     def forward(self, x, cache_x=None):
-        rank = get_sp_parallel_rank()
-        world_size = get_sp_world_size()
-
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
             cache_x = cache_x.to(x.device)
@@ -315,7 +313,7 @@ class WanDistCausalConv3d(nn.Conv3d):
 
         pad_top = self.height_pad_top
         stride = self.stride[-2]
-        global_start = rank * x.shape[-2]
+        global_start = self.rank * x.shape[-2]
         if self.height_halo_size > 0 and stride > 1:
             shift = (global_start - self.height_halo_size + pad_top) % stride
             if shift:
@@ -328,7 +326,7 @@ class WanDistCausalConv3d(nn.Conv3d):
             return out
 
         local_height = x.shape[-2]
-        global_height = local_height * world_size
+        global_height = local_height * self.world_size
         halo = self.height_halo_size
         pad_bottom = self.height_pad_bottom
         kernel = self.kernel_size[-2]
@@ -351,16 +349,16 @@ class WanDistZeroPad2d(nn.Module):
     def __init__(self, padding: tuple[int, int, int, int]) -> None:
         super().__init__()
         self.padding = padding  # (left, right, top, bottom)
+        self.rank = get_sp_parallel_rank()
+        self.world_size = get_sp_world_size()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         left, right, top, bottom = self.padding
-        world_size = get_sp_world_size()
-        if world_size <= 1:
+        if self.world_size <= 1:
             return F.pad(x, (left, right, top, bottom))
-        rank = get_sp_parallel_rank()
         # Only the first/last rank should contribute global top/bottom padding.
-        top = top if rank == 0 else 0
-        bottom = bottom if rank == world_size - 1 else 0
+        top = top if self.rank == 0 else 0
+        bottom = bottom if self.rank == self.world_size - 1 else 0
         return F.pad(x, (left, right, top, bottom))
 
 
@@ -477,19 +475,17 @@ class WanDistAttentionBlock(nn.Module):
         self.norm = WanRMS_norm(dim)
         self.to_qkv = nn.Conv2d(dim, dim * 3, 1)
         self.proj = nn.Conv2d(dim, dim, 1)
+        self.rank = get_sp_parallel_rank()
+        self.world_size = get_sp_world_size()
+        self.sp_group = get_sp_group()
 
     def forward(self, x):
-        rank = 0
-        world_size = 1
-        if dist.is_initialized():
-            world_size = get_sp_world_size()
-            rank = get_sp_parallel_rank()
-            x = get_sp_group().all_gather(x, dim=-2)
+        if self.world_size > 1:
+            x = self.sp_group.all_gather(x, dim=-2)
             x = x.contiguous()
-
         x = attention_block_forward(self, x)
-        if world_size > 1:
-            x = torch.chunk(x, world_size, dim=-2)[rank]
+        if self.world_size > 1:
+            x = torch.chunk(x, self.world_size, dim=-2)[self.rank]
 
         return x
 

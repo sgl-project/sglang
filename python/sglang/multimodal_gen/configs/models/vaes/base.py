@@ -42,9 +42,6 @@ class VAEConfig(ModelConfig):
     use_parallel_tiling: bool = True
     use_temporal_scaling_frames: bool = True
 
-    use_parallel_encode: bool = True
-    use_parallel_decode: bool = True
-
     def __post_init__(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
@@ -139,20 +136,6 @@ class VAEConfig(ModelConfig):
             dest=f"{prefix.replace('-', '_')}.use_parallel_tiling",
             default=VAEConfig.use_parallel_tiling,
             help="Whether to use parallel tiling for VAE",
-        )
-        parser.add_argument(
-            f"--{prefix}.use-parallel-encode",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.use_parallel_encode",
-            default=VAEConfig.use_parallel_encode,
-            help="Whether to use parallel encode for VAE",
-        )
-        parser.add_argument(
-            f"--{prefix}.use-parallel-decode",
-            action=StoreBoolean,
-            dest=f"{prefix.replace('-', '_')}.use_parallel_decode",
-            default=VAEConfig.use_parallel_decode,
-            help="Whether to use parallel decode for VAE",
         )
         return parser
 
