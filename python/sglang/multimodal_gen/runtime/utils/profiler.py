@@ -126,6 +126,7 @@ class SGLDiffusionProfiler:
             torch.cuda.synchronize()
         if current_platform.is_npu():
             torch.npu.synchronize()
+            export_trace = False  # set to false because our internal torch_npu.profiler will generate trace file
         self.profiler.stop()
 
         if export_trace:
@@ -147,8 +148,7 @@ class SGLDiffusionProfiler:
                     f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{self.rank}.trace.json.gz",
                 )
             )
-            if not current_platform.is_npu():
-                self.profiler.export_chrome_trace(trace_path)
+            self.profiler.export_chrome_trace(trace_path)
 
             if self._check_trace_integrity(trace_path):
                 logger.info(f"Saved profiler traces to: {CYAN}{trace_path}{RESET}")
