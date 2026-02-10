@@ -376,7 +376,7 @@ class OpenAIServingRerank(OpenAIServingBase):
                 for doc in request.documents
             ]
 
-            probs = await self.tokenizer_manager.score_prompts(
+            probs, prompt_tokens = await self.tokenizer_manager.score_prompts(
                 prompts,
                 label_token_ids=[self._yes_token_id, self._no_token_id],
                 apply_softmax=False,

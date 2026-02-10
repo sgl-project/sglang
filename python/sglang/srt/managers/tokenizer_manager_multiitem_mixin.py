@@ -14,7 +14,7 @@ class TokenizerManagerMultiItemMixin:
         label_token_ids: List[int],
         apply_softmax: bool = False,
         request: Optional[Any] = None,
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], int]:
         """
         Score probabilities of specified token IDs after each *full prompt*.
 
@@ -29,7 +29,8 @@ class TokenizerManagerMultiItemMixin:
             request: Optional FastAPI request object.
 
         Returns:
-            List of score lists, one for each prompt, each in the order of label_token_ids.
+            scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+            prompt_tokens: The number of prompt tokens processed.
         """
         # Text prompts
         if isinstance(prompts, str) or (
@@ -180,7 +181,8 @@ class TokenizerManagerMultiItemMixin:
             apply_softmax: Whether to apply softmax normalization
 
         Returns:
-            List of score lists, one for each result
+            scores: List of score lists, one for each result
+            prompt_tokens: The number of prompt tokens processed.
         """
         scores = []
         prompt_tokens = 0
@@ -238,11 +240,14 @@ class TokenizerManagerMultiItemMixin:
             request: Optional FastAPI request object
 
         Returns:
-            List of lists containing probabilities for each item and each label token
+            scores: List of lists containing probabilities for each item and each label token
+            prompt_tokens: The number of prompt tokens processed.
         """
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
 
+        if items is None:
+            raise ValueError("items must be provided")
         if not items:
             return [], 0
 

@@ -163,7 +163,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 # Return [p_yes, p_no] for each prompt
                 assert len(prompts) == 2
                 assert label_token_ids and len(label_token_ids) == 2
-                return [[0.9, 0.1], [0.2, 0.8]]
+                return [[0.9, 0.1], [0.2, 0.8]], 0
 
         handler = OpenAIServingRerank(_TM())
         req = V1RerankReqInput(query="q", documents=["d1", "d2"], return_documents=True)

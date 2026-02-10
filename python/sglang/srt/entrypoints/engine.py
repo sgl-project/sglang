@@ -727,7 +727,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], int]:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
         query = "<|user|>Is the following city the capital of France? "
@@ -752,8 +752,9 @@ class Engine(EngineBase):
             item_first: If True, prepend items to query. Otherwise append items to query.
 
         Returns:
-            List of dictionaries mapping token IDs to their probabilities for each item.
+            scores: List of dictionaries mapping token IDs to their probabilities for each item.
             Each dictionary in the list corresponds to one item input.
+            prompt_tokens: The number of prompt tokens processed.
 
         Raises:
             ValueError: If query is not provided, or if items is not provided,
@@ -777,7 +778,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> List[List[float]]:
+    ) -> Tuple[List[List[float]], int]:
         """
         Asynchronous version of score method.
 
