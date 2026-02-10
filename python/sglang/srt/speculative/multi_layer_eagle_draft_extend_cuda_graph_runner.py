@@ -387,6 +387,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 forward_batch,
             )
 
+            # Chain-style MTP: write model output (hidden_states_before_norm) back to buffer
+            # so assign_new_state_triton passes MTP output to next step, not input.
+            if ret.hidden_states is not None:
+                self.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
+
             select_index = (
                 torch.arange(bs, device=self.model_runner.device)
                 * (self.speculative_num_draft_tokens + self.step)

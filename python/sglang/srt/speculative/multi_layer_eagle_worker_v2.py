@@ -375,6 +375,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
+            # FULL mode so we get all-token hidden_states for chain-style MTP
+            forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
@@ -382,6 +384,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
+            # Chain-style: use this step's output hidden_states as next step's input
+            if step < self.speculative_num_steps - 1 and output.logits_output.hidden_states is not None:
+                forward_batch.spec_info.hidden_states = output.logits_output.hidden_states
             if forward_batch.extend_seq_lens is not None:
                 rotate_input_ids_triton(
                     forward_batch.input_ids,
@@ -591,8 +596,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 model_worker_batch
             )
 
-            # Draft prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+            # Draft prefill: use FULL so we get all-token hidden states for chain-style MTP
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,
