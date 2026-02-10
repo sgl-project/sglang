@@ -265,9 +265,9 @@ def _fused_fp8_set_qkv_buffer_kernel(
     v_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
     # Cache location indices
     cache_loc_ptr,  # [num_tokens] -> token to cache location mapping
-    # Pointers to scalar inverse scales (computed on GPU in wrapper)
-    inv_k_scale_ptr,  # pointer to 0-D tensor on GPU
-    inv_v_scale_ptr,  # pointer to 0-D tensor on GPU
+    # Scalar inverse scales for K/V quantization
+    inv_k_scale,  # float scalar inverse scale for K
+    inv_v_scale,  # float scalar inverse scale for V
     use_provided_scale: tl.constexpr,  # whether to use provided scale for K/V
     # Tensor dimensions
     num_q_heads: tl.constexpr,
@@ -320,10 +320,7 @@ def _fused_fp8_set_qkv_buffer_kernel(
         page_id = cache_loc // page_size
         page_offset = cache_loc % page_size
 
-        if use_provided_scale:
-            inv_scale = tl.load(inv_k_scale_ptr)
-        else:
-            inv_scale = 1.0
+        inv_scale = inv_k_scale if use_provided_scale else 1.0
 
         _process_kv_tensor(
             token_id,
@@ -355,10 +352,7 @@ def _fused_fp8_set_qkv_buffer_kernel(
         page_id = cache_loc // page_size
         page_offset = cache_loc % page_size
 
-        if use_provided_scale:
-            inv_scale = tl.load(inv_v_scale_ptr)
-        else:
-            inv_scale = 1.0
+        inv_scale = inv_v_scale if use_provided_scale else 1.0
 
         _process_kv_tensor(
             token_id,
@@ -714,8 +708,8 @@ def fused_fp8_set_qkv_buffer(
     v_cache: torch.Tensor,
     cache_loc: torch.Tensor,
     q_out: torch.Tensor,
-    inv_k_scale: Optional[torch.Tensor] = None,
-    inv_v_scale: Optional[torch.Tensor] = None,
+    inv_k_scale: Optional[float] = None,
+    inv_v_scale: Optional[float] = None,
     page_size: int = 16,
 ) -> None:
     """Fused FP8 quantization for Q, K, V. Writes Q to q_out, K/V to cache."""
@@ -757,8 +751,8 @@ def fused_fp8_set_qkv_buffer(
     grid = (num_tokens, 2 * num_kv_head_blocks + num_q_head_blocks)
 
     use_provided_scale = inv_k_scale is not None and inv_v_scale is not None
-    inv_k_scale_ptr = inv_k_scale if use_provided_scale else k_3d
-    inv_v_scale_ptr = inv_v_scale if use_provided_scale else k_3d
+    inv_k_scale_val = inv_k_scale if use_provided_scale else 1.0
+    inv_v_scale_val = inv_v_scale if use_provided_scale else 1.0
 
     _fused_fp8_set_qkv_buffer_kernel[grid](
         q_3d,
@@ -768,8 +762,8 @@ def fused_fp8_set_qkv_buffer(
         k_cache,
         v_cache,
         cache_loc,
-        inv_k_scale_ptr,
-        inv_v_scale_ptr,
+        inv_k_scale_val,
+        inv_v_scale_val,
         use_provided_scale,
         num_q_heads,
         num_kv_heads,
@@ -827,8 +821,8 @@ if __name__ == "__main__":
     cache_loc = torch.arange(num_tokens, device=device, dtype=torch.int32)
 
     # Create inverse scales
-    inv_k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
-    inv_v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+    inv_k_scale = 1.0
+    inv_v_scale = 1.0
 
     # Run the kernel
     fused_fp8_set_qkv_buffer(

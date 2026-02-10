@@ -127,9 +127,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self.num_q_heads = config.num_attention_heads // model_runner.tp_size
         self.head_dim = config.head_dim
 
-        # Cache for inv_scale tensors (layer_id -> (inv_k_scale, inv_v_scale))
-        # Pre-computed on first use to avoid tensor creation during CUDA graph capture
-        self._inv_scale_cache: dict = {}
 
     def init_cuda_graph_state(
         self,
@@ -451,30 +448,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Check if we should use the fused FP8 QKV quantization path."""
         return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
 
-    def _get_inv_scale_tensors(
-        self, layer: RadixAttention
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Get cached inv_scale tensors for a layer (create on first use)."""
-        layer_id = layer.layer_id
-        if layer_id not in self._inv_scale_cache:
-            k_scale, v_scale = layer.k_scale, layer.v_scale
-            if k_scale is not None and v_scale is not None:
-
-                def to_inv_scale(scale):
-                    if isinstance(scale, torch.Tensor):
-                        return (1.0 / scale).to(device=self.device, dtype=torch.float32)
-                    return torch.tensor(
-                        1.0 / float(scale), device=self.device, dtype=torch.float32
-                    )
-
-                self._inv_scale_cache[layer_id] = (
-                    to_inv_scale(k_scale),
-                    to_inv_scale(v_scale),
-                )
-            else:
-                self._inv_scale_cache[layer_id] = (None, None)
-        return self._inv_scale_cache[layer_id]
-
     def _ensure_q_fp8_buffer(self, num_tokens: int) -> None:
         """Lazy allocate q_fp8_buffer if needed."""
         if self.q_fp8_buffer is None or self.q_fp8_buffer.shape[0] < num_tokens:
@@ -503,7 +476,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         self._ensure_q_fp8_buffer(num_tokens)
         q_out = self.q_fp8_buffer[:num_tokens]
-        inv_k_scale, inv_v_scale = self._get_inv_scale_tensors(layer)
+        k_scale, v_scale = layer.k_scale, layer.v_scale
+        if k_scale is not None and v_scale is not None:
+            inv_k_scale = 1.0 / float(k_scale)
+            inv_v_scale = 1.0 / float(v_scale)
+        else:
+            inv_k_scale = None
+            inv_v_scale = None
         fused_fp8_set_qkv_buffer(
             q=q,
             k=k,
@@ -512,8 +491,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v_cache=v_cache,
             cache_loc=cache_loc,
             q_out=q_out,
-            inv_k_scale=inv_k_scale,  # Pre-computed tensor or None
-            inv_v_scale=inv_v_scale,  # Pre-computed tensor or None
+            inv_k_scale=inv_k_scale,
+            inv_v_scale=inv_v_scale,
             page_size=self.page_size,
         )
 
