@@ -109,7 +109,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
-    PinBlocksReqInput,
+    PinPrefixReqInput,
     ProfileReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -118,7 +118,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
-    UnpinBlocksReqInput,
+    UnpinPrefixReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -804,11 +804,11 @@ async def hicache_storage_backend_status():
     }
 
 
-@app.api_route("/hicache/pin_blocks", methods=["POST"])
+@app.api_route("/hicache/pin_prefix", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def pin_blocks(obj: PinBlocksReqInput):
-    """Pin blocks to resist eviction."""
-    ret = await _global_state.tokenizer_manager.pin_blocks(obj.block_hashes)
+async def pin_prefix(obj: PinPrefixReqInput):
+    """Pin a prefix by token_ids to resist eviction."""
+    ret = await _global_state.tokenizer_manager.pin_prefix(obj.token_ids)
     return ORJSONResponse(
         content={
             "status": "ok" if ret.success else "error",
@@ -819,11 +819,11 @@ async def pin_blocks(obj: PinBlocksReqInput):
     )
 
 
-@app.api_route("/hicache/unpin_blocks", methods=["POST"])
+@app.api_route("/hicache/unpin_prefix", methods=["POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def unpin_blocks(obj: UnpinBlocksReqInput):
-    """Unpin blocks to allow normal eviction."""
-    ret = await _global_state.tokenizer_manager.unpin_blocks(obj.block_hashes)
+async def unpin_prefix(obj: UnpinPrefixReqInput):
+    """Unpin a prefix by token_ids to allow normal eviction."""
+    ret = await _global_state.tokenizer_manager.unpin_prefix(obj.token_ids)
     return ORJSONResponse(
         content={
             "status": "ok" if ret.success else "error",

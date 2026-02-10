@@ -57,8 +57,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
-    PinBlocksReqInput,
-    PinBlocksReqOutput,
+    PinPrefixReqInput,
+    PinPrefixReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -74,8 +74,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UnpinBlocksReqInput,
-    UnpinBlocksReqOutput,
+    UnpinPrefixReqInput,
+    UnpinPrefixReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -216,10 +216,10 @@ class TokenizerCommunicatorMixin:
         self.detach_hicache_storage_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.pin_blocks_communicator = _Communicator(
+        self.pin_prefix_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
-        self.unpin_blocks_communicator = _Communicator(
+        self.unpin_prefix_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.profile_communicator = _Communicator(
@@ -310,12 +310,12 @@ class TokenizerCommunicatorMixin:
                     self.detach_hicache_storage_communicator.handle_recv,
                 ),
                 (
-                    PinBlocksReqOutput,
-                    self.pin_blocks_communicator.handle_recv,
+                    PinPrefixReqOutput,
+                    self.pin_prefix_communicator.handle_recv,
                 ),
                 (
-                    UnpinBlocksReqOutput,
-                    self.unpin_blocks_communicator.handle_recv,
+                    UnpinPrefixReqOutput,
+                    self.unpin_prefix_communicator.handle_recv,
                 ),
                 (
                     FlushCacheReqOutput,
@@ -413,29 +413,29 @@ class TokenizerCommunicatorMixin:
             self.server_args.hicache_storage_backend_extra_config = None
         return out
 
-    async def pin_blocks(
-        self: TokenizerManager, block_hashes: List[int]
-    ) -> PinBlocksReqOutput:
-        """Pin blocks to resist eviction."""
-        results = await self.pin_blocks_communicator(
-            PinBlocksReqInput(block_hashes=block_hashes)
+    async def pin_prefix(
+        self: TokenizerManager, token_ids: List[int]
+    ) -> PinPrefixReqOutput:
+        """Pin a prefix by token_ids to resist eviction."""
+        results = await self.pin_prefix_communicator(
+            PinPrefixReqInput(token_ids=token_ids)
         )
         all_success, all_message = _Communicator.merge_results(results)
         total = sum(r.pinned_count for r in results)
-        return PinBlocksReqOutput(
+        return PinPrefixReqOutput(
             success=all_success, pinned_count=total, message=all_message
         )
 
-    async def unpin_blocks(
-        self: TokenizerManager, block_hashes: List[int]
-    ) -> UnpinBlocksReqOutput:
-        """Unpin blocks to allow normal eviction."""
-        results = await self.unpin_blocks_communicator(
-            UnpinBlocksReqInput(block_hashes=block_hashes)
+    async def unpin_prefix(
+        self: TokenizerManager, token_ids: List[int]
+    ) -> UnpinPrefixReqOutput:
+        """Unpin a prefix by token_ids to allow normal eviction."""
+        results = await self.unpin_prefix_communicator(
+            UnpinPrefixReqInput(token_ids=token_ids)
         )
         all_success, all_message = _Communicator.merge_results(results)
         total = sum(r.unpinned_count for r in results)
-        return UnpinBlocksReqOutput(
+        return UnpinPrefixReqOutput(
             success=all_success, unpinned_count=total, message=all_message
         )
 

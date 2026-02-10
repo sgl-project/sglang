@@ -1247,28 +1247,28 @@ class DetachHiCacheStorageReqOutput(BaseReq):
 
 
 @dataclass
-class PinBlocksReqInput(BaseReq):
-    """Pin blocks to resist eviction."""
+class PinPrefixReqInput(BaseReq):
+    """Pin a prefix by token_ids to resist eviction."""
 
-    block_hashes: List[int] = field(default_factory=list)
+    token_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
-class PinBlocksReqOutput(BaseReq):
+class PinPrefixReqOutput(BaseReq):
     success: bool
     pinned_count: int = 0
     message: str = ""
 
 
 @dataclass
-class UnpinBlocksReqInput(BaseReq):
-    """Unpin blocks to allow normal eviction."""
+class UnpinPrefixReqInput(BaseReq):
+    """Unpin a prefix by token_ids to allow normal eviction."""
 
-    block_hashes: List[int] = field(default_factory=list)
+    token_ids: List[int] = field(default_factory=list)
 
 
 @dataclass
-class UnpinBlocksReqOutput(BaseReq):
+class UnpinPrefixReqOutput(BaseReq):
     success: bool
     unpinned_count: int = 0
     message: str = ""

@@ -108,8 +108,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
-    PinBlocksReqInput,
-    PinBlocksReqOutput,
+    PinPrefixReqInput,
+    PinPrefixReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -125,8 +125,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
-    UnpinBlocksReqInput,
-    UnpinBlocksReqOutput,
+    UnpinPrefixReqInput,
+    UnpinPrefixReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1022,8 +1022,8 @@ class Scheduler(
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
-                (PinBlocksReqInput, self.pin_blocks_wrapped),
-                (UnpinBlocksReqInput, self.unpin_blocks_wrapped),
+                (PinPrefixReqInput, self.pin_prefix_wrapped),
+                (UnpinPrefixReqInput, self.unpin_prefix_wrapped),
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
@@ -2558,32 +2558,32 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def pin_blocks_wrapped(self, recv_req: PinBlocksReqInput):
-        if not hasattr(self.tree_cache, "pin_blocks"):
-            return PinBlocksReqOutput(
+    def pin_prefix_wrapped(self, recv_req: PinPrefixReqInput):
+        if not hasattr(self.tree_cache, "pin_prefix"):
+            return PinPrefixReqOutput(
                 success=False,
                 pinned_count=0,
                 message="PIN requires --enable-hierarchical-cache",
             )
-        pinned = self.tree_cache.pin_blocks(recv_req.block_hashes)
-        return PinBlocksReqOutput(
+        pinned = self.tree_cache.pin_prefix(recv_req.token_ids)
+        return PinPrefixReqOutput(
             success=True,
             pinned_count=pinned,
-            message=f"Pinned {pinned}/{len(recv_req.block_hashes)} blocks",
+            message=f"Pinned {pinned} nodes from {len(recv_req.token_ids)} token_ids",
         )
 
-    def unpin_blocks_wrapped(self, recv_req: UnpinBlocksReqInput):
-        if not hasattr(self.tree_cache, "unpin_blocks"):
-            return UnpinBlocksReqOutput(
+    def unpin_prefix_wrapped(self, recv_req: UnpinPrefixReqInput):
+        if not hasattr(self.tree_cache, "unpin_prefix"):
+            return UnpinPrefixReqOutput(
                 success=False,
                 unpinned_count=0,
                 message="PIN requires --enable-hierarchical-cache",
             )
-        unpinned = self.tree_cache.unpin_blocks(recv_req.block_hashes)
-        return UnpinBlocksReqOutput(
+        unpinned = self.tree_cache.unpin_prefix(recv_req.token_ids)
+        return UnpinPrefixReqOutput(
             success=True,
             unpinned_count=unpinned,
-            message=f"Unpinned {unpinned}/{len(recv_req.block_hashes)} blocks",
+            message=f"Unpinned {unpinned} nodes from {len(recv_req.token_ids)} token_ids",
         )
 
     def _is_no_request(self):
@@ -2616,16 +2616,16 @@ class Scheduler(
             self.cur_batch = None
             self.last_batch = None
 
-            pin_count = getattr(self.tree_cache, "external_pin_count", {})
+            active_pins = getattr(self.tree_cache, "_active_pin_count", 0)
             evictable = getattr(self.tree_cache, "evictable_size_", "N/A")
             logger.info(
-                f"[PIN] flush_cache: pin_count={len(pin_count)}, "
+                f"[PIN] flush_cache: active_pin_count={active_pins}, "
                 f"evictable_size={evictable}, "
                 f"req_to_token_pool.size={self.req_to_token_pool.size}, "
                 f"tp_rank={self.tp_rank}"
             )
 
-            if pin_count:
+            if active_pins > 0:
                 # Selective flush: preserve pinned blocks
                 self.tree_cache.flush()
             else:
