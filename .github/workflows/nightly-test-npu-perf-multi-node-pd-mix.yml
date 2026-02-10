@@ -65,11 +65,15 @@ jobs:
 
       - name: Prepare scripts
         run: |
+          # Prepare source code on shared-disk
           current_path=$(pwd)
-          sglang_source_path=/root/.cache/tests/sglang
-          rm -rf ${sglang_source_path}
-          mkdir ${sglang_source_path}
-          cp -r ${current_path}/* ${sglang_source_path}/
+          target_path=/root/.cache/tests/sglang
+          rm -rf ${target_path}
+          mkdir -p ${target_path}
+          cp -r ${current_path}/* ${target_path}/
+
+          # sglang_source_path is host path
+          sglang_source_path=/data/ascend-ci-share-pkking-sglang/tests/sglang
           echo "Source code path: ${sglang_source_path}"
 
           # mkdir for output data
