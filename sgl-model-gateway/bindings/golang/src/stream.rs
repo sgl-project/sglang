@@ -23,7 +23,7 @@ use tokio::runtime::Runtime;
 use once_cell::sync::Lazy;
 use futures_util::StreamExt;
 
-use sgl_model_gateway::grpc_client::{sglang_proto as proto, sglang_scheduler::{SglangSchedulerClient, AbortOnDropStream}};
+use smg::grpc_client::{sglang_proto as proto, sglang_scheduler::{SglangSchedulerClient, AbortOnDropStream}};
 
 use super::error::{SglErrorCode, set_error_message};
 use super::grpc_converter::{GrpcResponseConverterHandle, convert_proto_chunk_to_openai};

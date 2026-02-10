@@ -1,18 +1,16 @@
 //! Data Parallel (DP) information discovery step.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use tracing::debug;
 
 use super::discover_metadata::get_server_info;
 use crate::{
-    protocols::worker_spec::WorkerConfigRequest,
+    core::{steps::workflow_data::LocalWorkerWorkflowData, UNKNOWN_MODEL_ID},
     workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
 };
 
 /// DP (Data Parallel) information for a worker.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DpInfo {
     pub dp_size: usize,
     pub model_id: String,
@@ -34,7 +32,7 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
             info.model_path
                 .and_then(|path| path.split('/').next_back().map(|s| s.to_string()))
         })
-        .unwrap_or_else(|| "unknown".to_string());
+        .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
 
     Ok(DpInfo { dp_size, model_id })
 }
@@ -43,9 +41,12 @@ pub async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, Str
 pub struct DiscoverDPInfoStep;
 
 #[async_trait]
-impl StepExecutor for DiscoverDPInfoStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
+impl StepExecutor<LocalWorkerWorkflowData> for DiscoverDPInfoStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<LocalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
 
         if !config.dp_aware {
             debug!(
@@ -69,7 +70,7 @@ impl StepExecutor for DiscoverDPInfoStep {
             dp_info.dp_size, config.url, dp_info.model_id
         );
 
-        context.set("dp_info", dp_info);
+        context.data.dp_info = Some(dp_info);
         Ok(StepResult::Success)
     }
 

@@ -42,7 +42,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, logger
+from sglang.srt.utils import add_prefix, is_npu, logger
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -278,6 +278,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
             -1, dtype=torch.int32
         )
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(

@@ -129,6 +129,7 @@ class Step3TextMoEMLP(nn.Module):
             top_k=config.moe_top_k,
             renormalize=config.norm_expert_weight,
             use_grouped_topk=False,
+            layer_id=layer_id,
         )
 
         self.experts = get_moe_impl_class(quant_config)(
@@ -442,7 +443,7 @@ class Step3TextModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
+            use_attn_tp_group=is_dp_attention_enabled(),
             prefix=add_prefix("embed_tokens", prefix),
         )
 

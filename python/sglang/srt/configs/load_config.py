@@ -29,6 +29,7 @@ class LoadFormat(str, enum.Enum):
     REMOTE_INSTANCE = "remote_instance"
     RDMA = "rdma"
     LOCAL_CACHED = "local_cached"
+    FASTSAFETENSORS = "fastsafetensors"
     PRIVATE = "private"
 
 
@@ -88,6 +89,9 @@ class LoadConfig:
     rl_quant_profile: Optional[str] = (
         None  # Path to rollout quantization profile (e.g., /root/profile.7b.pt)
     )
+
+    # For multi-layer MTP
+    draft_model_idx: Optional[int] = None
 
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
