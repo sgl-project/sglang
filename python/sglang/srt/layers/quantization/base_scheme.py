@@ -1,21 +1,19 @@
-# Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.layers.moe import MoeRunnerConfig
-from sglang.srt.layers.quantization.base_scheme import BaseLinearScheme, BaseMoEScheme
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 
-__all__ = ["CompressedTensorsLinearScheme", "CompressedTensorsMoEScheme"]
+__all__ = ["BaseLinearScheme", "BaseMoEScheme"]
 
 
-class CompressedTensorsLinearScheme(BaseLinearScheme):
+class BaseLinearScheme(ABC):
     """
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes supported by CompressedTensors.
@@ -37,6 +35,14 @@ class CompressedTensorsLinearScheme(BaseLinearScheme):
         raise NotImplementedError
 
     @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        """
+        Called after weight loading is complete for any cleanup that
+        needs to occur.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ):
@@ -52,16 +58,8 @@ class CompressedTensorsLinearScheme(BaseLinearScheme):
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def process_weights_after_loading(self, layer: torch.nn.Module):
-        """
-        Called after weight loading is complete for any cleanup that
-        needs to occur.
-        """
-        raise NotImplementedError
 
-
-class CompressedTensorsMoEScheme(BaseMoEScheme):
+class BaseMoEScheme(ABC):
     """
     Abstract class used to describe the weight creation and forward pass
     of different quantization schemes supported by CompressedTensors.

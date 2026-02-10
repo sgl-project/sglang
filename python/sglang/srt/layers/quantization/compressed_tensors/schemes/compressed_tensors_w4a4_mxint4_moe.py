@@ -14,7 +14,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2, set_weight_attrs
@@ -44,7 +44,7 @@ if is_flashinfer_available():
     )
 
 
-class CompressedTensorsMxInt4MoE(CompressedTensorsScheme):
+class CompressedTensorsMxInt4MoE(CompressedTensorsMoEScheme):
     def __init__(self, quant_config: CompressedTensorsConfig):
         self.quant_config = quant_config
         config = self.quant_config.target_scheme_map["Linear"].get("weights")

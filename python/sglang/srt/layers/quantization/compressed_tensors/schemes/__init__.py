@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from .compressed_tensors_scheme import CompressedTensorsScheme
+from .compressed_tensors_scheme import (
+    CompressedTensorsLinearScheme,
+    CompressedTensorsMoEScheme,
+)
 from .compressed_tensors_w4a4_mxint4_moe import CompressedTensorsMxInt4MoE
 from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 from .compressed_tensors_w4a4_nvfp4_moe import CompressedTensorsW4A4Nvfp4MoE
@@ -21,7 +24,8 @@ from .compressed_tensors_wNa16_moe import (
 )
 
 __all__ = [
-    "CompressedTensorsScheme",
+    "CompressedTensorsLinearScheme",
+    "CompressedTensorsMoEScheme",
     "CompressedTensorsW8A8Fp8",
     "CompressedTensorsW8A8Fp8MoE",
     "CompressedTensorsW8A16Fp8",

@@ -16,7 +16,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -29,7 +29,7 @@ if _is_cuda:
     from sgl_kernel import int8_scaled_mm
 
 
-class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
+class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
 
     def __init__(
         self, strategy: str, is_static_input_scheme: bool, input_symmetric: bool

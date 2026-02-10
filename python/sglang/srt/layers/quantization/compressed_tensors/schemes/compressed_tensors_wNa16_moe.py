@@ -14,7 +14,7 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
-    CompressedTensorsScheme,
+    CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
@@ -54,7 +54,7 @@ class GPTQMarlinState(Enum):
     READY = enum.auto()
 
 
-class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
+class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
     def __init__(self, quant_config: CompressedTensorsConfig, num_gpu_experts=-1):
         self.quant_config = quant_config
@@ -406,7 +406,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsScheme):
         return StandardCombineInput(hidden_states=output)
 
 
-class CompressedTensorsWNA16TritonMoE(CompressedTensorsScheme):
+class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
     """ROCm/HIP-compatible W4A16 MoE method using Triton kernels instead of Marlin.
 
     Inherits weight creation from CompressedTensorsWNA16MoE but converts
@@ -470,7 +470,7 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsScheme):
         return self.runner.run(dispatch_output, quant_info)
 
 
-class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsScheme):
+class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):
 
     def __init__(self, quantization_config) -> None:
         self.pack_factor = 8  # weight dtype is int4,  but use int32 to create

@@ -14,7 +14,7 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.fp8_utils import is_blackwell_supported
 from sglang.srt.layers.quantization.utils import (
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     )
 
 
-class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsScheme):
+class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
     def __init__(self):
         if not is_blackwell_supported():

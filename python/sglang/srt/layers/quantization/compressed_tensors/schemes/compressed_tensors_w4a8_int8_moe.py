@@ -10,7 +10,7 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
 )
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsMoEScheme,
 )
 from sglang.srt.utils import set_weight_attrs
 
@@ -26,7 +26,7 @@ __all__ = ["NPUCompressedTensorsW4A8Int8DynamicMoE"]
 logger = logging.getLogger(__name__)
 
 
-class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsScheme):
+class NPUCompressedTensorsW4A8Int8DynamicMoE(CompressedTensorsMoEScheme):
 
     ### TODO: Get rid of code duplication with python/sglang/srt/modelslim/modelslim_moe.py @OrangeRedeng @TamirBaydasov
     def __init__(self, quantization_config) -> None:

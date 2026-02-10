@@ -38,8 +38,9 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
+    CompressedTensorsLinearScheme,
+    CompressedTensorsMoEScheme,
     CompressedTensorsMxInt4MoE,
-    CompressedTensorsScheme,
     CompressedTensorsW4A4Fp4,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW8A8Fp8,
@@ -167,7 +168,7 @@ class CompressedTensorsConfig(QuantizationConfig):
             # This allows mixed quantization: experts with int4, linear layers with fp8
             if self.linear_fp8_config is not None:
                 return Fp8LinearMethod(self.linear_fp8_config)
-            scheme = self.get_scheme(layer=layer, layer_name=prefix)
+            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
@@ -176,6 +177,14 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
+            if layer.scheme is None:  # ignored layer
+                use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+                use_flashinfer_trtllm_moe = (
+                    get_moe_runner_backend().is_flashinfer_trtllm()
+                )
+                return UnquantizedFusedMoEMethod(
+                    use_triton_kernels, use_flashinfer_trtllm_moe
+                )
             return CompressedTensorsFusedMoEMethod(self)
         return None
 
@@ -530,7 +539,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def _get_scheme_from_parts(
         self, weight_quant: BaseModel, input_quant: BaseModel
-    ) -> CompressedTensorsScheme:
+    ) -> CompressedTensorsLinearScheme:
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
@@ -620,7 +629,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_moe_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
-    ) -> Optional[CompressedTensorsScheme]:
+    ) -> Optional[CompressedTensorsMoEScheme]:
         """
         compressed-tensors supports non uniform in the following way:
 
@@ -631,7 +640,7 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         Detect whether a layer_name is found in any target and
         use the quantization scheme corresponding to the matched target
-        to select the CompressedTensorsScheme used for infernece.
+        to select the CompressedTensorsMoEScheme used for infernece.
         """
 
         # FusedMoE was made by combining multiple Linears so need to
@@ -652,12 +661,8 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "quantization scheme but found multiple"
             )
 
-        use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
-        use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
         if scheme_dict is None:  # ignored layer
-            return UnquantizedFusedMoEMethod(
-                use_triton_kernels, use_flashinfer_trtllm_moe
-            )
+            return None
 
         weight_quant = scheme_dict.get("weights")
         input_quant = scheme_dict.get("input_activations")
@@ -712,9 +717,9 @@ class CompressedTensorsConfig(QuantizationConfig):
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
             )
 
-    def get_scheme(
+    def get_linear_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
-    ) -> Optional[CompressedTensorsScheme]:
+    ) -> Optional[CompressedTensorsLinearScheme]:
         """
         compressed-tensors supports non uniform in the following way:
 

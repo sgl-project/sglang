@@ -11,7 +11,7 @@ from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
 )
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsMoEScheme,
 )
 from sglang.srt.utils import set_weight_attrs
 
@@ -26,7 +26,7 @@ __all__ = ["NPUCompressedTensorsW8A8Int8DynamicMoE"]
 logger = logging.getLogger(__name__)
 
 
-class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsScheme):
+class NPUCompressedTensorsW8A8Int8DynamicMoE(CompressedTensorsMoEScheme):
 
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant

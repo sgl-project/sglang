@@ -10,7 +10,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
+    CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
@@ -38,7 +38,7 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
-class CompressedTensorsW8A8Fp8MoE(CompressedTensorsScheme):
+class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
