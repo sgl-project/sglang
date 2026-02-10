@@ -7,12 +7,6 @@ from __future__ import annotations
 
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.sample.mova import MOVASamplingParams
-from sglang.multimodal_gen.runtime.models.model_stages.mova import (
-    MOVADecodingStage,
-    MOVADenoisingStage,
-    MOVALatentPreparationStage,
-    MOVATimestepPreparationStage,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -21,6 +15,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ImageVAEEncodingStage,
     InputValidationStage,
     TextEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
+    MOVADecodingStage,
+    MOVADenoisingStage,
+    MOVALatentPreparationStage,
+    MOVATimestepPreparationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger

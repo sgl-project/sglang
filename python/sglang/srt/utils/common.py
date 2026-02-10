@@ -70,7 +70,7 @@ from typing import (
     Union,
 )
 from unittest import SkipTest
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import orjson
@@ -297,6 +297,10 @@ def xpu_has_xmx_support():
         # currently only PVC/LNL/BMG supports F64, so we only support these now
         return torch.xpu.get_device_properties().has_fp64
     return False
+
+
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
 
 
 @lru_cache(maxsize=1)
@@ -860,6 +864,9 @@ def load_audio(
         audio_file = BytesIO(response.content)
         response.close()
         audio, original_sr = sf.read(audio_file)
+    elif audio_file.startswith("file://"):
+        audio_file = unquote(urlparse(audio_file).path)
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
@@ -905,6 +912,9 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        image = Image.open(image_file)
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -925,6 +935,10 @@ def get_image_bytes(image_file: Union[str, bytes]):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         return response.content
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        with open(image_file, "rb") as f:
+            return f.read()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -974,8 +988,11 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("file://"):
+                video_file = unquote(urlparse(video_file).path)
+                vr = VideoReader(video_file, ctx=ctx)
             # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(urlparse(video_file).path):
+            elif os.path.isfile(unquote(urlparse(video_file).path)):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -983,6 +1000,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+        elif isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+            vr = video_file
         else:
             raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
@@ -2169,7 +2188,13 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
+        if is_npu():
+            # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_xpu():
+            my_lib.impl(op_name, op_func, "XPU")
+        else:
+            my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
