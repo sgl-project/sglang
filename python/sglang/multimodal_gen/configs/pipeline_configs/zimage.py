@@ -7,10 +7,7 @@ import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
-from sglang.multimodal_gen.configs.models.encoders import (
-    BaseEncoderOutput,
-    TextEncoderConfig,
-)
+from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
