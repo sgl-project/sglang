@@ -94,7 +94,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
                 "part_idx": request.part_idx,
             }
             for socket in self.send_sockets:
-                socket.send_pyobj(request_dict)
+                await socket.send_pyobj(request_dict)
 
             (
                 nbytes,
@@ -204,7 +204,7 @@ class SGLangEncoderServer(SGLangEncoderServicer):
 
 async def serve_grpc_encoder(server_args: ServerArgs):
     ctx = mp.get_context("spawn")
-    zmq_ctx = zmq.Context(10)
+    zmq_ctx = zmq.asyncio.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
 
