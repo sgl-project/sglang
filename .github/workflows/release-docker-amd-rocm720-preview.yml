@@ -1,11 +1,11 @@
 name: Release Docker Images ROCm 7.2.0 Preview (AMD)
 on:
-  # pull_request:
-  #   branches:
-  #     - main
-  #   paths:
-  #     - "docker/rocm720.Dockerfile"
-  #     - ".github/workflows/release-docker-amd-rocm720-preview.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "docker/rocm720.Dockerfile"
+      - ".github/workflows/release-docker-amd-rocm720-preview.yml"
   push:
     tags:
       - 'v[0-9]+.*'
@@ -79,5 +79,5 @@ jobs:
 
           tag=v${version}-${rocm_tag}
 
-          docker build . -f docker/rocm720.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} -t rocm/sgl-dev:${tag}-${{ env.DATE }}-preview --no-cache
+          docker build . -f docker/rocm720.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t rocm/sgl-dev:${tag}-${{ env.DATE }}-preview --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}-preview
