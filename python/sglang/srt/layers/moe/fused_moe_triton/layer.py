@@ -58,7 +58,10 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
     CompressedTensorsMxInt4MoEMethod,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptMxfp8MoEMethod,
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
@@ -769,6 +772,19 @@ class FusedMoE(torch.nn.Module):
 
         if "ModelOpt" in self.quant_method.__class__.__name__:
             is_fp4_variant = isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
+            is_mxfp8_variant = isinstance(self.quant_method, ModelOptMxfp8MoEMethod)
+
+            if is_mxfp8_variant:
+                # MXFP8: weight_scale is block scale (uint8 UE8M0), not per-tensor
+                if "weight_scale" in weight_name or "weight" in weight_name:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=tp_rank,
+                    )
+                return
 
             # FP4 uses "weight_scale_2" for per-tensor, FP8 uses "weight_scale" for per-tensor
             per_tensor_conditions = (
