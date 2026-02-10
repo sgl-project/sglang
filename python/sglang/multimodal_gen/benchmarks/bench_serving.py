@@ -774,7 +774,38 @@ async def benchmark(args):
         else:
             return await request_func(req, session, pbar)
 
-    # Start profiler if --profile is enabled
+    # Warmup: run a few requests before profiling to stabilize performance
+    warmup_requests = args.warmup_requests
+    if warmup_requests > 0:
+        logger.info(f"Starting warmup with {warmup_requests} request(s)...")
+        warmup_reqs = requests_list[:warmup_requests]
+        warmup_pbar = tqdm(
+            total=len(warmup_reqs),
+            desc="Warmup",
+            disable=args.disable_tqdm,
+        )
+        async with aiohttp.ClientSession() as warmup_session:
+            warmup_tasks = [
+                asyncio.create_task(
+                    limited_request_func(req, warmup_session, warmup_pbar)
+                )
+                for req in warmup_reqs
+            ]
+            warmup_outputs = await asyncio.gather(*warmup_tasks)
+        warmup_pbar.close()
+
+        # Verify at least one warmup request succeeded
+        if not any(out.success for out in warmup_outputs):
+            raise ValueError(
+                "Warmup failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {warmup_outputs[0].error}"
+            )
+        logger.info(
+            f"Warmup completed with {len(warmup_reqs)} request(s). "
+            "Starting main benchmark run..."
+        )
+
+    # Start profiler if --profile is enabled (after warmup)
     if args.profile:
         profile_output = await async_request_profile(
             api_url=f"{args.base_url}/start_profile"
@@ -972,9 +1003,16 @@ if __name__ == "__main__":
         "--disable-tqdm", action="store_true", help="Disable progress bar."
     )
     parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=0,
+        help="Number of warmup requests to run before the benchmark. "
+        "Warmup requests are not profiled. Default is 0 (no warmup).",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
-        help="Enable full pipeline profiling"
+        help="Enable full pipeline profiling. "
         "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR (default: ./logs/). ",
     )
     parser.add_argument(
