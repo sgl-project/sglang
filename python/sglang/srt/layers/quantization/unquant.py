@@ -604,6 +604,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=topk_ids,
         )
+        if hasattr(self.moe_runner_config, "routed_scaling_factor"):
+            final_hidden_states *= self.moe_runner_config.routed_scaling_factor
 
         return StandardCombineInput(hidden_states=final_hidden_states)
 
