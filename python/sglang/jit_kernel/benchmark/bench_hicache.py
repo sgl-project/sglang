@@ -32,10 +32,15 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer,
 )
 
+# NOTE: Adjustable hyperparameters for better benchmark stability
+
 # NOTE: torch impl is too slow in benchmark
 DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
 PAGE_SIZE = 1
 ENABLE_SORT = True
+GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
+HOST_CACHE_SIZE = 512 * 1024  # 512K tokens on CPU
+NUM_LAYERS = 8
 
 
 @dataclass(frozen=True)
@@ -178,9 +183,6 @@ def pytorch_transfer(
 
 
 # Benchmark configuration
-GPU_CACHE_SIZE = 256 * 1024  # 256K tokens on GPU
-HOST_CACHE_SIZE = 512 * 1024  # 512K tokens on CPU
-NUM_LAYERS = 8
 
 BS_RANGE = get_benchmark_range(
     full_range=[2**n for n in range(0, 16)],
