@@ -1,0 +1,157 @@
+name: 'e2e nightly test pd-separation (Ascend NPU)'
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: false
+        type: string
+        default: linux-aarch64-a3-0
+      test_config_name:
+        required: true
+        type: string
+        description: test config name
+      prefill_size:
+        required: true
+        type: number
+        description: number of prefill nodes
+      decode_size:
+        required: true
+        type: number
+        description: number of decode nodes
+      router_size:
+        required: true
+        type: number
+        description: number of router nodes
+      test_case:
+        required: true
+        type: string
+        description: path of test case file
+      image:
+        required: false
+        type: string
+        description: image for pods
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:v0.5.6-ascend-a3"
+      install_sglang_from_source:
+        required: false
+        type: boolean
+        default: true
+        description: use sglang from source code or from docker image
+
+concurrency:
+  group: ascend-nightly-multi-node-pd-separation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ inputs.test_config_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
+      env:
+        KUBECONFIG: /data/.cache/kb.yaml
+        KUBECTL: /data/.cache/kubectl
+        NAMESPACE: ascend-sglang
+        ASCEND_PERF_TEST_CONFIG_PATH: python/sglang/test/ascend/performance
+        KUBE_JOB_TYPE: pd-separation
+        KUBE_JOB_NAME: ascend-sglang-multi
+        KUBE_CONFIG_MAP: ascend-sglang-info
+        SGLANG_IS_IN_CI: true
+    steps:
+      - name: Install system denpendencies
+        run: |
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2-cli
+
+      - name: Install kubernetes
+        run: |
+          # Install kubernetes
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
+          cp $KUBECTL /usr/local/sbin/
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare scripts
+        run: |
+          current_path=$(pwd)
+          sglang_source_path=/root/.cache/tests/sglang
+          rm -rf ${sglang_source_path}
+          mkdir ${sglang_source_path}
+          cp -r ${current_path}/* ${sglang_source_path}/
+          echo "Source code path: ${sglang_source_path}"
+
+          # mkdir for output data
+          current_date=$(date +%Y%m%d)
+          test_data_output_path=/root/.cache/tests/output/perf/${current_date}
+          mkdir -p ${test_data_output_path}
+
+          install_sglang_from_source="${{ inputs.install_sglang_from_source }}"
+          if [ "${install_sglang_from_source}" = "true" ];then
+            echo "Install sglang from source, record the commit ID."
+            commit_id=${{ github.sha }}
+            echo "commit id: ${commit_id}" > ${test_data_output_path}/commit_id
+          fi
+
+          # make a metrics data file
+          test_case="${{ inputs.test_case }}"
+          tc_name=${test_case##*/}
+          tc_name=${tc_name%.*}
+          metrics_data_file=${test_data_output_path}/${tc_name}.txt
+          echo "Metrics file: ${metrics_data_file}"
+
+          # prepare a k8s yaml for creating pods
+          image="${{ inputs.image }}"
+          prefill_size="${{ inputs.prefill_size }}"
+          decode_size="${{ inputs.decode_size }}"
+          router_size="${{ inputs.router_size }}"
+          echo "{ \"image\": $image,                                                         \
+                  \"name_space\": \"$NAMESPACE\",                                            \
+                  \"kube_job_name\": \"$KUBE_JOB_NAME\",                                     \
+                  \"kube_config\": \"$KUBECONFIG\",                                          \
+                  \"kube_config_map\": \"$KUBE_CONFIG_MAP\",                                 \
+                  \"prefill_size\": $prefill_size,                                           \
+                  \"decode_size\": $decode_size,                                             \
+                  \"router_size\": $router_size,                                             \
+                  \"sglang_source_path\": \"$sglang_source_path\",                           \
+                  \"metrics_data_file\": \"$metrics_data_file\",                             \
+                  \"test_case\": \"$test_case\",                                             \
+                  \"sglang_is_in_ci\": \"$SGLANG_IS_IN_CI\",                                 \
+                  \"install_sglang_from_source\": \"$install_sglang_from_source\" }"        |\
+              jinja2 ${ASCEND_PERF_TEST_CONFIG_PATH}/k8s_multi_pd_separation.yaml.jinja2 -o  \
+                     ${ASCEND_PERF_TEST_CONFIG_PATH}/k8s_multi_pd_separation.yaml
+          echo "Kubelete config file is generated: ${ASCEND_PERF_TEST_CONFIG_PATH}/k8s_multi_pd_separation.yaml"
+
+      - name: Clear resources
+        run: |
+          cd ${ASCEND_PERF_TEST_CONFIG_PATH}
+          kubectl delete -f ./k8s_multi_pd_separation.yaml --ignore-not-found=true || true
+
+          pod_name_prefix="${KUBE_JOB_NAME}-sglang"
+          echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
+          while true; do
+            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds..."
+              sleep 30
+              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+            else
+              echo "No sglang job exist, start test case..."
+              break
+            fi
+          done
+
+      - name: Run test
+        timeout-minutes: 300
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          HF_ENDPOINT: https://hf-mirror.com
+        run: |
+
+          cd ${ASCEND_PERF_TEST_CONFIG_PATH}
+          python3 -u run_ascend_ci.py
+
+      - name: Post process
+        if: always()
+        run: |
+          kubectl get pods -n $NAMESPACE
+          cd ${ASCEND_PERF_TEST_CONFIG_PATH}
+          kubectl delete -f ./k8s_multi_pd_separation.yaml --ignore-not-found=true || true
