@@ -948,6 +948,9 @@ class LayerNormFn:
             )
         )
         y = y.reshape(x_shape_og)
+        if residual is not None:
+            residual_out = residual_out.reshape(x_shape_og)
+            return y, residual_out
         return y
 
 
