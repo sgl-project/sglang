@@ -1,19 +1,19 @@
 # Best Practice with DeepSeek Series Modes on Ascend NPU
 
-This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend NPU. If
+This section describes the best practice data of mainstream LLM models such as DeepSeek on the Ascend NPU. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## Low-Latency DeepSeek Series Models
 
-| Model             | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                                              |
-|-------------------|---------------|-------|---------------|-----------|------|--------------|--------------------------------------------------------------------------------------------|
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 6K+1.6K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-configuration-on-a3-separation-mode)      |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-configuration-on-a3-separation-mode)      |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-configuration-on-a3-separation-mode)      |
-| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-configuration-on-a3-separation-mode)      |
-| DeepSeek-V3.2-Exp | Atlas 800I A3 | 32    | PD Separation | 64K+3K    | 30ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-exp-low-latency-configuration-on-a3-separation-mode) |
+| Model             | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                                |
+|-------------------|---------------|-------|---------------|-----------|------|--------------|------------------------------------------------------------------------------|
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 6K+1.6K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-on-a3-separation-mode)      |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-on-a3-separation-mode)      |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-on-a3-separation-mode)      |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-low-latency-on-a3-separation-mode)      |
+| DeepSeek-V3.2-Exp | Atlas 800I A3 | 32    | PD Separation | 64K+3K    | 30ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-exp-low-latency-on-a3-separation-mode) |
 
-### DeepSeek-R1 Low Latency Configuration on A3 Separation Mode
+### DeepSeek-R1 Low Latency on A3 Separation Mode
 
 #### Deployment with TPOT 20ms on 32 Cards
 
@@ -149,7 +149,7 @@ python -m sglang.bench_serving --dataset-name random --backend sglang --host 127
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek-V32-Exp Low Latency Configuration on A3 Separation Mode
+### DeepSeek-V32-Exp Low Latency on A3 Separation Mode
 
 #### Deployment with 64K+3K TPOT 30ms on 32 Cards
 
@@ -366,7 +366,7 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 64000 --random-output-len 3000 --num-prompts 64 --random-range-ratio 1
 ```
 
-## High Throughput DeepSeek Series Models
+## High-Throughput DeepSeek Series Models
 
 | Model       | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                               |
 |-------------|---------------|-------|---------------|-----------|------|--------------|-----------------------------------------------------------------------------|
@@ -394,7 +394,7 @@ Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
-Quantization: W8A8 INT8
+Quantization: W4A8 INT8
 
 - Launch Prefill and Decode Instance
 
@@ -649,7 +649,7 @@ Input Output Length: 2K+2K
 
 TPOT: 50ms
 
-Quantization: W8A8 INT8
+Quantization: W4A8 INT8
 
 - Launch Prefill and Decode Instance
 
@@ -764,7 +764,6 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 400  --random-input-len 2048 --random-output-len 2048 --num-prompts 3200 --random-range-ratio 1 --request-rate 8
 ```
 
-
 ### DeepSeek-R1 High Throughput on A3 Mixed Mode
 
 #### Deployment with 3.5K+1.5K TPOT 50ms on 8 Cards
@@ -783,7 +782,7 @@ Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
-Quantization: W8A8 INT8
+Quantization: W4A8 INT8
 
 - Launch SGLang Instance
 
@@ -848,7 +847,6 @@ We tested it based on the `RANDOM` dataset.
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 144  --random-input-len 3500 --random-output-len 1500 --num-prompts 576 --random-range-ratio 1
 ```
 
-
 #### Deployment with 2K+2K TPOT 50ms on 8 Cards
 
 - Basic Case Details
@@ -865,7 +863,7 @@ Input Output Length: 2K+2K
 
 TPOT: 50ms
 
-Quantization: W8A8 INT8
+Quantization: W4A8 INT8
 
 - Launch SGLang Instance
 
