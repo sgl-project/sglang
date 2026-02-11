@@ -5,8 +5,6 @@ import time
 import warnings
 from urllib.parse import urlparse
 
-import requests
-
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -16,6 +14,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_with_error_check,
 )
+from sglang.utils import wait_for_http_ready
 
 logger = logging.getLogger(__name__)
 
@@ -72,23 +71,14 @@ class PDDisaggregationServerBase(CustomTestCase):
         ]
         print("Starting load balancer:", shlex.join(lb_command))
         cls.process_lb = popen_with_error_check(lb_command)
-        cls.wait_server_ready(cls.lb_url + "/health")
+        cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
 
     @classmethod
-    def wait_server_ready(cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH):
-        start_time = time.perf_counter()
-        while True:
-            try:
-                response = requests.get(url)
-                if response.status_code == 200:
-                    print(f"Server {url} is ready")
-                    return
-            except Exception:
-                pass
-
-            if time.perf_counter() - start_time > timeout:
-                raise RuntimeError(f"Server {url} failed to start in {timeout}s")
-            time.sleep(1)
+    def wait_server_ready(
+        cls, url, timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH, process=None
+    ):
+        wait_for_http_ready(url=url, timeout=timeout, process=process)
+        print(f"Server {url} is ready")
 
     @classmethod
     def tearDownClass(cls):
