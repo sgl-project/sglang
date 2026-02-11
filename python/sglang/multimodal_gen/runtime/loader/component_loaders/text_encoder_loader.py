@@ -16,7 +16,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.loader.component_loader import ComponentLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentLoader,
+)
 from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.utils import (
     _clean_hf_config_inplace,
@@ -277,7 +279,7 @@ class TextEncoderLoader(ComponentLoader):
             # if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
-                raise ValueError(
+                logger.warning(
                     "Following model weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
