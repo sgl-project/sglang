@@ -19,7 +19,11 @@ import regex as re
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -305,4 +309,6 @@ class NemotronHConfig(PretrainedConfig):
             conv_kernel=self.conv_kernel,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=self.mamba_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.mamba_layer_ids, dtype=mamba2_state_dtype(self)
+        )
