@@ -110,8 +110,8 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     attn_cp_size = get_attention_cp_size()
     if attn_cp_size == 1 or not can_nsa_prefill_cp_round_robin_split(forward_batch):
         return nsa_cache_seqlens
-    tokens = sum(forward_batch.extend_seq_lens_cpu)
-    pad_len = (tokens - 1) // attn_cp_size + 1 - nsa_cache_seqlens.shape[0]
+    tokens = cal_padded_tokens(forward_batch)
+    pad_len = tokens - nsa_cache_seqlens.shape[0]
     if pad_len > 0:
         nsa_cache_seqlens = torch.cat(
             [
