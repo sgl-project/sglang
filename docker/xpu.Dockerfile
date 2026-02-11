@@ -55,7 +55,7 @@ RUN --mount=type=secret,id=github_token \
     . /home/sdp/miniforge3/bin/activate && \
     conda activate py${PYTHON_VERSION} && \
     echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
-    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
+    git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . && \

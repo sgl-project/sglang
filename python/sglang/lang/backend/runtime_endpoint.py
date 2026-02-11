@@ -366,7 +366,7 @@ class Runtime:
     def __init__(
         self,
         log_level: str = "error",
-        launch_timeout: float = 420.0,
+        launch_timeout: float = 300.0,
         *args,
         **kwargs,
     ):
