@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import multiprocessing as mp
 import os
 import time
@@ -348,7 +349,8 @@ OOM detected. Possible solutions:
   - If the OOM occurs during runtime:
     1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
     2. Enable SP and/or TP
-    3. Enable a sparse-attention backend
+    3. Opt for a sparse-attention backend
+    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
@@ -401,7 +403,15 @@ def run_scheduler_process(
         )
         scheduler.event_loop()
     except torch.OutOfMemoryError as _e:
-        print(OOM_MSG)
+        logger.warning(OOM_MSG)
         raise
     finally:
+        # Clean up resources to speed up shutdown
+        if "scheduler" in locals():
+            del scheduler
+        gc.collect()
+        if torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         logger.info(f"Worker {rank}: Shutdown complete.")
