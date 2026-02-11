@@ -68,6 +68,7 @@ class LTX2AVDecodingStage(DecodingStage):
             output=video,
             trajectory_timesteps=batch.trajectory_timesteps,
             trajectory_latents=batch.trajectory_latents,
+            trajectory_log_probs=batch.trajectory_log_probs,
             trajectory_decoded=None,
             timings=batch.timings,
         )

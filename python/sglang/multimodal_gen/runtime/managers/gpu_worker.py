@@ -173,6 +173,7 @@ class GPUWorker:
                     timings=result.timings,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
+                    trajectory_log_probs=getattr(result, "trajectory_log_probs", None),
                     noise_pred=getattr(result, "noise_pred", None),
                     trajectory_decoded=getattr(result, "trajectory_decoded", None),
                 )

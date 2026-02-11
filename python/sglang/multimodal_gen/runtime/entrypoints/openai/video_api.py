@@ -88,6 +88,8 @@ def _build_sampling_params_from_request(
         sampling_kwargs["enable_teacache"] = request.enable_teacache
     if request.output_path is not None:
         sampling_kwargs["output_path"] = request.output_path
+    if request.rollout is not None:
+        sampling_kwargs["rollout"] = request.rollout
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         server_args=server_args,
@@ -173,6 +175,7 @@ async def create_video(
     guidance_scale: Optional[float] = Form(None),
     num_inference_steps: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    rollout: Optional[bool] = Form(False),
     extra_body: Optional[str] = Form(None),
 ):
     content_type = request.headers.get("content-type", "").lower()
@@ -232,6 +235,7 @@ async def create_video(
             negative_prompt=negative_prompt,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            rollout=rollout,
             **(
                 {"guidance_scale": guidance_scale} if guidance_scale is not None else {}
             ),

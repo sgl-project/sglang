@@ -221,6 +221,8 @@ def prepare_request(
         diffusers_kwargs = None
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
+    if getattr(sampling_params, "rollout", False):
+        req.extra["rollout"] = True
 
     req.adjust_size(server_args)
 
