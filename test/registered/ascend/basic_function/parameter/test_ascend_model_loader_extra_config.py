@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH, run_command
+from sglang.test.ascend.test_ascend_utils import (
+    DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH,
+    run_command,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -82,9 +85,9 @@ class BaseModelLoaderTest(ABC):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-        if hasattr(cls, 'out_file') and cls.out_file:
+        if hasattr(cls, "out_file") and cls.out_file:
             cls.out_file.close()
-        if hasattr(cls, 'err_file') and cls.err_file:
+        if hasattr(cls, "err_file") and cls.err_file:
             cls.err_file.close()
 
 
@@ -145,21 +148,21 @@ class TestModelLoaderExtraConfig(BaseModelLoaderTest, CustomTestCase):
             print(f"{pattern}: {line}")
             if not line:
                 return 0
-            mm_ss = line.split('[')[1].split('<')[0]
-            m, s = map(int, mm_ss.split(':'))
+            mm_ss = line.split("[")[1].split("<")[0]
+            m, s = map(int, mm_ss.split(":"))
             return m * 60 + s
 
         # Get loading times
         multi_thread_seconds = get_loading_seconds(
-            MULTITHREAD_ERR_LOG,
-            "Multi-thread loading shards"
+            MULTITHREAD_ERR_LOG, "Multi-thread loading shards"
         )
         checkpoint_seconds = get_loading_seconds(
-            CHECKPOINT_ERR_LOG,
-            "Loading safetensors checkpoint shards"
+            CHECKPOINT_ERR_LOG, "Loading safetensors checkpoint shards"
         )
 
-        print(f"Multi-thread: {multi_thread_seconds}s, Loading safetensors: {checkpoint_seconds}s.")
+        print(
+            f"Multi-thread: {multi_thread_seconds}s, Loading safetensors: {checkpoint_seconds}s."
+        )
 
         # "Model loading time is reduced."
         self.assertGreater(checkpoint_seconds, multi_thread_seconds)

@@ -1,6 +1,8 @@
 import json
-import requests
 import unittest
+
+import requests
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -230,7 +232,7 @@ class TestChatCompletionsInterface(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        self.assertEqual(response.json()['choices'][0]['matched_stop'], 13)
+        self.assertEqual(response.json()["choices"][0]["matched_stop"], 13)
 
     def test_rid(self):
         # Test rid parameter; verify response ID matches the requested rid value 'sssss'
@@ -243,7 +245,7 @@ class TestChatCompletionsInterface(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
-        self.assertEqual(response.json()['id'], 'sssss')
+        self.assertEqual(response.json()["id"], "sssss")
 
 
 if __name__ == "__main__":
