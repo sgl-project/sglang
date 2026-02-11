@@ -1814,7 +1814,6 @@ def run_mulit_request_test(
                     },
                 },
             )
-            # ret = response.json()
             response.json()
 
         with ThreadPoolExecutor(2) as executor:
