@@ -29,7 +29,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 apt-get install -y --no-install-recommends python3 python3-pip python3-venv git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
-    for pkg in python3 python3-pip git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
+    for pkg in python3 python3-pip python3-venv git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
             echo "ERROR: Required package $pkg is not installed and apt-get failed"
             exit 1
