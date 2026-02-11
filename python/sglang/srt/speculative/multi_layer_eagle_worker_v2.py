@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils.common import empty_context, fast_topk
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunnerOutput
+    from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
 
 
 logger = logging.getLogger(__name__)
@@ -125,7 +125,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
 
         # Alias for better readability
-        self.draft_runner_list = self.draft_worker.model_runner_list
+        self.draft_runner_list: List[ModelRunner] = self.draft_worker.model_runner_list
 
         self.init_lm_head()
 
@@ -352,9 +352,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            # draft mode is same with decode mode, only 1 token per req
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         batch.spec_info = next_draft_input
@@ -411,8 +411,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         # Prepare for draft extend in a separate stream
