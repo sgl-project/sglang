@@ -1,5 +1,9 @@
 import logging
+from functools import lru_cache
+from importlib import metadata
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
+
+from packaging.version import InvalidVersion, Version
 
 from sglang.srt.entrypoints.openai.protocol import (
     LegacyStructuralTagResponseFormat,
@@ -34,6 +38,25 @@ from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.srt.function_call.utils import get_json_schema_constraint
 
 logger = logging.getLogger(__name__)
+
+MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG = Version("0.1.31")
+
+
+@lru_cache(maxsize=1)
+def _is_kimi_k2_structural_tag_supported() -> bool:
+    try:
+        version_str = metadata.version("xgrammar")
+    except metadata.PackageNotFoundError:
+        return False
+
+    try:
+        return Version(version_str) >= MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG
+    except InvalidVersion:
+        logger.warning(
+            "Unexpected xgrammar version '%s'; disable kimi_k2 structural_tag.",
+            version_str,
+        )
+        return False
 
 
 class FunctionCallParser:
@@ -199,14 +222,26 @@ class FunctionCallParser:
         """
         # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
         # It cannot parse or validate function call Pythonic or XML-ish syntax.
+        enforce_structural_tag = tool_choice == "auto" and (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )
+
+        # Kimi-K2 structural_tag relies on xgrammar handling tokenizer whitespace
+        # conversion correctly; older xgrammar versions can corrupt tool arguments.
         if (
-            self.detector.supports_structural_tag()
-            and tool_choice == "auto"
-            and (
-                any(tool.function.strict for tool in self.tools)
-                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-            )
+            enforce_structural_tag
+            and isinstance(self.detector, KimiK2Detector)
+            and not _is_kimi_k2_structural_tag_supported()
         ):
+            logger.warning(
+                "Disable kimi_k2 structural_tag because xgrammar<%s; "
+                "upgrade xgrammar to re-enable strict auto constraints.",
+                MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG,
+            )
+            return None
+
+        if self.detector.supports_structural_tag() and enforce_structural_tag:
             tag = self.get_structure_tag()
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):

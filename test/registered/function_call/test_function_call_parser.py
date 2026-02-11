@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -16,6 +17,7 @@ from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(1.0, "default")
@@ -3709,6 +3711,56 @@ function call<|role_sep|>
 
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params["city"], "Rome")
+
+
+class TestFunctionCallParserStructuralTagGating(unittest.TestCase):
+    def setUp(self):
+        self.strict_tool = Tool(
+            type="function",
+            function=Function(
+                name="get_weather",
+                description="Get weather information",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                    },
+                    "required": ["location"],
+                },
+                strict=True,
+            ),
+        )
+
+    def test_kimi_k2_auto_ignores_structural_tag_on_unsupported_xgrammar(self):
+        parser = FunctionCallParser([self.strict_tool], "kimi_k2")
+        with patch(
+            "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
+            return_value=False,
+        ):
+            constraint = parser.get_structure_constraint("auto")
+        self.assertIsNone(constraint)
+
+    def test_kimi_k2_auto_uses_structural_tag_on_supported_xgrammar(self):
+        parser = FunctionCallParser([self.strict_tool], "kimi_k2")
+        with patch(
+            "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
+            return_value=True,
+        ):
+            constraint = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(constraint)
+        self.assertEqual(constraint[0], "structural_tag")
+
+    def test_non_kimi_parser_not_affected_by_kimi_gating(self):
+        parser = FunctionCallParser([self.strict_tool], "qwen")
+        with patch(
+            "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
+            return_value=False,
+        ):
+            constraint = parser.get_structure_constraint("auto")
+
+        self.assertIsNotNone(constraint)
+        self.assertEqual(constraint[0], "structural_tag")
 
 
 if __name__ == "__main__":
