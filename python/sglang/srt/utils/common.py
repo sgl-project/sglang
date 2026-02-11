@@ -2224,6 +2224,8 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.model_executor.model_runner.",
         "sglang.srt.layers.",
         "sglang.srt.utils.",
+        # --- slime ---
+        "slime.",
     }
 
     DENY_CLASSES = {

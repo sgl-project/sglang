@@ -11,10 +11,15 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+    NSATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -54,6 +59,16 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+        elif isinstance(self.kv_cache, NSATokenToKVPool):
+            # Check NSA before MLA since NSATokenToKVPool is a subclass of MLATokenToKVPool
+            self.token_to_kv_pool_host = NSATokenToKVPoolHost(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
@@ -64,7 +79,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(f"HiRadixCache only supports MHA and MLA and NSA yet")
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)

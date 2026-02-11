@@ -1678,7 +1678,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
-            else nullcontext()
+            else nullcontext(),
+            self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
         ):
             self.index_k_with_scale_buffer = [
                 torch.zeros(
@@ -1700,6 +1701,11 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+            self.index_k_with_scale_buffer_ptrs = torch.tensor(
+                [x.data_ptr() for x in self.index_k_with_scale_buffer],
+                dtype=torch.uint64,
+                device=self.device,
+            )
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:

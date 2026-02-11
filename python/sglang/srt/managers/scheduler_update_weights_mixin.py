@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from typing import TYPE_CHECKING, Tuple
 
@@ -12,6 +13,9 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -21,6 +25,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PostProcessWeightsReqInput,
+    PostProcessWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -114,6 +120,11 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
 
+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
+        """Optional post-processing for updated weights (e.g., Marlin conversion)."""
+        success, message = self.tp_worker.post_process_weights(recv_req)
+        return PostProcessWeightsReqOutput(success, message)
+
     def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
@@ -136,6 +147,13 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if hasattr(self, "disagg_decode_prealloc_queue"):
+                    self.disagg_decode_prealloc_queue.release_memory_occupation()
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if hasattr(self, "disagg_prefill_bootstrap_queue"):
+                    self.disagg_prefill_bootstrap_queue.release_memory_occupation()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
@@ -176,6 +194,13 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if hasattr(self, "disagg_decode_prealloc_queue"):
+                    self.disagg_decode_prealloc_queue.resume_memory_occupation()
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if hasattr(self, "disagg_prefill_bootstrap_queue"):
+                    self.disagg_prefill_bootstrap_queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 

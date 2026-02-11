@@ -287,6 +287,85 @@ def alloc_decode_kernel(
         tl.store(out_indices + pid, page * page_size)
 
 
+def alloc_extend_torch_fallback(
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_pages: torch.Tensor,
+    out_indices: torch.Tensor,
+    page_size: int,
+    debug_mode: bool = False,
+):
+    extend_lens_cpu = (seq_lens_cpu - prefix_lens_cpu).to(torch.int64)
+    if extend_lens_cpu.numel() == 0:
+        return
+
+    output_start_locs_cpu = torch.cumsum(extend_lens_cpu, dim=0) - extend_lens_cpu
+    num_pages_after = (seq_lens_cpu + page_size - 1) // page_size
+    num_pages_before = (prefix_lens_cpu + page_size - 1) // page_size
+    num_new_pages_cpu = num_pages_after - num_pages_before
+    page_start_locs_cpu = torch.cumsum(num_new_pages_cpu, dim=0) - num_new_pages_cpu
+
+    total_new_pages = int(num_new_pages_cpu.sum().item())
+    if total_new_pages > free_pages.numel():
+        return
+
+    if debug_mode:
+        assert int(extend_lens_cpu.sum().item()) == out_indices.numel()
+
+    prefix_lens_list = prefix_lens_cpu.tolist()
+    seq_lens_list = seq_lens_cpu.tolist()
+    extend_lens_list = extend_lens_cpu.tolist()
+    out_start_list = output_start_locs_cpu.tolist()
+    page_start_list = page_start_locs_cpu.tolist()
+    num_new_pages_list = num_new_pages_cpu.tolist()
+
+    device = out_indices.device
+    dtype = out_indices.dtype
+    offsets_page = torch.arange(page_size, device=device, dtype=dtype)
+
+    for i, extend_len in enumerate(extend_lens_list):
+        if extend_len == 0:
+            continue
+
+        pre_len = prefix_lens_list[i]
+        seq_len = seq_lens_list[i]
+        out_start = out_start_list[i]
+        page_start = page_start_list[i]
+        num_new_pages = num_new_pages_list[i]
+
+        pre_mod = pre_len % page_size
+        part1 = min(extend_len, page_size - pre_mod) if pre_mod != 0 else 0
+        if part1:
+            start_val = last_loc[i] + 1
+            out_indices[out_start : out_start + part1] = start_val + torch.arange(
+                part1, device=device, dtype=dtype
+            )
+            if part1 == extend_len:
+                continue
+
+        ceil_pre_pages = (pre_len + page_size - 1) // page_size
+        full_pages_after = seq_len // page_size
+        num_full_pages = full_pages_after - ceil_pre_pages
+        if num_full_pages < 0:
+            num_full_pages = 0
+        part2 = num_full_pages * page_size
+        if part2:
+            pages = free_pages[page_start : page_start + num_full_pages]
+            full_indices = (pages[:, None] * page_size + offsets_page).reshape(-1)
+            out_indices[out_start + part1 : out_start + part1 + part2] = full_indices
+            if part1 + part2 == extend_len:
+                continue
+
+        part3 = extend_len - part1 - part2
+        if part3:
+            last_page = free_pages[page_start + num_new_pages - 1]
+            out_indices[out_start + part1 + part2 : out_start + extend_len] = (
+                last_page * page_size
+                + torch.arange(part3, device=device, dtype=dtype)
+            )
+
+
 class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """
     An allocator managing the indices to kv cache data.
@@ -349,11 +428,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
-        self.seen_max_num_extend_tokens_next_power_of_2 = max(
-            self.seen_max_num_extend_tokens_next_power_of_2,
-            next_power_of_2(extend_num_tokens),
-        )
-
         bs = len(prefix_lens)
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
@@ -363,16 +437,34 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            next_power_of_2(bs),
-            self.page_size,
-            self.seen_max_num_extend_tokens_next_power_of_2,
-        )
+
+        # Use PyTorch fallback for large extend_num_tokens to avoid slow Triton compilation
+        MAX_TRITON_EXTEND_TOKENS = 65536  # 64K
+        if next_power_of_2(extend_num_tokens) > MAX_TRITON_EXTEND_TOKENS:
+            alloc_extend_torch_fallback(
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens_cpu=seq_lens_cpu,
+                last_loc=last_loc,
+                free_pages=self.free_pages,
+                out_indices=out_indices,
+                page_size=self.page_size,
+                debug_mode=self.debug_mode,
+            )
+        else:
+            self.seen_max_num_extend_tokens_next_power_of_2 = max(
+                self.seen_max_num_extend_tokens_next_power_of_2,
+                next_power_of_2(extend_num_tokens),
+            )
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                next_power_of_2(bs),
+                self.page_size,
+                self.seen_max_num_extend_tokens_next_power_of_2,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

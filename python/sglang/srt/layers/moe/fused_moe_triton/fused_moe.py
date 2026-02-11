@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -573,7 +574,10 @@ def fused_experts_impl(
                 ).squeeze(dim=1)
             else:
                 # According to micro benchmark results, torch.compile can get better performance for small token.
-                if tokens_in_chunk <= 32:
+                if (
+                    not get_global_server_args().enable_deterministic_inference
+                    and tokens_in_chunk <= 32
+                ):
                     moe_sum_reduce_torch_compile(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],

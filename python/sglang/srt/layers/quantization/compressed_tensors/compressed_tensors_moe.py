@@ -30,7 +30,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
-from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+from sglang.srt.layers.quantization.marlin_utils import (
+    marlin_moe_permute_scales,
+    moe_awq_to_marlin_zero_points
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -865,7 +868,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         self.strategy = config.strategy
         self.group_size = config.group_size
         self.actorder = config.actorder
-        assert config.symmetric, "Only symmetric quantization is supported for MoE"
+        self.sym = config.symmetric
 
         if not (
             self.quant_config.quant_format == CompressionFormat.pack_quantized.value
@@ -920,7 +923,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         # In the case where we have actorder/g_idx,
         # we do not partition the w2 scales
-        load_full_w2 = self.actorder and self.group_size != -1
+        load_full_w2 = (self.actorder != 'static') and self.group_size != -1
 
         if load_full_w2:
             w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
@@ -967,6 +970,32 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
         layer.register_parameter("w13_weight_shape", w13_weight_shape)
         set_weight_attrs(w13_weight_shape, extra_weight_attrs)
+
+        # add zero param
+        if not self.sym:
+            w13_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_qzeros)
+            set_weight_attrs(w13_qzeros, extra_weight_attrs)
+
+            w2_qzeros = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_qzeros)
+            set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
@@ -1016,13 +1045,40 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         layer.a2_scale = None
         layer.marlin_state = GPTQMarlinState.REPACK
 
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
+
+        # Force record: these are the target GPTQ shapes for rollback.
+        layer._original_shapes["w13_weight_packed"] = tuple(w13_weight.shape)
+        layer._original_shapes["w13_weight_scale"] = tuple(w13_scale.shape)
+        if not self.sym:
+            layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
+
+        layer._original_shapes["w2_weight_packed"] = tuple(w2_weight.shape)
+        layer._original_shapes["w2_weight_scale"] = tuple(w2_scale.shape)
+        if not self.sym:
+            layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Skip if the layer is already converted to Marlin format to prevent double-packing.
+        if getattr(layer, "is_marlin_converted", False):
+            return
+
+        if not hasattr(layer, "_original_shapes"):
+            layer._original_shapes = {}
 
         def replace_tensor(name, new_t):
+            target_attr = getattr(layer, name)
+
+            # Only save if the key doesn't exist to prevent overwriting with Marlin shapes.
+            if name not in layer._original_shapes:
+                # This is a safety check; `create_weights` usually handles this already.
+                layer._original_shapes[name] = tuple(target_attr.shape)
+
             # It is important to use resize_() here since it ensures
             # the same buffer is reused
-            getattr(layer, name).resize_(new_t.shape)
-            getattr(layer, name).copy_(new_t)
+            target_attr.resize_(new_t.shape)
+            target_attr.copy_(new_t)
             del new_t
 
         num_experts = layer.w13_weight_g_idx.shape[0]
@@ -1078,7 +1134,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+        replace_tensor("w13_weight_packed", marlin_w13_qweight)
         marlin_w2_qweight = gptq_marlin_moe_repack(
             layer.w2_weight_packed,
             layer.w2_g_idx_sort_indices,
@@ -1086,7 +1142,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_packed.shape[2],
             self.num_bits,
         )
-        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
+        replace_tensor("w2_weight_packed", marlin_w2_qweight)
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
             layer.w13_weight_scale,
@@ -1094,7 +1150,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_scale.shape[2],
             self.group_size,
         )
-        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
+        replace_tensor("w13_weight_scale", marlin_w13_scales)
 
         marlin_w2_scales = marlin_moe_permute_scales(
             layer.w2_weight_scale,
@@ -1103,7 +1159,40 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w2_weight_scale.shape[2],
             self.group_size,
         )
-        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+        replace_tensor("w2_weight_scale", marlin_w2_scales)
+
+        # Repack zero
+        if not self.sym:
+            marlin_w13_zp = moe_awq_to_marlin_zero_points(
+                layer.w13_weight_zero_point,
+                size_k=layer.w13_weight_zero_point.shape[1],
+                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w13_weight_zero_point", marlin_w13_zp)
+
+            marlin_w2_zp = moe_awq_to_marlin_zero_points(
+                layer.w2_weight_zero_point,
+                size_k=layer.w2_weight_zero_point.shape[1],
+                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+            )
+            replace_tensor("w2_weight_zero_point", marlin_w2_zp)
+
+        layer.is_marlin_converted = True
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module):
+        """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""
+        if not hasattr(layer, "_original_shapes"):
+            return
+
+        for name, orig_shape in layer._original_shapes.items():
+            param = getattr(layer, name, None)
+
+            if param is not None and param.shape != orig_shape:
+                param.resize_(orig_shape)
+
+        layer.is_marlin_converted = False
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1154,6 +1243,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=layer.w13_weight_zero_point if not self.sym else None,
+            w2_zeros=layer.w2_weight_zero_point if not self.sym else None,
             num_bits=self.num_bits,
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,

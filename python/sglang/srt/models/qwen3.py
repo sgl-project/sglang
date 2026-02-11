@@ -90,8 +90,8 @@ class Qwen3Attention(nn.Module):
 
         norm_kwargs = (
             dict(
-                weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
+                fp32_residual=False,
             )
             if get_global_server_args().rl_on_policy_target is not None
             else {}
@@ -242,10 +242,8 @@ class Qwen3DecoderLayer(nn.Module):
 
         norm_kwargs = (
             dict(
-                weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
+                fp32_residual=False,
             )
             if get_global_server_args().rl_on_policy_target is not None
             else {}
@@ -276,14 +274,14 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-        **kwargs,
+        post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
-            **kwargs,
+            post_residual_addition=post_residual_addition,
         )
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(

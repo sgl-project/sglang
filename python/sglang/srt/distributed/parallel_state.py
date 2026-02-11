@@ -1797,7 +1797,10 @@ def get_tensor_model_parallel_world_size():
 
 def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
-    return get_tp_group().rank_in_group
+    try:
+        return get_tp_group().rank_in_group
+    except Exception:
+        return 0
 
 
 def get_pipeline_model_parallel_world_size():

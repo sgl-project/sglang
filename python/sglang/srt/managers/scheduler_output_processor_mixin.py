@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -1070,7 +1071,7 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         # Send to detokenizer
-        if reqs or is_idle_batch:
+        if rids or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
 

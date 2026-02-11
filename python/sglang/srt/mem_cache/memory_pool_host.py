@@ -15,7 +15,12 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
-from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+    NSATokenToKVPool,
+)
 from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -1015,3 +1020,199 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
+
+
+class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
+    """
+    Host memory pool for NSA (Native Sparse Attention) KV cache.
+
+    NSA extends MLA with an additional index_k_with_scale_buffer that stores
+    sparse attention indexing information. This class ensures that buffer is
+    also backed up and restored during hicache operations.
+    """
+
+    device_pool: NSATokenToKVPool
+
+    def __init__(
+        self,
+        device_pool: NSATokenToKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        # Store NSA-specific attributes before calling parent __init__
+        self.index_head_dim = device_pool.index_head_dim
+        self.quant_block_size = device_pool.quant_block_size
+        self.index_k_with_scale_buffer_dtype = device_pool.index_k_with_scale_buffer_dtype
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+        # Initialize index buffer references and pointers for efficient transfer
+        self.index_data_refs = [
+            self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
+        ]
+        self.index_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.index_data_refs],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    def get_size_per_token(self):
+        # Get base MLA size
+        base_size = super().get_size_per_token()
+
+        # Add NSA index buffer size per token
+        # index_k_with_scale_buffer shape per layer: (num_pages, page_size * (index_head_dim + index_head_dim // quant_block_size * 4))
+        # Per token: (index_head_dim + index_head_dim // quant_block_size * 4) * dtype.itemsize * layer_num
+        index_size_per_token = (
+            (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4)
+            * self.index_k_with_scale_buffer_dtype.itemsize
+            * self.layer_num
+        )
+
+        return base_size + index_size_per_token
+
+    def init_kv_buffer(self):
+        # Initialize base MLA kv_buffer
+        buffer = super().init_kv_buffer()
+
+        # Initialize NSA index_k_with_scale_buffer on host
+        # Layout matches device pool: (num_pages, page_size * (index_head_dim + index_head_dim // quant_block_size * 4))
+        index_buffer_second_dim = self.page_size * (
+            self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        )
+        self.index_stride_size = (self.index_head_dim + self.index_head_dim // self.quant_block_size * 4) * self.index_k_with_scale_buffer_dtype.itemsize
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        self.index_k_with_scale_buffer = [
+            alloc_func(
+                (self.page_num, index_buffer_second_dim),
+                dtype=self.index_k_with_scale_buffer_dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            for _ in range(self.layer_num)
+        ]
+
+        return buffer
+
+    def _load_indexer_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """Load index_k_with_scale_buffer from host to device for a specific layer."""
+        # Convert token indices to page indices
+        # host_indices and device_indices are token-level indices
+        # index_k_with_scale_buffer is page-level with shape (num_pages, page_size * dim)
+
+        if io_backend == "kernel":
+            # Use page-level copy for index buffer
+            # Calculate page indices from token indices
+            page_indices_host = host_indices[:: self.page_size] // self.page_size
+            page_indices_device = device_indices[:: self.page_size] // self.page_size
+
+            src_buffer = self.index_k_with_scale_buffer[layer_id]
+            dst_buffer = device_pool.index_k_with_scale_buffer[layer_id - device_pool.start_layer]
+
+            # Copy each page
+            # for i in range(len(page_indices_host)):
+            #     src_page_idx = page_indices_host[i].item()
+            #     dst_page_idx = page_indices_device[i].item()
+            #     dst_buffer[dst_page_idx].copy_(src_buffer[src_page_idx], non_blocking=True)
+            if self.layout == "layer_first":
+                transfer_kv_per_layer_mla(
+                    src=src_buffer,
+                    dst=dst_buffer,
+                    src_indices=page_indices_host,
+                    dst_indices=page_indices_device,
+                    item_size=self.index_stride_size * self.page_size,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+
+        elif io_backend == "direct":
+            # Direct I/O copy for index buffer
+            page_indices_host = host_indices[:: self.page_size] // self.page_size
+            page_indices_device = device_indices[:: self.page_size] // self.page_size
+
+            src_buffer = self.index_k_with_scale_buffer[layer_id]
+            dst_buffer = device_pool.index_k_with_scale_buffer[layer_id - device_pool.start_layer]
+
+            for i in range(len(page_indices_host)):
+                src_page_idx = page_indices_host[i].item()
+                dst_page_idx = page_indices_device[i].item()
+                dst_buffer[dst_page_idx].copy_(src_buffer[src_page_idx], non_blocking=True)
+        else:
+            raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")
+
+    def _backup_indexer_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Backup index_k_with_scale_buffer from device to host for all layers."""
+        # Convert token indices to page indices
+        page_indices_host = host_indices[:: self.page_size] // self.page_size
+        page_indices_device = device_indices[:: self.page_size] // self.page_size
+
+        # if io_backend in ["kernel", "direct"]:
+        if io_backend == "kernel":
+            if self.layout == "layer_first":
+                transfer_kv_all_layer_mla(
+                    src_layers=device_pool.index_k_with_scale_buffer_ptrs,
+                    dst_layers=self.index_data_ptrs,
+                    src_indices=page_indices_device,
+                    dst_indices=page_indices_host,
+                    item_size=self.index_stride_size * self.page_size,
+                    num_layers=self.layer_num,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+        elif io_backend == "direct":
+            for layer_id in range(self.layer_num):
+                src_buffer = device_pool.index_k_with_scale_buffer[layer_id]
+                dst_buffer = self.index_k_with_scale_buffer[layer_id]
+
+                for i in range(len(page_indices_device)):
+                    src_page_idx = page_indices_device[i].item()
+                    dst_page_idx = page_indices_host[i].item()
+                    dst_buffer[dst_page_idx].copy_(src_buffer[src_page_idx], non_blocking=True)
+        else:
+            raise ValueError(f"Unsupported IO backend for NSA indexer: {io_backend}")
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """Load KV cache and index buffer from host to device for a specific layer."""
+        # Load base MLA kv_buffer
+        super().load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+        # Load NSA index_k_with_scale_buffer
+        self._load_indexer_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Backup KV cache and index buffer from device to host for all layers."""
+        # Backup base MLA kv_buffer
+        super().backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        # Backup NSA index_k_with_scale_buffer
+        self._backup_indexer_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )

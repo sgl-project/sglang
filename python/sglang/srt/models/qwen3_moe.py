@@ -22,6 +22,7 @@ import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -50,7 +51,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -229,6 +230,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
             layer_id=layer_id,
         )
+        self.top_k = config.num_experts_per_tok
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
@@ -294,7 +296,22 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+
+        if get_global_server_args().rl_on_policy_target is not None:
+            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, self.top_k, dim=-1
+            )
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights = routing_weights.to(hidden_states.dtype)
+            topk_output = StandardTopKOutput(
+                topk_weights=routing_weights,
+                topk_ids=selected_experts,
+                router_logits=router_logits,
+            )
+        else:
+            topk_output = self.topk(hidden_states, router_logits)
+
         final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             self.tp_size > 1
@@ -475,13 +492,14 @@ class Qwen3MoeAttention(nn.Module):
         )
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        )
+        ) and (get_global_server_args().rl_on_policy_target is None)
         self.compatible_with_fused_qk_norm_rope = (
             not isinstance(self.rotary_emb, MRotaryEmbedding)
         ) and self.head_dim in (64, 128, 256)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
+            and (get_global_server_args().rl_on_policy_target is None)
         )
         self._used_fused_qk_norm_rope_last_call = False
 
@@ -494,8 +512,16 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        norm_kwargs = (
+            dict(
+                cast_x_before_out_mul=True,
+                fp32_residual=False,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.alt_stream = alt_stream
 
     def op_prepare(self, state):
@@ -736,9 +762,19 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm_kwargs = (
+            dict(
+                cast_x_before_out_mul=True,
+                fp32_residual=False,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
         self.layer_communicator = LayerCommunicator(

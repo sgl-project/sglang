@@ -778,6 +778,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
             self.verified_id = self.verified_id[: len(new_indices)]
+            if self.accept_length is not None:
+                self.accept_length = self.accept_length[: len(new_indices)]
+            if self.accept_length_cpu is not None:
+                self.accept_length_cpu = self.accept_length_cpu[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
@@ -809,6 +813,27 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.accept_length is not None and spec_info.accept_length is not None:
+            self.accept_length = torch.cat(
+                [self.accept_length, spec_info.accept_length]
+            )
+            self.accept_length_cpu = self.accept_length.tolist()
+        elif self.accept_length is not None:
+            zeros = torch.zeros(
+                [spec_info.verified_id.shape[0]],
+                dtype=self.accept_length.dtype,
+                device=self.accept_length.device,
+            )
+            self.accept_length = torch.cat([self.accept_length, zeros])
+            self.accept_length_cpu = self.accept_length.tolist()
+        elif spec_info.accept_length is not None:
+            zeros = torch.zeros(
+                [self.verified_id.shape[0]],
+                dtype=self.accept_length.dtype,
+                device=self.accept_length.device,
+            )
+            self.accept_length = torch.cat([zeros, spec_info.accept_length])
+            self.accept_length_cpu = self.accept_length.tolist()
 
 
 @dataclass
