@@ -60,14 +60,17 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ── Pip bootstrap ───────────────────────────────────────────────────────
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --upgrade pip setuptools wheel --break-system-packages
 
-# ── PyTorch (cu129) ─────────────────────────────────────────────────────
-RUN pip install torch --extra-index-url https://download.pytorch.org/whl/cu129 \
+# ── Install sglang with all deps (respects version pins in pyproject.toml) ─
+# This ensures torch version matches what sgl-kernel was compiled against.
+COPY python/ /tmp/sglang-src/python/
+RUN pip install -e "/tmp/sglang-src/python[dev]" \
+        --extra-index-url https://download.pytorch.org/whl/cu129 \
         --break-system-packages
 
 # ── sgl-kernel ──────────────────────────────────────────────────────────
-RUN pip install sgl-kernel==${SGL_KERNEL_VERSION} --break-system-packages
+RUN pip install sgl-kernel==${SGL_KERNEL_VERSION} --force-reinstall --break-system-packages
 
 # ── flashinfer-jit-cache ────────────────────────────────────────────────
 RUN for i in 1 2 3 4 5; do \
@@ -77,22 +80,22 @@ RUN for i in 1 2 3 4 5; do \
         echo "Attempt $i failed, retrying in 10s..."; sleep 10; \
     done
 
-# ── Other Python dependencies ──────────────────────────────────────────
+# ── Additional Python dependencies (not in sglang's pyproject.toml) ────
 RUN pip install --break-system-packages \
     nvidia-nvshmem-cu12==3.4.5 \
     nvidia-cudnn-cu12==9.16.0.29 \
     nvidia-cuda-nvrtc-cu12 \
-    scipy \
-    pytest \
-    "huggingface_hub[hf_xet]" \
     py-spy \
     mooncake-transfer-engine==0.3.9 \
-    sglang-router \
-    opencv-python-headless
+    sglang-router
 
 # ── lmms-eval (for MMMU tests) ──────────────────────────────────────────
 RUN git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /opt/lmms-eval \
     && pip install -e /opt/lmms-eval/ --break-system-packages
+
+# Remove the build-time sglang source (CI will pip install -e from its own checkout)
+RUN pip uninstall -y sglang --break-system-packages 2>/dev/null || true \
+    && rm -rf /tmp/sglang-src
 
 # ── GitHub Actions runner ───────────────────────────────────────────────
 RUN useradd -m -s /bin/bash runner \
