@@ -353,6 +353,7 @@ class Envs:
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+    SGLANG_NSA_FORCE_MLA = EnvBool(False)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
@@ -417,7 +418,7 @@ class Envs:
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
-    SGLANG_MAMBA_SSM_DTYPE = EnvStr("float32")
+    SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -465,6 +466,10 @@ class Envs:
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
+
+    # EPD
+    SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
 
 
 envs = Envs()
