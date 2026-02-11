@@ -722,20 +722,17 @@ def fused_fp8_set_qkv_buffer(
     num_q_heads = q_out.shape[1]
 
     # Normalize to 3D if needed
+    # Q needs contiguous() because it may come from QKV split with non-contiguous stride,
+    # and the kernel uses a single set of Q strides for both input and output.
     q_3d = q if q.ndim == 3 else q.view(num_tokens, num_q_heads, head_dim)
+    q_3d = q_3d.contiguous()
     k_3d = k if k.ndim == 3 else k.view(num_tokens, num_kv_heads, head_dim)
     v_3d = v if v.ndim == 3 else v.view(num_tokens, num_kv_heads, head_dim)
 
-    # Assert K and V share the same stride (they come from same QKV projection)
     assert k_3d.stride() == v_3d.stride(), "K and V must have the same stride"
-    # Assert K cache and V cache share the same stride
     assert (
         k_cache.stride() == v_cache.stride()
     ), "K and V cache must have the same stride"
-    # Assert Q input and output share the same stride
-    assert (
-        q_3d.stride() == q_out.stride()
-    ), "Q input and output must have the same stride"
 
     # Compute cache strides (3D layout)
     cache_stride_page = k_cache.stride(0) * page_size
