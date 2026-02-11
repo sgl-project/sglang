@@ -34,6 +34,7 @@ from sglang.srt.configs.qwen3_5 import (
 # Distributed
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -1305,6 +1306,21 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
 
         return loaded_params
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        if hasattr(config, "text_config"):
+            text_config = config.text_config
+            return ModelConfigForExpertLocation(
+                num_layers=text_config.num_hidden_layers,
+                num_logical_experts=text_config.num_experts,
+                num_groups=None,
+            )
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
