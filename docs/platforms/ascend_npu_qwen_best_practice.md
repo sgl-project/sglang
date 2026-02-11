@@ -1644,7 +1644,9 @@ Input Output Length: 2K+2K
 
 TPOT: 50ms
 
-#### Model Deployment
+Quantization: W8A8 INT8
+
+- Launch SGlang Instance
 
 ```shell
 echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
