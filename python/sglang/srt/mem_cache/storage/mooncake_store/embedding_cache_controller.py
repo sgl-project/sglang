@@ -1,23 +1,15 @@
+import asyncio
 import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
     MooncakeEmbeddingStore,
 )
-
-logger = logging.getLogger(__name__)
-
-import asyncio
-import logging
-import threading
-from typing import List, Optional
-
-import torch
 
 logger = logging.getLogger(__name__)
 
@@ -98,8 +90,18 @@ class EmbeddingInsertOperation:
 
 
 class EmbeddingCacheController:
-    def __init__(self, tp_rank, tp_size, max_pool_size_gb=4.0, hidden_dim=1024):
+    def __init__(
+        self,
+        tp_rank,
+        tp_size,
+        max_pool_size_gb=4.0,
+        hidden_dim=1024,
+        tp_group=None,
+        all_rank_get=False,
+    ):
         self.tp_world_size = tp_size
+        self.tp_group = tp_group
+        self.all_rank_get = all_rank_get
         self.hidden_dim = hidden_dim
         self.element_size = torch.float32.itemsize
 
@@ -124,6 +126,20 @@ class EmbeddingCacheController:
         self.stop_event = threading.Event()
         self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
         self.io_thread.start()
+
+        if self.tp_world_size > 1:
+            if self.tp_group is None:
+                raise ValueError("tp_group must be provided when tp_size > 1")
+            from sglang.srt.distributed.parallel_state import (
+                create_custom_parallel_group,
+            )
+
+            group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
+            self.prefetch_tp_group = create_custom_parallel_group(
+                group_ranks=group_ranks, backend="gloo"
+            )
+        else:
+            self.prefetch_tp_group = None
 
     def prefetch(
         self, req_id: str, image_hashes: List[str], expected_tokens: List[int]
@@ -239,21 +255,20 @@ class EmbeddingCacheController:
                 if op.is_finished:
                     local_ready = op.success
 
-        if self.tp_world_size > 1:
+        if self.all_rank_get and self.tp_world_size > 1:
             ready_tensor = torch.tensor(
                 [1 if local_ready else 0], dtype=torch.int, device="cpu"
             )
             torch.distributed.all_reduce(
-                ready_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                ready_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.prefetch_tp_group,
             )
-            global_ready = ready_tensor.item() == 1
-        else:
-            global_ready = local_ready
+            local_ready = ready_tensor.item() == 1
 
-        if global_ready:
+        if local_ready:
             with self.lock:
-                if req_id in self.ongoing_prefetch:
-                    del self.ongoing_prefetch[req_id]
+                self.ongoing_prefetch.pop(req_id, None)
             return True
         return False
 

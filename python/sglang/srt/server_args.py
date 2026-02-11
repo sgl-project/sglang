@@ -4942,7 +4942,7 @@ class ServerArgs:
             "--enable-mm-global-cache",
             action="store_true",
             default=ServerArgs.enable_mm_global_cache,
-            help="Enable.",
+            help="Enable global multimodal embedding cache to skip redundant ViT inference.",
         )
 
         # For registering hooks
