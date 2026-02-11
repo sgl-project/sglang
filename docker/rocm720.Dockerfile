@@ -66,8 +66,7 @@ ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
-ARG SGL_DEFAULT="031a652"
-ARG SGL_BRANCH=${SGL_DEFAULT}
+ARG SGL_BRANCH="main"
 
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
@@ -212,13 +211,8 @@ RUN pip install IPython \
 RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
-    && if [ "${SGL_BRANCH}" = ${SGL_DEFAULT} ]; then \
-         echo "Using ${SGL_DEFAULT}, default branch."; \
-         git checkout ${SGL_DEFAULT}; \
-       else \
-         echo "Using ${SGL_BRANCH} branch."; \
-         git checkout ${SGL_BRANCH}; \
-       fi \
+    && echo "Using ${SGL_BRANCH} branch." \
+    && git checkout ${SGL_BRANCH} \
     && cd sgl-kernel \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
