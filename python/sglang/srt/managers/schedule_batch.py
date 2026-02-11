@@ -92,6 +92,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -1304,6 +1305,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    prefill_stats: Optional[PrefillStats] = None
 
     @classmethod
     def init_new(
@@ -2243,6 +2245,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
+            prefill_stats=self.prefill_stats,
         )
 
     def maybe_evict_swa(self):
