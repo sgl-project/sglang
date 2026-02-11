@@ -628,6 +628,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    enable_o_proj_tensor_parallel: bool = False
     nsa_prefill_cp_mode: str = "in-seq-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
@@ -4679,6 +4680,13 @@ class ServerArgs:
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
+
+        parser.add_argument(
+            "--enable-o-proj-tensor-parallel",
+            action="store_true",
+            help="Enable tensor parallel o proj linear used in context parallelism phase of DeepSeek v3.2.",
+        )
+
         parser.add_argument(
             "--nsa-prefill-cp-mode",
             type=str,
