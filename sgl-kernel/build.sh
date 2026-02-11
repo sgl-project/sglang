@@ -48,10 +48,13 @@ echo "Buildx cache:   ${BUILDX_CACHE_DIR}"
 echo "Builder:        ${BUILDER_NAME}"
 echo "----------------------------------------"
 
-# Optional profiling build-args (empty string disables)
+# Optional build-args (empty string disables)
 BUILD_ARGS=()
 [ -n "${ENABLE_CMAKE_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE}")
 [ -n "${ENABLE_BUILD_PROFILE:-}" ] && BUILD_ARGS+=(--build-arg ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE}")
+[ -n "${USE_CCACHE:-}" ]           && BUILD_ARGS+=(--build-arg USE_CCACHE="${USE_CCACHE}")
+[ -n "${BUILD_JOBS:-}" ]           && BUILD_ARGS+=(--build-arg BUILD_JOBS="${BUILD_JOBS}")
+[ -n "${NVCC_THREADS:-}" ]         && BUILD_ARGS+=(--build-arg NVCC_THREADS="${NVCC_THREADS}")
 
 docker buildx build \
   --builder "${BUILDER_NAME}" \
