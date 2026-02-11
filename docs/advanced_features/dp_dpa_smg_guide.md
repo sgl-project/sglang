@@ -197,6 +197,9 @@ The cache-aware routing policy in SMG significantly improves performance for wor
 - Workloads with shared prefixes (high cache reuse potential)
 - You need high availability and reliability features
 - You require detailed observability and metrics
+- You want to have highly efficient RL rollout systems
+
+Note that for RL rollout systems, **there are four crucial reasons that SMG-Based DP is far better than naive DP routing**. Details can be found at [Load Balancing Router in RL](./sglang_for_rl.md#load-balancing-router).
 
 ### Quick Start For SMG
 
