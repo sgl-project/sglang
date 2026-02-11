@@ -23,76 +23,13 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
-# Resolve a Python binary for mixed CI environments where python3/python may be missing from PATH.
-resolve_python_bin() {
-    if command -v python3 >/dev/null 2>&1; then
-        echo "python3"
-        return 0
-    fi
-    if command -v python >/dev/null 2>&1; then
-        echo "python"
-        return 0
-    fi
-
-    # Fall back to pip/pip3 shebang interpreter when python executables are not exported.
-    for pip_name in pip pip3; do
-        if command -v "$pip_name" >/dev/null 2>&1; then
-            local pip_bin shebang pip_python
-            pip_bin="$(command -v "$pip_name")"
-            shebang="$(head -n 1 "$pip_bin" 2>/dev/null || true)"
-            if [[ "$shebang" == "#!"* ]]; then
-                pip_python="${shebang#\#!}"
-                if [ -x "$pip_python" ]; then
-                    echo "$pip_python"
-                    return 0
-                fi
-            fi
-        fi
-    done
-
-    return 1
-}
-
-# Run pip in environments where only a subset of pip/python binaries are exported.
-run_pip() {
-    if command -v pip >/dev/null 2>&1; then
-        pip "$@"
-        return $?
-    fi
-    if command -v pip3 >/dev/null 2>&1; then
-        pip3 "$@"
-        return $?
-    fi
-
-    local py_bin="${PYTHON_BIN:-}"
-    if [ -z "$py_bin" ]; then
-        py_bin="$(resolve_python_bin || true)"
-    fi
-    if [ -n "$py_bin" ]; then
-        "$py_bin" -m pip "$@"
-        return $?
-    fi
-
-    echo "ERROR: pip is not available on PATH and no Python interpreter could be resolved."
-    return 1
-}
-
-PYTHON_BIN="$(resolve_python_bin || true)"
-
-# Clear torch compilation cache (best effort).
-if [ -n "$PYTHON_BIN" ]; then
-    "$PYTHON_BIN" -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
-else
-    echo "Warning: Python interpreter not found; skipping torch compilation cache cleanup."
-fi
-
-# Install apt packages
+# Install apt packages (including python3/pip which may be missing on some runners)
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
 # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
-apt-get install -y --no-install-recommends git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
+apt-get install -y --no-install-recommends python3 python3-pip python3-venv git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils || {
     echo "Warning: apt-get install failed, checking if required packages are available..."
     # Verify the packages we need are actually installed
-    for pkg in git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
+    for pkg in python3 python3-pip python3-venv git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils; do
         if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
             echo "ERROR: Required package $pkg is not installed and apt-get failed"
             exit 1
@@ -100,6 +37,9 @@ apt-get install -y --no-install-recommends git libnuma-dev libssl-dev pkg-config
     done
     echo "All required packages are already installed, continuing..."
 }
+
+# Clear torch compilation cache
+python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Check if protoc of correct architecture is already installed
 if command -v protoc >/dev/null 2>&1; then
@@ -153,19 +93,19 @@ else
     echo "protoc already installed: $(protoc --version)"
 fi
 
-# Install uv
-run_pip install --upgrade pip
+# Install uv (use python3 -m pip for robustness since some runners only have pip3)
+python3 -m pip install --upgrade pip
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
-    PIP_CMD="run_pip"
+    PIP_CMD="pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
-    PIP_UNINSTALL_CMD="run_pip uninstall -y"
+    PIP_UNINSTALL_CMD="pip uninstall -y"
     PIP_UNINSTALL_SUFFIX="--break-system-packages"
 else
     # In normal cases, we use uv, which is much faster than pip.
-    run_pip install uv
+    pip install uv
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
@@ -191,23 +131,15 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
-# Remove flash_attn folder to avoid conflicts (best effort).
-if [ -z "$PYTHON_BIN" ]; then
-    PYTHON_BIN="$(resolve_python_bin || true)"
-fi
+# Remove flash_attn folder to avoid conflicts
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
-if [ -n "$PYTHON_BIN" ]; then
-    PYTHON_LIB_PATH=$("$PYTHON_BIN" -c "import site; print(site.getsitepackages()[0])")
-    FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
-
-    if [ -d "$FLASH_ATTN_PATH" ]; then
-        echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-        rm -rf "$FLASH_ATTN_PATH"
-    else
-        echo "Directory $FLASH_ATTN_PATH does not exist."
-    fi
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
 else
-    echo "Warning: Python interpreter not found; skipping flash_attn cleanup."
+    echo "Directory $FLASH_ATTN_PATH does not exist."
 fi
 
 # Install sgl-kernel
@@ -234,7 +166,7 @@ elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; 
 else
     # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
     if [ "$IS_BLACKWELL" = "1" ]; then
-        INSTALLED_SGL_KERNEL=$(run_pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+        INSTALLED_SGL_KERNEL=$(pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
         if [ "$INSTALLED_SGL_KERNEL" = "$SGL_KERNEL_VERSION_FROM_SRT" ]; then
             echo "sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} already installed, skipping reinstall"
         else
@@ -261,7 +193,7 @@ fi
 # DeepEP depends on nvshmem 3.4.5
 # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
 if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_NVSHMEM=$(run_pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
         echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
     else
@@ -274,7 +206,7 @@ fi
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
 if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_CUDNN=$(run_pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
         echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
     else
@@ -314,7 +246,7 @@ fi
 if [ "$FLASHINFER_INSTALLED" = false ]; then
     for i in {1..5}; do
         # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
-        if run_pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
+        if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
             --index-url https://flashinfer.ai/whl/${CU_VERSION} \
             -d "${FLASHINFER_CACHE_DIR}"; then
 
@@ -341,14 +273,7 @@ fi
 
 # Show current packages
 $PIP_CMD list
-if [ -z "$PYTHON_BIN" ]; then
-    PYTHON_BIN="$(resolve_python_bin || true)"
-fi
-if [ -n "$PYTHON_BIN" ]; then
-    "$PYTHON_BIN" -c "import torch; print(torch.version.cuda)"
-else
-    echo "Warning: Python interpreter not found; skipping torch CUDA version print."
-fi
+python3 -c "import torch; print(torch.version.cuda)"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
