@@ -57,7 +57,6 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
-    set_mnnvl_mem_all_reduce,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
@@ -765,7 +764,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
-        set_mnnvl_mem_all_reduce(self.server_args.enable_flashinfer_mnnvl_allreduce)
 
         if not self.is_draft_worker:
             if self.device == "cpu":

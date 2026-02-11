@@ -45,6 +45,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH` | Enable NCCL for gathering when preparing mlp sync batch under overlap scheduler (without this flag gloo is used for gathering) | `false` |
 | `SGLANG_SYMM_MEM_PREALLOC_GB_SIZE` | Size of preallocated GPU buffer (in GB) for NCCL symmetric memory pool to limit memory fragmentation. Only have an effect when server arg `--enable-symm-mem` is set. | `4` |
 | `SGLANG_CUSTOM_ALLREDUCE_ALGO` | The algorithm of custom all-reduce. Set to `oneshot` or `1stage` to force use one-shot. Set to `twoshot` or `2stage` to force use two-shot. | `` |
+| `SGLANG_FLASHINFER_ALLREDUCE_FUSION_BACKEND` | Force FlashInfer allreduce fusion backend selection. Set to `"auto"` to let FlashInfer choose the best backend, `"trtllm"` to force TensorRT-LLM backend, or `"mnnvl"` to force MNNVL backend. Empty string (default) uses auto selection. | `` |
 
 
 ## DeepGEMM Configuration (Advanced Optimization)

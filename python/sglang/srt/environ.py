@@ -311,6 +311,8 @@ class Envs:
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Force FlashInfer allreduce fusion backend: "auto", "trtllm", or "mnnvl" (empty string = auto)
+    SGLANG_FLASHINFER_ALLREDUCE_FUSION_BACKEND = EnvStr("")
 
     # Triton
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
