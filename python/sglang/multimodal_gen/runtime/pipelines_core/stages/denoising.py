@@ -1304,9 +1304,7 @@ class DenoisingStage(PipelineStage):
                 min_kc_ratio=svg2_cfg.get("svg2_min_kc_ratio", 0.1),
                 kmeans_iter_init=svg2_cfg.get("svg2_kmeans_iter_init", 50),
                 kmeans_iter_step=svg2_cfg.get("svg2_kmeans_iter_step", 2),
-                zero_step_kmeans_init=svg2_cfg.get(
-                    "svg2_zero_step_kmeans_init", False
-                ),
+                zero_step_kmeans_init=svg2_cfg.get("svg2_zero_step_kmeans_init", False),
                 first_layers_fp=first_layers_fp,
                 first_times_fp=first_times_fp,
                 context_length=context_length,
