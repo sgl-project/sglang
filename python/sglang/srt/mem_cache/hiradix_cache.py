@@ -985,8 +985,12 @@ class HiRadixCache(RadixCache):
         return unpinned
 
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
-        """Convert raw token_ids to a RadixKey for tree walking."""
-        return RadixKey(token_ids=tuple(token_ids))
+        """Convert raw token_ids to a RadixKey for tree walking.
+
+        Must use list (not tuple) to match scheduler's RadixKey format,
+        since _key_match_paged compares slices directly and list != tuple.
+        """
+        return RadixKey(token_ids=list(token_ids))
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -1500,15 +1504,6 @@ class HiRadixCache(RadixCache):
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
-        logger.debug(
-            f"[PIN] match_prefix: key_len={len(params.key)}, "
-            f"device_hit={len(value)}, host_hit={host_hit_length}, "
-            f"last_node.evicted={last_node.evicted}, "
-            f"last_node.id={last_node.id}, "
-            f"evictable_size={self.evictable_size_}, "
-            f"active_pin_count={self._active_pin_count}"
-        )
-
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -1631,6 +1626,13 @@ class HiRadixCache(RadixCache):
         new_node.pin_count = child.pin_count
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+
+        if child.pin_count > 0:
+            logger.debug(
+                f"[PIN] _split_node: splitting pinned node {child.id} "
+                f"(pin_count={child.pin_count}, key_len={len(child.key)}, "
+                f"split_len={split_len}, new_node_id={new_node.id})"
+            )
 
         # split value and host value if exists
         if child.evicted:
