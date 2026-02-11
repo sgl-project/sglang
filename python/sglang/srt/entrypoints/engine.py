@@ -1052,4 +1052,12 @@ def _launch_subprocesses(
     # Get back some info from scheduler to tokenizer_manager
     tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
 
+    # Set up subprocess liveness monitor to detect crashes
+    # (e.g., NCCL timeout causing C++ std::terminate() before Python can handle it)
+    if hasattr(tokenizer_manager, "setup_subprocess_monitor"):
+        tokenizer_manager.setup_subprocess_monitor(
+            scheduler_procs=scheduler_procs,
+            detokenizer_proc=detoken_proc,
+        )
+
     return tokenizer_manager, template_manager, scheduler_infos, port_args
