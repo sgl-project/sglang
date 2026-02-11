@@ -1359,6 +1359,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         layer,
         mask=None,
         temp_cache=None,
+        intermediate_state_indices=None,
     ):
         q_offsets = metadata.query_start_loc
 
@@ -1379,6 +1380,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             decay_scales=self.tp_slope[layer.layer_id],
             meta=seg_meta,
             caches=temp_cache,
+            cache_indices=intermediate_state_indices,
             decouple=True,
         )
         return hidden
@@ -1421,6 +1423,9 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                 metadata,
             )
         elif self.linear_backend == "seg_la":
+            intermediate_state_indices = torch.arange(
+                cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+            ) if forward_batch.forward_mode.is_target_verify() else None
             o = self._linear_attention_entry(
                 q,
                 k,
@@ -1434,6 +1439,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
                     if forward_batch.forward_mode.is_target_verify()
                     else None
                 ),
+                intermediate_state_indices=intermediate_state_indices
             )
         else:
             raise ValueError(

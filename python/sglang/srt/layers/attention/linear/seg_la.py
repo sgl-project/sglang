@@ -565,6 +565,7 @@ def seg_la_mtp_kernel(
     stride_c,
     stride_o,
     s_offsets,
+    cache_indices,
     decay_scales,
     step,
     HEAD_DIM: tl.constexpr,
@@ -612,9 +613,10 @@ def seg_la_mtp_kernel(
     )
     state = tl.load(s_ptrs).to(tl.float32)
     # (bs, step, kv_heads, d, d)
+    cache_indices = tl.load(cache_indices + bid)
     c_ptrs = (
         CACHES
-        + s_offset * stride_c
+        + cache_indices * stride_c
         + hid * HEAD_DIM * HEAD_DIM
         + kid * HEAD_DIM * K_SPLIT_DIM
         + vid * V_SPLIT_DIM
@@ -652,7 +654,7 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
 
 
 def seg_la_fwd(
-    q, k, v, s, decay_scales, meta, caches=None, softmax_scale=None, decouple=False
+    q, k, v, s, decay_scales, meta, caches=None, cache_indices=None, softmax_scale=None, decouple=False
 ):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
@@ -702,6 +704,7 @@ def seg_la_fwd(
                 caches.stride(0),
                 tmp.stride(0),
                 meta.s_offsets,
+                cache_indices,
                 decay_scales,
                 step,
                 HEAD_DIM=HEAD_DIM,
