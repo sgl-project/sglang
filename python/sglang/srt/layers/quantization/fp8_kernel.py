@@ -219,7 +219,7 @@ def _per_token_group_quant_8bit_raw(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         group_size: The group size used for quantization.
         eps: The minimum to avoid dividing zero.
         dtype: The dype of output tensor.
@@ -635,7 +635,7 @@ def static_quant_fp8(
     quantized tensor along with the scaling factor used for quantization.
 
     Args:
-        x: The input tenosr with ndim >= 2.
+        x: The input tensor with ndim >= 2.
         x_s: The quantization scale.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
         dtype: The dype of output tensor.
