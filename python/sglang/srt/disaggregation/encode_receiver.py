@@ -5,7 +5,7 @@ import random
 import threading
 import uuid
 from enum import IntEnum
-from typing import TYPE_CHECKING, List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional
 
 import aiohttp
 import torch
@@ -20,64 +20,48 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto, get_zmq_socket_on_host
+from sglang.srt.utils.common import ImageData
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.utils.common import ImageData
 
 
-def _extract_image_url(image_item: Union[str, dict, "ImageData"]) -> str:
-    """Extract URL from various image data formats.
+def _extract_url_data(mm_data) -> List[str]:
+    """Extract URLs from multimodal data, handling various input formats.
 
+    Follows the pattern from the video/audio EPD PR (#17824).
     The native /generate API passes raw strings or dicts from JSON,
     while the OpenAI-compatible API creates ImageData objects.
 
-    Supports:
+    Supports per-item:
     - str: Direct URL or base64 data URI
     - dict: {"url": "..."} or {"image_url": "..."} format from JSON
     - ImageData: Object with .url attribute (from OpenAI-compatible API)
-
-    Args:
-        image_item: Image data in any supported format
-
-    Returns:
-        URL string extracted from the image data
-
-    Raises:
-        ValueError: If the image data type is not supported
     """
-    if isinstance(image_item, str):
-        return image_item
-    elif isinstance(image_item, dict):
-        # Support both {"url": "..."} and {"image_url": "..."} formats
-        # Support both {"url": "..."} and {"image_url": "..."} formats
-        url = image_item.get("url") or image_item.get("image_url")
-        if url:
-            return url
-        raise ValueError(f"Dictionary image data must contain 'url' or 'image_url' key: {image_item}")
-    elif hasattr(image_item, "url"):
-        return image_item.url
-    else:
-        raise ValueError(f"Unsupported image data type: {type(image_item)}")
-
-
-def _extract_image_urls(image_data: Union[str, dict, list, "ImageData", None]) -> List[str]:
-    """Extract URLs from image_data which may be a single item or list.
-
-    Args:
-        image_data: Single image item or list of image items
-
-    Returns:
-        List of URL strings
-    """
-    if image_data is None:
+    if mm_data is None:
         return []
-    if not isinstance(image_data, list):
-        return [_extract_image_url(image_data)]
-    return [_extract_image_url(img) for img in image_data]
+    if not isinstance(mm_data, list):
+        mm_data = [mm_data]
+
+    urls = []
+    for item in mm_data:
+        if isinstance(item, str):
+            urls.append(item)
+        elif isinstance(item, dict):
+            url = item.get("url") or item.get("image_url")
+            if not url:
+                raise ValueError(
+                    f"Dict image data must contain 'url' or 'image_url' key: {item}"
+                )
+            urls.append(url)
+        elif isinstance(item, ImageData):
+            urls.append(item.url)
+        else:
+            raise ValueError(f"Unsupported image data type: {type(item)}")
+    return urls
 
 
 class EmbeddingData:
@@ -600,7 +584,7 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def send_encode_request(self, obj):
-        image_urls = _extract_image_urls(obj.image_data)
+        image_urls = _extract_url_data(obj.image_data)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
         if image_urls and len(image_urls) > 0:
@@ -632,7 +616,7 @@ class MMReceiver:
                 return None
             req_id = uuid.uuid4().hex
             embedding_port, recv_socket = get_zmq_socket_on_host(self.context, zmq.PULL)
-            img_data = _extract_image_urls(img_data)
+            img_data = _extract_url_data(img_data)
             asyncio.create_task(
                 self.encode(req_id, img_data, embedding_port, "encode", "send")
             )
