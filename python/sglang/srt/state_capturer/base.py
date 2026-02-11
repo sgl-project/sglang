@@ -209,6 +209,7 @@ class BaseTopkCapturer:
         else:
             # Kernel batches may be padded; only real request tokens are stored.
             slice_gpu = slice_gpu[: out_cache_loc.shape[0]]
+        out_cache_loc = out_cache_loc[: slice_gpu.shape[0]]
         if no_copy_to_cpu:
             # Clone before the next overlapping forward reuses these buffers.
             return TopkCaptureOutput(
