@@ -326,12 +326,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
 
-        # Flag to enable the fused rope_quantize_fp8_append_paged_kv_cache kernel
-        # This combines RoPE application, FP8 quantization, and KV cache append
-        # into a single kernel call for better performance
-        # Set to True to use the fused kernel instead of separate calls
-        self.use_fused_rope_quantize_append = True  # PERF TEST: fused path
-
     def _init_forward_metadata_for_rope_fusion(
         self,
         metadata: TRTLLMMLADecodeMetadata,
@@ -506,7 +500,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         #   3. Updated in-place each replay (_init_forward_metadata_for_rope_fusion)
         # kv_indptr and batch_indices are static (arange), never modified after init.
         # kv_indices and positions are dynamic, refreshed each replay.
-        if self.use_fused_rope_quantize_append:
+        if self.data_type == torch.float8_e4m3fn:
             self._cuda_graph_fused_kv_indices = torch.zeros(
                 max_num_tokens, dtype=torch.int32, device=self.device
             )
@@ -605,7 +599,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Set pre-allocated fused kernel buffers (sliced to num_tokens)
         # NOTE: Values are initialized during replay via _init_forward_metadata_for_rope_fusion.
         # During capture, only tensor shapes/references matter for CUDA graph recording.
-        if self.use_fused_rope_quantize_append:
+        if self.data_type == torch.float8_e4m3fn:
             metadata.kv_indices = self._cuda_graph_fused_kv_indices[:num_tokens]
             metadata.kv_indptr = self._cuda_graph_fused_kv_indptr[:num_tokens + 1]
             metadata.batch_indices = self._cuda_graph_fused_batch_indices[:num_tokens]
@@ -681,7 +675,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Initialize fused kernel metadata for CUDA graph replay
-        if self.use_fused_rope_quantize_append and out_cache_loc is not None:
+        if self.data_type == torch.float8_e4m3fn and out_cache_loc is not None:
             self._init_forward_metadata_for_rope_fusion(
                 metadata,
                 out_cache_loc,
@@ -777,7 +771,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata.batch_size = bs
 
             # Initialize fused kernel metadata (computed once per forward pass, used by all layers)
-            if self.use_fused_rope_quantize_append and forward_batch.out_cache_loc is not None:
+            if self.data_type == torch.float8_e4m3fn and forward_batch.out_cache_loc is not None:
                 self._init_forward_metadata_for_rope_fusion(
                     self.forward_decode_metadata,
                     forward_batch.out_cache_loc,
@@ -867,6 +861,57 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         return q_out, k_nope_out, k_rope_out
+
+    def _fp8_rope_quantize_and_save(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        """Apply FP8 RoPE + quantize, and optionally save KV cache.
+
+        When save_kv_cache is True, the fused kernel performs RoPE application,
+        FP8 quantization, and paged KV cache write in a single kernel call.
+        When save_kv_cache is False (e.g. CUDA graph decode where the cache is
+        already populated), only RoPE + FP8 quantize is performed via the
+        separated kernel.
+
+        Returns:
+            merged_q: merged query tensor [nnz, num_heads, kv_lora_rank + qk_rope_head_dim]
+        """
+        k_squeezed = k.squeeze(1)
+        k_rope_squeezed = k_rope.squeeze(1)
+
+        if save_kv_cache:
+            # Fused kernel: RoPE + FP8 quantize + KV cache write in one call
+            return self.fused_rope_quantize_and_append_kv_cache(
+                q_nope,
+                q_rope,
+                k_squeezed,
+                k_rope_squeezed,
+                layer,
+                forward_batch,
+                cos_sin_cache,
+                is_neox,
+            )
+
+        # No cache write needed — RoPE + FP8 quantize only
+        merged_q, _k_nope_out, _k_rope_out = self.quantize_and_rope_for_fp8(
+            q_nope,
+            q_rope,
+            k_squeezed,
+            k_rope_squeezed,
+            forward_batch,
+            cos_sin_cache,
+            is_neox,
+        )
+        return merged_q
 
     def fused_rope_quantize_and_append_kv_cache(
         self,
@@ -1064,39 +1109,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
 
-            if self.use_fused_rope_quantize_append and save_kv_cache:
-                # Fused path: RoPE + quantize + KV cache append in one kernel
-                q = self.fused_rope_quantize_and_append_kv_cache(
-                    q,  # q_nope
-                    q_rope,
-                    k.squeeze(1),  # k_nope
-                    k_rope.squeeze(1),
-                    layer,
-                    forward_batch,
-                    cos_sin_cache,
-                    is_neox,
-                )
-                merge_query = False
-                # KV cache already saved by fused kernel, skip separate save
-                save_kv_cache = False
-            else:
-                # Separated path: quantize first, then append
-                q, k, k_rope = self.quantize_and_rope_for_fp8(
-                    q,
-                    q_rope,
-                    k.squeeze(1),
-                    k_rope.squeeze(1),
-                    forward_batch,
-                    cos_sin_cache,
-                    is_neox,
-                )
-                merge_query = False
+            q = self._fp8_rope_quantize_and_save(
+                q, q_rope, k, k_rope, layer, forward_batch,
+                cos_sin_cache, is_neox, save_kv_cache,
+            )
+            merge_query = False
+            save_kv_cache = False  # Already handled inside _fp8_rope_quantize_and_save
 
-        # Save KV cache if requested (skipped if fused path was used)
+        # Save KV cache for non-FP8 path (FP8 path already handled above)
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
@@ -1198,7 +1219,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
             )
 
-        # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
 
         if (
@@ -1210,44 +1230,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
 
-            if self.use_fused_rope_quantize_append and save_kv_cache:
-                # Fused path: RoPE + quantize + KV cache append in one kernel
-                q = self.fused_rope_quantize_and_append_kv_cache(
-                    q,  # q_nope
-                    q_rope,
-                    k.squeeze(1),  # k_nope
-                    k_rope.squeeze(1),
-                    layer,
-                    forward_batch,
-                    cos_sin_cache,
-                    is_neox,
-                )
-                merge_query = False
-                # KV cache already saved by fused kernel, skip separate save
-                save_kv_cache = False
-            else:
-                # Separated path: quantize first, then append
-                q, k, k_rope = self.quantize_and_rope_for_fp8(
-                    q,
-                    q_rope,
-                    k.squeeze(1),
-                    k_rope.squeeze(1),
-                    forward_batch,
-                    cos_sin_cache,
-                    is_neox,
-                )
-                merge_query = False
+            q = self._fp8_rope_quantize_and_save(
+                q, q_rope, k, k_rope, layer, forward_batch,
+                cos_sin_cache, is_neox, save_kv_cache,
+            )
+            merge_query = False
+            save_kv_cache = False  # Already handled inside _fp8_rope_quantize_and_save
 
-        # Save KV cache if requested (skipped if fused path was used)
+        # Save KV cache for non-FP8-target-verify path (FP8 path already handled above)
         if save_kv_cache:
-            assert (
-                k is not None and k_rope is not None
-            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
-        # TODO refactor to avoid code duplication
         # Prepare query tensor inline
         if merge_query:
             # For FP16 path, we merge the query and rope parts into a single tensor
