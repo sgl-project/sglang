@@ -91,11 +91,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
 
         return self.kernel_dispatcher.decode(
-            q,
-            k,
-            v,
-            a,
-            b,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             ssm_states=ssm_states,
@@ -176,11 +176,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         v = rearrange(v, "n (h d) -> 1 n h d", d=layer.head_v_dim)
 
         core_attn_out = self.kernel_dispatcher.extend(
-            q,
-            k,
-            v,
-            a,
-            b,
+            q=q,
+            k=k,
+            v=v,
+            g=a,
+            beta=b,
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,

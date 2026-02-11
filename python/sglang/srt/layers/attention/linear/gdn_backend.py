@@ -100,11 +100,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
         core_attn_out = self.kernel_dispatcher.decode(
-            query,
-            key,
-            value,
-            a,
-            b,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             ssm_states=ssm_states,
@@ -219,11 +219,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
-                query,
-                key,
-                value,
-                g,
-                beta,
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -234,11 +234,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
-                query,
-                key,
-                value,
-                g,
-                beta,
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
