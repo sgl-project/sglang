@@ -36,13 +36,10 @@ class GDNKernelDispatcher:
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_cutedsl():
-            if not is_cuda():
-                raise ValueError("CuTe DSL backend requires CUDA")
-            from sglang.srt.layers.attention.linear.kernels.cutedsl_gdn import (
-                CuteDSLGDNKernel,
+            raise ValueError(
+                "CuTe DSL backend only supports decode, not prefill. "
+                "Use --linear-attn-prefill-backend triton instead."
             )
-
-            self.extend_kernel = CuteDSLGDNKernel()
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
