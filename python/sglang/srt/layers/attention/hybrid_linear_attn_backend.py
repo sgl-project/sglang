@@ -33,7 +33,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
-from sglang.srt.utils.common import is_hip, rank0_log
+from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
     # fix import error on CPU device, no impacts when non-CPU path
@@ -55,11 +55,6 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_hip():
-    # On ROCm/HIP, sgl_kernel.causal_conv1d_fwd is not available.
-    # Use the triton-based causal_conv1d_fn already imported above from
-    # causal_conv1d_triton (lines 17-21) — no override needed.
-    pass
 elif is_npu():
     from sgl_kernel_npu.fla.chunk import chunk_gated_delta_rule_npu
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (

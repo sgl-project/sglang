@@ -86,6 +86,62 @@ global_workspace_buffer = None
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
+def _ck_batch_prefill_is_supported(
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+) -> bool:
+    """Return whether CK `mha_batch_prefill` can run for a given head shape.
+
+    CK support for head_dim > 128 depends on the local AITER build. Probe with a
+    small shape so we can fall back to triton when unsupported.
+    """
+    if "mha_batch_prefill_func" not in globals():
+        return False
+
+    try:
+        with torch.no_grad():
+            # Use a small but non-trivial (q_len=2) shape to avoid generating the
+            # special nmask kernel variant (max_seqlen_q == 1) which has been seen
+            # to trigger GPU faults at high TP (e.g. TP=8) on some ROCm stacks.
+            q_len = 2
+            q = torch.empty(
+                (q_len, num_q_heads, head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            k = torch.empty(
+                (q_len, num_kv_heads, head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            v = torch.empty(
+                (q_len, num_kv_heads, v_head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            indptr = torch.tensor([0, q_len], dtype=torch.int32, device=device)
+            indices = torch.arange(q_len, dtype=torch.int32, device=device)
+            mha_batch_prefill_func(
+                q,
+                k,
+                v,
+                indptr,
+                indptr,
+                indices,
+                q_len,
+                q_len,
+                causal=True,
+            )
+        return True
+    except Exception:
+        return False
+
+
 class AiterAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -123,51 +179,20 @@ class AiterAttnBackend(AttentionBackend):
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
-        # Probe whether CK batch_prefill kernel supports this head_dim.
-        # After AITER is rebuilt with hdim=256 tiles, CK works natively.
-        # Without the rebuild, fall back to triton extend_attention_fwd.
-        self._needs_triton_fallback = False
+        # CK `mha_batch_prefill` support for head_dim > 128 depends on the local
+        # AITER build. Probe once at init and fall back to triton extend kernel
+        # when unsupported.
+        self._use_ck_batch_prefill = True
         if not skip_prefill and (not self.use_mla) and self.head_dim > 128:
-            try:
-                # Use a small but non-trivial (q_len=2) shape to avoid generating the
-                # special nmask kernel variant (max_seqlen_q == 1) which has been seen
-                # to trigger GPU faults at high TP (e.g. TP=8) on some ROCm stacks.
-                _test_q = torch.empty(
-                    2,
-                    self.num_head,
-                    self.head_dim,
-                    device=self.device,
-                    dtype=self.input_dtype,
-                )
-                _test_k = torch.empty(
-                    2,
-                    self.num_kv_head,
-                    self.head_dim,
-                    device=self.device,
-                    dtype=self.input_dtype,
-                )
-                _test_v = torch.empty(
-                    2,
-                    self.num_kv_head,
-                    self.v_head_dim,
-                    device=self.device,
-                    dtype=self.input_dtype,
-                )
-                _indptr = torch.tensor([0, 2], dtype=torch.int32, device=self.device)
-                _indices = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
-                mha_batch_prefill_func(
-                    _test_q,
-                    _test_k,
-                    _test_v,
-                    _indptr,
-                    _indptr,
-                    _indices,
-                    2,
-                    2,
-                    causal=True,
-                )
-            except RuntimeError:
-                self._needs_triton_fallback = True
+            self._use_ck_batch_prefill = _ck_batch_prefill_is_supported(
+                device=self.device,
+                dtype=self.input_dtype,
+                num_q_heads=self.num_head,
+                num_kv_heads=self.num_kv_head,
+                head_dim=self.head_dim,
+                v_head_dim=self.v_head_dim,
+            )
+            if not self._use_ck_batch_prefill:
                 logger.warning(
                     "CK batch_prefill does not support head_dim=%d, "
                     "falling back to triton extend kernel",
@@ -1354,7 +1379,7 @@ class AiterAttnBackend(AttentionBackend):
                 k_cache = k_cache.to(dtype)
                 v_cache = v_cache.to(dtype)
 
-            if self._needs_triton_fallback:
+            if not self._use_ck_batch_prefill:
                 # CK mha_batch_prefill kernel does not support head_dim > 128.
                 # Fall back to the triton extend_attention_fwd kernel.
                 o = torch.empty(
@@ -1380,24 +1405,24 @@ class AiterAttnBackend(AttentionBackend):
                     logit_cap=self.logits_soft_cap,
                 )
                 return o
-            else:
-                o = mha_batch_prefill_func(
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k_cache,
-                    v_cache,
-                    self.qo_indptr[:bs0],
-                    self.forward_metadata.kv_indptr[:bs0],
-                    self.forward_metadata.kv_indices,
-                    self.forward_metadata.max_q_len,
-                    self.forward_metadata.max_kv_len,
-                    causal=True,
-                    logits_soft_cap=self.logits_soft_cap,
-                    alibi_slopes=None,
-                    return_lse=False,
-                    return_attn_probs=False,
-                )
 
-                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            o = mha_batch_prefill_func(
+                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                k_cache,
+                v_cache,
+                self.qo_indptr[:bs0],
+                self.forward_metadata.kv_indptr[:bs0],
+                self.forward_metadata.kv_indices,
+                self.forward_metadata.max_q_len,
+                self.forward_metadata.max_kv_len,
+                causal=True,
+                logits_soft_cap=self.logits_soft_cap,
+                alibi_slopes=None,
+                return_lse=False,
+                return_attn_probs=False,
+            )
+
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
         self,
