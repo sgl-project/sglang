@@ -637,14 +637,33 @@ class GroupCoordinator:
         ):
             return None
 
+        # Keep fused AR+RMSNorm deterministic mode consistent with all_reduce().
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            use_1stage_ar = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
             residual_inp_,
             weight_,
             eps,
+            use_1stage_ar,
         )
         # We check for None because custom_fused_ar_rms may not be supported or enabled on the communicator.
         # If it's not available, we can't perform fused all-reduce + RMSNorm, so we return None.
+        if fused_outputs is None:
+            if not getattr(self, "_fused_ar_rms_fallback_logged", False):
+                logger.warning(
+                    "Fused allreduce+rmsnorm fallback: custom fused path unavailable."
+                )
+                self._fused_ar_rms_fallback_logged = True
+        elif not getattr(self, "_fused_ar_rms_enabled_logged", False):
+            logger.info(
+                "Using fused allreduce+rmsnorm custom kernel (use_1stage=%s).",
+                use_1stage_ar,
+            )
+            self._fused_ar_rms_enabled_logged = True
         return fused_outputs
 
     def _all_reduce_out_place(
