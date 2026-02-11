@@ -178,7 +178,7 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+    if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
         prefix_len = tl.load(seq_lens + pid)
