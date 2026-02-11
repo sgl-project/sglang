@@ -19,13 +19,13 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
-    fused_mamba_state_scatter_with_mask,
-)
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
     Mamba2Metadata,
+)
+from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+    fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -1327,7 +1327,7 @@ class HybridLinearAttnBackend(AttentionBackend):
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
-        
+
         This replaces the original advanced indexing operations with a single fused
         gather-scatter kernel that also handles masking internally, avoiding:
         - index_elementwise_kernel from tensor[bool_mask]

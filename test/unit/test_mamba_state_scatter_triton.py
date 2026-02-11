@@ -59,8 +59,20 @@ def _ref_update_like(
     # Only scatter if there are valid indices (but don't early return -
     # mamba_track_indices processing is independent)
     if dst_state_indices.numel() > 0:
-        _ref_scatter(ssm_states, intermediate_ssm, dst_state_indices, src_state_indices, last_steps)
-        _ref_scatter(conv_states, intermediate_conv, dst_state_indices, src_state_indices, last_steps)
+        _ref_scatter(
+            ssm_states,
+            intermediate_ssm,
+            dst_state_indices,
+            src_state_indices,
+            last_steps,
+        )
+        _ref_scatter(
+            conv_states,
+            intermediate_conv,
+            dst_state_indices,
+            src_state_indices,
+            last_steps,
+        )
 
     if mamba_track_indices is not None:
         assert mamba_steps_to_track is not None
@@ -150,7 +162,9 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
     def test_fused_matches_reference(self):
         """Test that fused_mamba_state_scatter_with_mask matches the reference."""
         if fused_mamba_state_scatter_with_mask is None:
-            self.skipTest(f"fused_mamba_state_scatter_with_mask import failed: {_FUSED_IMPORT_ERROR}")
+            self.skipTest(
+                f"fused_mamba_state_scatter_with_mask import failed: {_FUSED_IMPORT_ERROR}"
+            )
 
         torch.manual_seed(42)
         device = torch.device("cuda")
@@ -163,15 +177,23 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
         ssm_elems = 1024
         conv_elems = 512
 
-        ssm_states0 = torch.empty((L, C, ssm_elems), device=device, dtype=torch.bfloat16)
-        conv_states0 = torch.empty((L, C, conv_elems), device=device, dtype=torch.bfloat16)
-        intermediate_ssm = torch.randn((L, B, D, ssm_elems), device=device, dtype=torch.bfloat16)
-        intermediate_conv = torch.randn((L, B, D, conv_elems), device=device, dtype=torch.bfloat16)
+        ssm_states0 = torch.empty(
+            (L, C, ssm_elems), device=device, dtype=torch.bfloat16
+        )
+        conv_states0 = torch.empty(
+            (L, C, conv_elems), device=device, dtype=torch.bfloat16
+        )
+        intermediate_ssm = torch.randn(
+            (L, B, D, ssm_elems), device=device, dtype=torch.bfloat16
+        )
+        intermediate_conv = torch.randn(
+            (L, B, D, conv_elems), device=device, dtype=torch.bfloat16
+        )
 
         # unique cache lines (no duplicates) to avoid nondeterministic write order
-        state_indices_tensor = torch.randperm(C, device=device, dtype=torch.int64)[:B].to(
-            torch.int32
-        )
+        state_indices_tensor = torch.randperm(C, device=device, dtype=torch.int64)[
+            :B
+        ].to(torch.int32)
 
         accepted_steps = torch.randint(0, D, (B,), device=device, dtype=torch.int64)
         # set ~10% invalid
@@ -180,7 +202,9 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
 
         # Optional track update
         mamba_track_indices = torch.randperm(C, device=device, dtype=torch.int64)[:B]
-        mamba_steps_to_track = torch.randint(0, D, (B,), device=device, dtype=torch.int64)
+        mamba_steps_to_track = torch.randint(
+            0, D, (B,), device=device, dtype=torch.int64
+        )
         track_invalid = torch.rand((B,), device=device) < 0.7
         mamba_steps_to_track[track_invalid] = -1
 
@@ -224,7 +248,9 @@ class TestMambaStateScatterPerf(unittest.TestCase):
         if os.environ.get("SGLANG_RUN_MAMBA_SCATTER_PERF_TEST", "0") != "1":
             self.skipTest("Set SGLANG_RUN_MAMBA_SCATTER_PERF_TEST=1 to run perf test.")
         if fused_mamba_state_scatter_with_mask is None:
-            self.skipTest(f"fused_mamba_state_scatter_with_mask import failed: {_FUSED_IMPORT_ERROR}")
+            self.skipTest(
+                f"fused_mamba_state_scatter_with_mask import failed: {_FUSED_IMPORT_ERROR}"
+            )
 
         torch.manual_seed(0)
         device = torch.device("cuda")
@@ -236,9 +262,13 @@ class TestMambaStateScatterPerf(unittest.TestCase):
         D = int(os.environ.get("SGLANG_MAMBA_SCATTER_DRAFT_TOKENS", "5"))
         ssm_elems = int(os.environ.get("SGLANG_MAMBA_SCATTER_SSM_ELEMS", "4096"))
         conv_elems = int(os.environ.get("SGLANG_MAMBA_SCATTER_CONV_ELEMS", "512"))
-        invalid_ratio = float(os.environ.get("SGLANG_MAMBA_SCATTER_INVALID_RATIO", "0.0"))
+        invalid_ratio = float(
+            os.environ.get("SGLANG_MAMBA_SCATTER_INVALID_RATIO", "0.0")
+        )
         track_ratio = float(os.environ.get("SGLANG_MAMBA_SCATTER_TRACK_RATIO", "0.0"))
-        ssm_dtype = _dtype_from_str(os.environ.get("SGLANG_MAMBA_SCATTER_SSM_DTYPE", "bfloat16"))
+        ssm_dtype = _dtype_from_str(
+            os.environ.get("SGLANG_MAMBA_SCATTER_SSM_DTYPE", "bfloat16")
+        )
         conv_dtype = _dtype_from_str(
             os.environ.get("SGLANG_MAMBA_SCATTER_CONV_DTYPE", "bfloat16")
         )
@@ -246,14 +276,16 @@ class TestMambaStateScatterPerf(unittest.TestCase):
         # Use zeros for dst so each iteration overwrites the same memory.
         ssm_states = torch.zeros((L, C, ssm_elems), device=device, dtype=ssm_dtype)
         conv_states = torch.zeros((L, C, conv_elems), device=device, dtype=conv_dtype)
-        intermediate_ssm = torch.randn((L, B, D, ssm_elems), device=device, dtype=ssm_dtype)
+        intermediate_ssm = torch.randn(
+            (L, B, D, ssm_elems), device=device, dtype=ssm_dtype
+        )
         intermediate_conv = torch.randn(
             (L, B, D, conv_elems), device=device, dtype=conv_dtype
         )
 
-        state_indices_tensor = torch.randperm(C, device=device, dtype=torch.int64)[:B].to(
-            torch.int32
-        )
+        state_indices_tensor = torch.randperm(C, device=device, dtype=torch.int64)[
+            :B
+        ].to(torch.int32)
         accepted_steps = torch.randint(0, D, (B,), device=device, dtype=torch.int64)
         if invalid_ratio > 0:
             invalid = torch.rand((B,), device=device) < invalid_ratio
@@ -262,8 +294,12 @@ class TestMambaStateScatterPerf(unittest.TestCase):
         mamba_track_indices = None
         mamba_steps_to_track = None
         if track_ratio > 0:
-            mamba_track_indices = torch.randperm(C, device=device, dtype=torch.int64)[:B]
-            mamba_steps_to_track = torch.randint(0, D, (B,), device=device, dtype=torch.int64)
+            mamba_track_indices = torch.randperm(C, device=device, dtype=torch.int64)[
+                :B
+            ]
+            mamba_steps_to_track = torch.randint(
+                0, D, (B,), device=device, dtype=torch.int64
+            )
             track_invalid = torch.rand((B,), device=device) >= track_ratio
             mamba_steps_to_track[track_invalid] = -1
 

@@ -33,11 +33,11 @@ def _fused_mamba_state_scatter_with_mask_kernel(
 ):
     """
     Fused gather-scatter kernel with built-in masking.
-    
+
     This kernel fuses the index_select operations by:
     1. Iterating over all requests (pid_req from 0 to total_requests-1)
     2. Checking if step_indices_raw[pid_req] >= 0 (valid mask)
-    3. If valid, performing the scatter: 
+    3. If valid, performing the scatter:
        dst[l, dst_indices_raw[pid_req], :] = src[l, pid_req, step_indices_raw[pid_req], :]
 
     Grid: (total_requests, num_layers, ceil(elem_per_entry / BLOCK_SIZE))
@@ -48,14 +48,14 @@ def _fused_mamba_state_scatter_with_mask_kernel(
 
     # Load step index to check validity (step >= 0 means valid)
     step_idx = tl.load(step_indices_raw_ptr + pid_req).to(tl.int64)
-    
+
     # Early exit if this request is not valid (step < 0)
     if step_idx < 0:
         return
-    
+
     # Load destination index
     dst_idx = tl.load(dst_indices_raw_ptr + pid_req).to(tl.int64)
-    
+
     # Source index is just the request index itself
     src_idx = pid_req
 
@@ -95,14 +95,14 @@ def fused_mamba_state_scatter_with_mask(
 ):
     """
     Fully fused gather-scatter with built-in masking for mamba state updates.
-    
+
     This function fuses the following operations into a single kernel:
     1. valid_mask = step_indices_raw >= 0
     2. valid_indices = valid_mask.nonzero()
     3. dst_indices = dst_indices_raw[valid_indices]  (index_select)
     4. step_indices = step_indices_raw[valid_indices]  (index_select)
     5. for each valid i: dst[:, dst_indices[i], :] = src[:, i, step_indices[i], :]
-    
+
     Args:
         dst: Destination tensor [num_layers, cache_size, *state_shape]
         src: Source tensor [num_layers, spec_size, draft_tokens, *state_shape]
@@ -114,9 +114,13 @@ def fused_mamba_state_scatter_with_mask(
         return
 
     if dst.device != src.device:
-        raise ValueError(f"dst and src must be on the same device. {dst.device=} {src.device=}")
+        raise ValueError(
+            f"dst and src must be on the same device. {dst.device=} {src.device=}"
+        )
     if not dst.is_cuda or not src.is_cuda:
-        raise ValueError("fused_mamba_state_scatter_with_mask only supports CUDA tensors.")
+        raise ValueError(
+            "fused_mamba_state_scatter_with_mask only supports CUDA tensors."
+        )
     if dst.ndim < 2 or src.ndim < 3:
         raise ValueError(f"Unexpected tensor ranks: {dst.ndim=} {src.ndim=}")
     if dst.shape[0] != src.shape[0]:
@@ -135,38 +139,38 @@ def fused_mamba_state_scatter_with_mask(
         raise ValueError(
             f"indices length mismatch: {dst_indices_raw.shape[0]=} vs {step_indices_raw.shape[0]=}"
         )
-    
+
     num_layers = dst.shape[0]
     src_req_size = src.shape[1]
     src_step_size = src.shape[2]
     dst_req_size = dst.shape[1]
-    
+
     # Flatten trailing dimensions: number of elements per (layer, cache_line) entry.
     elem_per_entry = dst.numel() // (dst.shape[0] * dst.shape[1])
-    
+
     # Get strides (in elements, not bytes)
     src_layer_stride = src.stride(0)
     src_req_stride = src.stride(1)
     src_step_stride = src.stride(2)
     dst_layer_stride = dst.stride(0)
     dst_req_stride = dst.stride(1)
-    
+
     # Ensure indices are int32 and contiguous
     dst_indices_raw = dst_indices_raw.to(torch.int32).contiguous()
     step_indices_raw = step_indices_raw.to(torch.int32).contiguous()
-    
+
     # Ensure tensors are contiguous
     if not dst.is_contiguous():
         raise ValueError("dst tensor must be contiguous")
     if not src.is_contiguous():
         raise ValueError("src tensor must be contiguous")
-    
+
     # Block size for copying elements
     BLOCK_SIZE = 1024
-    
+
     # Grid over all requests - invalid ones will early-exit in the kernel
     grid = (total_requests, num_layers, triton.cdiv(elem_per_entry, BLOCK_SIZE))
-    
+
     _fused_mamba_state_scatter_with_mask_kernel[grid](
         src,
         dst,
