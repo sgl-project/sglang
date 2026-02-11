@@ -1,9 +1,11 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>
-#include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #define kBitsToLoad 128
@@ -63,8 +65,8 @@ SGL_DEVICE T gelu_tanh(const T& x) {
 }
 
 template <typename T, T (*Activation)(const T&)>
-__global__ void act_and_mul_kernel(T* __restrict__ out_ptr, const T* __restrict__ input_ptr, int64_t d,
-                                   int64_t num_tokens) {
+__global__ void
+act_and_mul_kernel(T* __restrict__ out_ptr, const T* __restrict__ input_ptr, int64_t d, int64_t num_tokens) {
   constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
@@ -95,8 +97,8 @@ __global__ void act_and_mul_kernel(T* __restrict__ out_ptr, const T* __restrict_
 }
 
 template <typename T, T (*Activation)(const T&)>
-__global__ void act_only_kernel(T* __restrict__ out_ptr, const T* __restrict__ input_ptr, int64_t d,
-                                int64_t num_tokens) {
+__global__ void
+act_only_kernel(T* __restrict__ out_ptr, const T* __restrict__ input_ptr, int64_t d, int64_t num_tokens) {
   constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
