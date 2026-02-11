@@ -1,4 +1,4 @@
-# Comprehensive Guide: DP, DPA, and SGLang Model Gateway
+# DP, DPA and SGLang DP Router
 
 This guide explains the difference between Data Parallelism (DP) and Data Parallelism Attention (DPA), how to enable each mode correctly, and how to use the SGLang Model Gateway (SMG) for production-grade DP deployments.
 
@@ -6,7 +6,7 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 
 **Data Parallelism (DP)** is the most common parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests. With dedicated routing strategies, as we will introduce later, with those proper routing algorithms in SGLang Model Gateway, the throughput of your serving system could be multiplied nearly linearly.
 
-**Key characteristics:**
+### Key characteristics
 
 - Each replica has a full copy of the model
 - Requests are distributed/scattered across replicas
@@ -16,7 +16,7 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 
 **Data Parallelism Attention (DPA)**, also known as DP Attention, is an advanced parallelism strategy. While DPA provides the most significant benefits for **Multi-Head Latent Attention (MLA)** models (such as DeepSeek, MiniMax, Kimi-K2), it also supports **standard attention models** like Qwen.
 
-**The Problem with Tensor Parallelism for MLA Models**
+### The Problem with Tensor Parallelism for MLA Models
 
 The most common parallelism strategy for inference is **Tensor Parallelism (TP)**. However, TP might not be the most efficient strategy for certain models. For example, DeepSeek models use MLA and only have **one KV head**. If we use tensor parallelism on 8 GPUs, it will lead to:
 
@@ -24,7 +24,7 @@ The most common parallelism strategy for inference is **Tensor Parallelism (TP)*
 - **Unwanted memory usage** that limits batch size
 - **Reduced throughput** due to memory constraints
 
-**How DPA Works**
+### How DPA Works
 
 DPA addresses these limitations by applying **data parallelism specifically to the attention component**.
 
@@ -36,19 +36,21 @@ DPA addresses these limitations by applying **data parallelism specifically to t
 <td width="50%" valign="top">
 
 **Each DP replica:**
+
 - Processes different batches independently (can be in different forward modes: prefill, decode, or idle)
 - Maintains its own KV cache (no duplication)
 - Enables significantly larger batch sizes due to memory savings
 
 **Communication patterns in DPA + EP:**
-- **All2All (Dispatch)**: Routes tokens to expert sub-groups based on gating decisions
+-
+-  **All2All (Dispatch)**: Routes tokens to expert sub-groups based on gating decisions
 - **All2All (Combine)**: Gathers computed results from experts back to original token positions
 
 </td>
 </tr>
 </table>
 
-**Key benefits of DPA:**
+### Key benefits of DPA
 
 1. **Significantly reduced KV cache memory**: Each DP replica only stores KV cache for its own batches
 2. **Larger batch sizes**: Memory savings enable larger batch sizes
@@ -63,7 +65,7 @@ For MoE models like DeepSeek, DPA is **often** paired with Expert Parallelism (E
 - Enable efficient all-to-all token routing via DeepEP
 - Scale to large clusters (up to 5x throughput improvement over vanilla TP)
 
-**Recommended setup for DeepSeek:**
+### Recommended setup for DeepSeek
 
 ```bash
 python -m sglang.launch_server \
@@ -82,7 +84,7 @@ For detailed EP configuration (DeepEP, Two-Batch Overlap, EPLB), see [Expert Par
 
 ### Target Models
 
-**DPA supports the following model architectures:**
+DPA supports the following model architectures:
 
 - **MLA (Multi-Head Latent Attention) models** - where DPA provides the most significant benefits:
   - DeepSeek family (DeepSeek-V2, DeepSeek-V3, DeepSeek-R1)
@@ -93,7 +95,7 @@ For detailed EP configuration (DeepEP, Two-Batch Overlap, EPLB), see [Expert Par
 - **Standard attention models** - also supported:
   - Qwen models (see [PR #6121](https://github.com/sgl-project/sglang/pull/6121))
 
-For models like Llama with standard GQA, standard DP or TP is typically recommended.
+For models like Llama, with standard GQA, standard DP, or TP is typically recommended.
 
 To enable DPA, add `--enable-dp-attention` to your server launch command.
 
@@ -111,31 +113,39 @@ python -m sglang.launch_server \
 
 **Important**: `--dp-size` must be greater than 1 for DPA to work. When `dp_size == 1` (default), `--enable-dp-attention` is automatically disabled. The constraint `tp_size % dp_size == 0` must also be satisfied.
 
-**Standard DP for MLA models**: Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
+### Standard DP for MLA models
 
-## Native DP vs. SGLang Model Gateway (SMG)
+Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
 
-### Native DP Mode (Development/Testing Only)
+## Modern Data Parallelism SGLang Model Gateway (SMG)
 
-> **Warning**: Native DP is **not recommended for production use**. Use SGLang Model Gateway (SMG) for production deployments.
+### Native DP Mode
 
-Native DP (built-in Data Parallelism) in SGLang creates multiple worker processes within a single server instance. It is useful for quick prototyping and development, but lacks advanced features:
+Native DP (built-in Data Parallelism) in SGLang creates multiple worker processes within a single SGLang instance, under the control of `DataParallelController` with the launching parameter of `dp-size`.
+
 
 ```bash
-# Native DP mode (for development only)
+# Native DP mode
 python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --dp-size 4
 ```
 
 **Limitations:**
+
 - Built-in in-process load balancing only (e.g., `round_robin`, `total_requests`, `total_tokens`)
 - No cache-aware routing
 - Limited observability and metrics
 - No fault tolerance or circuit breakers
 - Not suitable for production workloads
 
+⚠️ Native DP is **highly not recommended for use right now**. It is only used in some ancient/outdated RL frameworks. You can use SGLang Model Gateway (SMG) to power up your data parallelism in any use case.
+
 ### SMG-Based DP (Recommended)
+
+Starting from September 2024, SGLang Model Gateway, i.e., SMG, formerly named as SGLang DP Router, was built especially as a production-ready DP routing system with Rust. It starts from DP routing, but later we further expanded its scope to coordinate RL, PD Disaggregation, and other scenarios. This doc only discusses SMG's usage in DP routing. For other usage, please refer to [SGLang Model Gateway Documentation](sgl_model_gateway.md).
+
+> To achieve the best production-level routing performance and reduce the overhead to an extreme extent, we use Rust to build SMG, but not Python, since Python is never FAST enough.
 
 **We strongly recommend using the SGLang Model Gateway (SMG) for production-grade Data Parallelism.** SMG provides significant advantages over native DP mode.
 
@@ -145,6 +155,8 @@ python -m sglang_router.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --dp-size 4
 ```
+
+⚠️ Note that **SMG and Naive DP share the same launching parameter, `--dp-size`**. But the entrypoint of Naive DP is `python -m sglang.launch_server`, and SMG's entrypoint is `python -m sglang_router.launch_server`.
 
 **Advantages of SMG-Based DP:**
 
@@ -159,9 +171,7 @@ python -m sglang_router.launch_server \
 | **Observability** | Basic metrics | ✅ 40+ Prometheus metrics, OpenTelemetry |
 | **Hot Worker Add/Remove** | ❌ No | ✅ Yes |
 
-### Comparison Summary
-
-**Cache-Aware Routing Performance**
+###  SMG's Performance
 
 The cache-aware routing policy in SMG significantly improves performance for workloads with shared prefixes:
 
@@ -172,24 +182,23 @@ The cache-aware routing policy in SMG significantly improves performance for wor
 
 *Benchmark from [SGLang v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), workload with multiple long prefix groups, 8x A100 80GB GPUs, dp-size=8*
 
-**When to Use Each**
+### When to Use Each
 
 **Use Native DP when:**
-- Quick prototyping or development
-- Single-node deployments with simple workloads
-- You don't need advanced load balancing
+
+- ~Never use Native/Naive DP~
+- Learning material of DP routing
 
 **Use SMG-Based DP when:**
+
+- In any case, when you think DP is needed
 - Production deployments
 - Multi-node distributed setups
 - Workloads with shared prefixes (high cache reuse potential)
 - You need high availability and reliability features
 - You require detailed observability and metrics
 
-
-## Practical Implementation: DP Routing via SMG
-
-### Quick Start
+### Quick Start For SMG
 
 **Installation**
 
@@ -287,6 +296,7 @@ python -m sglang_router.launch_router \
 ```
 
 **How it works:**
+
 1. Maintains an approximate radix tree for each worker based on request history
 2. Routes requests to workers with the highest prefix match (cache hit)
 3. Falls back to shortest-queue routing when load is imbalanced
@@ -340,13 +350,11 @@ sglang_cache_hit_rate{source="..."}
 
 For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentation](sgl_model_gateway.md).
 
----
-
-## Quick Reference
+## Reference
 
 | Strategy | Use Case | Key Benefit |
 |----------|----------|-------------|
-| **Native DP** (`--dp-size`) | Development/testing only | Easy to configure, single process |
+| **Native DP** (`--dp-size`) | Never | Easy to understand, not rust based |
 | **SMG-Based DP** | **Production (recommended)** | Cache-aware routing, high availability |
 | **DPA** (`--dp-size N --enable-dp-attention`) | DeepSeek/MLA models | Eliminates KV cache duplication, improved throughput |
 | **DPA + EP** | DeepSeek MoE models | Significant throughput improvement vs vanilla TP |
