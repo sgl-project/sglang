@@ -2,11 +2,11 @@ import os
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -15,11 +15,15 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
 
+
 class TestDeepEpDeepseekV32(CustomTestCase):
     """Testcase: Verify that for the DeepSeek V3.2 model in the single-machine colocation scenario,
     its inference accuracy on the MMLU and GSM8K dataset meets the preset standard when the parameter --deepep-mode auto is configured.
 
+    [Test Category] Parameter
+    [Test Target] --moe-a2a-backend deepep;--deepep-mode
     """
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH
@@ -42,9 +46,12 @@ class TestDeepEpDeepseekV32(CustomTestCase):
                 0.82,
                 "--disable-cuda-graph",
                 "--disable-radix-cache",
-                "--context-length", 40960,
-                "--max-prefill-tokens", 40960,
-                "--max-total-tokens", 40960,
+                "--context-length",
+                40960,
+                "--max-prefill-tokens",
+                40960,
+                "--max-total-tokens",
+                40960,
             ],
             env={
                 "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
