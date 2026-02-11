@@ -1374,17 +1374,11 @@ def run_embeddings_benchmark(
 
     async def _run_benchmark():
 
-        # Load tokenizer for generating test data
-        # from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-
-        # tokenizer = get_tokenizer(model)
-
         def generate_text_with_token_count(num_tokens):
             """Generate text with precise token count using special tokens."""
             # Use a token that reliably produces 1 token
             special_token = "<|im_start|>"
             # Verify it's a single token
-            # test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
             text = special_token * num_tokens
             return text
 
