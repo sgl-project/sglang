@@ -450,7 +450,7 @@ class ModelConfig:
                     or rope_scaling.get("type")
                     or "default"
                 )
-                if rope_type != "default":
+                if rope_type != "default" and "factor" in rope_scaling:
                     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
                     scaling_factor = rope_scaling["factor"]
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
