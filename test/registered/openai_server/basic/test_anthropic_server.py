@@ -70,7 +70,10 @@ class TestAnthropicServer(CustomTestCase):
             "model": self.model,
             "max_tokens": 64,
             "messages": [
-                {"role": "user", "content": "What is the capital of France? Answer in a few words."}
+                {
+                    "role": "user",
+                    "content": "What is the capital of France? Answer in a few words.",
+                }
             ],
         }
         payload.update(overrides)
@@ -95,9 +98,7 @@ class TestAnthropicServer(CustomTestCase):
         self.assertTrue(len(body["content"][0]["text"]) > 0)
 
         # Verify stop reason
-        self.assertIn(
-            body["stop_reason"], ["end_turn", "max_tokens", "stop_sequence"]
-        )
+        self.assertIn(body["stop_reason"], ["end_turn", "max_tokens", "stop_sequence"])
 
         # Verify usage
         self.assertIn("usage", body)
@@ -160,7 +161,9 @@ class TestAnthropicServer(CustomTestCase):
         """Test max_tokens limits output length."""
         payload = self._default_payload(
             max_tokens=5,
-            messages=[{"role": "user", "content": "Tell me a long story about a dragon."}],
+            messages=[
+                {"role": "user", "content": "Tell me a long story about a dragon."}
+            ],
         )
         resp = self._make_request(payload)
         self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
@@ -168,9 +171,7 @@ class TestAnthropicServer(CustomTestCase):
         body = resp.json()
         self.assertEqual(body["type"], "message")
         # With very small max_tokens the model should hit the limit
-        self.assertIn(
-            body["stop_reason"], ["max_tokens", "end_turn"]
-        )
+        self.assertIn(body["stop_reason"], ["max_tokens", "end_turn"])
         self.assertGreater(body["usage"]["output_tokens"], 0)
 
     def test_temperature(self):
@@ -354,9 +355,7 @@ class TestAnthropicServer(CustomTestCase):
         self.assertEqual(resp.status_code, 200)
 
         # Verify streaming content type
-        self.assertIn(
-            "text/event-stream", resp.headers.get("content-type", "")
-        )
+        self.assertIn("text/event-stream", resp.headers.get("content-type", ""))
 
         # Verify we get proper SSE events
         events = self._parse_sse_events(resp)
@@ -364,15 +363,15 @@ class TestAnthropicServer(CustomTestCase):
 
         # Verify event ordering: message_start should be first
         self.assertEqual(
-            events[0]["type"], "message_start",
-            "First event should be message_start"
+            events[0]["type"], "message_start", "First event should be message_start"
         )
 
         # Verify message_stop is last data event
         data_events = [e for e in events if e["type"] != "ping"]
         self.assertEqual(
-            data_events[-1]["type"], "message_stop",
-            "Last data event should be message_stop"
+            data_events[-1]["type"],
+            "message_stop",
+            "Last data event should be message_stop",
         )
 
     # ---- Content block tests ----
@@ -396,6 +395,75 @@ class TestAnthropicServer(CustomTestCase):
         self.assertEqual(body["type"], "message")
         self.assertTrue(len(body["content"]) > 0)
         self.assertEqual(body["content"][0]["type"], "text")
+
+    # ---- Count tokens tests ----
+
+    def test_count_tokens(self):
+        """Test /v1/messages/count_tokens endpoint."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "x-api-key": self.api_key,
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": "Hello, how are you?"},
+            ],
+        }
+        resp = requests.post(
+            self.base_url + "/v1/messages/count_tokens",
+            headers=headers,
+            json=payload,
+        )
+        self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
+
+        body = resp.json()
+        self.assertIn("input_tokens", body)
+        self.assertIsInstance(body["input_tokens"], int)
+        self.assertGreater(body["input_tokens"], 0)
+
+    def test_count_tokens_with_system(self):
+        """Test count_tokens with system message."""
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "x-api-key": self.api_key,
+        }
+        payload_no_system = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+            ],
+        }
+        payload_with_system = {
+            "model": self.model,
+            "messages": [
+                {"role": "user", "content": "Hello"},
+            ],
+            "system": "You are a helpful assistant with a very long system prompt that adds tokens.",
+        }
+        resp1 = requests.post(
+            self.base_url + "/v1/messages/count_tokens",
+            headers=headers,
+            json=payload_no_system,
+        )
+        resp2 = requests.post(
+            self.base_url + "/v1/messages/count_tokens",
+            headers=headers,
+            json=payload_with_system,
+        )
+        self.assertEqual(resp1.status_code, 200)
+        self.assertEqual(resp2.status_code, 200)
+
+        # System message should increase the token count
+        tokens_no_system = resp1.json()["input_tokens"]
+        tokens_with_system = resp2.json()["input_tokens"]
+        self.assertGreater(
+            tokens_with_system,
+            tokens_no_system,
+            "Adding system message should increase token count",
+        )
 
     # ---- Helpers ----
 

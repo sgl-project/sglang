@@ -148,9 +148,7 @@ class TestAnthropicToolUse(CustomTestCase):
         self.assertEqual(body["type"], "message")
 
         # Find tool_use content blocks
-        tool_use_blocks = [
-            b for b in body["content"] if b["type"] == "tool_use"
-        ]
+        tool_use_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
         self.assertTrue(
             len(tool_use_blocks) > 0,
             f"Expected tool_use content blocks, got: {body['content']}",
@@ -164,7 +162,8 @@ class TestAnthropicToolUse(CustomTestCase):
 
         # Verify stop_reason is tool_use
         self.assertEqual(
-            body["stop_reason"], "tool_use",
+            body["stop_reason"],
+            "tool_use",
             f"Expected stop_reason 'tool_use', got: {body['stop_reason']}",
         )
 
@@ -210,9 +209,7 @@ class TestAnthropicToolUse(CustomTestCase):
         self.assertEqual(body["type"], "message")
 
         # With 'any', the model must use a tool
-        tool_use_blocks = [
-            b for b in body["content"] if b["type"] == "tool_use"
-        ]
+        tool_use_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
         self.assertTrue(
             len(tool_use_blocks) > 0,
             f"Expected tool_use blocks with tool_choice=any, got: {body['content']}",
@@ -237,16 +234,15 @@ class TestAnthropicToolUse(CustomTestCase):
         self.assertEqual(body["type"], "message")
 
         # With specific tool choice, the model should call that specific tool
-        tool_use_blocks = [
-            b for b in body["content"] if b["type"] == "tool_use"
-        ]
+        tool_use_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
         self.assertTrue(
             len(tool_use_blocks) > 0,
             f"Expected tool_use blocks with specific tool_choice, got: {body['content']}",
         )
         for block in tool_use_blocks:
             self.assertEqual(
-                block["name"], "get_current_weather",
+                block["name"],
+                "get_current_weather",
                 f"Expected tool name 'get_current_weather', got: {block['name']}",
             )
 
@@ -268,9 +264,7 @@ class TestAnthropicToolUse(CustomTestCase):
         body_1 = resp_1.json()
 
         # Extract tool call info
-        tool_use_blocks = [
-            b for b in body_1["content"] if b["type"] == "tool_use"
-        ]
+        tool_use_blocks = [b for b in body_1["content"] if b["type"] == "tool_use"]
         self.assertTrue(len(tool_use_blocks) > 0, "Expected tool_use in first response")
         tool_call_id = tool_use_blocks[0]["id"]
 
@@ -303,7 +297,9 @@ class TestAnthropicToolUse(CustomTestCase):
 
         body_2 = resp_2.json()
         self.assertEqual(body_2["type"], "message")
-        self.assertTrue(len(body_2["content"]) > 0, "Second response should have content")
+        self.assertTrue(
+            len(body_2["content"]) > 0, "Second response should have content"
+        )
 
     def test_tool_use_with_text_content(self):
         """Test that response can contain both text and tool_use blocks."""
@@ -327,7 +323,8 @@ class TestAnthropicToolUse(CustomTestCase):
         # Verify that content has valid block types
         for block in body["content"]:
             self.assertIn(
-                block["type"], ["text", "tool_use"],
+                block["type"],
+                ["text", "tool_use"],
                 f"Unexpected content block type: {block['type']}",
             )
 
@@ -361,7 +358,8 @@ class TestAnthropicToolUse(CustomTestCase):
         # Check for tool use content block events
         block_starts = [e for e in events if e["type"] == "content_block_start"]
         tool_use_starts = [
-            e for e in block_starts
+            e
+            for e in block_starts
             if e.get("content_block", {}).get("type") == "tool_use"
         ]
 
@@ -375,7 +373,8 @@ class TestAnthropicToolUse(CustomTestCase):
 
             # Check for input_json_delta events
             input_deltas = [
-                e for e in events
+                e
+                for e in events
                 if e["type"] == "content_block_delta"
                 and e.get("delta", {}).get("type") == "input_json_delta"
             ]
@@ -389,7 +388,8 @@ class TestAnthropicToolUse(CustomTestCase):
             message_deltas = [e for e in events if e["type"] == "message_delta"]
             self.assertTrue(len(message_deltas) > 0)
             self.assertEqual(
-                message_deltas[-1]["delta"]["stop_reason"], "tool_use",
+                message_deltas[-1]["delta"]["stop_reason"],
+                "tool_use",
                 "Expected stop_reason 'tool_use' in streaming",
             )
 
@@ -401,7 +401,10 @@ class TestAnthropicToolUse(CustomTestCase):
             "stream": True,
             "system": SYSTEM_MESSAGE,
             "messages": [
-                {"role": "user", "content": "Please sum 5 and 7, just call the function."},
+                {
+                    "role": "user",
+                    "content": "Please sum 5 and 7, just call the function.",
+                },
             ],
             "tools": [
                 {
@@ -479,13 +482,15 @@ class TestAnthropicToolUse(CustomTestCase):
 
         # message_start must be first
         self.assertEqual(
-            event_types[0], "message_start",
+            event_types[0],
+            "message_start",
             "First event should be message_start",
         )
 
         # message_stop must be last
         self.assertEqual(
-            event_types[-1], "message_stop",
+            event_types[-1],
+            "message_stop",
             "Last event should be message_stop",
         )
 
@@ -493,7 +498,9 @@ class TestAnthropicToolUse(CustomTestCase):
         self.assertIn("message_delta", event_types)
         delta_idx = event_types.index("message_delta")
         stop_idx = event_types.index("message_stop")
-        self.assertLess(delta_idx, stop_idx, "message_delta should come before message_stop")
+        self.assertLess(
+            delta_idx, stop_idx, "message_delta should come before message_stop"
+        )
 
         # For each content block, start should come before stop
         block_start_indices = [
@@ -503,12 +510,14 @@ class TestAnthropicToolUse(CustomTestCase):
             i for i, t in enumerate(event_types) if t == "content_block_stop"
         ]
         self.assertEqual(
-            len(block_start_indices), len(block_stop_indices),
+            len(block_start_indices),
+            len(block_stop_indices),
             "Number of content_block_start should equal content_block_stop",
         )
         for start_i, stop_i in zip(block_start_indices, block_stop_indices):
             self.assertLess(
-                start_i, stop_i,
+                start_i,
+                stop_i,
                 "content_block_start should come before content_block_stop",
             )
 
@@ -525,15 +534,15 @@ class TestAnthropicToolUse(CustomTestCase):
         self.assertEqual(resp.status_code, 200, f"Response: {resp.text}")
 
         body = resp.json()
-        tool_use_blocks = [
-            b for b in body["content"] if b["type"] == "tool_use"
-        ]
+        tool_use_blocks = [b for b in body["content"] if b["type"] == "tool_use"]
         self.assertEqual(
-            len(tool_use_blocks), 0,
+            len(tool_use_blocks),
+            0,
             "Should not have tool_use blocks when no tools provided",
         )
         self.assertIn(
-            body["stop_reason"], ["end_turn", "max_tokens"],
+            body["stop_reason"],
+            ["end_turn", "max_tokens"],
             "Stop reason should be end_turn or max_tokens without tools",
         )
 

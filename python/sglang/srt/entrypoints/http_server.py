@@ -52,7 +52,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+from sglang.srt.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+)
 from sglang.srt.entrypoints.anthropic.serving import AnthropicServing
 from sglang.srt.entrypoints.engine import (
     _launch_subprocesses,
@@ -1554,6 +1557,16 @@ async def anthropic_v1_messages(
 ):
     """Anthropic-compatible Messages API endpoint."""
     return await raw_request.app.state.anthropic_serving.handle_messages(
+        request, raw_request
+    )
+
+
+@app.post("/v1/messages/count_tokens", dependencies=[Depends(validate_json_request)])
+async def anthropic_v1_count_tokens(
+    request: AnthropicCountTokensRequest, raw_request: Request
+):
+    """Anthropic-compatible token counting endpoint."""
+    return await raw_request.app.state.anthropic_serving.handle_count_tokens(
         request, raw_request
     )
 

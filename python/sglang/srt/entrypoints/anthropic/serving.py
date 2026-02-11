@@ -16,6 +16,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
     AnthropicDelta,
     AnthropicError,
     AnthropicErrorResponse,
@@ -30,7 +32,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionStreamResponse,
     StreamOptions,
     Tool,
-    ToolCall,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -106,9 +107,7 @@ class AnthropicServing:
         # Convert messages
         for msg in anthropic_request.messages:
             if isinstance(msg.content, str):
-                openai_messages.append(
-                    {"role": msg.role, "content": msg.content}
-                )
+                openai_messages.append({"role": msg.role, "content": msg.content})
                 continue
 
             # Complex content with blocks
@@ -144,9 +143,7 @@ class AnthropicServing:
                 elif block.type == "tool_result":
                     # Tool results from user become separate tool messages
                     if msg.role == "user":
-                        tool_content = (
-                            str(block.content) if block.content else ""
-                        )
+                        tool_content = str(block.content) if block.content else ""
                         openai_messages.append(
                             {
                                 "role": "tool",
@@ -155,9 +152,7 @@ class AnthropicServing:
                             }
                         )
                     else:
-                        tool_result_text = (
-                            str(block.content) if block.content else ""
-                        )
+                        tool_result_text = str(block.content) if block.content else ""
                         content_parts.append(
                             {
                                 "type": "text",
@@ -270,10 +265,8 @@ class AnthropicServing:
             adapted_request.received_time_perf = received_time_perf
 
             # Get response from OpenAI handler
-            response = (
-                await self.openai_serving_chat._handle_non_streaming_request(
-                    adapted_request, processed_request, raw_request
-                )
+            response = await self.openai_serving_chat._handle_non_streaming_request(
+                adapted_request, processed_request, raw_request
             )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
@@ -294,9 +287,7 @@ class AnthropicServing:
 
         # Convert to Anthropic response
         anthropic_response = self._convert_response(response)
-        return JSONResponse(
-            content=anthropic_response.model_dump(exclude_none=True)
-        )
+        return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
         self,
@@ -395,12 +386,12 @@ class AnthropicServing:
                     type="message_delta",
                     delta=AnthropicDelta(stop_reason=stop_reason),
                     usage=AnthropicUsage(
-                        input_tokens=usage_info.get("input_tokens", 0)
-                        if usage_info
-                        else 0,
-                        output_tokens=usage_info.get("output_tokens", 0)
-                        if usage_info
-                        else 0,
+                        input_tokens=(
+                            usage_info.get("input_tokens", 0) if usage_info else 0
+                        ),
+                        output_tokens=(
+                            usage_info.get("output_tokens", 0) if usage_info else 0
+                        ),
                     ),
                 )
                 yield _wrap_sse_event(
@@ -435,9 +426,9 @@ class AnthropicServing:
                         content=[],
                         model=model,
                         usage=AnthropicUsage(
-                            input_tokens=chunk.usage.prompt_tokens
-                            if chunk.usage
-                            else 0,
+                            input_tokens=(
+                                chunk.usage.prompt_tokens if chunk.usage else 0
+                            ),
                             output_tokens=0,
                         ),
                     ),
@@ -547,9 +538,7 @@ class AnthropicServing:
                     start_event = AnthropicStreamEvent(
                         type="content_block_start",
                         index=content_block_index,
-                        content_block=AnthropicContentBlock(
-                            type="text", text=""
-                        ),
+                        content_block=AnthropicContentBlock(type="text", text=""),
                     )
                     yield _wrap_sse_event(
                         start_event.model_dump_json(exclude_none=True),
@@ -611,9 +600,7 @@ class AnthropicServing:
             stop_reason=stop_reason,
             usage=AnthropicUsage(
                 input_tokens=response.usage.prompt_tokens if response.usage else 0,
-                output_tokens=response.usage.completion_tokens
-                if response.usage
-                else 0,
+                output_tokens=response.usage.completion_tokens if response.usage else 0,
             ),
         )
 
@@ -631,3 +618,60 @@ class AnthropicServing:
             status_code=status_code,
             content=error_resp.model_dump(),
         )
+
+    async def handle_count_tokens(
+        self,
+        request: AnthropicCountTokensRequest,
+        raw_request: Request,
+    ) -> JSONResponse:
+        """Handle /v1/messages/count_tokens endpoint.
+
+        Converts the request to a ChatCompletionRequest, applies the chat
+        template via the OpenAI handler to tokenize, and returns the count.
+        """
+        try:
+            # Build a minimal AnthropicMessagesRequest so we can reuse conversion
+            messages_request = AnthropicMessagesRequest(
+                model=request.model,
+                messages=request.messages,
+                max_tokens=1,  # dummy, not used for counting
+                system=request.system,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+            )
+            chat_request = self._convert_to_chat_completion_request(messages_request)
+        except Exception as e:
+            logger.exception("Error converting count_tokens request: %s", e)
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
+
+        try:
+            is_multimodal = (
+                self.openai_serving_chat.tokenizer_manager.model_config.is_multimodal
+            )
+            processed = self.openai_serving_chat._process_messages(
+                chat_request, is_multimodal
+            )
+
+            if isinstance(processed.prompt_ids, list):
+                input_tokens = len(processed.prompt_ids)
+            else:
+                # prompt_ids is a string (multimodal case) — tokenize it
+                tokenizer = self.openai_serving_chat.tokenizer_manager.tokenizer
+                input_tokens = len(tokenizer.encode(processed.prompt_ids))
+
+            return JSONResponse(
+                content=AnthropicCountTokensResponse(
+                    input_tokens=input_tokens
+                ).model_dump()
+            )
+        except Exception as e:
+            logger.exception("Error counting tokens: %s", e)
+            return self._error_response(
+                status_code=500,
+                error_type="internal_error",
+                message=str(e),
+            )

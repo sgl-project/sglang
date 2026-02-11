@@ -75,6 +75,22 @@ class AnthropicToolChoice(BaseModel):
     name: Optional[str] = None
 
 
+class AnthropicCountTokensRequest(BaseModel):
+    """Anthropic Count Tokens API request"""
+
+    model: str
+    messages: list[AnthropicMessage]
+    system: Optional[str | list[AnthropicContentBlock]] = None
+    tool_choice: Optional[AnthropicToolChoice] = None
+    tools: Optional[list[AnthropicTool]] = None
+
+
+class AnthropicCountTokensResponse(BaseModel):
+    """Anthropic Count Tokens API response"""
+
+    input_tokens: int
+
+
 class AnthropicMessagesRequest(BaseModel):
     """Anthropic Messages API request"""
 
