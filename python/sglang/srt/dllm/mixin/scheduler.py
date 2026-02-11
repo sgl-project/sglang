@@ -192,6 +192,18 @@ class SchedulerDllmMixin:
         new_batch.prepare_for_extend()
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
+
+        # Record prefill stats for logging after forward
+        from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+
+        new_batch.prefill_stats = PrefillStats(
+            log_input_tokens=self.adder.log_input_tokens,
+            log_hit_tokens=self.adder.log_hit_tokens,
+            new_token_ratio=self.adder.new_token_ratio,
+            running_bs=len(self.running_batch.reqs),
+            num_new_seqs=len(can_run_list),
+        )
+
         return new_batch
 
     def process_dllm_incoming_reqs(
