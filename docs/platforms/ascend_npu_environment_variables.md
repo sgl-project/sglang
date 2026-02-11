@@ -1,4 +1,4 @@
-# Commonly Used Environment Variables for Launching SGLang on Ascend NPU
+# Commonly Used Environment Variables for Ascend NPU
 
 SGLang supports various environment variables related to Ascend Npu that can be used to configure its runtime behavior.
 This document provides a list of commonly used environment variables and aims to stay updated over time.
