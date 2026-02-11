@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
+# Keep ragged MQA chunk rows in a small bucketized set to reduce DeepGEMM JIT churn.
+_MQA_CHUNK_MAX_ROWS = 1024
 
 
 class BaseIndexerMetadata(ABC):
@@ -570,8 +572,14 @@ class Indexer(MultiPlatformOp):
         bytes_per_elem = 4  # float32
         bytes_per_row = k_offset * bytes_per_elem
         # Reserve 50% of free memory for logits
-        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
-        max_rows = min(max_rows, q_offset)
+        safe_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        # Bucketize + cap chunk rows to avoid highly dynamic M values that trigger
+        # repeated deep_gemm compilation in long-context prefill.
+        max_rows = 1 << (safe_rows.bit_length() - 1)
+        max_rows = max(1, min(max_rows, _MQA_CHUNK_MAX_ROWS))
+        # For ultra-long KV, use smaller M buckets to keep DeepGEMM JIT latency bounded.
+        if k_offset >= 65536:
+            max_rows = min(max_rows, 256)
 
         global_topk_offset = metadata.attn_metadata.topk_indices_offset
 
@@ -586,6 +594,29 @@ class Indexer(MultiPlatformOp):
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)
+            valid_rows = end - start
+
+            if valid_rows == max_rows:
+                q_chunk = q_fp8[start:end]
+                w_chunk = weights[start:end]
+                ks_chunk = ks[start:end]
+                ke_chunk = ke[start:end]
+            else:
+                pad_rows = max_rows - valid_rows
+                q_pad = torch.zeros(
+                    (pad_rows, q_fp8.shape[1], q_fp8.shape[2]),
+                    dtype=q_fp8.dtype,
+                    device=device,
+                )
+                w_pad = torch.zeros(
+                    (pad_rows, weights.shape[1]), dtype=weights.dtype, device=device
+                )
+                ks_pad = torch.zeros((pad_rows,), dtype=ks.dtype, device=device)
+                ke_pad = torch.zeros((pad_rows,), dtype=ke.dtype, device=device)
+                q_chunk = torch.cat([q_fp8[start:end], q_pad], dim=0)
+                w_chunk = torch.cat([weights[start:end], w_pad], dim=0)
+                ks_chunk = torch.cat([ks[start:end], ks_pad], dim=0)
+                ke_chunk = torch.cat([ke[start:end], ke_pad], dim=0)
 
             with self._with_real_sm_count():
                 if _is_hip:
@@ -593,22 +624,24 @@ class Indexer(MultiPlatformOp):
 
                     kv, scale = kv_fp8
                     logits_chunk = fp8_mqa_logits(
-                        q_fp8[start:end],
+                        q_chunk,
                         kv,
                         scale,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
+                        w_chunk,
+                        ks_chunk,
+                        ke_chunk,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
-                        q_fp8[start:end],
+                        q_chunk,
                         kv_fp8,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
+                        w_chunk,
+                        ks_chunk,
+                        ke_chunk,
                         clean_logits=False,
                     )
+            if valid_rows != max_rows:
+                logits_chunk = logits_chunk[:valid_rows]
 
             lengths_chunk = seq_lens_expanded[start:end]
 
