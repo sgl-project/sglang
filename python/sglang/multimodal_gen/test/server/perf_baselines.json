@@ -1997,6 +1997,31 @@
             "expected_e2e_ms": 24895.28,
             "expected_avg_denoise_ms": 596.59,
             "expected_median_denoise_ms": 599.66
+        },
+        "fsdp-inference": {
+            "stages_ms": {
+                "InputValidationStage": 0.04,
+                "TextEncodingStage": 128.3,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 1.44,
+                "LatentPreparationStage": 0.1,
+                "DenoisingStage": 1569.61,
+                "DecodingStage": 41.43
+            },
+            "denoise_step_ms": {
+                "0": 165.33,
+                "1": 158.34,
+                "2": 167.65,
+                "3": 179.11,
+                "4": 183.98,
+                "5": 175.08,
+                "6": 178.34,
+                "7": 178.53,
+                "8": 178.08
+            },
+            "expected_e2e_ms": 1742.7,
+            "expected_avg_denoise_ms": 173.83,
+            "expected_median_denoise_ms": 178.08
         }
     }
 }
