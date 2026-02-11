@@ -482,9 +482,30 @@ class DataParallelController:
             return True
         return False
 
+    def maybe_external_prefill_dp_rank_routing(self, req: Req):
+        if req.prefill_dp_rank is not None:
+            logger.debug(f"Direct prefill routing to DP rank {req.prefill_dp_rank}")
+            self.workers[req.prefill_dp_rank].send_pyobj(req)
+            return True
+        return False
+
+    def maybe_external_decode_dp_rank_routing(self, req: Req):
+        if req.decode_dp_rank is not None:
+            logger.debug(f"Direct decode routing to DP rank {req.decode_dp_rank}")
+            self.workers[req.decode_dp_rank].send_pyobj(req)
+            return True
+        return False
+
     def round_robin_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+
+        if self.server_args.disaggregation_mode == "decode":
+            if self.maybe_external_decode_dp_rank_routing(req):
+                return
+        elif self.server_args.disaggregation_mode == "prefill":
+            if self.maybe_external_prefill_dp_rank_routing(req):
+                return
 
         while True:
             if self.status[self.round_robin_counter]:
@@ -501,6 +522,13 @@ class DataParallelController:
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+
+        if self.server_args.disaggregation_mode == "decode":
+            if self.maybe_external_decode_dp_rank_routing(req):
+                return
+        elif self.server_args.disaggregation_mode == "prefill":
+            if self.maybe_external_prefill_dp_rank_routing(req):
+                return
 
         # Set default bootstrap_room if in FAKE auto mode and room is None
         if (
@@ -522,12 +550,28 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+
+        if self.server_args.disaggregation_mode == "decode":
+            if self.maybe_external_decode_dp_rank_routing(req):
+                return
+        elif self.server_args.disaggregation_mode == "prefill":
+            if self.maybe_external_prefill_dp_rank_routing(req):
+                return
+
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
+
+        if self.server_args.disaggregation_mode == "decode":
+            if self.maybe_external_decode_dp_rank_routing(req):
+                return
+        elif self.server_args.disaggregation_mode == "prefill":
+            if self.maybe_external_prefill_dp_rank_routing(req):
+                return
+
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS)
         self.workers[target_worker].send_pyobj(req)
 
