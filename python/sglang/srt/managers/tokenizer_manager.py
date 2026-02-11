@@ -514,10 +514,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         def on_subprocess_crash():
             """Callback invoked when a subprocess crash is detected."""
             logger.error(
-                "Subprocess crash detected by monitor. Triggering cleanup..."
+                "Subprocess crash detected by monitor. Triggering SIGQUIT handler..."
             )
-            self.dump_requests_before_crash()
-            kill_process_tree(os.getpid())
+            # Send SIGQUIT to self to reuse the existing signal handler infrastructure.
+            # This ensures thread-safe cleanup (runs on the main thread via event loop)
+            # and respects custom_sigquit_handler if configured.
+            os.kill(os.getpid(), signal.SIGQUIT)
 
         self._subprocess_monitor = create_subprocess_monitor(
             scheduler_procs=scheduler_procs,

@@ -15,30 +15,11 @@
 
 import multiprocessing as mp
 import os
-import sys
 import threading
 import time
 import unittest
 
-# Allow direct execution without full sglang install
-# Path: test/unit/utils -> python/sglang/srt/utils (3 levels up, then into python/...)
-_utils_path = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "..",
-        "python",
-        "sglang",
-        "srt",
-        "utils",
-    )
-)
-if _utils_path not in sys.path:
-    sys.path.insert(0, _utils_path)
-
-# Import after path setup
-from subprocess_monitor import SubprocessMonitor, create_subprocess_monitor
+from sglang.srt.utils.subprocess_monitor import SubprocessMonitor, create_subprocess_monitor
 
 
 def healthy_worker():
@@ -48,13 +29,13 @@ def healthy_worker():
 
 def crashing_worker():
     """A worker that crashes immediately."""
-    sys.exit(1)
+    os._exit(1)
 
 
 def slow_crash_worker(delay: float = 0.5):
     """A worker that crashes after a delay."""
     time.sleep(delay)
-    sys.exit(42)
+    os._exit(42)
 
 
 class TestSubprocessMonitor(unittest.TestCase):

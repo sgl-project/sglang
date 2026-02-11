@@ -442,6 +442,12 @@ class Engine(EngineBase):
 
     def shutdown(self):
         """Shutdown the engine"""
+        # Stop the subprocess monitor before killing children to prevent
+        # false-positive crash detection during normal shutdown.
+        if hasattr(self.tokenizer_manager, "_subprocess_monitor"):
+            monitor = self.tokenizer_manager._subprocess_monitor
+            if monitor is not None:
+                monitor.stop()
         kill_process_tree(os.getpid(), include_parent=False)
 
     def __enter__(self):
