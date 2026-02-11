@@ -614,6 +614,10 @@ void map_sigmoid_cuda(
 }
 
 // ============ NormLinear Operator ============
+#ifndef CUBLAS_COMPUTE_32F_FAST_16BF
+#define CUBLAS_COMPUTE_32F_FAST_16BF CUBLAS_COMPUTE_32F
+#endif
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -732,12 +736,215 @@ std::tuple<torch::Tensor, torch::Tensor> norm_linear_cuda(
     return std::make_tuple(r, proj);
 }
 
+// ============ NormLinear BF16 Optimized Operator ============
+template <int THREADS>
+__global__ void row_l2norm_bf16_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ r,
+    int64_t D,
+    float inv_sqrt_d
+) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    const __nv_bfloat16* row_ptr = x + row * D;
+
+    float sum = 0.0f;
+    const int64_t vec8_elems = D >> 3;
+    const uint4* row_vec8 = reinterpret_cast<const uint4*>(row_ptr);
+
+    #pragma unroll 2
+    for (int64_t i = threadIdx.x; i < vec8_elems; i += THREADS) {
+        const uint4 pack = row_vec8[i];
+
+        const __nv_bfloat162 b0 = *reinterpret_cast<const __nv_bfloat162*>(&pack.x);
+        const __nv_bfloat162 b1 = *reinterpret_cast<const __nv_bfloat162*>(&pack.y);
+        const __nv_bfloat162 b2 = *reinterpret_cast<const __nv_bfloat162*>(&pack.z);
+        const __nv_bfloat162 b3 = *reinterpret_cast<const __nv_bfloat162*>(&pack.w);
+
+        const float2 f0 = __bfloat1622float2(b0);
+        const float2 f1 = __bfloat1622float2(b1);
+        const float2 f2 = __bfloat1622float2(b2);
+        const float2 f3 = __bfloat1622float2(b3);
+
+        sum = fmaf(f0.x, f0.x, sum);
+        sum = fmaf(f0.y, f0.y, sum);
+        sum = fmaf(f1.x, f1.x, sum);
+        sum = fmaf(f1.y, f1.y, sum);
+        sum = fmaf(f2.x, f2.x, sum);
+        sum = fmaf(f2.y, f2.y, sum);
+        sum = fmaf(f3.x, f3.x, sum);
+        sum = fmaf(f3.y, f3.y, sum);
+    }
+
+    for (int64_t i = (vec8_elems << 3) + threadIdx.x; i < D; i += THREADS) {
+        const float v = __bfloat162float(row_ptr[i]);
+        sum = fmaf(v, v, sum);
+    }
+
+    const float total = block_reduce_sum<THREADS>(sum);
+    if (threadIdx.x == 0) {
+        r[row] = sqrtf(total) * inv_sqrt_d;
+    }
+}
+
+template <int THREADS>
+__global__ void row_l2norm_scalar_kernel(
+    const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ r,
+    int64_t D,
+    float inv_sqrt_d
+) {
+    const int64_t row = static_cast<int64_t>(blockIdx.x);
+    const __nv_bfloat16* row_ptr = x + row * D;
+
+    float sum = 0.0f;
+    #pragma unroll 2
+    for (int64_t i = threadIdx.x; i < D; i += THREADS) {
+        const float v = __bfloat162float(row_ptr[i]);
+        sum = fmaf(v, v, sum);
+    }
+
+    const float total = block_reduce_sum<THREADS>(sum);
+    if (threadIdx.x == 0) {
+        r[row] = sqrtf(total) * inv_sqrt_d;
+    }
+}
+
+static inline int choose_threads(int64_t M, int64_t D) {
+    if (D >= 16384) {
+        if (M >= 32768) {
+            return 384;
+        }
+        if (M >= 2048) {
+            return 320;
+        }
+        return 256;
+    }
+    return (M >= 2048) ? 256 : 128;
+}
+
+static inline void launch_norm_bf16(
+    const __nv_bfloat16* x_ptr,
+    float* r_ptr,
+    int64_t M,
+    int64_t D,
+    int threads,
+    bool use_vec8,
+    float inv_sqrt_d,
+    cudaStream_t stream
+) {
+    auto launch = [&](auto kernel) {
+        kernel<<<static_cast<unsigned int>(M), threads, 0, stream>>>(x_ptr, r_ptr, D, inv_sqrt_d);
+    };
+
+    if (threads == 384) {
+        if (use_vec8) launch(row_l2norm_bf16_kernel<384>);
+        else launch(row_l2norm_scalar_kernel<384>);
+    } else if (threads == 320) {
+        if (use_vec8) launch(row_l2norm_bf16_kernel<320>);
+        else launch(row_l2norm_scalar_kernel<320>);
+    } else if (threads == 256) {
+        if (use_vec8) launch(row_l2norm_bf16_kernel<256>);
+        else launch(row_l2norm_scalar_kernel<256>);
+    } else {
+        if (use_vec8) launch(row_l2norm_bf16_kernel<128>);
+        else launch(row_l2norm_scalar_kernel<128>);
+    }
+}
+
+std::vector<torch::Tensor> norm_linear_bf16_cuda(
+    torch::Tensor x,
+    torch::Tensor weight_bf16
+) {
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA tensor");
+    TORCH_CHECK(weight_bf16.is_cuda(), "weight_bf16 must be CUDA tensor");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
+    TORCH_CHECK(weight_bf16.scalar_type() == at::kBFloat16, "weight_bf16 must be bfloat16");
+    TORCH_CHECK(x.dim() == 2, "x must be [M, D]");
+    TORCH_CHECK(weight_bf16.dim() == 2, "weight_bf16 must be [N, D]");
+
+    auto x_c = x.contiguous();
+    auto w_bf16 = weight_bf16.contiguous();
+
+    const int64_t M64 = x_c.size(0);
+    const int64_t D64 = x_c.size(1);
+    const int64_t N64 = w_bf16.size(0);
+
+    TORCH_CHECK(w_bf16.size(1) == D64, "weight_bf16 shape mismatch");
+    TORCH_CHECK(M64 > 0 && D64 > 0 && N64 > 0, "invalid dimensions");
+    TORCH_CHECK(M64 <= std::numeric_limits<int>::max(), "M too large");
+    TORCH_CHECK(D64 <= std::numeric_limits<int>::max(), "D too large");
+    TORCH_CHECK(N64 <= std::numeric_limits<int>::max(), "N too large");
+
+    const int M = static_cast<int>(M64);
+    const int D = static_cast<int>(D64);
+    const int N = static_cast<int>(N64);
+
+    const c10::cuda::CUDAGuard device_guard(x_c.device());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    auto r = torch::empty({M64, 1}, x_c.options().dtype(at::kFloat));
+    auto proj = torch::empty({M64, N64}, x_c.options().dtype(at::kFloat));
+
+    const auto* x_ptr = reinterpret_cast<const __nv_bfloat16*>(x_c.data_ptr<at::BFloat16>());
+    const auto* w_ptr = reinterpret_cast<const __nv_bfloat16*>(w_bf16.data_ptr<at::BFloat16>());
+    const float inv_sqrt_d = rsqrtf(static_cast<float>(D));
+
+    const int threads = choose_threads(M64, D64);
+    const bool ptr_aligned16 = ((reinterpret_cast<uintptr_t>(x_ptr) & 0xF) == 0);
+    const bool use_vec8 = ptr_aligned16 && ((D & 7) == 0);
+
+    launch_norm_bf16(
+        x_ptr,
+        r.data_ptr<float>(),
+        M64,
+        D64,
+        threads,
+        use_vec8,
+        inv_sqrt_d,
+        stream.stream()
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    auto handle = at::cuda::getCurrentCUDABlasHandle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream.stream()));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    // proj[M, N] = x[M, D] @ weight[N, D]^T
+    CUBLAS_CHECK(cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        N,
+        M,
+        D,
+        &alpha,
+        w_ptr,
+        CUDA_R_16BF,
+        D,
+        x_ptr,
+        CUDA_R_16BF,
+        D,
+        &beta,
+        proj.data_ptr<float>(),
+        CUDA_R_32F,
+        N,
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP
+    ));
+
+    return {r, proj};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("aggregate_cuda", &aggregate_cuda, "Aggregate Op");
     m.def("sinkhorn_cuda", &sinkhorn_cuda, "Sinkhorn Op");
     m.def("expand_merge_cuda", &expand_merge_cuda, "ExpandMerge Op");
     m.def("map_sigmoid_cuda", &map_sigmoid_cuda, "MapSigmoid Op");
     m.def("norm_linear_cuda", &norm_linear_cuda, "NormLinear Op");
+    m.def("norm_linear_bf16_cuda", &norm_linear_bf16_cuda, "NormLinear BF16 Op");
 }
 """
 
@@ -920,6 +1127,32 @@ class MHCCudaOps(nn.Module):
         self._check_tensor("norm_linear_output_proj", proj)
         return r, proj
     
+    def norm_linear_bf16(self, x, weight):
+        """
+        Perform fused Norm and Linear operation with BF16 optimization.
+        
+        This is an optimized version that keeps BF16 precision throughout the computation
+        and uses cuBLAS TensorCore operations for better performance.
+        
+        Args:
+            x: [M, n_streams, D], bf16
+            weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32 or bf16
+        Returns:
+            r: [M, 1], fp32
+            proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+        """
+        self._check_tensor("norm_linear_bf16_input_x", x)
+        x = x.contiguous()
+        x_flat = x.flatten(1)
+        weight = weight.to(dtype=torch.bfloat16, memory_format=torch.contiguous_format)
+
+        results = self._module.norm_linear_bf16_cuda(x_flat, weight)
+        r, proj = results[0], results[1]
+        
+        self._check_tensor("norm_linear_bf16_output_r", r)
+        self._check_tensor("norm_linear_bf16_output_proj", proj)
+        return r, proj
+    
     def forward(self, *args, **kwargs):
         """
         Forward pass - not used directly, call specific methods instead.
@@ -966,3 +1199,8 @@ def mhc_cuda_map_sigmoid(r, proj, bias, alpha_pre, alpha_post, alpha_res, n_stre
 def mhc_cuda_norm_linear(x, weight):
     """compatible function."""
     return _get_ops().norm_linear(x, weight)
+
+
+def mhc_cuda_norm_linear_bf16(x, weight):
+    """BF16 optimized compatible function."""
+    return _get_ops().norm_linear_bf16(x, weight)

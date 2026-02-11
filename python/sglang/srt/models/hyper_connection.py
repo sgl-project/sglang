@@ -9,14 +9,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.mhc_cuda_ops import MHCCudaOps
-from sglang.srt.layers.mhc_tilelang_ops import (
-    mhc_tilelang_aggregate,
-    mhc_deepgemm_norm_linear,
-    mhc_tilelang_expand_merge,
-    mhc_tilelang_map_sigmoid,
-    mhc_tilelang_norm_linear,
-    mhc_tilelang_sinkhorn,
-)
 
 
 class HyperConnectionModule(nn.Module):
@@ -44,38 +36,15 @@ class HyperConnectionModule(nn.Module):
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(2 * self.n + self.n * self.n, dtype=torch.float32))
-        
-        # Initialize ops based on backend
-        self.backend = os.environ.get("SGLANG_MHC_BACKEND", "deepgemm_cuda")
 
-        if self.backend == "cuda":
-            # Initialize unified CUDA ops module (compiled once, cached tensors)
-            self.cuda_ops = MHCCudaOps()
-            self.norm_linear_func = self.cuda_ops.norm_linear
-            self.map_sigmoid_func = self.cuda_ops.map_sigmoid
-            self.sinkhorn_func = self.cuda_ops.sinkhorn
-            self.aggregate_func = self.cuda_ops.aggregate
-            self.expand_merge_func = self.cuda_ops.expand_merge
-        elif self.backend == "tilelang_cuda":
-            self.cuda_ops = MHCCudaOps()
-            self.norm_linear_func = mhc_tilelang_norm_linear
-            self.map_sigmoid_func = self.cuda_ops.map_sigmoid
-            self.sinkhorn_func = self.cuda_ops.sinkhorn
-            self.aggregate_func = self.cuda_ops.aggregate
-            self.expand_merge_func = self.cuda_ops.expand_merge
-        elif self.backend == "deepgemm_cuda":
-            self.cuda_ops = MHCCudaOps()
-            self.norm_linear_func = mhc_deepgemm_norm_linear
-            self.map_sigmoid_func = self.cuda_ops.map_sigmoid
-            self.sinkhorn_func = self.cuda_ops.sinkhorn
-            self.aggregate_func = self.cuda_ops.aggregate
-            self.expand_merge_func = self.cuda_ops.expand_merge
-        else:
-            self.norm_linear_func = mhc_tilelang_norm_linear
-            self.map_sigmoid_func = mhc_tilelang_map_sigmoid
-            self.sinkhorn_func = mhc_tilelang_sinkhorn
-            self.aggregate_func = mhc_tilelang_aggregate
-            self.expand_merge_func = mhc_tilelang_expand_merge
+        # Initialize unified CUDA ops module (compiled once, cached tensors)
+        self.cuda_ops = MHCCudaOps()
+        self.norm_linear_func = self.cuda_ops.norm_linear_bf16
+        self.map_sigmoid_func = self.cuda_ops.map_sigmoid
+        self.sinkhorn_func = self.cuda_ops.sinkhorn
+        self.aggregate_func = self.cuda_ops.aggregate
+        self.expand_merge_func = self.cuda_ops.expand_merge
+
 
     def compute_mappings(
         self, 
@@ -96,7 +65,15 @@ class HyperConnectionModule(nn.Module):
         bs, _, _ = x.shape
 
         r, proj = self.norm_linear_func(x, self.mapping_proj.weight)
-        h_pre, h_post, h_res = self.map_sigmoid_func(r, proj, self.bias, self.alpha_pre, self.alpha_post, self.alpha_res, self.n)
+        h_pre, h_post, h_res = self.map_sigmoid_func(
+            r,
+            proj,
+            self.bias,
+            self.alpha_pre,
+            self.alpha_post,
+            self.alpha_res,
+            self.n,
+        )
         h_res = self.sinkhorn_func(h_res, n_iters=self.sinkhorn_iterations)
 
         return h_pre, h_post, h_res
