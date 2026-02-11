@@ -417,6 +417,8 @@ RUN CMAKE_VERSION=3.31.1 \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
+RUN python3 -m pip install -e ".[runai]"
+
 # Install just
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
     sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
