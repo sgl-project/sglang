@@ -1320,22 +1320,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization. Please use Blackwell and"
                 " above."
             )
-        self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-        )
         self._cache_permute_indices = {}
 
     @property
-    def enable_flashinfer_cutlass_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
+    def enable_flashinfer_trtllm_moe(self) -> bool:
+        """For FP4, auto resolves to flashinfer_trtllm."""
+        backend = get_moe_runner_backend()
+        return backend.is_flashinfer_trtllm() or backend.is_auto()
 
+    @property
+    def enable_flashinfer_cutlass_moe(self) -> bool:
         """Access the global enable_flashinfer_cutlass_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
-
         """Access the global enable_flashinfer_cutedsl_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
@@ -1673,7 +1672,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
 
         if moe_runner_backend.is_flashinfer_trtllm():
-            self.enable_flashinfer_trtllm_moe = True
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
