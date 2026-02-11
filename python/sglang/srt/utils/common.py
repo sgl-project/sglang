@@ -921,7 +921,9 @@ def load_image(
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
         image_metadata, image_file = image_file.split(",")  # wili
-        if ("jpg" in image_metadata) or ("jpeg" in image_metadata):  # wili, for jpeg base64 on NVIDIA GPU
+        if ("jpg" in image_metadata) or (
+            "jpeg" in image_metadata
+        ):  # wili, for jpeg base64 on NVIDIA GPU
             image_bytes = pybase64.b64decode(image_file, validate=True)
             image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image = decode_jpeg(image, device="cuda")
@@ -933,7 +935,9 @@ def load_image(
         # elif ("jp2" in image_metadata) or ("j2k" in image_metadata):  # wili, specified for jpeg2000 base64, not supported yet
         #     pass
         else:
-            image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))  # wili, original code
+            image = Image.open(
+                BytesIO(pybase64.b64decode(image_file, validate=True))
+            )  # wili, original code
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:

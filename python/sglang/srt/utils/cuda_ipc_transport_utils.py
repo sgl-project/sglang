@@ -90,7 +90,7 @@ class MmItemMemoryPool:
         self._lock = threading.Lock()
 
         self._recycle_interval = recycle_interval
-        self._stop_recycler = False  # wili, True to diable recycle for debug, default value is False
+        self._stop_recycler = False
         self._recycle_thread = threading.Thread(
             target=self._recycle_loop, name="MmItemMemoryPoolRecycler", daemon=True
         )

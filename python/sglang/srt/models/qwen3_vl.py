@@ -15,15 +15,17 @@
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
 import math
+import os  # wili
 import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
+import numpy as np  # wili
 import torch
 import torch.nn as nn
 from einops import rearrange
 from transformers.activations import ACT2FN
+from vfly.utils.parallel import dit_sp_gather, dit_sp_split  # wili
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -68,11 +70,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
-import nvtx  # wili
-import os  # wili
-import numpy as np  # wili
-from vfly.utils.parallel import dit_sp_split, dit_sp_gather  # wili
-
 logger = logging.getLogger(__name__)
 
 
@@ -92,7 +89,7 @@ class Qwen3_VisionMLP(nn.Module):
         use_data_parallel: bool = False,
     ):
         super().__init__()
-        if bool(int(os.environ.get('ENABLE_VFLY', '0'))):  # wili, for vfly
+        if bool(int(os.environ.get("ENABLE_VFLY", "0"))):  # wili, for vfly
             self.tp_size = 1  # wili, reuse TP group but keep TP size as 1
             self.tp_rank = 0  # wili
         else:  # wili, original code
@@ -177,9 +174,14 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             stride=kernel_size,
             bias=True,
         )
-        k = self.in_channels * self.temporal_patch_size * self.patch_size ** 2
-        self.linear = nn.Linear(in_features=k, out_features=self.embed_dim, bias=True, dtype=self.proj.weight.dtype)
-        
+        k = self.in_channels * self.temporal_patch_size * self.patch_size**2
+        self.linear = nn.Linear(
+            in_features=k,
+            out_features=self.embed_dim,
+            bias=True,
+            dtype=self.proj.weight.dtype,
+        )
+
     def copy_conv3d_weight_to_linear(self):
         # Call this after model loading in `sglang/srt/model_loader/loader.py: load_weights_and_postprocess()`
         print("Copy weights from Conv3d to Linear in PatchEmbed")
@@ -281,7 +283,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        if bool(int(os.environ.get('ENABLE_VFLY', '0'))):  # wili, for vfly
+        if bool(int(os.environ.get("ENABLE_VFLY", "0"))):  # wili, for vfly
             self.tp_size = 1  # wili, reuse TP group but keep TP size as 1
             self.tp_rank = 0  # wili
         else:  # wili, original code
@@ -371,7 +373,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             base=10000.0,
             is_neox_style=True,
         )
-        self.enable_vfly = bool(int(os.environ.get('ENABLE_VFLY', '0')))  # wili
+        self.enable_vfly = bool(int(os.environ.get("ENABLE_VFLY", "0")))  # wili
 
         self.blocks = nn.ModuleList(
             [
@@ -414,7 +416,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ]
         )
 
-        if bool(int(os.environ.get('ENABLE_VFLY', '0'))):  # wili, for vfly
+        if bool(int(os.environ.get("ENABLE_VFLY", "0"))):  # wili, for vfly
             self.tp_size = 1
         else:  # wili, original code, but seems useless?
             self.tp_size = (
@@ -458,23 +460,27 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         """
         device = grid_thw.device
         m = self.spatial_merge_size
-        
+
         pos_ids_list = []
-        
+
         for t, h, w in grid_thw:
             t, h, w = t.item(), h.item(), w.item()
-            
+
             hpos_ids = torch.arange(h, device=device).unsqueeze(1).expand(-1, w)
-            hpos_ids = hpos_ids.reshape(h // m, m, w // m, m).permute(0, 2, 1, 3).flatten()
-            
+            hpos_ids = (
+                hpos_ids.reshape(h // m, m, w // m, m).permute(0, 2, 1, 3).flatten()
+            )
+
             wpos_ids = torch.arange(w, device=device).unsqueeze(0).expand(h, -1)
-            wpos_ids = wpos_ids.reshape(h // m, m, w // m, m).permute(0, 2, 1, 3).flatten()
-            
+            wpos_ids = (
+                wpos_ids.reshape(h // m, m, w // m, m).permute(0, 2, 1, 3).flatten()
+            )
+
             sample_pos = torch.stack([hpos_ids, wpos_ids], dim=-1)  # [h*w, 2]
             pos_ids_list.append(sample_pos.repeat(t, 1))  # [t*h*w, 2]
-        
+
         pos_ids = torch.cat(pos_ids_list, dim=0)
-        
+
         max_grid_size = grid_thw[:, 1:].max()
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
@@ -605,8 +611,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             patch_pos_embeds, temporal_dims, height_dims, width_dims
         )
 
-
-    def fast_pos_embed_interpolate_v2(self, grid_thw: torch.Tensor):  # wili, TODO: align logic with original code
+    def fast_pos_embed_interpolate_v2(
+        self, grid_thw: torch.Tensor
+    ):  # wili, TODO: align logic with original code
         """
         grid_thw: LongTensor on CPU / GPU, shape [N, 3], value (t,h,w) per row
         return  : bfloat16 tensor on GPU, shape [Σ(t*h*w), self.pos_embed.embedding_dim]
@@ -614,15 +621,22 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         device = self.pos_embed.weight.device
         dtype = self.pos_embed.weight.dtype
         grid_thw = grid_thw.to(device, non_blocking=True)
-        num_grid = int(self.num_position_embeddings ** 0.5)
+        num_grid = int(self.num_position_embeddings**0.5)
         m_size = self.spatial_merge_size
         embedding_dim = self.pos_embed.embedding_dim
 
-        num_patch_per_clip = grid_thw.prod(dim=1)  # [t_i * h_i * w_i for i in range len(grid_thw)]
+        num_patch_per_clip = grid_thw.prod(
+            dim=1
+        )  # [t_i * h_i * w_i for i in range len(grid_thw)]
         num_patch_quad = num_patch_per_clip * 4  # 4 indice / weights per patch
         num_elements = int(num_patch_per_clip.sum())  # number of total patches, on CPU
 
-        offset = torch.cat([torch.tensor([0], dtype=torch.long, device=device), num_patch_per_clip.cumsum(0)])
+        offset = torch.cat(
+            [
+                torch.tensor([0], dtype=torch.long, device=device),
+                num_patch_per_clip.cumsum(0),
+            ]
+        )
         offset_quad = offset * 4
 
         idx_all = torch.empty(num_patch_quad.sum(), dtype=torch.long, device=device)
@@ -637,15 +651,25 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             h_ceil = (h_floor + 1).clamp_max(num_grid - 1)
             w_ceil = (w_floor + 1).clamp_max(num_grid - 1)
 
-            hf, wf = torch.meshgrid(h_floor, w_floor, indexing='ij')
-            hc, wf = torch.meshgrid(h_ceil, w_floor, indexing='ij')
-            hf, wc = torch.meshgrid(h_floor, w_ceil, indexing='ij')
-            hc, wc = torch.meshgrid(h_ceil, w_ceil, indexing='ij')
-            idx4 = torch.stack([hf * num_grid + wf, hf * num_grid + wc, hc * num_grid + wf, hc * num_grid + wc], dim=-1)
+            hf, wf = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            hc, wf = torch.meshgrid(h_ceil, w_floor, indexing="ij")
+            hf, wc = torch.meshgrid(h_floor, w_ceil, indexing="ij")
+            hc, wc = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+            idx4 = torch.stack(
+                [
+                    hf * num_grid + wf,
+                    hf * num_grid + wc,
+                    hc * num_grid + wf,
+                    hc * num_grid + wc,
+                ],
+                dim=-1,
+            )
 
             dh = (h_idx - h_floor.float()).view(-1, 1)
             dw = (w_idx - w_floor.float()).view(1, -1)
-            w4 = torch.stack([(1 - dh) * (1 - dw), (1 - dh) * dw, dh * (1 - dw), dh * dw], dim=-1)
+            w4 = torch.stack(
+                [(1 - dh) * (1 - dw), (1 - dh) * dw, dh * (1 - dw), dh * dw], dim=-1
+            )
 
             idx_all[st:ed] = idx4.flatten().repeat_interleave(t)
             wgt_all[st:ed] = w4.flatten().repeat_interleave(t)
@@ -662,7 +686,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return out
 
-    def fast_pos_embed_interpolate_v3(self, grid_thw: torch.Tensor):  # wili, TODO: align logic with 0.5.7
+    def fast_pos_embed_interpolate_v3(
+        self, grid_thw: torch.Tensor
+    ):  # wili, TODO: align logic with 0.5.7
         """
         grid_thw: LongTensor on CPU / GPU, shape [N, 3], value (t,h,w) per row
         return  : bfloat16 tensor on GPU, shape [Σ(t*h*w), self.pos_embed.embedding_dim]
@@ -670,16 +696,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         device = self.pos_embed.weight.device
         dtype = self.pos_embed.weight.dtype
         grid_thw_cpu = grid_thw.detach().cpu().numpy()
-        num_grid = int(self.num_position_embeddings ** 0.5)
+        num_grid = int(self.num_position_embeddings**0.5)
         m_size = self.spatial_merge_size
         embedding_dim = self.pos_embed.embedding_dim
 
         num_patch_per_clip = [int(t * h * w) for t, h, w in grid_thw_cpu]
         total_patches = sum(num_patch_per_clip)
-        
+
         idx_all = np.empty((total_patches, 4), dtype=np.int64)
         wgt_all = np.empty((total_patches, 4), dtype=np.float32)
-        
+
         offset = 0
         for t, h, w in grid_thw_cpu:
             h_idx = np.linspace(0, num_grid - 1, h)
@@ -689,32 +715,32 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             h_ceil = np.clip(h_floor + 1, 0, num_grid - 1)
             w_ceil = np.clip(w_floor + 1, 0, num_grid - 1)
 
-            hf, wf = np.meshgrid(h_floor, w_floor, indexing='ij')
-            hc, wf2 = np.meshgrid(h_ceil, w_floor, indexing='ij')
-            hf2, wc = np.meshgrid(h_floor, w_ceil, indexing='ij')
-            hc2, wc2 = np.meshgrid(h_ceil, w_ceil, indexing='ij')
-            idx4 = np.stack([
-                hf * num_grid + wf,
-                hf2 * num_grid + wc,
-                hc * num_grid + wf2,
-                hc2 * num_grid + wc2
-            ], axis=-1)  # [h, w, 4]
+            hf, wf = np.meshgrid(h_floor, w_floor, indexing="ij")
+            hc, wf2 = np.meshgrid(h_ceil, w_floor, indexing="ij")
+            hf2, wc = np.meshgrid(h_floor, w_ceil, indexing="ij")
+            hc2, wc2 = np.meshgrid(h_ceil, w_ceil, indexing="ij")
+            idx4 = np.stack(
+                [
+                    hf * num_grid + wf,
+                    hf2 * num_grid + wc,
+                    hc * num_grid + wf2,
+                    hc2 * num_grid + wc2,
+                ],
+                axis=-1,
+            )  # [h, w, 4]
 
             dh = (h_idx - h_floor).reshape(-1, 1)
             dw = (w_idx - w_floor).reshape(1, -1)
-            w4 = np.stack([
-                (1 - dh) * (1 - dw),
-                (1 - dh) * dw,
-                dh * (1 - dw),
-                dh * dw
-            ], axis=-1)  # [h, w, 4]
+            w4 = np.stack(
+                [(1 - dh) * (1 - dw), (1 - dh) * dw, dh * (1 - dw), dh * dw], axis=-1
+            )  # [h, w, 4]
 
             idx4 = np.tile(idx4, (t, 1, 1, 1))  # [t, h, w, 4]
-            w4 = np.tile(w4, (t, 1, 1, 1))      # [t, h, w, 4]
-            
+            w4 = np.tile(w4, (t, 1, 1, 1))  # [t, h, w, 4]
+
             patch_count = t * h * w
-            idx_all[offset:offset+patch_count] = idx4.reshape(-1, 4)
-            wgt_all[offset:offset+patch_count] = w4.reshape(-1, 4)
+            idx_all[offset : offset + patch_count] = idx4.reshape(-1, 4)
+            wgt_all[offset : offset + patch_count] = w4.reshape(-1, 4)
             offset += patch_count
 
         idx_all = torch.from_numpy(idx_all.reshape(-1)).to(device)
@@ -728,16 +754,18 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         # PErmute indices rather than values
         all_indices = np.empty(total_patches, dtype=np.int32)
-        for i, (st, ed, (t, h, w)) in enumerate(zip(offset_cumsum[:-1], offset_cumsum[1:], grid_thw_cpu)):
+        for i, (st, ed, (t, h, w)) in enumerate(
+            zip(offset_cumsum[:-1], offset_cumsum[1:], grid_thw_cpu)
+        ):
             base_idx = np.arange(st, ed).reshape(t, h, w)
             base_idx = base_idx.reshape(t, h // m_size, m_size, w // m_size, m_size)
             base_idx = base_idx.transpose(0, 1, 3, 2, 4)
             base_idx = base_idx.reshape(-1)
             all_indices[st:ed] = base_idx
-        
+
         all_indices = torch.from_numpy(all_indices)
         out[:] = patch_pos_embed[all_indices]
-        
+
         return out
 
     def forward(
@@ -749,9 +777,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype)
-        grid_thw = grid_thw.to(device=self.device)  # wili, TODO: align logic with original code
-        with nvtx.annotate("self.patch_embed(x)", color="yellow"):  # wili
-            x = self.patch_embed(x)
+        grid_thw = grid_thw.to(device=self.device)  # wili
+        x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
             grid_thw_list = grid_thw
@@ -759,38 +786,39 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             grid_thw_list = grid_thw.tolist()
 
-        with nvtx.annotate("self.fast_pos_embed_interpolate(x)", color="yellow"):  # wili
-            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)  # wili
-        # with nvtx.annotate("self.fast_pos_embed_interpolate_v2(x)", color="yellow"):  # wili
-        #     pos_embeds = self.fast_pos_embed_interpolate_v2(grid_thw)  # wili
-        # with nvtx.annotate("self.fast_pos_embed_interpolate_v3(x)", color="yellow"):  # wili
-        #     pos_embeds = self.fast_pos_embed_interpolate_v3(grid_thw)  # wili, TODO: align logic with original code
-
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)  # wili
+        # pos_embeds = self.fast_pos_embed_interpolate_v2(grid_thw)  # wili
+        # pos_embeds = self.fast_pos_embed_interpolate_v3(grid_thw)  # wili, TODO: align logic with original code
         x += pos_embeds
 
-        with nvtx.annotate("self.rot_pos_emb(x)", color="yellow"):  # wili
-            rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)  # wili, original code
-        # with nvtx.annotate("self.rot_pos_emb_v2(x)", color="yellow"):  # wili
-        #     rotary_pos_emb = self.rot_pos_emb_v2(grid_thw)  # wili, TODO: align logic with original code
+        rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(
+            grid_thw_list
+        )  # wili, original code
+        # rotary_pos_emb = self.rot_pos_emb_v2(grid_thw)  # wili, TODO: align logic with original code
 
         # compute cu_seqlens
-        with nvtx.annotate("compute cu_seqlens(x)", color="yellow"):  # wili
-            seq_lens_list = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0])  # wili
-            cu_seqlens = seq_lens_list.cumsum(dim=0)
-            cu_seqlens = torch.cat([
-                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
-                cu_seqlens.to(torch.int32),
-            ])
         # wili, original code
         # cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
-        # # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        # if not is_npu():
-        #     cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
-        # else:
-        #     cu_seqlens = cu_seqlens.to("cpu")
+        seq_lens_list = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        )  # wili
+        cu_seqlens = seq_lens_list.cumsum(dim=0)
+        cu_seqlens = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=cu_seqlens.device),
+                cu_seqlens.to(torch.int32),
+            ]
+        )
 
-        x = x.unsqueeze(1)  # wili, [seq_len, batch_size=1, hidden_size], transpose to [batch_size, seq_len, hidden_size] in Qwen3_VisionBlock just before attention
-        cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if not is_npu():
+            cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+        else:
+            cu_seqlens = cu_seqlens.to("cpu")
+
+        x = x.unsqueeze(
+            1
+        )  # wili, [seq_len, batch_size=1, hidden_size], transpose to [batch_size, seq_len, hidden_size] in Qwen3_VisionBlock just before attention
         # print("[wili] ==== shape before blocks ====================================")
         # print(f"{x.shape = }")
         # print(f"{rotary_pos_emb_cos.shape = }")
@@ -813,12 +841,20 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             pad_size = [x.size(i) for i in range(x.ndim)]
             pad_size[0] = pad_length
             x = torch.cat([x, x.new_zeros(*pad_size)], dim=0).contiguous()
-            pad_size = [rotary_pos_emb_cos.size(i) for i in range(rotary_pos_emb_cos.ndim)]
+            pad_size = [
+                rotary_pos_emb_cos.size(i) for i in range(rotary_pos_emb_cos.ndim)
+            ]
             pad_size[0] = pad_length
-            rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos.new_zeros(*pad_size)], dim=0).contiguous()
-            rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin.new_zeros(*pad_size)], dim=0).contiguous()
+            rotary_pos_emb_cos = torch.cat(
+                [rotary_pos_emb_cos, rotary_pos_emb_cos.new_zeros(*pad_size)], dim=0
+            ).contiguous()
+            rotary_pos_emb_sin = torch.cat(
+                [rotary_pos_emb_sin, rotary_pos_emb_sin.new_zeros(*pad_size)], dim=0
+            ).contiguous()
 
-            x = dit_sp_split(x, dim=0)  # wili, split sequence parts for distributed processing
+            x = dit_sp_split(
+                x, dim=0
+            )  # wili, split sequence parts for distributed processing
             rotary_pos_emb_cos = dit_sp_split(rotary_pos_emb_cos, dim=0)  # wili
             rotary_pos_emb_sin = dit_sp_split(rotary_pos_emb_sin, dim=0)  # wili
 
@@ -831,35 +867,36 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         num_deepstack_captured = 0
 
         for layer_num, blk in enumerate(self.blocks):
-            with nvtx.annotate("blk", color="yellow"):  # wili
-                x = blk(
-                    x,
-                    cu_seqlens=cu_seqlens,
-                    rotary_pos_emb_cos=rotary_pos_emb_cos,
-                    rotary_pos_emb_sin=rotary_pos_emb_sin,
+            x = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                rotary_pos_emb_cos=rotary_pos_emb_cos,
+                rotary_pos_emb_sin=rotary_pos_emb_sin,
+            )
+
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
+                    x
                 )
-
-                if layer_num in self.deepstack_visual_indexes:
-                    deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
-                        x
-                    )
-                    deepstack_feature_lists.append(deepstack_feature)
-                    num_deepstack_captured += 1
-
-        with nvtx.annotate("x = self.merger(x)", color="yellow"):  # wili
-            x = self.merger(x)
+                deepstack_feature_lists.append(deepstack_feature)
+                num_deepstack_captured += 1
+        x = self.merger(x)
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
 
         if self.enable_vfly:  # wili
-            hidden_states = hidden_states.unsqueeze(0)  # wili, [batch_size=1, seq_len, hidden_size * (1 + depth_of_deepstack)]
+            hidden_states = hidden_states.unsqueeze(
+                0
+            )  # wili, [batch_size=1, seq_len, hidden_size * (1 + depth_of_deepstack)]
             # print("[wili] ==== shape before dit_sp_gather ====================================")
             # print(f"{hidden_states.shape = }")
             # print("[wili] ==== shape before dit_sp_gather ====================================")
 
-            hidden_states = dit_sp_gather(hidden_states, dim=1)  # wili, gather sequence parts back
-            
+            hidden_states = dit_sp_gather(
+                hidden_states, dim=1
+            )  # wili, gather sequence parts back
+
             hidden_states = hidden_states.squeeze(0)
 
         # print("[wili] ==== shape after blocks ====================================")
@@ -1185,10 +1222,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         all_chunk_embeds: List[torch.Tensor] = []
         img_start = 0
 
-        # start = torch.cuda.Event(enable_timing=True)  # wili
-        # end   = torch.cuda.Event(enable_timing=True)  # wili
-        # torch.cuda.synchronize()  # wili
-        # start.record()  # wili
         while img_start < num_images:
             img_end = img_start
             patches_in_chunk = 0
@@ -1229,16 +1262,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             grid_chunk = image_grid_thw[img_start:img_end]
 
             # run ViT once on this chunk without extra padding
-            with nvtx.annotate("VisionModel", color="green"):  # wili
-                if self.use_data_parallel:
-                    chunk_embeds = run_dp_sharded_mrope_vision_model(
-                        self.visual,
-                        pixel_chunk,
-                        grid_chunk.tolist(),
-                        rope_type="rope_3d",
-                    )
-                else:
-                    chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
+            if self.use_data_parallel:
+                chunk_embeds = run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_chunk,
+                    grid_chunk.tolist(),
+                    rope_type="rope_3d",
+                )
+            else:
+                chunk_embeds = self.visual(pixel_chunk, grid_thw=grid_chunk)
 
             # chunk_embeds: (sum_patches_after_merge_this_chunk, hidden)
             all_chunk_embeds.append(chunk_embeds)
@@ -1246,15 +1278,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # next batch
             img_start = img_end
 
-        # end.record()  # wili
-        # torch.cuda.synchronize()  # wili
-        # elapsed_ms = start.elapsed_time(end)  # wili
-        # print(f"VisionModel,{elapsed_ms=:.3f}ms")  # wili
-
         # concatenate back the full image embedding sequence
-        with nvtx.annotate("Concat after Vision Model", color="green"):  # wili
-            res = torch.cat(all_chunk_embeds, dim=0)
-        return res
+        return torch.cat(all_chunk_embeds, dim=0)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         for item in items:
@@ -1433,12 +1458,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
     def enable_vision_fly(self):  # wili
         # Copy from /work/qwen3-vl/third_party/VisionFly/examples/qwenimage.py
-        from .common import BaseArgumentParser, create_vfly_config, validate_parallel_config
         from vfly import setup_configs
+        from vfly.configs.parallel import DiTParallelConfig, get_dit_parallel_config
+        from vfly.configs.pipeline import PipelineConfig
         from vfly.layers import VflyAttnProcessor, apply_vfly_linear, apply_vfly_norm
         from vfly.utils import get_logger
-        from vfly.configs.parallel import get_dit_parallel_config, DiTParallelConfig
-        from vfly.configs.pipeline import PipelineConfig
+
+        from .common import (
+            BaseArgumentParser,
+            create_vfly_config,
+            validate_parallel_config,
+        )
 
         logger = get_logger(__name__)
 
@@ -1461,7 +1491,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 seq_lens_list = cu_seqlens.diff()
                 max_seqlen = torch.max(seq_lens_list)
                 total_seq_len = cu_seqlens[-1].item()
-                seq_len_padded = (total_seq_len + world_size - 1) // world_size * world_size
+                seq_len_padded = (
+                    (total_seq_len + world_size - 1) // world_size * world_size
+                )
                 uneven_number = seq_len_padded - total_seq_len
                 seq_len_cur_rank = q.shape[1]
                 if torch.distributed.get_rank() == world_size - 1:
@@ -1473,7 +1505,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     ulysses_size=pfg.ulysses_size(),
                     ring_size=pfg.ring_size(),
                 )
-                PipelineConfig.set_uneven_cp_config(total_seq_len, seq_len_padded, seq_len_cur_rank, parallel_config)
+                PipelineConfig.set_uneven_cp_config(
+                    total_seq_len, seq_len_padded, seq_len_cur_rank, parallel_config
+                )
 
                 return self.vfly_attn(
                     q,
@@ -1488,7 +1522,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         # Setup argument parser
         parser = BaseArgumentParser("")
-        parser.set_defaults(ulysses=torch.distributed.get_world_size(), attn_type="flash-attn3")
+        parser.set_defaults(
+            ulysses=torch.distributed.get_world_size(), attn_type="flash-attn3"
+        )
         args = parser.parse_args([])
         """
         enable_autotuner = False
@@ -1525,5 +1561,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.visual = torch.compile(self.visual, mode=args.torch_compile_mode)
         """
         return
+
 
 EntryClass = Qwen3VLForConditionalGeneration

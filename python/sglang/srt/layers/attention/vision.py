@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
+import os  # wili
 from functools import lru_cache, partial
 from typing import Any, Callable, Optional, Tuple
 
@@ -28,8 +29,6 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
-
-import os  # wili
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -599,7 +598,7 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        self.enable_vfly = bool(int(os.environ.get('ENABLE_VFLY', '0')))  # wili
+        self.enable_vfly = bool(int(os.environ.get("ENABLE_VFLY", "0")))  # wili
         if self.enable_vfly:  # wili, reuse TP group but keep TP size as 1
             self.tp_size = 1
             self.tp_rank = 0
@@ -934,10 +933,13 @@ class VisionAttention(nn.Module):
             else:
                 q, k = self._apply_qk_norm(q, k)
 
-
         if self.enable_vfly:  # wili
-            assert attention_mask is None  # wili, `attention_mask` is always None in our workflow
-            q = q.unsqueeze(0)  # wili, vfly needs input as [batch_size, sequence_length, num_head, head_dim]
+            assert (
+                attention_mask is None
+            )  # wili, `attention_mask` is always None in our workflow
+            q = q.unsqueeze(
+                0
+            )  # wili, vfly needs input as [batch_size, sequence_length, num_head, head_dim]
             k = k.unsqueeze(0)
             v = v.unsqueeze(0)
             output = self.processor(q, k, v, cu_seqlens)
