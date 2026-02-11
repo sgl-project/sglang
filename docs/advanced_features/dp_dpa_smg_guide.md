@@ -12,9 +12,6 @@ This guide explains the difference between Data Parallelism (DP) and Data Parall
 - Requests are distributed/scattered across replicas
 - No inter-replica communication during one request's inference (for simple DP)
 
-**Standard DP for MLA models**: If you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG.
-
-
 ## Data Parallelism Attention (DPA)
 
 **Data Parallelism Attention (DPA)**, also known as DP Attention, is an advanced parallelism strategy. While DPA provides the most significant benefits for **Multi-Head Latent Attention (MLA)** models (such as DeepSeek, MiniMax, Kimi-K2), it also supports **standard attention models** like Qwen.
@@ -62,7 +59,7 @@ DPA addresses these limitations by applying **data parallelism specifically to t
 
 For MoE models like DeepSeek, DPA is **often** paired with Expert Parallelism (EP) for best throughput at scale. However, **DPA does not require EP**: you can enable DPA without EP if your deployment does not need expert sharding.
 
-- Distribute 256+ expert weights across GPUs (cannot fit on single GPU)
+- Distribute 256+ expert weights across GPUs (cannot fit on a single GPU)
 - Enable efficient all-to-all token routing via DeepEP
 - Scale to large clusters (up to 5x throughput improvement over vanilla TP)
 
@@ -114,7 +111,7 @@ python -m sglang.launch_server \
 
 **Important**: `--dp-size` must be greater than 1 for DPA to work. When `dp_size == 1` (default), `--enable-dp-attention` is automatically disabled. The constraint `tp_size % dp_size == 0` must also be satisfied.
 
----
+**Standard DP for MLA models**: Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
 
 ## Native DP vs. SGLang Model Gateway (SMG)
 
@@ -189,7 +186,6 @@ The cache-aware routing policy in SMG significantly improves performance for wor
 - You need high availability and reliability features
 - You require detailed observability and metrics
 
----
 
 ## Practical Implementation: DP Routing via SMG
 
