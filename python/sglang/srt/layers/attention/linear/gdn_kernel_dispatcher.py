@@ -21,17 +21,17 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
 
-        self._decode_kernel = self._resolve_kernel(decode_backend, triton_kernel)
-        self._extend_kernel = self._resolve_kernel(prefill_backend, triton_kernel)
-        self._verify_kernel = triton_kernel
+        self.decode_kernel = self.resolve_kernel(decode_backend, triton_kernel)
+        self.extend_kernel = self.resolve_kernel(prefill_backend, triton_kernel)
+        self.verify_kernel = triton_kernel
 
         rank0_log(
-            f"GDN kernel dispatcher: decode={self._decode_kernel.__class__.__name__}, "
-            f"extend={self._extend_kernel.__class__.__name__}, "
-            f"verify={self._verify_kernel.__class__.__name__}"
+            f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
+            f"extend={self.extend_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__}"
         )
 
-    def _resolve_kernel(
+    def resolve_kernel(
         self,
         backend: LinearAttnKernelBackend,
         triton_kernel: LinearAttnKernelBase,
@@ -64,7 +64,7 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self._decode_kernel.decode(
+        return self.decode_kernel.decode(
             q,
             k,
             v,
@@ -91,7 +91,7 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> tuple:
-        return self._extend_kernel.extend(
+        return self.extend_kernel.extend(
             q,
             k,
             v,
@@ -116,7 +116,7 @@ class GDNKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self._verify_kernel.target_verify(
+        return self.verify_kernel.target_verify(
             q,
             k,
             v,

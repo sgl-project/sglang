@@ -20,7 +20,7 @@ class KDAKernelDispatcher:
         triton_kernel = TritonKDAKernel()
 
         if decode_backend.is_triton():
-            self._decode_kernel = triton_kernel
+            self.decode_kernel = triton_kernel
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
@@ -28,7 +28,7 @@ class KDAKernelDispatcher:
             )
 
         if prefill_backend.is_triton():
-            self._extend_kernel = triton_kernel
+            self.extend_kernel = triton_kernel
         else:
             raise ValueError(
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
@@ -36,8 +36,8 @@ class KDAKernelDispatcher:
             )
 
         rank0_log(
-            f"KDA kernel dispatcher: decode={self._decode_kernel.__class__.__name__}, "
-            f"extend={self._extend_kernel.__class__.__name__}"
+            f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
+            f"extend={self.extend_kernel.__class__.__name__}"
         )
 
     def decode(
@@ -55,7 +55,7 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self._decode_kernel.decode(
+        return self.decode_kernel.decode(
             q,
             k,
             v,
@@ -82,7 +82,7 @@ class KDAKernelDispatcher:
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return self._extend_kernel.extend(
+        return self.extend_kernel.extend(
             q,
             k,
             v,
