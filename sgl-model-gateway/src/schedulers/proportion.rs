@@ -150,9 +150,9 @@ impl ProportionScheduler {
                 let total_regular_weight = regular_workers as f32 * config.regular_worker_weight;
                 let total_weight = total_pd_weight + total_regular_weight;
 
-                if total_weight == 0.0 { 
+                if total_weight == 0.0 {
                     debug!("Skipping adjustment due to zero total worker weight.");
-                    continue; 
+                    continue;
                 }
 
                 let ideal_regular_load_share = total_regular_weight / total_weight;
@@ -161,13 +161,13 @@ impl ProportionScheduler {
                 sorted_token_counts.sort_unstable();
 
                 let total_global_load: usize = sorted_token_counts.iter().sum();
-                if total_global_load == 0 { 
+                if total_global_load == 0 {
                     debug!("Skipping adjustment due to zero total load in queue.");
-                    continue; 
+                    continue;
                 }
 
                 let mut accumulated_load: usize = 0;
-                let mut new_crossover_point = *crossover_point.read().unwrap(); 
+                let mut new_crossover_point = *crossover_point.read().unwrap();
 
                 for &token_count in &sorted_token_counts {
                     accumulated_load += token_count;
@@ -176,7 +176,7 @@ impl ProportionScheduler {
                         break;
                     }
                 }
-                
+
                 *crossover_point.write().unwrap() = new_crossover_point;
                 info!(
                     new_crossover_point,
@@ -241,10 +241,10 @@ impl SchedulerPolicy for ProportionScheduler {
                 weight.pd = total_pd_weight,
                 all_loads = ?*loads_guard,
                 all_counts = ?*counts_guard,
-                "Evaluating router selection logic." 
+                "Evaluating router selection logic."
             );
 
-            
+
             let select_best_available = |choices: &[RouterId]| -> Option<RouterId> {
                 choices.iter().find(|id| candidate_routers.contains(id)).cloned()
             };
@@ -280,8 +280,8 @@ impl SchedulerPolicy for ProportionScheduler {
                         .or_else(|| select_best_available(&[router_ids::HTTP_REGULAR, router_ids::GRPC_REGULAR]))
                 }
             }
-            
-        }; 
+
+        };
         if let Some(ref chosen_id) = choice {
             self.global_request_queue.write().unwrap().push_back(RequestRecord {
                 token_count,
@@ -304,7 +304,7 @@ impl SchedulerPolicy for ProportionScheduler {
                 "Failed to select any router for the request."
             );
         }
-        
+
         choice
     }
 

@@ -4,7 +4,6 @@ from sglang_router.router_args import RouterArgs
 from sglang_router.sglang_router_rs import (
     BackendType,
     HistoryBackendType,
-    SchedulerPolicyType,
     PolicyType,
     PyApiKeyEntry,
     PyControlPlaneAuthConfig,
@@ -15,15 +14,20 @@ from sglang_router.sglang_router_rs import (
     PyRole,
 )
 from sglang_router.sglang_router_rs import Router as _Router
+from sglang_router.sglang_router_rs import SchedulerPolicyType
 
-def scheduler_policy_from_str(scheduler_policy_str: Optional[str]) -> SchedulerPolicyType:
+
+def scheduler_policy_from_str(
+    scheduler_policy_str: Optional[str],
+) -> SchedulerPolicyType:
     """Convert scheduler policy string to SchedulerPolicyType enum."""
     if scheduler_policy_str is None:
         return None
     policy_map = {
         "proportion": SchedulerPolicyType.Proportion,
-    }    
+    }
     return policy_map[scheduler_policy_str]
+
 
 def policy_from_str(policy_str: Optional[str]) -> PolicyType:
     """Convert policy string to PolicyType enum."""

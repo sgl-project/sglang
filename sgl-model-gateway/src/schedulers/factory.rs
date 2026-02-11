@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use super::proportion::{ProportionScheduler, ProportionSchedulerConfig};
-use super::SchedulerPolicy; 
+use super::SchedulerPolicy;
 use crate::config::SchedulerConfig;
 use crate::app_context::AppContext;
 

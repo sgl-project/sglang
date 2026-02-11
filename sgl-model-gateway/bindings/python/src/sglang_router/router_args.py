@@ -250,7 +250,7 @@ class RouterArgs:
             default=[],
             help="List of worker URLs. Supports IPv4 and IPv6 addresses (use brackets for IPv6, e.g., http://[::1]:8000 http://192.168.1.1:8000)",
         )
-        
+
         scheduling_group.add_argument(
             f"--{prefix}scheduler-strategy",
             type=str,
@@ -296,7 +296,14 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual", "bucket"],
+            choices=[
+                "random",
+                "round_robin",
+                "cache_aware",
+                "power_of_two",
+                "manual",
+                "bucket",
+            ],
             help="Load balancing policy to use. In PD mode, this is used for both prefill and decode unless overridden",
         )
         routing_group.add_argument(

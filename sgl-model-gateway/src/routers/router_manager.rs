@@ -39,7 +39,7 @@ use crate::{
         SelectRouterInfo,
         factory::SchedulerFactory,
     },
-    tokenizer::registry::TokenizerRegistry, 
+    tokenizer::registry::TokenizerRegistry,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -82,7 +82,7 @@ impl RouterManager {
         Self {
             worker_registry,
             routers: Arc::new(DashMap::new()),
-            routers_snapshot: ArcSwap::from_pointee(Vec::new()), 
+            routers_snapshot: ArcSwap::from_pointee(Vec::new()),
             default_router: Arc::new(std::sync::RwLock::new(None)),
             enable_igw: false, // Will be set properly in from_config
             scheduler: None,
@@ -380,7 +380,7 @@ impl RouterManager {
         // Extract router validity check into a closure to reduce redundancy
         let is_router_valid =
             |is_pd: bool| (is_pd && num_pd_workers > 0) || (!is_pd && num_regular_workers > 0);
-        
+
         if self.scheduler.is_none() {
             if let Some(model) = model_id {
                 // Efficient Single Lookup for Specific Model
@@ -396,7 +396,7 @@ impl RouterManager {
                 let routers_snapshot = self.routers_snapshot.load();
                 for router in routers_snapshot.iter() {
                     let mut score = 1.0;
-    
+
                     let is_pd = router.is_pd_mode();
                     if prefer_pd && is_pd {
                         score += 2.0;
@@ -407,7 +407,7 @@ impl RouterManager {
                     // - Average worker priority vs priority_threshold
                     // - Average worker cost vs max_cost
                     // - Current load and health status
-    
+
                     if score > best_score && is_router_valid(is_pd) {
                         best_score = score;
                         best_router = Some(Arc::clone(router));
