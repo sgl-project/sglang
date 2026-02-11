@@ -951,25 +951,29 @@ def _set_envs_and_config(server_args: ServerArgs):
                 "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
             )
 
-    if server_args.custom_sigquit_handler is None:
-        # Register the signal handler.
-        # The child processes will send SIGQUIT to this process when any error happens
-        # This process then clean up the whole process tree
-        # Note: This sigquit handler is used in the launch phase, and may be replaced by
-        # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
-        def launch_phase_sigquit_handler(signum, frame):
-            logger.error(
-                "Received sigquit from a child process. It usually means the child failed."
-            )
-            kill_process_tree(os.getpid())
+    # Signal handlers can only be registered from the main thread.
+    # When launch_server is called from a background thread (e.g., in a Ray actor),
+    # skip signal registration to avoid ValueError.
+    if threading.current_thread() is threading.main_thread():
+        if server_args.custom_sigquit_handler is None:
+            # Register the signal handler.
+            # The child processes will send SIGQUIT to this process when any error happens
+            # This process then clean up the whole process tree
+            # Note: This sigquit handler is used in the launch phase, and may be replaced by
+            # the running_phase_sigquit_handler in the tokenizer manager after the grpc server is launched.
+            def launch_phase_sigquit_handler(signum, frame):
+                logger.error(
+                    "Received sigquit from a child process. It usually means the child failed."
+                )
+                kill_process_tree(os.getpid())
 
-        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
-    else:
-        # Allow users to register a custom SIGQUIT handler for things like crash dump
-        logger.error(
-            f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
-        )
-        signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
+            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        else:
+            # Allow users to register a custom SIGQUIT handler for things like crash dump
+            logger.error(
+                f"Using custom SIGQUIT handler: {server_args.custom_sigquit_handler}"
+            )
+            signal.signal(signal.SIGQUIT, server_args.custom_sigquit_handler)
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
