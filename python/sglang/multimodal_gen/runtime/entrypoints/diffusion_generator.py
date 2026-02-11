@@ -169,15 +169,6 @@ class DiffGenerator:
         Returns:
             Either the output dictionary, list of frames, or list of results for batch processing
         """
-        if sampling_params_kwargs is None:
-            sampling_params_kwargs = {}
-        else:
-            sampling_params_kwargs = dict(sampling_params_kwargs)
-
-        # Extract extra request controls before constructing SamplingParams.
-        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
-        rollout_request = sampling_params_kwargs.pop("rollout_request", None)
-
         # 1. prepare requests
         prompt = sampling_params_kwargs.get("prompt", None)
         prompts: list[str] = []
@@ -209,9 +200,11 @@ class DiffGenerator:
             **sampling_params_kwargs,
         )
 
+        # Extract diffusers_kwargs if passed
+        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
+
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
-            del output_idx
             sampling_params.prompt = p
             req = prepare_request(
                 server_args=self.server_args,
@@ -220,8 +213,6 @@ class DiffGenerator:
             # Add diffusers_kwargs to request's extra dict
             if diffusers_kwargs:
                 req.extra["diffusers_kwargs"] = diffusers_kwargs
-            if rollout_request:
-                req.extra["rollout_request"] = rollout_request
             requests.append(req)
 
         results = []
@@ -293,9 +284,6 @@ class DiffGenerator:
                             "trajectory": output_batch.trajectory_latents,
                             "trajectory_timesteps": output_batch.trajectory_timesteps,
                             "trajectory_decoded": output_batch.trajectory_decoded,
-                            "rollout_metadata": self._slice_rollout_metadata(
-                                output_batch.rollout_metadata, output_idx
-                            ),
                             "prompt_index": output_idx,
                         }
                         results.append(result_item)
@@ -336,33 +324,6 @@ class DiffGenerator:
         Sends a request to the scheduler and waits for a response.
         """
         return sync_scheduler_client.forward(batch)
-
-    def _slice_rollout_metadata(
-        self,
-        rollout_metadata: dict[str, torch.Tensor] | None,
-        output_idx: int,
-    ) -> dict[str, torch.Tensor] | None:
-        if not rollout_metadata:
-            return None
-
-        sliced: dict[str, torch.Tensor] = {}
-        for key, value in rollout_metadata.items():
-            if not isinstance(value, torch.Tensor):
-                continue
-
-            tensor = value
-            if key == "timesteps":
-                if tensor.ndim >= 2:
-                    idx = output_idx if output_idx < tensor.shape[0] else 0
-                    tensor = tensor[idx]
-            else:
-                if tensor.ndim >= 1:
-                    idx = output_idx if output_idx < tensor.shape[0] else 0
-                    tensor = tensor[idx]
-
-            sliced[key] = tensor.detach().cpu().clone()
-
-        return sliced or None
 
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
