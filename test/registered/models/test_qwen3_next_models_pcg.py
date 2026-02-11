@@ -1,9 +1,5 @@
 """
 Qwen3 Next piecewise CUDA graph tests.
-
-DISABLED: See https://github.com/sgl-project/sglang/issues/17039
-PCG tests for Qwen3 Next have intermittent failures (5-10% probability).
-Investigation ongoing by @YuweiAn.
 """
 
 import unittest
@@ -22,7 +18,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=400,
     suite="stage-c-test-4-gpu-h100",
-    disabled="Intermittent failures, see #17039",
 )
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
@@ -31,8 +26,6 @@ ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
 }
 
-
-@unittest.skip("Disabled: intermittent failures, see #17039")
 class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
 
     @classmethod
