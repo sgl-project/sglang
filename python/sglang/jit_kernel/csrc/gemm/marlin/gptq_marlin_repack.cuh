@@ -22,6 +22,7 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
 
 #include "marlin.cuh"
@@ -270,16 +271,19 @@ __global__ void gptq_marlin_repack_kernel(
 
 }  // namespace device::marlin
 
-#define CALL_IF_REPACK(NUM_BITS, HAS_PERM)                                                                       \
-  else if (num_bits == NUM_BITS && has_perm == HAS_PERM) {                                                       \
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(                                                               \
-        device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, HAS_PERM>,           \
-        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                             \
-        max_shared_mem));                                                                                        \
-    host::LaunchKernel(                                                                                          \
-        blocks, device::marlin::repack_threads, stream, static_cast<std::size_t>(max_shared_mem))(               \
-        device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, HAS_PERM>,           \
-        b_q_weight_ptr, perm_ptr, out_ptr, size_k, size_n);                                                     \
+#define CALL_IF_REPACK(NUM_BITS, HAS_PERM)                                                                        \
+  else if (num_bits == NUM_BITS && has_perm == HAS_PERM) {                                                        \
+    host::RuntimeDeviceCheck(cudaFuncSetAttribute(                                                                \
+        device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, HAS_PERM>,            \
+        cudaFuncAttributeMaxDynamicSharedMemorySize,                                                              \
+        max_shared_mem));                                                                                         \
+    host::LaunchKernel(blocks, device::marlin::repack_threads, stream, static_cast<std::size_t>(max_shared_mem))( \
+        device::marlin::gptq_marlin_repack_kernel<device::marlin::repack_threads, NUM_BITS, HAS_PERM>,            \
+        b_q_weight_ptr,                                                                                           \
+        perm_ptr,                                                                                                 \
+        out_ptr,                                                                                                  \
+        size_k,                                                                                                   \
+        size_n);                                                                                                  \
   }
 
 void gptq_marlin_repack(
