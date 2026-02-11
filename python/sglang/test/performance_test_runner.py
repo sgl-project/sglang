@@ -57,6 +57,7 @@ def run_performance_test(
 
     print(f"\n{'='*60}")
     print(f"Running PERFORMANCE test for {model.model_path}")
+    print(f"  Variant: {model.variant}")
     print(f"  Batch sizes: {batch_sizes}")
     print(f"  Input lens: {input_lens}")
     print(f"  Output lens: {output_lens}")
@@ -76,11 +77,12 @@ def run_performance_test(
             input_lens=input_lens,
             output_lens=output_lens,
             other_args=model.extra_args,
+            variant=model.variant or "",
             extra_bench_args=extra_bench_args,
         )
 
         if success and results:
-            perf_runner.add_report(results)
+            perf_runner.add_report(results, variant=model.variant)
             print(f"✓ Performance test succeeded for {model.model_path}")
 
             # Validate speculative decoding accept length if threshold is set

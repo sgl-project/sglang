@@ -20,7 +20,7 @@ use crate::routers::{
 };
 
 /// Preparation stage (delegates to endpoint-specific implementations)
-pub struct PreparationStage {
+pub(crate) struct PreparationStage {
     chat_stage: ChatPreparationStage,
     generate_stage: GeneratePreparationStage,
     embedding_stage: EmbeddingPreparationStage,
@@ -49,6 +49,8 @@ impl PipelineStage for PreparationStage {
             RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
             RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
             RequestType::Embedding(_) => self.embedding_stage.execute(ctx).await,
+            // Classify reuses the embedding preparation (tokenization)
+            RequestType::Classify(_) => self.embedding_stage.execute(ctx).await,
             RequestType::Responses(_) => {
                 error!(
                     function = "PreparationStage::execute",
