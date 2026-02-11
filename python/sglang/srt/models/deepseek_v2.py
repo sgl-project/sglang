@@ -154,6 +154,7 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+
 if _use_aiter:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
