@@ -215,4 +215,3 @@ void concat_mla_absorb_q(at::Tensor a, at::Tensor b, at::Tensor out) {
   cudaError_t err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
 }
-// For ci build
