@@ -1,10 +1,7 @@
 import os
 import unittest
-import logging
-
 import requests
-
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -17,7 +14,7 @@ base_port = int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0])
 BASE_PORT_FOR_ASCEND_MF = 20000 + base_port * 1000 +66
 os.environ["ASCEND_MF_STORE_URL"] = f"tcp://127.0.0.1:{BASE_PORT_FOR_ASCEND_MF}"
 
-register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDisaggregationPrefillPp(TestDisaggregationBase):
@@ -104,7 +101,7 @@ class TestDisaggregationPrefillPp(TestDisaggregationBase):
         2. Validate inference correctness (France capital = Paris) with deterministic sampling
         3. Confirm disaggregation_prefill_pp=2 in Decode server info (parameter validation)
         """
-        
+
         response = requests.get(f"{DEFAULT_URL_FOR_TEST}/health_generate")
         self.assertEqual(response.status_code, 200)
 
