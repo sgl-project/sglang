@@ -688,7 +688,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     def fast_pos_embed_interpolate_v3(
         self, grid_thw: torch.Tensor
-    ):  # wili, TODO: align logic with 0.5.7
+    ):  # wili, TODO: align logic with original code
         """
         grid_thw: LongTensor on CPU / GPU, shape [N, 3], value (t,h,w) per row
         return  : bfloat16 tensor on GPU, shape [Σ(t*h*w), self.pos_embed.embedding_dim]
@@ -777,7 +777,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype)
-        grid_thw = grid_thw.to(device=self.device)  # wili
+        grid_thw = grid_thw.to(
+            device=self.device
+        )  # wili, TODO: align logic with original code
         x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
