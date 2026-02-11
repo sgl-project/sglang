@@ -369,6 +369,9 @@ class ServerArgs:
         """
         return self.host is None or self.port is None
 
+    def adjust_quant_config(self):
+        self.nunchaku_config.adjust_config()
+
     def adjust_offload(self):
         if self.pipeline_config.task_type.is_image_gen():
             logger.info(
@@ -436,6 +439,7 @@ class ServerArgs:
         configure_logger(server_args=self)
 
         self.adjust_offload()
+        self.adjust_quant_config()
 
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
