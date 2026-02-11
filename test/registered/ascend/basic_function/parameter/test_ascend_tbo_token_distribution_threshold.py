@@ -64,6 +64,8 @@ def start_tbo_server(tbo_threshold: float):
     other_args = [
         "--attention-backend",
         "ascend",
+        "--mem-fraction-static",
+        0.85,
         "--disable-cuda-graph",
         "--tbo-token-distribution-threshold",
         str(tbo_threshold)
