@@ -1308,20 +1308,10 @@ class ServerArgs:
                 ):
                     if envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get():
                         self.speculative_moe_runner_backend = "deep_gemm"
-                        # deepep only supports expert parallelism
-                        if self.ep_size > 1:
-                            self.speculative_moe_a2a_backend = "deepep"
-                            logger.info(
-                                "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
-                            )
-                        else:
-                            self.speculative_moe_a2a_backend = "none"
-                            logger.warning(
-                                "Expert parallelism is not enabled (ep_size=1), falling back to 'none' a2a backend instead of 'deepep' for speculative MoE."
-                            )
-                            logger.info(
-                                "Use deep_gemm moe runner and none a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
-                            )
+                        self.speculative_moe_a2a_backend = "deepep"
+                        logger.info(
+                            "Use deep_gemm moe runner and deepep a2a backend for bf16 nextn layer in deepseek fp4 checkpoint."
+                        )
                     else:
                         self.speculative_moe_runner_backend = "triton"
                         self.speculative_moe_a2a_backend = "none"
@@ -2056,6 +2046,20 @@ class ServerArgs:
             assert (
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
+
+        # Validate speculative MoE backend configuration
+        if (
+            self.speculative_moe_runner_backend == "deep_gemm"
+            and self.speculative_moe_a2a_backend == "deepep"
+            and self.ep_size == 1
+        ):
+            raise ValueError(
+                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
+                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
+                f"Current ep_size is {self.ep_size}. "
+                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
+                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
+            )
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
