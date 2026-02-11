@@ -473,6 +473,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_cuda_graph_bs: Optional[List[int]] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -2270,6 +2271,15 @@ class ServerArgs:
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
+
+        if (
+            self.speculative_cuda_graph_bs is None
+            and self.speculative_algorithm == "EAGLE"
+        ):
+            assert (
+                self.cuda_graph_bs is not None
+            ), "cuda-graph-bs must be set before speculative-cuda-graph-bst"
+            self.speculative_cuda_graph_bs = self.cuda_graph_bs
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -4359,6 +4369,12 @@ class ServerArgs:
             type=int,
             nargs="+",
             help="Set the list of batch sizes for cuda graph.",
+        )
+        parser.add_argument(
+            "--speculative-cuda-graph-bs",
+            type=int,
+            nargs="+",
+            help="Set the list of batch sizes for target verify/draft extend cuda graph. If not set, will use the same as cuda-graph-bs.",
         )
         parser.add_argument(
             "--disable-cuda-graph",

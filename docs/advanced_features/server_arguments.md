@@ -288,6 +288,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-moe-runner-backend` | MOE backend for EAGLE speculative decoding, see --moe-runner-backend for options. Same as moe runner backend if unset. | `None` | Same as --moe-runner-backend options |
 | `--speculative-moe-a2a-backend` | MOE A2A backend for EAGLE speculative decoding, see --moe-a2a-backend for options. Same as moe a2a backend if unset. | `None` | Same as --moe-a2a-backend options |
 | `--speculative-draft-model-quantization` | The quantization method for speculative model. | `None` | Same as --quantization options |
+| `--speculative-cuda-graph-bs` | The list of batch sizes for target verify/draft extend cuda graph (each batch has num_steps + 1 tokens). If not set, will use the same set as --cuda-graph-bs | `None` | Type: List[int] |
 
 ## Ngram speculative decoding
 | Argument | Description | Defaults | Options |

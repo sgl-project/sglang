@@ -186,9 +186,15 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner, num_tokens_per_bs=1, use_spec_bs=False
+):
     server_args = model_runner.server_args
-    capture_bs = server_args.cuda_graph_bs
+    if use_spec_bs:
+        # For target verify/draft extend cuda graph, we use overridden batch sizes
+        capture_bs = server_args.speculative_cuda_graph_bs
+    else:
+        capture_bs = server_args.cuda_graph_bs
 
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
@@ -272,6 +278,8 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        self.use_spec_bs = False
+
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
@@ -284,13 +292,14 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+                self.use_spec_bs = True
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
-            model_runner, self.num_tokens_per_bs
+            model_runner, self.num_tokens_per_bs, self.use_spec_bs
         )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
