@@ -71,6 +71,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -129,6 +130,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -187,6 +189,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -246,6 +249,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
@@ -305,6 +309,7 @@ jobs:
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
         run: |
+          pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
           pip install sentence_transformers torchaudio==2.8.0
           pip install protobuf==6.31.1 zss pre-commit wandb>=0.16.0 tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap

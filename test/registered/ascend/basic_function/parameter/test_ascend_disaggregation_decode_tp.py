@@ -3,7 +3,7 @@ import unittest
 import requests
 import logging
 
-from sglang.test.test_disaggregation_utils import TestDisaggregationBase
+from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -39,7 +39,7 @@ class TestDisaggregationDecodeTp(TestDisaggregationBase):
         logger.info(os.environ.get("ASCEND_RT_VISIBLE_DEVICES"))
         super().setUpClass()
         cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
-        
+
         env = os.environ.copy()
 
         # Non blocking start servers
