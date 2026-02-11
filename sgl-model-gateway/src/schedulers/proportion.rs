@@ -61,7 +61,6 @@ pub struct ProportionScheduler {
     worker_counts: Arc<RwLock<std::collections::HashMap<RouterId, usize>>>,
     config: ProportionSchedulerConfig,
     _adjustment_handle: tokio::task::JoinHandle<()>,
-    worker_registry: Arc<WorkerRegistry>,
 }
 
 impl ProportionScheduler {
@@ -91,7 +90,6 @@ impl ProportionScheduler {
             router_loads,
             worker_counts,
             config,
-            worker_registry,
             _adjustment_handle: adjustment_handle,
         }
     }
