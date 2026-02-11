@@ -112,6 +112,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.request_logger import RequestLogger
+from sglang.srt.utils.subprocess_monitor import SubprocessMonitor, create_subprocess_monitor
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -480,6 +481,44 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
         self.req_state_class = ReqState
+
+        # Subprocess monitor (will be set up after subprocesses are ready)
+        self._subprocess_monitor: Optional[SubprocessMonitor] = None
+
+    def setup_subprocess_monitor(
+        self,
+        scheduler_procs: list,
+        detokenizer_proc=None,
+    ) -> None:
+        """
+        Set up and start the subprocess liveness monitor.
+
+        This should be called after subprocesses are launched and ready.
+        When a subprocess crash is detected, the monitor triggers the SIGQUIT
+        handler to perform cleanup and terminate the process tree.
+
+        Args:
+            scheduler_procs: List of scheduler subprocess handles
+            detokenizer_proc: Optional detokenizer subprocess handle
+        """
+        if not scheduler_procs and detokenizer_proc is None:
+            logger.debug("No subprocesses to monitor")
+            return
+
+        def on_subprocess_crash():
+            """Callback invoked when a subprocess crash is detected."""
+            logger.error(
+                "Subprocess crash detected by monitor. Triggering cleanup..."
+            )
+            self.dump_requests_before_crash()
+            kill_process_tree(os.getpid())
+
+        self._subprocess_monitor = create_subprocess_monitor(
+            scheduler_procs=scheduler_procs,
+            detokenizer_proc=detokenizer_proc,
+            on_crash=on_subprocess_crash,
+        )
+        self._subprocess_monitor.start()
 
     async def generate_request(
         self,
