@@ -300,7 +300,7 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     if pad_size > 0:
         input_ = F.pad(input_, (0, 0, 0, pad_size), mode="constant", value=0)
     with use_symmetric_memory(
-        get_attention_tp_group(), disabled=not is_allocation_symmetric()
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
     ):
         input_tensor_all = torch.empty(
             max_len * attn_tp_size,
