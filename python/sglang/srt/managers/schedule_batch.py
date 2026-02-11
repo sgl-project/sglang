@@ -1779,8 +1779,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 selected_indices=sorted_indices, buf_multiplier=buf_multiplier
             )
         ):
-            if len(sorted_indices) == 1:
-                # Always keep at least one request
+            # We should allow all requests to be retracted in decode disaggregation mode
+            # because there can be prealloc prefill requests.
+            num_minimum_reqs = 0 if server_args.disaggregation_mode == "decode" else 1
+            if len(sorted_indices) == num_minimum_reqs:
                 break
 
             first_iter = False
