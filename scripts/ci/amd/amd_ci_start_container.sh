@@ -38,6 +38,12 @@ while [[ $# -gt 0 ]]; do
     --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
     --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
+    --rocm-version)
+      ROCM_VERSION="$2"
+      MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
+      MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
+      echo "Using ROCm version override: ${ROCM_VERSION}"
+      shift 2;;
     -h|--help)
       echo "Usage: $0 [OPTIONS]"
       echo "Options:"
@@ -46,6 +52,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --custom-image IMAGE       Use a specific Docker image directly"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
+      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -66,7 +73,7 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
-# Normalise / collapse architectures we don’t yet build specifically for
+# Normalise / collapse architectures we don't yet build specifically for
 case "${GPU_ARCH}" in
   mi35x)
     echo "Runner uses ${GPU_ARCH}; will fetch mi35x image."
@@ -148,9 +155,9 @@ find_latest_image() {
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
   echo "Using hard-coded fallback…" >&2
   if [[ "${gpu_arch}" == "mi35x" ]]; then
-    echo "rocm/sgl-dev:v0.5.5-rocm700-mi35x-20251110"
+    echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
   else
-    echo "rocm/sgl-dev:v0.5.5-rocm700-mi30x-20251110"
+    echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
   fi
 }
 

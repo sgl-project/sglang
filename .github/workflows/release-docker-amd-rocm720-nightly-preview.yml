@@ -1,19 +1,8 @@
-name: Release Docker Images ROCm 7.2.0 Preview (AMD)
+name: Release Docker Images ROCm 7.2.0 Nightly Preview (AMD)
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - "docker/rocm720.Dockerfile"
-      - ".github/workflows/release-docker-amd-rocm720-preview.yml"
-  push:
-    tags:
-      - 'v[0-9]+.*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to build (without v prefix, e.g., 0.5.7)'
-        required: true
+  schedule:
+    - cron: '0 13 * * *'
 
 concurrency:
   # A PR number if a pull request and otherwise the commit hash. This cancels
@@ -21,7 +10,7 @@ concurrency:
   # (postsubmit). The workflow name is prepended to avoid conflicts between
   # different workflows.
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
-  cancel-in-progress: false
+  cancel-in-progress: True
 
 jobs:
   publish:
