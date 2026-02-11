@@ -1121,6 +1121,7 @@ def general_mm_embed_routine(
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
             forward_batch.mm_inputs = None
+            forward_batch.mm_input_embeds = input_embeds
         else:
             input_embeds = embed_tokens(input_ids)
         # Copy to pre-allocated buffer if available (for CUDA graph address stability)

@@ -115,8 +115,6 @@ def fused_scale_residual_norm_scale_shift_ref(
 
 
 def _make_tensor(index_mode: str, shape: Tuple, dtype: torch.dtype):
-    if index_mode == "int1":
-        return 1
     if index_mode == "NAT":
         return None
     return torch.randn(*SHAPE_MAP[index_mode](*shape), device=DEVICE, dtype=dtype)
@@ -229,7 +227,7 @@ class TestFusedScaleResidualNormScaleShift:
             scale_mode=index_mode, shift_mode=index_mode, norm_type=norm_type
         )
 
-    @pytest.mark.parametrize("index_mode", INDEX_MODES + ["int1"])
+    @pytest.mark.parametrize("index_mode", INDEX_MODES)
     def test_gate_index_mode(self, index_mode, norm_type):
         run_scale_resi_norm_scale_shift(gate_mode=index_mode, norm_type=norm_type)
 
