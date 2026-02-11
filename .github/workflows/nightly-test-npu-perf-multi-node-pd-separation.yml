@@ -51,7 +51,7 @@ jobs:
       env:
         KUBECONFIG: /data/.cache/kb.yaml
         KUBECTL: /data/.cache/kubectl
-        NAMESPACE: ascend-sglang
+        NAMESPACE: sgl-project
         ASCEND_PERF_TEST_CONFIG_PATH: python/sglang/test/ascend/performance
         KUBE_JOB_TYPE: pd-separation
         KUBE_JOB_NAME: ascend-sglang-multi
