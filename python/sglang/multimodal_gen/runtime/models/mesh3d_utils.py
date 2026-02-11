@@ -944,6 +944,7 @@ class MeshRender:
             trust_map_merge += cos_map
 
         texture_merge = texture_merge / torch.clamp(trust_map_merge, min=1e-8)
+        texture_merge = texture_merge.clamp(0.0, 1.0)
 
         return texture_merge, trust_map_merge > 1e-8
 
@@ -988,7 +989,6 @@ class MeshRender:
         vtx_pos, pos_idx, vtx_uv, uv_idx = self.get_mesh()
 
         if vtx_uv is not None and uv_idx is not None:
-            # Use mesh-aware inpainting
             texture_np, mask_uint8 = meshVerticeInpaint(
                 texture_np, mask_uint8, vtx_pos, vtx_uv, pos_idx, uv_idx
             )

@@ -242,6 +242,10 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
     CAMERA_ELEVS = [0, 0, 0, 0, 90, -90]
     VIEW_WEIGHTS = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
 
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        return StageParallelismType.MAIN_RANK_ONLY
+
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
         self.config = config
@@ -988,6 +992,10 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
 
 class Hunyuan3DPaintPostprocessStage(PipelineStage):
     """Texture baking from multi-view images and final mesh export."""
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        return StageParallelismType.MAIN_RANK_ONLY
 
     def __init__(self, config: Hunyuan3D2PipelineConfig) -> None:
         super().__init__()
