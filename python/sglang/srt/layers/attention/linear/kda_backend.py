@@ -176,7 +176,3 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         return core_attn_out
-
-
-# Backward compatibility alias
-KimiLinearAttnBackend = KDAAttnBackend

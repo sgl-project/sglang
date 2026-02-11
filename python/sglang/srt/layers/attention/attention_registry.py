@@ -194,7 +194,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             Mamba2AttnBackend,
         )
         from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
-        from sglang.srt.layers.attention.linear.kda_backend import KimiLinearAttnBackend
+        from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
         from sglang.srt.layers.attention.linear.utils import (
             initialize_linear_attn_config,
         )
@@ -217,7 +217,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         elif runner.mamba2_config is not None:
             linear_attn_backend = Mamba2AttnBackend(runner)
         elif runner.kimi_linear_config is not None:
-            linear_attn_backend = KimiLinearAttnBackend(runner)
+            linear_attn_backend = KDAAttnBackend(runner)
         elif runner.hybrid_lightning_config is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
