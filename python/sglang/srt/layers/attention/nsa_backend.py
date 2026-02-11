@@ -287,7 +287,6 @@ class NativeSparseAttnBackend(
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
-        self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -298,6 +297,9 @@ class NativeSparseAttnBackend(
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Keep CUDA-graph page table width aligned with req_to_token width.
+        # req_to_token may include extra speculative headroom beyond context_len.
+        self.max_context_len = self.req_to_token.shape[1]
 
         self.use_mha: bool = False
         # Force NSA prefill to use MLA (i.e. disable MHA_ONE_SHOT), controlled by env var.
