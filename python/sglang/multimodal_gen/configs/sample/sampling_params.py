@@ -209,12 +209,25 @@ class SamplingParams:
         if self.height is None:
             self.height_not_provided = True
 
+        # Handle output_quality to output_compression conversion
+        if self.output_compression is None and self.output_quality is not None:
+            self.output_compression = self._adjust_output_quality(
+                self.output_quality, self.data_type
+            )
+
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
         env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
+
+    def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
+        """Convert output_quality string to compression level."""
+        output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
+        if output_quality == "default":
+            return 50 if data_type == DataType.VIDEO else 75
+        return output_quality_mapper.get(output_quality)
 
     def _validate(self):
         """
@@ -568,6 +581,18 @@ class SamplingParams:
             type=str,
             default=SamplingParams.output_file_name,
             help="Name of the output file",
+        )
+        parser.add_argument(
+            "--output-quality",
+            type=str,
+            default=SamplingParams.output_quality,
+            help="Output quality setting (default, low, medium, high, maximum)",
+        )
+        parser.add_argument(
+            "--output-compression",
+            type=int,
+            default=SamplingParams.output_compression,
+            help="Output compression level (0-100, higher means better quality but larger file size)",
         )
         parser.add_argument(
             "--num-outputs-per-prompt",
