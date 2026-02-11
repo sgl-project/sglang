@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -69,6 +70,15 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+
+        # [Optimization] Buffer for bundling requests
+        self.buffered_recv_reqs = []
+        # Requests received on PP0 during busy steps that haven't been
+        # processed into the waiting queue yet.  They are deferred by one
+        # step so that non-first ranks (which receive them via bundled
+        # proxy tensors) see them at the same scheduling step.
+        self._pp0_deferred_reqs = []
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -76,23 +86,79 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
-                with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.recv_requests()
-                    self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                
+                # Check if we expect to send tensors this step (Busy)
+                is_busy_step = (self.mbs[mb_id] is not None)
+                recv_reqs = []
+
+                # RANK 0: Always receive from tokenizer, decide how to forward
+                if self.pp_group.is_first_rank:
+                    # Process requests deferred from the previous busy step.
+                    # PP1 already extracted these from bundled proxy tensors
+                    # on the previous step, so both ranks now see them.
+                    if self._pp0_deferred_reqs:
+                        self.process_input_requests(self._pp0_deferred_reqs)
+                        self._pp0_deferred_reqs = []
+                    with torch.profiler.record_function("recv_requests"):
+                        recv_reqs = self.recv_requests()
+
+                    if not self.pp_group.is_last_rank:
+                        if is_busy_step:
+                            # Defer local processing to stay in sync with
+                            # non-first ranks which receive these via
+                            # bundled proxy tensors (after scheduling).
+                            self._pp0_deferred_reqs.extend(recv_reqs)
+                            # Buffer for bundled sending with proxy tensors
+                            self.buffered_recv_reqs.extend(recv_reqs)
+                        else:
+                            # Idle: process immediately and send via pyobj
+                            self.process_input_requests(recv_reqs)
+                            to_send = self.buffered_recv_reqs + recv_reqs
+                            self.buffered_recv_reqs = []
+                            self._pp_commit_comm_work(self.send_req_work)
+                            self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                                to_send, async_send=True
+                            )
+                    else:
+                        # First rank is also last rank (single-stage PP)
+                        self.process_input_requests(recv_reqs)
+                # RANK > 0: Receive logic
+                else:
+                    if not is_busy_step:
+                        # Idle mode: blocking receive to wait for work
+                        recv_reqs = self.recv_requests()
+                        self.process_input_requests(recv_reqs)
+                    # Busy mode: bundled reqs arrive bundled in proxy tensors
+
+                # [Optimization] Prefer packing: if this slot is empty but OTHER slots are active
+                # and NOT full, skip this slot to let the scheduler prioritize filling the active ones.
+                # This reduces the number of small, fragmented batches (high overhead) and promotes
+                # fewer, larger batches (better throughput).
+                should_skip_allocation = False
+                if self.mbs[mb_id] is None:
+                    # Check if there are other active batches that have room
+                    for other_mb in self.running_mbs:
+                        if (
+                            other_mb is not None
+                            and len(other_mb.reqs) > 0
+                            and not other_mb.batch_is_full
+                        ):
+                            # Found a better candidate; we should wait for it instead of starting a new batch here.
+                            should_skip_allocation = True
+                            break
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    self.mbs[mb_id] = self.get_next_batch_to_run()
+                    if should_skip_allocation:
+                        # Skip getting a new batch, forcing this slot to remain empty
+                        self.mbs[mb_id] = None
+                    else:
+                        self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                        metadata_cache_key=f"pp_proxy_{mb_id}"
+                    )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -101,6 +167,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            mb_id_for_cache_key=mb_id,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -116,6 +183,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            mb_id_for_cache_key=mb_id,
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
@@ -132,9 +200,25 @@ class SchedulerPPMixin:
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
+                            # Attach buffered requests as extra_pyobj.
+                            # When there are bundled reqs the tensor dict
+                            # schema changes, causing an automatic metadata
+                            # cache miss (signal=1 + fresh metadata).  On
+                            # the next step without reqs the schema reverts
+                            # and the cache hits again (signal=0, no CPU
+                            # metadata transfer).
+                            extra_data = {}
+                            if self.buffered_recv_reqs:
+                                extra_data["__bundled_reqs__"] = (
+                                    self.buffered_recv_reqs
+                                )
+                                self.buffered_recv_reqs = []
+
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
+                                extra_pyobj=extra_data if extra_data else None,
+                                metadata_cache_key=f"pp_proxy_{mb_id}",
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -231,13 +315,16 @@ class SchedulerPPMixin:
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                        metadata_cache_key=f"pp_proxy_{mb_id}",
+                    )
 
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            mb_id_for_cache_key=mb_id,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -253,6 +340,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            mb_id_for_cache_key=mb_id,
                         )
                     )
                 send_consensus_bootstrapped_work, consensus_bootstrapped_rids = (
@@ -306,6 +394,7 @@ class SchedulerPPMixin:
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
+                            metadata_cache_key=f"pp_proxy_{mb_id}",
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -380,7 +469,9 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = None
                     if not self.cur_batch.forward_mode.is_prebuilt():
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors(
+                            metadata_cache_key=f"pp_proxy_{mb_id}",
+                        )
 
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
@@ -388,6 +479,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            mb_id_for_cache_key=mb_id,
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
@@ -405,6 +497,7 @@ class SchedulerPPMixin:
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
+                            mb_id_for_cache_key=mb_id,
                         )
                     )
 
@@ -486,6 +579,7 @@ class SchedulerPPMixin:
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
+                            metadata_cache_key=f"pp_proxy_{mb_id}",
                         )
 
                 self.pp_outputs = next_pp_outputs
@@ -840,6 +934,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         next_first_rank_mb_id: int,
         next_mb_id: int,
+        mb_id_for_cache_key: int = 0,
     ) -> Tuple[PPProxyTensors, GenerationBatchResult, torch.cuda.Event]:
         self._pp_commit_comm_work(work=self.send_output_work)
         (
@@ -854,6 +949,7 @@ class SchedulerPPMixin:
             self.mb_metadata,
             self.last_rank_comm_queue,
             self.pp_outputs,
+            mb_id_for_cache_key=mb_id_for_cache_key,
         )
         return next_pp_outputs, next_batch_result, d2h_event
 
@@ -913,7 +1009,17 @@ class SchedulerPPMixin:
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
+        extra_pyobj: Dict = None,
+        metadata_cache_key: Optional[str] = None,
     ):
+        if extra_pyobj:
+            for k, v in extra_pyobj.items():
+                data_bytes = pickle.dumps(v)
+                np_array = np.frombuffer(data_bytes, dtype=np.uint8)
+                # Ensure tensor is on GPU for NCCL backend
+                t = torch.from_numpy(np_array).cuda(non_blocking=True)
+                tensor_dict[k] = t
+
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -922,29 +1028,43 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
                 async_send=async_send,
+                metadata_cache_key=metadata_cache_key,
             )
         )
         return p2p_work
 
-    def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
+    def _pp_recv_proxy_tensors(
+        self: Scheduler,
+        metadata_cache_key: Optional[str] = None,
+    ) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=(
-                        self.attn_tp_group if self.require_attn_tp_allgather else None
-                    )
-                )
+            recv_dict = self.pp_group.recv_tensor_dict(
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
+                metadata_cache_key=metadata_cache_key,
             )
+
+            # Check for bundled requests piggybacked in the tensor dict
+            if "__bundled_reqs__" in recv_dict:
+                bundled_tensor = recv_dict.pop("__bundled_reqs__")
+                bundled_bytes = bundled_tensor.cpu().numpy().tobytes()
+                bundled_reqs = pickle.loads(bundled_bytes)
+                self.process_input_requests(bundled_reqs)
+
+            pp_proxy_tensors = PPProxyTensors(recv_dict)
         return pp_proxy_tensors
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
+        metadata_cache_key: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
         res = self.pp_group.recv_tensor_dict(
             all_gather_group=(
                 self.attn_tp_group if self.require_attn_tp_allgather else None
             ),
+            metadata_cache_key=metadata_cache_key,
         )
         return res
 
@@ -991,6 +1111,7 @@ class SchedulerPPMixin:
         mbs: List[ScheduleBatch],
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        mb_id_for_cache_key: int = 0,
     ) -> List[P2PWork]:
         send_output_work = []
         if self.pp_group.is_last_rank:
@@ -1003,6 +1124,7 @@ class SchedulerPPMixin:
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
                             async_send=True,
+                            metadata_cache_key=f"pp_output_{mb_id_for_cache_key}",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
         if not self.pp_group.is_last_rank:
@@ -1011,6 +1133,7 @@ class SchedulerPPMixin:
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
                         async_send=True,
+                        metadata_cache_key=f"pp_output_{mb_id_for_cache_key}",
                     )
         return send_output_work
 
@@ -1022,6 +1145,11 @@ class SchedulerPPMixin:
         mb_metadata: List[PPBatchMetadata],
         last_rank_comm_queue: deque[Tuple[torch.cuda.Event, PPProxyTensors]],
         pp_outputs: PPProxyTensors | None,
+        # We use mb_id for cache numbering to avoid thrashing when different
+        # microbatches have different tensor shapes (e.g. diff batch sizes)
+        # Sender/Recv must agree on this key.  Here it corresponds to the
+        # loop index or batch slot being processed.
+        mb_id_for_cache_key: int = 0,
     ) -> Tuple[PPProxyTensors, List[P2PWork], torch.cuda.Event]:
         next_pp_outputs = None
         d2h_event = None
@@ -1031,6 +1159,7 @@ class SchedulerPPMixin:
             mbs,
             last_rank_comm_queue,
             pp_outputs,
+            mb_id_for_cache_key=mb_id_for_cache_key,
         )
 
         if mbs[next_mb_id] is not None:
@@ -1038,7 +1167,9 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 if not mbs[next_mb_id].forward_mode.is_prebuilt():
                     next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
+                        self._pp_recv_dict_from_prev_stage(
+                            metadata_cache_key=f"pp_output_{mb_id_for_cache_key}",
+                        )
                     )
             if not mbs[next_mb_id].forward_mode.is_prebuilt():
                 with self.copy_stream_ctx:

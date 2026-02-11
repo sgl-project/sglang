@@ -1160,9 +1160,25 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        metadata_cache_key: Optional[str] = None,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
-        NOTE: `dst` is the local rank of the source rank.
+        NOTE: `dst` is the local rank of the destination rank.
+
+        If metadata_cache_key is provided, the metadata (keys, dtypes, shapes)
+        will be cached after the first send. On subsequent sends with the same
+        cache key where the schema hasn't changed, metadata transfer over the
+        CPU group is skipped entirely, eliminating expensive Gloo round-trips.
+
+        Protocol when metadata_cache_key is set:
+        1. Send a 1-element int8 GPU signal tensor via NCCL device group:
+           - 0 = use cached metadata (no CPU metadata follows)
+           - 1 = new metadata follows on CPU group
+        2. If signal=1: send full metadata via send_object (CPU group)
+        3. Send tensor data via device group (same as without caching)
+
+        The NCCL signal is essentially free since we're already sending
+        tensor data over the same device group.
         """
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
@@ -1184,22 +1200,40 @@ class GroupCoordinator:
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        # Note: While switching to Device-to-Device (D2D) would introduce an extra
-        # Device-to-Host (D2H) memory copy overhead for serialization, our benchmarks
-        # show better overall transmission performance with D2D due to:
-        # 1. Superior D2D transfer bandwidth
-        # 2. Ability to overlap send and recv operations
-        # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works: List[P2PWork] = []
+
+        if metadata_cache_key is not None:
+            cache = self._get_send_metadata_cache()
+            cached = cache.get(metadata_cache_key)
+            cache_hit = cached is not None and cached == metadata_list
+
+            # Send signal via NCCL (device group) — negligible cost
+            signal_val = 0 if cache_hit else 1
+            signal = torch.tensor(
+                [signal_val], dtype=torch.int8, device=self.device
+            )
+            signal_work = send_func(signal, self.ranks[dst], group=group)
+            if async_send:
+                p2p_works.append(P2PWork(signal_work, signal))
+
+            if not cache_hit:
+                # Schema changed or first time — send full metadata on CPU
+                p2p_works.extend(
+                    self.send_object(metadata_list, dst=dst, async_send=async_send)
+                )
+                cache[metadata_cache_key] = list(metadata_list)
+        else:
+            # No caching — send metadata as before
+            p2p_works.extend(
+                self.send_object(metadata_list, dst=dst, async_send=async_send)
+            )
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
-                # Skip sending empty tensors.
                 continue
 
-            # send-allgather: send only a slice, then do allgather.
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
@@ -1213,11 +1247,16 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        metadata_cache_key: Optional[str] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
+
+        If metadata_cache_key is provided, first receives a 1-element int8
+        NCCL signal:
+        - 0 = use cached metadata (skip CPU recv)
+        - 1 = receive fresh metadata from CPU group and update cache
         """
-        # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
 
@@ -1233,41 +1272,85 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        if metadata_cache_key is not None:
+            # Receive NCCL signal
+            signal = torch.empty(1, dtype=torch.int8, device=self.device)
+            work = torch.distributed.irecv(
+                signal, src=self.ranks[src], group=group
+            )
+            work.wait()
+            signal_val = signal.item()
+
+            cache = self._get_recv_metadata_cache()
+            if signal_val == 0:
+                # Cache hit — use cached metadata
+                recv_metadata_list = cache[metadata_cache_key]
+            else:
+                # Cache miss — receive fresh metadata on CPU
+                recv_metadata_list = self.recv_object(src=src)
+                cache[metadata_cache_key] = recv_metadata_list
+        else:
+            recv_metadata_list = self.recv_object(src=src)
+
         tensor_dict: Dict[str, Any] = {}
+        pending_works = []
+
+        # First pass: initiate all receives
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
                     tensor_dict[key] = tensor
                     continue
 
-                # send-allgather: send only a slice, then do allgather.
                 use_all_gather = (
                     all_gather_group is not None
                     and tensor.numel() % all_gather_size == 0
                 )
 
+                orig_shape = None
                 if use_all_gather:
                     orig_shape = tensor.shape
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-                # We have to use irecv here to make it work for both isend and send.
                 comm_group = metadata_group if tensor.is_cpu else group
                 work = torch.distributed.irecv(
                     tensor, src=self.ranks[src], group=comm_group
                 )
-                work.wait()
-
-                if use_all_gather:
-                    tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
-
-                tensor_dict[key] = tensor
+                pending_works.append((key, tensor, work, use_all_gather, orig_shape))
             else:
                 tensor_dict[key] = value
+
+        # Second pass: wait for completion and post-process
+        for key, tensor, work, use_all_gather, orig_shape in pending_works:
+            work.wait()
+
+            if use_all_gather:
+                tensor = all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+
+            tensor_dict[key] = tensor
         return tensor_dict
+
+    def invalidate_metadata_cache(self, cache_key: str) -> None:
+        """Invalidate a metadata cache entry on both send and recv sides.
+        Call this when the tensor dict schema is expected to change
+        (e.g., on prefill/decode transitions).
+        """
+        send_cache = self._get_send_metadata_cache()
+        recv_cache = self._get_recv_metadata_cache()
+        send_cache.pop(cache_key, None)
+        recv_cache.pop(cache_key, None)
+
+    def _get_send_metadata_cache(self) -> Dict[str, Any]:
+        if not hasattr(self, "_send_metadata_cache"):
+            self._send_metadata_cache: Dict[str, Any] = {}
+        return self._send_metadata_cache
+
+    def _get_recv_metadata_cache(self) -> Dict[str, Any]:
+        if not hasattr(self, "_recv_metadata_cache"):
+            self._recv_metadata_cache: Dict[str, Any] = {}
+        return self._recv_metadata_cache
 
     def barrier(self):
         """Barrier synchronization among the group.
