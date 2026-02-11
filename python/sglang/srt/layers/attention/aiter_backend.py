@@ -195,6 +195,10 @@ class AiterAttnBackend(AttentionBackend):
             )
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
+            if self.num_head == 32:
+                fast_mode = True
+                intra_batch_mode = False
+
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
@@ -301,7 +305,7 @@ class AiterAttnBackend(AttentionBackend):
             kv_last_page_len,
             self.num_head // nhead_kv,
             nhead_kv,
-            True,
+            False,
             work_metadata,
             work_info_set,
             work_indptr,
