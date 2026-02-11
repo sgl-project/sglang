@@ -1,4 +1,4 @@
-# Best Practice with DeepSeek Series Modes on Ascend NPU
+# Best Practice with DeepSeek Series Models on Ascend NPU
 
 This section describes the best practice data of mainstream LLM models such as DeepSeek on the Ascend NPU. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
@@ -102,7 +102,7 @@ do
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 16 \
+        --port 8001 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 16 \
         --mem-fraction-static 0.75 --max-running-requests 32 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
@@ -123,9 +123,9 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://${P_IP[0]}:8000 8998 \
+    --prefill http://${P_IP[1]}:8000 8999 \
+    --decode http://${D_IP[0]}:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -351,8 +351,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://PIP1:8000 8995 \
-    --decode http://DIP1:8001 \
+    --prefill http://<your_prefill_ip1>:8000 8995 \
+    --decode http://<your_decode_ip1>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -493,8 +493,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --decode http://D_IP:8001 \
+    --prefill http://${P_IP[0]}:8000 8998 \
+    --decode http://${D_IP[0]}:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -617,9 +617,9 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --prefill http://P_IP:8000 8999 \
-    --decode http://D_IP:8001 \
+    --prefill http://${P_IP[0]}:8000 8998 \
+    --prefill http://${P_IP[1]}:8000 8999 \
+    --decode http://${D_IP[0]}:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -749,8 +749,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://P_IP:8000 8998 \
-    --decode http://D_IP:8001 \
+    --prefill http://${P_IP}:8000 8998 \
+    --decode http://${D_IP[0]}:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb

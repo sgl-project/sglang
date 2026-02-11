@@ -1,4 +1,4 @@
-# Best Practice with Qwen Series Modes on Ascend NPU
+# Best Practice with Qwen Series Models on Ascend NPU
 
 This section describes the best practice data of mainstream LLM models such as Qwen on the Ascend NPU. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
@@ -560,7 +560,7 @@ do
         export STREAMS_PER_DEVICE=32
         export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
-        # P节点
+        # Prefill node
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
@@ -617,8 +617,8 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://PIP:8000 8995 \
-    --decode http://DIP:8001 \
+    --prefill http://<P_IP>:8000 8995 \
+    --decode http://<D_IP>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --mini-lb
@@ -933,7 +933,7 @@ do
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
         --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
         --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 131072 --max-prefill-tokens 458880 \
-        --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization= unquant \
+        --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization unquant \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
         --context-length 8192 --disable-radix-cache \
         --enable-dp-lm-head --dtype bfloat16
