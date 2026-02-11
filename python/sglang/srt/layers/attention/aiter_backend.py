@@ -86,62 +86,6 @@ global_workspace_buffer = None
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
-def _ck_batch_prefill_is_supported(
-    *,
-    device: torch.device,
-    dtype: torch.dtype,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    v_head_dim: int,
-) -> bool:
-    """Return whether CK `mha_batch_prefill` can run for a given head shape.
-
-    CK support for head_dim > 128 depends on the local AITER build. Probe with a
-    small shape so we can fall back to triton when unsupported.
-    """
-    if "mha_batch_prefill_func" not in globals():
-        return False
-
-    try:
-        with torch.no_grad():
-            # Use a small but non-trivial (q_len=2) shape to avoid generating the
-            # special nmask kernel variant (max_seqlen_q == 1) which has been seen
-            # to trigger GPU faults at high TP (e.g. TP=8) on some ROCm stacks.
-            q_len = 2
-            q = torch.empty(
-                (q_len, num_q_heads, head_dim),
-                device=device,
-                dtype=dtype,
-            )
-            k = torch.empty(
-                (q_len, num_kv_heads, head_dim),
-                device=device,
-                dtype=dtype,
-            )
-            v = torch.empty(
-                (q_len, num_kv_heads, v_head_dim),
-                device=device,
-                dtype=dtype,
-            )
-            indptr = torch.tensor([0, q_len], dtype=torch.int32, device=device)
-            indices = torch.arange(q_len, dtype=torch.int32, device=device)
-            mha_batch_prefill_func(
-                q,
-                k,
-                v,
-                indptr,
-                indptr,
-                indices,
-                q_len,
-                q_len,
-                causal=True,
-            )
-        return True
-    except Exception:
-        return False
-
-
 class AiterAttnBackend(AttentionBackend):
     def __init__(
         self,
@@ -169,7 +113,11 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.model_config.v_head_dim
+        self.v_head_dim = getattr(model_runner.model_config, "v_head_dim", None)
+        if self.v_head_dim is None or self.v_head_dim <= 0:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
+                -1
+            ]
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -179,25 +127,17 @@ class AiterAttnBackend(AttentionBackend):
 
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
-        # CK `mha_batch_prefill` support for head_dim > 128 depends on the local
-        # AITER build. Probe once at init and fall back to triton extend kernel
-        # when unsupported.
+        # CK `mha_batch_prefill` is unsupported for head_dim > 128 in many ROCm
+        # deployments. Use triton extend_attention_fwd directly to avoid
+        # runtime JIT-probe overhead and startup instability.
         self._use_ck_batch_prefill = True
         if not skip_prefill and (not self.use_mla) and self.head_dim > 128:
-            self._use_ck_batch_prefill = _ck_batch_prefill_is_supported(
-                device=self.device,
-                dtype=self.input_dtype,
-                num_q_heads=self.num_head,
-                num_kv_heads=self.num_kv_head,
-                head_dim=self.head_dim,
-                v_head_dim=self.v_head_dim,
+            self._use_ck_batch_prefill = False
+            logger.warning(
+                "CK batch_prefill is disabled for head_dim=%d, "
+                "falling back to triton extend kernel",
+                self.head_dim,
             )
-            if not self._use_ck_batch_prefill:
-                logger.warning(
-                    "CK batch_prefill does not support head_dim=%d, "
-                    "falling back to triton extend kernel",
-                    self.head_dim,
-                )
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
