@@ -17,8 +17,8 @@ register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 class TestAscendL2CacheReused(CustomTestCase):
     """Testcase: Test enabled L2 cache (enable-hierarchical-cache) inference request reuse succeddfully
-       [Test Category] Parameter
-       [Test Target] --enable-hierarchical-cache
+   [Test Category] Parameter
+   [Test Target] --enable-hierarchical-cache
     """
 
     @classmethod
@@ -57,23 +57,23 @@ class TestAscendL2CacheReused(CustomTestCase):
                 f"{DEFAULT_URL_FOR_TEST}/generate",
                 json={
                     "text": "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?What is The capital of France?"
-                            "What is The capital of France?What is The capital of France?",
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?What is The capital of France?"
+                    "What is The capital of France?What is The capital of France?",
                     "sampling_params": {
                         "temperature": 0,
                         "max_new_tokens": 10,
@@ -86,7 +86,9 @@ class TestAscendL2CacheReused(CustomTestCase):
             if i == 0:
                 self.assertEqual(int(response.json()["meta_info"]["cached_tokens"]), 0)
             else:
-                self.assertGreater(int(response.json()["meta_info"]["cached_tokens"]), 0)
+                self.assertGreater(
+                    int(response.json()["meta_info"]["cached_tokens"]), 0
+                )
 
 
 if __name__ == "__main__":

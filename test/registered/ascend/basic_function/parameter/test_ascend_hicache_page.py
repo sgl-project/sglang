@@ -38,7 +38,7 @@ class TestHiCachePage(CustomTestCase):
                 "write_back",
                 "--attention-backend",
                 "ascend",
-                "--disable-cuda-graph"
+                "--disable-cuda-graph",
             ],
         )
 

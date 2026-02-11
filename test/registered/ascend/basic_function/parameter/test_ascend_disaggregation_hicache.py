@@ -3,14 +3,15 @@ import random
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from typing import Dict
 
 import requests
-from types import SimpleNamespace
-from sglang.test.few_shot_gsm8k import run_eval
+
+from sglang.bench_serving import get_tokenizer
 from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.bench_serving import get_tokenizer
+from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -186,7 +187,7 @@ class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
             port=21000,
         )
         metrics = run_eval(args)
-        self.assertGreaterEqual(metrics['accuracy'], 0.86)
+        self.assertGreaterEqual(metrics["accuracy"], 0.86)
 
     @classmethod
     def tearDownClass(cls):

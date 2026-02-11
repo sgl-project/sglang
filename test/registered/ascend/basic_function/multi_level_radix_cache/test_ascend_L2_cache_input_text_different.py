@@ -17,9 +17,9 @@ register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 class TestAscendL2CacheInputTextDifferent(CustomTestCase):
     """Testcase: Test enable L2 cache(--enable-hierarchical-cache), inputting different text inference requests
-                 will not reuse the same text.
-       [Test Category] Parameter
-       [Test Target] --enable-hierarchical-cache
+            will not reuse the same text.
+   [Test Category] Parameter
+   [Test Target] --enable-hierarchical-cache
     """
 
     @classmethod
@@ -84,7 +84,7 @@ class TestAscendL2CacheInputTextDifferent(CustomTestCase):
             "pairs of shoes. One pair of shorts costs $16.50. One pair of pants costs $22.50 and one pair of shoes "
             "costs $42. How many dollars did Mishka spend on all the clothing items?Mishka bought 3 pairs of shorts,"
             " 3 pairs of pants, and 3 pairs of shoes. One pair of shorts costs $16.50. One pair of pants costs "
-            "$22.50 and one pair of shoes costs $42. How many dollars did Mishka spend on all the clothing items?"
+            "$22.50 and one pair of shoes costs $42. How many dollars did Mishka spend on all the clothing items?",
         ]
         for text in texts:
             response = requests.post(

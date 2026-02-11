@@ -5,9 +5,9 @@ import unittest
 
 import requests
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 from sglang.srt.utils import  kill_process_tree
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -27,22 +27,18 @@ class TestInputEmbeds(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = (
-            LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-        )
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model)
         cls.ref_model = AutoModelForCausalLM.from_pretrained(cls.model)
-        other_args = (
-            [
-                "--disable-radix",
-                "--cuda-graph-max-bs",
-                4,
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-            ]
-        )
+        other_args = [
+            "--disable-radix",
+            "--cuda-graph-max-bs",
+            4,
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+        ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

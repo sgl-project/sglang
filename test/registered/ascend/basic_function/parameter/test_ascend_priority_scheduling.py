@@ -31,16 +31,14 @@ class TestPriorityScheduling(CustomTestCase):
     def setUpClass(cls):
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         other_args = (
-            (
-                "--max-running-requests",
-                "1",
-                "--max-queued-requests",
-                "3",
-                "--enable-priority-scheduling",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-            )
+            "--max-running-requests",
+            "1",
+            "--max-queued-requests",
+            "3",
+            "--enable-priority-scheduling",
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
         )
         cls.base_url = DEFAULT_URL_FOR_TEST
 
@@ -243,16 +241,14 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
     def setUpClass(cls):
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         other_args = (
-            (
-                "--max-running-requests",
-                "2",
-                "--max-queued-requests",
-                "3",
-                "--enable-priority-scheduling",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-            )
+            "--max-running-requests",
+            "2",
+            "--max-queued-requests",
+            "3",
+            "--enable-priority-scheduling",
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
         )
 
         cls.base_url = DEFAULT_URL_FOR_TEST
