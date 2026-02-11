@@ -229,8 +229,6 @@ class MMEncoder:
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
-            else:
-                self.mm_global_cache = None
 
             self.embedding_to_send = dict()
 
