@@ -22,6 +22,7 @@ PER_COMMIT_SUITES = {
         "stage-a-test-1-amd",
         "stage-b-test-small-1-gpu-amd",
         "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-b-test-large-8-gpu-35x-disaggregation-amd",
         "stage-b-test-large-1-gpu-amd",
         "stage-b-test-large-2-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
@@ -31,11 +32,22 @@ PER_COMMIT_SUITES = {
         "stage-b-test-small-1-gpu",
         "stage-b-test-large-1-gpu",
         "stage-b-test-large-2-gpu",
-        "stage-c-test-large-4-gpu",
-        "stage-b-test-4-gpu-b200",
-        "stage-c-test-large-4-gpu-b200",
+        "stage-c-test-4-gpu-h100",
+        "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-gb200",
+        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-8-gpu-h20",
+        "stage-c-test-8-gpu-h200",
+        "stage-c-test-8-gpu-b200",
+        "stage-c-test-deepep-8-gpu-h200",
     ],
-    HWBackend.NPU: [],
+    HWBackend.NPU: [
+        "stage-a-test-1",
+        "stage-b-test-1-npu-a2",
+        "stage-b-test-2-npu-a2",
+        "stage-b-test-4-npu-a3",
+        "stage-b-test-16-npu-a3",
+    ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
@@ -70,6 +82,7 @@ NIGHTLY_SUITES = {
         "nightly-1-npu-a3",
         "nightly-2-npu-a3",
         "nightly-4-npu-a3",
+        "nightly-8-npu-a3",
         "nightly-16-npu-a3",
     ],
 }

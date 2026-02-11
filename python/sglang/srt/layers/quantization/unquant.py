@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
+    use_intel_xpu_backend,
 )
 
 if TYPE_CHECKING:
@@ -469,6 +470,54 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 moe_runner_config,
             )
             return StandardCombineInput(hidden_states=output)
+
+    def forward_xpu(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+        assert moe_runner_config.activation in [
+            "silu",
+            "gelu",
+        ], f"activation = {moe_runner_config.activation} is not supported."
+
+        backend = self.runner.runner_backend
+        if use_intel_xpu_backend():
+            # sgl-kernel-xpu path
+            from sgl_kernel import fused_experts
+
+            topk_weights, topk_ids, _ = topk_output
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                activation=moe_runner_config.activation,
+            )
+            return StandardCombineInput(hidden_states=output)
+        else:
+            assert backend.is_triton()
+            assert (
+                moe_runner_config.activation == "silu"
+            ), f"activation = {moe_runner_config.activation} is not supported \
+            for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
     def forward_npu(
         self,
