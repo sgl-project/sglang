@@ -20,6 +20,7 @@ from sglang.srt.utils.common import is_flashinfer_available, is_sm100_supported
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import DeepEPLLDispatchOutput
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
 
 @dataclass
@@ -140,7 +141,7 @@ def post_permute_flashinfer_cutedsl_to_deepep_ll(
     quant_info: FlashInferCuteDslNvFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-):
+) -> "DeepEPLLCombineInput":
     from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
 
     return DeepEPLLCombineInput(
