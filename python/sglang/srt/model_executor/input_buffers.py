@@ -168,7 +168,7 @@ class GraphInputBuffers:
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         if self.out_cache_loc_swa is not None:
             self.out_cache_loc_swa[:raw_num_token].copy_(
-                self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                forward_batch.token_to_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
             )
