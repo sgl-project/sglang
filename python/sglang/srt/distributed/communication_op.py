@@ -19,7 +19,12 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     weight_: torch.Tensor,
     eps: float,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-    """Fused tensor-parallel all-reduce with RMSNorm, if supported."""
+    """Fused TP all-reduce + RMSNorm.
+
+    Policy and backend selection are owned by GroupCoordinator:
+    it may dispatch to communicator-native fused APIs, custom fused kernels,
+    or return None so callers can run generic fallback paths.
+    """
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 

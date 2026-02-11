@@ -630,18 +630,39 @@ class GroupCoordinator:
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator."""
         ca_comm = self.ca_comm
-        if (
-            ca_comm is None
-            or getattr(ca_comm, "disabled", True)
-            or not hasattr(ca_comm, "custom_fused_ar_rms")
-        ):
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
 
-        # Keep fused AR+RMSNorm deterministic mode consistent with all_reduce().
+        # Prefer communicator-native fused API when provided.
+        if hasattr(ca_comm, "fused_allreduce_rmsnorm"):
+            try:
+                return ca_comm.fused_allreduce_rmsnorm(
+                    input_, residual_inp_, weight_, eps
+                )
+            except Exception:
+                # Fall back to custom_fused_ar_rms path below.
+                pass
+
+        if not hasattr(ca_comm, "custom_fused_ar_rms"):
+            return None
+
+        # 1-stage policy for fused AR+RMSNorm:
+        # 1) Explicit env override wins.
+        # 2) Deterministic inference forces 1-stage for reproducibility.
+        # 3) Otherwise follow AITER's heuristic (small payloads only).
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        elif envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
+            use_1stage_ar = True
         else:
-            use_1stage_ar = envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            total_bytes = input_.numel() * input_.element_size()
+            hidden_dim = input_.shape[-1]
+            use_1stage_ar = total_bytes <= 128 * 1024 and hidden_dim in {
+                512,
+                1024,
+                2048,
+                4096,
+            }
 
         fused_outputs = ca_comm.custom_fused_ar_rms(
             input_,
@@ -650,20 +671,6 @@ class GroupCoordinator:
             eps,
             use_1stage_ar,
         )
-        # We check for None because custom_fused_ar_rms may not be supported or enabled on the communicator.
-        # If it's not available, we can't perform fused all-reduce + RMSNorm, so we return None.
-        if fused_outputs is None:
-            if not getattr(self, "_fused_ar_rms_fallback_logged", False):
-                logger.warning(
-                    "Fused allreduce+rmsnorm fallback: custom fused path unavailable."
-                )
-                self._fused_ar_rms_fallback_logged = True
-        elif not getattr(self, "_fused_ar_rms_enabled_logged", False):
-            logger.info(
-                "Using fused allreduce+rmsnorm custom kernel (use_1stage=%s).",
-                use_1stage_ar,
-            )
-            self._fused_ar_rms_enabled_logged = True
         return fused_outputs
 
     def _all_reduce_out_place(

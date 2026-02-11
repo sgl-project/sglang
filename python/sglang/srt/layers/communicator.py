@@ -25,7 +25,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_fused_allreduce_rmsnorm,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -97,6 +96,20 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_flashinfer_allreduce_fusion
+    )
+
+
+def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
+    n = input_tensor.shape[-1]
+    total_bytes = input_tensor.numel() * input_tensor.element_size()
+    return (
+        _use_aiter
+        and total_bytes > 0
+        and n <= 16384
+        and total_bytes < 8 * 1024 * 8192
+        and get_tensor_model_parallel_world_size() != 6
+        and not is_dp_attention_enabled()
+        and get_global_server_args().enable_aiter_allreduce_fusion
     )
 
 
@@ -430,34 +443,19 @@ class LayerCommunicator:
                 and hidden_states._sglang_needs_allreduce_fusion
             ):
                 if (
-                    not _use_aiter
-                    or not get_global_server_args().enable_aiter_allreduce_fusion
-                ):
+                    apply_aiter_all_reduce_fusion(hidden_states)
+                    or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
                             hidden_states, residual
                         )
                     )
                 else:
-                    fused_outputs = tensor_model_parallel_fused_allreduce_rmsnorm(
-                        hidden_states,
-                        residual,
-                        self.input_layernorm.weight,
-                        self.input_layernorm.variance_epsilon,
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                    hidden_states, residual = self.input_layernorm(
+                        hidden_states, residual
                     )
-                    if fused_outputs is not None:
-                        hidden_states, residual = fused_outputs
-                    elif hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                        hidden_states, residual = (
-                            self.input_layernorm.forward_with_allreduce_fusion(
-                                hidden_states, residual
-                            )
-                        )
-                    else:
-                        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                        hidden_states, residual = self.input_layernorm(
-                            hidden_states, residual
-                        )
             else:
                 if residual is None:
                     residual = hidden_states
@@ -622,30 +620,20 @@ class LayerCommunicator:
             if hasattr(forward_batch, "input_ids")
             else 0
         )
-        if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
-            return False
 
-        enable_flashinfer_fusion = (
-            get_global_server_args().enable_flashinfer_allreduce_fusion
-            and _is_flashinfer_available
-        )
-        enable_aiter_fusion = (
-            _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion
-        )
-
-        static_conditions_met = (
-            (not self.is_last_layer)
+        return (
+            (
+                apply_flashinfer_allreduce_fusion(batch_size)
+                or (
+                    _use_aiter
+                    and batch_size > 0
+                    and get_tensor_model_parallel_world_size() != 6
+                    and get_global_server_args().enable_aiter_allreduce_fusion
+                )
+            )
+            and (not self.is_last_layer)
             and (self._context.tp_size > 1)
-            and not is_dp_attention_enabled()
-            and (enable_flashinfer_fusion or enable_aiter_fusion)
         )
-        if not static_conditions_met:
-            return False
-
-        if enable_aiter_fusion:
-            return batch_size > 0
-
-        return apply_flashinfer_allreduce_fusion(batch_size)
 
 
 @dataclass
@@ -843,27 +831,14 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states = layernorm(hidden_states)
         else:
             handled = False
-            if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
-                layernorm, "forward_with_allreduce_fusion"
-            ):
+            if (
+                apply_aiter_all_reduce_fusion(hidden_states)
+                or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+            ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
                 handled = True
-            elif (
-                _use_aiter
-                and hasattr(layernorm, "forward_with_allreduce_fusion")
-                and get_global_server_args().enable_aiter_allreduce_fusion
-            ):
-                fused_outputs = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    hidden_states,
-                    residual,
-                    layernorm.weight,
-                    layernorm.variance_epsilon,
-                )
-                if fused_outputs is not None:
-                    hidden_states, residual = fused_outputs
-                    handled = True
 
             if not handled:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
