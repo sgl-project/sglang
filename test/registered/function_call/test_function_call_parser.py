@@ -3752,8 +3752,14 @@ class TestFunctionCallParserStructuralTagGating(unittest.TestCase):
         self.assertEqual(constraint[0], "structural_tag")
 
     def test_non_kimi_parser_not_affected_by_kimi_gating(self):
+        # Use a non-kimi detector (qwen); force it to support structural_tag so we only
+        # test that kimi gating does not apply to non-kimi detectors.
         parser = FunctionCallParser([self.strict_tool], "qwen")
-        with patch(
+        with patch.object(
+            parser.detector,
+            "supports_structural_tag",
+            return_value=True,
+        ), patch(
             "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
             return_value=False,
         ):

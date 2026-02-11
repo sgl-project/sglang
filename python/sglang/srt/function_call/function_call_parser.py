@@ -42,20 +42,42 @@ logger = logging.getLogger(__name__)
 MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG = Version("0.1.31")
 
 
+def _log_kimi_k2_structural_tag_disabled(version_str: Optional[str] = None) -> None:
+    """Log once that kimi_k2 strict structural_tag is disabled (called from cached helper)."""
+    if version_str is not None:
+        logger.warning(
+            "kimi_k2 with tool_choice='auto' and strict structural_tag is disabled: "
+            "xgrammar version '%s' is missing or < %s. Upgrade to xgrammar>=%s to "
+            "re-enable. Falling back to no structural_tag.",
+            version_str,
+            MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG,
+            MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG,
+        )
+    else:
+        logger.warning(
+            "kimi_k2 with tool_choice='auto' and strict structural_tag is disabled: "
+            "xgrammar is missing or < %s. Upgrade to xgrammar>=%s to re-enable. "
+            "Falling back to no structural_tag.",
+            MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG,
+            MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG,
+        )
+
+
 @lru_cache(maxsize=1)
 def _is_kimi_k2_structural_tag_supported() -> bool:
     try:
         version_str = metadata.version("xgrammar")
     except metadata.PackageNotFoundError:
+        _log_kimi_k2_structural_tag_disabled(None)
         return False
 
     try:
-        return Version(version_str) >= MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG
+        if Version(version_str) >= MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG:
+            return True
+        _log_kimi_k2_structural_tag_disabled(version_str)
+        return False
     except InvalidVersion:
-        logger.warning(
-            "Unexpected xgrammar version '%s'; disable kimi_k2 structural_tag.",
-            version_str,
-        )
+        _log_kimi_k2_structural_tag_disabled(version_str)
         return False
 
 
@@ -234,11 +256,6 @@ class FunctionCallParser:
             and isinstance(self.detector, KimiK2Detector)
             and not _is_kimi_k2_structural_tag_supported()
         ):
-            logger.warning(
-                "Disable kimi_k2 structural_tag because xgrammar<%s; "
-                "upgrade xgrammar to re-enable strict auto constraints.",
-                MIN_XGRAMMAR_VERSION_FOR_KIMI_K2_STRUCTURAL_TAG,
-            )
             return None
 
         if self.detector.supports_structural_tag() and enforce_structural_tag:
