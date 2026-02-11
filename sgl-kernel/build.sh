@@ -117,10 +117,10 @@ if [ "${USE_CCACHE}" = "1" ]; then
 fi
 
 if [ "'"${ARCH}"'" = "aarch64" ]; then
-  export CUDA_NVCC_FLAGS="-Xcudafe --threads=2"
-  export MAKEFLAGS="-j2"
+  export CUDA_NVCC_FLAGS="-Xcudafe --threads=8"
+  export MAKEFLAGS="-j8"
   export CMAKE_BUILD_PARALLEL_LEVEL=2
-  export NINJAFLAGS="-j2"
+  export NINJAFLAGS="-j4"
   echo "ARM detected: Using extra conservative settings (2 parallel jobs)"
 elif [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then
   export CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
