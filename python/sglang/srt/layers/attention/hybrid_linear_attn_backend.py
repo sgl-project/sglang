@@ -26,25 +26,6 @@ if not is_cpu():
     )
 
 
-# Backward-compatible re-exports: GDN and KDA backends now live in linear/
-# Use lazy imports via __getattr__ to avoid circular dependency
-# (gdn_backend.py / kda_backend.py import MambaAttnBackendBase from this module)
-_LAZY_IMPORTS = {
-    "GDNAttnBackend": "sglang.srt.layers.attention.linear.gdn_backend",
-    "KDAAttnBackend": "sglang.srt.layers.attention.linear.kda_backend",
-    "KimiLinearAttnBackend": "sglang.srt.layers.attention.linear.kda_backend",
-}
-
-
-def __getattr__(name):
-    if name in _LAZY_IMPORTS:
-        import importlib
-
-        module = importlib.import_module(_LAZY_IMPORTS[name])
-        return getattr(module, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 # Kernel to track mamba states if needed based on track mask
 @triton.jit
 def track_mamba_state_if_needed_kernel(
