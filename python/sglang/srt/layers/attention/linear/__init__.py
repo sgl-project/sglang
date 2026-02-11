@@ -5,7 +5,8 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
-    get_linear_attn_kernel_backend,
+    get_linear_attn_decode_backend,
+    get_linear_attn_prefill_backend,
     initialize_linear_attn_config,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "KDAAttnBackend",
     "KimiLinearAttnBackend",
     "LinearAttnKernelBackend",
-    "get_linear_attn_kernel_backend",
+    "get_linear_attn_decode_backend",
+    "get_linear_attn_prefill_backend",
     "initialize_linear_attn_config",
 ]

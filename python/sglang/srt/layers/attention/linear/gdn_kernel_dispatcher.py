@@ -1,7 +1,6 @@
 import torch
 
-from sglang.srt.environ import Envs
-from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelInterface
+from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelBase
 from sglang.srt.layers.attention.linear.kernels.triton_gdn import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.utils import is_cuda
@@ -11,24 +10,20 @@ from sglang.srt.utils.common import rank0_log
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode.
 
-    Resolves decode/extend/verify kernels based on the configured backend,
-    with AUTO resolution using CuTe DSL for decode on CUDA when the env var
-    is set, and Triton for everything else.
+    Resolves decode and prefill/extend/verify kernels independently based on
+    the configured backends.
     """
 
-    def __init__(self, backend: LinearAttnKernelBackend):
+    def __init__(
+        self,
+        decode_backend: LinearAttnKernelBackend,
+        prefill_backend: LinearAttnKernelBackend,
+    ):
         triton_kernel = TritonGDNKernel()
 
-        if backend.is_auto():
-            self._resolve_auto(triton_kernel)
-        elif backend.is_cutedsl():
-            self._resolve_cutedsl(triton_kernel)
-        elif backend.is_triton():
-            self._decode_kernel = triton_kernel
-            self._extend_kernel = triton_kernel
-            self._verify_kernel = triton_kernel
-        else:
-            raise ValueError(f"Unsupported GDN kernel backend: {backend}")
+        self._decode_kernel = self._resolve_kernel(decode_backend, triton_kernel)
+        self._extend_kernel = self._resolve_kernel(prefill_backend, triton_kernel)
+        self._verify_kernel = triton_kernel
 
         rank0_log(
             f"GDN kernel dispatcher: decode={self._decode_kernel.__class__.__name__}, "
@@ -36,31 +31,23 @@ class GDNKernelDispatcher:
             f"verify={self._verify_kernel.__class__.__name__}"
         )
 
-    def _resolve_auto(self, triton_kernel: LinearAttnKernelInterface):
-        """AUTO: Use CuTe DSL for decode on CUDA if env var is set, else Triton."""
-        use_cutedsl = is_cuda() and Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
-        if use_cutedsl:
+    def _resolve_kernel(
+        self,
+        backend: LinearAttnKernelBackend,
+        triton_kernel: LinearAttnKernelBase,
+    ) -> LinearAttnKernelBase:
+        if backend.is_triton():
+            return triton_kernel
+        elif backend.is_cutedsl():
+            if not is_cuda():
+                raise ValueError("CuTe DSL backend requires CUDA")
             from sglang.srt.layers.attention.linear.kernels.cutedsl_gdn import (
                 CuteDSLGDNKernel,
             )
 
-            self._decode_kernel = CuteDSLGDNKernel()
+            return CuteDSLGDNKernel()
         else:
-            self._decode_kernel = triton_kernel
-        self._extend_kernel = triton_kernel
-        self._verify_kernel = triton_kernel
-
-    def _resolve_cutedsl(self, triton_kernel: LinearAttnKernelInterface):
-        """CUTEDSL: Use CuTe DSL for decode, Triton for extend/verify."""
-        if not is_cuda():
-            raise ValueError("CuTe DSL backend requires CUDA")
-        from sglang.srt.layers.attention.linear.kernels.cutedsl_gdn import (
-            CuteDSLGDNKernel,
-        )
-
-        self._decode_kernel = CuteDSLGDNKernel()
-        self._extend_kernel = triton_kernel
-        self._verify_kernel = triton_kernel
+            raise ValueError(f"Unsupported GDN kernel backend: {backend}")
 
     def decode(
         self,

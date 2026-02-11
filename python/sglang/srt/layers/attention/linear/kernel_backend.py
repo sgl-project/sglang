@@ -3,7 +3,7 @@ from abc import ABC, abstractmethod
 import torch
 
 
-class LinearAttnKernelInterface(ABC):
+class LinearAttnKernelBase(ABC):
     """Abstract base class for linear attention kernel implementations.
 
     Each concrete implementation wraps a specific kernel (Triton, CuTe DSL, etc.)

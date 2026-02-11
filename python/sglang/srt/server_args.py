@@ -215,7 +215,7 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["auto", "triton", "cutedsl"]
+LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
 
 
 # Allow external code to add more choices
@@ -519,7 +519,8 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
-    linear_attn_kernel_backend: str = "triton"
+    linear_attn_decode_backend: str = "triton"
+    linear_attn_prefill_backend: str = "triton"
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -4159,13 +4160,19 @@ class ServerArgs:
             help="The interval to track the mamba state during decode.",
         )
         parser.add_argument(
-            "--linear-attn-kernel-backend",
+            "--linear-attn-decode-backend",
             type=str,
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
-            default=ServerArgs.linear_attn_kernel_backend,
-            help="The kernel backend to use for linear attention (GDN/KDA). "
-            "'auto' selects the best available backend. "
+            default=ServerArgs.linear_attn_decode_backend,
+            help="The kernel backend for linear attention decode. "
             "'cutedsl' uses CuTe DSL for GDN decode on CUDA.",
+        )
+        parser.add_argument(
+            "--linear-attn-prefill-backend",
+            type=str,
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
+            default=ServerArgs.linear_attn_prefill_backend,
+            help="The kernel backend for linear attention prefill/extend.",
         )
 
         # Hierarchical cache

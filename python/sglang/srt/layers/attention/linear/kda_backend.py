@@ -5,7 +5,10 @@ from einops import rearrange
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_kernel_dispatcher import KDAKernelDispatcher
-from sglang.srt.layers.attention.linear.utils import get_linear_attn_kernel_backend
+from sglang.srt.layers.attention.linear.utils import (
+    get_linear_attn_decode_backend,
+    get_linear_attn_prefill_backend,
+)
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -20,8 +23,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        backend = get_linear_attn_kernel_backend()
-        self.kernel_dispatcher = KDAKernelDispatcher(backend)
+        decode_backend = get_linear_attn_decode_backend()
+        prefill_backend = get_linear_attn_prefill_backend()
+        self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
 
     def forward_decode(
         self,

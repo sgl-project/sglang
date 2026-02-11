@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelInterface
+from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelBase
 from sglang.srt.utils import is_cpu
 
 if not is_cpu():
@@ -10,7 +10,7 @@ if not is_cpu():
     from sglang.srt.layers.attention.fla.kda import chunk_kda
 
 
-class TritonKDAKernel(LinearAttnKernelInterface):
+class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
     def decode(

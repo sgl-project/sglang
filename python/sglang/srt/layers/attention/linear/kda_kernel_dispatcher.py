@@ -12,16 +12,27 @@ class KDAKernelDispatcher:
     to allow future kernel additions without modifying the backend.
     """
 
-    def __init__(self, backend: LinearAttnKernelBackend):
+    def __init__(
+        self,
+        decode_backend: LinearAttnKernelBackend,
+        prefill_backend: LinearAttnKernelBackend,
+    ):
         triton_kernel = TritonKDAKernel()
 
-        if backend.is_auto() or backend.is_triton():
+        if decode_backend.is_triton():
             self._decode_kernel = triton_kernel
+        else:
+            raise ValueError(
+                f"Unsupported KDA decode backend: {decode_backend}. "
+                "KDA currently only supports 'triton'."
+            )
+
+        if prefill_backend.is_triton():
             self._extend_kernel = triton_kernel
         else:
             raise ValueError(
-                f"Unsupported KDA kernel backend: {backend}. "
-                "KDA currently only supports 'auto' and 'triton'."
+                f"Unsupported KDA prefill backend: {prefill_backend}. "
+                "KDA currently only supports 'triton'."
             )
 
         rank0_log(

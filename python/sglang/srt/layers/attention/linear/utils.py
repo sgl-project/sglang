@@ -9,18 +9,12 @@ from sglang.srt.utils.common import rank0_log
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-logger = logging.getLogger(
-    __name__
-)  # Used for warning in get_linear_attn_kernel_backend
+logger = logging.getLogger(__name__)
 
 
 class LinearAttnKernelBackend(Enum):
-    AUTO = "auto"
     TRITON = "triton"
     CUTEDSL = "cutedsl"
-
-    def is_auto(self):
-        return self == LinearAttnKernelBackend.AUTO
 
     def is_triton(self):
         return self == LinearAttnKernelBackend.TRITON
@@ -29,22 +23,41 @@ class LinearAttnKernelBackend(Enum):
         return self == LinearAttnKernelBackend.CUTEDSL
 
 
-LINEAR_ATTN_KERNEL_BACKEND: Optional[LinearAttnKernelBackend] = None
+LINEAR_ATTN_DECODE_BACKEND: Optional[LinearAttnKernelBackend] = None
+LINEAR_ATTN_PREFILL_BACKEND: Optional[LinearAttnKernelBackend] = None
 
 
 def initialize_linear_attn_config(server_args: ServerArgs):
-    global LINEAR_ATTN_KERNEL_BACKEND
-    LINEAR_ATTN_KERNEL_BACKEND = LinearAttnKernelBackend(
-        server_args.linear_attn_kernel_backend
+    global LINEAR_ATTN_DECODE_BACKEND
+    global LINEAR_ATTN_PREFILL_BACKEND
+    LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend(
+        server_args.linear_attn_decode_backend
     )
-    rank0_log(f"Linear attention kernel backend: {LINEAR_ATTN_KERNEL_BACKEND.value}")
+    LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend(
+        server_args.linear_attn_prefill_backend
+    )
+    rank0_log(
+        f"Linear attention kernel backend: "
+        f"decode={LINEAR_ATTN_DECODE_BACKEND.value}, "
+        f"prefill={LINEAR_ATTN_PREFILL_BACKEND.value}"
+    )
 
 
-def get_linear_attn_kernel_backend() -> LinearAttnKernelBackend:
-    global LINEAR_ATTN_KERNEL_BACKEND
-    if LINEAR_ATTN_KERNEL_BACKEND is None:
+def get_linear_attn_decode_backend() -> LinearAttnKernelBackend:
+    global LINEAR_ATTN_DECODE_BACKEND
+    if LINEAR_ATTN_DECODE_BACKEND is None:
         logger.warning(
-            "LINEAR_ATTN_KERNEL_BACKEND is not initialized, using triton backend"
+            "LINEAR_ATTN_DECODE_BACKEND is not initialized, using triton backend"
         )
-        LINEAR_ATTN_KERNEL_BACKEND = LinearAttnKernelBackend.TRITON
-    return LINEAR_ATTN_KERNEL_BACKEND
+        LINEAR_ATTN_DECODE_BACKEND = LinearAttnKernelBackend.TRITON
+    return LINEAR_ATTN_DECODE_BACKEND
+
+
+def get_linear_attn_prefill_backend() -> LinearAttnKernelBackend:
+    global LINEAR_ATTN_PREFILL_BACKEND
+    if LINEAR_ATTN_PREFILL_BACKEND is None:
+        logger.warning(
+            "LINEAR_ATTN_PREFILL_BACKEND is not initialized, using triton backend"
+        )
+        LINEAR_ATTN_PREFILL_BACKEND = LinearAttnKernelBackend.TRITON
+    return LINEAR_ATTN_PREFILL_BACKEND
