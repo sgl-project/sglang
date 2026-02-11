@@ -21,7 +21,7 @@ concurrency:
   # (postsubmit). The workflow name is prepended to avoid conflicts between
   # different workflows.
   group: ${{ github.workflow }}-${{ github.event.number || github.sha }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   publish:
