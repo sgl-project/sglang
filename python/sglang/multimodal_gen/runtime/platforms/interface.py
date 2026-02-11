@@ -47,6 +47,7 @@ class PlatformEnum(enum.Enum):
     TPU = enum.auto()
     CPU = enum.auto()
     MPS = enum.auto()
+    NPU = enum.auto()
     MUSA = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
@@ -79,6 +80,7 @@ class Platform:
     _enum: PlatformEnum
     device_name: str
     device_type: str
+    device: torch.device | None = None  # Dummy attribute for compatibility
 
     # available dispatch keys:
     # check https://github.com/pytorch/pytorch/blob/313dac6c1ca0fa0cde32477509cce32089f8532a/torchgen/model.py#L134 # noqa
@@ -97,6 +99,10 @@ class Platform:
     @lru_cache(maxsize=1)
     def is_cuda(self) -> bool:
         return self.is_cuda_static()
+
+    @lru_cache(maxsize=1)
+    def is_npu(self) -> bool:
+        return self._enum == PlatformEnum.NPU
 
     @lru_cache(maxsize=1)
     def is_rocm(self) -> bool:
@@ -175,6 +181,15 @@ class Platform:
         return self.is_rocm()
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_amp_supported(cls) -> bool:
+        return True
+
+    @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        raise NotImplementedError
+
+    @classmethod
     def get_attn_backend_cls_str(
         cls,
         selected_backend: AttentionBackendEnum | None,
@@ -235,6 +250,8 @@ class Platform:
     def get_device(self, local_rank: int) -> torch.device:
         if self.is_cuda() or self.is_rocm():
             return torch.device("cuda", local_rank)
+        elif self.is_npu():
+            return torch.device("npu", local_rank)
         elif self.is_musa():
             return torch.device("musa", local_rank)
         elif self.is_mps():
@@ -246,6 +263,8 @@ class Platform:
     def get_torch_distributed_backend_str(self) -> str:
         if self.is_cuda_alike():
             return "nccl"
+        elif self.is_npu():
+            return "hccl"
         elif self.is_musa():
             return "mccl"
         elif self.is_mps():
@@ -342,6 +361,11 @@ class Platform:
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture of the current platform."""
         return CpuArchEnum.UNSPECIFIED
+
+    @classmethod
+    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
+        """Whether to enable DIT layerwise offload by default on the current platform."""
+        return True
 
     def get_attn_backend(self, *args, **kwargs) -> AttentionImpl:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
