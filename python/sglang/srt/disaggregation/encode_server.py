@@ -229,15 +229,6 @@ class MMEncoder:
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = get_mooncake_transfer_engine()
-            if getattr(self.server_args, "enable_mm_global_cache", False):
-                from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
-                    EmbeddingCacheController,
-                )
-
-                self.mm_global_cache = EmbeddingCacheController(
-                    rank, server_args.tp_size, hidden_dim=self.model_config.hidden_size
-                )
-                self.background_tasks = set()
             else:
                 self.mm_global_cache = None
 
