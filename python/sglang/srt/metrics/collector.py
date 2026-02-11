@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -73,6 +73,8 @@ class TimeStats:
     prefill_end_time_host: float = 0.0
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
+    # Number of prefill retries for this request
+    prefill_retry_count: int = 0
 
     # Timestamp when prefill phase finishes, obtained from `time.time()`.
     # Note that this differs from the other `_time` fields tracked by the
@@ -139,7 +141,8 @@ class TimeStats:
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f}MB"
+                f"transfer_total={self.transfer_total_mb:.2f}MB, "
+                f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -453,6 +456,11 @@ class SchedulerMetricsCollector:
         self.num_transfer_failed_reqs = Counter(
             name="sglang:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_prefill_retries_total = Counter(
+            name="sglang:num_prefill_retries_total",
+            documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
         self.kv_transfer_speed_gb_s = Gauge(
@@ -841,6 +849,16 @@ class SchedulerMetricsCollector:
             ],
         )
 
+        # This is a work-around Info metric since Info metrics are not supported in Prometheus.
+        # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
+        # If more Info metrics are needed, we can create a common _log_info function.
+        self.cache_config_info = Gauge(
+            name="sglang:cache_config_info",
+            documentation="Cache configuration information.",
+            labelnames=["page_size", "num_pages"],
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -853,6 +871,10 @@ class SchedulerMetricsCollector:
 
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
+
+    def increment_prefill_retries(self, count: int) -> None:
+        if count > 0:
+            self.num_prefill_retries_total.labels(**self.labels).inc(count)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
@@ -1054,6 +1076,9 @@ class SchedulerMetricsCollector:
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
+    def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
+        self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
+
 
 class TokenizerMetricsCollector:
     def __init__(
@@ -1136,8 +1161,8 @@ class TokenizerMetricsCollector:
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens.",
-            labelnames=labels.keys(),
+            documentation="Number of cached prompt tokens by source (device/host/storage).",
+            labelnames=list(labels.keys()) + ["cache_source"],
         )
 
         self.num_requests_total = Counter(
@@ -1291,11 +1316,36 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
+        cached_tokens_details: Optional[Dict[str, Any]] = None,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
+
+        # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:
-            self.cached_tokens_total.labels(**labels).inc(cached_tokens)
+            if cached_tokens_details:
+                # Report by cache source (device/host, and storage if L3 enabled)
+                def report_cache_source(source: str, value: int):
+                    if value > 0:
+                        source_labels = {**labels, "cache_source": source}
+                        self.cached_tokens_total.labels(**source_labels).inc(value)
+
+                report_cache_source("device", cached_tokens_details.get("device", 0))
+                report_cache_source("host", cached_tokens_details.get("host", 0))
+
+                # Storage fields are only present when L3 storage backend is enabled
+                if "storage" in cached_tokens_details:
+                    storage_tokens = cached_tokens_details.get("storage", 0)
+                    if storage_tokens > 0:
+                        backend = (
+                            cached_tokens_details.get("storage_backend") or "unknown"
+                        )
+                        report_cache_source(f"storage_{backend}", storage_tokens)
+            else:
+                # Fallback for backward compatibility
+                labels_total = {**labels, "cache_source": "total"}
+                self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
+
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)

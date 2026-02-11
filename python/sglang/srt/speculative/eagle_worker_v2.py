@@ -13,6 +13,9 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
     EAGLEDraftNpuGraphRunner,
 )
 from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLAMultiStepDraftBackend,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
@@ -102,11 +105,6 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
-        )
-
-        # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
         # Do not capture cuda graph in `TpModelWorker` init,
@@ -276,6 +274,10 @@ class EagleDraftWorker(BaseDraftWorker):
             or (
                 _is_cuda
                 and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            )
+            or (
+                _is_cuda
+                and isinstance(self.draft_attn_backend, TRTLLMMLAMultiStepDraftBackend)
             )
         ):
             tic = time.perf_counter()
@@ -481,9 +483,9 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            # draft mode is same with decode mode, only 1 token per req
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         batch.spec_info = next_draft_input
@@ -506,8 +508,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -689,7 +691,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
+        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify

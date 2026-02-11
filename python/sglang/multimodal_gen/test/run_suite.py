@@ -38,6 +38,15 @@ SUITES = {
     ],
 }
 
+suites_ascend = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ]
+}
+
+SUITES.update(suites_ascend)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run multimodal_gen test suite")
@@ -83,12 +92,7 @@ def parse_args():
 
 
 def collect_test_items(files, filter_expr=None):
-    """Collect test item node IDs from the given files using pytest --collect-only.
-
-    Raises:
-        RuntimeError: If pytest collection fails due to errors (e.g., syntax errors,
-            import errors, or other collection failures).
-    """
+    """Collect test item node IDs from the given files using pytest --collect-only."""
     cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
     if filter_expr:
         cmd.extend(["-k", filter_expr])

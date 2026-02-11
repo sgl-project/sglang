@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
+    ShutdownReq,
     UnmergeLoraWeightsReq,
     _parse_size,
     save_image_to_path,
@@ -87,6 +88,7 @@ class Scheduler:
             Req: self._handle_generation,
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
+            ShutdownReq: self._handle_shutdown,
         }
 
         # FIFO, new reqs are appended
@@ -122,6 +124,10 @@ class Scheduler:
 
     def _handle_list_loras(self, _reqs: List[Any]) -> OutputBatch:
         return self.worker.list_loras()
+
+    def _handle_shutdown(self, _reqs: List[Any]) -> OutputBatch:
+        self._running = False
+        return OutputBatch()
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]
@@ -202,7 +208,6 @@ class Scheduler:
                         prompt="",
                         is_warmup=True,
                     )
-
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
@@ -219,17 +224,14 @@ class Scheduler:
             return recv_reqs
 
         # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
-        # only the very first req through server's lifetime will be warmup
+        # only the very first req through server's lifetime will be warmed up
         identity, req = recv_reqs[0]
         if isinstance(req, Req):
             warmup_req = deepcopy(req)
-            warmup_req.is_warmup = True
-            warmup_req.extra["cache_dit_num_inference_steps"] = req.num_inference_steps
-            warmup_req.num_inference_steps = 1
+            warmup_req.set_as_warmup()
             recv_reqs.insert(0, (identity, warmup_req))
             self._warmup_total = 1
-            self._warmup_processed = 1
-            logger.info("Processing warmup req... (1/1)")
+            self._warmup_processed = 0
             self.warmed_up = True
         return recv_reqs
 
@@ -385,10 +387,9 @@ class Scheduler:
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
-        logger.info("Scheduler event loop terminated.")
         if self.receiver is not None:
             self.receiver.close()
-        self.context.term()
+        self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
         """Broadcast a task to all slave worker processes."""
