@@ -1,9 +1,13 @@
 #pragma once
 
 #include <sgl_kernel/tensor.h>
+#include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/utils.h>
 #include <tvm/ffi/container/tensor.h>
+
+#define kBitsToLoad 128
+#define kBytesToLoad (kBitsToLoad / 8)
 
 namespace {
 
@@ -59,8 +63,9 @@ SGL_DEVICE T gelu_tanh(const T& x) {
 }
 
 template <typename T, T (*Activation)(const T&)>
-__global__ void act_and_mul_kernel(void* __restrict__ out_ptr, const void* __restrict__ input_ptr, int64_t d,
+__global__ void act_and_mul_kernel(T* __restrict__ out_ptr, const T* __restrict__ input_ptr, int64_t d,
                                    int64_t num_tokens) {
+  constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
   const int64_t stride = blockDim.x;
@@ -68,19 +73,31 @@ __global__ void act_and_mul_kernel(void* __restrict__ out_ptr, const void* __res
 
   if (token_idx >= num_tokens) return;
 
-  const T* input = static_cast<const T*>(input_ptr) + offset;
-  T* out = static_cast<T*>(out_ptr) + token_idx * d;
+#pragma unroll 1
+  for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
+    device::AlignedVector<T, vec_size> x_vec, y_vec, out_vec;
+    x_vec.load(input_ptr + offset + idx * vec_size);
+    y_vec.load(input_ptr + offset + d + idx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      out_vec[i] = Activation(x_vec[i]) * y_vec[i];
+    }
+    out_vec.store(out_ptr + token_idx * d + idx * vec_size);
+  }
 
-  for (int64_t i = thread_idx; i < d; i += stride) {
-    T x = input[i];
-    T y = input[i + d];
-    out[i] = Activation(x) * y;
+  const int64_t remaining_offset = d - d % (stride * vec_size);
+  // process the remaining elements
+#pragma unroll 1
+  for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
+    T x = input_ptr[offset + remaining_offset + idx], y = input_ptr[offset + remaining_offset + d + idx];
+    out_ptr[token_idx * d + remaining_offset + idx] = Activation(x) * y;
   }
 }
 
 template <typename T, T (*Activation)(const T&)>
-__global__ void act_only_kernel(void* __restrict__ out_ptr, const void* __restrict__ input_ptr, int64_t d,
+__global__ void act_only_kernel(T* __restrict__ out_ptr, const T* __restrict__ input_ptr, int64_t d,
                                 int64_t num_tokens) {
+  constexpr uint32_t vec_size = kBytesToLoad / sizeof(T);
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
   const int64_t stride = blockDim.x;
@@ -88,11 +105,23 @@ __global__ void act_only_kernel(void* __restrict__ out_ptr, const void* __restri
 
   if (token_idx >= num_tokens) return;
 
-  const T* input = static_cast<const T*>(input_ptr) + offset;
-  T* out = static_cast<T*>(out_ptr) + token_idx * d;
+#pragma unroll 1
+  for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
+    device::AlignedVector<T, vec_size> x_vec, out_vec;
+    x_vec.load(input_ptr + offset + idx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      out_vec[i] = Activation(x_vec[i]);
+    }
+    out_vec.store(out_ptr + token_idx * d + idx * vec_size);
+  }
 
-  for (int64_t i = thread_idx; i < d; i += stride) {
-    out[i] = Activation(input[i]);
+  const int64_t remaining_offset = d - d % (stride * vec_size);
+  // process the remaining elements
+#pragma unroll 1
+  for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
+    T x = input_ptr[offset + remaining_offset + idx];
+    out_ptr[token_idx * d + remaining_offset + idx] = Activation(x);
   }
 }
 
@@ -125,7 +154,8 @@ struct ActivationAndMul {
 
     const uint32_t block_size = std::min<uint32_t>(d, 1024);
 
-    LaunchKernel(num_tokens, block_size, device.unwrap())(kernel, output.data_ptr(), input.data_ptr(), d, num_tokens);
+    LaunchKernel(num_tokens, block_size, device.unwrap())(
+        kernel, static_cast<T*>(output.data_ptr()), static_cast<T*>(input.data_ptr()), d, num_tokens);
   }
 };
 
@@ -155,7 +185,8 @@ struct ActivationOnly {
 
     const uint32_t block_size = std::min<uint32_t>(d, 1024);
 
-    LaunchKernel(num_tokens, block_size, device.unwrap())(kernel, output.data_ptr(), input.data_ptr(), d, num_tokens);
+    LaunchKernel(num_tokens, block_size, device.unwrap())(
+        kernel, static_cast<T*>(output.data_ptr()), static_cast<T*>(input.data_ptr()), d, num_tokens);
   }
 };
 
