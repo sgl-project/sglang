@@ -112,10 +112,17 @@ struct LaunchKernel {
 
   auto enable_pdl(bool enabled = true) -> LaunchKernel& {
     if (enabled) {
-      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
-      m_config.numAttrs = 1;
-      m_config.attrs = m_attrs;
+      // Skip PDL during CUDA graph capture - the ProgrammaticStreamSerialization
+      // launch attribute is incompatible with graph capture on SM120 (Blackwell)
+      // and causes "CUDA error: invalid resource handle".
+      cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+      cudaStreamIsCapturing(m_config.stream, &capture_status);
+      if (capture_status == cudaStreamCaptureStatusNone) {
+        m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        m_attrs[0].val.programmaticStreamSerializationAllowed = true;
+        m_config.numAttrs = 1;
+        m_config.attrs = m_attrs;
+      }
     } else {
       m_config.numAttrs = 0;
     }
