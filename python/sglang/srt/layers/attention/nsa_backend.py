@@ -29,7 +29,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_cp_round_robin_split_q_seqs,
     pad_nsa_cache_seqlens,
 )
-from sglang.srt.layers.attention.trtllm_mla_backend import _concat_mla_absorb_q_general
+from sglang.srt.layers.attention.utils import (
+    mla_quantize_and_rope_for_fp8,
+    concat_mla_absorb_q_general,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
@@ -327,7 +330,7 @@ class NativeSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
-        self.data_type = model_runner.kv_cache_dtype
+        self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.nsa_decode_impl == "trtllm":
@@ -1305,7 +1308,7 @@ class NativeSparseAttnBackend(
 
         if nsa_impl == "tilelang":
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1315,7 +1318,7 @@ class NativeSparseAttnBackend(
             )
         elif nsa_impl == "flashmla_sparse":
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
@@ -1339,7 +1342,7 @@ class NativeSparseAttnBackend(
             )
         elif nsa_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1448,7 +1451,7 @@ class NativeSparseAttnBackend(
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1458,7 +1461,7 @@ class NativeSparseAttnBackend(
             )
         elif self.nsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1471,7 +1474,7 @@ class NativeSparseAttnBackend(
             )
         elif self.nsa_decode_impl == "tilelang":
             if q_rope is not None:
-                q_all = _concat_mla_absorb_q_general(q_nope, q_rope)
+                q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
                 kv_cache=kv_cache,
@@ -1508,86 +1511,6 @@ class NativeSparseAttnBackend(
 
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
-
-    def _quantize_and_rope_for_fp8(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        k_nope: torch.Tensor,
-        k_rope: torch.Tensor,
-        forward_batch: ForwardBatch,
-        cos_sin_cache: torch.Tensor,
-        is_neox: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        import flashinfer.rope
-
-        """Quantize and apply RoPE for FP8 attention path.
-
-        This function handles the FP8 quantization and RoPE application for MLA attention.
-        It takes separate query/key nope and rope components, applies RoPE to the rope parts,
-        quantizes all components to FP8, and merges the query components into a single tensor.
-
-        Args:
-            q_nope: Query no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            q_rope: Query RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            k_nope: Key no-position-encoding component [seq_len, num_heads, kv_lora_rank]
-                - expected dtype: torch.bfloat16
-            k_rope: Key RoPE component [seq_len, num_heads, qk_rope_head_dim]
-                - expected dtype: torch.bfloat16
-            forward_batch: Forward batch containing position information
-            cos_sin_cache: Precomputed cosine/sine cache for RoPE
-                - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
-            is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
-
-        Returns:
-            tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
-                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
-                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
-                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
-        """
-        attn_dtype = torch.float8_e4m3fn
-        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
-
-        # Allocate output tensors with FP8 dtype
-        # Query output will contain merged nope + rope components
-        q_out = q_rope.new_empty(
-            q_len,
-            num_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            dtype=attn_dtype,
-        )
-
-        # Key outputs maintain original shapes but with FP8 dtype
-        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
-        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
-
-        # Apply RoPE and quantize all components in a single fused kernel call
-        # This kernel handles:
-        # 1. RoPE application to q_rope and k_rope using cos_sin_cache and positions
-        # 2. Quantization of all components to FP8 format
-        # 3. Output placement into pre-allocated tensors
-        flashinfer.rope.mla_rope_quantize_fp8(
-            q_rope=q_rope,
-            k_rope=k_rope,
-            q_nope=q_nope,
-            k_nope=k_nope,
-            cos_sin_cache=cos_sin_cache,
-            pos_ids=forward_batch.positions,
-            is_neox=is_neox,
-            quantize_dtype=attn_dtype,
-            # Output tensor slicing: q_out contains [nope_part, rope_part]
-            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
-            k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
-            k_nope_out=k_nope_out,
-            # Quantization scales (set to 1.0 for no additional scaling)
-            quant_scale_q=1.0,
-            quant_scale_kv=1.0,
-        )
-
-        return q_out, k_nope_out, k_rope_out
 
     def _forward_fa3(
         self,
@@ -1868,7 +1791,7 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
-        if self.data_type == torch.float8_e4m3fn:
+        if self.kv_cache_dtype == torch.float8_e4m3fn:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
@@ -1877,12 +1800,12 @@ class NativeSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
-            q, k, k_rope = self._quantize_and_rope_for_fp8(
+            q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
                 q_rope,
                 k.squeeze(1),
                 k_rope.squeeze(1),
-                forward_batch,
+                forward_batch.positions,
                 cos_sin_cache,
                 is_neox,
             )
@@ -1910,7 +1833,7 @@ class NativeSparseAttnBackend(
             q_rope_reshaped = q_rope.view(
                 -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
             )
-            q_all = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
+            q_all = concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
@@ -2084,20 +2007,6 @@ class NativeSparseAttnBackend(
             flashmla_metadata=flashmla_metadata,
             num_splits=num_splits,
         )
-
-
-_is_cuda = is_cuda()
-
-if _is_cuda:
-    from sgl_kernel import concat_mla_absorb_q
-
-
-def _concat_mla_absorb_q_general(q_nope, q_rope):
-    if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
-        return concat_mla_absorb_q(q_nope, q_rope)
-    else:
-        return torch.cat([q_nope, q_rope], dim=-1)
-
 
 class NativeSparseAttnMultiStepBackend:
 

@@ -1255,7 +1255,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
         )
-        self.nsa_attention_backend_impl = None
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
@@ -1322,9 +1321,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         # Determine attention backend used by current forward batch
         if forward_batch.forward_mode.is_decode_or_idle():
             attention_backend = get_global_server_args().decode_attention_backend
-            nsa_attention_backend_impl = (
-                get_global_server_args().nsa_decode_backend if self.use_nsa else None
-            )
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
@@ -1332,25 +1328,11 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             # Use the specified backend for speculative operations (both verify and draft extend)
             if get_global_server_args().speculative_attention_mode == "decode":
                 attention_backend = get_global_server_args().decode_attention_backend
-                nsa_attention_backend_impl = (
-                    get_global_server_args().nsa_decode_backend
-                    if self.use_nsa
-                    else None
-                )
             else:  # default to prefill
                 attention_backend = get_global_server_args().prefill_attention_backend
-                nsa_attention_backend_impl = (
-                    get_global_server_args().nsa_prefill_backend
-                    if self.use_nsa
-                    else None
-                )
         else:
             attention_backend = get_global_server_args().prefill_attention_backend
-            nsa_attention_backend_impl = (
-                get_global_server_args().nsa_prefill_backend if self.use_nsa else None
-            )
         self.current_attention_backend = attention_backend
-        self.nsa_attention_backend_impl = nsa_attention_backend_impl
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         return handler(self, forward_batch)
@@ -1509,7 +1491,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         return (
             (
                 self.current_attention_backend == "nsa"
-                and self.nsa_attention_backend_impl == "trtllm"
+                and (
+                    get_global_server_args().decode_attention_backend == "trtllm"
+                    or get_global_server_args().prefill_attention_backend == "trtllm"
+                )
             )
             or (
                 self.current_attention_backend == "trtllm_mla"
