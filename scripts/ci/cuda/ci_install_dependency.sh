@@ -2,6 +2,46 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
+# ── Fast path for containerized runners ─────────────────────────────────
+# When running inside a CI container (docker/Dockerfile.ci-5090), all
+# dependencies are pre-installed. We only need to do an editable install
+# of sglang itself (no deps) and kill stale processes.
+if [ -f /.dockerenv ] && [ "${CI_CONTAINER:-}" = "1" ]; then
+    echo "=== Containerized CI runner detected ==="
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    bash "${SCRIPT_DIR}/../../killall_sglang.sh"
+    echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+
+    # Clear torch compilation cache
+    python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+
+    # Editable install of sglang (deps already in container)
+    EXTRAS="dev"
+    OPTIONAL_DEPS="${1:-}"
+    if [ -n "$OPTIONAL_DEPS" ]; then
+        EXTRAS="dev,${OPTIONAL_DEPS}"
+    fi
+    pip install -e "python[${EXTRAS}]" --no-deps --break-system-packages
+
+    # If a custom-built sgl-kernel wheel is available, install it
+    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            WHEEL_ARCH="aarch64"
+        else
+            WHEEL_ARCH="x86_64"
+        fi
+        SGL_KERNEL_VERSION=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
+        pip install "sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl" \
+            --force-reinstall --break-system-packages
+    fi
+
+    # Prepare runner (HF cache cleanup, model validation)
+    bash "${SCRIPT_DIR}/prepare_runner.sh"
+    echo "=== Container fast-path complete ==="
+    exit 0
+fi
+
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
 CU_VERSION="cu129"

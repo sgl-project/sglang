@@ -1,0 +1,119 @@
+# Dockerfile for CI runners on 5090 (Blackwell) machines.
+#
+# This is a "fat" image that pre-installs all dependencies so that CI jobs
+# only need to do a quick `pip install -e "python[dev]" --no-deps` at the
+# start of each run. Each container is assigned exactly 1 GPU via
+# `docker run --gpus "device=N"`.
+#
+# Build:
+#   docker build -f docker/Dockerfile.ci-5090 -t ghcr.io/sgl-project/sglang/ci-5090:latest .
+#
+# Run (example for GPU 0):
+#   docker run --gpus "device=0" --network host \
+#     -v /tmp/huggingface:/hf_home \
+#     -e RUNNER_NAME=5090a-gpu-0 \
+#     -e RUNNER_TOKEN=<token> \
+#     ghcr.io/sgl-project/sglang/ci-5090:latest
+
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04
+
+ARG SGL_KERNEL_VERSION=0.3.21
+ARG FLASHINFER_VERSION=0.6.2
+ARG ACTIONS_RUNNER_VERSION=2.322.0
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    CI_CONTAINER=1
+
+# ── System packages ─────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Core utilities
+    ca-certificates curl wget git git-lfs unzip lsof jq sudo \
+    software-properties-common locales \
+    # Build essentials
+    build-essential cmake pkg-config \
+    # Python
+    python3.10 python3.10-dev python3.10-venv python3-pip \
+    # RDMA / InfiniBand
+    libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils \
+    libnuma-dev libssl-dev \
+    # Misc runtime
+    ffmpeg \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8
+
+# ── Protoc (for router / gRPC) ──────────────────────────────────────────
+RUN PROTOC_ZIP="protoc-32.0-linux-x86_64.zip" \
+    && wget -q "https://github.com/protocolbuffers/protobuf/releases/download/v32.0/${PROTOC_ZIP}" -O /tmp/${PROTOC_ZIP} \
+    && unzip -o /tmp/${PROTOC_ZIP} -d /usr/local \
+    && rm /tmp/${PROTOC_ZIP} \
+    && protoc --version
+
+# ── Rust / Cargo (for sglang-router) ────────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# ── Pip bootstrap ───────────────────────────────────────────────────────
+RUN pip install --upgrade pip setuptools wheel
+
+# ── PyTorch (cu129) ─────────────────────────────────────────────────────
+RUN pip install torch --extra-index-url https://download.pytorch.org/whl/cu129 \
+        --break-system-packages
+
+# ── sgl-kernel ──────────────────────────────────────────────────────────
+RUN pip install sgl-kernel==${SGL_KERNEL_VERSION} --break-system-packages
+
+# ── flashinfer-jit-cache ────────────────────────────────────────────────
+RUN for i in 1 2 3 4 5; do \
+        pip install flashinfer-jit-cache==${FLASHINFER_VERSION} \
+            --index-url https://flashinfer.ai/whl/cu129 \
+            --break-system-packages && break; \
+        echo "Attempt $i failed, retrying in 10s..."; sleep 10; \
+    done
+
+# ── Other Python dependencies ──────────────────────────────────────────
+RUN pip install --break-system-packages \
+    nvidia-nvshmem-cu12==3.4.5 \
+    nvidia-cudnn-cu12==9.16.0.29 \
+    nvidia-cuda-nvrtc-cu12 \
+    scipy \
+    pytest \
+    "huggingface_hub[hf_xet]" \
+    py-spy \
+    mooncake-transfer-engine==0.3.9 \
+    sglang-router \
+    opencv-python-headless
+
+# ── lmms-eval (for MMMU tests) ──────────────────────────────────────────
+RUN git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /opt/lmms-eval \
+    && pip install -e /opt/lmms-eval/ --break-system-packages
+
+# ── GitHub Actions runner ───────────────────────────────────────────────
+RUN useradd -m -s /bin/bash runner \
+    && echo "runner ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers.d/runner
+
+RUN mkdir -p /home/runner/actions-runner && cd /home/runner/actions-runner \
+    && curl -sL "https://github.com/actions/runner/releases/download/v${ACTIONS_RUNNER_VERSION}/actions-runner-linux-x64-${ACTIONS_RUNNER_VERSION}.tar.gz" \
+       | tar xz \
+    && chown -R runner:runner /home/runner/actions-runner \
+    && /home/runner/actions-runner/bin/installdependencies.sh
+
+# ── Entrypoint ──────────────────────────────────────────────────────────
+COPY docker/ci-runner-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Ensure the container sees exactly 1 GPU (set by `--gpus "device=N"`)
+# RUNNER_ALLOW_RUNASROOT is required because the container runs as root.
+ENV CUDA_VISIBLE_DEVICES=0 \
+    HF_HOME=/hf_home \
+    IS_BLACKWELL=1 \
+    RUNNER_ALLOW_RUNASROOT=1
+
+WORKDIR /home/runner/actions-runner
+ENTRYPOINT ["/entrypoint.sh"]
