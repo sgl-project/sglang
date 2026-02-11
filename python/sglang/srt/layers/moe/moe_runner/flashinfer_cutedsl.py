@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 class FlashInferCuteDslNvFp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer CuteDSL NVFP4 MoE kernels."""
 
-    input_global_scale: Optional[torch.Tensor]
+    input_global_scale: torch.Tensor | None
     w13_weight: torch.Tensor
     w13_blockscale_swizzled: torch.Tensor
     g1_alphas: torch.Tensor
@@ -38,7 +38,7 @@ class FlashInferCuteDslNvFp4MoeQuantInfo(MoeQuantInfo):
 
 @dataclass
 class FlashInferCuteDslRunnerInput(RunnerInput):
-    hidden_states: Tuple[torch.Tensor, Optional[torch.Tensor]]
+    hidden_states: tuple[torch.Tensor, torch.Tensor | None]
     masked_m: torch.Tensor
 
     @property
@@ -86,7 +86,7 @@ class FlashInferCuteDslRunnerCore(MoeRunnerCore):
             flashinfer_cutedsl_moe_masked,
         )
 
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = running_state.get(
+        down_gemm_overlap_args: DownGemmOverlapArgs | None = running_state.get(
             "down_gemm_overlap_args"
         )
 
@@ -116,7 +116,7 @@ class FlashInferCuteDslRunnerCore(MoeRunnerCore):
 
 @register_pre_permute("deepep_ll", "flashinfer_cutedsl")
 def pre_permute_deepep_ll_to_flashinfer_cutedsl(
-    dispatch_output: "DeepEPLLDispatchOutput",
+    dispatch_output: DeepEPLLDispatchOutput,
     quant_info: FlashInferCuteDslNvFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
