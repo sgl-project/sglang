@@ -2048,7 +2048,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.disable_piecewise_cuda_graph:
             return
 
+        # Disable piecewise CUDA graph for non-language models
         if not hasattr(self.model, "model"):
+            return
+
+        # Disable piecewise CUDA graph for non capture size
+        if not self.server_args.piecewise_cuda_graph_tokens:
             return
 
         # Collect attention layers and moe layers from the model
