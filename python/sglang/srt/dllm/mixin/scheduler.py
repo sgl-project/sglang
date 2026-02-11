@@ -8,7 +8,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.managers.schedule_batch import Req, RequestStage, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 logger = logging.getLogger(__name__)
@@ -195,6 +194,9 @@ class SchedulerDllmMixin:
         new_batch.decoding_reqs = None
 
         # Record prefill stats for logging after forward (matches scheduler.py normal path)
+        # Import here to avoid circular import: scheduler -> dllm/scheduler -> scheduler_metrics_mixin -> scheduler
+        from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+
         new_batch.prefill_stats = PrefillStats(
             log_input_tokens=self.adder.log_input_tokens,
             log_hit_tokens=self.adder.log_hit_tokens,
