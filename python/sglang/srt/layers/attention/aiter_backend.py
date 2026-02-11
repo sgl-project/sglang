@@ -27,15 +27,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 try:
+    # Core kernels used by both decode and non-PS prefill paths.
     from aiter import (
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
         get_mla_metadata_v1,
-        get_ps_metadata_info_v1,
-        get_ps_metadata_v1,
         mha_batch_prefill_func,
-        mla_prefill_ps_asm_fwd,
-        mla_reduce_v1,
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
@@ -43,6 +40,21 @@ except ImportError:
     print(
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
+
+# Optional PS/fp8 prefill kernels: newer aiter builds provide these symbols, but
+# some environments ship older builds. Keep decode/non-PS paths available.
+try:
+    from aiter import (
+        get_ps_metadata_info_v1,
+        get_ps_metadata_v1,
+        mla_prefill_ps_asm_fwd,
+        mla_reduce_v1,
+    )
+except ImportError:
+    get_ps_metadata_info_v1 = None
+    get_ps_metadata_v1 = None
+    mla_prefill_ps_asm_fwd = None
+    mla_reduce_v1 = None
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.utils import pad_sequence_with_mask
@@ -54,10 +66,32 @@ logger = logging.getLogger(__name__)
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
-# Use fp8 prefill only on gfx95
-_use_fp8_prefill_attn = (
-    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+_has_fp8_prefill_ps_kernels = all(
+    x is not None
+    for x in (
+        get_ps_metadata_info_v1,
+        get_ps_metadata_v1,
+        mla_prefill_ps_asm_fwd,
+        mla_reduce_v1,
+    )
 )
+
+# Use fp8 prefill only on gfx95 and when optional PS kernels are available.
+_use_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True")
+    and is_gfx95_supported()
+    and _has_fp8_prefill_ps_kernels
+)
+
+if (
+    get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True")
+    and is_gfx95_supported()
+    and not _has_fp8_prefill_ps_kernels
+):
+    logger.warning(
+        "SGLANG_AITER_FP8_PREFILL_ATTN is enabled but optional AITER PS kernels "
+        "are unavailable; falling back to non-PS prefill path."
+    )
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
