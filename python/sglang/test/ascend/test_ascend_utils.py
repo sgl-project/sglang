@@ -1,23 +1,22 @@
 """Common utilities for testing and benchmarking on NPU"""
 
+import asyncio
+import copy
 import os
 import subprocess
-import copy
+
+from types import SimpleNamespace
+from typing import Awaitable, Callable, NamedTuple, Optional
 from typing import NamedTuple
 from typing import  Awaitable, Callable, Optional
 
-import asyncio
 from sglang.bench_serving import run_benchmark
-from sglang.srt.utils import (
-    kill_process_tree,
-)
-from types import SimpleNamespace
-
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    auto_config_device,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    auto_config_device,
     popen_launch_server,
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 )
 
 # Model weights storage directory
@@ -189,7 +188,10 @@ QWEN2_0_5B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 )
 
 QWEN3_30B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B")
-QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-w8a8")
+QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR,
+    "Qwen/Qwen3-30B-A3B-w8a8"
+)
 
 DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
@@ -247,6 +249,7 @@ class ModelTestConfig(NamedTuple):
         gsm8k_accuracy: Weight for GSM8K benchmark score
         mmmu_accuracy: Weight for MMMU benchmark score
     """
+
     model_path: str
     mmlu_score: Optional[float] = None
     gsm8k_accuracy: Optional[float] = None
@@ -254,28 +257,23 @@ class ModelTestConfig(NamedTuple):
 
 
 LLAMA_3_2_1B_INSTRUCT_WEIGHTS_FOR_TEST = ModelTestConfig(
-    model_path=LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
-    mmlu_score=0.2
+    model_path=LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH, mmlu_score=0.2
 )
 
 QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_FOR_TEST = ModelTestConfig(
-    model_path=QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH,
-    gsm8k_accuracy=0.9
+    model_path=QWEN3_30B_A3B_INSTRUCT_2507_WEIGHTS_PATH, gsm8k_accuracy=0.9
 )
 
 QWEN3_32B_WEIGHTS_FOR_TEST = ModelTestConfig(
-    model_path=QWEN3_32B_WEIGHTS_PATH,
-    gsm8k_accuracy=0.82
+    model_path=QWEN3_32B_WEIGHTS_PATH, gsm8k_accuracy=0.82
 )
 
 QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_FOR_TEST = ModelTestConfig(
-    model_path=QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH,
-    gsm8k_accuracy=0.92
+    model_path=QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH, gsm8k_accuracy=0.92
 )
 
 QWQ_32B_W8A8_WEIGHTS_FOR_TEST = ModelTestConfig(
-    model_path=QWQ_32B_W8A8_WEIGHTS_PATH,
-    gsm8k_accuracy=0.59
+    model_path=QWQ_32B_W8A8_WEIGHTS_PATH, gsm8k_accuracy=0.59
 )
 
 # Default configuration for testing
@@ -301,6 +299,7 @@ def run_command(cmd, shell=True):
     except subprocess.CalledProcessError as e:
         print(f"execute command error: {e}")
         return None
+
 
 def get_benchmark_args(
     base_url="",
@@ -407,6 +406,7 @@ def get_benchmark_args(
         header=header,
         max_concurrency=max_concurrency,
     )
+
 
 def run_bench_serving(
     model,
