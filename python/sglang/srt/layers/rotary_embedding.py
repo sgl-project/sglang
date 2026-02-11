@@ -49,7 +49,7 @@ if _use_aiter:
 
 if is_npu():
     import torch_npu
-    from sgl_kernel_npu.norm.fused_split_qk_norm import fused_rope_qk_mqa
+    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
     NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
     NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
 
