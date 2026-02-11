@@ -342,13 +342,7 @@ class MoEGate(nn.Module):
                 and hidden_states.shape[1] == 7168
                 and _device_sm >= 90
             ):
-                if self.weight.shape[0] == 384:
-                    logits = dsv3_router_gemm(
-                        hidden_states,
-                        self.weight,
-                        out_dtype=torch.float32
-                    )
-                elif self.weight.shape[0] == 256:
+                if self.weight.shape[0] == 256:
                     # router gemm output float32
                     logits = torch.empty(
                         hidden_states.shape[0],
@@ -361,6 +355,12 @@ class MoEGate(nn.Module):
                         hidden_states,
                         self.weight.t(),
                         logits,
+                    ) 
+                elif self.weight.shape[0] == 384:
+                    logits = dsv3_router_gemm(
+                        hidden_states,
+                        self.weight,
+                        out_dtype=torch.float32
                     ) 
             elif _use_aiter_gfx95 and hidden_states.shape[0] <= 256:
                 logits = aiter_dsv3_router_gemm(
