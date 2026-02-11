@@ -1,4 +1,5 @@
-from typing import List, Tuple, Union
+import math
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -9,6 +10,113 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
+
+def parallel_decoding_update_input_ids_vectorized(
+    input_ids_1d: torch.Tensor,  # [B*blk]
+    full_logits_2d: torch.Tensor,  # [B*blk, V]
+    mask_id: int,
+    block_size: int,
+    threshold: float,
+    finished: Optional[
+        torch.Tensor
+    ] = None,  # [B] bool, True means do NOT update this row
+    force_at_least_one: bool = True,
+) -> None:
+    """
+    Vectorized update for parallel decoding:
+      - reshape to [B, blk] and update each row in-place
+      - replaces per-batch Python loop + .item() sync points
+      - optionally gates out finished rows
+
+    Semantics (matches your old code):
+      - Only positions where input_ids == mask_id are candidates for replacement
+      - Replace with argmax token if its confidence > threshold
+      - If a row has any mask positions but none pass threshold, force select 1 position (max confidence)
+      - Rows with no mask positions are left unchanged (equivalent to `continue`)
+      - If `finished` is provided, finished rows are always left unchanged
+    """
+    assert (
+        input_ids_1d.dim() == 1
+    ), f"input_ids_1d must be 1D, got {tuple(input_ids_1d.shape)}"
+    assert (
+        full_logits_2d.dim() == 2
+    ), f"full_logits_2d must be 2D, got {tuple(full_logits_2d.shape)}"
+    assert (
+        input_ids_1d.shape[0] == full_logits_2d.shape[0]
+    ), f"len mismatch: {input_ids_1d.shape[0]} vs {full_logits_2d.shape[0]}"
+    assert (
+        input_ids_1d.shape[0] % block_size == 0
+    ), f"len(input_ids_1d) must be divisible by block_size, got {input_ids_1d.shape[0]}, block_size={block_size}"
+    assert 0.0 < threshold <= 1.0, f"threshold should be in (0,1], got {threshold}"
+
+    B = input_ids_1d.shape[0] // block_size
+    blk = block_size
+    V = full_logits_2d.shape[1]
+    dev = input_ids_1d.device
+
+    # Views (no copy)
+    input_ids = input_ids_1d.view(B, blk)  # [B, blk]
+    logits = full_logits_2d.view(B, blk, V)  # [B, blk, V]
+
+    # Candidate mask
+    mask = input_ids.eq(mask_id)  # [B, blk]
+    if finished is not None:
+        assert finished.shape == (
+            B,
+        ), f"finished must be shape [B]={B}, got {tuple(finished.shape)}"
+        alive = (~finished).view(B, 1)  # [B,1]
+        eff_mask = mask & alive
+    else:
+        eff_mask = mask
+
+    # Argmax token id per position and its log-prob.
+    # logp = log softmax(logits)[argmax] = max_logit - logsumexp(logits)
+    max_logit, x = logits.max(dim=-1)  # [B, blk], [B, blk]
+    lse = torch.logsumexp(logits, dim=-1)  # [B, blk]
+    logp = max_logit - lse  # [B, blk]
+
+    neg_inf = torch.full_like(logp, float("-inf"))
+    confidence = torch.where(eff_mask, logp, neg_inf)  # [B, blk]
+
+    log_thr = math.log(threshold)
+    transfer = confidence > log_thr  # [B, blk] bool
+
+    # Apply threshold updates first
+    new_ids = torch.where(transfer, x, input_ids)  # [B, blk]
+
+    # Force-at-least-one (graph-friendly): unconditional sparse per-row write, gated to no-op when not needed
+    if force_at_least_one:
+        row_has_any = eff_mask.any(dim=1)  # [B]
+        hit_any = transfer.any(dim=1)  # [B]
+        need_force = row_has_any & (~hit_any)  # [B]
+
+        # Best idx per row (even if all -inf -> 0); gated by need_force
+        best_idx = confidence.argmax(dim=1)  # [B] long
+
+        # idx2: where to write per row:
+        #   - need_force: best_idx
+        #   - else: 0 (safe position)
+        zero_idx = torch.zeros_like(best_idx)
+        idx2 = torch.where(need_force, best_idx, zero_idx)  # [B]
+
+        rows = torch.arange(B, device=dev)  # [B]
+
+        # val2: what to write per row:
+        #   - need_force: x[row, best_idx]
+        #   - else: new_ids[row, 0] (no-op)
+        force_val = x[rows, best_idx]  # [B]
+        noop_val = new_ids[rows, zero_idx]  # [B] == new_ids[:,0]
+        val2 = torch.where(need_force, force_val, noop_val)  # [B]
+
+        # Single-point update per row (typically much cheaper than [B,blk] one-hot scatter_)
+        new_ids[rows, idx2] = val2
+
+    # In-place write-back (preserve storage / better for graph capture)
+    input_ids.copy_(new_ids)
 
 
 class LowConfidence(DllmAlgorithm):
@@ -48,14 +156,35 @@ class LowConfidence(DllmAlgorithm):
             start = self.block_size - torch.sum(block_mask_index).item()
             start_list.append(start)
 
+        if _is_npu:
+            skip_attn_backend_init = False
+
         for _ in range(self.block_size):
             mask_index = forward_batch.input_ids == self.mask_id
             if torch.sum(mask_index).item() == 0:
                 break
 
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            if _is_npu:
+                out = model_runner.forward(
+                    forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
+                )
+                skip_attn_backend_init = True
+            else:
+                out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             assert batch_size == forward_batch.input_ids.shape[0] // self.block_size
+            if _is_npu:
+                parallel_decoding_update_input_ids_vectorized(
+                    input_ids_1d=forward_batch.input_ids,
+                    full_logits_2d=logits_output.full_logits,
+                    mask_id=self.mask_id,
+                    block_size=self.block_size,
+                    threshold=self.threshold,
+                    finished=None,
+                    force_at_least_one=True,
+                )
+                continue
+
             for batch_id in range(batch_size):
                 curr_block_start = batch_id * self.block_size
                 curr_block_end = curr_block_start + self.block_size
@@ -89,7 +218,12 @@ class LowConfidence(DllmAlgorithm):
 
                 block_input_ids[transfer_index] = x[transfer_index]
 
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        if _is_npu:
+            out = model_runner.forward(
+                forward_batch, skip_attn_backend_init, pp_proxy_tensors=None
+            )
+        else:
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
         # Here next token ids is tricky to implement the dynamic lengths,
         # so we return a list of tensors

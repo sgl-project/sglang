@@ -76,11 +76,23 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    is_cuda,
+    is_non_idle_and_non_empty,
+    is_npu,
+    make_layers,
+)
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    from sglang.srt.layers.rotary_embedding import (
+        split_qkv_rmsnorm_rope_pos_cache_half_npu,
+    )
 
 
 class LLaDA2MoeMLP(nn.Module):
@@ -195,6 +207,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 "Only silu is supported for now."
             )
 
+        # fused_topk_npu() conducting norm before scale with routed_scaling_factor by default
+        # norm_topk_prob=True will renorm the routed_scaling_factor thus need to keep norm_topk_prob=False
+        if _is_npu:
+            self.norm_topk_prob = False
+
         # Gate always runs at half / full precision for now.
         router_dtype = getattr(config, "router_dtype", None)
         if router_dtype is None:
@@ -202,6 +219,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         elif router_dtype == "fp32":
             self.router_dtype = torch.float32
         else:
+            self.router_dtype = torch.bfloat16
+
+        # to accelerate MoEGate on NPU, and LLaDA2.0-mini precision on GSM8k increase from 0.930->0.935
+        if _is_npu:
             self.router_dtype = torch.bfloat16
 
         # TODO global_server_args.ep_num_redundant_experts is used for eplb, not supported now
@@ -502,30 +523,47 @@ class LLaDA2MoeAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.use_qk_norm:
-            q, k = apply_qk_norm(
-                q=q,
-                k=k,
-                q_norm=self.query_layernorm,
-                k_norm=self.key_layernorm,
-                head_dim=self.head_dim,
-                alt_stream=self.alt_stream,
+        if _is_npu:
+            q, k, v = split_qkv_rmsnorm_rope_pos_cache_half_npu(
+                qkv,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                self.q_size,
+                self.kv_size,
+                self.head_dim,
+                eps=self.query_layernorm.variance_epsilon,
+                q_weight=self.query_layernorm.weight,
+                k_weight=self.key_layernorm.weight,
+                q_bias=getattr(self.query_layernorm, "bias", None),
+                k_bias=getattr(self.key_layernorm, "bias", None),
+                rope_dim=self.rotary_dim,
             )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.use_qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.query_layernorm,
+                    k_norm=self.key_layernorm,
+                    head_dim=self.head_dim,
+                    alt_stream=self.alt_stream,
                 )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    else None
+                ),
+            )
+
         context_layer = self.attn(
             q,
             k,

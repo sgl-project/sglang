@@ -3402,3 +3402,353 @@ def get_rope_wrapper(
         partial_rotary_factor,
         device,
     )
+
+
+@triton.jit
+def fp32_to_bf16_rne(x):
+    """Deterministic FP32 -> BF16 (round-to-nearest-even). Keep ONLY for RMSNorm cast."""
+    u = tl.cast(x, tl.uint32, bitcast=True)
+    lsb = (u >> 16) & 1
+    u = (u + (0x7FFF + lsb)) & 0xFFFF0000
+    return tl.cast(u, tl.float32, bitcast=True).to(tl.bfloat16)
+
+
+@triton.jit
+def split_qkv_rmsnorm_rope_half_pos_cache_kernel(
+    input_ptr,
+    pos_ptr,  # [B]
+    cos_sin_cache_ptr,  # [max_seq, ROPE_DIM] layout: [cos_half, sin_half]
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    q_weight_ptr,
+    q_bias_ptr,
+    k_weight_ptr,
+    k_bias_ptr,
+    batch_size,
+    q_hidden_size: tl.constexpr,
+    kv_hidden_size: tl.constexpr,
+    total_hidden_size: tl.constexpr,
+    eps: tl.constexpr,
+    Q_BLOCK_SIZE: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,
+    Q_BLOCK_N: tl.constexpr,  # Q_BLOCK_SIZE // HEAD_DIM
+    K_BLOCK_N: tl.constexpr,  # KV_BLOCK_SIZE // HEAD_DIM
+    BIAS: tl.constexpr,
+    NORMS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HALF_ROPE_DIM: tl.constexpr,
+    COS_SIN_STRIDE0: tl.constexpr,
+    CAST_NORM_TO_BF16: tl.constexpr,  # ONLY this cast uses fp32_to_bf16_rne
+):
+    row_pid = tl.program_id(0)
+    col_pid = tl.program_id(1)
+    row_step = tl.num_programs(0)
+
+    Q_TY = q_ptr.dtype.element_ty
+    K_TY = k_ptr.dtype.element_ty
+    V_TY = v_ptr.dtype.element_ty
+
+    # =========================
+    # Q
+    # =========================
+    if NORMS:
+        q_w = tl.load(q_weight_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
+    if BIAS:
+        q_b = tl.load(q_bias_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
+
+    in_off = row_pid * total_hidden_size
+    outq_off = row_pid * q_hidden_size
+    in_off_step = row_step * total_hidden_size
+    outq_off_step = row_step * q_hidden_size
+
+    for row_idx in tl.range(row_pid, batch_size, row_step):
+        col = col_pid * Q_BLOCK_SIZE + tl.arange(0, Q_BLOCK_SIZE)
+        mask = col < q_hidden_size
+
+        x = tl.load(input_ptr + in_off + col, mask=mask, other=0.0).to(tl.float32)
+        x = x.reshape(Q_BLOCK_N, HEAD_DIM)
+
+        # RMSNorm (fp32)
+        if NORMS:
+            var = tl.sum(x * x, axis=1) / (1.0 * HEAD_DIM)
+            inv_std = tl.rsqrt(var + eps).reshape(Q_BLOCK_N, 1)
+            y = x * inv_std
+            if BIAS:
+                y = y * q_w + q_b
+            else:
+                y = y * q_w
+        else:
+            y = x
+
+        # y_base: fp32 or bf16
+        if CAST_NORM_TO_BF16:
+            # keep strict RNE here ONLY
+            y_base = fp32_to_bf16_rne(y)  # bf16
+        else:
+            y_base = y  # fp32
+
+        # ---- load cos/sin half (fp32) ----
+        p = tl.load(pos_ptr + row_idx).to(tl.int32)
+        base = p * COS_SIN_STRIDE0
+        offs = tl.arange(0, HALF_ROPE_DIM)
+        cos_f = (
+            tl.load(cos_sin_cache_ptr + base + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
+        sin_f = (
+            tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
+
+        # ---- RoPE half on first ROPE_DIM (fp32 math; casts use .to(bf16)) ----
+        y_rot = tl.extract_slice(
+            y_base, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
+        y_rot_f = y_rot.to(tl.float32)
+
+        x1 = tl.extract_slice(
+            y_rot_f, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        x2 = tl.extract_slice(
+            y_rot_f,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(Q_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
+
+        o1 = x1 * cos_f - x2 * sin_f
+        o2 = x2 * cos_f + x1 * sin_f
+        ro1 = o1.to(tl.bfloat16)
+        ro2 = o2.to(tl.bfloat16)
+
+        roped = tl.zeros((Q_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
+        roped = tl.insert_slice(
+            roped, ro1, offsets=(0, 0), sizes=(Q_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        roped = tl.insert_slice(
+            roped,
+            ro2,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(Q_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
+
+        # output base bf16 (tail passthrough)
+        if CAST_NORM_TO_BF16:
+            y_out = y_base  # already bf16
+        else:
+            y_out = y_base.to(tl.bfloat16)  # fast cast
+
+        y_out = tl.insert_slice(
+            y_out, roped, offsets=(0, 0), sizes=(Q_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
+        tl.store(
+            q_ptr + outq_off + col, y_out.reshape(Q_BLOCK_SIZE).to(Q_TY), mask=mask
+        )
+
+        in_off += in_off_step
+        outq_off += outq_off_step
+
+    # =========================
+    # K
+    # =========================
+    if NORMS:
+        k_w = tl.load(k_weight_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
+    if BIAS:
+        k_b = tl.load(k_bias_ptr + tl.arange(0, HEAD_DIM)).to(tl.float32)
+
+    in_off = row_pid * total_hidden_size + q_hidden_size
+    outk_off = row_pid * kv_hidden_size
+    outk_off_step = row_step * kv_hidden_size
+
+    for row_idx in tl.range(row_pid, batch_size, row_step):
+        col = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
+        mask = col < kv_hidden_size
+
+        x = tl.load(input_ptr + in_off + col, mask=mask, other=0.0).to(tl.float32)
+        x = x.reshape(K_BLOCK_N, HEAD_DIM)
+
+        if NORMS:
+            var = tl.sum(x * x, axis=1) / (1.0 * HEAD_DIM)
+            inv_std = tl.rsqrt(var + eps).reshape(K_BLOCK_N, 1)
+            y = x * inv_std
+            if BIAS:
+                y = y * k_w + k_b
+            else:
+                y = y * k_w
+        else:
+            y = x
+
+        if CAST_NORM_TO_BF16:
+            y_base = fp32_to_bf16_rne(y)  # strict here only
+        else:
+            y_base = y
+
+        # cos/sin half
+        p = tl.load(pos_ptr + row_idx).to(tl.int32)
+        base = p * COS_SIN_STRIDE0
+        offs = tl.arange(0, HALF_ROPE_DIM)
+        cos_f = (
+            tl.load(cos_sin_cache_ptr + base + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
+        sin_f = (
+            tl.load(cos_sin_cache_ptr + base + HALF_ROPE_DIM + offs)
+            .to(tl.float32)
+            .reshape(1, HALF_ROPE_DIM)
+        )
+
+        # rope
+        y_rot = tl.extract_slice(
+            y_base, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
+        y_rot_f = y_rot.to(tl.float32)
+
+        x1 = tl.extract_slice(
+            y_rot_f, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        x2 = tl.extract_slice(
+            y_rot_f,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(K_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
+
+        o1 = x1 * cos_f - x2 * sin_f
+        o2 = x2 * cos_f + x1 * sin_f
+        ro1 = o1.to(tl.bfloat16)
+        ro2 = o2.to(tl.bfloat16)
+
+        roped = tl.zeros((K_BLOCK_N, ROPE_DIM), dtype=tl.bfloat16)
+        roped = tl.insert_slice(
+            roped, ro1, offsets=(0, 0), sizes=(K_BLOCK_N, HALF_ROPE_DIM), strides=(1, 1)
+        )
+        roped = tl.insert_slice(
+            roped,
+            ro2,
+            offsets=(0, HALF_ROPE_DIM),
+            sizes=(K_BLOCK_N, HALF_ROPE_DIM),
+            strides=(1, 1),
+        )
+
+        if CAST_NORM_TO_BF16:
+            y_out = y_base
+        else:
+            y_out = y_base.to(tl.bfloat16)
+
+        y_out = tl.insert_slice(
+            y_out, roped, offsets=(0, 0), sizes=(K_BLOCK_N, ROPE_DIM), strides=(1, 1)
+        )
+        tl.store(
+            k_ptr + outk_off + col, y_out.reshape(KV_BLOCK_SIZE).to(K_TY), mask=mask
+        )
+
+        in_off += in_off_step
+        outk_off += outk_off_step
+
+    # =========================
+    # V
+    # =========================
+    in_off = row_pid * total_hidden_size + q_hidden_size + kv_hidden_size
+    outv_off = row_pid * kv_hidden_size
+    outv_off_step = row_step * kv_hidden_size
+
+    for _ in tl.range(row_pid, batch_size, row_step):
+        col = col_pid * KV_BLOCK_SIZE + tl.arange(0, KV_BLOCK_SIZE)
+        mask = col < kv_hidden_size
+        v = tl.load(input_ptr + in_off + col, mask=mask, other=0.0)
+        tl.store(v_ptr + outv_off + col, v.to(V_TY), mask=mask)
+        in_off += in_off_step
+        outv_off += outv_off_step
+
+
+def split_qkv_rmsnorm_rope_pos_cache_half_npu(
+    input: torch.Tensor,  # [B, q_hidden + 2*kv_hidden]
+    positions: torch.Tensor,  # [B]
+    cos_sin_cache: torch.Tensor,  # [max_seq, rope_dim] layout [cos_half, sin_half]
+    q_hidden_size: int,
+    kv_hidden_size: int,
+    head_dim: int,
+    eps: float = None,
+    q_weight: torch.Tensor = None,
+    k_weight: torch.Tensor = None,
+    q_bias: torch.Tensor = None,
+    k_bias: torch.Tensor = None,
+    rope_dim: int = None,
+    cast_norm_to_bf16: bool = True,
+):
+    from sgl_kernel_npu.utils.triton_utils import get_device_properties
+
+    _, num_vectorcore = get_device_properties()
+    assert input.dim() == 2
+    B, total_hidden = input.shape
+
+    if rope_dim is None:
+        rope_dim = head_dim
+    assert rope_dim % 2 == 0 and rope_dim <= head_dim
+
+    expected_total = q_hidden_size + 2 * kv_hidden_size
+    assert total_hidden == expected_total
+
+    pos = positions
+    assert pos.numel() == B, f"positions must be [B], got numel={pos.numel()} B={B}"
+    if pos.dtype not in (torch.int32, torch.int64):
+        pos = pos.to(torch.int32)
+    pos = pos.contiguous()
+
+    cache = cos_sin_cache.contiguous()
+    stride0 = cache.stride(0)
+
+    KV_BLOCK_SIZE = triton.next_power_of_2(head_dim)
+    assert KV_BLOCK_SIZE == head_dim, "this kernel assumes head_dim is power-of-2"
+    assert q_hidden_size % kv_hidden_size == 0
+    Q_BLOCK_SIZE = (q_hidden_size // kv_hidden_size) * head_dim
+
+    Q_BLOCK_N = Q_BLOCK_SIZE // head_dim
+    K_BLOCK_N = KV_BLOCK_SIZE // head_dim  # usually 1
+
+    q_out = torch.empty((B, q_hidden_size), device=input.device, dtype=input.dtype)
+    k_out = torch.empty((B, kv_hidden_size), device=input.device, dtype=input.dtype)
+    v_out = torch.empty((B, kv_hidden_size), device=input.device, dtype=input.dtype)
+
+    n_cols = kv_hidden_size // KV_BLOCK_SIZE
+    n_rows = (num_vectorcore + n_cols - 1) // n_cols
+
+    BIAS = q_bias is not None
+    NORMS = eps is not None
+
+    split_qkv_rmsnorm_rope_half_pos_cache_kernel[(n_rows, n_cols, 1)](
+        input,
+        pos,
+        cache,
+        q_out,
+        k_out,
+        v_out,
+        q_weight,
+        q_bias,
+        k_weight,
+        k_bias,
+        B,
+        q_hidden_size=q_hidden_size,
+        kv_hidden_size=kv_hidden_size,
+        total_hidden_size=expected_total,
+        eps=eps if eps is not None else 0.0,
+        Q_BLOCK_SIZE=Q_BLOCK_SIZE,
+        KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+        Q_BLOCK_N=Q_BLOCK_N,
+        K_BLOCK_N=K_BLOCK_N,
+        BIAS=BIAS,
+        NORMS=NORMS,
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_dim,
+        HALF_ROPE_DIM=rope_dim // 2,
+        COS_SIN_STRIDE0=stride0,
+        CAST_NORM_TO_BF16=cast_norm_to_bf16,
+    )
+
+    return q_out, k_out, v_out
