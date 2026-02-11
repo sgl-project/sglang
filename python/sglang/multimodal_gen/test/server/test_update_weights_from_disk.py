@@ -1,8 +1,116 @@
 """
 Tests for update_weights_from_disk API in SGLang-D (diffusion engine).
 
-This tests the ability to dynamically update model weights without restarting the server,
-which is critical for RL workflows and iterative fine-tuning scenarios.
+This module verifies the ability to hot update model weights without restarting
+the server, which is critical for RL workflows and iterative fine-tuning scenarios.
+
+Author:
+
+Menyang Liu, https://github.com/dreamyang-liu
+Chenyang Zhao, https://github.com/zhaochenyang20
+
+=============================================================================
+Test organization: 9 test cases in 3 classes
+=============================================================================
+
+Each test class uses a single long-lived server (pytest fixture with scope="class").
+The server is started once when the first test in that class runs; all tests in the
+class share the same server and send multiple POST /update_weights_from_disk
+requests to it. This reflects real usage: one running diffusion service, many weight
+updates over time.
+
+Class 1: TestUpdateWeightsFromDisk             (7 tests) — API contract & error handling
+Class 2: TestUpdateWeightsFromDiskWithOffload  (1 test) — Offload-aware update
+Class 3: TestUpdateWeightsEndToEnd             (1 test) — Generation after update
+
+-----------------------------------------------------------------------------
+Class 1: TestUpdateWeightsFromDisk
+-----------------------------------------------------------------------------
+Purpose: Validate the update_weights_from_disk API contract, request/response shape,
+and error handling. All 7 tests run against one server (fixture:
+diffusion_server_for_weight_update).
+
+  • test_update_weights_same_model
+    Same model path as the one already loaded; must succeed (200, success=True).
+    Exercises the basic "hot reload same checkpoint" path.
+
+  • test_update_weights_with_flush_cache
+    Explicit flush_cache=True; must succeed. Ensures the flush_cache parameter
+    is accepted and applied.
+
+  • test_update_weights_without_flush_cache
+    Explicit flush_cache=False; must succeed. Ensures updates work when not
+    flushing TeaCache.
+
+  • test_update_weights_nonexistent_model
+    model_path set to a non-existent path; must fail (success=False). Verifies
+    all-or-nothing / rollback semantics when load fails.
+
+  • test_update_weights_missing_model_path
+    Request body empty (no model_path); must return 400. Validates required
+    parameter checks.
+
+  • test_update_weights_specific_modules
+    target_modules=["transformer"]; must return 200. Verifies partial module
+    update (target_modules parameter).
+
+  • test_update_weights_nonexistent_module
+    target_modules=["nonexistent_module"]; must return 400 and message containing
+    "not found in pipeline". Validates rejection of invalid module names.
+
+-----------------------------------------------------------------------------
+Class 2: TestUpdateWeightsFromDiskWithOffload
+-----------------------------------------------------------------------------
+Purpose: Ensure weight updates work when layerwise offload is enabled
+(--dit-layerwise-offload). With offload, parameters live in CPU buffers and
+placeholders on GPU; the updater must write into CPU buffers and update
+prefetched GPU tensors without shape mismatch.
+
+  • test_update_weights_with_offload_enabled
+    Server started with --dit-layerwise-offload true. Call update_weights_from_disk
+    with the same model; must succeed (200, success=True) and message must not
+    contain "Shape mismatch".
+
+-----------------------------------------------------------------------------
+Class 3: TestUpdateWeightsEndToEnd
+-----------------------------------------------------------------------------
+Purpose: End-to-end check that the model remains in a consistent, usable state
+after a weight update: inference (image generation) works both before and after
+the update.
+
+  • test_generation_after_weight_update
+    (1) Generate an image (e.g. "a beautiful sunset") via /v1/images/generations.
+    (2) Call POST /update_weights_from_disk (same model, flush_cache=True).
+    (3) Generate another image (e.g. "a beautiful sunrise").
+    Both generations must succeed; this confirms no partial or broken state
+    after update.
+
+=============================================================================
+Relation to RL scenarios and reference implementation
+=============================================================================
+
+In RL or iterative training, a typical pattern is:
+
+  1. Run a diffusion (or LLM) server for inference.
+  2. Periodically pull new weights (e.g., from a training run or from disk)
+     without restarting the server.
+  3. Continue serving with the updated model.
+
+The diffusion engine supports this via POST /update_weights_from_disk: it loads
+weights from a model_path (HF repo or local) and applies them in-place, with
+rollback on failure and support for layerwise offload and DTensor.
+
+For a distributed RL setup where the training process broadcasts weights to
+inference engines (rather than loading from disk), see the SGLang LLM test that
+simulates rank 0 as trainer and other ranks as inference engines, using
+update_weights_from_distributed and init_weights_update_group:
+
+  https://github.com/sgl-project/sglang/blob/main/test/registered/rl/test_update_weights_from_distributed.py
+
+That test verifies weight synchronization across ranks (instruct vs base model)
+and optional pause_generation/continue_generation during update. This diffusion
+test suite focuses on the disk-based update path and offload/consistency
+behavior of the diffusion engine only.
 """
 
 from __future__ import annotations
