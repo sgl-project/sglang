@@ -187,7 +187,7 @@ class TestModelLoaderExtraConfig(BaseModelLoaderTest, CustomTestCase):
 
 if __name__ == "__main__":
     suite = unittest.TestSuite()
-    suite.addTest(TestNOModelLoaderExtraConfig("test_model_loader_extra_config"))
+    suite.addTest(TestNOModelLoaderExtraConfig("test_no_model_loader_extra_config"))
     suite.addTest(TestModelLoaderExtraConfig("test_model_loader_extra_config"))
     suite.addTest(TestModelLoaderExtraConfig("test_model_loading_time_reduced"))
     suite.addTest(TestModelLoaderExtraConfig("test_gsm8k"))
