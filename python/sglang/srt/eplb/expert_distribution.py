@@ -359,6 +359,43 @@ class _SinglePassGatherer(ABC):
         raise NotImplementedError
 
 
+class _RingBuffer:
+    def __init__(self, item_shape, capacity, dtype=torch.float32):
+        self.item_shape = item_shape
+        self.capacity = capacity
+        self.dtype = dtype
+
+        # Preallocate pinned CPU buffer
+        self.buffer = torch.empty((capacity, *item_shape), dtype=dtype, pin_memory=True)
+
+        self.head = 0
+        self.full = False
+
+        self.buffer[...] = -1
+
+    def next(self):
+        slot_id = self.head
+        slot = self.buffer[slot_id]
+
+        # Advance head
+        self.head = (self.head + 1) % self.capacity
+        if self.head == 0:
+            self.full = True
+
+        return slot_id, slot
+
+    def reset(self):
+        self.head = 0
+        self.full = False
+        self.buffer[...] = -1
+
+    def is_full(self):
+        return self.full
+
+    def get_slot(self, slot_id):
+        return self.buffer[slot_id]
+
+
 class _DetailSinglePassGatherer(_SinglePassGatherer):
     # DeepSeek V3 has this value; should generalize later
     _TOP_K_NUM = 8
@@ -371,6 +408,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     ):
         super().__init__(expert_location_metadata, rank)
         self._metadata: Optional[Dict[str, Any]] = None
+        self._gather_stream = torch.cuda.Stream()
         self._topk_ids_of_layer = torch.zeros(
             (
                 expert_location_metadata.num_layers,
@@ -381,6 +419,25 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             dtype=torch.int32,
             device=server_args.device,
         )
+        self._gather_buffer = _RingBuffer(
+            (
+                expert_location_metadata.num_layers,
+                # TODO determine the max number
+                server_args.chunked_prefill_size * 8,
+                self._TOP_K_NUM,
+            ),
+            capacity=512,
+            dtype=torch.int32,
+        )  # pinned, on CPU
+        self._metadata_buffer = _RingBuffer(
+            (
+                2,  # input ids and positions
+                server_args.chunked_prefill_size,
+            ),
+            capacity=512,
+            dtype=torch.int32,
+        )  # pinned, on CPU
+        self._slot_id = 0  # used to sync between metadata buffer and gather buffer
         self._misc_objects: List[Dict[str, Any]] = []
         assert (
             not server_args.enable_two_batch_overlap
@@ -389,11 +446,22 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
         assert self._metadata is None
+        self._slot_id, slot = self._metadata_buffer.next()
+
+        with torch.cuda.stream(self._gather_stream):
+            slot[0, : forward_batch.input_ids.shape[0]].copy_(
+                forward_batch.input_ids, non_blocking=True
+            )
+
+            slot[1, : forward_batch.positions.shape[0]].copy_(
+                forward_batch.positions, non_blocking=True
+            )
+
         self._metadata = dict(
             # TODO pr-chain
             # rids=forward_batch.rids,
-            input_ids=forward_batch.input_ids.cpu().tolist(),
-            positions=forward_batch.positions.cpu().tolist(),
+            metadata=slot,  # tensors
+            input_len=forward_batch.input_ids.shape[0],
             extend_seq_lens=forward_batch.extend_seq_lens_cpu,
             forward_mode=forward_batch.forward_mode.value,
         )
@@ -426,7 +494,14 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         self._metadata = None
 
     def collect(self) -> Dict:
-        num_tokens = len(self._metadata["input_ids"])
+        num_tokens = self._metadata["input_len"]
+
+        slot = self._gather_buffer.get_slot(self._slot_id)
+
+        with torch.cuda.stream(self._gather_stream):
+            slot[:, :num_tokens, :].copy_(
+                self._topk_ids_of_layer[:, :num_tokens, :], non_blocking=True
+            )
 
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
