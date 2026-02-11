@@ -182,6 +182,7 @@ class HiCacheStorage(ABC):
 
 
 class HiCacheFile(HiCacheStorage):
+    _NSA_INDEXER_SUFFIX = "__nsa_idx"
 
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
@@ -270,6 +271,41 @@ class HiCacheFile(HiCacheStorage):
             if not self.set(key, value):
                 return False
         return True
+
+    def batch_get_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        results = []
+        for key, buffer in zip(keys, buffers):
+            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
+            results.append(self.get(extra_key, target_location=buffer) is not None)
+        return results
+
+    def batch_set_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        results = []
+        for key, buffer in zip(keys, buffers):
+            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
+            results.append(self.set(extra_key, value=buffer))
+        return results
+
+    def batch_exists_extra(
+        self,
+        keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> int:
+        for i, key in enumerate(keys):
+            extra_key = f"{key}{self._NSA_INDEXER_SUFFIX}"
+            if not self.exists(extra_key):
+                return i
+        return len(keys)
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)

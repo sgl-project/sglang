@@ -223,6 +223,7 @@ class MooncakeStoreConfig:
 
 
 class MooncakeStore(HiCacheStorage):
+    _NSA_INDEXER_SUFFIX = "__nsa_idx"
 
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
@@ -449,6 +450,41 @@ class MooncakeStore(HiCacheStorage):
         else:
             return self._get_mha_buffer_meta(keys, host_indices)
 
+    def _get_extra_keys(self, keys: List[str]) -> List[str]:
+        if self.is_mla_backend:
+            suffix = self.mla_suffix
+        else:
+            suffix = self.mha_suffix
+        if suffix:
+            return [f"{key}_{suffix}{self._NSA_INDEXER_SUFFIX}" for key in keys]
+        return [f"{key}{self._NSA_INDEXER_SUFFIX}" for key in keys]
+
+    def _register_staging_buffers(self, buffers: List[torch.Tensor]):
+        if not buffers:
+            return None
+        base_ptr = buffers[0].data_ptr()
+        last_buf = buffers[-1]
+        total_size = (
+            last_buf.data_ptr() - base_ptr
+        ) + last_buf.numel() * last_buf.element_size()
+        ret_code = self.store.register_buffer(base_ptr, total_size)
+        if ret_code:
+            logger.warning(
+                "Failed to register staging buffer for NSA indexer RDMA, "
+                "error code: %s",
+                ret_code,
+            )
+            return None
+        return base_ptr
+
+    def _unregister_staging_buffers(self, base_ptr):
+        """Unregister a previously registered staging buffer."""
+        if base_ptr is not None:
+            try:
+                self.store.unregister_buffer(base_ptr)
+            except Exception as e:
+                logger.warning("Failed to unregister staging buffer: %s", e)
+
     def _batch_postprocess(self, results: List[int], is_set_operate=False):
         """
         refer to https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/pybind_client.h
@@ -487,6 +523,29 @@ class MooncakeStore(HiCacheStorage):
         )
         return self._batch_postprocess(get_results, is_set_operate=False)
 
+    def batch_get_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+        key_strs = self._get_extra_keys(keys)
+        buffer_ptrs = [buf.data_ptr() for buf in buffers]
+        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+        # Register staging memory for RDMA (staging tensor is not in
+        # Mooncake-registered memory by default).
+        base_ptr = self._register_staging_buffers(buffers)
+        try:
+            get_results = self._get_batch_zero_copy_impl(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        finally:
+            self._unregister_staging_buffers(base_ptr)
+        return [res > 0 for res in get_results]
+
     def batch_set_v1(
         self,
         keys: List[str],
@@ -524,6 +583,49 @@ class MooncakeStore(HiCacheStorage):
                 set_results[set_indices[i]] = put_results[i]
 
         return self._batch_postprocess(set_results, is_set_operate=True)
+
+    def batch_set_extra(
+        self,
+        keys: List[str],
+        buffers: List[torch.Tensor],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+        key_strs = self._get_extra_keys(keys)
+        buffer_ptrs = [buf.data_ptr() for buf in buffers]
+        buffer_sizes = [buf.numel() * buf.element_size() for buf in buffers]
+        exist_result = self._batch_exist(key_strs)
+
+        set_keys = []
+        set_buffer_ptrs = []
+        set_buffer_sizes = []
+        set_indices = []
+        set_results = [-1] * len(key_strs)
+        for i in range(len(key_strs)):
+            if exist_result[i] != 1:
+                set_keys.append(key_strs[i])
+                set_buffer_ptrs.append(buffer_ptrs[i])
+                set_buffer_sizes.append(buffer_sizes[i])
+                set_indices.append(i)
+            else:
+                set_results[i] = 0
+
+        if len(set_keys) > 0:
+            # Register staging memory for RDMA (staging tensor is not in
+            # Mooncake-registered memory by default).
+            base_ptr = self._register_staging_buffers(buffers)
+            try:
+                put_results = self._put_batch_zero_copy_impl(
+                    set_keys, set_buffer_ptrs, set_buffer_sizes
+                )
+            finally:
+                self._unregister_staging_buffers(base_ptr)
+            for i in range(len(set_indices)):
+                set_results[set_indices[i]] = put_results[i]
+
+        return [res == 0 for res in set_results]
 
     def set(
         self,
@@ -669,6 +771,19 @@ class MooncakeStore(HiCacheStorage):
             if exist_result[i] != 1:
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
+
+    def batch_exists_extra(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        if self.extra_backend_tag is not None:
+            prefix = self.extra_backend_tag
+            keys = [f"{prefix}_{key}" for key in keys]
+        query_keys = self._get_extra_keys(keys)
+        exist_result = self._batch_exist(query_keys)
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                return i
+        return len(query_keys)
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so

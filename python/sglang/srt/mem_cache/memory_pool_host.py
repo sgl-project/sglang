@@ -1186,3 +1186,63 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         self._backup_indexer_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
+
+    def pack_indexer_pages(self, host_indices: torch.Tensor) -> torch.Tensor:
+        if host_indices.numel() == 0:
+            return torch.empty(
+                (0, self.layer_num, self.indexer_page_stride_size),
+                dtype=self.indexer_dtype,
+                device=self.device,
+            )
+        if host_indices.numel() % self.page_size != 0:
+            raise ValueError(
+                "Index buffer transfer expects page-aligned indices for NSA."
+            )
+        host_page_indices = (
+            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        )
+        if host_page_indices.device.type != "cpu":
+            host_page_indices = host_page_indices.cpu()
+        staging = torch.empty(
+            (host_page_indices.numel(), self.layer_num, self.indexer_page_stride_size),
+            dtype=self.indexer_dtype,
+            device=self.device,
+        )
+        for layer_id in range(self.layer_num):
+            staging[:, layer_id, :] = self.index_k_with_scale_buffer[layer_id][
+                host_page_indices
+            ]
+        return staging
+
+    def unpack_indexer_pages(
+        self,
+        host_indices: torch.Tensor,
+        staging: torch.Tensor,
+        page_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if host_indices.numel() == 0:
+            return
+        if host_indices.numel() % self.page_size != 0:
+            raise ValueError(
+                "Index buffer transfer expects page-aligned indices for NSA."
+            )
+        host_page_indices = (
+            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
+        )
+        if host_page_indices.device.type != "cpu":
+            host_page_indices = host_page_indices.cpu()
+        if page_mask is not None:
+            if not torch.is_tensor(page_mask):
+                page_mask = torch.tensor(page_mask, dtype=torch.bool)
+            if page_mask.device.type != "cpu":
+                page_mask = page_mask.cpu()
+            host_page_indices = host_page_indices[page_mask]
+            staging = staging[page_mask]
+        if host_page_indices.numel() == 0:
+            return
+        if staging.device.type != "cpu":
+            staging = staging.cpu()
+        for layer_id in range(self.layer_num):
+            self.index_k_with_scale_buffer[layer_id][host_page_indices] = staging[
+                :, layer_id, :
+            ]
