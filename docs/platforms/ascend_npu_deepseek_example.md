@@ -126,7 +126,6 @@ export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 unset TASK_QUEUE_ENABLE
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 
 # suggest max-running-requests <= max-cuda-graph-bs * dp_size, Because when this value is exceeded, performance will significantly degrade.
 python -m sglang.launch_server \
