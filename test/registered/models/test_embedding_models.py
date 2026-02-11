@@ -42,9 +42,17 @@ MODEL_TO_CONFIG = {
     "intfloat/e5-mistral-7b-instruct": (1, 1e-5),
     "marco/mcdse-2b-v1": (1, 1e-5),
     "Qwen/Qwen3-Embedding-8B": (1, 1e-5),
+    "nvidia/llama-embed-nemotron-8b": (1, 1e-5),
     # Temporarily disable before this model is fixed
     # "jason9693/Qwen2.5-1.5B-apeach": (1, 1e-5),
 }
+
+# Models that require trust_remote_code=True
+TRUST_REMOTE_CODE_MODELS = {"nvidia/llama-embed-nemotron-8b"}
+
+# Bidirectional (non-causal) models need chunked prefill disabled to avoid
+# causal masking artifacts when long and short sequences share a batch.
+BIDIRECTIONAL_MODELS = {"nvidia/llama-embed-nemotron-8b"}
 MODELS = [(key, *MODEL_TO_CONFIG[key]) for key in MODEL_TO_CONFIG]
 
 TORCH_DTYPES = [torch.float16]
@@ -57,10 +65,13 @@ class TestEmbeddingModels(CustomTestCase):
         mp.set_start_method("spawn", force=True)
 
     def _truncate_prompts(self, prompts, model_path):
-        config = AutoConfig.from_pretrained(model_path)
+        trust_remote = model_path in TRUST_REMOTE_CODE_MODELS
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote)
         max_length = getattr(config, "max_position_embeddings", 2048)
 
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote
+        )
 
         truncated_prompts = []
         for prompt in prompts:
@@ -84,22 +95,28 @@ class TestEmbeddingModels(CustomTestCase):
         matryoshka_dim: Optional[int] = None,
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
+        trust_remote = model_path in TRUST_REMOTE_CODE_MODELS
 
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,
             model_type="embedding",
             matryoshka_dim=matryoshka_dim,
+            trust_remote_code=trust_remote,
         ) as hf_runner:
             hf_outputs = hf_runner.forward(truncated_prompts)
 
         attention_backend = "triton" if is_in_amd_ci() else None
+        is_bidirectional = model_path in BIDIRECTIONAL_MODELS
         with SRTRunner(
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
             attention_backend=attention_backend,
+            trust_remote_code=trust_remote,
+            disable_radix_cache=is_bidirectional,
+            chunked_prefill_size=-1 if is_bidirectional else None,
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
             ),

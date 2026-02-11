@@ -99,7 +99,10 @@ def get_token_ids_logprobs(logits, token_ids):
 
 
 def _get_sentence_transformer_embedding_model(
-    model_path, torch_dtype, matryoshka_dim: Optional[int] = None
+    model_path,
+    torch_dtype,
+    matryoshka_dim: Optional[int] = None,
+    trust_remote_code: bool = False,
 ):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
@@ -109,11 +112,14 @@ def _get_sentence_transformer_embedding_model(
             model_path,
             model_kwargs={"torch_dtype": torch_dtype},
             truncate_dim=matryoshka_dim,
+            trust_remote_code=trust_remote_code,
         )
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
 
-        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        word_embedding_model = models.Transformer(
+            model_path, model_args={"trust_remote_code": trust_remote_code}
+        ).to(dtype=torch_dtype)
         pooling_model = models.Pooling(
             word_embedding_model.get_word_embedding_dimension(),
             pooling_mode="lasttoken",
@@ -286,7 +292,10 @@ class HFRunner:
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
-                    model_path, torch_dtype, matryoshka_dim=matryoshka_dim
+                    model_path,
+                    torch_dtype,
+                    matryoshka_dim=matryoshka_dim,
+                    trust_remote_code=self.trust_remote_code,
                 )
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
@@ -353,7 +362,7 @@ class HFRunner:
                                 ),
                             ).tolist()
                     else:
-                        logits = self.model.encode(prompts).tolist()
+                        logits = self.model.encode(prompts, batch_size=1).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
                 elif self.model_type == "cross_encoder":
                     inputs = self.tokenizer(
