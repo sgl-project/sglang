@@ -1566,7 +1566,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if self.enable_flashinfer_trtllm_moe:
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,
@@ -1667,7 +1667,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if get_moe_runner_backend().is_flashinfer_trtllm():
+        moe_runner_backend = get_moe_runner_backend()
+
+        if moe_runner_backend.is_auto():
+            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+
+        if moe_runner_backend.is_flashinfer_trtllm():
+            self.enable_flashinfer_trtllm_moe = True
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
