@@ -1134,8 +1134,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 q_for_kernel = query.squeeze(0).contiguous()
                 k_for_kernel = key.squeeze(0).contiguous()
                 v_for_kernel = value.squeeze(0).contiguous()
-                # Should? FlashInfer GDN prefill does not apply QK L2 norm internally.
-                # Keep behavior aligned with the non-FlashInfer path.
                 q_for_kernel = l2norm_fwd(q_for_kernel)
                 k_for_kernel = l2norm_fwd(k_for_kernel)
                 # FlashInfer expects alpha in probability space, not log space.
