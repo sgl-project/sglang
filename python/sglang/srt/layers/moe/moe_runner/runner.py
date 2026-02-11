@@ -37,6 +37,12 @@ class MoeRunner:
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_flashinfer_cutedsl():
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                FlashInferCuteDslRunnerCore,
+            )
+
+            self.runner_core = FlashInferCuteDslRunnerCore(config)
         elif runner_backend.is_marlin():
             self.runner_core = None  # Marlin only supports fused path
         elif runner_backend.is_flashinfer_trtllm():

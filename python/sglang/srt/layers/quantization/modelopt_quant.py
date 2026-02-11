@@ -58,10 +58,10 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
-    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DispatchOutput,
         StandardDispatchOutput,
     )
     from sglang.srt.models.utils import WeightsMapper
@@ -1669,12 +1669,62 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(
                 MoeRunnerBackend.FLASHINFER_TRTLLM, moe_runner_config
             )
+        elif get_moe_runner_backend().is_flashinfer_cutedsl():
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTEDSL, moe_runner_config
+            )
 
     def apply(
         self,
         layer: FusedMoE,
-        dispatch_output: StandardDispatchOutput,
+        dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            assert (
+                self.enable_flashinfer_cutedsl_moe
+            ), "deepep_ll dispatch is only supported for flashinfer_cutedsl"
+            assert (
+                self.runner is not None
+            ), "flashinfer_cutedsl requires MoeRunner to be created"
+            assert (
+                self.moe_runner_config.activation == "silu"
+            ), "Only SiLU activation is supported."
+            assert (
+                not self.moe_runner_config.apply_router_weight_on_input
+            ), "apply_router_weight_on_input is not supported for Flashinfer"
+
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                FlashInferCuteDslNvFp4MoeQuantInfo,
+            )
+
+            quant_info = FlashInferCuteDslNvFp4MoeQuantInfo(
+                input_global_scale=(
+                    None if MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+                ),
+                w13_weight=layer.w13_weight,
+                w13_blockscale_swizzled=layer.w13_blockscale_swizzled,
+                g1_alphas=layer.g1_alphas,
+                w2_weight=layer.w2_weight,
+                w2_input_scale_quant=layer.w2_input_scale_quant,
+                w2_blockscale_swizzled=layer.w2_blockscale_swizzled,
+                g2_alphas=layer.g2_alphas,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if self.enable_flashinfer_cutedsl_moe:
+            raise NotImplementedError(
+                "flashinfer_cutedsl ModelOpt NVFP4 MoE currently only supports deepep_ll dispatch output."
+            )
+
+        if not DispatchOutputChecker.format_is_standard(dispatch_output):
+            raise NotImplementedError(
+                f"{type(self).__name__} only supports standard/deepep_ll dispatch outputs, "
+                f"got {dispatch_output.format=}."
+            )
+        if TYPE_CHECKING:
+            assert isinstance(dispatch_output, StandardDispatchOutput)
 
         x = dispatch_output.hidden_states
         x_sf = dispatch_output.hidden_states_scale
@@ -1801,52 +1851,3 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         return StandardCombineInput(hidden_states=output)
-
-    def apply_without_routing_weights(
-        self,
-        layer: FusedMoE,
-        x: tuple[torch.Tensor, Optional[torch.Tensor]],
-        masked_m: torch.Tensor,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        assert (
-            moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
-        assert self.enable_flashinfer_cutedsl_moe, "only support flashinfer cutedsl moe"
-        assert (
-            not moe_runner_config.apply_router_weight_on_input
-        ), "apply_router_weight_on_input is not supported for Flashinfer"
-
-        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
-            flashinfer_cutedsl_moe_masked,
-        )
-
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
-            layer, "down_gemm_overlap_args", None
-        )
-
-        out = flashinfer_cutedsl_moe_masked(
-            hidden_states=x,
-            input_global_scale=(
-                None if MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
-            ),
-            w1=layer.w13_weight,
-            w1_blockscale=layer.w13_blockscale_swizzled,
-            w1_alpha=layer.g1_alphas,
-            w2=layer.w2_weight,
-            a2_global_scale=layer.w2_input_scale_quant,
-            w2_blockscale=layer.w2_blockscale_swizzled,
-            w2_alpha=layer.g2_alphas,
-            masked_m=masked_m,
-            **(
-                dict(
-                    down_sm_count=down_gemm_overlap_args.num_sms,
-                    down_signals=down_gemm_overlap_args.signal,
-                    down_start_event=down_gemm_overlap_args.start_event,
-                )
-                if down_gemm_overlap_args is not None
-                else {}
-            ),
-        )
-        return out
