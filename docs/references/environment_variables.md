@@ -89,6 +89,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DSA_FUSE_TOPK` | Fuse the operation of picking topk logits and picking topk indices from page table  | `true` |
 | `SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA` | Precompute metadata that can be shared among different draft steps when MTP is enabled | `true` |
 
+> **Note:** The old `SGLANG_NSA_*` environment variable names (e.g. `SGLANG_NSA_FUSE_TOPK`, `SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA`, `SGLANG_NSA_FORCE_MLA`) are deprecated and will be removed in a future version. Please migrate to the `SGLANG_DSA_*` names listed above.
+
 
 ## Memory Management
 

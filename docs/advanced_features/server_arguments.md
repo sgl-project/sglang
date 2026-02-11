@@ -565,3 +565,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--load-watch-interval` | The interval of load watching in seconds. | `0.1` | Type: float |
 | `--dsa-prefill` | Choose the DSA backend for the prefill stage (overrides `--attention-backend` when running DeepSeek DSA-style attention). | `flashmla_sparse` | `flashmla_sparse`, `flashmla_decode`, `fa3`, `tilelang`, `aiter` |
 | `--dsa-decode` | Choose the DSA backend for the decode stage when running DeepSeek DSA-style attention. Overrides `--attention-backend` for decoding. | `flashmla_kv` | `flashmla_prefill`, `flashmla_kv`, `fa3`, `tilelang`, `aiter` |
+| `--nsa-prefill-backend` | Deprecated. Please use `--dsa-prefill-backend` instead. | N/A | Same as `--dsa-prefill-backend` |
+| `--nsa-decode-backend` | Deprecated. Please use `--dsa-decode-backend` instead. | N/A | Same as `--dsa-decode-backend` |
+| `--enable-nsa-prefill-context-parallel` | Deprecated. Please use `--enable-dsa-prefill-context-parallel` instead. | N/A | N/A |
+| `--nsa-prefill-cp-mode` | Deprecated. Please use `--dsa-prefill-cp-mode` instead. | N/A | Same as `--dsa-prefill-cp-mode` |
+| `--attention-backend=nsa` | Deprecated. Please use `--attention-backend=dsa` instead. | N/A | N/A |

@@ -29,6 +29,20 @@ def temp_set_env(**env_vars: dict[str, Any]):
                 os.environ[key] = value
 
 
+# Mapping of deprecated environment variable names to their new names.
+# If a user sets an old name, it will be forwarded with a deprecation warning.
+_DEPRECATED_ENV_ALIASES: dict[str, str] = {
+    "SGLANG_NSA_FUSE_TOPK": "SGLANG_DSA_FUSE_TOPK",
+    "SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA": "SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA",
+    "SGLANG_NSA_FORCE_MLA": "SGLANG_DSA_FORCE_MLA",
+}
+
+# Build reverse lookup: new_name -> old_name
+_NEW_TO_DEPRECATED_ENV: dict[str, str] = {
+    v: k for k, v in _DEPRECATED_ENV_ALIASES.items()
+}
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -53,6 +67,18 @@ class EnvField:
             assert value == str(None)
             return None
 
+        # Check for deprecated env var alias if the canonical name is not set
+        if value is None and self.name in _NEW_TO_DEPRECATED_ENV:
+            old_name = _NEW_TO_DEPRECATED_ENV[self.name]
+            value = os.getenv(old_name)
+            if value is not None:
+                warnings.warn(
+                    f"Environment variable '{old_name}' is deprecated and will be removed "
+                    f"in a future version. Please use '{self.name}' instead.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+
         # Not set, return default
         if value is None:
             return self.default
@@ -66,7 +92,12 @@ class EnvField:
             return self.default
 
     def is_set(self):
-        return self.name in os.environ
+        if self.name in os.environ:
+            return True
+        # Also check deprecated alias
+        if self.name in _NEW_TO_DEPRECATED_ENV:
+            return _NEW_TO_DEPRECATED_ENV[self.name] in os.environ
+        return False
 
     def set(self, value: Any):
         self._set_to_none = value is None

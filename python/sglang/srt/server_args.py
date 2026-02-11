@@ -125,6 +125,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "dsa",
+    "nsa",  # Deprecated alias for "dsa", will be removed in a future version
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -826,6 +827,19 @@ class ServerArgs:
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
             self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+
+        # Handle deprecated "nsa" attention backend name (renamed to "dsa")
+        for attr in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            if getattr(self, attr) == "nsa":
+                logger.warning(
+                    f"The attention backend name 'nsa' is deprecated and will be removed in a future version. "
+                    f"Please use 'dsa' instead (e.g. --{attr.replace('_', '-')}=dsa)."
+                )
+                setattr(self, attr, "dsa")
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
@@ -3796,6 +3810,25 @@ class ServerArgs:
             choices=DSA_CHOICES,
             help="DSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
+        # Deprecated --nsa-* aliases (will be removed in a future version)
+        parser.add_argument(
+            "--nsa-prefill-backend",
+            dest="dsa_prefill_backend",
+            type=str,
+            choices=DSA_CHOICES,
+            action=DeprecatedAliasAction,
+            new_option_string="--dsa-prefill-backend",
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--nsa-decode-backend",
+            dest="dsa_decode_backend",
+            type=str,
+            choices=DSA_CHOICES,
+            action=DeprecatedAliasAction,
+            new_option_string="--dsa-decode-backend",
+            help=argparse.SUPPRESS,
+        )
         parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
@@ -4686,6 +4719,26 @@ class ServerArgs:
             choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
+        )
+        # Deprecated --nsa-* aliases (will be removed in a future version)
+        parser.add_argument(
+            "--enable-nsa-prefill-context-parallel",
+            dest="enable_dsa_prefill_context_parallel",
+            action=DeprecatedAliasAction,
+            new_option_string="--enable-dsa-prefill-context-parallel",
+            nargs=0,
+            const=True,
+            default=False,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            dest="dsa_prefill_cp_mode",
+            type=str,
+            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
+            action=DeprecatedAliasAction,
+            new_option_string="--dsa-prefill-cp-mode",
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--enable-fused-qk-norm-rope",
@@ -5653,6 +5706,31 @@ class DeprecatedAction(argparse.Action):
         print_deprecated_warning(
             f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
         )
+
+
+class DeprecatedAliasAction(argparse.Action):
+    """Action for deprecated CLI arguments that still forward their value.
+
+    Use this when an argument has been renamed but the old name should still
+    work temporarily.  The value is stored under *dest* (which should point to
+    the new canonical attribute) and a deprecation warning is emitted.
+    """
+
+    def __init__(self, option_strings, dest, new_option_string=None, **kwargs):
+        self.new_option_string = new_option_string
+        super().__init__(option_strings, dest, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        new_name = self.new_option_string or self.dest
+        print_deprecated_warning(
+            f"The command line argument '{option_string}' is deprecated and will be removed in a future version. "
+            f"Please use '{new_name}' instead."
+        )
+        # For nargs=0 (boolean flags), use const; otherwise use the parsed values.
+        if self.nargs == 0:
+            setattr(namespace, self.dest, self.const)
+        else:
+            setattr(namespace, self.dest, values)
 
 
 def auto_choose_speculative_params(self: ServerArgs):
