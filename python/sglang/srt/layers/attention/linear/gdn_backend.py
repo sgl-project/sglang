@@ -4,8 +4,9 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.gdn_kernel_dispatcher import GDNKernelDispatcher
+from sglang.srt.layers.attention.linear.kernels.triton_gdn import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
+    LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
@@ -18,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils.common import rank0_log
 
 if not is_cpu():
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
@@ -44,6 +46,127 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+class GDNKernelDispatcher:
+    """Dispatches GDN kernel calls to the appropriate backend per mode."""
+
+    def __init__(
+        self,
+        decode_backend: LinearAttnKernelBackend,
+        prefill_backend: LinearAttnKernelBackend,
+    ):
+        triton_kernel = TritonGDNKernel()
+
+        if decode_backend.is_triton():
+            self.decode_kernel = triton_kernel
+        elif decode_backend.is_cutedsl():
+            if not is_cuda():
+                raise ValueError("CuTe DSL backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.cutedsl_gdn import (
+                CuteDSLGDNKernel,
+            )
+
+            self.decode_kernel = CuteDSLGDNKernel()
+        else:
+            raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
+
+        if prefill_backend.is_triton():
+            self.extend_kernel = triton_kernel
+        elif prefill_backend.is_cutedsl():
+            raise ValueError(
+                "CuTe DSL backend only supports decode, not prefill. "
+                "Use --linear-attn-prefill-backend triton instead."
+            )
+        else:
+            raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
+
+        self.verify_kernel = triton_kernel
+
+        rank0_log(
+            f"GDN kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
+            f"extend={self.extend_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__}"
+        )
+
+    def decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.decode_kernel.decode(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> tuple:
+        return self.extend_kernel.extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def target_verify(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
 
 
 class GDNAttnBackend(MambaAttnBackendBase):

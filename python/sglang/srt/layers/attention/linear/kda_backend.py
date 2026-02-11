@@ -4,8 +4,9 @@ import torch
 from einops import rearrange
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.kda_kernel_dispatcher import KDAKernelDispatcher
+from sglang.srt.layers.attention.linear.kernels.triton_kda import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
+    LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
 )
@@ -15,7 +16,10 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils.common import rank0_log
 
+# KDA always uses the triton causal_conv1d_fn (no CUDA override).
+# Only causal_conv1d_update needs platform-specific overrides for decode.
 if is_npu():
     from sgl_kernel_npu.mamba.causal_conv1d import causal_conv1d_update_npu
 
@@ -27,6 +31,92 @@ elif is_cpu():
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+class KDAKernelDispatcher:
+    """Dispatches KDA kernel calls to the appropriate backend per mode."""
+
+    def __init__(
+        self,
+        decode_backend: LinearAttnKernelBackend,
+        prefill_backend: LinearAttnKernelBackend,
+    ):
+        triton_kernel = TritonKDAKernel()
+
+        if decode_backend.is_triton():
+            self.decode_kernel = triton_kernel
+        else:
+            raise ValueError(
+                f"Unsupported KDA decode backend: {decode_backend}. "
+                "KDA currently only supports 'triton'."
+            )
+
+        if prefill_backend.is_triton():
+            self.extend_kernel = triton_kernel
+        else:
+            raise ValueError(
+                f"Unsupported KDA prefill backend: {prefill_backend}. "
+                "KDA currently only supports 'triton'."
+            )
+
+        rank0_log(
+            f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
+            f"extend={self.extend_kernel.__class__.__name__}"
+        )
+
+    def decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.decode_kernel.decode(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.extend_kernel.extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            **kwargs,
+        )
 
 
 class KDAAttnBackend(MambaAttnBackendBase):
