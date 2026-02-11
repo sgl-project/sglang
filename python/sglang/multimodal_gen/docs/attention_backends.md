@@ -22,6 +22,7 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 | CLI value | Enum value | Notes |
 |---|---|---|
 | `fa` / `fa3` / `fa4` | `FA` | FlashAttention. `fa3/fa4` are normalized to `fa` during argument parsing (`ServerArgs.__post_init__`). |
+| `lite_attn` | `LITE_ATTN` | LiteAttention (Hopper/SM90 only). Configure via `--attention-backend-config` (e.g. `threshold=-6.0`). Falls back to `fa` if not installed. |
 | `torch_sdpa` | `TORCH_SDPA` | PyTorch `scaled_dot_product_attention`. |
 | `sliding_tile_attn` | `SLIDING_TILE_ATTN` | Sliding Tile Attention (STA). Requires `st_attn`. Configure via `--attention-backend-config`. |
 | `sage_attn` | `SAGE_ATTN` | Requires `sageattention`. Upstream SageAttention CUDA extensions target SM80/SM86/SM89/SM90/SM120 (compute capability 8.0/8.6/8.9/9.0/12.0); see upstream `setup.py`: https://github.com/thu-ml/SageAttention/blob/main/setup.py. |
@@ -80,6 +81,12 @@ Some backends require additional configuration. You can pass these parameters vi
 | `spatial_layer` | `int` | Number of spatial layers. | `1` |
 | `st_layer` | `int` | Number of spatiotemporal layers. | `1` |
 
+#### LiteAttention (`lite_attn`)
+
+| Parameter | Type | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `threshold` | `float` | Log-space threshold for skipping tiles. Lower (more negative) is more aggressive skipping. | `-6.0` |
+
 ## Platform support matrix
 
 | Backend | CUDA | ROCm | MPS | Notes |
@@ -92,6 +99,7 @@ Some backends require additional configuration. You can pass these parameters vi
 | `video_sparse_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `vsa`. Configure `sparsity` via `--attention-backend-config`. |
 | `vmoba_attn` | ✅ | ❌ | ❌ | CUDA-only. Requires `kernel.attn.vmoba_attn.vmoba`. Configure via `--attention-backend-config`. |
 | `aiter` | ✅ | ❌ | ❌ | Requires `aiter`. |
+| `lite_attn` | ✅ | ❌ | ❌ | Hopper-only optional dependency. Configure `threshold` via `--attention-backend-config`. |
 
 ## Usage
 

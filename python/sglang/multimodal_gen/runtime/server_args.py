@@ -242,6 +242,12 @@ class ServerArgs:
         None  # cache-dit config for diffusers
     )
 
+    # LiteAttention backend params (only used when attention_backend == "lite_attn")
+    lite_attn_threshold: float = -6.0
+    lite_attn_max_batch_size: int = 2
+    lite_attn_reverse_skip_list: bool = True
+    lite_attn_use_int8: bool = False
+
     # Distributed executor backend
     nccl_port: Optional[int] = None
 
@@ -501,6 +507,36 @@ class ServerArgs:
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+
+        # LiteAttention options
+        parser.add_argument(
+            "--lite-attn-threshold",
+            type=float,
+            dest="lite_attn_threshold",
+            default=ServerArgs.lite_attn_threshold,
+            help="LiteAttention threshold (log-space), default -6.0.",
+        )
+        parser.add_argument(
+            "--lite-attn-max-batch-size",
+            type=int,
+            dest="lite_attn_max_batch_size",
+            default=ServerArgs.lite_attn_max_batch_size,
+            help="Max batch size for LiteAttention internal pre-allocation.",
+        )
+        parser.add_argument(
+            "--lite-attn-reverse-skip-list",
+            action=StoreBoolean,
+            dest="lite_attn_reverse_skip_list",
+            default=ServerArgs.lite_attn_reverse_skip_list,
+            help="Use reverse skip list format in LiteAttention (recommended).",
+        )
+        parser.add_argument(
+            "--lite-attn-use-int8",
+            action=StoreBoolean,
+            dest="lite_attn_use_int8",
+            default=ServerArgs.lite_attn_use_int8,
+            help="Enable LiteAttention int8 quantization for Q/K.",
         )
         parser.add_argument(
             "--diffusers-attention-backend",
@@ -945,6 +981,7 @@ class ServerArgs:
             if self.attention_backend is not None and self.attention_backend not in (
                 "fa",
                 "sage_attn",
+                "lite_attn",
             ):
                 raise ValueError(
                     "Ring Attention is only supported for flash attention or sage attention backend for now"
