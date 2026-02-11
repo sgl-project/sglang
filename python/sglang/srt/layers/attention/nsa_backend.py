@@ -1789,13 +1789,14 @@ class NativeSparseAttnBackend(
         kv_indptr = torch.zeros(num_tokens + 1, dtype=torch.int32, device=self.device)
         kv_indptr[1:] = torch.cumsum(non_minus1_counts, dim=0)
 
-        # Compact valid global indices
-        total_valid = kv_indptr[-1].item()
-        kv_indices = torch.zeros(total_valid, dtype=torch.int32, device=self.device)
+        # Allocate kv_indices with upper-bound size (num_tokens * topk)
+        topk = page_table_1.shape[1]
+        kv_indices = torch.zeros(
+            num_tokens * topk, dtype=torch.int32, device=self.device
+        )
 
         # Use get_valid_kv_indices kernel to extract valid indices
-        if num_tokens > 0 and total_valid > 0:
-            get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
+        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, num_tokens)
 
         # Build cu_seqlens_q for extend: each token is treated as seq_len_q=1
         cu_seqlens_q = torch.arange(
