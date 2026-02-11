@@ -56,7 +56,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
+    GIT_TAG        fc08e5775a5db960690a41248655168c55bef228
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -550,8 +550,29 @@ set(DEEPGEMM_SOURCES
 
 Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
+# pybind11 and torch C++ headers require full CPython API (they use internal
+# macros like PyTuple_SET_ITEM, _PyUnicodeWriter, etc. which are not available
+# under Py_LIMITED_API). We keep USE_SABI above for the .abi3.so naming so the
+# wheel is installable across Python versions, but undo the Py_LIMITED_API
+# compile definition so the code actually compiles.  This is safe because:
+#   1. torch already constrains the Python version at the wheel level
+#   2. The affected symbols are macros/inline-functions whose ABI is stable
+#      within the CPython 3.x series
+target_compile_options(deep_gemm_cpp PRIVATE "-UPy_LIMITED_API")
+
+# DeepGEMM's Python package (`deep_gemm/__init__.py`) expects the extension module name to be `_C`,
+# i.e. it does `from . import _C`. Make sure the built module is importable as `deep_gemm._C`.
+set_target_properties(deep_gemm_cpp PROPERTIES
+    OUTPUT_NAME "_C"
+    PREFIX ""
+)
+
 # Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+find_library(TORCH_PYTHON_LIB
+    NAMES torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib" "${TORCH_INSTALL_PREFIX}/lib64"
+)
+target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIB}" c10 cuda nvrtc mscclpp_static)
 
 # Add include directories needed by DeepGEMM.
 target_include_directories(deep_gemm_cpp PRIVATE
