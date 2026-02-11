@@ -1,7 +1,6 @@
 # Quantization
 
-This document introduces the model quantization schemes supported in SGLang and how to use them to reduce memory usage
-and accelerate inference.
+This document introduces the model quantization schemes supported in SGLang and how to use them.
 
 ## Nunchaku (SVDQuant)
 
@@ -12,8 +11,7 @@ activations to 4-bit precision (W4A4) while maintaining high visual quality. Thi
 Decomposition (SVD) to decompose the weight matrix into low-rank components and residuals, effectively absorbing
 outliers in activations, making 4-bit quantization possible.
 
-**Nunchaku** is a high-performance inference engine that implements SVDQuant, optimized for low-bit neural networks. It
-is not Quantization-Aware Training (QAT), but directly quantizes pre-trained models.
+**Nunchaku** is a high-performance inference engine that implements SVDQuant, optimized for low-bit neural networks.
 
 Paper: [SVDQuant: Absorbing Outliers by Low-Rank Components for 4-Bit Diffusion Models](https://arxiv.org/abs/2411.05007) (
 ICLR 2025 Spotlight)
@@ -65,7 +63,7 @@ Taking Qwen-Image as an example, several quantized models with different configu
 
 #### 3. Run Quantized Models
 
-When running quantized models using the SGLang CLI, the following arguments are required:
+When running quantized models using the SGLang CLI, the following arguments are relevant:
 
 - `--enable-svdquant`: Enable SVDQuant quantization inference.
 - `--quantized-model-path`: Path to the quantized weight file (can be a single `.safetensors` file or a directory
@@ -84,7 +82,6 @@ sglang generate \
   --width 1024 \
   --height 1024 \
   --save-output \
-  --attention-backend torch_sdpa \
   --enable-svdquant \
   --quantized-model-path /path/to/svdq-int4_r32-qwen-image.safetensors \
   --quantization-precision int4 \
@@ -101,7 +98,6 @@ sglang generate \
   --width 1024 \
   --height 1024 \
   --save-output \
-  --attention-backend torch_sdpa \
   --enable-svdquant \
   --quantized-model-path /path/to/svdq-fp4_r32-qwen-image.safetensors \
   --quantization-precision nvfp4 \
@@ -140,6 +136,3 @@ Choose the appropriate configuration based on your hardware and requirements:
 ### Custom Model Quantization
 
 If you want to quantize your own models, you can use the [DeepCompressor](https://github.com/mit-han-lab/deepcompressor) tool. For detailed instructions, please refer to the Nunchaku official documentation.
-
-
-
