@@ -427,7 +427,6 @@ MODEL_PATH=xxx
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -683,7 +682,6 @@ MODEL_PATH=xxx
 
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 
 LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
 LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
@@ -816,7 +814,6 @@ export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 
 MODEL_PATH=xxx
 
@@ -902,7 +899,6 @@ export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_USE_FIA_NZ=1
-export ENABLE_MOE_NZ=1
 
 python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --tp 16 \
