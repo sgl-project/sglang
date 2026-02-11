@@ -356,7 +356,6 @@ class GPUWorker:
         updater = WeightsUpdater(self.pipeline)
         success, message = updater.update_weights_from_disk(
             model_path,
-            original_model_path=self.server_args.model_path,
             flush_cache=flush_cache,
             target_modules=target_modules,
         )

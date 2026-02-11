@@ -1,9 +1,9 @@
-"""Post-training APIs: weight updates and related operations."""
+"""Weight update API for the diffusion engine."""
 
 from fastapi import APIRouter, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client

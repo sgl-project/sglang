@@ -277,11 +277,21 @@ class LayerwiseOffloadManager:
             self.sync_layer_to_cpu(layer_idx)
 
     @torch.compiler.disable
-    def update_cpu_weights(self, weight_dict: Dict[str, torch.Tensor]) -> Set[str]:
+    def update_cpu_weights(
+        self, weight_dict: Dict[str, torch.Tensor]
+    ) -> Set[str] | None:
         """Update consolidated CPU buffers with new weights.
 
-        For layers currently on GPU, the live GPU parameter is also updated
-        so the change takes effect immediately.
+        When layerwise offload (--dit-layerwise-offload) is enabled, the
+        offload manager replaces GPU parameters with small torch.empty((1,))
+        placeholders while real weights live in consolidated pinned CPU
+        buffers.  A naive param.data.copy_() would fail with a shape
+        mismatch.  Instead, this method writes new weights directly into
+        the CPU buffers, bypassing the placeholders entirely.  For any
+        layer that happens to be resident on GPU at update time, the live
+        GPU tensor is also updated so the change takes effect immediately.
+        This requires no extra GPU memory and does not disturb the offload
+        state.
 
         Args:
             weight_dict: Mapping of parameter name to new weight tensor.
@@ -294,7 +304,7 @@ class LayerwiseOffloadManager:
                 metadata (i.e. the real shape, not the placeholder shape).
         """
         if not self.enabled:
-            return set()
+            return None
 
         updated_names: Set[str] = set()
         for name, loaded_weight in weight_dict.items():

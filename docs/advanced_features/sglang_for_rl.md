@@ -127,6 +127,8 @@ This path trades some I/O overhead for simplicity and flexibility. It integrates
 | `success` | Whether the update succeeded. | - | Type: bool |
 | `message` | Status / error message. | - | Type: str |
 
+> **Note:** The diffusion engine (SGLang-Diffusion) does not currently support hot refit (updating weights while inference is in progress). The diffusion scheduler processes one request at a time and completes the entire inference before handling the next request, so weight updates and inference never run concurrently.
+
 ### Update Weights from Tensor
 
 **When to use:**

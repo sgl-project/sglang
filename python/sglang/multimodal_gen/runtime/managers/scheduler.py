@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
 )
-from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker

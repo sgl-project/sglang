@@ -5,19 +5,23 @@ This module provides WeightsUpdater, which swaps model weights at runtime
 without restarting the server.  It is the diffusion-engine counterpart of the
 LLM engine's ModelRunner.update_weights_from_disk.
 
-Typical usage (from GPUWorker):
+Typical usage (from GPUWorker.update_weights_from_disk):
 
     updater = WeightsUpdater(self.pipeline)
     success, message = updater.update_weights_from_disk(
         model_path,
-        original_model_path=self.server_args.model_path,
+        flush_cache=flush_cache,
+        target_modules=target_modules,
     )
+    if success:
+        self.server_args.model_path = model_path
+    return success, message
 
 Key design decisions:
 
 - All-or-nothing: if any module fails to load, all previously updated
   modules are rolled back to the original weights by reloading from
-  original_model_path.  No partial updates are left behind.
+  pipeline.model_path. No partial updates are left behind.
 
 - Rollback failures propagate: if rollback itself fails, the exception is
   not caught so the caller knows the model is in an inconsistent state.
@@ -41,13 +45,15 @@ Key design decisions:
 from __future__ import annotations
 
 import gc
-import os
-import time
 
 import torch
+from torch.distributed.tensor import DTensor, distribute_tensor
 
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
-from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    find_weights_dir,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
@@ -55,12 +61,6 @@ from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import Diffusers
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-try:
-    from torch.distributed.tensor import DTensor, distribute_tensor
-except ImportError:
-    DTensor = None
-    distribute_tensor = None
 
 logger = init_logger(__name__)
 
@@ -87,7 +87,8 @@ class WeightsUpdater:
 
     Args:
         pipeline: A ComposedPipelineBase (or DiffusersPipeline) instance
-            whose modules will be updated.
+            whose modules will be updated.  The pipeline's model_path
+            attribute is used for rollback on failure.
     """
 
     def __init__(self, pipeline):
@@ -96,7 +97,6 @@ class WeightsUpdater:
     def update_weights_from_disk(
         self,
         model_path: str,
-        original_model_path: str,
         flush_cache: bool = True,
         target_modules: list[str] | None = None,
     ) -> tuple[bool, str]:
@@ -104,18 +104,14 @@ class WeightsUpdater:
 
         Args:
             model_path: HF repo id or local path to the new weights.
-            original_model_path: Path to the currently loaded weights (used
-                for rollback on failure).
             flush_cache: If True, reset TeaCache state after a successful
                 update so that stale cached residuals are not reused.
             target_modules: Explicit list of module names to update.  None
-                or ["all"] updates every nn.Module in the pipeline.
+                updates every nn.Module in the pipeline.
 
         Returns:
-            (success, message) tuple.
+            (success, message) tuple where success is True on success.
         """
-        tic = time.perf_counter()
-        self._original_model_path = original_model_path
         logger.info(f"Updating weights from disk: {model_path}")
 
         try:
@@ -161,10 +157,9 @@ class WeightsUpdater:
 
         if success and flush_cache:
             for _, module in modules_to_update:
-                _reset_cache_state(module)
+                if isinstance(module, TeaCacheMixin):
+                    module.reset_teacache_state()
 
-        elapsed = time.perf_counter() - tic
-        message = f"{message} elapsed={elapsed:.2f}s"
         logger.info(message)
         return success, message
 
@@ -182,7 +177,7 @@ class WeightsUpdater:
         """
         components = get_updatable_modules(self.pipeline)
 
-        if target_modules is None or target_modules == ["all"]:
+        if target_modules is None:
             names = list(components.keys())
         else:
             unknown = [n for n in target_modules if n not in components]
@@ -232,7 +227,7 @@ class WeightsUpdater:
         """
         if not updated_modules:
             return
-        original_path = maybe_download_model(self._original_model_path)
+        original_path = maybe_download_model(self.pipeline.model_path)
         for name in updated_modules:
             module = self.pipeline.get_module(name)
             if module is None:
@@ -247,23 +242,6 @@ class WeightsUpdater:
 # ---------------------------------------------------------------------------
 # Module-level utility functions
 # ---------------------------------------------------------------------------
-
-
-def find_weights_dir(local_path: str, module_name: str) -> str | None:
-    """Locate the safetensors directory for module_name under local_path.
-
-    Diffusion models store weights in per-module subdirectories (e.g.
-    transformer/, vae/, text_encoder/).  This function tries
-    <local_path>/<module_name>/ first, then falls back to local_path
-    itself if it directly contains safetensors files (common for RL
-    checkpoints that save weights in a flat directory).
-    """
-    dir_path = os.path.join(local_path, module_name)
-    if os.path.exists(dir_path):
-        return dir_path
-    if _list_safetensors_files(local_path):
-        return local_path
-    return None
 
 
 def _get_weights_iter(weights_dir: str):
@@ -295,25 +273,21 @@ def _validate_weight_files(
     return weights_map, missing
 
 
-def _get_offload_managers(module: torch.nn.Module) -> list:
-    """Return active offload managers for the given module, if any."""
-    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
-        return [m for m in module.layerwise_offload_managers if m.enabled]
-    return []
-
-
 def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
     """Load weights into a module, handling offload-managed parameters.
 
     For offloaded modules, updates CPU buffers directly via
     update_cpu_weights(); non-offloaded parameters use in-place copy.
     """
-    offload_managers = _get_offload_managers(module)
+    offload_managers: list = []
+    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+
     if offload_managers:
         weight_dict = dict(weights_iter)
         offloaded_names: set[str] = set()
         for manager in offload_managers:
-            offloaded_names |= manager.update_cpu_weights(weight_dict)
+            offloaded_names.update(manager.update_cpu_weights(weight_dict))
         remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
         load_weights_into_model(remaining, dict(module.named_parameters()))
     else:
@@ -330,7 +304,7 @@ def load_weights_into_model(weights_iter, model_params: dict) -> None:
             raise ValueError(
                 f"Shape mismatch for {name}: model={param.shape}, loaded={loaded_weight.shape}"
             )
-        if DTensor is not None and isinstance(param, DTensor):
+        if isinstance(param, DTensor):
             distributed_weight = distribute_tensor(
                 loaded_weight.to(param.dtype),
                 param.device_mesh,
@@ -339,13 +313,3 @@ def load_weights_into_model(weights_iter, model_params: dict) -> None:
             param._local_tensor.copy_(distributed_weight._local_tensor)
         else:
             param.data.copy_(loaded_weight.to(param.dtype))
-
-
-def _reset_cache_state(module: torch.nn.Module) -> None:
-    """Reset Cache state after weight updates.
-
-    After weights change, any cached residuals from previous denoising steps
-    are invalid and must be cleared.
-    """
-    if isinstance(module, TeaCacheMixin):
-        module.reset_teacache_state()
