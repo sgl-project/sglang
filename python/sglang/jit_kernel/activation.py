@@ -24,7 +24,9 @@ def _jit_activation_module(dtype: torch.dtype, act_type: str) -> Module:
     )
 
 
-def silu_and_mul(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+def silu_and_mul(
+    input: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     if out is None:
         out = torch.empty(
             input.shape[:-1] + (input.shape[-1] // 2,),
@@ -36,7 +38,9 @@ def silu_and_mul(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> tor
     return out
 
 
-def gelu_and_mul(input: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+def gelu_and_mul(
+    input: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     if out is None:
         out = torch.empty(
             input.shape[:-1] + (input.shape[-1] // 2,),
