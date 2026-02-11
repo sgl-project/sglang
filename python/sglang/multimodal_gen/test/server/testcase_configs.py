@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -132,8 +132,26 @@ class BaselineConfig:
             ),
         )
 
+    def update(self, path: Path):
+        """Load baseline configuration from JSON file."""
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
 
-@dataclass(frozen=True)
+        scenarios_new = {}
+        for name, cfg in data["scenarios"].items():
+            scenarios_new[name] = ScenarioConfig(
+                stages_ms=cfg["stages_ms"],
+                denoise_step_ms={int(k): v for k, v in cfg["denoise_step_ms"].items()},
+                expected_e2e_ms=float(cfg["expected_e2e_ms"]),
+                expected_avg_denoise_ms=float(cfg["expected_avg_denoise_ms"]),
+                expected_median_denoise_ms=float(cfg["expected_median_denoise_ms"]),
+            )
+
+        self.scenarios.update(scenarios_new)
+        return self
+
+
+@dataclass
 class DiffusionServerArgs:
     """Configuration for a single model/scenario test case."""
 
@@ -164,6 +182,14 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
+
+    extras: list[str] = field(default_factory=lambda: [])
+
+    def __post_init__(self):
+        if self.modality == "image":
+            self.custom_validator = "image"
+        elif self.modality == "video":
+            self.custom_validator = "video"
 
 
 @dataclass(frozen=True)
@@ -312,6 +338,8 @@ TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     fps=4,
 )
+
+DEFAULT_SMALL_MODEL = "Tongyi-MAI/Z-Image-Turbo"
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
@@ -626,6 +654,17 @@ TWO_GPU_CASES_A = [
             prompt=T2V_PROMPT,
         ),
     ),
+    DiffusionTestCase(
+        "fsdp-inference",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL,
+            modality="image",
+            num_gpus=2,
+            warmup=True,
+            extras=["--use-fsdp-inference"],
+        ),
+        T2I_sampling_params,
+    ),
 ]
 
 # Skip turbowan because Triton requires 81920 shared memory, but AMD only has 65536.
@@ -729,4 +768,6 @@ TWO_GPU_CASES_B = [
 ]
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+BASELINE_CONFIG = BaselineConfig.load(
+    Path(__file__).with_name("perf_baselines.json")
+).update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
