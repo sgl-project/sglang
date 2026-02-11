@@ -34,20 +34,46 @@ resolve_python_bin() {
         return 0
     fi
 
-    # Fall back to pip shebang interpreter when python executables are not exported.
-    if command -v pip >/dev/null 2>&1; then
-        local pip_bin shebang pip_python
-        pip_bin="$(command -v pip)"
-        shebang="$(head -n 1 "$pip_bin" 2>/dev/null || true)"
-        if [[ "$shebang" == "#!"* ]]; then
-            pip_python="${shebang#\#!}"
-            if [ -x "$pip_python" ]; then
-                echo "$pip_python"
-                return 0
+    # Fall back to pip/pip3 shebang interpreter when python executables are not exported.
+    for pip_name in pip pip3; do
+        if command -v "$pip_name" >/dev/null 2>&1; then
+            local pip_bin shebang pip_python
+            pip_bin="$(command -v "$pip_name")"
+            shebang="$(head -n 1 "$pip_bin" 2>/dev/null || true)"
+            if [[ "$shebang" == "#!"* ]]; then
+                pip_python="${shebang#\#!}"
+                if [ -x "$pip_python" ]; then
+                    echo "$pip_python"
+                    return 0
+                fi
             fi
         fi
+    done
+
+    return 1
+}
+
+# Run pip in environments where only a subset of pip/python binaries are exported.
+run_pip() {
+    if command -v pip >/dev/null 2>&1; then
+        pip "$@"
+        return $?
+    fi
+    if command -v pip3 >/dev/null 2>&1; then
+        pip3 "$@"
+        return $?
     fi
 
+    local py_bin="${PYTHON_BIN:-}"
+    if [ -z "$py_bin" ]; then
+        py_bin="$(resolve_python_bin || true)"
+    fi
+    if [ -n "$py_bin" ]; then
+        "$py_bin" -m pip "$@"
+        return $?
+    fi
+
+    echo "ERROR: pip is not available on PATH and no Python interpreter could be resolved."
     return 1
 }
 
@@ -128,18 +154,18 @@ else
 fi
 
 # Install uv
-pip install --upgrade pip
+run_pip install --upgrade pip
 
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
-    PIP_CMD="pip"
+    PIP_CMD="run_pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
-    PIP_UNINSTALL_CMD="pip uninstall -y"
+    PIP_UNINSTALL_CMD="run_pip uninstall -y"
     PIP_UNINSTALL_SUFFIX="--break-system-packages"
 else
     # In normal cases, we use uv, which is much faster than pip.
-    pip install uv
+    run_pip install uv
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
@@ -208,7 +234,7 @@ elif [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ ! -d "sgl-kernel/dist" ]; 
 else
     # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
     if [ "$IS_BLACKWELL" = "1" ]; then
-        INSTALLED_SGL_KERNEL=$(pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+        INSTALLED_SGL_KERNEL=$(run_pip show sgl-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
         if [ "$INSTALLED_SGL_KERNEL" = "$SGL_KERNEL_VERSION_FROM_SRT" ]; then
             echo "sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} already installed, skipping reinstall"
         else
@@ -235,7 +261,7 @@ fi
 # DeepEP depends on nvshmem 3.4.5
 # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
 if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_NVSHMEM=$(pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    INSTALLED_NVSHMEM=$(run_pip show nvidia-nvshmem-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     if [ "$INSTALLED_NVSHMEM" = "3.4.5" ]; then
         echo "nvidia-nvshmem-cu12==3.4.5 already installed, skipping reinstall"
     else
@@ -248,7 +274,7 @@ fi
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 # On Blackwell machines, skip reinstall if correct version already installed to avoid race conditions
 if [ "$IS_BLACKWELL" = "1" ]; then
-    INSTALLED_CUDNN=$(pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
+    INSTALLED_CUDNN=$(run_pip show nvidia-cudnn-cu12 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     if [ "$INSTALLED_CUDNN" = "9.16.0.29" ]; then
         echo "nvidia-cudnn-cu12==9.16.0.29 already installed, skipping reinstall"
     else
@@ -288,7 +314,7 @@ fi
 if [ "$FLASHINFER_INSTALLED" = false ]; then
     for i in {1..5}; do
         # Download wheel to cache directory (use pip directly as uv pip doesn't support download)
-        if pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
+        if run_pip download flashinfer-jit-cache==${FLASHINFER_VERSION} \
             --index-url https://flashinfer.ai/whl/${CU_VERSION} \
             -d "${FLASHINFER_CACHE_DIR}"; then
 
