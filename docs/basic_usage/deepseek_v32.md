@@ -53,14 +53,14 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --ep
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8
 
 # Launch with TP on MI30x/MI35x
-python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --nsa-prefill-backend tilelang --nsa-decode-backend tilelang
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dsa-prefill-backend tilelang --dsa-decode-backend tilelang
 ```
 
 ### Configuration Tips
 - **DP Attention (Recommended)**: For DeepSeek V3.2 model, the kernels are customized for the use case of `dp_size=8`, so DP attention (`--dp 8 --enable-dp-attention`) is the recommended configuration for better stability and performance. All test cases use this configuration by default.
 - **Pure TP Mode**: Launching with pure TP (without `--dp` and `--enable-dp-attention`) is also supported. Note that this mode has not been fully validated in PD disaggregation scenarios.
-- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the NSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance. `MHA_ONE_SHOT` computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
-- **Choices of Attention Kernels**: The attention backend is automatically set to `nsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--nsa-prefill-backend` and `--nsa-decode-backend` server arguments. The choices of nsa prefill/decode attention kernels include:
+- **Short-sequence MHA prefill (adaptive)**: For short prefill sequences (default threshold: **2048 tokens**), the DSA backend uses standard MHA automatically (no extra flags). On H200 (SM90) this path uses the FlashAttention variable-length kernel; on B200 (SM100) it uses TRT-LLM ragged MHA. MHA uses `MHA_ONE_SHOT` for best performance. `MHA_ONE_SHOT` computes multi-head attention over all tokens (both cached prefix and newly extended tokens) in a single kernel invocation, avoiding the overhead of chunked KV cache processing. This achieves optimal throughput for short sequences where total sequence length fits within the chunk capacity limit.
+- **Choices of Attention Kernels**: The attention backend is automatically set to `dsa` attention backend for DeepSeek V3.2 model. In this backend, different kernels for sparse prefilling/decoding are implemented, which can be specified by `--dsa-prefill-backend` and `--dsa-decode-backend` server arguments. The choices of dsa prefill/decode attention kernels include:
   - `flashmla_sparse`: `flash_mla_sparse_fwd` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, kv inputs.
   - `flashmla_kv`: `flash_mla_with_kvcache` kernel from `flash_mla` library. Can run on both Hopper and Blackwell GPUs. It requires bf16 q, fp8 k_cache inputs.
   - `fa3`: `flash_attn_with_kvcache` kernel from `flash_attn` library. Can only run on Hopper GPUs. It requires bf16 q, kv inputs.
@@ -304,11 +304,11 @@ DeepSeek-V3.2-Speciale:
 
 **Note: This feature is only verified on Hopper machines**
 
-For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--nsa-prefill-cp-mode`.
+For context parallel in DeepSeek V3.2 model, we provide two different modes of splitting tokens, which can be controlled with argument `--dsa-prefill-cp-mode`.
 
 ### In sequence splitting (default setting)
 
-The first mode can be enabled by `--nsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
+The first mode can be enabled by `--dsa-prefill-cp-mode in-seq-split`. This mode implements context parallel for DSA by splitting the sequence uniformly between context parallel ranks. At attention stage, each cp rank computes the indexer results of sharded sequence, and collects the whole kv cache through all gather operator.
 
 The communication group for context parallel reuses the one for attention tp, thus `cp_size` equals `atten_tp_size = tp_size / dp_size`.
 
@@ -323,12 +323,12 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example:
 ```bash
 # In-seq splitting mode launched with EP + DP
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode in-seq-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --ep 8 --dp 2 --enable-dp-attention --enable-dsa-prefill-context-parallel --dsa-prefill-cp-mode in-seq-split --max-running-requests 32
 ```
 
 ### Round robin splitting
 
-This mode can be enabled by specifying the parameter `--nsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
+This mode can be enabled by specifying the parameter `--dsa-prefill-cp-mode round-robin-split`, which distributes tokens across ranks based on `token_idx % cp_size`.
 
 In this scenario, compared with the aforementioned method, it additionally supports the fused MoE backend (the fused MoE backend may deliver better performance than DeepEP in single-machine scenarios), FP8 KV-cache, and multi-batch prefill inference. But it cannot be enabled with dp attention together.
 
@@ -337,7 +337,7 @@ For more details, please refer to PR https://github.com/sgl-project/sglang/pull/
 Example usage:
 ```bash
 # Launch with FusedMoe + CP8
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split --max-running-requests 32
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp  --tp 8 --enable-dsa-prefill-context-parallel --dsa-prefill-cp-mode round-robin-split --max-running-requests 32
 ```
 ### Pipeline Parallel + Context Parallel (PP + CP)
 
@@ -360,8 +360,8 @@ python3 -m sglang.launch_server \
   --dist-init-addr <HEAD_NODE_IP>:62001 \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
-  --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode round-robin-split \
+  --enable-dsa-prefill-context-parallel \
+  --dsa-prefill-cp-mode round-robin-split \
   --trust-remote-code \
   --disable-radix-cache \
   --mem-fraction-static 0.8 \
@@ -383,8 +383,8 @@ python3 -m sglang.launch_server \
   --dist-init-addr <HEAD_NODE_IP>:62001 \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
-  --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode round-robin-split \
+  --enable-dsa-prefill-context-parallel \
+  --dsa-prefill-cp-mode round-robin-split \
   --trust-remote-code \
   --disable-radix-cache \
   --mem-fraction-static 0.8 \
@@ -410,8 +410,8 @@ python -m sglang.launch_server \
   --dist-init-addr <PREFILL_HEAD_IP>:20102 \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
-  --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode round-robin-split  \
+  --enable-dsa-prefill-context-parallel \
+  --dsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
   --disable-radix-cache \
@@ -435,8 +435,8 @@ python -m sglang.launch_server \
   --dist-init-addr <PREFILL_HEAD_IP>:20102 \
   --tp 8 --pp-size 2 \
   --dp-size 1 --moe-dense-tp-size 1 \
-  --enable-nsa-prefill-context-parallel \
-  --nsa-prefill-cp-mode round-robin-split  \
+  --enable-dsa-prefill-context-parallel \
+  --dsa-prefill-cp-mode round-robin-split  \
   --disaggregation-ib-device mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3 \
   --trust-remote-code \
   --disable-radix-cache \

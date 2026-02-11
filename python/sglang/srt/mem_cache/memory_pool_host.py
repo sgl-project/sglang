@@ -1103,7 +1103,7 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
             return host_indices, device_indices
         if host_indices.numel() % self.page_size != 0:
             raise ValueError(
-                "Index buffer transfer expects page-aligned indices for NSA."
+                "Index buffer transfer expects page-aligned indices for DSA."
             )
         host_page_indices = (
             host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size

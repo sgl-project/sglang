@@ -9,10 +9,10 @@ from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
 
 class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
     """
-    Sparse attention algorithm for DeepSeek NSA.
+    Sparse attention algorithm for DeepSeek DSA.
 
-    This algorithm uses NSA's native indexer for TopK retrieval.
-    Overrides all parent methods as NSA has its own specialized flow.
+    This algorithm uses DSA's native indexer for TopK retrieval.
+    Overrides all parent methods as DSA has its own specialized flow.
     """
 
     def __init__(self, config, device: torch.device, **kwargs):

@@ -51,7 +51,7 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
-def is_deepseek_nsa(config: PretrainedConfig) -> bool:
+def is_deepseek_dsa(config: PretrainedConfig) -> bool:
     return (
         config.architectures is not None
         and config.architectures[0]
@@ -67,18 +67,18 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     )
 
 
-def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_head_dim
 
 
-def get_nsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_topk
 
 
-def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_n_heads
 
 
@@ -435,8 +435,8 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_text_config)
-                if is_deepseek_nsa(self.hf_text_config)
+                get_dsa_index_head_dim(self.hf_text_config)
+                if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
             # Handle rope scaling

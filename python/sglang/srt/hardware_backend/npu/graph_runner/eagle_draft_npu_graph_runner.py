@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Dict, Union
 import numpy as np
 import torch
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -94,7 +94,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
     def _replay(self, forward_batch: ForwardBatch):
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             seq_lens = forward_batch.seq_lens_cpu.tolist() + [0] * (
                 self.bs - self.raw_bs
             )

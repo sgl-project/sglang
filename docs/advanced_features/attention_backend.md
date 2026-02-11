@@ -50,7 +50,7 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 
 ```{note}
 - FlashAttention 4 is prefill-only for now.
-- NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
+- DSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
 ```{note}

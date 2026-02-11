@@ -18,9 +18,9 @@ from typing import Callable, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
-    nsa_use_prefill_cp,
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.communicator import (
     CommunicateContext,
@@ -39,11 +39,11 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def nsa_enable_prefill_cp():
+def dsa_enable_prefill_cp():
     # After using cp, the communication mode of this part changes.
     # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
     # no longer require additional communication for reduce, scatter, etc.
-    return is_nsa_enable_prefill_cp()
+    return is_dsa_enable_prefill_cp()
 
 
 class NSACPLayerCommunicator(LayerCommunicator):
@@ -151,7 +151,7 @@ class NSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             hidden_states, local_hidden_states = (
                 get_local_dp_buffer(),
@@ -200,7 +200,7 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
     ):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             assert context.attn_dp_size == 1
             input_hidden_states = hidden_states
             hidden_states = hidden_states.tensor_split(context.attn_tp_size)[

@@ -188,7 +188,7 @@ class PrefillBootstrapQueue:
                         self.token_to_kv_pool.get_state_dim_per_tensor()
                     )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.state_type = "nsa"
+                kv_args.state_type = "dsa"
             else:
                 kv_args.state_type = "none"
         else:

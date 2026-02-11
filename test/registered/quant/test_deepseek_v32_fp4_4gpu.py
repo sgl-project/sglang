@@ -30,7 +30,7 @@ class TestDeepseekV32FP4(CustomTestCase):
             "4",
             "--enable-dp-attention",
             "--attention-backend",
-            "nsa",
+            "dsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",

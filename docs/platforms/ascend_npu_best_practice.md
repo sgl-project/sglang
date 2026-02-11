@@ -873,7 +873,7 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 --disable-cuda-graph \
 --nnodes $nnodes --node-rank $VC_TASK_INDEX \
 --disaggregation-bootstrap-port 8995 \
---enable-nsa-prefill-context-parallel  --moe-dense-tp-size 1 \
+--enable-dsa-prefill-context-parallel  --moe-dense-tp-size 1 \
 --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
 --dist-init-addr ${IPs[0]}:10000
 ```

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -108,10 +108,10 @@ class DeepseekMHAForwardMixin:
                 )
             )
 
-            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+            # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
-            if self.use_nsa:
-                # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
+            if self.use_dsa:
+                # DSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
@@ -215,9 +215,9 @@ class DeepseekMHAForwardMixin:
             forward_batch.mha_one_shot
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
-            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+            if self.use_dsa and self.kv_cache_dtype == "fp8_e4m3":
+                # FP8 path: dequantize DSA-specific FP8 format to BF16
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
@@ -428,12 +428,12 @@ class DeepseekMHAForwardMixin:
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
 
-    def _get_mla_kv_buffer_from_fp8_for_nsa(
+    def _get_mla_kv_buffer_from_fp8_for_dsa(
         self: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ):
         """
-        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
+        Dequantize FP8 KV cache to BF16 for MLA attention (DSA-specific format).
 
         Returns: (kv_a, k_pe) both in BF16
         """

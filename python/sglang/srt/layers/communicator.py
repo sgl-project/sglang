@@ -29,9 +29,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
-    nsa_use_prefill_cp,
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -115,7 +115,7 @@ class ScatterMode(Enum):
     @staticmethod
     def model_input_output():
         """The scatter mode for model forward pass input and output data"""
-        if is_nsa_enable_prefill_cp():
+        if is_dsa_enable_prefill_cp():
             return ScatterMode.SCATTERED
         return ScatterMode.TP_ATTN_FULL
 
@@ -170,12 +170,12 @@ class AttnTpContext:
         self.input_scattered_ = False
         self.attn_inputs_: Optional[AttentionInputs] = None
 
-    def init_context(self, q_lora_rank, is_nsa):
+    def init_context(self, q_lora_rank, is_dsa):
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and _is_cuda
             and q_lora_rank is not None
-            and not is_nsa
+            and not is_dsa
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -572,7 +572,7 @@ class LayerCommunicator:
             and forward_batch.dp_padding_mode.is_max_len()
         ):
             return True
-        if nsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
             return True

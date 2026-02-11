@@ -140,7 +140,7 @@ class GraphInputBuffers:
         seq_len_fill_value: int,
         require_gathered_buffer: bool,
         num_tokens_per_bs: int,
-        nsa_enable_prefill_cp: bool,
+        dsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[torch.Tensor]:
@@ -188,7 +188,7 @@ class GraphInputBuffers:
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
 
         if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not nsa_enable_prefill_cp:
+            if require_gathered_buffer and not dsa_enable_prefill_cp:
                 num_tokens_per_dp = bs * num_tokens_per_bs
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,

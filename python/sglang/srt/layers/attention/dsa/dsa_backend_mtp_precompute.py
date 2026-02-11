@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.utils import compute_nsa_seqlens
+from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -36,10 +36,10 @@ class PrecomputedMetadata:
     page_indices: torch.Tensor  # int32, [bs, max_len] or [expanded_bs, max_len]
     real_page_table: Optional[torch.Tensor]  # int32, transformed version
 
-    # NSA seqlens
+    # DSA seqlens
     seqlens_expanded: torch.Tensor  # int32, [expanded_size]
-    nsa_cache_seqlens: torch.Tensor  # int32, [expanded_size]
-    nsa_cu_seqlens_k: torch.Tensor  # int32, [expanded_size+1]
+    dsa_cache_seqlens: torch.Tensor  # int32, [expanded_size]
+    dsa_cu_seqlens_k: torch.Tensor  # int32, [expanded_size+1]
     seqlens_expanded_size: int
 
     # Dimensions
@@ -129,15 +129,15 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         # Get page indices from cache
         page_indices = self.req_to_token[req_pool_indices, :max_len]
 
-        # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(
-            cache_seqlens, nsa_index_topk=self.nsa_index_topk
+        # Compute DSA seqlens
+        dsa_cache_seqlens = compute_dsa_seqlens(
+            cache_seqlens, dsa_index_topk=self.dsa_index_topk
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
-        # Compute NSA cumsum
-        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens)
+        # Compute DSA cumsum
+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table if needed
         if self.real_page_size > 1:
@@ -147,9 +147,9 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # Compute FlashMLA metadata if needed
         flashmla_metadata = None
-        if self.nsa_decode_impl == "flashmla_kv":
+        if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=nsa_cache_seqlens,
+                cache_seqlens=dsa_cache_seqlens,
                 seq_len_q=1,
             )
 
@@ -159,8 +159,8 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,
-            nsa_cache_seqlens=nsa_cache_seqlens,
-            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            dsa_cache_seqlens=dsa_cache_seqlens,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=max_len,
             max_seqlen_k=max_len,
@@ -211,12 +211,12 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             ]
         )
 
-        # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        # Compute DSA seqlens
+        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
-        # NSA cumsum
-        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens)
+        # DSA cumsum
+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table
         if self.real_page_size > 1:
@@ -226,9 +226,9 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # FlashMLA metadata
         flashmla_metadata = None
-        if self.nsa_decode_impl == "flashmla_kv":
+        if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=nsa_cache_seqlens,
+                cache_seqlens=dsa_cache_seqlens,
                 seq_len_q=1,
             )
 
@@ -238,8 +238,8 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,
-            nsa_cache_seqlens=nsa_cache_seqlens,
-            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            dsa_cache_seqlens=dsa_cache_seqlens,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=-1,  # Not used in this mode
             max_seqlen_k=max_seqlen_k,
@@ -288,12 +288,12 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             ]
         )
 
-        # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
+        # Compute DSA seqlens
+        dsa_cache_seqlens = compute_dsa_seqlens(seqlens_expanded, self.dsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
-        # NSA cumsum
-        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens)
+        # DSA cumsum
+        dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens)
 
         # Transform page table
         if self.real_page_size > 1:
@@ -303,9 +303,9 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
 
         # FlashMLA metadata
         flashmla_metadata = None
-        if self.nsa_decode_impl == "flashmla_kv":
+        if self.dsa_decode_impl == "flashmla_kv":
             flashmla_metadata = self._compute_flashmla_metadata(
-                cache_seqlens=nsa_cache_seqlens,
+                cache_seqlens=dsa_cache_seqlens,
                 seq_len_q=1,
             )
 
@@ -315,8 +315,8 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
             page_indices=page_indices,
             real_page_table=real_page_table,
             seqlens_expanded=seqlens_expanded,
-            nsa_cache_seqlens=nsa_cache_seqlens,
-            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            dsa_cache_seqlens=dsa_cache_seqlens,
+            dsa_cu_seqlens_k=dsa_cu_seqlens_k,
             seqlens_expanded_size=seqlens_expanded_size,
             max_len=max_seqlen_k,
             max_seqlen_k=max_seqlen_k,

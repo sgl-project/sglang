@@ -290,9 +290,9 @@ def initialize_dp_attention(
 
     tp_group = get_tp_group()
     # Trick to solve circular references
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
-    use_pynccl = True if is_nsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
+    use_pynccl = True if is_dsa_enable_prefill_cp() else SYNC_TOKEN_IDS_ACROSS_TP
     _ATTN_TP_GROUP = GroupCoordinator(
         [
             list(range(head, head + _ATTN_TP_SIZE))

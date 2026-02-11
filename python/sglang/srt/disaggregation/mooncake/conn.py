@@ -633,8 +633,8 @@ class MooncakeKVManager(CommonKVManager):
                     prefill_state_indices,
                     dst_state_data_ptrs,
                 )
-        elif state_type in ["swa", "nsa"]:
-            # SWA and NSA hybrid models do not support different TP sizes yet
+        elif state_type in ["swa", "dsa"]:
+            # SWA and DSA hybrid models do not support different TP sizes yet
             if (
                 target_rank_registration_info is not None
                 and not self.is_mla_backend

@@ -71,9 +71,9 @@ class TestDeepseekV32TPMTP(CustomTestCase):
             "0.7",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
         ]
         cls.process = popen_launch_server(

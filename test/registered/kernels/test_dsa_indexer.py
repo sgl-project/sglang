@@ -11,12 +11,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.nsa.nsa_indexer import (
+from sglang.srt.layers.attention.dsa.dsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+from sglang.srt.layers.attention.dsa_backend import NativeSparseAttnBackend
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -132,7 +132,7 @@ class MockIndexerMetadata(BaseIndexerMetadata):
         """Return: seq lens for each batch."""
         return torch.tensor(self.seq_lens, dtype=torch.int32, device="cpu")
 
-    def get_nsa_extend_len_cpu(self) -> List[int]:
+    def get_dsa_extend_len_cpu(self) -> List[int]:
         """
         Return: extend seq lens for each batch.
         """
@@ -175,7 +175,7 @@ class MockModelRunner:
         max_context_len = self.config["context_len"]
         max_batch_size = self.config["max_bs"]
 
-        # Create mock hf_config for NSA - instantiate it as an object, not a type
+        # Create mock hf_config for DSA - instantiate it as an object, not a type
         hf_config = type(
             "HfConfig",
             (),
@@ -234,7 +234,7 @@ class MockModelRunner:
             enable_memory_saver=False,
         )
 
-        # Required by backend with NSA-specific attributes
+        # Required by backend with DSA-specific attributes
         self.server_args = type(
             "ServerArgs",
             (),
@@ -243,8 +243,8 @@ class MockModelRunner:
                 "speculative_eagle_topk": None,
                 "speculative_num_draft_tokens": 0,
                 "enable_deterministic_inference": False,
-                "nsa_prefill_backend": "flashmla_sparse",
-                "nsa_decode_backend": "fa3",
+                "dsa_prefill_backend": "flashmla_sparse",
+                "dsa_decode_backend": "fa3",
             },
         )()
 
@@ -256,8 +256,8 @@ class TestNSAIndexer(CustomTestCase):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
         server_args.enable_dp_attention = False
-        server_args.nsa_prefill_backend = "flashmla_sparse"
-        server_args.nsa_decode_backend = "flashmla_sparse"
+        server_args.dsa_prefill_backend = "flashmla_sparse"
+        server_args.dsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
 
         # Check GPU capability for FP8
@@ -412,7 +412,7 @@ class TestNSAIndexer(CustomTestCase):
             "Output should have padding or exact topk size",
         )
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):
         """Test basic indexer creation and initialization."""
         mock_deep_gemm.get_num_sms.return_value = 132
@@ -426,8 +426,8 @@ class TestNSAIndexer(CustomTestCase):
         self.assertEqual(indexer.index_topk, self.config["index_topk"])
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.nsa.triton_kernel.act_quant")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""
         if not self.supports_fp8:
@@ -508,8 +508,8 @@ class TestNSAIndexer(CustomTestCase):
             topk_indices, self.batch_size, self.seq_len, self.config["index_topk"]
         )
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
-    @patch("sglang.srt.layers.attention.nsa.triton_kernel.act_quant")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.triton_kernel.act_quant")
     def test_forward_decode_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in decode mode."""
         if not self.supports_fp8:
@@ -622,7 +622,7 @@ class TestNSAIndexer(CustomTestCase):
         self.assertEqual(topk_indices.shape, (batch_size, topk))
 
     # TODO: enable this test after indexer accuracy aligned
-    # @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    # @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     # def test_indexer_with_different_topk(self, mock_deep_gemm):
     #     """Test indexer with different topk values."""
     #     mock_deep_gemm.get_num_sms.return_value = 132
@@ -632,7 +632,7 @@ class TestNSAIndexer(CustomTestCase):
     #             indexer = self._create_indexer(index_topk=topk)
     #             self.assertEqual(indexer.index_topk, topk)
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     def test_indexer_with_fused_wk(self, mock_deep_gemm):
         """Test indexer creation with fused wk and weights projection."""
         mock_deep_gemm.get_num_sms.return_value = 132
@@ -642,7 +642,7 @@ class TestNSAIndexer(CustomTestCase):
         indexer = self._create_indexer()
         self.assertIsNotNone(indexer)
 
-    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    @patch("sglang.srt.layers.attention.dsa.dsa_indexer.deep_gemm")
     def test_indexer_with_alt_stream(self, mock_deep_gemm):
         """Test indexer creation with alternative CUDA stream."""
         mock_deep_gemm.get_num_sms.return_value = 132

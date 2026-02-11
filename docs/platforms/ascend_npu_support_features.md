@@ -192,8 +192,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--sampling-backend`                   | `None`            | `pytorch`,<br/>`ascend`                                                                        |      A2, A3      |
 | `--grammar-backend`                    | `None`            | `xgrammar`                                                                                     |      A2, A3      |
 | `--mm-attention-backend`               | `None`            | `ascend_attn`                                                                                  |      A2, A3      |
-| `--nsa-prefill-backend`                | `flashmla_sparse` | `flashmla_sparse`,<br/> `flashmla_decode`,<br/>`fa3`,<br/> `tilelang`,<br/> `aiter`            | Special for GPU  |
-| `--nsa-decode-backend`                 | `fa3`             | `flashmla_prefill`,<br/> `flashmla_kv`,<br/> `fa3`,<br/>`tilelang`,<br/> `aiter`               | Special for GPU  |
+| `--dsa-prefill-backend`                | `flashmla_sparse` | `flashmla_sparse`,<br/> `flashmla_decode`,<br/>`fa3`,<br/> `tilelang`,<br/> `aiter`            | Special for GPU  |
+| `--dsa-decode-backend`                 | `fa3`             | `flashmla_prefill`,<br/> `flashmla_kv`,<br/> `fa3`,<br/>`tilelang`,<br/> `aiter`               | Special for GPU  |
 | `--fp8-gemm-backend`                   | `auto`            | `auto`,<br/> `deep_gemm`,<br/> `flashinfer_trtllm`,<br/>`cutlass`,<br/> `triton`,<br/> `aiter` | Special for GPU  |
 | `--disable-flashinfer-`<br/>`autotune` | `False`           | bool flag<br/> (set to enable)                                                                 | Special for GPU  |
 
@@ -359,7 +359,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |     Planned      |
 | `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |   Experimental   |
-| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-dsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 
 ## Dynamic batch tokenizer

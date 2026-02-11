@@ -16,10 +16,10 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache = self.create_tree_cache()
         self.mock_token_allocator = self.create_token_allocator()
         patcher = patch(
-            "sglang.srt.managers.schedule_policy.is_nsa_prefill_cp_in_seq_split",
+            "sglang.srt.managers.schedule_policy.is_dsa_prefill_cp_in_seq_split",
             return_value=False,
         )
-        self.mock_is_nsa = patcher.start()
+        self.mock_is_dsa = patcher.start()
         self.addCleanup(patcher.stop)
 
     def create_tree_cache(

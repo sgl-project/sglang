@@ -1,4 +1,4 @@
-# temp NSA debugging environ
+# temp DSA debugging environ
 from dataclasses import dataclass
 from itertools import accumulate
 from typing import TYPE_CHECKING, List, Tuple, Union
@@ -27,37 +27,37 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
-    return original_seq_lens.clamp(max=nsa_index_topk)
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
+    return original_seq_lens.clamp(max=dsa_index_topk)
 
 
-def is_nsa_enable_prefill_cp():
-    return get_global_server_args().enable_nsa_prefill_context_parallel
+def is_dsa_enable_prefill_cp():
+    return get_global_server_args().enable_dsa_prefill_context_parallel
 
 
-def is_nsa_prefill_cp_in_seq_split():
+def is_dsa_prefill_cp_in_seq_split():
     return (
-        is_nsa_enable_prefill_cp()
-        and get_global_server_args().nsa_prefill_cp_mode == "in-seq-split"
+        is_dsa_enable_prefill_cp()
+        and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
-def is_nsa_prefill_cp_round_robin_split():
+def is_dsa_prefill_cp_round_robin_split():
     return (
-        is_nsa_enable_prefill_cp()
-        and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
+        is_dsa_enable_prefill_cp()
+        and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
-def can_nsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
+def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
     if not forward_batch.forward_mode.is_context_parallel_extend():
         return False
     cp_size = get_attention_tp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return is_nsa_prefill_cp_round_robin_split() and seq_len > 0 and cp_size > 1
+    return is_dsa_prefill_cp_round_robin_split() and seq_len > 0 and cp_size > 1
 
 
-def nsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
+def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
     """
     # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
     |   +-----------before split------------+|
@@ -105,24 +105,24 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = global_num_tokens[get_attention_dp_rank()]
     else:
         tokens = global_num_tokens[0]
-    if can_nsa_prefill_cp_round_robin_split(forward_batch):
+    if can_dsa_prefill_cp_round_robin_split(forward_batch):
         tokens = ceil_div(tokens, attn_tp_size)
     return tokens
 
 
-def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
+def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     if forward_batch.global_num_tokens_cpu is None:
-        return nsa_cache_seqlens
+        return dsa_cache_seqlens
     tokens = cal_padded_tokens(forward_batch)
-    pad_len = tokens - nsa_cache_seqlens.shape[0]
+    pad_len = tokens - dsa_cache_seqlens.shape[0]
     if pad_len > 0:
-        nsa_cache_seqlens = torch.cat(
+        dsa_cache_seqlens = torch.cat(
             [
-                nsa_cache_seqlens,
-                nsa_cache_seqlens.new_zeros(pad_len, *nsa_cache_seqlens.shape[1:]),
+                dsa_cache_seqlens,
+                dsa_cache_seqlens.new_zeros(pad_len, *dsa_cache_seqlens.shape[1:]),
             ]
         )
-    return nsa_cache_seqlens
+    return dsa_cache_seqlens
 
 
 @dataclass
@@ -145,12 +145,12 @@ class NSAContextParallelMetadata:
     total_seq_lens: torch.Tensor = None
 
 
-def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
-    if is_nsa_prefill_cp_round_robin_split():
+def can_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
+    if is_dsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
             seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -159,9 +159,9 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
-        and use_nsa
+        and use_dsa
         and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_nsa_enable_prefill_cp()
+        and is_dsa_enable_prefill_cp()
     ):
         return True
     else:
@@ -169,43 +169,43 @@ def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_round_robin_split_data(input_)
+        return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
-        torch.split(input_, forward_batch.nsa_cp_metadata.split_list, dim=0)
+        torch.split(input_, forward_batch.dsa_cp_metadata.split_list, dim=0)
     )
     result = torch.cat(
-        [input_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index], dim=0
+        [input_list[i] for i in forward_batch.dsa_cp_metadata.zigzag_index], dim=0
     ).view(-1, input_.shape[-1])
     return result
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_tp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_round_robin_split_data(positions)
+        return dsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
-        torch.split(positions, forward_batch.nsa_cp_metadata.split_list, dim=-1)
+        torch.split(positions, forward_batch.dsa_cp_metadata.split_list, dim=-1)
     )
     positions = torch.cat(
-        [position_id_list[i] for i in forward_batch.nsa_cp_metadata.zigzag_index],
+        [position_id_list[i] for i in forward_batch.dsa_cp_metadata.zigzag_index],
         dim=-1,
     )
     return positions
 
 
 @triton.jit
-def nsa_cp_round_robin_split_q_seqs_kernel(
+def dsa_cp_round_robin_split_q_seqs_kernel(
     in_seqs_ptr,
     out_seqs_ptr,
     bs_idx_ptr,
@@ -226,7 +226,7 @@ def nsa_cp_round_robin_split_q_seqs_kernel(
         extra_seq = cur_len - cur_seq * cp_size
 
 
-def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
+def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
     extra_seq = 0
@@ -241,7 +241,7 @@ def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
     return q_seqs, bs_idx
 
 
-def nsa_cp_round_robin_split_q_seqs(
+def dsa_cp_round_robin_split_q_seqs(
     extend_seqs_cpu, extend_seqs
 ) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
     """
@@ -256,7 +256,7 @@ def nsa_cp_round_robin_split_q_seqs(
     cp_size = get_attention_tp_size()
     cp_rank = get_attention_tp_rank()
     # len(ret_q_lens_cpu) == len(bs_idx_cpu)
-    ret_q_lens_cpu, bs_idx_cpu = nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
+    ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
     ret_q_lens = torch.empty(
         (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
     )
@@ -264,18 +264,18 @@ def nsa_cp_round_robin_split_q_seqs(
         (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
     )
     grid = (1,)
-    nsa_cp_round_robin_split_q_seqs_kernel[grid](
+    dsa_cp_round_robin_split_q_seqs_kernel[grid](
         extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
     )
     return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
 
 
-def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
-    if nsa_enable_prefill_cp is None:
-        nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
+    if dsa_enable_prefill_cp is None:
+        dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
     if (
-        forward_batch.nsa_cp_metadata is not None
-        and nsa_enable_prefill_cp
+        forward_batch.dsa_cp_metadata is not None
+        and dsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
         return True
@@ -313,13 +313,13 @@ def cp_attn_tp_all_gather_reorganazied_into_tensor(
     )
     # step3
     outputs_list_max = list(
-        torch.split(input_tensor_all, forward_batch.nsa_cp_metadata.max_rank_len, dim=0)
+        torch.split(input_tensor_all, forward_batch.dsa_cp_metadata.max_rank_len, dim=0)
     )
     outputs = torch.cat(
         [
             outputs_list_max[index][:per_rank_len]
             for index, per_rank_len in enumerate(
-                forward_batch.nsa_cp_metadata.per_rank_actual_token
+                forward_batch.dsa_cp_metadata.per_rank_actual_token
             )
         ],
         dim=0,
@@ -354,7 +354,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -376,18 +376,18 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_attn_tp_all_gather_reorganazied_into_tensor(
         input_tensor,
-        forward_batch.nsa_cp_metadata.total_seq_lens,
+        forward_batch.dsa_cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
     )
     outputs_list = list(
         torch.split(
-            output_tensor, forward_batch.nsa_cp_metadata.reverse_split_len, dim=0
+            output_tensor, forward_batch.dsa_cp_metadata.reverse_split_len, dim=0
         )
     )
     output_tensor = torch.cat(
-        [outputs_list[i] for i in forward_batch.nsa_cp_metadata.cp_reverse_index], dim=0
+        [outputs_list[i] for i in forward_batch.dsa_cp_metadata.cp_reverse_index], dim=0
     )
     output_tensor = output_tensor.view(-1, hidden_size)
     return output_tensor
@@ -447,7 +447,7 @@ def prepare_input_dp_with_cp_dsa(
     cp_size,
     seqs_len,
 ):
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         return True
     """prepare_input_dp_with_cp_dsa-zigzag index
     Example (DP_ATTENT_TP == CP_SIZE == 4):
@@ -548,7 +548,7 @@ def prepare_input_dp_with_cp_dsa(
         device="cuda", dtype=torch.int32
     )
 
-    nsa_cp_metadata = NSAContextParallelMetadata(
+    dsa_cp_metadata = NSAContextParallelMetadata(
         split_list=split_list,
         max_rank_len=max_rank_len,
         zigzag_index=zigzag_index,
@@ -565,4 +565,4 @@ def prepare_input_dp_with_cp_dsa(
         actual_seq_q_next_tensor=actual_seq_q_next_tensor,
         total_seq_lens=kv_len_origin,
     )
-    return nsa_cp_metadata
+    return dsa_cp_metadata

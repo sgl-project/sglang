@@ -47,7 +47,7 @@ class BackendAdaptor(ABC):
 
 
 class NSABackendAdaptor(BackendAdaptor):
-    """Adaptor for NSA (Native Sparse Attention) backend."""
+    """Adaptor for DSA (Native Sparse Attention) backend."""
 
     def __init__(
         self,
@@ -70,9 +70,9 @@ class NSABackendAdaptor(BackendAdaptor):
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """
-        Transform logical page indices to physical device indices for NSA backend.
+        Transform logical page indices to physical device indices for DSA backend.
         """
-        # TODO: Implement NSA backend adaptor logic
+        # TODO: Implement DSA backend adaptor logic
         pass
 
 

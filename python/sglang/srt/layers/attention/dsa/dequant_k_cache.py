@@ -185,7 +185,7 @@ def dequantize_k_cache_paged(
     quant_k_cache = quant_k_cache.view((-1, dim_quant))
 
     # num_tokens can exceed kv_cache_size due to prefix sharing (multiple seqs share same KV slots)
-    # Index bounds validated in nsa_backend.init_forward_metadata
+    # Index bounds validated in dsa_backend.init_forward_metadata
     num_tokens = page_table_1_flattened.shape[0]
     assert quant_k_cache.dtype == torch.float8_e4m3fn
     dim_nope = 512

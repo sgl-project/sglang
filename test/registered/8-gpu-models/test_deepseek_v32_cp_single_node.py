@@ -36,18 +36,18 @@ GSM8K_BASELINE = 0.935
 
 # CP mode arguments
 CP_IN_SEQ_SPLIT_ARGS = [
-    "--enable-nsa-prefill-context-parallel",
-    "--nsa-prefill-cp-mode=in-seq-split",
+    "--enable-dsa-prefill-context-parallel",
+    "--dsa-prefill-cp-mode=in-seq-split",
 ]
 
 CP_ROUND_ROBIN_ARGS = [
-    "--enable-nsa-prefill-context-parallel",
-    "--nsa-prefill-cp-mode=round-robin-split",
+    "--enable-dsa-prefill-context-parallel",
+    "--dsa-prefill-cp-mode=round-robin-split",
 ]
 
 
 class TestDeepseekV32CPSingleNode(unittest.TestCase):
-    """Test class for DeepSeek V3.2 with NSA context parallelism.
+    """Test class for DeepSeek V3.2 with DSA context parallelism.
 
     Tests context parallelism modes with DP+MTP:
     - in-seq-split: In-sequence split CP mode

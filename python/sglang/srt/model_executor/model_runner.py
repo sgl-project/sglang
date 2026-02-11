@@ -86,7 +86,7 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -203,7 +203,7 @@ MLA_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "ascend",
-    "nsa",
+    "dsa",
 ]
 
 CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
@@ -2291,7 +2291,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         # In DP Attention, IDLE batches are padded (batch_size > 0) for MLP sync.
         # in this case, we need to reinit the forward metadata, otherwise the stale
-        # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
+        # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
 
@@ -2420,7 +2420,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.num_token_non_padded is not None
             and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer(self.server_args)
-            and not is_nsa_enable_prefill_cp()
+            and not is_dsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp(
                 server_args=self.server_args,

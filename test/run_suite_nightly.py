@@ -8,7 +8,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # Nightly test suites
 suites = {
     "nightly-1-gpu": [
-        TestFile("test_nsa_indexer.py", 2),
+        TestFile("test_dsa_indexer.py", 2),
         TestFile("test_lora_qwen3.py", 97),
         TestFile("test_lora_radix_cache.py", 200),
         TestFile("test_lora_eviction_policy.py", 200),
