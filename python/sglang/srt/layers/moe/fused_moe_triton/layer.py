@@ -957,16 +957,29 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
+            if TopKOutputChecker.format_is_standard(topk_output):
+                return moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
+            elif TopKOutputChecker.format_is_bypassed(topk_output):
+                return fused_moe_bypassed_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.router_logits,
+                    topk_output.topk_config.top_k,
+                    topk_output.topk_config.topk_group,
+                    topk_output.topk_config.num_expert_group,
+                    topk_output.topk_config.correction_bias,
+                    topk_output.topk_config.renormalize,
+                    self.layer_id,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported topk output format for piecewise cuda graph: {topk_output.format}"
+                )
         else:
             return self.forward_impl(hidden_states, topk_output)
 
@@ -1128,15 +1141,19 @@ class FlashInferFusedMoE(FusedMoE):
         super().__init__(*args, **kwargs)
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        assert TopKOutputChecker.format_is_bypassed(
+            topk_output
+        ), "Only bypassed topk output is supported for flashinfer trtllm moe"
+
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
+            return flashinfer_bf16_moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
                 topk_output.router_logits,
+                topk_output.topk_config.top_k,
+                topk_output.topk_config.topk_group,
+                topk_output.topk_config.num_expert_group,
+                topk_output.topk_config.correction_bias,
+                topk_output.topk_config.renormalize,
                 self.layer_id,
             )
         else:
@@ -1157,8 +1174,6 @@ class FlashInferFusedMoE(FusedMoE):
             self.moe_runner_config.is_gated
         ), "Only gated MoEs are supported for flashinfer trtllm moe"
 
-        assert TopKOutputChecker.format_is_bypassed(topk_output)
-
         router_logits = topk_output.router_logits
         topk_config = topk_output.topk_config
         correction_bias = topk_config.correction_bias
@@ -1174,28 +1189,40 @@ class FlashInferFusedMoE(FusedMoE):
                     "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
                 ) from e
 
+            # Allocate output inside symmetric memory context
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 # TODO: Now trtllm_bf16_moe doesn't support inplace output,
                 # we can move this out when it support that.
-                final_hidden_states = trtllm_bf16_moe(
-                    routing_logits=router_logits,
-                    routing_bias=correction_bias,
-                    hidden_states=hidden_states,
-                    gemm1_weights=self.w13_weight,
-                    gemm2_weights=self.w2_weight,
-                    num_experts=self.num_experts,
-                    top_k=topk_config.top_k,
-                    n_group=topk_config.num_expert_group,
-                    topk_group=topk_config.topk_group,
-                    intermediate_size=self.intermediate_size_per_partition,
-                    local_expert_offset=self.moe_ep_rank * self.num_local_experts,
-                    local_num_experts=self.num_local_experts,
-                    routing_method_type=self.routing_method_type,
-                    routed_scaling_factor=routed_scaling_factor,
-                    tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+                symm_output = torch.empty(
+                    hidden_states.shape[0],
+                    hidden_states.shape[1],
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
                 )
+
+            # Move kernel call outside context manager to avoid graph breaks
+            # during torch.compile for piecewise cuda graph
+            moe_result = trtllm_bf16_moe(
+                routing_logits=router_logits,
+                routing_bias=correction_bias,
+                hidden_states=hidden_states,
+                gemm1_weights=self.w13_weight,
+                gemm2_weights=self.w2_weight,
+                num_experts=self.num_experts,
+                top_k=topk_config.top_k,
+                n_group=topk_config.num_expert_group,
+                topk_group=topk_config.topk_group,
+                intermediate_size=self.intermediate_size_per_partition,
+                local_expert_offset=self.moe_ep_rank * self.num_local_experts,
+                local_num_experts=self.num_local_experts,
+                routing_method_type=self.routing_method_type,
+                tune_max_num_tokens=next_power_of_2(hidden_states.shape[0]),
+            )
+            # Copy result to symmetric memory output
+            symm_output.copy_(moe_result)
+            final_hidden_states = symm_output
 
         else:
 
@@ -1378,6 +1405,60 @@ def moe_forward_piecewise_cuda_graph_impl(
     # only standard topk output is supported for piecewise cuda graph
     topk_output = StandardTopKOutput(
         topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
+    )
+    forward_context = get_forward_context()
+    moe_layer = forward_context.moe_layers[layer_id]
+    return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+@register_custom_op(out_shape="hidden_states")
+def fused_moe_bypassed_piecewise_cuda_graph_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    topk_group: Optional[int],
+    num_expert_group: Optional[int],
+    correction_bias: Optional[torch.Tensor],
+    renormalize: bool,
+    layer_id: int,
+) -> torch.Tensor:
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=TopKConfig(
+            top_k=top_k,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            correction_bias=correction_bias,
+            renormalize=renormalize,
+        ),
+    )
+    forward_context = get_forward_context()
+    moe_layer = forward_context.moe_layers[layer_id]
+    return moe_layer.forward_impl(hidden_states, topk_output)
+
+
+@register_custom_op(out_shape="hidden_states")
+def flashinfer_bf16_moe_forward_piecewise_cuda_graph_impl(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    top_k: int,
+    topk_group: Optional[int],
+    num_expert_group: Optional[int],
+    correction_bias: Optional[torch.Tensor],
+    renormalize: bool,
+    layer_id: int,
+) -> torch.Tensor:
+    topk_output = BypassedTopKOutput(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        topk_config=TopKConfig(
+            top_k=top_k,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            correction_bias=correction_bias,
+            renormalize=renormalize,
+        ),
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]

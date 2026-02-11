@@ -7,6 +7,8 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+# Import to register custom ops for torch.compile compatibility
+import sglang.srt.layers.moe.flashinfer_trtllm_moe  # noqa: F401
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -216,11 +218,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from flashinfer.fused_moe import (
-        trtllm_fp8_block_scale_moe,
-        trtllm_fp8_per_tensor_scale_moe,
-    )
-
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
@@ -250,6 +247,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         a_q, a_sf = per_token_group_quant_fp8(hidden_states, quant_info.weight_block_k)
         a_sf_t = a_sf.t().contiguous()
 
+        # Allocate output inside symmetric memory context
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -257,37 +255,47 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             # It ignored the `output` argument. https://github.com/flashinfer-ai/flashinfer/blob/da01b1bd8f9f22aec8c0eea189ad54860b034947/flashinfer/fused_moe/core.py#L1323-L1325
             # so we put the whole function under the ``use_symmetric_memory`` context manager.
             # If the bug is fixed, we can only put the output tensor allocation under the context manager.
-            output = trtllm_fp8_block_scale_moe(
-                routing_logits=(
-                    router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits
-                ),
-                routing_bias=correction_bias,
-                hidden_states=a_q,
-                hidden_states_scale=a_sf_t,
-                gemm1_weights=quant_info.w13_weight,
-                gemm1_weights_scale=quant_info.w13_weight_scale_inv,
-                gemm2_weights=quant_info.w2_weight,
-                gemm2_weights_scale=quant_info.w2_weight_scale_inv,
-                num_experts=quant_info.global_num_experts,
-                top_k=topk_config.top_k,
-                n_group=(
-                    topk_config.num_expert_group if topk_config.num_expert_group else 0
-                ),
-                topk_group=topk_config.topk_group if topk_config.topk_group else 0,
-                intermediate_size=quant_info.intermediate_size,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-                routing_method_type=routing_method_type,
-                use_shuffled_weight=False,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
             )
+
+        # Move kernel call outside context manager to avoid graph breaks
+        # during torch.compile for piecewise cuda graph.
+        # Use custom op wrapper for torch.compile compatibility.
+        output = torch.ops.sglang.trtllm_fp8_block_scale_moe_wrapper(
+            routing_logits=(
+                router_logits.to(torch.float32)
+                if routing_method_type == RoutingMethodType.DeepSeekV3
+                else router_logits
+            ),
+            routing_bias=correction_bias,
+            hidden_states=a_q,
+            hidden_states_scale=a_sf_t,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale_inv,
+            num_experts=quant_info.global_num_experts,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
+            intermediate_size=int(quant_info.w2_weight.shape[2]),
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+            routing_method_type=routing_method_type,
+            use_shuffled_weight=False,
+            tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+        )
+        symm_output.copy_(output)
+        output = symm_output
     else:
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
@@ -299,36 +307,47 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             None if correction_bias is None else correction_bias.to(torch.bfloat16)
         )
 
+        # Allocate output inside symmetric memory context
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            output = trtllm_fp8_per_tensor_scale_moe(
-                routing_logits=router_logits.to(torch.bfloat16),
-                routing_bias=routing_bias_cast,
-                hidden_states=a_q,
-                gemm1_weights=quant_info.w13_weight,
-                output1_scales_scalar=quant_info.output1_scales_scalar,
-                output1_scales_gate_scalar=quant_info.output1_scales_gate_scalar,
-                gemm2_weights=quant_info.w2_weight,
-                output2_scales_scalar=quant_info.output2_scales_scalar,
-                num_experts=quant_info.global_num_experts,
-                top_k=topk_config.top_k,
-                n_group=(
-                    topk_config.num_expert_group if topk_config.num_expert_group else 0
-                ),
-                topk_group=topk_config.topk_group if topk_config.topk_group else 0,
-                intermediate_size=quant_info.intermediate_size,
-                local_expert_offset=quant_info.local_expert_offset,
-                local_num_experts=quant_info.local_num_experts,
-                routed_scaling_factor=(
-                    runner_config.routed_scaling_factor
-                    if runner_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-                use_routing_scales_on_input=quant_info.use_routing_scales_on_input,
-                routing_method_type=routing_method_type,
-                tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=torch.bfloat16,
+                device=hidden_states.device,
             )
+
+        # Move kernel call outside context manager to avoid graph breaks
+        # during torch.compile for piecewise cuda graph.
+        # Use custom op wrapper for torch.compile compatibility.
+        output = torch.ops.sglang.trtllm_fp8_per_tensor_scale_moe(
+            routing_logits=router_logits.to(torch.bfloat16),
+            routing_bias=routing_bias_cast,
+            hidden_states=a_q,
+            gemm1_weights=quant_info.w13_weight,
+            output1_scales_scalar=quant_info.output1_scales_scalar,
+            output1_scales_gate_scalar=quant_info.output1_scales_gate_scalar,
+            gemm2_weights=quant_info.w2_weight,
+            output2_scales_scalar=quant_info.output2_scales_scalar,
+            num_experts=quant_info.global_num_experts,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
+            intermediate_size=int(quant_info.w2_weight.shape[2]),
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+            use_routing_scales_on_input=False,
+            routing_method_type=routing_method_type,
+            tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
+        )
+        symm_output.copy_(output)
+        output = symm_output
 
     return StandardCombineInput(hidden_states=output)
 
