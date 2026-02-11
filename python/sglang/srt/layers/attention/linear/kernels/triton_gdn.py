@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelCore
+from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelInterface
 from sglang.srt.utils import is_cpu, is_npu
 
 if not is_cpu():
@@ -29,7 +29,7 @@ elif is_cpu():
     )
 
 
-class TritonGDNKernel(LinearAttnKernelCore):
+class TritonGDNKernel(LinearAttnKernelInterface):
     """Triton-based kernel for GDN (Gated Delta Network) linear attention."""
 
     def decode(

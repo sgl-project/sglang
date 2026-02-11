@@ -1,7 +1,7 @@
 import torch
 
 from sglang.srt.environ import Envs
-from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelCore
+from sglang.srt.layers.attention.linear.kernel_backend import LinearAttnKernelInterface
 from sglang.srt.layers.attention.linear.kernels.triton_gdn import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.utils import is_cuda
@@ -36,7 +36,7 @@ class GDNKernelDispatcher:
             f"verify={self._verify_kernel.__class__.__name__}"
         )
 
-    def _resolve_auto(self, triton_kernel: LinearAttnKernelCore):
+    def _resolve_auto(self, triton_kernel: LinearAttnKernelInterface):
         """AUTO: Use CuTe DSL for decode on CUDA if env var is set, else Triton."""
         use_cutedsl = is_cuda() and Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
         if use_cutedsl:
@@ -50,7 +50,7 @@ class GDNKernelDispatcher:
         self._extend_kernel = triton_kernel
         self._verify_kernel = triton_kernel
 
-    def _resolve_cutedsl(self, triton_kernel: LinearAttnKernelCore):
+    def _resolve_cutedsl(self, triton_kernel: LinearAttnKernelInterface):
         """CUTEDSL: Use CuTe DSL for decode, Triton for extend/verify."""
         if not is_cuda():
             raise ValueError("CuTe DSL backend requires CUDA")

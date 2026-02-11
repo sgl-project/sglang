@@ -44,7 +44,7 @@ def get_linear_attn_kernel_backend() -> LinearAttnKernelBackend:
     global LINEAR_ATTN_KERNEL_BACKEND
     if LINEAR_ATTN_KERNEL_BACKEND is None:
         logger.warning(
-            "LINEAR_ATTN_KERNEL_BACKEND is not initialized, using auto backend"
+            "LINEAR_ATTN_KERNEL_BACKEND is not initialized, using triton backend"
         )
-        LINEAR_ATTN_KERNEL_BACKEND = LinearAttnKernelBackend.AUTO
+        LINEAR_ATTN_KERNEL_BACKEND = LinearAttnKernelBackend.TRITON
     return LINEAR_ATTN_KERNEL_BACKEND

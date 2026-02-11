@@ -519,7 +519,7 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
-    linear_attn_kernel_backend: str = "auto"
+    linear_attn_kernel_backend: str = "triton"
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
