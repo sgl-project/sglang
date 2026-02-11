@@ -399,7 +399,16 @@ jobs:
 
   multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'multimodal-gen-test-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -520,7 +529,16 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'multimodal-gen-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
@@ -639,7 +657,7 @@ jobs:
 
 
   stage-c-test-large-8-gpu-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -687,7 +705,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600 --continue-on-error
 
   stage-c-test-large-8-gpu-amd-mi35x:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
