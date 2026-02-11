@@ -483,9 +483,9 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            # draft mode is same with decode mode, only 1 num token per batch
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            # draft mode is same with decode mode, only 1 token per req
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         batch.spec_info = next_draft_input
@@ -508,8 +508,8 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
+            num_tokens_per_req=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -691,7 +691,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
+        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify

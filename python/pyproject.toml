@@ -19,7 +19,7 @@ dependencies = [
   "aiohttp",
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -82,6 +82,22 @@ dependencies = [
   "grpcio-health-checking==1.75.1", # required for Kubernetes gRPC health probes
 ]
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[[tool.uv.index]]
+name = "torch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pypi", marker = "platform_machine == 'x86_64'"},
+  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
+]
+
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
@@ -96,7 +112,8 @@ diffusion = [
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
   "runai_model_streamer>=0.15.5",
-  "cache-dit==1.2.0"
+  "cache-dit==1.2.0",
+  "addict"
 ]
 
 tracing = [
@@ -111,6 +128,7 @@ test = [
   "bitsandbytes",
   "expecttest",
   "jsonlines",
+  "lm-eval[api]>=0.4.9.2",
   "matplotlib",
   "pandas",
   "parameterized",

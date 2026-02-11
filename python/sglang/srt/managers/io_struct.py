@@ -1005,6 +1005,8 @@ class BatchTokenIDOutput(
     load: GetLoadReqOutput = None
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1094,6 +1096,8 @@ class BatchStrOutput(
 
     # Customized info
     customized_info: Optional[Dict[str, List[Any]]] = None
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1119,6 +1123,8 @@ class BatchMultimodalOutput(BaseBatchReq):
     placeholder_tokens_val: List[Optional[List[int]]]
 
     return_bytes: List[bool]
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1136,6 +1142,8 @@ class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+    # Detailed breakdown of cached tokens by source (device/host/storage)
+    cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 @dataclass
@@ -1263,7 +1271,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
-    # Whether to recapture cuda graph after weight udpdate
+    # Whether to recapture cuda graph after weight update
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
