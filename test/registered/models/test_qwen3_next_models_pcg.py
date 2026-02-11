@@ -26,6 +26,7 @@ ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
 }
 
+
 class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
 
     @classmethod
