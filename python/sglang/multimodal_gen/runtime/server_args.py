@@ -370,6 +370,8 @@ class ServerArgs:
         return self.host is None or self.port is None
 
     def adjust_quant_config(self):
+        """validate and adjust"""
+        self.nunchaku_config.validate()
         self.nunchaku_config.adjust_config()
 
     def adjust_offload(self):
@@ -469,9 +471,6 @@ class ServerArgs:
         # TODO: remove hard code
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
-
-        # Validate Nunchaku configuration
-        self.nunchaku_config.validate()
 
         self.check_server_args()
 
@@ -997,8 +996,7 @@ class ServerArgs:
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
-        if getattr(self.nunchaku_config, "enable_svdquant", False):
-
+        if self.nunchaku_config.enable_svdquant:
             if not current_platform.is_cuda():
                 raise ValueError(
                     "Nunchaku SVDQuant is only supported on NVIDIA CUDA GPUs "

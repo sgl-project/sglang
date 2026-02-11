@@ -1,20 +1,16 @@
 # Quantization
 
-This document introduces the model quantization schemes supported in SGLang and how to use them.
+This document introduces the model quantization schemes supported in SGLang and how to use them to reduce memory usage and accelerate inference.
 
 ## Nunchaku (SVDQuant)
 
 ### Introduction
 
-**SVDQuant** is a Post-Training Quantization (PTQ) technique for diffusion models that quantizes model weights and
-activations to 4-bit precision (W4A4) while maintaining high visual quality. This method uses Singular Value
-Decomposition (SVD) to decompose the weight matrix into low-rank components and residuals, effectively absorbing
-outliers in activations, making 4-bit quantization possible.
+**SVDQuant** is a Post-Training Quantization (PTQ) technique for diffusion models that quantizes model weights and activations to 4-bit precision (W4A4) while maintaining high visual quality. This method uses Singular Value Decomposition (SVD) to decompose the weight matrix into low-rank components and residuals, effectively absorbing outliers in activations, making 4-bit quantization possible.
 
-**Nunchaku** is a high-performance inference engine that implements SVDQuant, optimized for low-bit neural networks.
+**Nunchaku** is a high-performance inference engine that implements SVDQuant, optimized for low-bit neural networks. It is not Quantization-Aware Training (QAT), but directly quantizes pre-trained models.
 
-Paper: [SVDQuant: Absorbing Outliers by Low-Rank Components for 4-Bit Diffusion Models](https://arxiv.org/abs/2411.05007) (
-ICLR 2025 Spotlight)
+Paper: [SVDQuant: Absorbing Outliers by Low-Rank Components for 4-Bit Diffusion Models](https://arxiv.org/abs/2411.05007) (ICLR 2025 Spotlight)
 
 ### Key Features
 
@@ -22,9 +18,9 @@ SVDQuant significantly reduces memory usage and accelerates inference while main
 
 - **Memory Optimization**: Reduces memory usage by **3.6×** compared to BF16 models.
 - **Inference Acceleration**:
-    - **3.0×** faster than the NF4 (W4A16) baseline on desktop/laptop RTX 4090 GPUs.
-    - **8.7×** speedup on laptop RTX 4090 by eliminating CPU offloading compared to 16-bit models.
-    - **3.1×** faster than BF16 and NF4 models on RTX 5090 GPUs with NVFP4.
+  - **3.0×** faster than the NF4 (W4A16) baseline on desktop/laptop RTX 4090 GPUs.
+  - **8.7×** speedup on laptop RTX 4090 by eliminating CPU offloading compared to 16-bit models.
+  - **3.1×** faster than BF16 and NF4 models on RTX 5090 GPUs with NVFP4.
 
 ### Supported Precisions
 
@@ -37,9 +33,11 @@ Nunchaku supports two quantization precisions:
 
 #### 1. Install Nunchaku
 
-Please refer to
-the [Nunchaku Official Documentation](https://nunchaku.tech/docs/nunchaku/installation/installation.html) for
-installation methods.
+```bash
+pip install nunchaku
+```
+
+For more installation information, please refer to the [Nunchaku Official Documentation](https://nunchaku.tech/docs/nunchaku/).
 
 #### 2. Download Quantized Models
 
@@ -50,29 +48,22 @@ Nunchaku provides pre-quantized model weights available on Hugging Face:
 
 Taking Qwen-Image as an example, several quantized models with different configurations are provided:
 
-| Filename                                                     | Precision | Rank | Usage                         |
-|--------------------------------------------------------------|-----------|------|-------------------------------|
-| `svdq-int4_r32-qwen-image.safetensors`                       | INT4      | 32   | Standard Version              |
-| `svdq-int4_r128-qwen-image.safetensors`                      | INT4      | 128  | High-Quality Version          |
-| `svdq-fp4_r32-qwen-image.safetensors`                        | NVFP4     | 32   | RTX 5090 Standard Version     |
-| `svdq-fp4_r128-qwen-image.safetensors`                       | NVFP4     | 128  | RTX 5090 High-Quality Version |
-| `svdq-int4_r32-qwen-image-lightningv1.0-4steps.safetensors`  | INT4      | 32   | Lightning 4-Step Version      |
-| `svdq-int4_r128-qwen-image-lightningv1.1-8steps.safetensors` | INT4      | 128  | Lightning 8-Step Version      |
+| Filename | Precision | Rank | Usage |
+|----------|-----------|------|-------|
+| `svdq-int4_r32-qwen-image.safetensors` | INT4 | 32 | Standard Version |
+| `svdq-int4_r128-qwen-image.safetensors` | INT4 | 128 | High-Quality Version |
+| `svdq-fp4_r32-qwen-image.safetensors` | NVFP4 | 32 | RTX 5090 Standard Version |
+| `svdq-fp4_r128-qwen-image.safetensors` | NVFP4 | 128 | RTX 5090 High-Quality Version |
+| `svdq-int4_r32-qwen-image-lightningv1.0-4steps.safetensors` | INT4 | 32 | Lightning 4-Step Version |
+| `svdq-int4_r128-qwen-image-lightningv1.1-8steps.safetensors` | INT4 | 128 | Lightning 8-Step Version |
 
 > **Note**: Higher Rank usually means better image quality, but with slightly increased memory usage and computation.
 
 #### 3. Run Quantized Models
 
-When running quantized models using the SGLang CLI, the following arguments are relevant:
+SGLang features **smart auto-detection** for Nunchaku models. In most cases, you only need to provide the path to the quantized weights, and the precision and rank will be automatically inferred from the filename.
 
-- `--enable-svdquant`: Enable SVDQuant quantization inference.
-- `--quantized-model-path`: Path to the quantized weight file (can be a single `.safetensors` file or a directory
-  containing multiple files).
-- `--quantization-precision`: Quantization precision, either `int4` or `nvfp4`.
-- `--quantization-rank`: Rank for SVD low-rank decomposition (e.g., 32 or 128).
-- `--quantization-act-unsigned` (Optional): Use unsigned activation quantization.
-
-**Example 1: INT4 Rank-32 Standard Version**
+**Simplified Command (Recommended):**
 
 ```bash
 sglang generate \
@@ -82,56 +73,55 @@ sglang generate \
   --width 1024 \
   --height 1024 \
   --save-output \
-  --enable-svdquant \
-  --quantized-model-path /path/to/svdq-int4_r32-qwen-image.safetensors \
-  --quantization-precision int4 \
-  --quantization-rank 32
+  --attention-backend torch_sdpa \
+  --quantized-model-path /path/to/svdq-int4_r32-qwen-image.safetensors
 ```
 
-**Example 2: NVFP4 Version (RTX 5090)**
+**Manual Override (If needed):**
+
+If your filename doesn't follow the standard naming convention, or you want to force specific settings:
+
+- `--enable-svdquant`: Manually enable SVDQuant.
+- `--quantization-precision`: Set to `int4` or `nvfp4`.
+- `--quantization-rank`: Set the SVD rank (e.g., 32, 128).
+- `--quantization-act-unsigned` (Optional): Use unsigned activation quantization.
+
+Example with manual overrides:
 
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
   --num-gpus 1 \
-  --prompt "a cute puppy playing in the park" \
-  --width 1024 \
-  --height 1024 \
-  --save-output \
+  --prompt "a beautiful sunset" \
   --enable-svdquant \
-  --quantized-model-path /path/to/svdq-fp4_r32-qwen-image.safetensors \
-  --quantization-precision nvfp4 \
-  --quantization-rank 32
+  --quantized-model-path /path/to/custom_model.safetensors \
+  --quantization-precision int4 \
+  --quantization-rank 128
 ```
-
 
 #### 4. Configuration Recommendations
 
 Choose the appropriate configuration based on your hardware and requirements:
 
-| Scenario                           | Recommended Config       | Description                                         |
-|------------------------------------|--------------------------|-----------------------------------------------------|
-| Standard Use (20/30/40 Series GPU) | INT4 + Rank 32           | Balanced performance and quality                    |
-| Quality Focus (Sufficient VRAM)    | INT4 + Rank 128          | Better image quality                                |
-| RTX 5090 Standard Use              | NVFP4 + Rank 32          | Utilizes FP4 hardware acceleration                  |
-| RTX 5090 Quality Focus             | NVFP4 + Rank 128         | Best image quality                                  |
-| Fast Prototyping/Preview           | Lightning 4-Step Version | Extremely fast generation, slightly reduced quality |
+| Scenario | Recommended Config | Description |
+|----------|-------------------|-------------|
+| Standard Use (20/30/40 Series GPU) | INT4 + Rank 32 | Balanced performance and quality |
+| Quality Focus (Sufficient VRAM) | INT4 + Rank 128 | Better image quality |
+| RTX 5090 Standard Use | NVFP4 + Rank 32 | Utilizes FP4 hardware acceleration |
+| RTX 5090 Quality Focus | NVFP4 + Rank 128 | Best image quality |
+| Fast Prototyping/Preview | Lightning 4-Step Version | Extremely fast generation, slightly reduced quality |
 
 ### Notes
 
-1. **Model Path Correspondence**: `--model-path` should point to the original non-quantized model (for loading config
-   and tokenizer, etc.), while `--quantized-model-path` points to the quantized weight file.
+1.  Model Path Correspondence: `--model-path` should point to the original non-quantized model (for loading config and tokenizer, etc.), while `--quantized-model-path` points to the quantized weight file.
 
-2. **Parameter Matching**: `--quantization-precision` and `--quantization-rank` must match the quantized model filename:
-    - `svdq-int4_r32-*` → `--quantization-precision int4 --quantization-rank 32`
-    - `svdq-fp4_r128-*` → `--quantization-precision nvfp4 --quantization-rank 128`
+2.  Auto-Detection Requirements: For auto-detection to work, the filename must contain the pattern `svdq-{precision}_r{rank}` (e.g., `svdq-int4_r32`).
 
-3. **GPU Compatibility**:
-    - INT4: Supports NVIDIA GPUs with Compute Capability 7.0+ (RTX 20 series and above).
-    - NVFP4: Optimized mainly for newer cards like the RTX 50 series that support FP4.
+3.  GPU Compatibility:
+    -   INT4: Supports NVIDIA GPUs with Compute Capability 7.0+ (RTX 20 series and above).
+    -   NVFP4: Optimized mainly for newer cards like the RTX 50 series that support FP4.
 
-4. **Lightning Models**: When using Lightning versions, adjust `--num-inference-steps` accordingly (usually 4 or 8
-   steps).
+4.  Lightning Models: When using Lightning versions, adjust `--num-inference-steps` accordingly (usually 4 or 8 steps).
 
 ### Custom Model Quantization
 
