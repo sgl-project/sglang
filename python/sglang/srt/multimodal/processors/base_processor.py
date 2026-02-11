@@ -331,7 +331,7 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
+            if is_cpu() or get_global_server_args().rl_on_policy_target is not None:
                 kwargs["device"] = "cpu"
             elif _is_xpu:
                 kwargs["device"] = "xpu"
