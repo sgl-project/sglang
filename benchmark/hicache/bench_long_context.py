@@ -36,20 +36,18 @@ class ContextWorkloadGenerator(WorkloadGenerator):
         init_requests = []
         for i in range(num_requests):
             context_id = self.dataset["queries"][i]["context"]
-            init_requests.append(
-                (
-                    i,
-                    gen_payload(
-                        self.dataset["contexts"][context_id]
-                        + self.dataset["queries"][i]["question"],
-                        len(
-                            self.tokenizer(
-                                self.dataset["queries"][i]["reference_answer"]
-                            )["input_ids"]
-                        ),
-                    ),
-                )
+            # Tokenize the context + question to get input_ids
+            prompt_text = (
+                self.dataset["contexts"][context_id]
+                + self.dataset["queries"][i]["question"]
             )
+            input_ids = self.tokenizer.encode(prompt_text)
+            output_len = len(
+                self.tokenizer(self.dataset["queries"][i]["reference_answer"])[
+                    "input_ids"
+                ]
+            )
+            init_requests.append((i, gen_payload(input_ids, output_len)))
         self.ready_queue = ReadyQueue(init_requests=init_requests)
 
         self.response_queue = queue.Queue()

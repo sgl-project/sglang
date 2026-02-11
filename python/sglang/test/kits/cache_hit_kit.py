@@ -22,11 +22,12 @@ async def async_request_sglang_generate(
 ):
     """Send a streaming request to the server and collect cache metrics.
 
-    Returns a RequestFuncOutput with additional cached_tokens attribute.
+    Returns a RequestFuncOutput with additional cached_tokens and output_ids attributes.
     """
     async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
         headers = {}
         generated_text = ""
+        all_output_ids = []
         ttft = 0.0
         st = time.perf_counter()
         most_recent_timestamp = st
@@ -50,7 +51,11 @@ async def async_request_sglang_generate(
                             pass
                         else:
                             data = json.loads(chunk)
-                            if data["text"]:
+
+                            # output_ids and text are always returned together
+                            if data.get("output_ids"):
+                                all_output_ids = data["output_ids"]
+                                generated_text = data.get("text", "")
                                 timestamp = time.perf_counter()
 
                                 if ttft == 0.0:
@@ -66,9 +71,9 @@ async def async_request_sglang_generate(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text = data["text"]
 
                     output.generated_text = generated_text
+                    output.output_ids = all_output_ids
                     output.success = True
                     output.latency = latency
                     output.prompt_len = prompt_tokens
@@ -87,9 +92,9 @@ async def async_request_sglang_generate(
     return output
 
 
-def gen_payload(prompt, output_len, lora_path=""):
+def gen_payload(input_ids, output_len, lora_path=""):
     return {
-        "text": prompt,
+        "input_ids": input_ids,
         "sampling_params": {
             "temperature": 0.0,
             "max_new_tokens": output_len,
@@ -175,7 +180,7 @@ def run_multiturn_cache_hit_test(
         sub_question_input_length if sub_question_input_length != 0 else request_length
     )
 
-    # Sample initial prompts and sub-question prompts
+    # Sample initial prompts and sub-question prompts as token ids
     tokenizer = get_tokenizer(model_path)
 
     initial_inputs = sample_random_requests(
@@ -185,8 +190,10 @@ def run_multiturn_cache_hit_test(
         range_ratio=1.0,
         tokenizer=tokenizer,
         dataset_path=dataset_path,
+        return_text=False,
     )
-    initial_prompts = [r.prompt for r in initial_inputs]
+    # r.prompt is now List[int] when return_text=False
+    initial_token_ids = [list(r.prompt) for r in initial_inputs]
 
     sub_question_inputs = sample_random_requests(
         input_len=effective_sub_len,
@@ -195,8 +202,9 @@ def run_multiturn_cache_hit_test(
         range_ratio=1.0,
         tokenizer=tokenizer,
         dataset_path=dataset_path,
+        return_text=False,
     )
-    sub_question_prompts = [r.prompt for r in sub_question_inputs]
+    sub_question_token_ids = [list(r.prompt) for r in sub_question_inputs]
 
     # Per-round metrics and per-client tracking for expected cache computation
     round_metrics = {
@@ -205,7 +213,8 @@ def run_multiturn_cache_hit_test(
     }
     # Track the previous round's prompt_len per client to compute expected cache
     prev_prompt_lens = [0] * num_clients
-    histories = list(initial_prompts)
+    # histories now stores List[int] (token ids) for each client
+    histories = [list(ids) for ids in initial_token_ids]
     sub_idx = 0
 
     for round_num in range(num_rounds):
@@ -230,21 +239,25 @@ def run_multiturn_cache_hit_test(
                 cacheable = prev_prompt_lens[i] + output_length - miss_tolerance
                 expected_cached = (cacheable // page_size) * page_size
 
-            assert resp.cached_tokens >= expected_cached - page_size, (
+            msg = (
                 f"Round {round_num}, client {i}: "
                 f"cached_tokens={resp.cached_tokens}, "
-                f"expected>={expected_cached - page_size} "
+                f"expected>={expected_cached} "
                 f"(prev_prompt={prev_prompt_lens[i]}, "
                 f"output={output_length}, page_size={page_size})"
             )
 
+            print(msg)
+
+            assert resp.cached_tokens >= expected_cached
+
             # Record this round's prompt_len for next round's expected calc
             prev_prompt_lens[i] = resp.prompt_len
 
-            # Accumulate history for next round
-            histories[i] += resp.generated_text
+            # Accumulate history for next round using output_ids (token ids)
+            histories[i].extend(resp.output_ids)
             if round_num < num_rounds - 1:
-                histories[i] += sub_question_prompts[sub_idx]
+                histories[i].extend(sub_question_token_ids[sub_idx])
                 sub_idx += 1
 
     # Compute per-round and overall cache hit rate

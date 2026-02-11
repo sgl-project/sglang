@@ -189,6 +189,7 @@ class WorkloadGenerator:
         self.sent_requests = 0
         self.completed_requests = 0
 
+        # Use return_text=False to get token ids instead of text
         self.candidate_inputs = sample_random_requests(
             input_len=args.request_length,
             output_len=args.output_length,
@@ -197,8 +198,10 @@ class WorkloadGenerator:
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
+            return_text=False,
         )
-        self.candidate_inputs = [i.prompt for i in self.candidate_inputs]
+        # r.prompt is now List[int] when return_text=False
+        self.candidate_inputs = [list(i.prompt) for i in self.candidate_inputs]
 
         if args.sub_question_input_length != 0:
             sub_question_input_length = args.sub_question_input_length
@@ -213,6 +216,7 @@ class WorkloadGenerator:
             tokenizer=self.tokenizer,
             dataset_path=args.dataset_path,
             random_sample=not args.disable_random_sample,
+            return_text=False,
         )
 
         init_requests = [
@@ -224,8 +228,9 @@ class WorkloadGenerator:
             )
             for i in range(args.num_clients)
         ]
+        # history now stores List[int] (token ids) for each client
         self.client_records = {
-            i: {"round": 0, "history": init_requests[i][1]["text"]}
+            i: {"round": 0, "history": list(self.candidate_inputs[i])}
             for i in range(args.num_clients)
         }
         self.ready_queue = ReadyQueue(
@@ -311,7 +316,8 @@ class WorkloadGenerator:
                 )  # Block until response is available
                 if not response.success:
                     raise ValueError(f"Request failed with error: {response.error}")
-                self.client_records[client_id]["history"] += response.generated_text
+                # Use output_ids (token ids) instead of generated_text
+                self.client_records[client_id]["history"].extend(response.output_ids)
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
@@ -338,10 +344,9 @@ class WorkloadGenerator:
                 self.completed_requests += 1
 
                 if self.client_records[client_id]["round"] < self.num_rounds:
-                    # append new request to client's history
-                    self.client_records[client_id][
-                        "history"
-                    ] += self.sub_question_inputs.pop().prompt
+                    # Append sub-question token ids to client's history
+                    sub_q_ids = list(self.sub_question_inputs.pop().prompt)
+                    self.client_records[client_id]["history"].extend(sub_q_ids)
                     new_req = (
                         client_id,
                         gen_payload(
