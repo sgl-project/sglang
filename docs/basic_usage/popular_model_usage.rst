@@ -1,7 +1,9 @@
 Popular Model Usage (DeepSeek, GPT-OSS, GLM, Llama, MiniMax, Qwen, and more)
 ===============================================================
 
-For more usage examples and recipes, visit the `SGLang Cookbook <https://cookbook.sglang.io/>`_.
+Model-specific usage guides have moved to the `SGLang Cookbook <https://cookbook.sglang.io/>`_ for more comprehensive, self-contained documentation including installation, deployment, configuration, usage examples, and benchmarks.
+
+The pages below contain redirect links to the corresponding cookbook pages.
 
 .. toctree::
    :maxdepth: 1
