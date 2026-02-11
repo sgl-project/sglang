@@ -23,18 +23,42 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
-# Resolve a Python binary on runners where python3 is missing from PATH.
-if command -v python3 >/dev/null 2>&1; then
-    PYTHON_BIN="python3"
-elif command -v python >/dev/null 2>&1; then
-    PYTHON_BIN="python"
-else
-    echo "ERROR: Neither python3 nor python is available in PATH."
-    exit 1
-fi
+# Resolve a Python binary for mixed CI environments where python3/python may be missing from PATH.
+resolve_python_bin() {
+    if command -v python3 >/dev/null 2>&1; then
+        echo "python3"
+        return 0
+    fi
+    if command -v python >/dev/null 2>&1; then
+        echo "python"
+        return 0
+    fi
 
-# Clear torch compilation cache
-"$PYTHON_BIN" -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+    # Fall back to pip shebang interpreter when python executables are not exported.
+    if command -v pip >/dev/null 2>&1; then
+        local pip_bin shebang pip_python
+        pip_bin="$(command -v pip)"
+        shebang="$(head -n 1 "$pip_bin" 2>/dev/null || true)"
+        if [[ "$shebang" == "#!"* ]]; then
+            pip_python="${shebang#\#!}"
+            if [ -x "$pip_python" ]; then
+                echo "$pip_python"
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+PYTHON_BIN="$(resolve_python_bin || true)"
+
+# Clear torch compilation cache (best effort).
+if [ -n "$PYTHON_BIN" ]; then
+    "$PYTHON_BIN" -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+else
+    echo "Warning: Python interpreter not found; skipping torch compilation cache cleanup."
+fi
 
 # Install apt packages
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
@@ -141,15 +165,23 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
-# Remove flash_attn folder to avoid conflicts
-PYTHON_LIB_PATH=$("$PYTHON_BIN" -c "import site; print(site.getsitepackages()[0])")
-FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+# Remove flash_attn folder to avoid conflicts (best effort).
+if [ -z "$PYTHON_BIN" ]; then
+    PYTHON_BIN="$(resolve_python_bin || true)"
+fi
 
-if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
+if [ -n "$PYTHON_BIN" ]; then
+    PYTHON_LIB_PATH=$("$PYTHON_BIN" -c "import site; print(site.getsitepackages()[0])")
+    FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+
+    if [ -d "$FLASH_ATTN_PATH" ]; then
+        echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+        rm -rf "$FLASH_ATTN_PATH"
+    else
+        echo "Directory $FLASH_ATTN_PATH does not exist."
+    fi
 else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
+    echo "Warning: Python interpreter not found; skipping flash_attn cleanup."
 fi
 
 # Install sgl-kernel
@@ -283,7 +315,14 @@ fi
 
 # Show current packages
 $PIP_CMD list
-"$PYTHON_BIN" -c "import torch; print(torch.version.cuda)"
+if [ -z "$PYTHON_BIN" ]; then
+    PYTHON_BIN="$(resolve_python_bin || true)"
+fi
+if [ -n "$PYTHON_BIN" ]; then
+    "$PYTHON_BIN" -c "import torch; print(torch.version.cuda)"
+else
+    echo "Warning: Python interpreter not found; skipping torch CUDA version print."
+fi
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
