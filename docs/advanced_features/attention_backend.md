@@ -53,6 +53,10 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 - NSA is specifically designed for [DeepSeek V3.2 DSA](https://lmsys.org/blog/2025-09-29-deepseek-V32/).
 ```
 
+```{warning}
+**FA4 on Hopper (SM90):** FA4 decode speed decreases as sequence length grows due to lack of SplitKV support. Compared to FA3 on H100: ~-10% at 2K tokens, ~-18% at 4K, ~-31% at 8K, ~-49% at 16K. Blackwell (SM100) is not affected. For long-output workloads on Hopper, consider using FA3 for decode or the hybrid attention backend (`--prefill-attention-backend fa4 --decode-attention-backend fa3`).
+```
+
 ```{note}
 For FP4 KV cache scenarios, FA4 can be used as a prefill-only backend with a different `--decode-attention-backend`. Except for `trtllm_mha` being incompatible with FA4, all other decode backends behave as shown in the table. For MHA models on SM90+, FA4 can also handle both prefill and decode natively with `--attention-backend fa4 --page-size 128`.
 ```
