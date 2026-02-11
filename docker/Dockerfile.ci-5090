@@ -108,6 +108,15 @@ RUN mkdir -p /home/runner/actions-runner && cd /home/runner/actions-runner \
     && chown -R runner:runner /home/runner/actions-runner \
     && /home/runner/actions-runner/bin/installdependencies.sh
 
+# ── CI environment script (sourced by workflow YAML) ────────────────────
+# The workflow does `source /etc/profile.d/sglang-ci.sh` before each step.
+# HF_TOKEN is passed at runtime via -e HF_TOKEN=...
+RUN printf '%s\n' \
+    '# SGLang CI Environment Configuration' \
+    'export LD_LIBRARY_PATH="/usr/local/cuda/targets/x86_64-linux/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/lib/python3.10/dist-packages/nvidia/nvshmem/lib:/usr/local/lib/python3.10/dist-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH}"' \
+    > /etc/profile.d/sglang-ci.sh \
+    && chmod +x /etc/profile.d/sglang-ci.sh
+
 # ── Entrypoint ──────────────────────────────────────────────────────────
 COPY docker/ci-runner-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

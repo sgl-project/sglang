@@ -82,6 +82,7 @@ cmd_start() {
             -e RUNNER_TOKEN="${RUNNER_TOKEN}" \
             -e RUNNER_LABELS="1-gpu-5090" \
             -e CUDA_VISIBLE_DEVICES=0 \
+            -e HF_TOKEN="${HF_TOKEN:-}" \
             "${IMAGE}"
     done
 
