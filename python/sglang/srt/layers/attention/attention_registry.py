@@ -194,9 +194,13 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
             KimiLinearAttnBackend,
             Mamba2AttnBackend,
         )
+        from sglang.srt.layers.attention.linear.utils import (
+            initialize_linear_attn_config,
+        )
         from sglang.srt.utils import is_blackwell, is_npu
 
         check_environments()
+        initialize_linear_attn_config(runner.server_args)
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (
