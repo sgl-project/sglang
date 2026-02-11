@@ -43,6 +43,52 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestFa3KvCacheDtypeCompatibility(unittest.TestCase):
+    def test_raise_when_attention_backend_fa3_with_fp8_e5m2(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.attention_backend = "fa3"
+        server_args.kv_cache_dtype = "fp8_e5m2"
+
+        with self.assertRaises(ValueError) as context:
+            server_args._validate_fa3_kv_cache_dtype_compatibility()
+
+        self.assertIn("fp8_e5m2", str(context.exception))
+
+    def test_raise_when_decode_backend_fa3_with_fp8_e5m2(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.attention_backend = "triton"
+        server_args.decode_attention_backend = "fa3"
+        server_args.kv_cache_dtype = "fp8_e5m2"
+
+        with self.assertRaises(ValueError):
+            server_args._validate_fa3_kv_cache_dtype_compatibility()
+
+    def test_raise_when_prefill_backend_fa3_with_fp8_e5m2(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.attention_backend = "triton"
+        server_args.prefill_attention_backend = "fa3"
+        server_args.kv_cache_dtype = "fp8_e5m2"
+
+        with self.assertRaises(ValueError):
+            server_args._validate_fa3_kv_cache_dtype_compatibility()
+
+    def test_not_raise_when_fp8_e4m3_with_fa3(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.attention_backend = "fa3"
+        server_args.kv_cache_dtype = "fp8_e4m3"
+
+        server_args._validate_fa3_kv_cache_dtype_compatibility()
+
+    def test_not_raise_when_fp8_e5m2_without_fa3(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.attention_backend = "triton"
+        server_args.prefill_attention_backend = "triton"
+        server_args.decode_attention_backend = "triton"
+        server_args.kv_cache_dtype = "fp8_e5m2"
+
+        server_args._validate_fa3_kv_cache_dtype_compatibility()
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.is_port_available")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

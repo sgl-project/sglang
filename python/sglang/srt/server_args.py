@@ -1878,12 +1878,7 @@ class ServerArgs:
                 )
                 self.page_size = 64
 
-        if self.attention_backend == "fa3" and self.kv_cache_dtype == "fp8_e5m2":
-            logger.warning(
-                "FlashAttention3 only supports fp8_e4m3 if using FP8; "
-                "Setting attention backend to triton."
-            )
-            self.attention_backend = "triton"
+        self._validate_fa3_kv_cache_dtype_compatibility()
 
         if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
@@ -1943,6 +1938,19 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
             self.disable_radix_cache = True
+
+    def _validate_fa3_kv_cache_dtype_compatibility(self):
+        if self.kv_cache_dtype != "fp8_e5m2":
+            return
+
+        prefill_attention_backend, decode_attention_backend = (
+            self.get_attention_backends()
+        )
+        if prefill_attention_backend == "fa3" or decode_attention_backend == "fa3":
+            raise ValueError(
+                "FlashAttention3 does not support --kv-cache-dtype fp8_e5m2. "
+                "Please use --kv-cache-dtype fp8_e4m3 or switch to a different attention backend."
+            )
 
     def _handle_kv4_compatibility(self):
         """Check FP4 KV cache compatibility with the attention backend"""
