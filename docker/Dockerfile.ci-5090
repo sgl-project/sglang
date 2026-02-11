@@ -60,7 +60,8 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # ── Pip bootstrap ───────────────────────────────────────────────────────
-RUN pip install --upgrade pip setuptools wheel --break-system-packages
+# System pip on 22.04 is too old for --break-system-packages; upgrade first.
+RUN pip install --upgrade pip setuptools wheel
 
 # ── Install sglang with all deps (respects version pins in pyproject.toml) ─
 # This ensures torch version matches what sgl-kernel was compiled against.
