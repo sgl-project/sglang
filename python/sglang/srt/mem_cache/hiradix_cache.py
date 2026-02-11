@@ -195,8 +195,14 @@ class HiRadixCache(RadixCache):
             self.page_size / 1024 * prefetch_timeout_per_ki_token
         )
 
-        storage_metrics_collector = None
-        if enable_storage_metrics:
+        self.enable_storage = enable_storage
+        self.prefetch_threshold = prefetch_threshold
+        self.prefetch_timeout_base = prefetch_timeout_base
+        self.prefetch_timeout_per_page = prefetch_timeout_per_page
+        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
+        self.enable_storage_metrics = enable_storage_metrics
+
+        if self.enable_storage_metrics:
             labels = {
                 "storage_backend": storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
@@ -206,19 +212,18 @@ class HiRadixCache(RadixCache):
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
-            self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
-            storage_metrics_collector = StorageMetricsCollector(labels=labels)
-
-        self.enable_storage = enable_storage
-        self.prefetch_threshold = prefetch_threshold
-        self.prefetch_timeout_base = prefetch_timeout_base
-        self.prefetch_timeout_per_page = prefetch_timeout_per_page
-        self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
-        self.enable_storage_metrics = enable_storage_metrics
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector = storage_metrics_collector
-        else:
-            self.storage_metrics_collector = None
+            existing_collector = getattr(self, "storage_metrics_collector", None)
+            if existing_collector is None:
+                self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+            elif set(existing_collector.labels.keys()) == set(labels.keys()):
+                existing_collector.labels = labels
+            else:
+                logger.warning(
+                    "Storage metrics labels changed (%s -> %s). Keep existing labels to "
+                    "avoid duplicate metric registration.",
+                    sorted(existing_collector.labels.keys()),
+                    sorted(labels.keys()),
+                )
 
     def attach_storage_backend(
         self,
@@ -366,8 +371,6 @@ class HiRadixCache(RadixCache):
 
         self.enable_storage = False
         self.enable_storage_metrics = False
-        if hasattr(self, "storage_metrics_collector"):
-            self.storage_metrics_collector = None
         return True, "Detached HiCache storage backend successfully."
 
     def _force_release_pending_storage_ops(self):
