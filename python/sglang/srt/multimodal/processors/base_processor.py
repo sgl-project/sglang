@@ -37,6 +37,7 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 
 import nvtx  # wili
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
