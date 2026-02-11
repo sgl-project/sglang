@@ -4,11 +4,8 @@ import asyncio
 import copy
 import os
 import subprocess
-
 from types import SimpleNamespace
 from typing import Awaitable, Callable, NamedTuple, Optional
-from typing import NamedTuple
-from typing import  Awaitable, Callable, Optional
 
 from sglang.bench_serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
@@ -189,8 +186,7 @@ QWEN2_0_5B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 
 QWEN3_30B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B")
 QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR,
-    "Qwen/Qwen3-30B-A3B-w8a8"
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-w8a8"
 )
 
 DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH = os.path.join(
