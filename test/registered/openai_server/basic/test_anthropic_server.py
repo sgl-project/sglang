@@ -470,15 +470,12 @@ class TestAnthropicServer(CustomTestCase):
     def _parse_sse_events(self, response):
         """Parse SSE events from a streaming response."""
         events = []
-        current_event_type = None
 
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
 
-            if line.startswith("event: "):
-                current_event_type = line[7:].strip()
-            elif line.startswith("data: "):
+            if line.startswith("data: "):
                 data_str = line[6:].strip()
                 if data_str == "[DONE]":
                     continue

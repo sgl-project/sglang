@@ -1,9 +1,9 @@
 """Pydantic models for Anthropic Messages API protocol"""
 
-import time
+import uuid
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class AnthropicError(BaseModel):
@@ -160,7 +160,7 @@ class AnthropicStreamEvent(BaseModel):
 class AnthropicMessagesResponse(BaseModel):
     """Anthropic Messages API response"""
 
-    id: str
+    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     content: list[AnthropicContentBlock]
@@ -170,7 +170,3 @@ class AnthropicMessagesResponse(BaseModel):
     ] = None
     stop_sequence: Optional[str] = None
     usage: Optional[AnthropicUsage] = None
-
-    def model_post_init(self, __context):
-        if not self.id:
-            self.id = f"msg_{int(time.time() * 1000)}"

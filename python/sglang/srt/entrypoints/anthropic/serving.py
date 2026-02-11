@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
 
 from fastapi import Request
@@ -131,7 +132,7 @@ class AnthropicServing:
 
                 elif block.type == "tool_use":
                     tool_call = {
-                        "id": block.id or f"call_{int(time.time())}",
+                        "id": block.id or f"call_{uuid.uuid4().hex}",
                         "type": "function",
                         "function": {
                             "name": block.name or "",
@@ -357,10 +358,8 @@ class AnthropicServing:
         content_block_open = False
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
-        message_id = f"msg_{int(time.time() * 1000)}"
+        message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
-        # Track open tool call blocks
-        open_tool_call_ids: set = set()
 
         async for sse_line in openai_stream:
             if not sse_line.startswith("data: "):
@@ -487,7 +486,7 @@ class AnthropicServing:
                             index=content_block_index,
                             content_block=AnthropicContentBlock(
                                 type="tool_use",
-                                id=tc_id or f"toolu_{int(time.time())}",
+                                id=tc_id or f"toolu_{uuid.uuid4().hex}",
                                 name=tc_func.name,
                                 input={},
                             ),
@@ -497,8 +496,6 @@ class AnthropicServing:
                             "content_block_start",
                         )
                         content_block_open = True
-                        if tc_id:
-                            open_tool_call_ids.add(tc_id)
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
