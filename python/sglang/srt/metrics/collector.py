@@ -423,7 +423,7 @@ class SchedulerMetricsCollector:
         self.kv_cache_idle_time_before_eviction_total = Counter(
             name="sglang:kv_cache_idle_time_before_eviction_total",
             documentation="Total idle time before eviction in seconds.",
-            labelnames=[*labels.keys()],
+            labelnames=[*labels.keys(), "reason"],
         )
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
@@ -1166,7 +1166,7 @@ class SchedulerMetricsCollector:
         self.kv_cache_eviction_total.labels(**self.labels, reason=reason).inc(1)
         self.kv_cache_evicted_tokens_total.labels(**self.labels, reason=reason).inc(num_tokens)
         if idle_time > 0:
-            self.kv_cache_idle_time_before_eviction_total.labels(**self.labels).inc(idle_time)
+            self.kv_cache_idle_time_before_eviction_total.labels(**self.labels, reason=reason).inc(idle_time)
 
 
 class TokenizerMetricsCollector:
