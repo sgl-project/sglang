@@ -19,7 +19,11 @@ import enum
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 from sglang.srt.configs.update_config import adjust_tp_num_heads_if_necessary
 from sglang.srt.utils import is_cpu
 
@@ -293,4 +297,6 @@ class Qwen3NextConfig(PretrainedConfig):
             conv_kernel=self.linear_conv_kernel_dim,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+        )
