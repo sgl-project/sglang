@@ -37,7 +37,10 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+    from sglang.jit_kernel.rope import (
+        FusedSetKVBufferArg,
+        apply_rope_with_cos_sin_cache_inplace,
+    )
 else:
     FusedSetKVBufferArg = None
 
