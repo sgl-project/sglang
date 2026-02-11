@@ -1196,15 +1196,26 @@ class NativeSparseAttnBackend(
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
+        metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
-        if self.nsa_decode_impl == "trtllm" and not self.use_mha:
+        nsa_impl = (
+            self.nsa_decode_impl
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            )
+            else self.nsa_prefill_impl
+        )
+
+        if nsa_impl == "trtllm" and not self.use_mha:
             return self._forward_trtllm(
                 q,
                 k,
                 v,
                 layer,
                 forward_batch,
+                metadata.nsa_cache_seqlens_int32,
                 save_kv_cache,
                 q_rope,
                 k_rope,
@@ -1228,8 +1239,6 @@ class NativeSparseAttnBackend(
                     k,
                     k_rope,
                 )
-
-        metadata = self.forward_metadata
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1291,15 +1300,6 @@ class NativeSparseAttnBackend(
                     extend_lens_cpu=metadata.nsa_extend_seq_lens_list,
                     page_size=1,
                 )
-
-        nsa_impl = (
-            self.nsa_decode_impl
-            if (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
-            )
-            else self.nsa_prefill_impl
-        )
 
         if nsa_impl == "tilelang":
             if q_rope is not None:
@@ -1384,6 +1384,7 @@ class NativeSparseAttnBackend(
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
+        metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
         if self.nsa_decode_impl == "trtllm":
@@ -1393,6 +1394,7 @@ class NativeSparseAttnBackend(
                 v,
                 layer,
                 forward_batch,
+                metadata.cache_seqlens_int32,
                 save_kv_cache,
                 q_rope,
                 k_rope,
@@ -1401,8 +1403,6 @@ class NativeSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
             )
-
-        metadata = self.forward_metadata
 
         if k is not None:
             assert v is not None
@@ -1850,6 +1850,7 @@ class NativeSparseAttnBackend(
         v: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
         save_kv_cache=True,
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
@@ -1938,6 +1939,7 @@ class NativeSparseAttnBackend(
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
+        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
@@ -1947,7 +1949,7 @@ class NativeSparseAttnBackend(
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,
-            seq_lens=metadata.cache_seqlens_int32,
+            seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
@@ -1995,12 +1997,15 @@ class NativeSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
+            # when nsa prefill impl is trtllm, use its max chunk capacity as mha max kv len
+            mha_max_kv_len = forward_batch.get_max_chunk_capacity() if self.nsa_prefill_impl == 'trtllm' else self.nsa_index_topk
+
             # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
-                and max_kv_len <= self.nsa_index_topk  # Short enough for MHA
+                and max_kv_len <= mha_max_kv_len # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
@@ -2095,7 +2100,7 @@ class NativeSparseAttnMultiStepBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 NativeSparseAttnBackend(
                     model_runner,
@@ -2110,11 +2115,11 @@ class NativeSparseAttnMultiStepBackend:
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
                 forward_batch.batch_size * self.topk,
@@ -2140,7 +2145,7 @@ class NativeSparseAttnMultiStepBackend:
             )
 
             # Fast copy to each backend (1-2x faster than computing N times)
-            for i in range(self.speculative_num_steps):
+            for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[
                     i
                 ].init_forward_metadata_replay_cuda_graph_from_precomputed(
@@ -2150,7 +2155,7 @@ class NativeSparseAttnMultiStepBackend:
                 )
         else:
             # Fallback: compute metadata separately for each backend
-            for i in range(self.speculative_num_steps):
+            for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                     bs=bs,
                     req_pool_indices=forward_batch.req_pool_indices,
