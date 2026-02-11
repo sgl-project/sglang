@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
+SIN = None
+COS = None
 
 class BaseIndexerMetadata(ABC):
     @abstractmethod
@@ -1147,10 +1149,18 @@ class Indexer(MultiPlatformOp):
             and not forward_batch.forward_mode.is_draft_extend()
         )
 
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-        sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+        global SIN, COS
+        if layer_id == 0:
+            cos_sin = self.rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+            sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
+            SIN = sin
+            COS = cos
+        else:
+            sin = SIN
+            cos = COS
+
 
         bs = x.shape[0]
         if self.alt_stream is not None:
