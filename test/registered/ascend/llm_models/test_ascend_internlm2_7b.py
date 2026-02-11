@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -9,7 +10,6 @@ register_npu_ci(
     est_time=400,
     suite="nightly-1-npu-a3",
     nightly=True,
-    disabled="run failed",
 )
 
 
@@ -20,6 +20,7 @@ class TestInternlm2(GSM8KAscendMixin, CustomTestCase):
     [Test Target] Shanghai_AI_Laboratory/internlm2-7b
     """
 
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
     model = INTERNLM2_7B_WEIGHTS_PATH
     accuracy = 0.585
 

@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import unittest
 
 import torch
@@ -12,7 +13,6 @@ register_npu_ci(
     est_time=400,
     suite="nightly-4-npu-a3",
     nightly=True,
-    disabled="run failed",
 )
 
 PROMPT = (
@@ -35,6 +35,7 @@ class TestInternlm2(CustomTestCase):
     [Test Target] Shanghai_AI_Laboratory/internlm2-7b-reward
     """
 
+    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
     model_path = INTERNLM2_7B_REWARD_WEIGHTS_PATH
     torch_dtype = torch.float16
 

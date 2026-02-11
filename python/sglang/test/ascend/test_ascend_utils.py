@@ -53,6 +53,7 @@ BAICHUAN2_13B_CHAT_WEIGHTS_PATH = os.path.join(
 C4AI_COMMAND_R_V01_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "CohereForAI/c4ai-command-r-v01"
 )
+C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH = "/__w/sglang/sglang/test/registered/ascend/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
 CHATGLM2_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/chatglm2-6b")
 DBRX_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "AI-ModelScope/dbrx-instruct"
