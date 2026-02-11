@@ -239,7 +239,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd --continue-on-error
 
   stage-b-test-small-1-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -279,7 +279,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 13 --timeout-per-file 1800 --continue-on-error
 
   stage-b-test-small-1-gpu-amd-mi35x:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -318,7 +318,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x --continue-on-error
 
   stage-b-test-large-1-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -358,7 +358,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 --continue-on-error
 
   stage-b-test-large-2-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
