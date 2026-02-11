@@ -231,10 +231,20 @@ def load_model_from_full_model_state_dict(
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
-    for target_param_name, full_tensor in custom_param_sd.items():
+
+    is_fsdp_model = isinstance(model, FSDPModule) or any(
+        hasattr(p, "device_mesh") for p in meta_sd.values()
+    )
+
+    # sort parameter names to ensure all ranks process parameters in the same order
+    sorted_param_names = sorted(custom_param_sd.keys())
+
+    for target_param_name in sorted_param_names:
+        full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
-            if strict:
+            # For FSDP models, ensure all ranks process parameters consistently
+            if strict or is_fsdp_model:
                 raise ValueError(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
@@ -261,6 +271,9 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = temp_param.data
             else:
                 sharded_tensor = full_tensor
+
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             sharded_tensor = distribute_tensor(
@@ -296,6 +309,8 @@ def load_model_from_full_model_state_dict(
             sharded_tensor = torch.zeros_like(
                 meta_sharded_param, device=device, dtype=param_dtype
             )
+            if cpu_offload:
+                sharded_tensor = sharded_tensor.cpu()
         else:
             # Initialize with zeros and distribute
             full_tensor = torch.zeros_like(
