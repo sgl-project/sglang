@@ -295,6 +295,9 @@ class Envs:
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
 
+    # MTHREADS & MUSA
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
+
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
