@@ -324,7 +324,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             final_hidden_states = self._forward_router_experts(hidden_states)
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            final_hidden_states += shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
