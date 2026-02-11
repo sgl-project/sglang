@@ -2136,7 +2136,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 default_extend = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
@@ -2147,7 +2147,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
                 metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
 
             metadata.cu_seqlens_q[1:].copy_(

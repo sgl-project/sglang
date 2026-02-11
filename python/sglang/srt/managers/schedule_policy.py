@@ -34,7 +34,7 @@ import torch
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
-from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     InsertParams,
@@ -435,7 +435,6 @@ class PrefillAdder:
         max_running_reqs = dllm_config.max_running_requests
 
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
-        self.dllm_staging_reqs = DllmStagingReqs(dllm_config=dllm_config)
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
@@ -551,7 +550,6 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: prefix_len + trunc_len]
 
         self.can_run_list.append(req)
-        self.dllm_staging_reqs.add_reqs(req)
 
         self._update_prefill_budget(prefix_len, trunc_len, 0)
 
@@ -561,6 +559,34 @@ class PrefillAdder:
             req.swa_uuid_for_lock = swa_uuid_for_lock
         else:
             self.tree_cache.inc_lock_ref(req.last_node)
+
+    def add_dllm_staging_req(self, req: Req):
+        assert self.dllm_config is not None
+        _rem_tokens = self._get_dllm_remain_tokens()
+
+        if _rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+
+        # Truncate input length to available tokens and update request metadata
+        truncated = req.extend_input_len > _rem_tokens
+        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+        req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
+        self.can_run_list.append(req)
+
+        # Update budget: reserve max_new_tokens only if not truncated
+        max_new_tokens = (
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            if not truncated
+            else 0
+        )
+        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+
+        # Return based on remaining token availability
+        return (
+            AddReqResult.NO_TOKEN
+            if self._get_dllm_remain_tokens() <= 0
+            else AddReqResult.CONTINUE
+        )
 
     def add_chunked_req(self, req: Req):
         if self.dllm_config is not None:

@@ -77,7 +77,8 @@ diffusion = [
     "moviepy>=2.0.0",
     "opencv-python==4.10.0.84",
     "remote-pdb",
-    "cache-dit==1.1.8"
+    "cache-dit==1.2.1",
+    "addict"
 ]
 
 tracing = [

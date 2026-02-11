@@ -64,6 +64,7 @@ if TYPE_CHECKING:
         CombineInput,
         StandardDispatchOutput,
     )
+    from sglang.srt.models.utils import WeightsMapper
 
 fp4_quantize = None
 try:
@@ -133,11 +134,7 @@ def fp4_gemm(
     fp4_backend = get_fp4_gemm_runner_backend()
     if enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
-        backend = (
-            fp4_backend.get_flashinfer_backend()
-            if not fp4_backend.is_auto()
-            else "cutlass"
-        )
+        backend = fp4_backend.get_flashinfer_backend()
         return flashinfer_fp4_gemm(
             input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
         )
@@ -307,6 +304,22 @@ class ModelOptQuantConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: "WeightsMapper"
+    ):  # noqa: B027
+        # Map excluded module patterns from HF layout to sglang layout.
+        # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
+        # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
+        if self.exclude_modules:
+            mapped = hf_to_sglang_mapper.apply_list(self.exclude_modules)
+            expanded: List[str] = []
+            for name in mapped:
+                expanded.append(name)
+                if name.startswith("language_model."):
+                    expanded.append(name.removeprefix("language_model."))
+            # Preserve order, drop duplicates.
+            self.exclude_modules = list(dict.fromkeys(expanded))
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):

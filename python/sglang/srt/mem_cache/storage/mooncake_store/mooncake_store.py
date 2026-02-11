@@ -310,6 +310,8 @@ class MooncakeStore(HiCacheStorage):
                     self.config.client_server_address,
                 )
             else:
+                # TODO(shangming): disable mooncake transfer engine reuse for hicache temporary
+                # Need to wait for the next mooncake release
                 ret_code = self.store.setup(
                     self.config.local_hostname,
                     self.config.metadata_server,

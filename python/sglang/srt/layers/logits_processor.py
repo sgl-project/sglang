@@ -104,6 +104,8 @@ class LogitsProcessorOutput:
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    mm_input_embeds: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -145,6 +147,8 @@ class LogitsMetadata:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -196,6 +200,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            mm_input_embeds=forward_batch.mm_input_embeds,
         )
 
     def compute_dp_attention_metadata(self):
@@ -242,6 +247,7 @@ class LogitsProcessor(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
@@ -341,6 +347,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
         # Start to process input logprobs
@@ -386,6 +393,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
             input_token_ids_logprobs_val=logprobs_result.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=logprobs_result.input_token_ids_logprobs_idx,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
     def _get_pruned_states(
@@ -899,23 +907,23 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.config.vocab_size % self.attn_tp_size == 0:
+        if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
                     self.attn_tp_size,
                     logits.shape[0],
-                    self.config.vocab_size // self.attn_tp_size,
+                    self.vocab_size // self.attn_tp_size,
                 ),
                 device=logits.device,
                 dtype=logits.dtype,
             )
             attn_tp_all_gather_into_tensor(global_logits, logits)
             global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.config.vocab_size
+                logits.shape[0], self.vocab_size
             )
         else:
             global_logits = torch.empty(
-                (self.config.vocab_size, logits.shape[0]),
+                (self.vocab_size, logits.shape[0]),
                 device=logits.device,
                 dtype=logits.dtype,
             )
@@ -948,10 +956,10 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.config.vocab_size])
+            logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
-            logits = logits[:, : self.config.vocab_size].float()
+            logits = logits[:, : self.vocab_size].float()
         return logits
 
     def _get_dllm_logits(
@@ -1067,6 +1075,10 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_idx=input_top_logprobs_idx,
             input_token_ids_logprobs_val=input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+            # FIXME: These fields are not logits-related but are passed through here as a
+            # workaround since ForwardBatch is local to forward_batch_generation().
+            # They should be moved to GenerationBatchResult to keep this class clean.
+            mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
 

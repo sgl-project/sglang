@@ -7,6 +7,7 @@ from typing import List, Union
 import numpy as np
 import torch
 import torchvision
+from decord import VideoReader
 from PIL import Image
 from torchvision.transforms import InterpolationMode
 
@@ -15,6 +16,10 @@ from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
+from sglang.srt.models.qwen3_5 import (
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5MoeForConditionalGeneration,
+)
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
@@ -148,6 +153,9 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
 ) -> torch.Tensor:
+    # preprocessed video
+    if not isinstance(vr, VideoReader):
+        return vr
     entry_time = time.perf_counter()
 
     total_frames, video_fps = len(vr), vr.get_avg_fps()
@@ -226,6 +234,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen2_5_VLForConditionalGeneration,
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5MoeForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -326,7 +336,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
-        if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
+        if self.hf_config.model_type in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+        ):
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,
                 self.mm_tokens,

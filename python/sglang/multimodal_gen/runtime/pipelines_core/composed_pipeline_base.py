@@ -14,7 +14,7 @@ from typing import Any, cast
 import torch
 from tqdm import tqdm
 
-from sglang.multimodal_gen.runtime.loader.component_loader import (
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (

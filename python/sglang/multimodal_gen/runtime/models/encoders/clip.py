@@ -264,7 +264,7 @@ class CLIPAttention(nn.Module):
                     key_states,
                     value_states,
                     attn_mask=attn_mask,
-                    is_causal=True,
+                    is_causal=attention_mask is None,
                     scale=self.scale,
                 )
             attn_output = attn_output.transpose(1, 2)

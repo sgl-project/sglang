@@ -19,7 +19,9 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAt
 
 # Reuse SGLang's optimized RMSNorm instead of torch.nn.RMSNorm or custom SlowRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNormScaleShift,
     RMSNorm,
+    ScaleResidualLayerNormScaleShift,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -247,14 +249,12 @@ class CrossAttention(nn.Module):
         return x
 
 
-class GateModule(nn.Module):
-    def __init__(
-        self,
-    ):
+class MulAdd(nn.Module):
+    def __init__(self):
         super().__init__()
 
     def forward(self, x, gate, residual):
-        return x + gate * residual
+        return residual + gate * x
 
 
 class DiTBlock(nn.Module):
@@ -272,12 +272,18 @@ class DiTBlock(nn.Module):
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
         self.cross_attn = CrossAttention(dim, num_heads, eps)
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
+        self.norm1 = LayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
+        )
+        self.self_attn_norm = nn.LayerNorm(dim, eps=eps)
+        # Fused: residual + 1 * cross_attn_out → layernorm + scale/shift
+        # Replaces the old norm2 (LayerNormScaleShift) + residual add for cross-attention
+        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
+        )
         self.ffn = MLP(dim, ffn_dim, output_dim=dim, act_type="gelu_pytorch_tanh")
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        self.gate = GateModule()
+        self.mlp_residual = MulAdd()
 
     def forward(self, x, context, t_mod, freqs):
         has_seq = len(t_mod.shape) == 4
@@ -295,11 +301,23 @@ class DiTBlock(nn.Module):
                 scale_mlp.squeeze(2),
                 gate_mlp.squeeze(2),
             )
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-        x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
+        orig_dtype = x.dtype
+        # 1. Self-attention, fuse:
+        # - layernorm(x) * (1 + scale_msa) + shift_msa
+        input_x = self.norm1(x, shift_msa, scale_msa)
+        # 2. torch.compile may fuse mlp_residual and self_attn_norm
+        x = self.mlp_residual(self.self_attn(input_x, freqs), gate_msa, x)
+        norm_x = self.self_attn_norm(x)
+        # 3. Cross-attention, fuse:
+        # - x = x + 1 * cross_output
+        # - input_x = layernorm(x) * (1 + scale_mlp) + shift_mlp
+        cross_output = self.cross_attn(norm_x, context)
+        input_x, x = self.cross_attn_residual_norm(
+            x, cross_output, 1, shift_mlp, scale_mlp
+        )
+        # 4. Feed-forward
+        x = self.mlp_residual(self.ffn(input_x), gate_mlp, x)
+        x = x.to(orig_dtype)
         return x
 
 
@@ -310,7 +328,9 @@ class Head(nn.Module):
         super().__init__()
         self.dim = dim
         self.patch_size = patch_size
-        self.norm = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.norm = LayerNormScaleShift(
+            dim, eps=eps, elementwise_affine=False, dtype=torch.float32
+        )
         # Output dim is small for MOVA; replicate to avoid TP shape coupling.
         self.head = ReplicatedLinear(dim, out_dim * math.prod(patch_size))
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
@@ -321,12 +341,12 @@ class Head(nn.Module):
                 self.modulation.unsqueeze(0).to(dtype=t_mod.dtype, device=t_mod.device)
                 + t_mod.unsqueeze(2)
             ).chunk(2, dim=2)
-            x, _ = self.head(self.norm(x) * (1 + scale.squeeze(2)) + shift.squeeze(2))
+            x, _ = self.head(self.norm(x, shift.squeeze(2), scale.squeeze(2)))
         else:
             shift, scale = (
                 self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
             ).chunk(2, dim=1)
-            x, _ = self.head(self.norm(x) * (1 + scale) + shift)
+            x, _ = self.head(self.norm(x, shift, scale))
         return x
 
 

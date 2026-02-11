@@ -77,6 +77,7 @@ class ImageEncodingStage(PipelineStage):
         fields = [
             "image_processor",
             "image_encoder",
+            "text_encoder",
         ]
         for field in fields:
             processor = getattr(self, field, None)

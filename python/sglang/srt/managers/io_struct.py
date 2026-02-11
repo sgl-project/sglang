@@ -824,6 +824,11 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
 
+    # The path to the LoRA adaptors
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # The uid of LoRA adaptors, should be initialized by tokenizer manager
+    lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -875,6 +880,21 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
+            self._normalize_lora_paths(self.batch_size)
+
+    def _normalize_lora_paths(self, num):
+        """Normalize LoRA paths for batch processing."""
+        if self.lora_path is not None:
+            if isinstance(self.lora_path, str):
+                self.lora_path = [self.lora_path] * num
+            elif isinstance(self.lora_path, list):
+                if len(self.lora_path) != num:
+                    raise ValueError(
+                        f"lora_path list length ({len(self.lora_path)}) must match batch size ({num})"
+                    )
+            else:
+                raise ValueError("lora_path should be a list or a string.")
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -888,6 +908,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
                 text=[self.text[i]] if self.text is not None else None,
                 sampling_params=self.sampling_params[i],
                 rid=self.rid[i],
+                lora_path=self.lora_path[i] if self.lora_path is not None else None,
+                lora_id=self.lora_id[i] if self.lora_id is not None else None,
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
             )
@@ -900,6 +922,8 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
+            lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            lora_id=self.lora_id[i] if self.lora_id is not None else None,
             external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
@@ -928,6 +952,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # LoRA related
+    lora_id: Optional[str] = None  # None means just use the base model
 
 
 @dataclass
@@ -1271,7 +1297,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
-    # Whether to recapture cuda graph after weight udpdate
+    # Whether to recapture cuda graph after weight update
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0

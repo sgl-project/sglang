@@ -14,8 +14,12 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
+_is_npu = current_platform.is_npu()
 if _is_cuda or _is_hip:
     from sgl_kernel import silu_and_mul
+
+if _is_npu:
+    import torch_npu
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
@@ -45,6 +49,10 @@ class SiluAndMul(CustomOp):
         """PyTorch-native implementation equivalent to forward()."""
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch_npu.npu_swiglu(x)
+        return out
 
 
 @CustomOp.register("gelu_and_mul")

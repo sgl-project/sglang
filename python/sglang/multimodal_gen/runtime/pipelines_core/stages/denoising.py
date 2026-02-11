@@ -55,7 +55,9 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.transformer_loader import TransformerLoader
+from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
+    TransformerLoader,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -844,6 +846,10 @@ class DenoisingStage(PipelineStage):
         if not server_args.dit_cpu_offload:
             return
 
+        # FSDP manages offloading internally
+        if server_args.use_fsdp_inference:
+            return
+
         # Offload the unused model if it's on CUDA
         if (
             model_to_offload is not None
@@ -1227,9 +1233,8 @@ class DenoisingStage(PipelineStage):
                 raw_latent_shape=batch.raw_latent_shape
             )
         else:
+            # attn_metadata can be None for SDPA attention backend
             return None
-
-        assert attn_metadata is not None, "attn_metadata cannot be None"
 
         return attn_metadata
 

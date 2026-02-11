@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=360, suite="stage-c-test-large-4-gpu")
+register_cuda_ci(est_time=360, suite="stage-c-test-4-gpu-h100")
 
 SHAREGPT_URL = (
     "https://huggingface.co/datasets/anon8231489123/"

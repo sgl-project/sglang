@@ -1,5 +1,4 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
@@ -31,6 +30,7 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 import contextlib
+import datetime
 import os
 import weakref
 from collections import namedtuple
@@ -219,6 +219,7 @@ def init_distributed_environment(
     local_rank: int = 0,
     backend: str = "nccl",
     device_id: torch.device | None = None,
+    timeout: int | None = None,
 ):
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -229,12 +230,14 @@ def init_distributed_environment(
         logger.info("Using gloo backend for %s platform", current_platform.device_name)
 
     logger.debug(
-        "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
+        "world_size=%d rank=%d local_rank=%d "
+        "distributed_init_method=%s backend=%s timeout=%s",
         world_size,
         rank,
         local_rank,
         distributed_init_method,
         backend,
+        timeout,
     )
     if not torch.distributed.is_initialized():
         assert distributed_init_method is not None, (
@@ -245,9 +248,19 @@ def init_distributed_environment(
         # For MPS and MUSA, don't pass device_id as it doesn't support device indices
         extra_args = (
             {}
-            if (current_platform.is_mps() or current_platform.is_musa())
+            if (
+                current_platform.is_mps()
+                or current_platform.is_musa()
+                or current_platform.is_npu()
+            )
             else dict(device_id=device_id)
         )
+
+        if timeout is not None:
+
+            extra_args["timeout"] = datetime.timedelta(seconds=timeout)
+            logger.info(f"Setting distributed timeout to {timeout} seconds")
+
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -255,6 +268,7 @@ def init_distributed_environment(
             rank=rank,
             **extra_args,
         )
+
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -577,6 +591,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     ring_degree: int = 1,
     dp_size: int = 1,
     distributed_init_method: str = "env://",
+    dist_timeout: int | None = None,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -594,9 +609,10 @@ def maybe_init_distributed_environment_and_model_parallel(
     rank = int(os.environ.get("RANK", 0))
     device = get_local_torch_device()
     logger.info(
-        "Initializing distributed environment with world_size=%d, device=%s",
+        "Initializing distributed environment with world_size=%d, device=%s, timeout=%s",
         world_size,
         device,
+        dist_timeout,
         main_process_only=False,
     )
 
@@ -606,6 +622,8 @@ def maybe_init_distributed_environment_and_model_parallel(
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
         device_id=device,
+        backend=current_platform.get_torch_distributed_backend_str(),
+        timeout=dist_timeout,
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,

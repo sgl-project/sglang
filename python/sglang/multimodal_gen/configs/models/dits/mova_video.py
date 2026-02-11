@@ -18,6 +18,7 @@ class MOVAVideoArchConfig(DiTArchConfig):
         default_factory=lambda: {
             r"^blocks\.(\d+)\.ffn\.0\.(.*)$": r"blocks.\1.ffn.fc_in.\2",
             r"^blocks\.(\d+)\.ffn\.2\.(.*)$": r"blocks.\1.ffn.fc_out.\2",
+            r"^blocks\.(\d+)\.norm3\.(.*)$": r"blocks.\1.self_attn_norm.\2",
             r"^text_embedding\.0\.(.*)$": r"text_embedding.fc_in.\1",
             r"^text_embedding\.2\.(.*)$": r"text_embedding.fc_out.\1",
             r"^time_embedding\.0\.(.*)$": r"time_embedding.fc_in.\1",

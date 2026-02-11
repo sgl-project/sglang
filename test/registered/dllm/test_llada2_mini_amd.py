@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=520, suite="stage-b-test-small-1-gpu-amd")
+register_amd_ci(est_time=1000, suite="stage-b-test-small-1-gpu-amd")
 
 
 class TestLLaDA2MiniAMD(CustomTestCase):

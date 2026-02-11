@@ -497,8 +497,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         forward_batch.spec_info.hidden_states = self.hidden_states[:num_tokens]
         forward_batch.spec_info.accept_length = self.accept_length[:bs]
-        forward_batch.spec_info.num_tokens_per_batch = self.num_tokens_per_bs
-        forward_batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        forward_batch.spec_info.num_tokens_per_req = self.num_tokens_per_bs
+        forward_batch.spec_info.num_tokens_for_logprob_per_req = 1
         forward_batch.spec_info.positions = self.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
 

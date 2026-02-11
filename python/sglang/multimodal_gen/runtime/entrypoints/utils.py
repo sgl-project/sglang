@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import imageio
 import numpy as np
@@ -232,6 +232,72 @@ def prepare_request(
         )
 
     return req
+
+
+def attach_audio_to_video_sample(
+    sample: Any,
+    audio: Any,
+    output_idx: int,
+) -> Any:
+    """Attach per-sample audio for video outputs when available."""
+    if audio is None:
+        return sample
+    if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+        audio = audio[output_idx] if audio.shape[0] > output_idx else None
+    elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
+        audio = audio[output_idx] if audio.shape[0] > output_idx else None
+
+    if audio is not None and not (
+        isinstance(sample, (tuple, list)) and len(sample) == 2
+    ):
+        return (sample, audio)
+    return sample
+
+
+def save_outputs(
+    outputs: Sequence[Any],
+    data_type: DataType,
+    fps: int,
+    save_output: bool,
+    build_output_path: Callable[[int], str],
+    *,
+    audio: Any = None,
+    audio_sample_rate: Optional[int] = None,
+    samples_out: Optional[list[Any]] = None,
+    audios_out: Optional[list[Any]] = None,
+    frames_out: Optional[list[Any]] = None,
+) -> list[str]:
+    """Save outputs to files and return the list of file paths."""
+    output_paths: list[str] = []
+    for idx, output in enumerate(outputs):
+        save_file_path = build_output_path(idx)
+        sample = output
+        if data_type == DataType.VIDEO:
+            sample = attach_audio_to_video_sample(sample, audio, idx)
+        frames = post_process_sample(
+            sample,
+            data_type,
+            fps,
+            save_output,
+            save_file_path,
+            audio_sample_rate=audio_sample_rate,
+        )
+        if samples_out is not None:
+            samples_out.append(sample)
+        if audios_out is not None:
+            if data_type == DataType.VIDEO:
+                audio_item = audio
+                if isinstance(audio, torch.Tensor) and audio.ndim >= 2:
+                    audio_item = audio[idx] if audio.shape[0] > idx else None
+                elif isinstance(audio, np.ndarray) and audio.ndim >= 2:
+                    audio_item = audio[idx] if audio.shape[0] > idx else None
+                audios_out.append(audio_item)
+            else:
+                audios_out.append(audio)
+        if frames_out is not None:
+            frames_out.append(frames)
+        output_paths.append(save_file_path)
+    return output_paths
 
 
 def post_process_sample(
