@@ -116,7 +116,10 @@ class LoRAAdapter(nn.Module):
             # "all-linear"), we allow loading since the server-level
             # --lora-target-modules will govern which modules are active.
             module_name = "embed_tokens" if "embed_tokens" in name else "lm_head"
-            if not normalized_target_modules or module_name in normalized_target_modules:
+            if (
+                not normalized_target_modules
+                or module_name in normalized_target_modules
+            ):
                 self.embedding_layers[name] = loaded_weight.cpu()
             else:
                 logger.debug(

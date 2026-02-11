@@ -48,7 +48,7 @@ from transformers import AutoModelForCausalLM
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestCase
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 
@@ -82,9 +82,9 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
     )
 
     # Verify the model actually has tied embeddings
-    assert model.config.tie_word_embeddings, (
-        f"Expected tie_word_embeddings=True for {base_model_name}"
-    )
+    assert (
+        model.config.tie_word_embeddings
+    ), f"Expected tie_word_embeddings=True for {base_model_name}"
 
     lora_config = LoraConfig(
         r=8,
@@ -113,9 +113,9 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
     safetensors_path = os.path.join(output_dir, "adapter_model.safetensors")
     f = safe_open(safetensors_path, framework="pt")
     lm_head_keys = [k for k in f.keys() if "lm_head" in k]
-    assert len(lm_head_keys) > 0, (
-        f"Expected lm_head LoRA weights in adapter, got keys: {sorted(f.keys())}"
-    )
+    assert (
+        len(lm_head_keys) > 0
+    ), f"Expected lm_head LoRA weights in adapter, got keys: {sorted(f.keys())}"
 
     print(f"Created LoRA adapter at {output_dir}")
     print(f"  lm_head keys: {lm_head_keys}")
@@ -293,9 +293,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             srt_logprobs = torch.tensor(srt_outputs.top_input_logprobs[i])
             hf_logprobs = torch.tensor(hf_outputs.top_input_logprobs[i])
             max_diff = torch.max(torch.abs(srt_logprobs - hf_logprobs)).item()
-            print(
-                f"Prompt {i} prefill logprob max_diff (SGLang vs HF): {max_diff:.6e}"
-            )
+            print(f"Prompt {i} prefill logprob max_diff (SGLang vs HF): {max_diff:.6e}")
             self.assertLess(
                 max_diff,
                 LOGPROB_THRESHOLD,
@@ -308,9 +306,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             srt_logprobs = torch.tensor(srt_outputs.top_output_logprobs[i])
             hf_logprobs = torch.tensor(hf_outputs.top_output_logprobs[i])
             max_diff = torch.max(torch.abs(srt_logprobs - hf_logprobs)).item()
-            print(
-                f"Prompt {i} decode logprob max_diff (SGLang vs HF): {max_diff:.6e}"
-            )
+            print(f"Prompt {i} decode logprob max_diff (SGLang vs HF): {max_diff:.6e}")
             self.assertLess(
                 max_diff,
                 LOGPROB_THRESHOLD,
