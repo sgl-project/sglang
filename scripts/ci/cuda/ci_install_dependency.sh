@@ -23,8 +23,18 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 bash "${SCRIPT_DIR}/../../killall_sglang.sh"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 
+# Resolve a Python binary on runners where python3 is missing from PATH.
+if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+else
+    echo "ERROR: Neither python3 nor python is available in PATH."
+    exit 1
+fi
+
 # Clear torch compilation cache
-python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
+"$PYTHON_BIN" -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Install apt packages
 # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
@@ -132,7 +142,7 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
 # Remove flash_attn folder to avoid conflicts
-PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+PYTHON_LIB_PATH=$("$PYTHON_BIN" -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
@@ -273,7 +283,7 @@ fi
 
 # Show current packages
 $PIP_CMD list
-python3 -c "import torch; print(torch.version.cuda)"
+"$PYTHON_BIN" -c "import torch; print(torch.version.cuda)"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
