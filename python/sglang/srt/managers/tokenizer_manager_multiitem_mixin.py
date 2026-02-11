@@ -1,10 +1,17 @@
 import logging
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ScoreResult:
+    scores: List[List[float]]
+    prompt_tokens: int
 
 
 class TokenizerManagerMultiItemMixin:
@@ -14,7 +21,7 @@ class TokenizerManagerMultiItemMixin:
         label_token_ids: List[int],
         apply_softmax: bool = False,
         request: Optional[Any] = None,
-    ) -> Tuple[List[List[float]], int]:
+    ) -> ScoreResult:
         """
         Score probabilities of specified token IDs after each *full prompt*.
 
@@ -29,8 +36,9 @@ class TokenizerManagerMultiItemMixin:
             request: Optional FastAPI request object.
 
         Returns:
-            scores: List of score lists, one for each prompt, each in the order of label_token_ids.
-            prompt_tokens: The number of prompt tokens processed.
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
         # Text prompts
         if isinstance(prompts, str) or (
@@ -109,7 +117,7 @@ class TokenizerManagerMultiItemMixin:
         label_token_ids: List[int],
         apply_softmax: bool,
         batch_request=None,
-    ) -> Tuple[List[List[float]], int]:
+    ) -> ScoreResult:
         """
         Process results from multi-item scoring request.
         Extracts logprobs at delimiter positions from input_token_ids_logprobs.
@@ -122,7 +130,9 @@ class TokenizerManagerMultiItemMixin:
             batch_request: The original batch request containing input sequence
 
         Returns:
-            List of score lists, one for each item
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
         result = results[0] if isinstance(results, list) else results
         meta_info = result.get("meta_info", {})
@@ -166,11 +176,11 @@ class TokenizerManagerMultiItemMixin:
             )
             scores.append(score_list)
 
-        return scores, prompt_tokens
+        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
 
     def _process_single_item_scoring_results(
         self, results: Any, label_token_ids: List[int], apply_softmax: bool
-    ) -> Tuple[List[List[float]], int]:
+    ) -> ScoreResult:
         """
         Process results from single-item scoring request.
         Single-item scoring results are stored in output_token_ids_logprobs.
@@ -181,8 +191,9 @@ class TokenizerManagerMultiItemMixin:
             apply_softmax: Whether to apply softmax normalization
 
         Returns:
-            scores: List of score lists, one for each result
-            prompt_tokens: The number of prompt tokens processed.
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
         scores = []
         prompt_tokens = 0
@@ -206,7 +217,7 @@ class TokenizerManagerMultiItemMixin:
             )
             scores.append(score_list)
 
-        return scores, prompt_tokens
+        return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
 
     async def score_request(
         self,
@@ -216,7 +227,7 @@ class TokenizerManagerMultiItemMixin:
         apply_softmax: bool = False,
         item_first: bool = False,
         request: Optional[Any] = None,
-    ) -> Tuple[List[List[float]], int]:
+    ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
 
@@ -240,8 +251,9 @@ class TokenizerManagerMultiItemMixin:
             request: Optional FastAPI request object
 
         Returns:
-            scores: List of lists containing probabilities for each item and each label token
-            prompt_tokens: The number of prompt tokens processed.
+            ScoreResult with:
+                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
+                prompt_tokens: The number of prompt tokens processed.
         """
         if label_token_ids is None:
             raise ValueError("label_token_ids must be provided")
@@ -249,7 +261,7 @@ class TokenizerManagerMultiItemMixin:
         if items is None:
             raise ValueError("items must be provided")
         if not items:
-            return [], 0
+            return ScoreResult(scores=[], prompt_tokens=0)
 
         if self.tokenizer is not None:
             vocab_size = self.tokenizer.vocab_size

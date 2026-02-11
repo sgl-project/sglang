@@ -376,13 +376,13 @@ class OpenAIServingRerank(OpenAIServingBase):
                 for doc in request.documents
             ]
 
-            probs, prompt_tokens = await self.tokenizer_manager.score_prompts(
+            result = await self.tokenizer_manager.score_prompts(
                 prompts,
                 label_token_ids=[self._yes_token_id, self._no_token_id],
                 apply_softmax=False,
                 request=raw_request,
             )
-            scores = [_qwen3_rerank_score(p[0], p[1]) for p in probs]
+            scores = [_qwen3_rerank_score(s[0], s[1]) for s in result.scores]
         except ValueError as e:
             return self.create_error_response(str(e))
         except Exception as e:

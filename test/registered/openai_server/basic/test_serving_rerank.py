@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock
 
 from sglang.srt.entrypoints.openai.protocol import V1RerankReqInput
+from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Keep consistent with other openai_server/basic unit tests.
@@ -163,7 +164,7 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
                 # Return [p_yes, p_no] for each prompt
                 assert len(prompts) == 2
                 assert label_token_ids and len(label_token_ids) == 2
-                return [[0.9, 0.1], [0.2, 0.8]], 0
+                return ScoreResult(scores=[[0.9, 0.1], [0.2, 0.8]], prompt_tokens=0)
 
         handler = OpenAIServingRerank(_TM())
         req = V1RerankReqInput(query="q", documents=["d1", "d2"], return_documents=True)

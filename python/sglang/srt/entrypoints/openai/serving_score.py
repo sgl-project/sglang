@@ -43,7 +43,7 @@ class OpenAIServingScore(OpenAIServingBase):
         """Handle the scoring request"""
         try:
             # Use tokenizer_manager's score_request method directly
-            scores, prompt_tokens = await self.tokenizer_manager.score_request(
+            result = await self.tokenizer_manager.score_request(
                 query=request.query,
                 items=request.items,
                 label_token_ids=request.label_token_ids,
@@ -54,11 +54,11 @@ class OpenAIServingScore(OpenAIServingBase):
 
             # Create response with just the scores, without usage info
             response = ScoringResponse(
-                scores=scores,
+                scores=result.scores,
                 model=request.model,
                 usage=UsageInfo(
-                    prompt_tokens=prompt_tokens,
-                    total_tokens=prompt_tokens,
+                    prompt_tokens=result.prompt_tokens,
+                    total_tokens=result.prompt_tokens,
                 ),
             )
             return response

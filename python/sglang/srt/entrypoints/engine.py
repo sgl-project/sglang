@@ -66,6 +66,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager_multiitem_mixin import ScoreResult
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     parse_remote_instance_transfer_engine_info_from_scheduler_infos,
 )
@@ -727,7 +728,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> Tuple[List[List[float]], int]:
+    ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair. For example:
         query = "<|user|>Is the following city the capital of France? "
@@ -752,9 +753,9 @@ class Engine(EngineBase):
             item_first: If True, prepend items to query. Otherwise append items to query.
 
         Returns:
-            scores: List of dictionaries mapping token IDs to their probabilities for each item.
-            Each dictionary in the list corresponds to one item input.
-            prompt_tokens: The number of prompt tokens processed.
+            ScoreResult with:
+                scores: List of lists containing probabilities for each item and each label token
+                prompt_tokens: The number of prompt tokens processed.
 
         Raises:
             ValueError: If query is not provided, or if items is not provided,
@@ -778,7 +779,7 @@ class Engine(EngineBase):
         label_token_ids: Optional[List[int]] = None,
         apply_softmax: bool = False,
         item_first: bool = False,
-    ) -> Tuple[List[List[float]], int]:
+    ) -> ScoreResult:
         """
         Asynchronous version of score method.
 
