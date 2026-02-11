@@ -1,14 +1,17 @@
 """
 Manifold-Constrained Hyper-Connection Module (mHC).
 """
+import os
 from typing import Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.mhc_cuda_ops import MHCCudaOps
 from sglang.srt.layers.mhc_tilelang_ops import (
     mhc_tilelang_aggregate,
+    mhc_deepgemm_norm_linear,
     mhc_tilelang_expand_merge,
     mhc_tilelang_map_sigmoid,
     mhc_tilelang_norm_linear,
@@ -38,21 +41,41 @@ class HyperConnectionModule(nn.Module):
         self.alpha_pre = nn.Parameter(torch.tensor([0.1], dtype=torch.float32))
         self.alpha_post = nn.Parameter(torch.tensor([0.1], dtype=torch.float32))
         self.alpha_res = nn.Parameter(torch.tensor([0.1], dtype=torch.float32))
-        
-        self.alpha = torch.cat([
-            self.alpha_pre.expand(self.n),
-            self.alpha_post.expand(self.n),
-            self.alpha_res.expand(self.n * self.n)
-            ], dim=-1).contiguous()
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(2 * self.n + self.n * self.n, dtype=torch.float32))
         
-        self.norm_linear_func = mhc_tilelang_norm_linear
-        self.map_sigmoid_func = mhc_tilelang_map_sigmoid
-        self.sinkhorn_func = mhc_tilelang_sinkhorn
-        self.aggregate_func = mhc_tilelang_aggregate
-        self.expand_merge_func = mhc_tilelang_expand_merge
+        # Initialize ops based on backend
+        self.backend = os.environ.get("SGLANG_MHC_BACKEND", "deepgemm_cuda")
+
+        if self.backend == "cuda":
+            # Initialize unified CUDA ops module (compiled once, cached tensors)
+            self.cuda_ops = MHCCudaOps()
+            self.norm_linear_func = self.cuda_ops.norm_linear
+            self.map_sigmoid_func = self.cuda_ops.map_sigmoid
+            self.sinkhorn_func = self.cuda_ops.sinkhorn
+            self.aggregate_func = self.cuda_ops.aggregate
+            self.expand_merge_func = self.cuda_ops.expand_merge
+        elif self.backend == "tilelang_cuda":
+            self.cuda_ops = MHCCudaOps()
+            self.norm_linear_func = mhc_tilelang_norm_linear
+            self.map_sigmoid_func = self.cuda_ops.map_sigmoid
+            self.sinkhorn_func = self.cuda_ops.sinkhorn
+            self.aggregate_func = self.cuda_ops.aggregate
+            self.expand_merge_func = self.cuda_ops.expand_merge
+        elif self.backend == "deepgemm_cuda":
+            self.cuda_ops = MHCCudaOps()
+            self.norm_linear_func = mhc_deepgemm_norm_linear
+            self.map_sigmoid_func = self.cuda_ops.map_sigmoid
+            self.sinkhorn_func = self.cuda_ops.sinkhorn
+            self.aggregate_func = self.cuda_ops.aggregate
+            self.expand_merge_func = self.cuda_ops.expand_merge
+        else:
+            self.norm_linear_func = mhc_tilelang_norm_linear
+            self.map_sigmoid_func = mhc_tilelang_map_sigmoid
+            self.sinkhorn_func = mhc_tilelang_sinkhorn
+            self.aggregate_func = mhc_tilelang_aggregate
+            self.expand_merge_func = mhc_tilelang_expand_merge
 
     def compute_mappings(
         self, 
@@ -72,26 +95,9 @@ class HyperConnectionModule(nn.Module):
 
         bs, _, _ = x.shape
 
-        # Use mhc_tilelang_norm_linear for normalization + projection
-        r, proj = self.norm_linear_func(
-            x,
-            self.mapping_proj.weight
-        )
-        
-        # Use mhc_tilelang_map_sigmoid for scaling, bias, and sigmoid operations
-        h_pre, h_post, h_res = self.map_sigmoid_func(
-            r,
-            proj,
-            self.bias,
-            self.alpha,
-            self.n
-        )
-
-        # apply fused Sinkhorn
-        h_res = self.sinkhorn_func(
-            h_res, 
-            n_iters=self.sinkhorn_iterations
-        )
+        r, proj = self.norm_linear_func(x, self.mapping_proj.weight)
+        h_pre, h_post, h_res = self.map_sigmoid_func(r, proj, self.bias, self.alpha_pre, self.alpha_post, self.alpha_res, self.n)
+        h_res = self.sinkhorn_func(h_res, n_iters=self.sinkhorn_iterations)
 
         return h_pre, h_post, h_res
 
@@ -114,8 +120,7 @@ class HyperConnectionModule(nn.Module):
 
         # Compute all mappings
         h_pre, h_post, h_res = self.compute_mappings(residuals)
-        # Use mhc_tilelang_aggregate for weighted sum aggregation
-        # mhc_tilelang_aggregate expects: residuals [bs, n, d], h_pre [bs, n]
+        
         x_in = self.aggregate_func(residuals, h_pre)
         
         return x_in, h_post, h_res
@@ -140,12 +145,6 @@ class HyperConnectionModule(nn.Module):
             residuals_new: [bs, n, dim]
         """
 
-        # Use mhc_tilelang_expand_merge to combine residual mixing and layer output expansion
-        # mhc_tilelang_expand_merge expects:
-        #   residuals: [bs, n, d]
-        #   layer_output: [bs, d]
-        #   h_res: [bs, n, n]
-        #   h_post: [bs, n]
         residuals_new = self.expand_merge_func(residuals, layer_output, h_res, h_post)
         
         return residuals_new

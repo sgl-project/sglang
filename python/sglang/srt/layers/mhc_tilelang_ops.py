@@ -11,6 +11,10 @@ import tilelang
 import tilelang.language as T
 from typing import Tuple
 import math
+try:
+    import deep_gemm
+except ImportError:
+    deep_gemm = None
 
 tilelang.set_log_level("ERROR")
 
@@ -128,6 +132,42 @@ def norm_linear_splitk_kernel(
                     if idx_m < M:
                         T.atomic_add(SumSqX_accum[idx_m], SumSqX_local[i])
     return norm_linear_splitk_func
+
+
+@tilelang.jit(pass_configs=pass_configs)
+def reduce_finalize_kernel(M, num_splits, threads, block_M):
+    """
+    Fused kernel to reduce sum_sq_x_split and compute RMS.
+    Replaces: sum(dim=0) -> sqrt -> div -> copy
+    """
+    fp32 = "float32"
+    M = T.dynamic("M")
+    
+    @T.prim_func
+    def reduce_finalize_func(
+        SumSqX_Split: T.Tensor[(num_splits, M), fp32],
+        R_Out: T.Tensor[(M, 1), fp32],
+        K_val: T.float32,
+        eps: T.float32
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=threads) as pid_m:
+            for i in T.Parallel(block_M):
+                m_idx = pid_m * block_M + i
+                if m_idx < M:
+                    # Reduce across splits
+                    # Use alloc_fragment for mutable scalar accumulation
+                    sum_sq = T.alloc_fragment((1,), fp32)
+                    sum_sq[0] = 0.0
+                    for s in T.serial(num_splits):
+                        sum_sq[0] += SumSqX_Split[s, m_idx]
+                    
+                    # Compute RMS
+                    # R = sqrt(sum_sq / K + eps)
+                    r_val = T.sqrt(sum_sq[0] / K_val + eps)
+                    
+                    # Store result
+                    R_Out[m_idx, 0] = r_val
+    return reduce_finalize_func
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -269,6 +309,73 @@ def mhc_tilelang_norm_linear(
     return out_r, out_y
 
 
+def mhc_deepgemm_norm_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DeepGEMM accelerated RMS normalization and linear projection operation.
+    Args:
+        x: [M, n_streams, D], bf16
+        weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32
+    Returns:
+        r: [M, 1], fp32
+        proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+    """
+    if deep_gemm is None or not hasattr(deep_gemm, "tf32_hc_prenorm_gemm"):
+        raise RuntimeError("deep_gemm.tf32_hc_prenorm_gemm not found. Please install or update DeepGEMM library.")
+
+    x_in = x.flatten(1)
+    M, K = x_in.shape
+    N, K_w = weight.shape
+
+    out_y = torch.empty((M, N), dtype=torch.float32, device=x.device)
+    out_r = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+
+    out_y_in = out_y
+    out_r_in = out_r
+    assert K == K_w, f"Shape mismatch"
+    
+    if not x_in.is_contiguous():
+        x_in = x_in.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
+    # When num_splits is set (e.g. 16), outputs must be splitted tensors:
+    # sum_sq_x: (num_splits, M)
+    # proj_out: (num_splits, M, N)
+    num_splits = 16
+    sum_sq_x_split = torch.empty((num_splits, M), device=x.device, dtype=torch.float32)
+    proj_out_split = torch.empty((num_splits, M, N), device=x.device, dtype=torch.float32)
+    
+    # DeepGEMM optimization: Fused GEMM + Pre-Norm Stats
+    deep_gemm.tf32_hc_prenorm_gemm(x_in, weight, proj_out_split, sum_sq_x_split, num_splits)
+    
+    # Reduce Split-K results
+    # Optimization: Use out= parameter to avoid intermediate buffer allocation and copy
+    # for y_accum if output tensor is contiguous.
+    torch.sum(proj_out_split, dim=0, out=out_y_in)
+
+    # Compute r from sum_sq_x
+    # Optimization: Fused kernel to reduce overhead
+    # r = sqrt(sum(sum_sq_x_split) / K)
+    
+    # Kernel config
+    # Optimization: Use smaller blocks for small batch to avoid thread idleness
+    if M <= 64:
+        threads = 64
+        block_M = 64
+    else:
+        threads = 128
+        block_M = 128
+    eps = 1e-6
+    
+    finalize_kernel = reduce_finalize_kernel(M, num_splits, threads, block_M)
+    finalize_kernel(sum_sq_x_split, out_r_in, float(K), eps)
+
+    return out_r, out_y
+
+
 @tilelang.jit(pass_configs=pass_configs)
 def map_sigmoid_kernel(M, Dim, N, threads, block_M, block_Dim):
     """
@@ -323,20 +430,29 @@ def map_sigmoid_kernel(M, Dim, N, threads, block_M, block_Dim):
     return map_sigmoid_func
 
 
-def mhc_tilelang_map_sigmoid(r, proj, bias, alpha, n_streams):
+def mhc_tilelang_map_sigmoid(r, proj, bias, alpha_pre, alpha_post, alpha_res, n_streams):
     """
     Fused map and sigmoid operations.
     Args:
         r: [M, 1], fp32
-        proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+        proj: [M, 2 * n_streams + n_streams * n_streams, fp32
         bias: [2 * n_streams + n_streams * n_streams, ], fp32
-        alpha: [2 * n_streams + n_streams * n_streams, ], fp32
+        alpha_pre: [1, ], fp32
+        alpha_post: [1, ], fp32
+        alpha_res: [1, ], fp32
         n_streams: int
     Returns:
         h_pre: [M, n_streams], fp32
         h_post: [M, n_streams], fp32
         h_res: [M, n_streams, n_streams], fp32
     """
+    # Expand and concatenate alpha components
+    alpha = torch.cat([
+        alpha_pre.expand(n_streams),
+        alpha_post.expand(n_streams),
+        alpha_res.expand(n_streams * n_streams)
+    ], dim=-1).contiguous()
+    
     OutDim = proj.shape[-1]
     M, _ = r.shape
     r_in = r
@@ -531,30 +647,61 @@ def sinkhorn_kernel(M, n_streams, threads, block_M):
             for i in T.Parallel(block_M):
                 m_idx = pid_m * block_M + i
                 if m_idx < M:
-                    # Manual unroll N=4 load
+                    # Load raw logits first to find max for numerical stability
                     # row 0
-                    mat_shared[i, 0, 0] = T.exp(Logits[m_idx, 0, 0])
-                    mat_shared[i, 0, 1] = T.exp(Logits[m_idx, 0, 1])
-                    mat_shared[i, 0, 2] = T.exp(Logits[m_idx, 0, 2])
-                    mat_shared[i, 0, 3] = T.exp(Logits[m_idx, 0, 3])
+                    l00 = Logits[m_idx, 0, 0]
+                    l01 = Logits[m_idx, 0, 1]
+                    l02 = Logits[m_idx, 0, 2]
+                    l03 = Logits[m_idx, 0, 3]
                     # row 1
-                    mat_shared[i, 1, 0] = T.exp(Logits[m_idx, 1, 0])
-                    mat_shared[i, 1, 1] = T.exp(Logits[m_idx, 1, 1])
-                    mat_shared[i, 1, 2] = T.exp(Logits[m_idx, 1, 2])
-                    mat_shared[i, 1, 3] = T.exp(Logits[m_idx, 1, 3])
+                    l10 = Logits[m_idx, 1, 0]
+                    l11 = Logits[m_idx, 1, 1]
+                    l12 = Logits[m_idx, 1, 2]
+                    l13 = Logits[m_idx, 1, 3]
                     # row 2
-                    mat_shared[i, 2, 0] = T.exp(Logits[m_idx, 2, 0])
-                    mat_shared[i, 2, 1] = T.exp(Logits[m_idx, 2, 1])
-                    mat_shared[i, 2, 2] = T.exp(Logits[m_idx, 2, 2])
-                    mat_shared[i, 2, 3] = T.exp(Logits[m_idx, 2, 3])
+                    l20 = Logits[m_idx, 2, 0]
+                    l21 = Logits[m_idx, 2, 1]
+                    l22 = Logits[m_idx, 2, 2]
+                    l23 = Logits[m_idx, 2, 3]
                     # row 3
-                    mat_shared[i, 3, 0] = T.exp(Logits[m_idx, 3, 0])
-                    mat_shared[i, 3, 1] = T.exp(Logits[m_idx, 3, 1])
-                    mat_shared[i, 3, 2] = T.exp(Logits[m_idx, 3, 2])
-                    mat_shared[i, 3, 3] = T.exp(Logits[m_idx, 3, 3])
+                    l30 = Logits[m_idx, 3, 0]
+                    l31 = Logits[m_idx, 3, 1]
+                    l32 = Logits[m_idx, 3, 2]
+                    l33 = Logits[m_idx, 3, 3]
+
+                    # Find max value per row (Row Max)
+                    rm0 = T.max(T.max(l00, l01), T.max(l02, l03))
+                    rm1 = T.max(T.max(l10, l11), T.max(l12, l13))
+                    rm2 = T.max(T.max(l20, l21), T.max(l22, l23))
+                    rm3 = T.max(T.max(l30, l31), T.max(l32, l33))
+                    
+                    # Compute exp(logits - row_max) to prevent overflow and ensure row stability
+                    # row 0
+                    mat_shared[i, 0, 0] = T.exp(l00 - rm0)
+                    mat_shared[i, 0, 1] = T.exp(l01 - rm0)
+                    mat_shared[i, 0, 2] = T.exp(l02 - rm0)
+                    mat_shared[i, 0, 3] = T.exp(l03 - rm0)
+                    # row 1
+                    mat_shared[i, 1, 0] = T.exp(l10 - rm1)
+                    mat_shared[i, 1, 1] = T.exp(l11 - rm1)
+                    mat_shared[i, 1, 2] = T.exp(l12 - rm1)
+                    mat_shared[i, 1, 3] = T.exp(l13 - rm1)
+                    # row 2
+                    mat_shared[i, 2, 0] = T.exp(l20 - rm2)
+                    mat_shared[i, 2, 1] = T.exp(l21 - rm2)
+                    mat_shared[i, 2, 2] = T.exp(l22 - rm2)
+                    mat_shared[i, 2, 3] = T.exp(l23 - rm2)
+                    # row 3
+                    mat_shared[i, 3, 0] = T.exp(l30 - rm3)
+                    mat_shared[i, 3, 1] = T.exp(l31 - rm3)
+                    mat_shared[i, 3, 2] = T.exp(l32 - rm3)
+                    mat_shared[i, 3, 3] = T.exp(l33 - rm3)
             
-            # Iterations loop (serial) outside Parallel
+            # Ite, 3]rations loop (serial) outside Parallel
             for iter_idx in T.serial(iters):
+                # Standard Order: Row Norm first, then Col Norm
+                # This ensures the final operation is Col Norm, guaranteeing col_sum == 1.0
+
                 # Row Norm Phase
                 for i in T.Parallel(block_M):
                     m_idx = pid_m * block_M + i
@@ -633,8 +780,7 @@ def sinkhorn_kernel(M, n_streams, threads, block_M):
                         mat_shared[i, 0, 3] /= col_sum_shared[i, 3]
                         mat_shared[i, 1, 3] /= col_sum_shared[i, 3]
                         mat_shared[i, 2, 3] /= col_sum_shared[i, 3]
-                        mat_shared[i, 3, 3] /= col_sum_shared[i, 3]
-            
+                        mat_shared[i, 3, 3] /= col_sum_shared[i, 3]            
             # Store Phase
             for i in T.Parallel(block_M):
                 m_idx = pid_m * block_M + i
