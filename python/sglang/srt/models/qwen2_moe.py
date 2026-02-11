@@ -592,7 +592,17 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            norm_kwargs = (
+                dict(
+                    cast_x_before_out_mul=True,
+                    fp32_residual=False,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
+            self.norm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
