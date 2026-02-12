@@ -16,7 +16,7 @@ default parameters when initializing and generating videos.
 
 ### Video Generation Models
 
-| Model Name                   | Hugging Face Model ID                             | Resolutions         | TeaCache | Sliding Tile Attn | Sage Attn | Video Sparse Attention (VSA) | Sparse Linear Attention（SLA）| Sage Sparse Linear Attention（SageSLA）|
+| Model Name                   | Hugging Face Model ID                             | Resolutions         | TeaCache | Sliding Tile Attn | Sage Attn | Video Sparse Attention (VSA) | Sparse Linear Attention (SLA) | Sage Sparse Linear Attention (SageSLA) |
 |:-----------------------------|:--------------------------------------------------|:--------------------|:--------:|:-----------------:|:---------:|:----------------------------:|:----------------------------:|:-----------------------------------------------:|
 | FastWan2.1 T2V 1.3B          | `FastVideo/FastWan2.1-T2V-1.3B-Diffusers`         | 480p                |    ⭕     |         ⭕         |     ⭕     |              ✅               |              ❌               |              ❌               |
 | FastWan2.2 TI2V 5B Full Attn | `FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers` | 720p                |    ⭕     |         ⭕         |     ⭕     |              ✅               |              ❌               |              ❌               |
@@ -34,8 +34,8 @@ default parameters when initializing and generating videos.
 | TurboWan2.1 T2V 14B 720P     | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers`  | 720p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |
 | TurboWan2.2 I2V A14B         | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers`      | 720p                |    ✅     |         ❌         |     ❌     |              ❌               |              ✅               |              ✅               |
 
-**Note**: <br>
-1.Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.<br>
+**Note**:
+1.Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
 2.SageSLA Based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
 
 ### Image Generation Models
@@ -55,7 +55,7 @@ default parameters when initializing and generating videos.
 
 This section lists example LoRAs that have been explicitly tested and verified with each base model in the **SGLang Diffusion** pipeline.
 
-> Important: \
+> Important:
 > LoRAs that are not listed here are not necessarily incompatible.
 > In practice, most standard LoRAs are expected to work, especially those following common Diffusers or SD-style conventions.
 > The entries below simply reflect configurations that have been manually validated by the SGLang team.
