@@ -288,6 +288,11 @@ at::Tensor causal_conv1d_update_cpu(
     int64_t pad_slot_id,
     bool is_vnni);
 
+// conv3d fast path for patch embedding
+at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
+
+at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -505,6 +510,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "causal_conv1d_update_cpu(Tensor x, Tensor conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
       "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
   m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
+  // conv3d fast path for patch embedding
+  m.def("conv3d_embed_weight_pack(Tensor weight) -> Tensor");
+  m.impl("conv3d_embed_weight_pack", torch::kCPU, &conv3d_embed_weight_pack);
+  m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
+  m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
