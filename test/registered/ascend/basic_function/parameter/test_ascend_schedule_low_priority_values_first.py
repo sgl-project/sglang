@@ -39,12 +39,12 @@ class TestLowPriorityFirstScheduling(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args = [
+            other_args=[
                 "--max-running-requests",
-                "1", # Limit concurrent running requests to 1 (enforce queueing)
+                "1",  # Limit concurrent running requests to 1 (enforce queueing)
                 "--max-queued-requests",
                 "3",  # Limit maximum queued requests to 3 (enforce request abortion when queue is full)
-                "--enable-priority-scheduling", # Enable priority-based request scheduling (prerequisite for priority features)
+                "--enable-priority-scheduling",  # Enable priority-based request scheduling (prerequisite for priority features)
                 "--schedule-low-priority-values-first",
                 "--disable-cuda-graph",
                 "--attention-backend",

@@ -56,13 +56,15 @@ class TestAscendApi(CustomTestCase):
         thread1 = threading.Thread(
             target=send_requests,
             args=('/generate',),
-            kwargs={'rid': '10086', 'text': 'who are you?',
-            'sampling_params': {'temperature': 0.0, 'max_new_tokens': 1024},
+            kwargs={
+                'rid': '10086',
+                'text': 'who are you?',
+                'sampling_params': {'temperature': 0.0, 'max_new_tokens': 1024},
             },
         )
         # Create thread 2: Send an /abort_request to terminate the request with rid=10086
         thread2 = threading.Thread(
-            target=send_requests, args=('/abort_request',), kwargs={'rid': "10086"}
+            target=send_requests, args=("/abort_request",), kwargs={"rid": "10086"}
         )
         thread1.start()
         time.sleep(0.5)
