@@ -1079,7 +1079,12 @@ class FusedMoE(torch.nn.Module):
                 f"Unsupported weight_name {weight_name} for FusedMoE weight_loader_fused. Nothing is loaded."
             )
 
-    def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        shared_state: Optional[torch.Tensor] = None,
+    ):
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
@@ -1108,9 +1113,14 @@ class FusedMoE(torch.nn.Module):
                 # Make sure there is torch lib op registration for the whole moe layer
                 return self.forward_impl(hidden_states, topk_output)
         else:
-            return self.forward_impl(hidden_states, topk_output)
+            return self.forward_impl(hidden_states, topk_output, shared_state)
 
-    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        shared_state: Optional[torch.Tensor] = None,
+    ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
@@ -1120,6 +1130,7 @@ class FusedMoE(torch.nn.Module):
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
+            shared_state=shared_state,
         )
 
         with use_symmetric_memory(
@@ -1154,11 +1165,16 @@ class FusedMoE(torch.nn.Module):
 
         return self.dispatcher.combine(combine_input=combine_input)
 
-    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+    def run_moe_core(
+        self,
+        dispatch_output: DispatchOutput,
+        shared_state: Optional[torch.Tensor] = None,
+    ) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
+            shared_state=shared_state,
         )
 
     @classmethod

@@ -337,11 +337,16 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         return shared_output
 
-    def _forward_router_experts(self, hidden_states: torch.Tensor):
+    def _forward_router_experts(
+        self, hidden_states: torch.Tensor, shared_output: Optional[torch.Tensor] = None
+    ):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        return self.experts(hidden_states, topk_output)
+        if _is_npu:
+            return self.experts(hidden_states, topk_output, shared_output)
+        else:
+            return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
         self,
@@ -375,9 +380,14 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             )
         else:
             shared_output = self._forward_shared_experts(hidden_states)
-            final_hidden_states = self._forward_router_experts(hidden_states)
+            if _is_npu:
+                final_hidden_states = self._forward_router_experts(
+                    hidden_states, shared_output
+                )
+            else:
+                final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if self.num_shared_experts > 0:
+        if not _is_npu and self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
