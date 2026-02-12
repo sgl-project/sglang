@@ -1764,6 +1764,7 @@ class Scheduler(
             dimensions=recv_req.dimensions,
             lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
+            vocab_size=self.model_config.vocab_size,
         )
         req.tokenizer = self.tokenizer
 
