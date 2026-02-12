@@ -976,6 +976,11 @@ class Scheduler(
             self.copy_stream
         )
 
+        # Track completion of the last forward pass on the forward_stream.
+        # Used to prevent req_to_token_pool writes (from prepare_for_decode on the
+        # default stream) from racing with forward_stream reads of the same pool.
+        self._last_forward_done = None
+
         if not self.enable_overlap:
             self.future_map = None
             return
@@ -2141,6 +2146,10 @@ class Scheduler(
             # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
+                # Ensure the forward stream has finished reading req_to_token_pool
+                # before prepare_for_decode writes new entries to it.
+                if self.enable_overlap and self._last_forward_done is not None:
+                    self.default_stream.wait_event(self._last_forward_done)
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
@@ -2214,6 +2223,11 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
+        # Ensure the forward stream has finished reading req_to_token_pool
+        # before prepare_for_decode writes new entries to it.
+        if self.enable_overlap and self._last_forward_done is not None:
+            self.default_stream.wait_event(self._last_forward_done)
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
@@ -2281,6 +2295,16 @@ class Scheduler(
                             model_worker_batch
                             # here pp is not compatible with overlap
                         )
+
+                    # Record an event after the forward pass completes on the
+                    # forward_stream.  The default stream must wait on this event
+                    # before the next prepare_for_decode(), which writes to
+                    # req_to_token_pool.req_to_token — the same tensor the forward
+                    # pass reads.  Without this, a freed-and-reused req_pool_idx
+                    # can be overwritten while the forward kernels still read it.
+                    self._last_forward_done = self.device_module.Event()
+                    self._last_forward_done.record()  # recorded on forward_stream
+
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
