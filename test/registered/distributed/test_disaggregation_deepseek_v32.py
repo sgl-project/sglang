@@ -40,6 +40,8 @@ class TestDisaggregationDeepseekV32(PDDisaggregationServerBase):
             "prefill",
             "--tp",
             "4",
+            "--cpu-offload-gb",
+            "128",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
@@ -61,6 +63,8 @@ class TestDisaggregationDeepseekV32(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--cpu-offload-gb",
+            "128",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
