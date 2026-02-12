@@ -267,7 +267,8 @@ def _flash_attn_fwd(
         9,
         10,
         11,
-    ], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+        12,
+    ], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -295,7 +296,7 @@ def _flash_attn_fwd(
         ):
             n_block_size = 192
 
-    if compute_capability in [10, 11]:
+    if compute_capability in [10, 11, 12]:
         if pack_gqa and (128 % qhead_per_kvhead != 0):
             pack_gqa = False
         # TODO: fix GQA + SplitKV + non-varlen
