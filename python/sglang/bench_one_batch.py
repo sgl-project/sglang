@@ -814,3 +814,4 @@ if __name__ == "__main__":
     finally:
         if server_args.tp_size != 1:
             kill_process_tree(os.getpid(), include_parent=False)
+
