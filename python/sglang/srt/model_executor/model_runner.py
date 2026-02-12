@@ -592,7 +592,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # Init routed experts capturer
-        self.init_routed_experts_capturer()
+        if not self.is_draft_worker:
+            self.init_routed_experts_capturer()
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
@@ -2375,11 +2376,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
-        get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-        )
+        if not self.is_draft_worker:
+            # In speculative decoding, num_tokens_per_bs > 1, so we need to pass
+            # the actual number of tokens per dp rank in cuda graph, not batch size.
+            cuda_graph_num_tokens = None
+            if getattr(self.graph_runner, "bs", None):
+                cuda_graph_num_tokens = (
+                    self.graph_runner.bs * self.graph_runner.num_tokens_per_bs
+                )
+            get_global_experts_capturer().on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=cuda_graph_num_tokens,
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
