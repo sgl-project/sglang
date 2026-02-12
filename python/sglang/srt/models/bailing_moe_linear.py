@@ -18,12 +18,8 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.linear.fused_group_rmsnorm import (
-    BailingMoEFusedGroupRMSNormSigmoidGate,
-    BailingMoERMSNormTP,
-)
-from sglang.srt.layers.attention.linear.linear_rotary_embedding import get_linear_rope
-from sglang.srt.layers.attention.linear.rmsnorm import rms_norm_triton_fn
+from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
+from sglang.srt.layers.attention.fla.layernorm_gated import layernorm_fn
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -54,6 +50,7 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -354,6 +351,40 @@ class BailingMoE(nn.Module):
         return final_hidden_states
 
 
+class BailingGroupRMSNormGate(RMSNormGated):
+    def __init__(
+        self,
+        hidden_size,
+        eps=1e-5,
+        group_size=None,
+        norm_before_gate=True,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__(
+            hidden_size,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            device=device,
+            dtype=dtype,
+            activation="sigmoid",
+        )
+        self.weight.weight_loader = self.weight_loader
+
+    @staticmethod
+    def weight_loader(
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        tp_size = get_attention_tp_size()
+        tp_rank = get_attention_tp_rank()
+        shard_size = loaded_weight.shape[0] // tp_size
+        shard = slice(tp_rank * shard_size, (tp_rank + 1) * shard_size)
+        param.data.copy_(loaded_weight[shard].contiguous())
+        return
+
+
 class BailingMoELinearAttention(nn.Module):
     def __init__(
         self,
@@ -449,27 +480,17 @@ class BailingMoELinearAttention(nn.Module):
 
         self.group_norm_size = getattr(config, "group_norm_size", 1)
         self.rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-5))
-        if self.group_norm_size > 1:
-            assert (
-                self.tp_size <= self.group_norm_size
-            ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
-            assert (
-                self.group_norm_size % self.tp_size == 0
-            ), "group_norm_size must be divisible by tp_size"
-            self.g_norm = BailingMoEFusedGroupRMSNormSigmoidGate(
-                self.hidden_inner_size,
-                eps=self.rms_norm_eps,
-                group_norm_size=self.group_norm_size,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            )
-        else:
-            self.g_norm = BailingMoERMSNormTP(
-                self.hidden_inner_size,
-                eps=self.rms_norm_eps,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            )
+        assert (
+            self.tp_size <= self.group_norm_size
+        ), "tp_size must be less than or equal to group_norm_size that can use local rms norm"
+        assert (
+            self.group_norm_size % self.tp_size == 0
+        ), "group_norm_size must be divisible by tp_size"
+        self.g_norm = BailingGroupRMSNormGate(
+            hidden_size=self.hidden_inner_size // self.tp_size,
+            eps=self.rms_norm_eps,
+            group_size=self.hidden_inner_size // self.group_norm_size,
+        )
         # use fp32 rotary embedding
         if hasattr(config, "rotary_dim"):
             rotary_dim = config.rotary_dim
@@ -477,13 +498,15 @@ class BailingMoELinearAttention(nn.Module):
             rotary_dim = int(self.head_dim * config.partial_rotary_factor)
         else:
             rotary_dim = self.head_dim
-        self.rotary_emb = get_linear_rope(
-            head_size=self.head_dim,
+
+        self.rotary_emb = get_rope_wrapper(
+            self.head_dim,
             rotary_dim=rotary_dim,
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
-            is_neox_style=True,
             rope_scaling=config.rope_scaling,
+            is_neox_style=True,
+            device=get_global_server_args().device,
             dtype=torch.float32,
         )
 
@@ -515,13 +538,20 @@ class BailingMoELinearAttention(nn.Module):
         if self.use_qk_norm:
             q = q.reshape(-1, self.tp_heads, self.head_dim)
             k = k.reshape(-1, self.tp_kv_heads, self.head_dim)
-            q = rms_norm_triton_fn(
-                q, self.query_layernorm.weight.data, eps=self.rms_norm_eps
+            q = layernorm_fn(
+                q,
+                self.query_layernorm.weight.data,
+                bias=None,
+                eps=self.rms_norm_eps,
+                is_rms_norm=True,
             )
-            k = rms_norm_triton_fn(
-                k, self.key_layernorm.weight.data, eps=self.rms_norm_eps
+            k = layernorm_fn(
+                k,
+                self.key_layernorm.weight.data,
+                bias=None,
+                eps=self.rms_norm_eps,
+                is_rms_norm=True,
             )
-
             q = q.reshape(-1, self.q_size_per_rank)
             k = k.reshape(-1, self.kv_size_per_rank)
 
@@ -549,7 +579,7 @@ class BailingMoELinearAttention(nn.Module):
             hidden = self.g_norm(hidden)
             hidden = F.sigmoid(gate) * hidden
         # logger.warning(f"===={self.layer_id=}, 1-4 {hidden.shape=}")
-        # hidden = hidden.to(hidden_states.dtype)
+        hidden = hidden.data.to(hidden_states.dtype)
         hidden, _ = self.dense(hidden)
         # logger.warning(f"===={self.layer_id=}, 1-5 {hidden.shape=}")
         return hidden
@@ -618,12 +648,13 @@ class BailingMoEAttention(nn.Module):
             self.rotary_dim = self.head_dim
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = getattr(config, "rope_theta", 600000)
-        self.rotary_emb = get_linear_rope(
+        self.rotary_emb = get_rope_wrapper(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=self.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=config.rope_scaling,
+            device=get_global_server_args().device,
         )
         self.attn = RadixAttention(
             self.num_heads,
