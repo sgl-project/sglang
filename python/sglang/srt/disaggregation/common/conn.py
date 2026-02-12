@@ -342,8 +342,15 @@ class CommonKVReceiver(BaseKVReceiver):
             self.target_tp_ranks = [self.target_tp_rank]
         else:
             if not self.kv_mgr.is_mla_backend:
-                logger.warning_once(
-                    "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
+                raise ValueError(
+                    f"Different TP sizes between Prefill and Decode are not supported for non-MLA models.\n"
+                    f"Configuration: Prefill TP={self.prefill_attn_tp_size}, Decode TP={self.kv_mgr.attn_tp_size}\n"
+                    f"Reason: Non-MLA models (e.g., Qwen, Llama, Mistral) require collecting full KV cache "
+                    f"from all Prefill ranks, causing 2x data transfer overhead and concurrent connection "
+                    f"conflicts under load, which leads to crashes (see https://github.com/sgl-project/sglang/issues/15674).\n"
+                    f"Solutions:\n"
+                    f"  1. Use the same --tp-size for both Prefill and Decode (Recommended)\n"
+                    f"  2. Switch to MLA models (DeepSeek, Kimi) which support different TP sizes"
                 )
             # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks for non MLA models;
             self.target_tp_ranks = [
