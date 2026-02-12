@@ -237,7 +237,6 @@
     let tagsArray = null;  // Compact format: array of [name, date, type]
     let sortedCommitKeys = null;  // Sorted keys for binary prefix search
     const INDEX_FILE = 'release_index.json';
-    const EXAMPLE_FILE = 'example_index.json';
     const SHORT_HASH_LEN = 8;
 
     const input = document.getElementById('queryInput');
@@ -294,13 +293,9 @@
         statusDiv.innerText = 'Downloading index...';
 
         try {
-            let response = await fetch(INDEX_FILE);
+            const response = await fetch(INDEX_FILE);
             if (!response.ok) {
-                console.log('Main index not found, trying example...');
-                response = await fetch(EXAMPLE_FILE);
-                if (!response.ok) {
-                    throw new Error("No index file found. Please run generate_index.py.");
-                }
+                throw new Error("No index file found. Please run generate_index.py.");
             }
             const data = await response.json();
 

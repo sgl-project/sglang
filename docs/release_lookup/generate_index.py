@@ -113,7 +113,7 @@ def process_tag_line(tags, commit_map, pr_map, tag_type, tag_to_idx):
 
                 tag_idx = tag_to_idx[tag_name]
 
-                # Store tag index using full SHA as key
+                # Store release index using full SHA as key
                 if sha not in commit_map:
                     commit_map[sha] = {}
                 commit_map[sha][tag_type] = tag_idx
@@ -130,7 +130,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate lookup index for sglang releases"
     )
-    parser.add_argument("--output", default="release_index.json", help="Output JSON file")
+    parser.add_argument(
+        "--output", default="release_index.json", help="Output JSON file"
+    )
     args = parser.parse_args()
 
     tags = get_tags()
@@ -202,11 +204,12 @@ def main():
         "g": datetime.now().isoformat(),  # generated_at
     }
 
-    # Write minified JSON
+    # Write minified JSON with a trailing newline for formatter compatibility.
     json_str = json.dumps(output_data, separators=(",", ":"))
 
-    with open(args.output, "w") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         f.write(json_str)
+        f.write("\n")
 
     json_size = os.path.getsize(args.output)
 
