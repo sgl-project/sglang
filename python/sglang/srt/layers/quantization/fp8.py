@@ -60,7 +60,10 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     convert_to_channelwise,
@@ -119,6 +122,7 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: List[int] = None,
         use_mxfp8: bool = False,
     ) -> None:
+        super().__init__()
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -167,6 +171,9 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        packed_modules_mapping = cls.get_from_keys_or(
+            config, ["packed_modules_mapping"], {}
+        )
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
@@ -182,13 +189,15 @@ class Fp8Config(QuantizationConfig):
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
             )
             weight_block_size = [1, 32]
-        return cls(
+        quant_config = cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             use_mxfp8=use_mxfp8,
         )
+        quant_config.packed_modules_mapping = packed_modules_mapping or {}
+        return quant_config
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -198,10 +207,20 @@ class Fp8Config(QuantizationConfig):
         from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.ignored_layers):
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            # FusedMoE prefixes include ".experts", where layer-prefix rules
+            # (e.g., "model.layers.{i}.") should also force BF16 fallback.
+            if is_layer_skipped(
+                prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
+            ) or any(ignored in prefix for ignored in self.ignored_layers):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
+                )
             return Fp8MoEMethod(self)
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
