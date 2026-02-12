@@ -309,3 +309,271 @@ impl SchedulerPolicy for ProportionScheduler {
     }
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{BasicWorkerBuilder, WorkerRegistry, WorkerType};
+
+    /// Helper: create a config with a long adjust_interval so the background task
+    /// doesn't interfere with synchronous assertions.
+    fn test_config() -> ProportionSchedulerConfig {
+        ProportionSchedulerConfig {
+            adjust_interval: Duration::from_secs(3600),
+            adjust_window: Duration::from_secs(3600),
+            balance_abs_threshold: 100,
+            balance_rel_threshold: 1.5,
+            regular_worker_weight: 0.4,
+        }
+    }
+
+    /// Helper: create a WorkerRegistry with one Regular and one Prefill worker.
+    fn registry_with_regular_and_prefill() -> Arc<WorkerRegistry> {
+        let registry = Arc::new(WorkerRegistry::new());
+        let regular: Box<dyn crate::core::Worker> = Box::new(
+            BasicWorkerBuilder::new("http://regular:8000")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let prefill: Box<dyn crate::core::Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill { bootstrap_port: None })
+                .build(),
+        );
+        registry.register(Arc::from(regular));
+        registry.register(Arc::from(prefill));
+        registry
+    }
+
+    /// Helper: seed internal worker_counts so select_router can work
+    /// without waiting for the background adjustment task.
+    fn seed_worker_counts(scheduler: &ProportionScheduler, regular: usize, pd: usize) {
+        let mut counts = scheduler.worker_counts.write().unwrap();
+        counts.insert(router_ids::HTTP_REGULAR, regular);
+        counts.insert(router_ids::HTTP_PD, pd);
+    }
+
+    // ── 1. Basic properties ──────────────────────────────────────────
+
+    #[test]
+    fn test_scheduler_name() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let registry = registry_with_regular_and_prefill();
+            let scheduler = ProportionScheduler::new(test_config(), registry);
+            assert_eq!(scheduler.name(), "proportion");
+        });
+    }
+
+    #[test]
+    fn test_needs_request_text() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let registry = registry_with_regular_and_prefill();
+            let scheduler = ProportionScheduler::new(test_config(), registry);
+            assert!(scheduler.needs_request_text());
+        });
+    }
+
+    // ── 2. No workers → None ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_no_workers_returns_none() {
+        let registry = registry_with_regular_and_prefill();
+        let scheduler = ProportionScheduler::new(test_config(), registry);
+        // worker_counts stays empty (all zeros) → should return None
+        let candidates = vec![router_ids::HTTP_REGULAR, router_ids::HTTP_PD];
+        let tokens: Vec<u32> = vec![1; 100];
+        let info = SelectRouterInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let result = scheduler.select_router(&candidates, &info).await;
+        assert!(result.is_none(), "Should return None when worker_counts are all zero");
+    }
+
+    // ── 3. Crossover-point routing ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_short_request_routes_to_regular() {
+        let registry = registry_with_regular_and_prefill();
+        let scheduler = ProportionScheduler::new(test_config(), registry);
+        seed_worker_counts(&scheduler, 2, 2);
+
+        let candidates = vec![router_ids::HTTP_REGULAR, router_ids::HTTP_PD];
+        let tokens: Vec<u32> = vec![1; 100]; // 100 < crossover(512)
+        let info = SelectRouterInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let result = scheduler.select_router(&candidates, &info).await;
+        assert_eq!(result, Some(router_ids::HTTP_REGULAR));
+    }
+
+    #[tokio::test]
+    async fn test_long_request_routes_to_pd() {
+        let registry = registry_with_regular_and_prefill();
+        let scheduler = ProportionScheduler::new(test_config(), registry);
+        seed_worker_counts(&scheduler, 2, 2);
+
+        let candidates = vec![router_ids::HTTP_REGULAR, router_ids::HTTP_PD];
+        let tokens: Vec<u32> = vec![1; 1000]; // 1000 > crossover(512)
+        let info = SelectRouterInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let result = scheduler.select_router(&candidates, &info).await;
+        assert_eq!(result, Some(router_ids::HTTP_PD));
+    }
+
+    // ── 4. Fallback ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fallback_when_only_pd_available() {
+        let registry = registry_with_regular_and_prefill();
+        let scheduler = ProportionScheduler::new(test_config(), registry);
+        seed_worker_counts(&scheduler, 2, 2);
+
+        let candidates = vec![router_ids::HTTP_PD]; // only PD
+        let tokens: Vec<u32> = vec![1; 100]; // short, would prefer Regular
+        let info = SelectRouterInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let result = scheduler.select_router(&candidates, &info).await;
+        assert_eq!(result, Some(router_ids::HTTP_PD));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_when_only_regular_available() {
+        let registry = registry_with_regular_and_prefill();
+        let scheduler = ProportionScheduler::new(test_config(), registry);
+        seed_worker_counts(&scheduler, 2, 2);
+
+        let candidates = vec![router_ids::HTTP_REGULAR]; // only Regular
+        let tokens: Vec<u32> = vec![1; 1000]; // long, would prefer PD
+        let info = SelectRouterInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let result = scheduler.select_router(&candidates, &info).await;
+        assert_eq!(result, Some(router_ids::HTTP_REGULAR));
+    }
+
+    // ── 5. Load tracking ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_load_tracking() {
+        let registry = registry_with_regular_and_prefill();
+        let scheduler = ProportionScheduler::new(test_config(), registry);
+        seed_worker_counts(&scheduler, 2, 2);
+
+        let candidates = vec![router_ids::HTTP_REGULAR, router_ids::HTTP_PD];
+
+        // Short request (100 tokens) → Regular
+        let tokens_short: Vec<u32> = vec![1; 100];
+        let info_short = SelectRouterInfo {
+            tokens: Some(&tokens_short),
+            ..Default::default()
+        };
+        scheduler.select_router(&candidates, &info_short).await;
+
+        // Long request (1000 tokens) → PD
+        let tokens_long: Vec<u32> = vec![1; 1000];
+        let info_long = SelectRouterInfo {
+            tokens: Some(&tokens_long),
+            ..Default::default()
+        };
+        scheduler.select_router(&candidates, &info_long).await;
+
+        {
+            let loads = scheduler.router_loads.read().unwrap();
+            assert_eq!(*loads.get(&router_ids::HTTP_REGULAR).unwrap_or(&0), 100);
+            assert_eq!(*loads.get(&router_ids::HTTP_PD).unwrap_or(&0), 1000);
+        }
+        {
+            let queue = scheduler.global_request_queue.read().unwrap();
+            assert_eq!(queue.len(), 2);
+        }
+    }
+
+    // ── 6. Imbalance override ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_imbalance_overrides_crossover() {
+        let registry = registry_with_regular_and_prefill();
+        let config = ProportionSchedulerConfig {
+            adjust_interval: Duration::from_secs(3600),
+            adjust_window: Duration::from_secs(3600),
+            balance_abs_threshold: 10,
+            balance_rel_threshold: 1.01,
+            regular_worker_weight: 1.0,
+        };
+        let scheduler = ProportionScheduler::new(config, registry);
+        seed_worker_counts(&scheduler, 1, 1);
+
+        // Inflate PD load so norm_pd >> norm_regular
+        {
+            let mut loads = scheduler.router_loads.write().unwrap();
+            loads.insert(router_ids::HTTP_PD, 10000);
+            loads.insert(router_ids::HTTP_REGULAR, 0);
+        }
+
+        let candidates = vec![router_ids::HTTP_REGULAR, router_ids::HTTP_PD];
+        let tokens: Vec<u32> = vec![1; 1000]; // long, would go PD normally
+        let info = SelectRouterInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        let result = scheduler.select_router(&candidates, &info).await;
+        assert_eq!(
+            result,
+            Some(router_ids::HTTP_REGULAR),
+            "Should override crossover and pick less-loaded Regular"
+        );
+    }
+
+    // ── 7. Adjustment task recalculates crossover ────────────────────
+
+    #[tokio::test]
+    async fn test_adjustment_recalculates_crossover() {
+        let registry = registry_with_regular_and_prefill();
+        let config = ProportionSchedulerConfig {
+            adjust_interval: Duration::from_millis(100),
+            adjust_window: Duration::from_secs(60),
+            balance_abs_threshold: 100,
+            balance_rel_threshold: 1.5,
+            regular_worker_weight: 0.5, // regular_share = 0.5/(0.5+1.0) ≈ 0.333
+        };
+        let scheduler = ProportionScheduler::new(config, registry);
+        seed_worker_counts(&scheduler, 1, 1);
+
+        // Populate queue: [100, 200, 300, 400, 500], total=1500
+        {
+            let mut queue = scheduler.global_request_queue.write().unwrap();
+            let mut loads = scheduler.router_loads.write().unwrap();
+            for &tc in &[100usize, 200, 300, 400, 500] {
+                queue.push_back(RequestRecord {
+                    token_count: tc,
+                    timestamp: Instant::now(),
+                    router_id: router_ids::HTTP_REGULAR,
+                });
+                *loads.entry(router_ids::HTTP_REGULAR).or_insert(0) += tc;
+            }
+        }
+
+        let old_crossover = *scheduler.crossover_point.read().unwrap();
+
+        // Wait for adjustment cycle
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let new_crossover = *scheduler.crossover_point.read().unwrap();
+        // ideal_regular_share ≈ 0.333, sorted=[100,200,300,400,500]
+        // accumulated: 100→6.7%, 300→20%, 600→40%≥33.3% → crossover=300
+        assert_ne!(
+            new_crossover, old_crossover,
+            "Adjustment task should have recalculated crossover (old={old_crossover}, new={new_crossover})"
+        );
+        assert_eq!(new_crossover, 300, "Expected crossover=300 based on load distribution");
+    }
+}
