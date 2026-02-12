@@ -211,13 +211,14 @@ jobs:
             echo "High priority PR detected, setting max_parallel to 14"
           elif [[ -n "${{ inputs.target_stage }}" ]]; then
             # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
+            # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
+            LABELS=""
             PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
             if [[ -n "$PR_HEAD_SHA" ]]; then
-              echo "Looking up PR labels by SHA: $PR_HEAD_SHA"
               LABELS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
                 --jq '.[0].labels[].name' 2>/dev/null || true)
-            else
-              echo "Looking up PR labels by branch: ${{ github.ref_name }}"
+            fi
+            if [[ -z "$LABELS" ]]; then
               LABELS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
                 --json labels --jq '.[0].labels[].name' 2>/dev/null || true)
             fi
