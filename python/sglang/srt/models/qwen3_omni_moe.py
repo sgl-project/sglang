@@ -523,10 +523,8 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
 
         num_experts = self.config.num_experts
 
-        # Cache params_dict to avoid repeated expensive traversal of model parameters
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
+        # Pre-define `params_dict` to avoid repeated expensive traversal of model parameters.
+        params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
             name = name.replace(r"model.language_model.", r"model.")
