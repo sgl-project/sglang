@@ -33,7 +33,10 @@ from tqdm.auto import tqdm
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -48,6 +51,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
+    is_cpu,
     log_info_on_rank0,
     print_warning_once,
 )
@@ -193,6 +197,8 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if not isinstance(hf_quant_config, dict):
+            hf_quant_config = hf_quant_config.to_dict()
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         return quant_cls.from_config(hf_quant_config)
 
@@ -836,12 +842,8 @@ def multi_thread_safetensors_weights_iterator(
     def _load_file(st_file: str):
         if disable_mmap:
             with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-
-        return result
+                return safetensors.torch.load(f.read())
+        return safetensors.torch.load_file(st_file, device="cpu")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -1040,9 +1042,25 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
 
-        return default_weight_loader(param, loaded_weight)
+        if (
+            is_cpu()
+            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+            and loaded_weight.dim() == 1
+        ):
+            param_data = param.data  # view copy on param for uneven padding
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param_data,
+                loaded_weight,
+                0,  # param_data_start
+                start_idx,
+                shard_axis,
+                shard_size,
+            )
+            return default_weight_loader(param_data, loaded_weight)
+        else:
+            loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+            return default_weight_loader(param, loaded_weight)
 
     return loader
 
