@@ -1,14 +1,16 @@
 import unittest
+
 import requests
-from sglang.test.ascend.test_ascend_utils import PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
+
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -16,20 +18,21 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestRevision(CustomTestCase):
     """Testcase：Verify set --revision parameter, the inference request is successfully processed.
 
-       [Test Category] Parameter
-       [Test Target] --revision
-       """
+   [Test Category] Parameter
+   [Test Target] --revision
+   """
+
     revision = "33e62acdd07cd7d6635badd529aa0a3467bb9c6a"
     model = PHI_4_MULTIMODAL_INSTRUCT_WEIGHTS_PATH
 
     @classmethod
     def setUpClass(cls):
         other_args = [
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--trust-remote-code",
-            ]
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--trust-remote-code",
+        ]
         if cls.revision is not None:
             other_args.extend(["--revision", cls.revision])
         cls.process = popen_launch_server(
@@ -56,7 +59,6 @@ class TestRevision(CustomTestCase):
         )
         return response
 
-
     def test_revision(self):
         response = self._send_request()
         self.assertEqual(
@@ -80,7 +82,9 @@ class TestNoRevision(TestRevision):
     """
     unset --revision parameter
     """
+
     revision = None
+
     def test_revision(self):
         response = self._send_request()
         self.assertEqual(
