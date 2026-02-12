@@ -10,3 +10,10 @@ class UpdateWeightFromDiskReqInput:
     model_path: str
     flush_cache: bool = True
     target_modules: list[str] | None = None
+
+
+@dataclass
+class GetWeightsChecksumReqInput:
+    """Request to compute SHA-256 checksum of loaded module weights."""
+
+    module_names: list[str] | None = None

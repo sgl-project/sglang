@@ -15,6 +15,7 @@ Typical usage (from GPUWorker.update_weights_from_disk):
     )
     if success:
         self.server_args.model_path = model_path
+        self.pipeline.model_path = model_path
     return success, message
 
 Key design decisions:

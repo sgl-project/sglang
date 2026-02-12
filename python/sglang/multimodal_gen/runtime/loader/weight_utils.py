@@ -2,18 +2,19 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
-"""Utilities for downloading and initializing model weights."""
+"""Utilities for downloading, loading, and verifying model weights."""
 import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 import filelock
 import huggingface_hub.constants
 import torch
 from safetensors.torch import safe_open
+from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
 
 try:
@@ -335,3 +336,23 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
 
     # If there were no matches, return the untouched param name
     return name
+
+
+def compute_weights_checksum(
+    named_params: Iterable[tuple[str, torch.Tensor]],
+) -> str:
+    """Compute SHA-256 checksum over (name, tensor) pairs.
+
+    Parameters are sorted by name so the digest is deterministic
+    regardless of iteration order.  Raw bytes are hashed directly
+    (no dtype conversion) for speed and fidelity.
+    """
+    hasher = hashlib.sha256()
+    for name, tensor in sorted(named_params, key=lambda x: x[0]):
+        hasher.update(name.encode())
+        t = tensor.detach()
+        # DTensor doesn't support .numpy(); extract the local tensor.
+        if isinstance(t, DTensor):
+            t = t._local_tensor
+        hasher.update(t.cpu().contiguous().reshape(-1).view(torch.uint8).numpy().data)
+    return hasher.hexdigest()

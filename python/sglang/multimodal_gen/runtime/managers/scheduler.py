@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
@@ -93,6 +94,7 @@ class Scheduler:
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
         # FIFO, new reqs are appended
@@ -145,6 +147,12 @@ class Scheduler:
             output={"success": success, "message": message},
             error=None if success else message,
         )
+
+    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
+        """Handle get_weights_checksum request."""
+        req = reqs[0]
+        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
+        return OutputBatch(output=checksums)
 
     def _handle_generation(self, reqs: List[Req]):
         warmup_reqs = [req for req in reqs if req.is_warmup]

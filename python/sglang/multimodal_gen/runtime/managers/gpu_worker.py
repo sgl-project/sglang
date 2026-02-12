@@ -29,7 +29,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
-from sglang.multimodal_gen.runtime.loader.weights_updater import WeightsUpdater
+from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
+from sglang.multimodal_gen.runtime.loader.weights_updater import (
+    WeightsUpdater,
+    get_updatable_modules,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -40,7 +44,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    OffloadableDiTMixin,
+    iter_materialized_weights,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
@@ -361,7 +368,29 @@ class GPUWorker:
         )
         if success:
             self.server_args.model_path = model_path
+            self.pipeline.model_path = model_path
         return success, message
+
+    def get_weights_checksum(
+        self, module_names: list[str] | None = None
+    ) -> dict[str, str]:
+        """Compute SHA-256 checksum of each module's weights."""
+        if not self.pipeline:
+            return {"error": "Pipeline is not initialized"}
+
+        all_modules = get_updatable_modules(self.pipeline)
+        names = module_names if module_names is not None else list(all_modules.keys())
+
+        checksums: dict[str, str] = {}
+        for name in names:
+            module = all_modules.get(name)
+            if module is None:
+                checksums[name] = "not_found"
+                continue
+            checksums[name] = compute_weights_checksum(
+                iter_materialized_weights(module)
+            )
+        return checksums
 
 
 OOM_MSG = f"""

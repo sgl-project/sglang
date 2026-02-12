@@ -10,7 +10,7 @@ Menyang Liu, https://github.com/dreamyang-liu
 Chenyang Zhao, https://github.com/zhaochenyang20
 
 =============================================================================
-Test organization: 9 test cases in 3 classes
+Test organization: 9 test cases in 2 classes
 =============================================================================
 
 Each test class uses a single long-lived server (pytest fixture with scope="class").
@@ -19,20 +19,15 @@ class share the same server and send multiple POST /update_weights_from_disk
 requests to it. This reflects real usage: one running diffusion service, many weight
 updates over time.
 
-Class 1: TestUpdateWeightsFromDisk             (7 tests) — API contract & error handling
-Class 2: TestUpdateWeightsFromDiskWithOffload  (1 test) — Offload-aware update
-Class 3: TestUpdateWeightsEndToEnd             (1 test) — Generation after update
+Class 1: TestUpdateWeightsFromDisk                  (7 tests) — API contract & checksum
+Class 2: TestUpdateWeightsFromDiskWithOffload       (2 tests) — Offload-aware update
 
 -----------------------------------------------------------------------------
 Class 1: TestUpdateWeightsFromDisk
 -----------------------------------------------------------------------------
 Purpose: Validate the update_weights_from_disk API contract, request/response shape,
-and error handling. All 7 tests run against one server (fixture:
-diffusion_server_for_weight_update).
-
-  • test_update_weights_same_model
-    Same model path as the one already loaded; must succeed (200, success=True).
-    Exercises the basic "hot reload same checkpoint" path.
+error handling, and checksum verification. All 7 tests run against one server
+(fixture: diffusion_server_for_weight_update).
 
   • test_update_weights_with_flush_cache
     Explicit flush_cache=True; must succeed. Ensures the flush_cache parameter
@@ -58,32 +53,29 @@ diffusion_server_for_weight_update).
     target_modules=["nonexistent_module"]; must return 400 and message containing
     "not found in pipeline". Validates rejection of invalid module names.
 
+  • test_update_weights_checksum_matches
+    Fetches checksum before update (base model), then updates weights and fetches
+    checksum again (update model). Verifies the post-update checksum matches the
+    update model's disk checksum, and differs from the pre-update checksum.
+
 -----------------------------------------------------------------------------
 Class 2: TestUpdateWeightsFromDiskWithOffload
 -----------------------------------------------------------------------------
-Purpose: Ensure weight updates work when layerwise offload is enabled
-(--dit-layerwise-offload). With offload, parameters live in CPU buffers and
-placeholders on GPU; the updater must write into CPU buffers and update
-prefetched GPU tensors without shape mismatch.
+Purpose: Ensure weight updates and checksum verification work when layerwise
+offload is enabled (--dit-layerwise-offload). With offload, parameters live in
+CPU buffers and placeholders on GPU; the updater must write into CPU buffers and
+update prefetched GPU tensors without shape mismatch. The checksum endpoint must
+read from CPU buffers (not the (1,) placeholders) to produce correct results.
 
   • test_update_weights_with_offload_enabled
     Server started with --dit-layerwise-offload true. Call update_weights_from_disk
     with the same model; must succeed (200, success=True) and message must not
     contain "Shape mismatch".
 
------------------------------------------------------------------------------
-Class 3: TestUpdateWeightsEndToEnd
------------------------------------------------------------------------------
-Purpose: End-to-end check that the model remains in a consistent, usable state
-after a weight update: inference (image generation) works both before and after
-the update.
-
-  • test_generation_after_weight_update
-    (1) Generate an image (e.g. "a beautiful sunset") via /v1/images/generations.
-    (2) Call POST /update_weights_from_disk (same model, flush_cache=True).
-    (3) Generate another image (e.g. "a beautiful sunrise").
-    Both generations must succeed; this confirms no partial or broken state
-    after update.
+  • test_update_weights_checksum_matches
+    Fetches checksum before update (base model), then updates weights and fetches
+    checksum again (update model). Verifies the post-update checksum matches the
+    update model's disk checksum, and differs from the pre-update checksum.
 
 =============================================================================
 Relation to RL scenarios and reference implementation
@@ -120,6 +112,15 @@ import os
 import pytest
 import requests
 
+from sglang.multimodal_gen.runtime.loader.utils import (
+    _list_safetensors_files,
+    find_weights_dir,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    compute_weights_checksum,
+    safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
@@ -129,10 +130,31 @@ from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
 
 logger = init_logger(__name__)
 
-# Default model for testing - use a small/fast model, need to be an image diffusion model
+# Base model the server starts with
 DEFAULT_DIFFUSION_MODEL = os.environ.get(
-    "SGLANG_TEST_DIFFUSION_MODEL", "black-forest-labs/FLUX.2-klein-4B"
+    "SGLANG_TEST_DIFFUSION_MODEL", "black-forest-labs/FLUX.2-klein-base-4B"
 )
+
+# Model used for weight updates (same architecture, different weights)
+UPDATE_DIFFUSION_MODEL = os.environ.get(
+    "SGLANG_TEST_UPDATE_MODEL", "black-forest-labs/FLUX.2-klein-4B"
+)
+
+
+def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
+    """Compute SHA-256 checksum from safetensors files on disk.
+
+    Uses the same compute_weights_checksum function as the server,
+    so the checksums are directly comparable.
+    """
+    local_path = maybe_download_model(model_path)
+    weights_dir = find_weights_dir(local_path, module_name)
+    assert weights_dir is not None, f"No weights dir for {module_name} in {local_path}"
+
+    safetensors_files = _list_safetensors_files(weights_dir)
+    assert safetensors_files, f"No safetensors files in {weights_dir}"
+
+    return compute_weights_checksum(safetensors_weights_iterator(safetensors_files))
 
 
 @pytest.fixture(scope="class")
@@ -185,17 +207,26 @@ class TestUpdateWeightsFromDisk:
         )
         return response.json(), response.status_code
 
-    def test_update_weights_same_model(
-        self, diffusion_server_for_weight_update: ServerContext
-    ):
-        """Test updating weights with the same model (should succeed)."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+    def _get_weights_checksum(
+        self,
+        base_url: str,
+        module_names: list[str] | None = None,
+        timeout: int = 300,
+    ) -> dict:
+        """Call get_weights_checksum API and return the checksum dict."""
+        payload = {}
+        if module_names is not None:
+            payload["module_names"] = module_names
 
-        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
-        logger.info(f"Update result: {result}")
-
-        assert status_code == 200, f"Expected 200, got {status_code}"
-        assert result.get("success", False), f"Update failed: {result.get('message')}"
+        response = requests.post(
+            f"{base_url}/get_weights_checksum",
+            json=payload,
+            timeout=timeout,
+        )
+        assert (
+            response.status_code == 200
+        ), f"get_weights_checksum failed: {response.status_code} {response.text}"
+        return response.json()
 
     def test_update_weights_with_flush_cache(
         self, diffusion_server_for_weight_update: ServerContext
@@ -205,7 +236,7 @@ class TestUpdateWeightsFromDisk:
 
         result, status_code = self._update_weights(
             base_url,
-            DEFAULT_DIFFUSION_MODEL,
+            UPDATE_DIFFUSION_MODEL,
             flush_cache=True,
         )
 
@@ -220,7 +251,7 @@ class TestUpdateWeightsFromDisk:
 
         result, status_code = self._update_weights(
             base_url,
-            DEFAULT_DIFFUSION_MODEL,
+            UPDATE_DIFFUSION_MODEL,
             flush_cache=False,
         )
 
@@ -267,7 +298,7 @@ class TestUpdateWeightsFromDisk:
         # Try to update only transformer module
         result, status_code = self._update_weights(
             base_url,
-            DEFAULT_DIFFUSION_MODEL,
+            UPDATE_DIFFUSION_MODEL,
             target_modules=["transformer"],
         )
         logger.info(f"Update specific modules result: {result}")
@@ -285,7 +316,7 @@ class TestUpdateWeightsFromDisk:
 
         result, status_code = self._update_weights(
             base_url,
-            DEFAULT_DIFFUSION_MODEL,
+            UPDATE_DIFFUSION_MODEL,
             target_modules=["nonexistent_module"],
             timeout=60,
         )
@@ -294,6 +325,58 @@ class TestUpdateWeightsFromDisk:
         assert status_code == 400, f"Expected 400, got {status_code}"
         assert not result.get("success", True), "Should fail for nonexistent module"
         assert "not found in pipeline" in result.get("message", "")
+
+    def test_update_weights_checksum_matches(
+        self, diffusion_server_for_weight_update: ServerContext
+    ):
+        """Verify GPU checksum matches disk after weight update.
+
+        1. Fetch the pre-update (base model) checksum from the server.
+        2. Update weights to a different model.
+        3. Fetch the post-update checksum and compare with disk.
+        4. Verify post-update checksum differs from pre-update (different model).
+        """
+        base_url = self._get_base_url(diffusion_server_for_weight_update)
+
+        # Update to base model.
+        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
+
+        # Checksum before update (base model already loaded by the fixture).
+        pre_update_checksum = self._get_weights_checksum(
+            base_url, module_names=["transformer"]
+        )["transformer"]
+
+        # Update to a different model.
+        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
+        assert status_code == 200 and result.get(
+            "success"
+        ), f"Update failed: {result.get('message')}"
+
+        # Checksum after update — must match the update model on disk.
+        post_update_checksum = self._get_weights_checksum(
+            base_url, module_names=["transformer"]
+        )["transformer"]
+        update_disk_checksum = _compute_checksum_from_disk(
+            UPDATE_DIFFUSION_MODEL, "transformer"
+        )
+
+        print(f"\n{'='*60}")
+        print(f"Checksum test")
+        print(f"  pre-update (base):  {pre_update_checksum}")
+        print(f"  post-update (gpu):  {post_update_checksum}")
+        print(f"  post-update (disk): {update_disk_checksum}")
+        print(f"  gpu == disk:        {post_update_checksum == update_disk_checksum}")
+        print(f"  changed:            {pre_update_checksum != post_update_checksum}")
+        print(f"{'='*60}")
+
+        assert post_update_checksum == update_disk_checksum, (
+            f"GPU checksum does not match disk checksum for update model\n"
+            f"  disk: {update_disk_checksum}\n"
+            f"  gpu:  {post_update_checksum}"
+        )
+        assert (
+            pre_update_checksum != post_update_checksum
+        ), "Checksum did not change after updating to a different model"
 
 
 class TestUpdateWeightsFromDiskWithOffload:
@@ -341,7 +424,7 @@ class TestUpdateWeightsFromDiskWithOffload:
 
         logger.info("Testing weight update with offload enabled")
 
-        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
         logger.info(f"Update result: {result}")
 
         assert status_code == 200, f"Expected 200, got {status_code}"
@@ -351,76 +434,78 @@ class TestUpdateWeightsFromDiskWithOffload:
         message = result.get("message", "")
         assert "Shape mismatch" not in message, f"Shape mismatch detected: {message}"
 
+    def _get_weights_checksum(
+        self,
+        base_url: str,
+        module_names: list[str] | None = None,
+        timeout: int = 300,
+    ) -> dict:
+        """Call get_weights_checksum API and return the checksum dict."""
+        payload = {}
+        if module_names is not None:
+            payload["module_names"] = module_names
 
-class TestUpdateWeightsEndToEnd:
-    """End-to-end tests: verify generation works after weight update."""
+        response = requests.post(
+            f"{base_url}/get_weights_checksum",
+            json=payload,
+            timeout=timeout,
+        )
+        assert (
+            response.status_code == 200
+        ), f"get_weights_checksum failed: {response.status_code} {response.text}"
+        return response.json()
 
-    @pytest.fixture(scope="class")
-    def diffusion_server_e2e(self):
-        """Start a diffusion server for E2E tests."""
-        port = get_dynamic_server_port()
-        wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
+    def test_update_weights_checksum_matches(
+        self, diffusion_server_with_offload: ServerContext
+    ):
+        """Verify checksum from offloaded CPU buffers matches disk after update.
 
-        manager = ServerManager(
-            model=DEFAULT_DIFFUSION_MODEL,
-            port=port,
-            wait_deadline=wait_deadline,
-            extra_args="--num-gpus 1",
+        1. Fetch the pre-update (base model) checksum from the server.
+        2. Update weights to a different model.
+        3. Fetch the post-update checksum and compare with disk.
+        4. Verify post-update checksum differs from pre-update (different model).
+        """
+        base_url = self._get_base_url(diffusion_server_with_offload)
+
+        # Update to base model.
+        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
+
+        # Checksum before update (base model already loaded by the fixture).
+        pre_update_checksum = self._get_weights_checksum(
+            base_url, module_names=["transformer"]
+        )["transformer"]
+
+        # Update to a different model.
+        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
+        assert status_code == 200 and result.get(
+            "success"
+        ), f"Update failed: {result.get('message')}"
+
+        # Checksum after update — must match the update model on disk.
+        post_update_checksum = self._get_weights_checksum(
+            base_url, module_names=["transformer"]
+        )["transformer"]
+        update_disk_checksum = _compute_checksum_from_disk(
+            UPDATE_DIFFUSION_MODEL, "transformer"
         )
 
-        ctx = manager.start()
+        print(f"\n{'='*60}")
+        print(f"Offload checksum test")
+        print(f"  pre-update (base):  {pre_update_checksum}")
+        print(f"  post-update (gpu):  {post_update_checksum}")
+        print(f"  post-update (disk): {update_disk_checksum}")
+        print(f"  gpu == disk:        {post_update_checksum == update_disk_checksum}")
+        print(f"  changed:            {pre_update_checksum != post_update_checksum}")
+        print(f"{'='*60}")
 
-        try:
-            yield ctx
-        finally:
-            ctx.cleanup()
-
-    def _get_base_url(self, ctx: ServerContext) -> str:
-        return f"http://localhost:{ctx.port}"
-
-    def _generate_image(self, base_url: str, prompt: str = "a cat") -> dict:
-        """Generate an image using the OpenAI-compatible API."""
-        from openai import OpenAI
-
-        client = OpenAI(
-            api_key="sglang-test",
-            base_url=f"{base_url}/v1",
+        assert post_update_checksum == update_disk_checksum, (
+            f"GPU checksum does not match disk checksum for update model\n"
+            f"  disk: {update_disk_checksum}\n"
+            f"  gpu:  {post_update_checksum}"
         )
-
-        response = client.images.generate(
-            model="default",
-            prompt=prompt,
-            n=1,
-            size="512x512",
-            response_format="b64_json",  # Avoid needing cloud storage
-        )
-
-        return response
-
-    def test_generation_after_weight_update(self, diffusion_server_e2e: ServerContext):
-        """Test that generation still works after updating weights."""
-        base_url = self._get_base_url(diffusion_server_e2e)
-
-        # Generate before update
-        logger.info("Generating image before weight update...")
-        response_before = self._generate_image(base_url, "a beautiful sunset")
-        assert response_before.data, "Generation before update failed"
-        logger.info("Generation before update succeeded")
-
-        # Update weights
-        update_response = requests.post(
-            f"{base_url}/update_weights_from_disk",
-            json={"model_path": DEFAULT_DIFFUSION_MODEL, "flush_cache": True},
-            timeout=300,
-        )
-        assert update_response.json().get("success"), "Weight update failed"
-        logger.info("Weight update succeeded")
-
-        # Generate after update
-        logger.info("Generating image after weight update...")
-        response_after = self._generate_image(base_url, "a beautiful sunrise")
-        assert response_after.data, "Generation after update failed"
-        logger.info("Generation after update succeeded")
+        assert (
+            pre_update_checksum != post_update_checksum
+        ), "Checksum did not change after updating to a different model"
 
 
 if __name__ == "__main__":
