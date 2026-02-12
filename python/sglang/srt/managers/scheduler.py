@@ -2202,6 +2202,11 @@ class Scheduler(
                     f", #new_token_ratio: {old_ratio:.4f} -> {new_token_ratio:.4f}"
                 )
             logger.warning(msg_prefix + msg_details)
+            if retracted_reqs:
+                logger.info(
+                    "Retracted request ids: %s",
+                    [req.rid for req in retracted_reqs],
+                )
 
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
@@ -2755,6 +2760,20 @@ class Scheduler(
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
+
+            # Abort requests already retracted to CPU cache
+            if self.disagg_decode_prealloc_queue.retracted_queue:
+                remaining_retracted = []
+                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
+                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
+                        if hasattr(decode_req, "kv_cache_cpu"):
+                            del decode_req.kv_cache_cpu
+                        self.send_to_tokenizer.send_output(
+                            AbortReq(rid=decode_req.rid), decode_req
+                        )
+                    else:
+                        remaining_retracted.append(decode_req)
+                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
         # Delete requests in the running batch
         if self.cur_batch is self.running_batch or self.cur_batch is None:
