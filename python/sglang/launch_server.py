@@ -3,6 +3,7 @@
 import asyncio
 import os
 import sys
+from importlib.metadata import version as pkg_version
 
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
@@ -29,6 +30,13 @@ def run_server(server_args):
 
 
 if __name__ == "__main__":
+    if "--version" in sys.argv:
+        try:
+            v = pkg_version("sglang")
+        except Exception:
+            v = "unknown"
+        print(f"SGLang {v}")
+        sys.exit(0)
     server_args = prepare_server_args(sys.argv[1:])
 
     try:
