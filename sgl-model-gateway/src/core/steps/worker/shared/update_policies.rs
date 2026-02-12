@@ -4,13 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
-
-use crate::{
-    core::{steps::workflow_data::WorkerRegistrationData, Worker},
-    workflow::{
-        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
-    },
+use wfaas::{
+    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
+
+use crate::core::{steps::workflow_data::WorkerRegistrationData, Worker};
 
 /// Unified step to update policy registry for registered workers.
 ///

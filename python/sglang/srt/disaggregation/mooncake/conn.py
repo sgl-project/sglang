@@ -27,11 +27,11 @@ from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
 )
-from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, is_valid_ipv6_address
@@ -239,11 +239,7 @@ class MooncakeKVManager(CommonKVManager):
         self.failure_lock = threading.Lock()
 
     def init_engine(self):
-        self.engine = MooncakeTransferEngine(
-            hostname=self.local_ip,
-            gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
-        )
+        self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
@@ -315,8 +311,10 @@ class MooncakeKVManager(CommonKVManager):
             # Use correct item lengths for K and V separately
             if layers_current_pp_stage > len(dst_k_ptrs):
                 logger.error(
-                    f"layers_current_pp_stage is out of range: {layers_current_pp_stage=}, {len(dst_k_ptrs)}"
+                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
                 )
+                return -1
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
@@ -373,12 +371,11 @@ class MooncakeKVManager(CommonKVManager):
                     for f in futures:
                         f.cancel()
                     return status
+            return 0
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
             return process_layers(layers_params)
-
-        return 0
 
     def send_kvcache(
         self,
@@ -401,9 +398,9 @@ class MooncakeKVManager(CommonKVManager):
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int64],
+        prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int64],
+        dst_kv_indices: npt.NDArray[np.int32],
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
@@ -422,7 +419,6 @@ class MooncakeKVManager(CommonKVManager):
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         num_kv_heads = self.kv_args.kv_head_num
-        num_layers = len(self.kv_args.kv_data_ptrs)
         page_size = self.kv_args.page_size
 
         # Calculate head distribution
@@ -464,30 +460,31 @@ class MooncakeKVManager(CommonKVManager):
             )
             return -1
 
-        prefill_kv_indices_reshaped = prefill_kv_indices.astype(np.int64).reshape(-1, 1)
-        dst_kv_indices_reshaped = dst_kv_indices.astype(np.int64).reshape(-1, 1)
-        token_offsets = np.arange(page_size, dtype=np.int64).reshape(1, -1)
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1)
+        tokens_per_page = np.arange(page_size, dtype=np.int32).reshape(1, -1)
         bytes_per_token_on_prefill = src_kv_item_len // page_size
         bytes_per_token_on_decode = dst_kv_item_len // page_size
-        src_token_offsets_base = (
-            token_offsets * bytes_per_token_on_prefill + src_head_slice_offset
+        src_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
         )
-        dst_token_offsets_base = (
-            token_offsets * bytes_per_token_on_decode + dst_head_slice_offset
+        dst_token_slot_offsets = (
+            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
         )
 
-        def process_layer_tp_aware(ptrs):
-            src_ptr, dst_ptr = ptrs
-            src_page_starts = src_ptr + prefill_kv_indices_reshaped * src_kv_item_len
-            dst_page_starts = dst_ptr + dst_kv_indices_reshaped * dst_kv_item_len
-            src_addrs = src_page_starts + src_token_offsets_base
-            dst_addrs = dst_page_starts + dst_token_offsets_base
-            src_addr_list = src_addrs.reshape(-1).tolist()
+        def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
+            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
+            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
+            src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
+            dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
+
+            src_addr_list = src_slice_addrs.reshape(-1).tolist()
             if not src_addr_list:
+                # Nothing to transfer for this layer.
                 return 0
-            dst_addr_list = dst_addrs.reshape(-1).tolist()
-            total_chunks = len(src_addr_list)
-            length_list = [heads_bytes_per_token_to_send] * total_chunks
+            dst_addr_list = dst_slice_addrs.reshape(-1).tolist()
+            total_slices = len(src_addr_list)
+            length_list = [heads_bytes_per_token_to_send] * total_slices
             return self.engine.batch_transfer_sync(
                 mooncake_session_id, src_addr_list, dst_addr_list, length_list
             )
@@ -495,11 +492,11 @@ class MooncakeKVManager(CommonKVManager):
         futures = []
         for i in range(layers_current_pp_stage):
             futures.append(
-                executor.submit(process_layer_tp_aware, (src_k_ptrs[i], dst_k_ptrs[i]))
+                executor.submit(process_layer_tp_aware, src_k_ptrs[i], dst_k_ptrs[i])
             )
         for i in range(layers_current_pp_stage):
             futures.append(
-                executor.submit(process_layer_tp_aware, (src_v_ptrs[i], dst_v_ptrs[i]))
+                executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
         for future in concurrent.futures.as_completed(futures):
@@ -985,7 +982,7 @@ class MooncakeKVManager(CommonKVManager):
                 elif status == KVPoll.Failed:
                     self.record_failure(
                         bootstrap_room,
-                        f"Failed to get kvcache from prefill instance, it might be dead",
+                        "Failed to get kvcache from prefill instance, it might be dead",
                     )
                     self.update_status(bootstrap_room, status)
 

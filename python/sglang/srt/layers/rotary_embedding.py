@@ -37,7 +37,10 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
+    from sglang.jit_kernel.rope import (
+        FusedSetKVBufferArg,
+        apply_rope_with_cos_sin_cache_inplace,
+    )
 else:
     FusedSetKVBufferArg = None
 
@@ -1822,7 +1825,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 **kwargs,
             )
         if (
-            model_type.startswith("qwen3_vl") or model_type.startswith("qwen3_vl_moe")
+            model_type.startswith("qwen3_vl")
+            or model_type.startswith("qwen3_vl_moe")
+            or model_type.startswith("qwen3_5")
         ) and video_grid_thw is not None:
             video_grid_thw = torch.repeat_interleave(
                 video_grid_thw, video_grid_thw[:, 0], dim=0
@@ -1922,6 +1927,8 @@ class MRotaryEmbedding(RotaryEmbedding):
                         "qwen2_vl",
                         "qwen3_vl",
                         "qwen3_vl_moe",
+                        "qwen3_5",
+                        "qwen3_5_moe",
                     ):
                         t_index = (
                             torch.arange(llm_grid_t, device=position_ids.device)
