@@ -12,6 +12,24 @@ from torch.library import Library
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
+def get_group_size(group) -> int:
+    if hasattr(group, "world_size"):
+        return group.world_size  # GroupCoordinator
+    elif hasattr(group, "size") and callable(getattr(group, "size", None)):
+        return group.size()  # ProcessGroup
+    else:
+        raise ValueError(f"Unsupported group type: {type(group)}")
+
+
+def get_group_rank(group) -> int:
+    if hasattr(group, "rank_in_group"):
+        return group.rank_in_group  # GroupCoordinator
+    elif hasattr(group, "rank") and callable(getattr(group, "rank", None)):
+        return group.rank()  # ProcessGroup
+    else:
+        raise ValueError(f"Unsupported group type: {type(group)}")
+
+
 def get_token_bin_counts_and_mask(
     tokens: torch.Tensor,
     vocab_size: int,

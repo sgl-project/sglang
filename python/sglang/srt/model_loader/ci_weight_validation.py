@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from typing import List, Optional, Tuple
 
 import safetensors
@@ -1758,6 +1759,59 @@ def _get_lock_file_path(model_name_or_path: str) -> str:
     return f"/tmp/sglang_download_lock_{key_hash}"
 
 
+def _cleanup_incomplete_blobs(model_name_or_path: str, cache_dir: Optional[str]) -> int:
+    """
+    Remove stale .incomplete files from the model's blobs directory.
+
+    This is lighter than _cleanup_corrupted_model_cache (which deletes the
+    entire cache). We only remove .incomplete files so snapshot_download
+    starts fresh on retry, preserving any successfully downloaded blobs.
+
+    Args:
+        model_name_or_path: Model identifier (e.g., "meta-llama/Llama-2-7b-hf")
+        cache_dir: HF cache directory (None to use default)
+
+    Returns:
+        Number of .incomplete files removed
+    """
+    try:
+        import huggingface_hub.constants
+
+        effective_cache_dir = cache_dir or huggingface_hub.constants.HF_HUB_CACHE
+        repo_folder_name = huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+            ["models", *model_name_or_path.split("/")]
+        )
+        blobs_dir = os.path.join(effective_cache_dir, repo_folder_name, "blobs")
+
+        if not os.path.isdir(blobs_dir):
+            return 0
+
+        incomplete_files = glob_module.glob(os.path.join(blobs_dir, "*.incomplete"))
+        removed = 0
+        for f in incomplete_files:
+            try:
+                os.remove(f)
+                removed += 1
+                logger.debug("Removed incomplete blob: %s", os.path.basename(f))
+            except OSError as e:
+                logger.debug(
+                    "Failed to remove incomplete blob %s: %s", os.path.basename(f), e
+                )
+
+        if removed > 0:
+            logger.warning(
+                "Cleaned up %d .incomplete blob(s) for %s in %s",
+                removed,
+                model_name_or_path,
+                blobs_dir,
+            )
+        return removed
+
+    except Exception as e:
+        logger.debug("Failed to clean up incomplete blobs: %s", e)
+        return 0
+
+
 def ci_download_with_validation_and_retry(
     model_name_or_path: str,
     allow_patterns: List[str],
@@ -1837,19 +1891,51 @@ def ci_download_with_validation_and_retry(
         # Now we have exclusive access - perform download with retry logic
         hf_folder = None
         for attempt in range(max_retries):
-            hf_folder = snapshot_download(
-                model_name_or_path,
-                allow_patterns=allow_patterns,
-                ignore_patterns=ignore_patterns,
-                cache_dir=cache_dir,
-                tqdm_class=DisabledTqdm,
-                revision=revision,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                # Force single-threaded downloads to prevent race conditions on NFS
-                # HF hub defaults to max_workers=8, which can cause .incomplete file
-                # conflicts when multiple threads operate on the same files
-                max_workers=1,
-            )
+            try:
+                hf_folder = snapshot_download(
+                    model_name_or_path,
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
+                    cache_dir=cache_dir,
+                    tqdm_class=DisabledTqdm,
+                    revision=revision,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                    # Force single-threaded downloads to prevent race conditions
+                    # on NFS. HF hub defaults to max_workers=8, which can cause
+                    # .incomplete file conflicts when multiple threads operate
+                    # on the same files
+                    max_workers=1,
+                )
+            except (FileNotFoundError, OSError) as e:
+                # Cross-container race condition: another container on the same
+                # host moved/deleted the .incomplete file while we were using it.
+                # This happens when multiple CI containers share an NFS-mounted
+                # HF cache but have separate /dev/shm lock namespaces.
+                logger.warning(
+                    "[CI Download] Process %d hit download race condition "
+                    "(attempt %d/%d) for %s: %s: %s",
+                    os.getpid(),
+                    attempt + 1,
+                    max_retries,
+                    model_name_or_path,
+                    type(e).__name__,
+                    e,
+                )
+                _cleanup_incomplete_blobs(model_name_or_path, cache_dir)
+                if attempt < max_retries - 1:
+                    backoff = 2**attempt
+                    logger.info(
+                        "[CI Download] Retrying in %ds...",
+                        backoff,
+                    )
+                    time.sleep(backoff)
+                    continue
+                raise RuntimeError(
+                    f"Download failed for {model_name_or_path} after "
+                    f"{max_retries} attempts due to cross-container race "
+                    f"condition (.incomplete file conflicts). "
+                    f"Last error: {type(e).__name__}: {e}"
+                ) from e
 
             # Validate downloaded files to catch corruption early
             is_valid = _validate_weights_after_download(
