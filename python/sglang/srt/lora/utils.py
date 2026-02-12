@@ -60,6 +60,13 @@ def get_hidden_dim(
     if hasattr(base_model, "get_hidden_dim"):
         return base_model.get_hidden_dim(module_name, layer_idx)
     else:
+        orig_module_name = module_name
+        normalized_modules = get_normalized_target_modules([module_name])
+        assert (
+            len(normalized_modules) == 1
+        ), f"Expected 1 normalized module for '{orig_module_name}', got {len(normalized_modules)}"
+        module_name = normalized_modules.pop()
+
         """
         WARNING: get_hidden_dim() is not defined,
         which is used to get the hidden dim for different lora modules
@@ -93,7 +100,7 @@ def get_hidden_dim(
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
         else:
             raise NotImplementedError(
-                "get_hidden_dim not implemented for " + module_name
+                "get_hidden_dim not implemented for " + orig_module_name
             )
 
 
