@@ -2,9 +2,9 @@ import os
 import unittest
 import requests
 
+from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -45,7 +45,6 @@ class TestDisaggregationPrefillPp(TestDisaggregationBase):
     def start_prefill(cls):
         """Launch the Prefill service with specified configuration for Ascend NPU (disaggregated architecture)"""
         prefill_args = [
-            
             "--disaggregation-mode",
             "prefill",
             "--disaggregation-transfer-backend",
