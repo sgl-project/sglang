@@ -20,6 +20,8 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
     ):
         kwargs["rope_scaling"] = rope_parameters
         super().__init__(**kwargs)
+        if self.rope_scaling is None:
+            self.rope_scaling = {}
 
 
 class Qwen3_5Config(PretrainedConfig):
