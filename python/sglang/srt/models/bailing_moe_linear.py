@@ -422,7 +422,7 @@ class BailingMoELinearAttention(nn.Module):
         self.use_qk_norm = getattr(config, "use_qk_norm", False)
         # minimax / seg_la / fla
         # TODO support fla
-        self.linear_backend = getattr(config, "linear_backend", "minimax")
+        self.linear_backend = getattr(config, "linear_backend", "seg_la")
         logger.info(f"linear_backend in bailing_moe_linear: {self.linear_backend}")
         self.linear_scale = True if self.linear_backend == "minimax" else False
         self.linear_rope = getattr(config, "linear_rope", True)
@@ -1404,176 +1404,162 @@ class BailingMoELinearForCausalLM(nn.Module):
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         for name, loaded_weight in weights:
-            try:
-                found = False
-                name0 = name
-                if name.startswith("model.mtp"):
+            if name.startswith("model.mtp"):
+                continue
+            layer_idx = None
+            if "model.layers." in name:
+                layer_idx = int(name.split(".")[2])
+            if (
+                ("v_head" in name)
+                or ("inv_freq" in name)
+                or (self.config.tie_word_embeddings and "lm_head" in name)
+            ):
+                continue
+
+            weight_names.append(name)
+
+            if is_nextn:
+                if not name.startswith(nextn_layer_prefix):
                     continue
-                layer_idx = None
-                if "model.layers." in name:
-                    layer_idx = int(name.split(".")[2])
-                if (
-                    ("v_head" in name)
-                    or ("inv_freq" in name)
-                    or (self.config.tie_word_embeddings and "lm_head" in name)
-                ):
+
+                    # Use shared head and embed weights from target model
+                if "shared_head.head" in name or "embed_tokens" in name:
                     continue
 
-                weight_names.append(name)
+                is_decoder = True
+                # For nextn specific weights
+                for weight_name in nextn_spec_weight_names:
+                    if weight_name in name:
+                        name = name.replace(nextn_layer_prefix, "model")
+                        is_decoder = False
+                        break
+                # For decoder layer weights
+                if is_decoder:
+                    name = name.replace(nextn_layer_prefix, "model.decoder")
 
-                if is_nextn:
-                    if not name.startswith(nextn_layer_prefix):
-                        continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                if "mlp.experts" in name:
+                    continue
 
-                        # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
+                name = name.replace(weight_name, param_name)
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
 
-                    is_decoder = True
-                    # For nextn specific weights
-                    for weight_name in nextn_spec_weight_names:
-                        if weight_name in name:
-                            name = name.replace(nextn_layer_prefix, "model")
-                            is_decoder = False
-                            break
-                    # For decoder layer weights
-                    if is_decoder:
-                        name = name.replace(nextn_layer_prefix, "model.decoder")
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
 
-                for param_name, weight_name, shard_id in stacked_params_mapping:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "mlp.experts" in name:
-                        continue
-
                     name = name.replace(weight_name, param_name)
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+
                     if name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):
                         continue
-
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    found = True
-                    weight_loader(param, loaded_weight, shard_id)
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
                     break
                 else:
 
-                    for mapping in expert_params_mapping:
-                        param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name = name.replace(weight_name, param_name)
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    if "slope" in name:
+                        continue
 
-                        if name not in params_dict:
-                            continue
-                        if is_pp_missing_parameter(name, self):
-                            continue
-                        param = params_dict[name]
-                        weight_loader = param.weight_loader
-                        found = True
-                        weight_loader(
-                            param,
-                            loaded_weight,
-                            name,
-                            shard_id=shard_id,
-                            expert_id=expert_id,
+                    if fuse_qkv_a_proj and (
+                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    ):
+                        cached_a_proj[name] = loaded_weight
+                        q_a_proj_name = (
+                            name
+                            if "q_a_proj" in name
+                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
                         )
-                        break
-                    else:
+                        kv_a_proj_name = (
+                            name
+                            if "kv_a_proj_with_mqa" in name
+                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                        )
 
-                        if name.endswith(".bias") and name not in params_dict:
-                            continue
-                        if "slope" in name:
-                            continue
-
-                        if fuse_qkv_a_proj and (
-                            "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                        # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
+                        if (
+                            q_a_proj_name in cached_a_proj
+                            and kv_a_proj_name in cached_a_proj
                         ):
-                            found = True
-                            cached_a_proj[name] = loaded_weight
-                            q_a_proj_name = (
-                                name
+                            q_a_proj_weight = cached_a_proj[q_a_proj_name]
+                            kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+                            cat_dim = 0
+                            if self.quant_config is not None and (
+                                self.quant_config.get_name() == "awq"
+                                or self.quant_config.get_name() == "awq_marlin"
+                                or self.quant_config.get_name() == "moe_wna16"
+                            ):
+                                cat_dim = 1
+                            fused_weight = torch.cat(
+                                [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                            )
+                            param_name = (
+                                name.replace(
+                                    "q_a_proj", "fused_qkv_a_proj_with_mqa"
+                                )
                                 if "q_a_proj" in name
-                                else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                                else name.replace(
+                                    "kv_a_proj_with_mqa",
+                                    "fused_qkv_a_proj_with_mqa",
+                                )
                             )
-                            kv_a_proj_name = (
-                                name
-                                if "kv_a_proj_with_mqa" in name
-                                else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                            )
-
-                            # When both q_a_proj and kv_a_proj_with_mqa has been cached, load the fused weight to parameter
-                            if (
-                                q_a_proj_name in cached_a_proj
-                                and kv_a_proj_name in cached_a_proj
-                            ):
-                                q_a_proj_weight = cached_a_proj[q_a_proj_name]
-                                kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
-                                param_name = (
-                                    name.replace(
-                                        "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                    )
-                                    if "q_a_proj" in name
-                                    else name.replace(
-                                        "kv_a_proj_with_mqa",
-                                        "fused_qkv_a_proj_with_mqa",
-                                    )
-                                )
-                                if param_name not in params_dict:
-                                    continue
-                                param = params_dict[param_name]
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-
-                                weight_loader(param, fused_weight)
-                                cached_a_proj.pop(q_a_proj_name)
-                                cached_a_proj.pop(kv_a_proj_name)
-                        else:
-
-                            if name not in params_dict:
-                                name = name.replace(".dense.", ".o_proj.")
-                                if name not in params_dict:
-                                    continue
-                            if is_pp_missing_parameter(name, self):
+                            if param_name not in params_dict:
                                 continue
-                            if (
-                                "attention" in name
-                                and "slope" not in name
-                                and is_linear_layer(
-                                    layer_idx, self.model.layer_group_size
-                                )
-                            ):
-                                load_linear_attn_weight(name, loaded_weight, self)
-                                loaded_params.add(name)
-                                found = True
-                                continue
-
-                            param = params_dict[name]
-                            found = True
+                            param = params_dict[param_name]
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            weight_loader(param, loaded_weight)
-            finally:
-                if not found:
-                    if not is_nextn and layer_idx != self.config.num_hidden_layers:
-                        logger.warning(f"fail to load main model weight: {name0}")
-                    if is_nextn and layer_idx == nextn_layer_id:
-                        logger.warning(f"fail to load mtp model weights: {name0}")
+
+                            weight_loader(param, fused_weight)
+                            cached_a_proj.pop(q_a_proj_name)
+                            cached_a_proj.pop(kv_a_proj_name)
+                    else:
+
+                        if name not in params_dict:
+                            name = name.replace(".dense.", ".o_proj.")
+                            if name not in params_dict:
+                                continue
+                        if is_pp_missing_parameter(name, self):
+                            continue
+                        if (
+                            "attention" in name
+                            and "slope" not in name
+                            and is_linear_layer(
+                                layer_idx, self.model.layer_group_size
+                            )
+                        ):
+                            load_linear_attn_weight(name, loaded_weight, self)
+                            loaded_params.add(name)
+                            continue
+
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
             loaded_params.add(name)
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
