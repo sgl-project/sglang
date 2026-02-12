@@ -110,7 +110,8 @@ impl CacheAwarePolicy {
                     for tree_ref in trees_clone.iter() {
                         let model_id = tree_ref.key();
                         let tree = tree_ref.value();
-                        tree.evict_tenant_by_size(max_tree_size);
+                        // Use per-model aggregate eviction for global maintenance
+                        tree.evict_aggregate_by_size(max_tree_size);
 
                         debug!(
                             "Cache eviction completed for model {}, max_size: {}",
@@ -277,12 +278,44 @@ impl CacheAwarePolicy {
         for tree_ref in self.trees.iter() {
             let model_id = tree_ref.key();
             let tree = tree_ref.value();
-            tree.evict_tenant_by_size(max_size);
+            tree.evict_aggregate_by_size(max_size);
             debug!(
                 "Cache eviction for model {}, max_size: {}",
                 model_id, max_size
             );
         }
+    }
+
+    /// Helper to trigger eviction if the model's aggregate cache exceeds the high-water mark.
+    fn check_reactive_eviction(&self, tree: &Tree, _worker_url: &str) {
+        if !self.config.enable_reactive_eviction {
+            return;
+        }
+
+        // Check total size across ALL workers in this model's tree
+        let current_total_size = tree
+            .total_char_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let high_water_mark =
+            (self.config.max_tree_size as f32 * self.config.reactive_eviction_threshold) as usize;
+
+        if current_total_size > high_water_mark {
+            debug!(
+                "Reactive aggregate eviction triggered (Total size: {} > high-water: {})",
+                current_total_size, high_water_mark
+            );
+            // Trim the whole tree back to the configured global budget
+            tree.evict_aggregate_by_size(self.config.max_tree_size);
+        }
+    }
+
+    /// Get the current character count in the tree for a specific worker and model.
+    /// Useful for testing and monitoring.
+    pub fn get_worker_cache_size(&self, model_id: &str, worker_url: &str) -> usize {
+        self.trees
+            .get(model_id)
+            .and_then(|tree| tree.tenant_char_count.get(worker_url).map(|v| *v.value()))
+            .unwrap_or(0)
     }
 
     fn select_worker_min_load(
@@ -317,22 +350,26 @@ impl CacheAwarePolicy {
             let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
-                // Now we can work with the tree without holding the HashMap lock
-                tree.insert(text, worker_url);
+
+                let url = workers[min_load_idx].url();
+                tree.insert(text, url);
+
+                // Trigger reactive check
+                self.check_reactive_eviction(&tree, url);
 
                 // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use crate::mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
                         text: text.to_string(),
-                        tenant: worker_url.to_string(),
+                        tenant: url.to_string(),
                     });
                     let mesh_model_id = Self::normalize_mesh_model_id(model_id);
                     if let Err(e) = mesh_sync.sync_tree_operation(mesh_model_id.to_string(), op) {
                         warn!("Failed to sync tree insert operation to mesh: {}", e);
                     }
                 }
+
             } else {
                 debug!(
                     "Warning: No tree found for model '{}', skipping cache update",
@@ -422,8 +459,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
-                tree.insert(text, workers[idx].url());
+                let url = workers[idx].url();
+
+                // Update the tree with this request
+                tree.insert(text, url);
+
+                // Trigger reactive check
+                self.check_reactive_eviction(&tree, url);
 
                 // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
                 if let Some(ref mesh_sync) = self.mesh_sync {
@@ -518,7 +560,9 @@ mod tests {
     async fn test_cache_aware_with_balanced_load() {
         // Create policy without eviction thread for testing
         let config = CacheAwareConfig {
-            eviction_interval_secs: 0, // Disable eviction thread
+            eviction_interval_secs: 0,
+            enable_reactive_eviction: true,
+            reactive_eviction_threshold: 1.2,
             ..Default::default()
         };
         let policy = CacheAwarePolicy::with_config(config);
@@ -587,6 +631,8 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            enable_reactive_eviction: true, //
+            reactive_eviction_threshold: 1.2,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -619,7 +665,9 @@ mod tests {
     #[tokio::test]
     async fn test_cache_aware_worker_removal() {
         let config = CacheAwareConfig {
-            eviction_interval_secs: 0, // Disable eviction thread
+            eviction_interval_secs: 0,      // Disable eviction thread
+            enable_reactive_eviction: true, //
+            reactive_eviction_threshold: 1.2,
             ..Default::default()
         };
         let policy = CacheAwarePolicy::with_config(config);
