@@ -27,8 +27,6 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
-from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     Field,
@@ -463,6 +461,35 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
+class Function(BaseModel):
+    """Function descriptions."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: str
+    parameters: Optional[object] = None
+    strict: bool = False
+
+
+class Tool(BaseModel):
+    """Function wrapper."""
+
+    type: str = Field(default="function", examples=["function"])
+    function: Function
+
+
+class ToolChoiceFuncName(BaseModel):
+    """The name of tool choice function."""
+
+    name: Optional[str] = None
+
+
+class ToolChoice(BaseModel):
+    """The tool choice definition."""
+
+    function: ToolChoiceFuncName
+    type: Literal["function"] = Field(default="function", examples=["function"])
+
+
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool", "function", "developer"]
     content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
@@ -495,35 +522,6 @@ class ChatCompletionMessageUserParam(BaseModel):
 ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
-
-
-class Function(BaseModel):
-    """Function descriptions."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-
-
-class Tool(BaseModel):
-    """Function wrapper."""
-
-    type: str = Field(default="function", examples=["function"])
-    function: Function
-
-
-class ToolChoiceFuncName(BaseModel):
-    """The name of tool choice function."""
-
-    name: Optional[str] = None
-
-
-class ToolChoice(BaseModel):
-    """The tool choice definition."""
-
-    function: ToolChoiceFuncName
-    type: Literal["function"] = Field(default="function", examples=["function"])
 
 
 class ChatCompletionRequest(BaseModel):
