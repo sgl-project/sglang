@@ -957,16 +957,17 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                # Make sure there is torch lib op registration for the whole moe layer
+                return self.forward_impl(hidden_states, topk_output)
+            else:
+                return moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
         else:
             return self.forward_impl(hidden_states, topk_output)
 
@@ -1129,16 +1130,17 @@ class FlashInferFusedMoE(FusedMoE):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                # Make sure there is torch lib op registration for the whole moe layer
+                return self.forward_impl(hidden_states, topk_output)
+            else:
+                return moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
         else:
             return self.forward_impl(hidden_states, topk_output)
 
