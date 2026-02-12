@@ -349,8 +349,7 @@ OOM detected. Possible solutions:
   - If the OOM occurs during runtime:
     1. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
     2. Enable SP and/or TP
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
+    3. Enable a sparse-attention backend
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 
@@ -403,7 +402,7 @@ def run_scheduler_process(
         )
         scheduler.event_loop()
     except torch.OutOfMemoryError as _e:
-        logger.warning(OOM_MSG)
+        print(OOM_MSG)
         raise
     finally:
         # Clean up resources to speed up shutdown
