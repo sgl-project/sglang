@@ -92,7 +92,7 @@ class _RoutedExpertsHostCache:
         return get_tensor_size_bytes(self.buffer)
 
     def set_experts_buffer(self, layer_id: int, loc: torch.Tensor, top_k: torch.Tensor):
-        self.buffer[layer_id, loc, :] = top_k.to(device="cpu", non_blocking=True)
+        self.buffer[layer_id, loc, :] = top_k.to(device="cpu")
 
     def _finalize_allocation_log(self):
         """Common logging and memory usage computation for captured experts buffers."""

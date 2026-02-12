@@ -1119,7 +1119,7 @@ def general_mm_embed_routine(
                         for mm_item in mm_input_obj.mm_items:
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
+                                mm_item.feature = feature.to("cpu")
             forward_batch.mm_inputs = None
             forward_batch.mm_input_embeds = input_embeds
         else:
