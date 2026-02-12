@@ -179,24 +179,10 @@ class Fp8Config(QuantizationConfig):
         )
         if ignored_layers:
             # Keep both "model." and non-"model." variants for robust prefix matching.
-            normalized: List[str] = []
-            seen: set[str] = set()
+            normalized = []
             for layer in ignored_layers:
-                candidates = [layer]
-                if layer.startswith("model."):
-                    candidates.append(layer[len("model.") :])
-                else:
-                    candidates.append(f"model.{layer}")
-                for candidate in candidates:
-                    if candidate not in seen:
-                        normalized.append(candidate)
-                        seen.add(candidate)
-            if len(normalized) != len(ignored_layers):
-                log_info_on_rank0(
-                    logger,
-                    "Fp8Config expanded ignored_layers to include both "
-                    "'model.' and non-'model.' variants for matching.",
-                )
+                base = layer.removeprefix("model.")
+                normalized.extend((base, f"model.{base}"))
             ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8 and weight_block_size is not None:
