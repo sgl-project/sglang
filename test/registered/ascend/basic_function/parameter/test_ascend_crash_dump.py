@@ -26,6 +26,7 @@ class TestCrashDump(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --crash-dump-folder
     """
+
     crash_dump_folder = None
     MAX_NEW_TOKENS = 4
     NUM_REQUESTS_BEFORE_CRASH = 5
