@@ -2,6 +2,9 @@
 
 ## Production Metrics
 SGLang exposes the following metrics via Prometheus. You can enable them by adding `--enable-metrics` when launching the server.
+
+By default, metrics are served on the main server's `/metrics` endpoint. You can optionally serve metrics on a separate port by specifying `--metrics-port <port>`.
+
 You can query them by:
 ```
 curl http://localhost:30000/metrics
