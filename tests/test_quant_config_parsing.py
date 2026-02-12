@@ -1,53 +1,70 @@
 import unittest
-from unittest.mock import MagicMock
-
-from sglang.srt.configs.model_config import ModelConfig
 
 
-class MockHfConfig:
-    def __init__(self, quant_config=None):
-        self.quantization_config = quant_config
-        self.architectures = ["LlamaForCausalLM"]
-        self.model_type = "llama"
+def get_quant_str(quant_cfg):
+    if not quant_cfg:
+        return None
+
+    quant_method = quant_cfg.get("quant_method", "quantized")
+    quant_str = f"{quant_method}"
+
+    # Append interesting fields if they exist
+    if "bits" in quant_cfg:
+        quant_str += f", bits={quant_cfg['bits']}"
+    if "quant_algo" in quant_cfg:
+        quant_str += f", quant_algo={quant_cfg['quant_algo']}"
+    if "fmt" in quant_cfg:
+        quant_str += f", fmt={quant_cfg['fmt']}"
+
+    return quant_str
 
 
-class TestQuantConfigParsing(unittest.TestCase):
-    def test_gptq_config(self):
-        # GPTQ 4-bit
-        quant_config = {"quant_method": "gptq", "bits": 4, "group_size": 128}
+class TestQuantStringFormatting(unittest.TestCase):
+    def test_qwen_fp8_config(self):
+        # Example from Qwen/Qwen3-4B-Thinking-2507-FP8
+        quant_config = {
+            "activation_scheme": "dynamic",
+            "modules_to_not_convert": ["lm_head"],
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        }
+        expected = "fp8, fmt=e4m3"
+        print(f"\n[Test Qwen FP8] Result: {get_quant_str(quant_config)}")
+        self.assertEqual(get_quant_str(quant_config), expected)
 
-        # Mocking ModelConfig
-        model_config = MagicMock()
-        model_config.hf_config = MockHfConfig(quant_config)
-        # We bind the definition of _parse_quant_hf_config from the actual class to the mock if possible,
-        # or just reimplement the logic we want to test: lines 627-629 of model_config.py
-
-        # Logic from model_config.py mainly accesses attributes.
-        # Let's verify what the actual function returns.
-        # Since we cannot easily instantiate full ModelConfig without files, we will use the logic directly.
-
-        extracted_cfg = getattr(model_config.hf_config, "quantization_config", None)
-        self.assertEqual(extracted_cfg, quant_config)
-        self.assertEqual(
-            str(extracted_cfg), "{'quant_method': 'gptq', 'bits': 4, 'group_size': 128}"
-        )
+    def test_llama_gptq_int4_config(self):
+        # Example from hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4
+        quant_config = {
+            "bits": 4,
+            "quant_method": "gptq",
+            # ... other fields ignored by logic
+            "group_size": 128,
+        }
+        expected = "gptq, bits=4"
+        print(f"\n[Test Llama GPTQ] Result: {get_quant_str(quant_config)}")
+        self.assertEqual(get_quant_str(quant_config), expected)
 
     def test_awq_config(self):
-        # AWQ 4-bit
-        quant_config = {"quant_method": "awq", "bits": 4, "group_size": 128}
-        model_config = MagicMock()
-        model_config.hf_config = MockHfConfig(quant_config)
+        # Standard AWQ config
+        quant_config = {
+            "quant_method": "awq",
+            "bits": 4,
+            "group_size": 128,
+        }
+        expected = "awq, bits=4"
+        print(f"\n[Test AWQ] Result: {get_quant_str(quant_config)}")
+        self.assertEqual(get_quant_str(quant_config), expected)
 
-        extracted_cfg = getattr(model_config.hf_config, "quantization_config", None)
-        self.assertEqual(extracted_cfg, quant_config)
+    def test_modelopt_nvfp4(self):
+        # Parsed modelopt config (simulated output from _parse_modelopt_quant_config)
+        quant_config = {"quant_method": "modelopt_fp4"}
+        expected = "modelopt_fp4"
+        print(f"\n[Test ModelOpt] Result: {get_quant_str(quant_config)}")
+        self.assertEqual(get_quant_str(quant_config), expected)
 
     def test_no_quant_config(self):
-        # No quantization
-        model_config = MagicMock()
-        model_config.hf_config = MockHfConfig(None)
-
-        extracted_cfg = getattr(model_config.hf_config, "quantization_config", None)
-        self.assertIsNone(extracted_cfg)
+        self.assertIsNone(get_quant_str(None))
 
 
 if __name__ == "__main__":

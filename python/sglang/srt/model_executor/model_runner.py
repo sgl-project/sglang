@@ -1022,7 +1022,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_cfg = self.model_config._parse_quant_hf_config()
-        quant_str = str(quant_cfg) if quant_cfg else None
+        quant_str = None
+        if quant_cfg:
+            quant_method = quant_cfg.get("quant_method", "quantized")
+            quant_str = f"{quant_method}"
+
+            # Append interesting fields if they exist
+            if "bits" in quant_cfg:
+                quant_str += f", bits={quant_cfg['bits']}"
+            if "quant_algo" in quant_cfg:
+                quant_str += f", quant_algo={quant_cfg['quant_algo']}"
+            if "fmt" in quant_cfg:
+                quant_str += f", fmt={quant_cfg['fmt']}"
 
         logger.info(
             f"Load weight end. "
