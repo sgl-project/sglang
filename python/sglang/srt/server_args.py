@@ -5048,7 +5048,10 @@ class ServerArgs:
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size
-        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+        ) % self.nnodes == 0, (
+            f"tp_size * pp_size ({self.tp_size} * {self.pp_size} = {self.tp_size * self.pp_size}) "
+            f"must be divisible by number of nodes ({self.nnodes})"
+        )
 
         if self.pp_size > 1:
             assert (
