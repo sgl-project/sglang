@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=500, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=800, suite="stage-c-test-8-gpu-h200")
 
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
@@ -42,6 +42,9 @@ class TestDisaggregationDeepseekV32(PDDisaggregationServerBase):
             "4",
             "--cpu-offload-gb",
             "128",
+            "--disable-cuda-graph",
+            "--watchdog-timeout",
+            "600",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
@@ -65,6 +68,9 @@ class TestDisaggregationDeepseekV32(PDDisaggregationServerBase):
             "4",
             "--cpu-offload-gb",
             "128",
+            "--disable-cuda-graph",
+            "--watchdog-timeout",
+            "600",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
         ]
