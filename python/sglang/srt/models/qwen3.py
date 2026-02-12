@@ -178,6 +178,9 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if get_global_server_args().rl_on_policy_target is not None:
+            hidden_states = hidden_states.bfloat16()
+
         if not _is_npu:
             q, k, v = self.forward_prepare_native(
                 positions=positions,
@@ -189,6 +192,10 @@ class Qwen3Attention(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
+
+        if get_global_server_args().rl_on_policy_target is not None:
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
 
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
