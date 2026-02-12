@@ -3,7 +3,7 @@
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.ci.ci_stress_utils import StressTestRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
@@ -14,6 +14,7 @@ OUTPUT_FILE = "stress_test_deepseek_v3.jsonl"
 
 # Register for CI - estimated 45 minutes
 register_cuda_ci(est_time=2700, suite="stress")
+register_amd_ci(est_time=2700, suite="stress")
 
 
 class TestStressDeepSeekV3(unittest.TestCase):
