@@ -67,9 +67,10 @@ def sde_step_with_logprob(
     if sde_type == "sde":
         denom_sigma = 1 - torch.where(sigma == 1, torch.as_tensor(sigma_max), sigma)
         std_dev_t = torch.sqrt((sigma / denom_sigma).clamp_min(1e-12)) * noise_level
-        prev_sample_mean = sample * (1 + std_dev_t**2 / (2 * sigma) * dt) + model_output * (
-            1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)
-        ) * dt
+        prev_sample_mean = (
+            sample * (1 + std_dev_t**2 / (2 * sigma) * dt)
+            + model_output * (1 + std_dev_t**2 * (1 - sigma) / (2 * sigma)) * dt
+        )
 
         sqrt_neg_dt = torch.sqrt((-dt).clamp_min(1e-12))
         if prev_sample is None:
@@ -92,10 +93,9 @@ def sde_step_with_logprob(
         pred_original_sample = sample - sigma * model_output
         noise_estimate = sample + model_output * (1 - sigma)
         sigma_delta = (sigma_prev**2 - std_dev_t**2).clamp_min(0.0)
-        prev_sample_mean = (
-            pred_original_sample * (1 - sigma_prev)
-            + noise_estimate * torch.sqrt(sigma_delta)
-        )
+        prev_sample_mean = pred_original_sample * (
+            1 - sigma_prev
+        ) + noise_estimate * torch.sqrt(sigma_delta)
 
         if prev_sample is None:
             variance_noise = randn_tensor(

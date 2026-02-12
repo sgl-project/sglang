@@ -57,17 +57,14 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 )
 from sglang.multimodal_gen.runtime.loader.transformer_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines.patches.flow_matching_with_logprob import (
+    sde_step_with_logprob,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
-try:
-    from sglang.multimodal_gen.runtime.pipelines.patches.flow_matching_with_logprob import (
-        sde_step_with_logprob,
-    )
-except Exception:  # pragma: no cover
-    sde_step_with_logprob = None
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -114,10 +111,7 @@ class DenoisingStage(PipelineStage):
             self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
-        if (
-            sde_step_with_logprob is not None
-            and not hasattr(self.scheduler, "sde_step_with_logprob")
-        ):
+        if not hasattr(self.scheduler, "sde_step_with_logprob"):
             self.scheduler.sde_step_with_logprob = sde_step_with_logprob.__get__(
                 self.scheduler, type(self.scheduler)
             )
@@ -1017,9 +1011,7 @@ class DenoisingStage(PipelineStage):
         rollout_sde_type = getattr(batch, "rollout_sde_type", None)
         if rollout_sde_type is None or str(rollout_sde_type).strip() == "":
             if rollout_enabled:
-                logger.warning(
-                    "rollout_sde_type is not set, defaulting to 'sde'."
-                )
+                logger.warning("rollout_sde_type is not set, defaulting to 'sde'.")
             rollout_sde_type = "sde"
         else:
             rollout_sde_type = str(rollout_sde_type).strip().lower()
@@ -1029,7 +1021,6 @@ class DenoisingStage(PipelineStage):
                 rollout_sde_type,
             )
             rollout_sde_type = "sde"
-        capture_trajectory = bool(batch.return_trajectory_latents or rollout_enabled)
         if rollout_enabled and not hasattr(self.scheduler, "sde_step_with_logprob"):
             raise RuntimeError(
                 f"Rollout is enabled, but scheduler '{type(self.scheduler).__name__}' "
@@ -1141,7 +1132,7 @@ class DenoisingStage(PipelineStage):
                         )
 
                         # save trajectory latents if needed
-                        if capture_trajectory:
+                        if batch.return_trajectory_latents:
                             trajectory_timesteps.append(t_host)
                             trajectory_latents.append(latents)
 
