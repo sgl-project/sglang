@@ -15,6 +15,8 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
 
+logger = logging.getLogger(__name__)
+
 # Lazy import for FlashInfer GDN kernels (prefill, decode and verify/MTP)
 _flashinfer_gdn_available = None
 _flashinfer_chunk_gated_delta_rule = None
@@ -111,8 +113,6 @@ elif is_npu():
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
-
-logger = logging.getLogger(__name__)
 
 
 # Kernel to track mamba states if needed based on track mask
