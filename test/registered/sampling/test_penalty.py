@@ -23,13 +23,56 @@ register_amd_ci(est_time=82, suite="stage-b-test-small-1-gpu-amd")
 class TestPenalty(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        import tempfile
+
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+
+        # Create temp files to capture server output for debugging CI failures
+        cls._stdout_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stdout.log", delete=False
         )
+        cls._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stderr.log", delete=False
+        )
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                return_stdout_stderr=(cls._stdout_file, cls._stderr_file),
+            )
+        except Exception as e:
+            # If server fails to start, dump the captured logs for debugging
+            import sys
+
+            cls._stdout_file.close()
+            cls._stderr_file.close()
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Server failed to start for {cls.model}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDOUT:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stdout_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stdout: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDERR:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stderr_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stderr: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            raise
 
     @classmethod
     def tearDownClass(cls):

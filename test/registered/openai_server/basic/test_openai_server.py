@@ -35,17 +35,60 @@ register_amd_ci(est_time=200, suite="stage-b-test-small-1-gpu-amd")
 class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        import tempfile
+
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
+
+        # Create temp files to capture server output for debugging CI failures
+        cls._stdout_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stdout.log", delete=False
         )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stderr.log", delete=False
+        )
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                return_stdout_stderr=(cls._stdout_file, cls._stderr_file),
+            )
+            cls.base_url += "/v1"
+            cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        except Exception as e:
+            # If server fails to start, dump the captured logs for debugging
+            import sys
+
+            cls._stdout_file.close()
+            cls._stderr_file.close()
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Server failed to start for {cls.model}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDOUT:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stdout_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stdout: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDERR:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stderr_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stderr: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            raise
 
     @classmethod
     def tearDownClass(cls):
@@ -449,17 +492,60 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 class TestOpenAIServerv1Responses(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        import tempfile
+
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
+
+        # Create temp files to capture server output for debugging CI failures
+        cls._stdout_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stdout.log", delete=False
         )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stderr.log", delete=False
+        )
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                return_stdout_stderr=(cls._stdout_file, cls._stderr_file),
+            )
+            cls.base_url += "/v1"
+            cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        except Exception as e:
+            # If server fails to start, dump the captured logs for debugging
+            import sys
+
+            cls._stdout_file.close()
+            cls._stderr_file.close()
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Server failed to start for {cls.model}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDOUT:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stdout_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stdout: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDERR:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stderr_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stderr: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            raise
 
     @classmethod
     def tearDownClass(cls):
@@ -795,6 +881,8 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        import tempfile
+
         cls.model = DEFAULT_SMALL_CROSS_ENCODER_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
@@ -810,14 +898,55 @@ class TestOpenAIV1Rerank(CustomTestCase):
             "--attention-backend",
             "torch_native",
         ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=other_args,
+
+        # Create temp files to capture server output for debugging CI failures
+        cls._stdout_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stdout.log", delete=False
         )
-        cls.base_url += "/v1/rerank"
+        cls._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stderr.log", delete=False
+        )
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                other_args=other_args,
+                return_stdout_stderr=(cls._stdout_file, cls._stderr_file),
+            )
+            cls.base_url += "/v1/rerank"
+        except Exception as e:
+            # If server fails to start, dump the captured logs for debugging
+            import sys
+
+            cls._stdout_file.close()
+            cls._stderr_file.close()
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Server failed to start for {cls.model}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDOUT:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stdout_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stdout: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDERR:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stderr_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stderr: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            raise
 
     @classmethod
     def tearDownClass(cls):
@@ -866,18 +995,61 @@ class TestOpenAIV1Rerank(CustomTestCase):
 class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        import tempfile
+
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
-            other_args=["--enable-custom-logit-processor"],
+
+        # Create temp files to capture server output for debugging CI failures
+        cls._stdout_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stdout.log", delete=False
         )
-        cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(cls.model)
+        cls._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stderr.log", delete=False
+        )
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                other_args=["--enable-custom-logit-processor"],
+                return_stdout_stderr=(cls._stdout_file, cls._stderr_file),
+            )
+            cls.base_url += "/v1"
+            cls.tokenizer = get_tokenizer(cls.model)
+        except Exception as e:
+            # If server fails to start, dump the captured logs for debugging
+            import sys
+
+            cls._stdout_file.close()
+            cls._stderr_file.close()
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Server failed to start for {cls.model}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDOUT:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stdout_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stdout: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDERR:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stderr_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stderr: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            raise
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -954,18 +1126,60 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
 class TestOpenAIV1Score(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        import tempfile
+
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
 
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            api_key=cls.api_key,
+        # Create temp files to capture server output for debugging CI failures
+        cls._stdout_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stdout.log", delete=False
         )
-        cls.base_url += "/v1/score"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls._stderr_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix="_stderr.log", delete=False
+        )
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                api_key=cls.api_key,
+                return_stdout_stderr=(cls._stdout_file, cls._stderr_file),
+            )
+            cls.base_url += "/v1/score"
+            cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        except Exception as e:
+            # If server fails to start, dump the captured logs for debugging
+            import sys
+
+            cls._stdout_file.close()
+            cls._stderr_file.close()
+            print(f"\n{'='*60}", file=sys.stderr, flush=True)
+            print(
+                f"[DEBUG] Server failed to start for {cls.model}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDOUT:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stdout_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stdout: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] Server STDERR:", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            try:
+                with open(cls._stderr_file.name, "r") as f:
+                    print(f.read(), file=sys.stderr, flush=True)
+            except Exception as read_err:
+                print(f"Failed to read stderr: {read_err}", file=sys.stderr, flush=True)
+            print(f"{'='*60}", file=sys.stderr, flush=True)
+            raise
 
     @classmethod
     def tearDownClass(cls):
