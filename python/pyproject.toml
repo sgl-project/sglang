@@ -138,7 +138,8 @@ test = [
   "tabulate",
 ]
 
-dev = ["sglang[test]"]
+dev = ["sglang[test]", "sglang[tracing]"]
+all = ["sglang[test]", "sglang[tracing]"]
 
 all = [
   "sglang[diffusion]",
