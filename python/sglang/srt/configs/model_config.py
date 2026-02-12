@@ -49,6 +49,7 @@ class ModelImpl(str, Enum):
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
     MINDSPORE = "mindspore"
+    ATOM = "atom"
 
 
 def is_deepseek_nsa(config: PretrainedConfig) -> bool:
