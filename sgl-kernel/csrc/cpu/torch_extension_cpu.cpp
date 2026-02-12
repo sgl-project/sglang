@@ -337,6 +337,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t head_qk,
     int64_t head_v);
 
+// image preprocessor
+std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
+    at::TensorList images,
+    bool do_convert_rgb,
+    bool do_resize,
+    int64_t shortest_edge,
+    int64_t longest_edge,
+    const std::string& interpolation,
+    bool do_rescale,
+    double rescale_factor,
+    bool do_normalize,
+    c10::ArrayRef<double> image_mean,
+    c10::ArrayRef<double> image_std,
+    int64_t patch_size,
+    int64_t temporal_patch_size,
+    int64_t merge_size,
+    bool disable_grouping,
+    at::ScalarType out_dtype);
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
@@ -536,6 +555,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
+
+  // image preprocessor
+  m.def(
+      "image_preprocess_cpu(Tensor[] images, bool do_convert_rgb, bool do_resize, int shortest_edge, int longest_edge,"
+      "str interpolation, bool do_rescale, float rescale_factor, bool do_normalize, float[] image_mean, float[] "
+      "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
+      "out_dtype) -> (Tensor, Tensor)");
+  m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
