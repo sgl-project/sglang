@@ -753,7 +753,7 @@ def safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
                 # NOTE(xiuyu): safetensors.torch.load() may return keys in a
                 # different order per TP-shard file. Sort to ensure that cross-rank
-                # collectives (e.g. all_gather in fp8_jax sync_quantize_weight) stay
+                # collectives (e.g. all_gather in sync_quantize_weight) stay
                 # aligned across TP ranks.
                 for name in sorted(result.keys()):
                     yield name, result[name]
