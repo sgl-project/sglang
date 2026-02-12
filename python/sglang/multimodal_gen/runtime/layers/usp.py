@@ -209,7 +209,7 @@ def _usp_input_all_to_all_async_wait(
 ) -> torch.Tensor:
     """
     Wait for async all-to-all to complete and reshape the result.
-    
+
     Args:
         x_async_tuple: (AsyncCollectiveTensor, metadata), returned result from _usp_input_all_to_all_async
     """
@@ -242,7 +242,7 @@ def ulysses_attn_with_async_qkv_proj(
 ) -> torch.Tensor:
     """
     Ulysses Attention with Async QKV Projection optimization.
-    
+
     This function implements the async QKV projection optimization inspired by
     ByteDance-Seed/VeOmni and cache-dit.
 
@@ -280,7 +280,9 @@ def ulysses_attn_with_async_qkv_proj(
 
     # 4. perform attention on gathered tensors [B, S_global, H_local, D]
     ctx_attn_metadata = get_forward_context().attn_metadata
-    out = attn_impl.forward(query_gathered, key_gathered, value_gathered, ctx_attn_metadata)
+    out = attn_impl.forward(
+        query_gathered, key_gathered, value_gathered, ctx_attn_metadata
+    )
 
     # 5. all-to-all to restore original sharding [B, S_local, H_global, D]
     out = _usp_output_all_to_all(out, head_dim=head_dim)

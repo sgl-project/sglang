@@ -41,9 +41,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.layers.usp import (
-    ulysses_attn_with_async_qkv_proj,
-)
+from sglang.multimodal_gen.runtime.layers.usp import ulysses_attn_with_async_qkv_proj
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
@@ -387,11 +385,13 @@ class WanTransformerBlock(nn.Module):
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
         self.mlp_residual = MulAdd()
 
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-    def compute_qkv_selfattn(self,
-                             norm_hidden_states: torch.Tensor,
-                             freqs_cis: tuple[torch.Tensor, torch.Tensor], ):
+    def compute_qkv_selfattn(
+        self,
+        norm_hidden_states: torch.Tensor,
+        freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    ):
         """
         Compute QKV for self-attention in optimal order: V → (Q, K with norm) → rope.
 
@@ -475,7 +475,9 @@ class WanTransformerBlock(nn.Module):
 
         attn_output = ulysses_attn_with_async_qkv_proj(
             qkv_proj_fn=self.compute_qkv_selfattn,
-            qkv_proj_kwargs=dict(norm_hidden_states=norm_hidden_states, freqs_cis=freqs_cis),
+            qkv_proj_kwargs=dict(
+                norm_hidden_states=norm_hidden_states, freqs_cis=freqs_cis
+            ),
             attn_impl=self.attn1.attn_impl,
             head_dim=2,
         )
@@ -604,7 +606,7 @@ class WanTransformerBlock_VSA(nn.Module):
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
         self.mlp_residual = MulAdd()
 
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
     def forward(
         self,
@@ -770,7 +772,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             gather_output=True,
         )
         self.scale_shift_table = nn.Parameter(
-            torch.randn(1, 2, inner_dim) / inner_dim ** 0.5
+            torch.randn(1, 2, inner_dim) / inner_dim**0.5
         )
 
         # For type checking
