@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -261,6 +262,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        is_eagle: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -274,6 +276,7 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.is_eagle = is_eagle
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -879,6 +882,11 @@ class HiCacheController:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+
+        # EAGLE mode: convert tokens to bigram format for hash computation
+        # This ensures consistency with how tokens are stored (using bigram keys)
+        if self.is_eagle:
+            tokens_to_fetch = convert_to_bigram_key(tokens_to_fetch)
 
         storage_query_count = 0
         hash_value = []
