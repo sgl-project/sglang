@@ -68,7 +68,7 @@ class TestSpecV2(CustomTestCase):
             max_prompt_tokens=2000,
         )
 
-class TestSpecV2Ref(TestSpecV2):
+class TestSpecV1Ref(TestSpecV2):
     env = None
     
 
