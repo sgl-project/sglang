@@ -926,7 +926,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if cfg is not None:
             try:
                 self.ssm_k_last = bool(cfg.mamba2_cache_params.shape.k_last)
-            except Exception:
+            except (AttributeError, TypeError):
                 self.ssm_k_last = bool(get_global_server_args().mamba_ssm_k_last)
         else:
             self.ssm_k_last = bool(get_global_server_args().mamba_ssm_k_last)
@@ -1069,10 +1069,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Clean up
             del q, k, v, A_log, dt_bias, a, b, initial_state, cache_indices
             del intermediate_state_cache
-            torch.cuda.empty_cache()
 
         except Exception as e:
             logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
+            self._flashinfer_gated_delta_rule_mtp = None
 
     def _warmup_decode_kernel(self):
         """Warmup FlashInfer decode kernel to avoid JIT compilation overhead during serving.
@@ -1137,10 +1137,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             # Clean up
             del q, k, v, A_log, dt_bias, a, b, state
-            torch.cuda.empty_cache()
 
         except Exception as e:
             logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
+            self._flashinfer_gated_delta_rule_decode = None
 
     def forward_decode(
         self,
