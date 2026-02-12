@@ -467,6 +467,7 @@ class DeepseekV2MoE(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if get_moe_a2a_backend().is_deepep()
                     or get_moe_a2a_backend().is_mooncake()
+                    or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_ascend_fuseep()
                     or get_moe_a2a_backend().is_flashinfer()
                     or should_use_flashinfer_cutlass_moe_fp4_allgather()
@@ -510,6 +511,7 @@ class DeepseekV2MoE(nn.Module):
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
         ):
             # TODO: we will support tp < ep in the future
@@ -530,6 +532,7 @@ class DeepseekV2MoE(nn.Module):
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
@@ -739,8 +742,6 @@ class DeepseekV2MoE(nn.Module):
                 if self.shared_experts_is_fp8
                 else None
             ),  # block_size
-            None,  # a1_scale
-            None,  # a2_scale
             True,  # is_vnni
         )
         if self.tp_size > 1 and not should_allreduce_fusion:
@@ -945,13 +946,17 @@ class DeepseekV2MoE(nn.Module):
             torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            # aiter moe call will handle routed_scaling_factor in the function
+            # so add _use_aiter condition to eliminate to use self.routed_scaling_factor in add_ call
+            if self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
         else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if not (
+                self.experts.should_fuse_routed_scaling_factor_in_topk or _use_aiter
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
@@ -1145,6 +1150,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
 
         if self.use_nsa:
+            is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
                 index_n_heads=get_nsa_index_n_heads(config),
@@ -1157,6 +1163,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 scale_fmt="ue8m0",
                 block_size=128,
                 rope_scaling=rope_scaling,
+                is_neox_style=is_neox_style,
                 prefix=add_prefix("indexer", prefix),
                 quant_config=quant_config,
                 layer_id=layer_id,
@@ -1186,13 +1193,14 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
+            is_neox_style = not getattr(config, "rope_interleave", True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=rope_theta,
                 rope_scaling=rope_scaling,
-                is_neox_style=False,
+                is_neox_style=is_neox_style,
                 device=get_global_server_args().device,
             )
 
@@ -2238,9 +2246,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        if hasattr(config, "rope_parameters"):
+            rope_theta = config.rope_parameters.get("rope_theta")
+            assert rope_theta is not None, f"rope_theta not found in config: {config}"
+            rope_type = config.rope_parameters.get("rope_type")
+            rope_scaling = config.rope_parameters if rope_type != "default" else None
+        else:
+            rope_theta = config.rope_theta
+            rope_scaling = config.rope_scaling
+        max_position_embeddings = config.max_position_embeddings
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
@@ -2592,7 +2606,16 @@ class DeepseekV2Model(nn.Module):
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
-                    tp_size = get_tensor_model_parallel_world_size()
+                    # tp_size = get_tensor_model_parallel_world_size()
+                    a2a_backend = get_moe_a2a_backend()
+                    is_a2a_moe = (
+                        a2a_backend.is_deepep()
+                        or a2a_backend.is_mori()
+                        or a2a_backend.is_mooncake()
+                    )
+                    tp_size = (
+                        1 if is_a2a_moe else get_tensor_model_parallel_world_size()
+                    )
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
                     )
@@ -2846,7 +2869,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
-            disable_reason = "Config not support fused shared expert(s)."
+            disable_reason = "Config does not support fused shared expert(s)."
         elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
@@ -2858,8 +2881,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
+        elif disable_reason is None and (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
+        ):
+            disable_reason = "Deepseek V3/R1 cannot use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
