@@ -25,6 +25,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -72,6 +76,7 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -183,16 +188,28 @@ class GptOssSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-
-        router_logits, _ = self.router(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if is_in_piecewise_cuda_graph():
+            final_hidden_states = moe_impl(self.layer_id, hidden_states)
+        else:
+            router_logits, _ = self.router(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
         return ans
+
+
+@register_custom_op(out_shape="hidden_states")
+def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
+    forward_context = get_forward_context()
+    moe_fusion = forward_context.moe_fusions[layer_id]
+    router_logits, _ = moe_fusion.router(hidden_states)
+    topk_output = moe_fusion.topk(hidden_states, router_logits)
+    final_hidden_states = moe_fusion.experts(hidden_states, topk_output)
+    return final_hidden_states
 
 
 class GptOssAttention(nn.Module):
