@@ -60,6 +60,7 @@ class BaseModelLoaderTest(ABC):
         os.environ["SGLANG_ENBLE_TORCH_COMILE"] = "1"
         os.environ["AUTO_USE_UC_MEMORY"] = "0"
         os.environ["P2P_HCCL_BUFFSIZE"] = "20"
+        os.environ["SGLANG_IS_IN_CI"] = "False"
         env = os.environ.copy()
 
         # Start the service first to prevent caching from affecting model load time.
