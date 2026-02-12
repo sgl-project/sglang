@@ -235,6 +235,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if schema is None:
                 return "schema_ is required for json_schema response format request."
 
+        # Validate stream_options dependency
+        if request.stream_options is not None and not request.stream:
+            return "The 'stream_options' parameter is only allowed when 'stream' is enabled."
         return None
 
     def _convert_to_internal_request(

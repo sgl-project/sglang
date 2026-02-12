@@ -57,6 +57,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
 
+        # Validate stream_options dependency
+        if request.stream_options is not None and not request.stream:
+            return "The 'stream_options' parameter is only allowed when 'stream' is enabled."
+
         return None
 
     def _convert_to_internal_request(
