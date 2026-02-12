@@ -3,8 +3,6 @@ import os
 from typing import Optional, Union
 
 import torch
-
-logger = logging.getLogger(__name__)
 import triton
 import triton.language as tl
 from einops import rearrange
@@ -66,13 +64,6 @@ def _get_flashinfer_gdn_kernels():
     )
 
 
-# Legacy alias for backward compatibility
-def _get_flashinfer_gdn_prefill():
-    """Lazy import for FlashInfer GDN prefill kernel (legacy alias)."""
-    available, prefill_fn, _, _ = _get_flashinfer_gdn_kernels()
-    return available, prefill_fn
-
-
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -120,6 +111,8 @@ elif is_npu():
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
+
+logger = logging.getLogger(__name__)
 
 
 # Kernel to track mamba states if needed based on track mask
