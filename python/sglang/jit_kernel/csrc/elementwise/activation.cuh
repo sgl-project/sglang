@@ -3,7 +3,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/type.cuh>
 #include <sgl_kernel/vec.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -11,57 +11,33 @@
 #define kBitsToLoad 128
 #define kBytesToLoad (kBitsToLoad / 8)
 
-namespace {
-
-namespace detail {
-
-template <typename T>
-SGL_DEVICE float to_f32(const T& x) {
-#if USE_ROCM
-  return castToFloat(x);
-#else
-  return static_cast<float>(x);
-#endif
-}
-
-template <typename T>
-SGL_DEVICE T from_f32(float f32) {
-#if USE_ROCM
-  return castFromFloat<T>(f32);
-#else
-  return static_cast<T>(f32);
-#endif
-}
-
-}  // namespace detail
-
 template <typename T>
 SGL_DEVICE T silu(const T& x) {
-  float f32_val = detail::to_f32(x);
-  return detail::from_f32<T>(f32_val / (1.0f + expf(-f32_val)));
+  float f32_val = device::cast<float>(x);
+  return device::cast<T>(f32_val / (1.0f + expf(-f32_val)));
 }
 
 template <typename T>
 SGL_DEVICE T gelu(const T& x) {
   constexpr float kAlpha = M_SQRT1_2;
-  float f32_val = detail::to_f32(x);
-  return detail::from_f32<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
+  float f32_val = device::cast<float>(x);
+  return device::cast<T>(f32_val * (0.5f * (1.0f + erf(f32_val * kAlpha))));
 }
 
 // gelu_quick(x) = x * torch.sigmoid(1.702 * x)
 template <typename T>
 SGL_DEVICE T gelu_quick_act(const T& x) {
-  float f32_val = detail::to_f32(x);
-  return detail::from_f32<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
+  float f32_val = device::cast<float>(x);
+  return device::cast<T>(f32_val / (1.0f + expf(-f32_val * 1.702f)));
 }
 
 template <typename T>
 SGL_DEVICE T gelu_tanh(const T& x) {
   constexpr float kAlpha = 0.044715f;
   constexpr float kBeta = 0.7978845608028654f;
-  float f32_val = detail::to_f32(x);
+  float f32_val = device::cast<float>(x);
   const float cdf = 0.5f * (1.0f + tanhf((kBeta * (f32_val + kAlpha * f32_val * f32_val * f32_val))));
-  return detail::from_f32<T>(f32_val * cdf);
+  return device::cast<T>(f32_val * cdf);
 }
 
 template <typename T, T (*Activation)(const T&)>
@@ -203,5 +179,3 @@ using gelu_tanh_and_mul = ActivationAndMul<T, gelu_tanh>;
 
 template <typename T>
 using gelu_quick = ActivationOnly<T, gelu_quick_act>;
-
-}  // namespace
