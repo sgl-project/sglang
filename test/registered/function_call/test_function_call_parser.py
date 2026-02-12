@@ -1,6 +1,5 @@
 import json
 import unittest
-from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -3713,7 +3712,7 @@ function call<|role_sep|>
         self.assertEqual(params["city"], "Rome")
 
 
-class TestFunctionCallParserStructuralTagGating(unittest.TestCase):
+class TestFunctionCallParserStructuralTagConstraint(unittest.TestCase):
     def setUp(self):
         self.strict_tool = Tool(
             type="function",
@@ -3731,39 +3730,18 @@ class TestFunctionCallParserStructuralTagGating(unittest.TestCase):
             ),
         )
 
-    def test_kimi_k2_auto_ignores_structural_tag_on_unsupported_xgrammar(self):
+    def test_kimi_k2_auto_uses_structural_tag(self):
         parser = FunctionCallParser([self.strict_tool], "kimi_k2")
-        with patch(
-            "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
-            return_value=False,
-        ):
-            constraint = parser.get_structure_constraint("auto")
-        self.assertIsNone(constraint)
-
-    def test_kimi_k2_auto_uses_structural_tag_on_supported_xgrammar(self):
-        parser = FunctionCallParser([self.strict_tool], "kimi_k2")
-        with patch(
-            "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
-            return_value=True,
-        ):
-            constraint = parser.get_structure_constraint("auto")
+        constraint = parser.get_structure_constraint("auto")
 
         self.assertIsNotNone(constraint)
         self.assertEqual(constraint[0], "structural_tag")
 
-    def test_non_kimi_parser_not_affected_by_kimi_gating(self):
-        # Use a non-kimi detector (qwen); force it to support structural_tag so we only
-        # test that kimi gating does not apply to non-kimi detectors.
+    def test_non_kimi_parser_auto_uses_structural_tag_when_supported(self):
         parser = FunctionCallParser([self.strict_tool], "qwen")
-        with patch.object(
-            parser.detector,
-            "supports_structural_tag",
-            return_value=True,
-        ), patch(
-            "sglang.srt.function_call.function_call_parser._is_kimi_k2_structural_tag_supported",
-            return_value=False,
-        ):
-            constraint = parser.get_structure_constraint("auto")
+        if not parser.detector.supports_structural_tag():
+            self.skipTest("qwen detector does not support structural_tag")
+        constraint = parser.get_structure_constraint("auto")
 
         self.assertIsNotNone(constraint)
         self.assertEqual(constraint[0], "structural_tag")
