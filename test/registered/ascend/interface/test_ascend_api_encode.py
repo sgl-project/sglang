@@ -39,7 +39,7 @@ class TestAscendApi(CustomTestCase):
             "--disable-cuda-graph",
             "--tp-size",
             2,
-            "--is-embedding",  
+            "--is-embedding",
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -68,7 +68,7 @@ class TestAscendApi(CustomTestCase):
         )
         logger.info("Test 01 response keys: %s", response.json().keys())
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['meta_info']['id'], "2")
+        self.assertEqual(response.json()["meta_info"]["id"], "2")
 
     def test_api_encode_02(self):
         # Test Scenario 2: Call /encode API with input_ids parameter
@@ -81,7 +81,7 @@ class TestAscendApi(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['meta_info']['id'], "3")
+        self.assertEqual(response.json()["meta_info"]["id"], "3")
 
     def test_api_encode_03(self):
         # Test Scenario 3: Call /encode API with text and image parameters (multimodal capability verification)
@@ -96,7 +96,7 @@ class TestAscendApi(CustomTestCase):
         )
         logger.info("Test 03 response keys: %s", response.json().keys())
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['meta_info']['id'], "4")
+        self.assertEqual(response.json()["meta_info"]["id"], "4")
 
     def test_api_encode_04(self):
         # Test Scenario 4: Call /encode API with list of rids (multiple requests) - text input
@@ -121,13 +121,13 @@ class TestAscendApi(CustomTestCase):
         logger.info(
             "Test 04 response type: %s, first item meta_info: %s", 
             type(response_json),
-            response_json[0].get('meta_info', {}),
+            response_json[0].get("meta_info", {}),
         )
         
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response_json), len(request_rids))
         for idx, result in enumerate(response_json):
-            self.assertEqual(result['meta_info']['id'], request_rids[idx])
+            self.assertEqual(result["meta_info"]["id"], request_rids[idx])
 
 
 if __name__ == "__main__":
