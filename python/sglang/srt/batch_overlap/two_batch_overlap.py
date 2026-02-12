@@ -1035,6 +1035,12 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def dispatch_b(self, **kwargs):
         return self._execute("dispatch_b", **kwargs)
 
+    def dispatch_a_peo(self, **kwargs):
+        return self._execute("dispatch_a_peo", **kwargs)
+
+    def dispatch_b_peo(self, **kwargs):
+        return self._execute("dispatch_b_peo", **kwargs)
+
     def combine(self, **kwargs) -> torch.Tensor:
         return self._execute("combine", **kwargs)
 
@@ -1066,3 +1072,12 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         super().clear_overlap_args()
         for inner in self._inners:
             inner.clear_overlap_args()
+
+    def combine_a_peo(self, **kwargs):
+        return self._execute("combine_a_peo", **kwargs)
+
+    def combine_b_peo(self, **kwargs):
+        return self._execute("combine_b_peo", **kwargs)
+
+    def get_buffer(self):
+        return self._inners[0].get_buffer()

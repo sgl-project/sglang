@@ -9,10 +9,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     PermuteMethodPool,
 )
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+    DeepGemmRunnerCore,
+    PeoDeepGemmRunnerCore,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend, is_peo_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -36,7 +39,10 @@ class MoeRunner:
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
-            self.runner_core = DeepGemmRunnerCore(config)
+            if is_peo_enabled():
+                self.runner_core = PeoDeepGemmRunnerCore(config)
+            else:
+                self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
             self.runner_core = None  # Marlin only supports fused path
         elif runner_backend.is_flashinfer_trtllm():
