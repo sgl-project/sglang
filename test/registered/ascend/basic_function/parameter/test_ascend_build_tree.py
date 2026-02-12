@@ -8,6 +8,7 @@ from typing import List, Optional
 
 import torch
 from sgl_kernel_npu.speculative import build_tree_efficient_native
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
@@ -16,8 +17,8 @@ logger = logging.getLogger(__name__)
 # Configure logging basic settings (ensure log messages are formatted properly)
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 
 
@@ -184,8 +185,8 @@ def build_tree_kernel_efficient(
     kernel_tree_times.append(kernel_time)  # Collect single timing result
 
     # Log single timing results (replace print with logging)
-    logger.info(f'native_tree_time is {native_time}')
-    logger.info(f'kernel_tree_time is {kernel_time}')
+    logger.info(f"native_tree_time is {native_time}")
+    logger.info(f"kernel_tree_time is {kernel_time}")
 
     # Calculate average times (single result here, extendable for multiple runs)
     avg_native_time = sum(native_tree_times) / len(native_tree_times)
@@ -196,12 +197,15 @@ def build_tree_kernel_efficient(
     performance_threshold = 0.5  # 10% speedup requirement
     if avg_native_time > 1e-9:  # Avoid division by zero
         speedup_ratio = (avg_native_time - avg_kernel_time) / avg_native_time
-        logger.info(f'Average native tree time: {avg_native_time}, Average kernel tree time: {avg_kernel_time}')
+        logger.info(
+            f'Average native tree time: {avg_native_time}, Average kernel tree time: {avg_kernel_time}'
+        )
         logger.info(f'Performance speedup ratio: {speedup_ratio}')
 
         # Assert the speedup meets the requirement
-        assert speedup_ratio >= performance_threshold, \
-            f"Performance requirement not met! Speedup ratio {speedup_ratio:.4f} < {performance_threshold}"
+        assert (
+            speedup_ratio >= performance_threshold
+        ), f"Performance requirement not met! Speedup ratio {speedup_ratio:.4f} < {performance_threshold}"
 
     return (
         tree_mask,
