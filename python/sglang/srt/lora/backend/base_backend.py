@@ -2,6 +2,7 @@ from typing import Tuple, Union
 
 import torch
 
+from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -18,6 +19,15 @@ class BaseLoRABackend:
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        # lm_head receives pruned hidden states whose shape differs from the
+        # original extend_seq_lens used to build the main ``batch_info``.
+        # Backends that support lm_head LoRA should populate this field in
+        # ``prepare_lora_batch`` so that ``ParallelLMHeadWithLoRA`` can swap
+        # it in during its forward pass.
+        self.lm_head_batch_info = None
+        # Saved full-pruned version so the chunked-logprobs path can restore
+        # it after iterating over individual chunks.
+        self._lm_head_batch_info_full = None
 
     def run_lora_a_embedding(
         self,
@@ -178,3 +188,86 @@ class BaseLoRABackend:
             use_cuda_graph: whether to use CUDA Graph for this batch
         """
         pass
+
+    # ------------------------------------------------------------------
+    # lm_head pruned batch_info helpers
+    # ------------------------------------------------------------------
+    # LogitsProcessor prunes hidden states before lm_head, so the default
+    # batch_info no longer matches.  ``_compute_lm_head_batch_info``
+    # (shared) computes the pruned segmentation;
+    # ``_make_lm_head_batch_info`` (overridable) creates the concrete
+    # batch-info object for the backend.
+
+    def _compute_lm_head_batch_info(
+        self, forward_batch: ForwardBatch, weight_indices: list[int]
+    ):
+        """Pre-compute ``lm_head_batch_info`` that matches the pruned hidden
+        states that ``LogitsProcessor`` will pass to the lm_head layer.
+
+        Three scenarios:
+        * **Decode** – no pruning; lm_head sees the same tokens → ``None``.
+        * **Extend without logprob** – only last token per seq → seg_lens=[1,…].
+        * **Extend with logprob** – pruned by ``extend_logprob_start_lens`` →
+          seg_lens = per-sequence pruned lengths.
+        """
+        if not forward_batch.forward_mode.is_extend():
+            self.lm_head_batch_info = None
+            self._lm_head_batch_info_full = None
+            return
+
+        bs = forward_batch.batch_size
+
+        if (
+            forward_batch.return_logprob
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.extend_logprob_start_lens_cpu is not None
+        ):
+            # Mirrors ``_get_pruned_states()`` in logits_processor.py.
+            pruned_seg_lens_list = [
+                max(1, ext - start)  # at least 1 for sampling
+                for ext, start in zip(
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            ]
+        else:
+            # Extend without logprob: only last token per sequence.
+            pruned_seg_lens_list = [1] * bs
+
+        self.lm_head_batch_info = self._make_lm_head_batch_info(
+            pruned_seg_lens_list, weight_indices
+        )
+        self._lm_head_batch_info_full = self.lm_head_batch_info
+
+    def _make_lm_head_batch_info(
+        self,
+        seg_lens_list: list[int],
+        weight_indices_list: list[int],
+    ) -> LoRABatchInfo:
+        """Create a ``LoRABatchInfo`` from *pruned* segment lengths.
+
+        The default implementation builds a standard ``LoRABatchInfo`` suitable
+        for the Triton backend.  Backends that require a different type (e.g.
+        ``TorchNativeLoRABatchInfo``) should override this method.
+        """
+        num_segs = len(seg_lens_list)
+        seg_lens = torch.tensor(seg_lens_list, dtype=torch.int32, device=self.device)
+        seg_indptr = torch.zeros(num_segs + 1, dtype=torch.int32, device=self.device)
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+
+        wi_tensor = torch.tensor(
+            weight_indices_list[:num_segs], dtype=torch.int32, device=self.device
+        )
+
+        return LoRABatchInfo(
+            bs=num_segs,
+            num_segments=num_segs,
+            max_len=max(seg_lens_list) if seg_lens_list else 0,
+            use_cuda_graph=False,
+            seg_lens=seg_lens,
+            seg_indptr=seg_indptr,
+            weight_indices=wi_tensor,
+            lora_ranks=self.batch_info.lora_ranks,   # shared reference
+            scalings=self.batch_info.scalings,        # shared reference
+            permutation=None,
+        )

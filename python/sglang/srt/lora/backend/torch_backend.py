@@ -273,3 +273,47 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         batch_info.weight_indices_cpu = weight_indices_tensor
 
         self.batch_info = batch_info
+
+        # Pre-compute lm_head batch_info for pruned hidden states.
+        self._compute_lm_head_batch_info(forward_batch, weight_indices)
+
+    # ------------------------------------------------------------------
+    # Override _make_lm_head_batch_info for TorchNativeLoRABatchInfo
+    # ------------------------------------------------------------------
+
+    def _make_lm_head_batch_info(
+        self,
+        seg_lens_list: list[int],
+        weight_indices_list: list[int],
+    ) -> TorchNativeLoRABatchInfo:
+        """Create a ``TorchNativeLoRABatchInfo`` for lm_head from pruned segments."""
+        num_segs = len(seg_lens_list)
+
+        seg_lens_cpu = torch.tensor(seg_lens_list, dtype=torch.int32, device="cpu")
+        seg_indptr_cpu = torch.zeros(num_segs + 1, dtype=torch.int32, device="cpu")
+        seg_indptr_cpu[1:] = torch.cumsum(seg_lens_cpu, dim=0)
+        wi_cpu = torch.tensor(
+            weight_indices_list[:num_segs], dtype=torch.int32, device="cpu"
+        )
+
+        seg_lens_gpu = seg_lens_cpu.to(self.device, non_blocking=True)
+        seg_indptr_gpu = seg_indptr_cpu.to(self.device, non_blocking=True)
+        wi_gpu = wi_cpu.to(self.device, non_blocking=True)
+
+        return TorchNativeLoRABatchInfo(
+            bs=num_segs,
+            num_segments=num_segs,
+            max_len=max(seg_lens_list) if seg_lens_list else 0,
+            use_cuda_graph=False,
+            seg_lens=seg_lens_gpu,
+            seg_indptr=seg_indptr_gpu,
+            weight_indices=wi_gpu,
+            lora_ranks=self.batch_info.lora_ranks,
+            scalings=self.batch_info.scalings,
+            permutation=None,
+            # CPU copies for torch_native ops
+            lora_ranks_cpu=self.batch_info.lora_ranks_cpu,
+            seg_lens_cpu=seg_lens_cpu,
+            seg_indptr_cpu=seg_indptr_cpu,
+            weight_indices_cpu=wi_cpu,
+        )

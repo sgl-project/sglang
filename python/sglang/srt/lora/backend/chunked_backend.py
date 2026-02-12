@@ -254,6 +254,20 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
         self.batch_info = batch_info
 
+        # Pre-compute lm_head batch_info for pruned hidden states.
+        self._compute_lm_head_batch_info(forward_batch, weight_indices)
+
+    def _compute_lm_head_batch_info(
+        self, forward_batch: ForwardBatch, weight_indices: list[int]
+    ):
+        """CSGMV backend uses permutation-based segmentation; producing a
+        pruned lm_head batch_info would require re-permutation.  For now,
+        mark as unsupported.  An informative error will be raised in
+        ``ParallelLMHeadWithLoRA.prepare_for_logits_chunk()`` if the user
+        attempts chunked-logprobs + lm_head LoRA with this backend."""
+        self.lm_head_batch_info = None
+        self._lm_head_batch_info_full = None
+
     @staticmethod
     def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):
         """
