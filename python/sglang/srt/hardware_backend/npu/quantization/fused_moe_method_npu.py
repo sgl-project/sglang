@@ -3,6 +3,11 @@ from typing import TYPE_CHECKING, Optional
 import numpy as np
 import torch
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -246,6 +251,23 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
 class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
 
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+    ):
+        super().__init__(quant_config)
+        # Detect device capability once at initialization
+        self._use_v2_api = None
+
+    def _detect_device_capability(self, device_index: int = 0) -> bool:
+        """Detect if device supports v2 MoE API (not supported on 910B)."""
+        if self._use_v2_api is None:
+            if torch_npu is None:
+                raise ImportError("torch_npu is required for NPU MoE operations")
+            device_name = torch_npu.npu.get_device_name(device_index)
+            self._use_v2_api = "910b" not in device_name.lower()
+        return self._use_v2_api
+
     def _process_scale(
         self, weight: torch.Tensor, scale, per_group_scale, is_per_channel_weight
     ):
@@ -387,18 +409,42 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         last_expert_idx = layer.num_experts
         global_num_experts = layer.num_experts
 
-        sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(
-                hidden_states,
-                topk_ids,
-                active_num=num_tokens * top_k,
-                expert_num=global_num_experts,
-                expert_tokens_num_type=1,
-                expert_tokens_num_flag=True,
-                active_expert_range=[first_expert_idx, last_expert_idx],
-                quant_mode=1,
+        # Check if device supports npu_moe_init_routing_v2 (not supported on 910B)
+        use_v2_api = self._detect_device_capability(hidden_states.device.index or 0)
+
+        if use_v2_api:
+            # Use v2 API for devices that support it (A3, etc.)
+            sorted_hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
+                torch.ops.npu.npu_moe_init_routing_v2(
+                    hidden_states,
+                    topk_ids,
+                    active_num=num_tokens * top_k,
+                    expert_num=global_num_experts,
+                    expert_tokens_num_type=1,
+                    expert_tokens_num_flag=True,
+                    active_expert_range=[first_expert_idx, last_expert_idx],
+                    quant_mode=1,
+                )
             )
-        )
+        else:
+            # Fallback to v1 API for 910B devices
+            topk_ids_int32 = topk_ids.to(torch.int32)
+            row_idx = (
+                torch.arange(0, num_tokens * top_k, dtype=torch.int32, device=topk_ids.device)
+                .view(top_k, -1)
+                .permute(1, 0)
+                .contiguous()
+            )
+            sorted_hidden_states, expanded_row_idx, expanded_expert_idx = (
+                torch.ops.npu.npu_moe_init_routing(
+                    hidden_states, row_idx=row_idx, expert_idx=topk_ids_int32, active_num=num_tokens
+                )
+            )
+            expert_tokens = torch.ops.npu.npu_moe_compute_expert_tokens(
+                expanded_expert_idx, global_num_experts
+            )
+            # Quantize for v1 path
+            sorted_hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_quant(sorted_hidden_states)
 
         expert_tokens = expert_tokens.to(torch.int64)
 
@@ -439,11 +485,26 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         )[0]
 
         assert original_shape is not None
-        final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
-            permuted_tokens=output,
-            sorted_indices=torch.abs(expanded_row_idx),
-            probs=topk_weights,
-        )
+
+        if use_v2_api:
+            # Use v2 unpermute for v2 API
+            final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
+                permuted_tokens=output,
+                sorted_indices=torch.abs(expanded_row_idx),
+                probs=topk_weights,
+            )
+        else:
+            # Use v1 finalize for v1 API
+            final_hidden_states = torch.ops.npu.npu_moe_finalize_routing(
+                output,
+                skip1=None,
+                skip2=None,
+                bias=None,
+                scales=topk_weights,
+                expanded_src_to_dst_row=expanded_row_idx,
+                export_for_source_row=topk_ids,
+            )
+
         if len(original_shape) == 3:
             final_hidden_states = final_hidden_states.view(original_shape)
 
