@@ -63,7 +63,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 try:
-    from sglang.multimodal_gen.runtime.pipelines.patches.flow_matching_sde_with_logprob import (
+    from sglang.multimodal_gen.runtime.pipelines.patches.flow_matching_with_logprob import (
         sde_step_with_logprob,
     )
 except Exception:  # pragma: no cover
