@@ -2047,20 +2047,6 @@ class ServerArgs:
                 self.enable_dp_attention
             ), "Please enable dp attention when setting enable_dp_lm_head. "
 
-        # Validate speculative MoE backend configuration
-        if (
-            self.speculative_moe_runner_backend == "deep_gemm"
-            and self.speculative_moe_a2a_backend == "deepep"
-            and self.ep_size == 1
-        ):
-            raise ValueError(
-                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
-                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
-                f"Current ep_size is {self.ep_size}. "
-                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
-                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
-            )
-
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":
             if self.moe_runner_backend not in ["auto", "cutlass"]:
@@ -2110,6 +2096,21 @@ class ServerArgs:
             assert (
                 self.ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+
+        # Validate speculative MoE backend configuration
+        if (
+            envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
+            and self.speculative_moe_runner_backend == "deep_gemm"
+            and self.speculative_moe_a2a_backend == "deepep"
+            and self.ep_size == 1
+        ):
+            raise ValueError(
+                "Invalid configuration: 'deep_gemm' speculative MoE runner backend with "
+                "'deepep' a2a backend requires expert parallelism (ep_size > 1). "
+                f"Current ep_size is {self.ep_size}. "
+                "Please set --ep-size > 1 (e.g., --ep-size 8) to use this configuration, "
+                "or change --speculative-moe-a2a-backend to 'none' if expert parallelism is not available."
+            )
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
