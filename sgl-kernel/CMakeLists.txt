@@ -47,7 +47,7 @@ clear_cuda_arches(CMAKE_FLAG)
 FetchContent_Declare(
     repo-cutlass
     GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
+    GIT_TAG        2fafefb7b9c7e233c1cfb258f38139a6406d1511
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-cutlass)
@@ -92,7 +92,7 @@ FetchContent_Populate(repo-flashinfer)
 FetchContent_Declare(
     repo-flash-attention
     GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f866ec34002250e74c8bbcbcffa0e1ae71300b2d
+    GIT_TAG.       10d78675c42d9dcfeed16af68695d87e40983f68
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
