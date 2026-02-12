@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MODEL_EAGLE
 
 ACC_THRESHOLDS = {
-    DEFAULT_TARGET_MODEL_EAGLE: {"kl_div": 0.01},
+    DEFAULT_TARGET_MODEL_EAGLE: {"kl_div": 0.0001},
 }
 
 

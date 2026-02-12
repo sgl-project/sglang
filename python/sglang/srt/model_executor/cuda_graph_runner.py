@@ -868,7 +868,7 @@ class CudaGraphRunner:
                 full_logits = output.full_logits[: self.raw_num_token]
             else:
                 full_logits = None
-                next_token_logits = output.next_token_logits[: self.raw_num_token]
+                next_token_logits = output.next_token_logits[: self.raw_num_token].clone()
 
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
