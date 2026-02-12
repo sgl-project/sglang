@@ -1684,8 +1684,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        tic = time.perf_counter()
-        logger.info("Init attention backend begin.")
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -1696,9 +1694,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
             self.attn_backend = self._get_attention_backend()
-        logger.info(
-            f"Init attention backend end. elapsed={time.perf_counter() - tic:.2f} s"
-        )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""
