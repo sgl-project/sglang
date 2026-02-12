@@ -422,6 +422,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("weak_ref_tensor(Tensor tensor) -> Tensor");
   m.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 
+  m.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
+  m.impl("get_cuda_view_from_cpu_tensor", torch::kCPU, &get_cuda_view_from_cpu_tensor);
+
   /*
    * From FlashInfer
    */
