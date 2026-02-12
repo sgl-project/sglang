@@ -153,12 +153,27 @@ find_latest_image() {
   fi
 
   echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag}" >&2
-  echo "Using hard-coded fallback…" >&2
-  if [[ "${gpu_arch}" == "mi35x" ]]; then
-    echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
-  else
-    echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
-  fi
+  echo "Using hard-coded fallback for ${ROCM_VERSION}…" >&2
+  case "${ROCM_VERSION}" in
+    rocm720)
+      if [[ "${gpu_arch}" == "mi35x" ]]; then
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
+      else
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
+      fi
+      ;;
+    rocm700)
+      if [[ "${gpu_arch}" == "mi35x" ]]; then
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
+      else
+        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
+      fi
+      ;;
+    *)
+      echo "Error: no hard-coded fallback available for ${ROCM_VERSION}" >&2
+      return 1
+      ;;
+  esac
 }
 
 # Determine which image to use
