@@ -86,25 +86,26 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
         model.config.tie_word_embeddings
     ), f"Expected tie_word_embeddings=True for {base_model_name}"
 
+    # Only target lm_head to isolate the test to the tied-embedding scenario.
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "lm_head",
-        ],
+        target_modules=["lm_head"],
         lora_dropout=0,
         bias="none",
         task_type="CAUSAL_LM",
     )
 
     peft_model = get_peft_model(model, lora_config)
+
+    # PEFT initializes lora_B to zeros by default, which makes the adapter
+    # produce identical output to the base model. Initialize lora_B with
+    # non-zero random weights so the adapter has a visible effect.
+    with torch.no_grad():
+        for name, param in peft_model.named_parameters():
+            if "lora_B" in name:
+                torch.nn.init.normal_(param, mean=0.0, std=0.02)
+
     peft_model.save_pretrained(output_dir)
 
     # Verify the saved adapter contains lm_head keys
@@ -158,6 +159,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             lora_paths=[self._adapter_dir],
             max_loras_per_batch=1,
             lora_backend="triton",
+            lora_target_modules=["lm_head"],
             disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.80,
@@ -204,6 +206,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             lora_paths=[self._adapter_dir],
             max_loras_per_batch=1,
             lora_backend="triton",
+            lora_target_modules=["lm_head"],
             disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.80,
@@ -263,6 +266,7 @@ class TestLoRATiedLMHead(CustomTestCase):
             lora_paths=[self._adapter_dir],
             max_loras_per_batch=1,
             lora_backend="triton",
+            lora_target_modules=["lm_head"],
             disable_cuda_graph=True,
             disable_radix_cache=True,
             mem_fraction_static=0.80,
