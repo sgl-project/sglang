@@ -2126,6 +2126,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         language_model = getattr(self.model, "language_model", self.model)
         self.attention_layers = []
         self.moe_layers = []
+        self.moe_fusions = []
         for layer in language_model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
@@ -2144,15 +2145,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.attention_layers.append(layer.attention.attn)
 
             moe_block = None
+            moe_fusion = None
             if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
                 moe_block = layer.mlp.experts
+                moe_fusion = layer.mlp
             if hasattr(layer, "block_sparse_moe") and hasattr(
                 layer.block_sparse_moe, "experts"
             ):
                 moe_block = layer.block_sparse_moe.experts
+                moe_fusion = layer.block_sparse_moe
             if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
                 moe_block = layer.moe.experts
+                moe_fusion = layer.moe
             self.moe_layers.append(moe_block)
+            self.moe_fusions.append(moe_fusion)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
