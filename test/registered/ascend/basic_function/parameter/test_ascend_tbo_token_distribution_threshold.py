@@ -1,6 +1,3 @@
-
-
-
 import threading
 import time
 import unittest
@@ -62,7 +59,6 @@ def send_generate_request(task_id, request_results, semaphore):
                 "task_id": task_id,
                 "status_code": response.status_code,
                 "single_elapsed_time": single_elapsed_time,
-        
             }
         )
 
@@ -117,6 +113,7 @@ class TestTbo08(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --tbo-token-distribution-threshold;
     """
+
     @classmethod
     def setUpClass(cls):
         print(
@@ -140,14 +137,13 @@ class TestTbo08(CustomTestCase):
             f"=== Starting continuous concurrency test: {CONFIG['CONCURRENT_THREADS']} concurrent threads, total {CONFIG['REQUEST_COUNT']} requests ==="
         )
 
-
         semaphore = threading.Semaphore(CONFIG["CONCURRENT_THREADS"])
 
         threads = []
 
         for task_id in range(CONFIG["REQUEST_COUNT"]):
             t = threading.Thread(
-                target=send_generate_request,args=(task_id, request_results, semaphore)
+                target=send_generate_request, args=(task_id, request_results, semaphore)
             )
             threads.append(t)
             t.start()
@@ -162,6 +158,7 @@ class TestTbo08(CustomTestCase):
         print(
             f"  Average elapsed time per request: {statistics['avg_elapsed']} seconds"
         )
+
 
 class TestTboDisabled(CustomTestCase):
     """Testcase: Verify TBO performance with threshold 0 (disabled two-chunk-overlap)
@@ -191,14 +188,13 @@ class TestTboDisabled(CustomTestCase):
             f"=== Starting continuous concurrency test: {CONFIG['CONCURRENT_THREADS']} concurrent threads, total {CONFIG['REQUEST_COUNT']} requests ==="
         )
 
-
         semaphore = threading.Semaphore(CONFIG["CONCURRENT_THREADS"])
 
         threads = []
 
         for task_id in range(CONFIG["REQUEST_COUNT"]):
             t = threading.Thread(
-                target=send_generate_request,args=(task_id, request_results, semaphore)
+                target=send_generate_request, args=(task_id, request_results, semaphore)
             )
             threads.append(t)
             t.start()
@@ -234,7 +230,7 @@ class TestTboDisabled(CustomTestCase):
             tbo_08_avg,
             tbo_0_avg,
             1,
-            f"Assertion Failed: Average elapsed time - TBO 0 ({tbo_0_avg}s) is not close to TBO 0.8 ({tbo_08_avg}s)"
+            f"Assertion Failed: Average elapsed time - TBO 0 ({tbo_0_avg}s) is not close to TBO 0.8 ({tbo_08_avg}s)",
         )
 
 
