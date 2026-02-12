@@ -368,6 +368,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
+        self.page_offsets = torch.arange(self.page_size, device=self.device)
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.clear()
@@ -390,7 +391,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_indices = (
             out_pages[:, None] * self.page_size
-            + torch.arange(self.page_size, device=self.device)
+            + self.page_offsets
         ).reshape(-1)
 
         return out_indices
