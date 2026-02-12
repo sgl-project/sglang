@@ -65,7 +65,7 @@ class TestDisaggregationDecodeDp(TestDisaggregationBase):
             "--attention-backend",
             "ascend",
             "--mem-fraction-static",
-            0.8,   
+            0.8,
         ]
 
         env = os.environ.copy()
@@ -97,7 +97,7 @@ class TestDisaggregationDecodeDp(TestDisaggregationBase):
             "--attention-backend",
             "ascend",
             "--mem-fraction-static",
-            0.8, 
+            0.8,
         ]
 
         env = os.environ.copy()
