@@ -305,28 +305,21 @@ class DFlashVerifyInput(SpecInput):
             target_predict=target_predict,
         )
 
-        # Build output tokens on GPU: accepted drafts + bonus token.
-        out_lens = accept_len.to(torch.int32) + 1
-        accept_len_i64 = accept_len.to(torch.int64)
+        # Single D2H transfer: candidates[1:] + accept_len + bonus
+        packed = torch.cat(
+            [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
+        ).cpu()
 
-        out_tokens = torch.empty(
-            (bs, self.draft_token_num), dtype=torch.int64, device=device
-        )
-        if int(self.draft_token_num) > 1:
-            out_tokens[:, : self.draft_token_num - 1].copy_(candidates[:, 1:])
-        out_tokens[:, self.draft_token_num - 1].fill_(0)
-        out_tokens.scatter_(1, accept_len_i64[:, None], bonus[:, None])
-
-        out_tokens_cpu = out_tokens.cpu()
-        out_lens_cpu = out_lens.cpu()
-
-        commit_lens_cpu: List[int] = []
-        new_verified_cpu: List[int] = []
+        max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
+        commit_lens_cpu: List[int] = []
+        new_verified_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
-            proposed_len = int(out_lens_cpu[i])
-            proposed = out_tokens_cpu[i, :proposed_len].tolist()
+            acc_len = int(packed[i, max_acc].item())
+            proposed = packed[i, :acc_len].tolist() + [
+                int(packed[i, max_acc + 1].item())
+            ]
 
             appended = 0
             if (
@@ -388,18 +381,16 @@ class DFlashVerifyInput(SpecInput):
                     if req.grammar is not None:
                         req.grammar.accept_token(int(tok))
 
-            # DFlash always treats the last appended token as the new "current token"
-            # (uncommitted); therefore we commit exactly `appended` verify-input tokens.
-            if appended <= 0:
-                raise RuntimeError("DFLASH verify unexpectedly appended 0 tokens.")
             commit_lens_cpu.append(appended)
-            new_verified_cpu.append(req.output_ids[-1])
+            new_verified_list.append(req.output_ids[-1])
             accept_length_per_req_cpu.append(max(0, appended - 1))
-
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+        new_verified_id = torch.tensor(
+            new_verified_list, dtype=torch.int64, device=device
+        )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
         if page_size == 1:
@@ -456,9 +447,6 @@ class DFlashVerifyInput(SpecInput):
         # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None
 
-        new_verified_id = torch.tensor(
-            new_verified_cpu, dtype=torch.int64, device=device
-        )
         return (
             new_verified_id,
             commit_lens,
