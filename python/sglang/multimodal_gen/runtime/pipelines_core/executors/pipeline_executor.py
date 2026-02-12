@@ -30,7 +30,9 @@ class Timer(StageProfiler):
     """
 
     def __init__(self, name="Stage"):
-        super().__init__(stage_name=name, timings=None, simple_log=True, logger=logger)
+        super().__init__(
+            stage_name=name, timings=None, log_stage_start_end=True, logger=logger
+        )
 
 
 class PipelineExecutor(ABC):
@@ -81,8 +83,7 @@ class PipelineExecutor(ABC):
         """
         Context manager for profiling execution.
         """
-        do_profile = batch.profile
-
+        do_profile = batch.profile and not batch.is_warmup
         if not do_profile:
             # fast forward
             yield

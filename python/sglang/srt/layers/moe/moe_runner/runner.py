@@ -39,6 +39,8 @@ class MoeRunner:
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
             self.runner_core = None  # Marlin only supports fused path
+        elif runner_backend.is_flashinfer_trtllm():
+            self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
@@ -49,6 +51,12 @@ class MoeRunner:
         self.fused_func = FusedOpPool.get_fused_func(
             a2a_backend_name, runner_backend_name
         )
+
+        if self.runner_core is None and self.fused_func is None:
+            raise NotImplementedError(
+                f"Runner backend {runner_backend} requires a fused func for a2a backend "
+                f"{a2a_backend_name}, but none is registered."
+            )
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
@@ -69,6 +77,7 @@ class MoeRunner:
         if self.fused_func is not None:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
+        assert self.runner_core is not None
         dispatch_format = dispatch_output.format.value
         runner_format = self.runner_core.runner_backend.value
         self.pre_permute_func = PermuteMethodPool.get_pre_permute(

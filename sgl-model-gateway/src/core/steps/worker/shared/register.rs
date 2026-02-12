@@ -6,23 +6,33 @@ use async_trait::async_trait;
 use tracing::debug;
 
 use crate::{
-    app_context::AppContext,
-    core::Worker,
+    core::steps::workflow_data::WorkerRegistrationData,
     observability::metrics::Metrics,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowResult},
+    workflow::{
+        StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    },
 };
 
 /// Unified step to register workers in the registry.
 ///
 /// Works with both single workers and batches. Always expects `workers` key
 /// in context containing `Vec<Arc<dyn Worker>>`.
+/// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
 
 #[async_trait]
-impl StepExecutor for RegisterWorkersStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let workers: Arc<Vec<Arc<dyn Worker>>> = context.get_or_err("workers")?;
+impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
+    async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
+        let app_context = context
+            .data
+            .get_app_context()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
+            .clone();
+
+        let workers = context
+            .data
+            .get_actual_workers()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
         let mut worker_ids = Vec::with_capacity(workers.len());
 
@@ -75,11 +85,18 @@ impl StepExecutor for RegisterWorkersStep {
             );
         }
 
-        context.set("worker_ids", worker_ids);
+        // Note: worker_ids are stored for potential future use but not persisted
+        // as they are internal registry identifiers
+        debug!(
+            "Registered {} workers with IDs: {:?}",
+            worker_ids.len(),
+            worker_ids
+        );
+
         Ok(StepResult::Success)
     }
 
-    fn is_retryable(&self, _error: &crate::workflow::WorkflowError) -> bool {
+    fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
 }
