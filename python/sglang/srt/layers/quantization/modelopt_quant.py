@@ -299,7 +299,8 @@ class ModelOptQuantConfig(QuantizationConfig):
             # Check if MoE layer should be excluded from quantization
             # (e.g., MTP layers that have no quantization scales in checkpoint)
             if self.is_layer_excluded(prefix):
-                return None  # Falls back to default unquantized MoE
+                # Falls back to default unquantized MoEx
+                return None
             return Moe(self)
         return None
 
@@ -325,6 +326,54 @@ class ModelOptQuantConfig(QuantizationConfig):
                     expanded.append(name.removeprefix("language_model."))
             # Preserve order, drop duplicates.
             self.exclude_modules = list(dict.fromkeys(expanded))
+
+    def is_layer_excluded(self, prefix: str) -> bool:
+        """Check if a layer should be excluded from quantization.
+
+        Handles:
+        - Exact matches (e.g., "lm_head" matching prefix "lm_head")
+        - Glob-style wildcards (e.g., "mtp*" matching "mtp_layers")
+        - Part-by-part matching (split prefix on "." and check each part)
+        - language_model. prefix stripping for vision-language models
+        - Fused module patterns (e.g., "q_a_proj" in "fused_qkv_a_proj_with_mqa")
+        """
+        if not self.exclude_modules:
+            return False
+
+        # Build prefix variants: some models wrap layers under "language_model."
+        prefixes_to_check = [prefix]
+        if prefix.startswith("language_model."):
+            prefixes_to_check.append(prefix.removeprefix("language_model."))
+
+        # Fused module patterns: the exclude list may reference a sub-component
+        # (e.g., "q_a_proj") that is fused into a combined parameter name
+        # (e.g., "fused_qkv_a_proj_with_mqa"). We check if the last segment of
+        # the exclude pattern is a substring of the last segment of the prefix.
+        fused_patterns = {"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"}
+
+        for pattern in self.exclude_modules:
+            # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*")
+            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
+
+            for pfx in prefixes_to_check:
+                if re.fullmatch(regex_str, pfx):
+                    return True
+                # Part-by-part check: handles wildcards like "mtp*" matching
+                pfx_parts = pfx.split(".")
+                for part in pfx_parts:
+                    if re.fullmatch(regex_str, part):
+                        return True
+
+            # Check fused patterns: if the last segment of the exclude pattern
+            # is a known fused component, check if it appears in the prefix's
+            # last segment (handles fused_qkv_a_proj_with_mqa containing q_a_proj)
+            pattern_tail = pattern.rsplit(".", maxsplit=1)[-1]
+            if pattern_tail in fused_patterns:
+                for pfx in prefixes_to_check:
+                    if pattern_tail in pfx.rsplit(".", maxsplit=1)[-1]:
+                        return True
+
+        return False
 
 
 class ModelOptFp8Config(ModelOptQuantConfig):
@@ -421,26 +470,6 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             exclude_modules=exclude_modules,
             packed_modules_mapping=config.get("packed_modules_mapping"),
         )
-
-    def is_layer_excluded(self, prefix: str) -> bool:
-        if len(self.exclude_modules) == 0:
-            return False
-
-        # Build prefix variants: some models wrap layers under "language_model."
-        prefixes_to_check = [prefix]
-        if prefix.startswith("language_model."):
-            prefixes_to_check.append(prefix.removeprefix("language_model."))
-
-        for pattern in self.exclude_modules:
-            # Convert glob-style wildcard to regex (e.g., "mtp*" -> "mtp.*")
-            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
-            for pfx in prefixes_to_check:
-                if re.fullmatch(regex_str, pfx):
-                    return True
-                for part in pfx.split("."):
-                    if re.fullmatch(regex_str, part):
-                        return True
-        return False
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -1044,30 +1073,6 @@ class ModelOptFp4Config(ModelOptQuantConfig):
             exclude_modules,
             config.get("packed_modules_mapping"),
         )
-
-    def is_layer_excluded(self, prefix: str):
-        fused_patterns = ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"]
-        prefix_split = prefix.split(".")
-        for pattern in self.exclude_modules:
-            regex_str = pattern.replace(".", r"\.").replace("*", r".*")
-            pattern_split = pattern.split(".")
-            if re.fullmatch(regex_str, prefix):
-                return True
-            # Part-by-part check: handles wildcards like "mtp*" matching
-            # the "mtp_layers" part in "model.mtp_layers.0.lm_head"
-            for part in prefix_split:
-                if re.fullmatch(regex_str, part):
-                    return True
-            if (
-                pattern_split[-1] in fused_patterns
-                and pattern_split[-1] in prefix_split[-1]
-            ):
-                # Check if the last part of the excluded pattern is contained in the last part of the prefix
-                # This handles fused modules like fused_qkv_a_proj_with_mqa that contain q_a_proj and kv_a_proj_with_mqa
-                # e.g., model.layers.{i}.self_attn.{fused_weight_name}
-                assert len(prefix_split) == 5 and len(pattern_split) == 5
-                return True
-        return False
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         return self._get_quant_method(
