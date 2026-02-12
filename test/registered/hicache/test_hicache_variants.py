@@ -43,6 +43,22 @@ class HiCacheEvalMixin:
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], self.expected_mmlu_score)
+        print("Flushing device cache...")
+        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
+
+        print("Running second MMLU evaluation using memory cache...")
+        metrics_cached = run_eval(args)
+
+        self.assertGreaterEqual(metrics_cached["score"], self.expected_mmlu_score)
+        # Verify accuracy consistency
+        accuracy_diff = abs(metrics["score"] - metrics_cached["score"])
+        print(f"Accuracy difference after cache flush: {accuracy_diff:.4f}")
+        if accuracy_diff > 0:
+            self.assertLess(
+                accuracy_diff,
+                0.05,
+                "Accuracy should be consistent between cache states",
+            )
 
 
 class HiCacheMGSMEvalMixin:
@@ -87,6 +103,14 @@ class HiCacheBaseServer(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+    def flush_cache(self) -> bool:
+        """Flush device cache to force remote storage access"""
+        try:
+            response = requests.post(f"{self.base_url}/flush_cache", timeout=10)
+            return response.status_code == 200
+        except requests.RequestException:
+            return False
 
 
 class TestHiCacheStandard(HiCacheBaseServer, HiCacheEvalMixin):
