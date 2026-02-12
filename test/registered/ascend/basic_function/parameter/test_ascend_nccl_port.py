@@ -69,8 +69,9 @@ class TestNcclPort(CustomTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        result = run_command("lsof -i:9111")
-        self.assertIn("*:9111 (LISTEN)", result)
+        result = run_command("netstat -tulnp | grep :9111")
+        self.assertIn(":9111", result)
+        self.assertIn("LISTEN", result)
 
 
 if __name__ == "__main__":
