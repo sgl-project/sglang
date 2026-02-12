@@ -542,7 +542,7 @@
                 "7": 99.3,
                 "8": 100.83
             },
-            "expected_e2e_ms": 952.09,
+            "expected_e2e_ms": 1461.08,
             "expected_avg_denoise_ms": 89.36,
             "expected_median_denoise_ms": 99.67
         },
@@ -567,14 +567,14 @@
                 "7": 100.86,
                 "8": 103.87
             },
-            "expected_e2e_ms": 955.14,
+            "expected_e2e_ms": 1464.31,
             "expected_avg_denoise_ms": 89.96,
             "expected_median_denoise_ms": 99.72
         },
         "zimage_image_t2i_2_gpus": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
-                "TextEncodingStage": 118.66,
+                "TextEncodingStage": 420.74,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.5,
                 "LatentPreparationStage": 0.12,
@@ -617,7 +617,7 @@
                 "7": 110.54,
                 "8": 115.24
             },
-            "expected_e2e_ms": 1029.96,
+            "expected_e2e_ms": 1184.45,
             "expected_avg_denoise_ms": 98.46,
             "expected_median_denoise_ms": 109.65
         },
