@@ -167,18 +167,27 @@ What is 2 + 2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
         # This tests the boundary case: when completion_tokens == max_tokens
         # and the last token is eos, finish_reason should be "stop" (not "length").
         # The model answers " 4" + eos = 3 tokens for completions API.
+        # But matched_stop_kit.py may be called both in test_matched_stop.py (use Llama-3.1-8B-Instruct as default model) and
+        # test_eagle_infer_beta.py (use Llama-2-7b-chat-hf as default model), so the output length may be different.
+        # So we use 200 as the max_tokens here for a safe test.
+        if self.model == "meta-llama/Llama-3.1-8B-Instruct":
+            max_tokens_1 = 3
+            max_tokens_2 = 13
+        else:
+            max_tokens_1 = 200
+            max_tokens_2 = 200
         self._run_completions_generation(
             prompt=llama_format_prompt,
-            max_tokens=3,
+            max_tokens=max_tokens_1,
             finish_reason="stop",
             matched_stop=eos_token_ids,
         )
 
-        # For chat completions, the model answers "The answer to 2 + 2 is 4." + eos = 13 tokens.
-        # When completion_tokens == max_tokens and eos is hit, should return "stop".
+        # For chat completions, the model answers "The answer to 2 + 2 is 4." + eos = 13 tokens in Llama-3.1-8B-Instruct.
+        # When completion_tokens == max_tokens and eos is hit, should return "stop", as we tested locally with Llama-3.1-8B-Instruct.
         self._run_chat_completions_generation(
             prompt="What is 2 + 2?",
-            max_tokens=13,
+            max_tokens=max_tokens_2,
             finish_reason="stop",
             matched_stop=eos_token_ids,
         )
