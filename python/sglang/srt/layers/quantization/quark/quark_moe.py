@@ -15,6 +15,7 @@ from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnu
 from sglang.srt.layers.quantization.utils import all_close_1d, per_tensor_dequantize
 from sglang.srt.utils import (
     get_bool_env_var,
+    get_torch_compile_disable_decorator,
     is_gfx95_supported,
     is_hip,
     set_weight_attrs,
@@ -29,13 +30,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_shuffle_moe_mxfp4 = _is_gfx95_supported = is_gfx95_supported()
 
 __all__ = ["QuarkMoEMethod", "QuarkW4A4MXFp4MoEMethod"]
 
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -202,6 +205,7 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
     ):
         self.moe_runner_config = moe_runner_config
 
+    @get_torch_compile_disable_decorator(_use_aiter_gfx95)
     def apply(
         self,
         layer: torch.nn.Module,
