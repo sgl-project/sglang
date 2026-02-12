@@ -496,7 +496,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
             )
-        elif compute_capability in [10, 11]:
+        elif compute_capability in [10, 11, 12]:
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -521,7 +521,7 @@ def _flash_attn_fwd(
             )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x"
+                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
