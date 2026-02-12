@@ -1645,6 +1645,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # The reference by CudaIpcTensorTransportProxy was cut off,
                     # proactively delete to avoid slow gc.
                     del pixel_values
+                if get_global_server_args().language_only:
+                    precomputed_embeddings = getattr(
+                        mm_item, "precomputed_embeddings", None
+                    )
+                    if isinstance(precomputed_embeddings, torch.Tensor):
+                        mm_item.precomputed_embeddings = precomputed_embeddings.to(
+                            self.device, non_blocking=True
+                        )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
