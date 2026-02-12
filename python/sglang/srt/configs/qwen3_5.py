@@ -15,13 +15,10 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
 
     def __init__(
         self,
+        rope_parameters=None,
         **kwargs,
     ):
-        rope_scaling = kwargs.get("rope_scaling") or {}
-        if "rope_type" not in rope_scaling and "type" not in rope_scaling:
-            rope_scaling = dict(rope_scaling)
-            rope_scaling["rope_type"] = "default"
-        kwargs["rope_scaling"] = rope_scaling
+        kwargs["rope_scaling"] = rope_parameters
         super().__init__(**kwargs)
 
 
