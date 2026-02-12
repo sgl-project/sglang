@@ -13,6 +13,8 @@ pub struct RouterConfig {
     pub mode: RoutingMode,
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<SchedulerConfig>,
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
@@ -151,7 +153,7 @@ fn default_history_backend() -> HistoryBackend {
 #[serde(tag = "type")]
 pub enum RoutingMode {
     #[serde(rename = "regular")]
-    Regular { worker_urls: Vec<String> },
+    Regular { worker_urls: Vec<String>},
     #[serde(rename = "prefill_decode")]
     PrefillDecode {
         /// With optional bootstrap ports
@@ -217,6 +219,20 @@ pub enum ManualAssignmentMode {
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+}
+
+/// scheduler configuration for router select
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SchedulerConfig {
+    #[serde(rename = "proportion")]
+    Proportion{
+        adjust_interval: usize,
+        adjust_window: usize,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        regular_worker_weight: f32,
+    }
 }
 
 /// Policy configuration for routing
@@ -478,6 +494,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            scheduler: None,
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536_870_912,     // 512MB

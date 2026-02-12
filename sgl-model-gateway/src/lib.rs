@@ -19,3 +19,4 @@ pub use tool_parser;
 pub mod version;
 pub mod wasm;
 pub use wfaas as workflow;
+pub mod schedulers;
