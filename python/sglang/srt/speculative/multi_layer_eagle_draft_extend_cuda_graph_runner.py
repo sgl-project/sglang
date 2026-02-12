@@ -387,8 +387,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                 forward_batch,
             )
 
-            # Chain-style MTP: write model output (hidden_states_before_norm) back to buffer
-            # so assign_new_state_triton passes MTP output to next step, not input.
+            # Chain-style MTP: overwrite self.hidden_states with the draft model's
+            # output (hidden_states_before_norm) so that assign_new_state_triton
+            # propagates each MTP layer's own output to the next MTP layer,
+            # rather than always feeding the target model's hidden states.
             if ret.hidden_states is not None:
                 self.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
 
