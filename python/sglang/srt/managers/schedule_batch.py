@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
@@ -939,6 +940,19 @@ class Req(ReqDllmMixin):
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+
+        if self.multimodal_inputs and self.multimodal_inputs.mrope_positions is not None and self.multimodal_inputs.mrope_position_delta is not None:
+            current_len = self.multimodal_inputs.mrope_positions.shape[1]
+            new_len = len(self.fill_ids)
+            if new_len > current_len:
+                new_mrope_positions = MRotaryEmbedding.get_next_input_positions(
+                    self.multimodal_inputs.mrope_position_delta[0],
+                    current_len,
+                    new_len,
+                )
+                self.multimodal_inputs.mrope_positions = torch.cat(
+                    (self.multimodal_inputs.mrope_positions, new_mrope_positions), dim=1
+                )
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
