@@ -182,7 +182,7 @@ export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
 export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables Documentation](../environment_variables.md) for more details.
+See [Environment Variables Documentation](../references/environment_variables.md) for more details.
 
 ## Generate
 

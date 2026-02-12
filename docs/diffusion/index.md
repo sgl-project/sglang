@@ -19,7 +19,7 @@ SGLang Diffusion is an inference framework for accelerated image and video gener
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
-See [Installation Guide](installation.md) for more installation methods and ROCm-specific instructions.
+See [Installation Guide](get_started/installation.md) for more installation methods and ROCm-specific instructions.
 
 ### Basic Usage
 
@@ -36,34 +36,6 @@ Or start a server with the OpenAI-compatible API:
 ```bash
 sglang serve --model-path Qwen/Qwen-Image --port 30010
 ```
-
----
-
-## Documentation
-
-### Getting Started
-
-- **[Installation](installation.md)** - Install SGLang Diffusion via pip, uv, Docker, or from source
-- **[Compatibility Matrix](compatibility_matrix.md)** - Supported models and optimization compatibility
-
-### Usage
-
-- **[CLI Documentation](api/cli.md)** - Command-line interface for `sglang generate` and `sglang serve`
-- **[OpenAI API](api/openai_api.md)** - OpenAI-compatible API for image/video generation and LoRA management
-
-### Performance Optimization
-
-- **[Performance Overview](performance/index.md)** - Overview of all performance optimization strategies
-- **[Attention Backends](performance/attention_backends.md)** - Available attention backends (FlashAttention, SageAttention, etc.)
-- **[Caching Strategies](performance/cache/)** - Cache-DiT and TeaCache acceleration
-- **[Profiling](performance/profiling.md)** - Profiling techniques with PyTorch Profiler and Nsight Systems
-
-### Reference
-
-- **[Environment Variables](environment_variables.md)** - Configuration via environment variables
-- **[Support New Models](support_new_models.md)** - Guide for adding new diffusion models
-- **[Contributing](contributing.md)** - Contribution guidelines and commit message conventions
-- **[CI Performance](ci_perf.md)** - Performance baseline generation script
 
 ---
 

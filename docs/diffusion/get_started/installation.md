@@ -65,7 +65,7 @@ docker run --device=/dev/kfd --device=/dev/dri --ipc=host \
   sglang generate --model-path black-forest-labs/FLUX.1-dev --prompt "A logo With Bold Large text: SGL Diffusion" --save-output
 ```
 
-For detailed ROCm system configuration and installation from source, see [AMD GPUs](../../platforms/amd_gpu.md).
+For detailed ROCm system configuration and installation from source, see [AMD GPUs](../../../platforms/amd_gpu.md).
 
 ## Platform-Specific: MUSA (Moore Threads GPUs)
 
