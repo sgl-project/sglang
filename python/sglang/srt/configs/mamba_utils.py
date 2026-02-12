@@ -83,7 +83,7 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
-    k_last: bool = False  # If True, temporal shape is (HV, V, K) instead of (HV, K, V)
+    k_last: bool = False  # If True, temporal shape is (HV, V, K) — K in last dim; default is (HV, K, V)
 
     @staticmethod
     def create(
@@ -95,7 +95,7 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
-        k_last: bool = False,  # If True, use K-last layout (HV, V, K) for MTP kernel
+        k_last: bool = False,  # If True, use (HV, V, K) layout (K-last) for FlashInfer kernels
     ) -> "Mamba2StateShape":
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
@@ -111,22 +111,21 @@ class Mamba2StateShape:
         # These are not TP-ed as they depend on A, dt_bias, D
         # - they are typically small
         #   e.g., QWen3-Next: (32, 128, 128)
-        # V-last layout: (HV, K, V) for Triton decode/prefill kernels (default)
-        # K-last layout: (HV, V, K) for MTP verify + FlashInfer prefill kernels
-        # Note: head_dim is K dimension, state_size is V dimension
+        # Note: For Qwen3-Next, head_dim = linear_value_head_dim (V dimension),
+        #       state_size = linear_key_head_dim (K dimension).
+        # k_last=True:  (HV, head_dim, state_size) = (HV, V, K) — K-last, for FlashInfer kernels
+        # k_last=False: (HV, state_size, head_dim) = (HV, K, V) — default, for Triton kernels
         if k_last:
-            # K-last: (HV, V, K) = (HV, state_size, head_dim)
             temporal_state_shape = (
                 divide(num_heads, tp_world_size),
-                state_size,
-                head_dim,
+                head_dim,     # V
+                state_size,   # K (last)
             )
         else:
-            # V-last: (HV, K, V) = (HV, head_dim, state_size)
             temporal_state_shape = (
                 divide(num_heads, tp_world_size),
-                head_dim,
-                state_size,
+                state_size,   # K
+                head_dim,     # V
             )
         return Mamba2StateShape(
             conv=[conv_state_shape],

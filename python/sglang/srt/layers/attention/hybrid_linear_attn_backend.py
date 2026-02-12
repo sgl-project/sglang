@@ -989,7 +989,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         k_dim = 128  # ssm_state_size (key dimension)
         v_dim = 128  # ssm_state_size (value dimension)
         
-        device = "cuda"
+        device = torch.cuda.current_device()
         dtype = torch.bfloat16
         
         try:
@@ -1054,7 +1054,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         k_dim = 128  # ssm_state_size (key dimension)
         v_dim = 128  # ssm_state_size (value dimension)
         
-        device = "cuda"
+        device = torch.cuda.current_device()
         dtype = torch.bfloat16
         
         try:
