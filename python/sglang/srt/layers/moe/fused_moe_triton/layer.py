@@ -1176,6 +1176,12 @@ class FlashInferFusedMoE(FusedMoE):
                     "Please check flashinfer version to use bf16 with flashinfer_trtllm backend."
                 ) from e
 
+            routing_method_type = RoutingMethodType(self.routing_method_type)
+            assert routing_method_type in [
+                RoutingMethodType.RenormalizeNaive,
+                RoutingMethodType.Renormalize,
+            ], f"Only RenormalizeNaive and Renormalize routing methods (Qwen models) are supported and valided for flashinfer trtllm bf16 moe, but got RoutingMethodType={routing_method_type.name}."
+
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
