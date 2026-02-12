@@ -967,6 +967,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "Using FlashInfer GDN decode kernel for K-last decode."
                 )
                 GDNAttnBackend._k_last_decode_warning_shown = True
+            if not server_args.disable_radix_cache:
+                logger.warning(
+                    "K-last SSM layout (--mamba-ssm-k-last) does not support prefix caching "
+                    "for the prefill path. SSM state tracking at chunk boundaries is skipped, "
+                    "which may cause incorrect outputs for cached prefixes. "
+                    "Consider using --disable-radix-cache or disabling --mamba-ssm-k-last."
+                )
 
     def _warmup_mtp_kernel(self):
         """Warmup FlashInfer MTP kernel to avoid JIT compilation overhead during serving.
