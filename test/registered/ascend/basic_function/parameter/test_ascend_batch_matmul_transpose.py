@@ -8,6 +8,9 @@ import torch
 import torch_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
+assert sgl_kernel_npu is not None
+assert torch_npu is not None
+
 # Configure logging module to replace direct print statements
 logging.basicConfig(
     level=logging.INFO,
