@@ -12,9 +12,7 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.utils import IS_GLUON_SUPPORTED
 
 if IS_GLUON_SUPPORTED:
-    from triton.experimental.gluon import language as gl
-    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-
+    from sglang.srt.layers.attention.fla.gluon import TensorDescriptor, gl
     from sglang.srt.layers.attention.fla.gluon.wy_fast_gluon import (
         recompute_w_u_fwd_kernel_gluon,
     )

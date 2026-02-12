@@ -17,9 +17,7 @@ from sglang.srt.layers.attention.fla.utils import (
 )
 
 if IS_GLUON_SUPPORTED:
-    from triton.experimental.gluon import language as gl
-    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-
+    from sglang.srt.layers.attention.fla.gluon import TensorDescriptor, gl
     from sglang.srt.layers.attention.fla.gluon.chunk_o_gluon import (
         chunk_fwd_kernel_o_gluon,
     )

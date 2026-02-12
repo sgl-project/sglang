@@ -16,9 +16,7 @@ from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import IS_GLUON_SUPPORTED, is_nvidia_hopper
 
 if IS_GLUON_SUPPORTED:
-    from triton.experimental.gluon import language as gl
-    from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-
+    from sglang.srt.layers.attention.fla.gluon import TensorDescriptor, gl
     from sglang.srt.layers.attention.fla.gluon.chunk_delta_h_gluon import (
         chunk_gated_delta_rule_fwd_kernel_h_blockdim64_gluon,
     )
