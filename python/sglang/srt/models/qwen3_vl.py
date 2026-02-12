@@ -308,10 +308,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 self.num_position_embeddings,
                 self.hidden_size,
                 quant_config=quant_config,
-                enable_tp=not (
-                    is_dp_attention_enabled()
-                    or get_global_server_args().mm_enable_dp_encoder
-                ),
+                enable_tp=not get_global_server_args().mm_enable_dp_encoder,
+                use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("pos_embed", prefix),
             )
         else:
