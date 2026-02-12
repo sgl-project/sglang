@@ -1025,15 +1025,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         quant_str = None
         if quant_cfg:
             quant_method = quant_cfg.get("quant_method", "quantized")
-            quant_str = f"{quant_method}"
-
-            # Append interesting fields if they exist
-            if "bits" in quant_cfg:
-                quant_str += f", bits={quant_cfg['bits']}"
-            if "quant_algo" in quant_cfg:
-                quant_str += f", quant_algo={quant_cfg['quant_algo']}"
-            if "fmt" in quant_cfg:
-                quant_str += f", fmt={quant_cfg['fmt']}"
+            quant_parts = [quant_method]
+            for field in ["bits", "quant_algo", "fmt"]:
+                if field in quant_cfg:
+                    quant_parts.append(f"{field}={quant_cfg[field]}")
+            quant_str = ", ".join(quant_parts)
 
         logger.info(
             f"Load weight end. "
