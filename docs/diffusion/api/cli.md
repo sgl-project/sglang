@@ -5,7 +5,6 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ## Prerequisites
 
 - A working SGLang diffusion installation and the `sglang` CLI available in `$PATH`.
-- Python 3.11+ if you plan to use the OpenAI Python SDK.
 
 
 ## Supported Arguments
@@ -35,7 +34,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--seed {SEED}`: Random seed for reproducible generation
 
 
-#### Image/Video Configuration
+**Image/Video Configuration**
 
 - `--height {HEIGHT}`: Height of the generated output
 - `--width {WIDTH}`: Width of the generated output
@@ -43,7 +42,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 - `--fps {FPS}`: Frames per second for the saved output, if this is a video-generation task
 
 
-#### Output Options
+**Output Options**
 
 - `--output-path {PATH}`: Directory to save the generated video
 - `--save-output`: Whether to save the image/video to disk
@@ -168,7 +167,7 @@ When enabled, the server follows a **Generate -> Upload -> Delete** workflow:
 3. Upon successful upload, the local file is deleted.
 4. The API response returns the public URL of the uploaded object.
 
-#### Configuration
+**Configuration**
 
 Cloud storage is enabled via environment variables. Note that `boto3` must be installed separately (`pip install boto3`) to use this feature.
 
@@ -183,7 +182,7 @@ export SGLANG_S3_SECRET_ACCESS_KEY=your-secret-key
 export SGLANG_S3_ENDPOINT_URL=https://minio.example.com
 ```
 
-See [Environment Variables Documentation](environment_variables.md) for more details.
+See [Environment Variables Documentation](../environment_variables.md) for more details.
 
 ## Generate
 

@@ -151,6 +151,7 @@ from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
+    PrefillStats,
     SchedulerMetricsMixin,
 )
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -1761,6 +1762,7 @@ class Scheduler(
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
+            lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
@@ -2120,6 +2122,15 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        # Record prefill stats for logging after forward
+        new_batch.prefill_stats = PrefillStats(
+            log_input_tokens=adder.log_input_tokens,
+            log_hit_tokens=adder.log_hit_tokens,
+            new_token_ratio=adder.new_token_ratio,
+            running_bs=len(self.running_batch.reqs),
+            num_new_seqs=len(can_run_list),
+        )
 
         # Mixed-style chunked prefill
         if (
