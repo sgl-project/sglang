@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 
@@ -23,6 +23,7 @@ _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 
+
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
 
@@ -34,8 +35,11 @@ def _get_flashinfer_gdn_kernels():
         try:
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
+            from flashinfer.gdn_decode import (
+                gated_delta_rule_decode_pretranspose,
+                gated_delta_rule_mtp,
+            )
             from flashinfer.gdn_prefill import chunk_gated_delta_rule
-            from flashinfer.gdn_decode import gated_delta_rule_mtp, gated_delta_rule_decode_pretranspose
 
             _flashinfer_chunk_gated_delta_rule = chunk_gated_delta_rule
             _flashinfer_gated_delta_rule_mtp = gated_delta_rule_mtp
@@ -44,16 +48,22 @@ def _get_flashinfer_gdn_kernels():
             _flashinfer_gated_delta_rule_decode = gated_delta_rule_decode_pretranspose
             # Check if SM90+ (required for FlashInfer GDN kernels)
             _flashinfer_gdn_available = (
-                torch.cuda.is_available()
-                and torch.cuda.get_device_capability()[0] >= 9
+                torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
             )
             if _flashinfer_gdn_available:
-                logger.info("FlashInfer GDN kernels (prefill + decode + MTP) loaded successfully")
+                logger.info(
+                    "FlashInfer GDN kernels (prefill + decode + MTP) loaded successfully"
+                )
         except (ImportError, RuntimeError) as e:
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
             _flashinfer_gated_delta_rule_decode = None
-    return _flashinfer_gdn_available, _flashinfer_chunk_gated_delta_rule, _flashinfer_gated_delta_rule_mtp, _flashinfer_gated_delta_rule_decode
+    return (
+        _flashinfer_gdn_available,
+        _flashinfer_chunk_gated_delta_rule,
+        _flashinfer_gated_delta_rule_mtp,
+        _flashinfer_gated_delta_rule_decode,
+    )
 
 
 # Legacy alias for backward compatibility
@@ -61,6 +71,8 @@ def _get_flashinfer_gdn_prefill():
     """Lazy import for FlashInfer GDN prefill kernel (legacy alias)."""
     available, prefill_fn, _, _ = _get_flashinfer_gdn_kernels()
     return available, prefill_fn
+
+
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -930,7 +942,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._flashinfer_chunk_gated_delta_rule = None
         self._flashinfer_gated_delta_rule_mtp = None
         if self.ssm_k_last:
-            flashinfer_available, flashinfer_prefill, flashinfer_mtp, flashinfer_decode = _get_flashinfer_gdn_kernels()
+            (
+                flashinfer_available,
+                flashinfer_prefill,
+                flashinfer_mtp,
+                flashinfer_decode,
+            ) = _get_flashinfer_gdn_kernels()
             if not flashinfer_available:
                 raise RuntimeError(
                     "K-last SSM layout is enabled but FlashInfer GDN kernels are unavailable. "
@@ -951,13 +968,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._flashinfer_chunk_gated_delta_rule = flashinfer_prefill
             self._flashinfer_gated_delta_rule_mtp = flashinfer_mtp
             self._flashinfer_gated_delta_rule_decode = flashinfer_decode
-            logger.info("K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels")
-            
+            logger.info(
+                "K-last mode: Using FlashInfer GDN prefill, decode and MTP (verify) kernels"
+            )
+
             # Warmup MTP kernel to avoid JIT compilation overhead during serving
             # The MTP kernel has ~4s JIT compilation on first call
             self._warmup_mtp_kernel()
             self._warmup_decode_kernel()
-        
+
         # Warn if K-last is enabled without speculative decoding
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
             server_args = get_global_server_args()
@@ -977,17 +996,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def _warmup_mtp_kernel(self):
         """Warmup FlashInfer MTP kernel to avoid JIT compilation overhead during serving.
-        
+
         The MTP kernel has ~4s JIT compilation on first call. This warmup runs the kernel
         once with dummy tensors to trigger compilation before serving begins.
         """
         if self._flashinfer_gated_delta_rule_mtp is None:
             return
-        
+
         import time
+
         logger.info("Warming up FlashInfer GDN MTP kernel (may take a few seconds)...")
         start_time = time.perf_counter()
-        
+
         # Use small but representative sizes for warmup.
         # The kernel config is: batch_size, seq_len=4 (draft_token_num), num_heads, k/v_dim=128
         batch_size = 4
@@ -995,75 +1015,97 @@ class GDNAttnBackend(MambaAttnBackendBase):
         num_heads = 4  # typical per-GPU head count
         k_dim = 128  # ssm_state_size (key dimension)
         v_dim = 128  # ssm_state_size (value dimension)
-        
+
         device = torch.cuda.current_device()
         dtype = torch.bfloat16
-        
+
         try:
             # Create dummy tensors
-            q = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
-            k = torch.randn(batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype)
-            v = torch.randn(batch_size, seq_len, num_heads, v_dim, device=device, dtype=dtype)
+            q = torch.randn(
+                batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype
+            )
+            k = torch.randn(
+                batch_size, seq_len, num_heads, k_dim, device=device, dtype=dtype
+            )
+            v = torch.randn(
+                batch_size, seq_len, num_heads, v_dim, device=device, dtype=dtype
+            )
             A_log = torch.randn(num_heads, device=device, dtype=torch.float32)
             dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
             a = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
             b = torch.randn(batch_size, seq_len, num_heads, device=device, dtype=dtype)
-            
+
             pool_size = batch_size + 16
             # K-last (V-major) layout: [pool, HV, V, K]
-            initial_state = torch.randn(pool_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32)
+            initial_state = torch.randn(
+                pool_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
+            )
             cache_indices = torch.arange(batch_size, device=device, dtype=torch.int64)
             intermediate_state_cache = torch.zeros(
-                pool_size, seq_len, num_heads, v_dim, k_dim,
-                device=device, dtype=torch.float32
+                pool_size,
+                seq_len,
+                num_heads,
+                v_dim,
+                k_dim,
+                device=device,
+                dtype=torch.float32,
             )
-            
+
             # Run warmup call
             self._flashinfer_gated_delta_rule_mtp(
-                q=q, k=k, v=v,
+                q=q,
+                k=k,
+                v=v,
                 initial_state=initial_state,
                 initial_state_indices=cache_indices,
-                A_log=A_log, a=a, dt_bias=dt_bias, b=b,
-                scale=None, output=None,
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                b=b,
+                scale=None,
+                output=None,
                 intermediate_states_buffer=intermediate_state_cache,
                 disable_state_update=True,
                 use_qk_l2norm=True,
             )
             torch.cuda.synchronize()
-            
+
             elapsed = time.perf_counter() - start_time
             logger.info(f"FlashInfer GDN MTP kernel warmup completed in {elapsed:.2f}s")
-            
+
             # Clean up
             del q, k, v, A_log, dt_bias, a, b, initial_state, cache_indices
             del intermediate_state_cache
             torch.cuda.empty_cache()
-            
+
         except Exception as e:
             logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
 
     def _warmup_decode_kernel(self):
         """Warmup FlashInfer decode kernel to avoid JIT compilation overhead during serving.
-        
+
         The decode kernel has JIT compilation on first call. This warmup runs the kernel
         once with dummy tensors to trigger compilation before serving begins.
         """
         if self._flashinfer_gated_delta_rule_decode is None:
             return
-        
+
         import time
-        logger.info("Warming up FlashInfer GDN decode kernel (may take a few seconds)...")
+
+        logger.info(
+            "Warming up FlashInfer GDN decode kernel (may take a few seconds)..."
+        )
         start_time = time.perf_counter()
-        
+
         # Use representative sizes for warmup
         batch_size = 4
         num_heads = 4  # typical per-GPU head count
         k_dim = 128  # ssm_state_size (key dimension)
         v_dim = 128  # ssm_state_size (value dimension)
-        
+
         device = torch.cuda.current_device()
         dtype = torch.bfloat16
-        
+
         try:
             # Create dummy tensors matching decode kernel expectations
             q = torch.randn(batch_size, 1, num_heads, k_dim, device=device, dtype=dtype)
@@ -1073,13 +1115,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             dt_bias = torch.randn(num_heads, device=device, dtype=torch.float32)
             a = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
             b = torch.randn(batch_size, 1, num_heads, device=device, dtype=dtype)
-            
+
             # K-last (V-major) layout: [B, HV, V, K]
-            state = torch.randn(batch_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32)
-            
+            state = torch.randn(
+                batch_size, num_heads, v_dim, k_dim, device=device, dtype=torch.float32
+            )
+
             # Run warmup call
             self._flashinfer_gated_delta_rule_decode(
-                q=q, k=k, v=v,
+                q=q,
+                k=k,
+                v=v,
                 state=state,
                 A_log=A_log,
                 a=a,
@@ -1090,14 +1136,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm=True,
             )
             torch.cuda.synchronize()
-            
+
             elapsed = time.perf_counter() - start_time
-            logger.info(f"FlashInfer GDN decode kernel warmup completed in {elapsed:.2f}s")
-            
+            logger.info(
+                f"FlashInfer GDN decode kernel warmup completed in {elapsed:.2f}s"
+            )
+
             # Clean up
             del q, k, v, A_log, dt_bias, a, b, state
             torch.cuda.empty_cache()
-            
+
         except Exception as e:
             logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
 
@@ -1274,7 +1322,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if intermediate_state_indices is None:
                 # Fallback for non-CUDA-graph path
                 intermediate_state_indices = torch.arange(
-                    cache_indices.shape[0], dtype=torch.int32, device=cache_indices.device
+                    cache_indices.shape[0],
+                    dtype=torch.int32,
+                    device=cache_indices.device,
                 )
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
@@ -1353,9 +1403,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     )
                 batch_size = seq_len // forward_batch.spec_info.draft_token_num
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                query_mtp = query.view(batch_size, draft_token_num, num_heads, head_k_dim)
+                query_mtp = query.view(
+                    batch_size, draft_token_num, num_heads, head_k_dim
+                )
                 key_mtp = key.view(batch_size, draft_token_num, num_heads, head_k_dim)
-                value_mtp = value.view(batch_size, draft_token_num, num_value_heads, head_v_dim)
+                value_mtp = value.view(
+                    batch_size, draft_token_num, num_value_heads, head_v_dim
+                )
                 a_mtp = a.view(batch_size, draft_token_num, num_value_heads)
                 b_mtp = b.view(batch_size, draft_token_num, num_value_heads)
 
@@ -1379,8 +1433,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     use_qk_l2norm=True,
                 )
                 # Reshape output: [B, T, HV, V] -> [1, seq_len, HV, V]
-                core_attn_out = core_attn_out.view(1, seq_len, num_value_heads, head_v_dim)
-                
+                core_attn_out = core_attn_out.view(
+                    1, seq_len, num_value_heads, head_v_dim
+                )
+
             else:
                 # V-last Triton verify kernel
                 g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
@@ -1400,7 +1456,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_steps=forward_batch.spec_info.draft_token_num,
                     retrieve_parent_token=retrieve_parent_token,
                 )
-                
+
         else:
             # Prefill/Extend path
             g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
@@ -1409,7 +1465,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 # Use FlashInfer GDN prefill kernel for K-last layout
                 # The FlashInfer kernel natively supports K-last state layout [N, H, V, K]
                 total_seq_len = query.shape[1]
-                
+
                 # Format conversion: [1, seq, H, K] -> [seq, H, K]
                 q_fi = query[0].contiguous()
                 k_fi = key[0].contiguous()
@@ -1417,13 +1473,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 # L2-normalize q and k (FlashInfer kernel expects normalized inputs)
                 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+
                 q_fi = l2norm_fwd(q_fi)
                 k_fi = l2norm_fwd(k_fi)
-                
+
                 # g (alpha) and beta: [1, seq, HV] -> [seq, HV], must be float32 for FlashInfer
                 alpha_fi = torch.exp(g[0]).to(torch.float32)
                 beta_fi = beta[0].to(torch.float32)
-                
+
                 # cu_seqlens: int32 -> int64
                 cu_seqlens_fi = query_start_loc.to(torch.int64)
 
@@ -1436,7 +1493,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
                 # Prepare initial_state (FlashInfer requires float32, K-last layout [B, HV, V, K])
                 initial_state_fi = ssm_states[ssm_cache_indices].to(torch.float32)
-                
+
                 # Call FlashInfer prefill kernel
                 # Note: q and k are already L2-normalized above, so use_qk_l2norm_in_kernel=False
                 output_fi, output_state_fi = self._flashinfer_chunk_gated_delta_rule(
@@ -1453,10 +1510,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 # Output: [seq, HV, V] -> [1, seq, HV, V]
-                core_attn_out = output_fi.view(1, total_seq_len, num_value_heads, head_v_dim)
+                core_attn_out = output_fi.view(
+                    1, total_seq_len, num_value_heads, head_v_dim
+                )
 
                 # Write back state to pool (K-last layout)
-                ssm_states.index_copy_(0, ssm_cache_indices.to(torch.int64), output_state_fi.to(ssm_states.dtype))
+                ssm_states.index_copy_(
+                    0,
+                    ssm_cache_indices.to(torch.int64),
+                    output_state_fi.to(ssm_states.dtype),
+                )
 
                 # Note: _track_mamba_state_extend needs h tensor from Triton kernel
                 # FlashInfer doesn't provide intermediate states, so we skip tracking for K-last prefill
@@ -1483,7 +1546,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 **recurrent_state_indices_args,
             )
-            
+
             if is_npu():
                 last_recurrent_state = last_recurrent_state.to(
                     ssm_states.dtype, copy=False

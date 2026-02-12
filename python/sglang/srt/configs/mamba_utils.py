@@ -83,7 +83,9 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
-    k_last: bool = False  # If True, temporal shape is (HV, V, K) — K in last dim; default is (HV, K, V)
+    k_last: bool = (
+        False  # If True, temporal shape is (HV, V, K) — K in last dim; default is (HV, K, V)
+    )
 
     @staticmethod
     def create(
@@ -118,14 +120,14 @@ class Mamba2StateShape:
         if k_last:
             temporal_state_shape = (
                 divide(num_heads, tp_world_size),
-                head_dim,     # V
-                state_size,   # K (last)
+                head_dim,  # V
+                state_size,  # K (last)
             )
         else:
             temporal_state_shape = (
                 divide(num_heads, tp_world_size),
-                state_size,   # K
-                head_dim,     # V
+                state_size,  # K
+                head_dim,  # V
             )
         return Mamba2StateShape(
             conv=[conv_state_shape],
