@@ -87,6 +87,8 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
+    _default_sampling_params_logged = False
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
@@ -101,10 +103,14 @@ class OpenAIServingChat(OpenAIServingBase):
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
-        if self.default_sampling_params:
+        if (
+            self.default_sampling_params
+            and not OpenAIServingChat._default_sampling_params_logged
+        ):
             logger.info(
                 f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
             )
+            OpenAIServingChat._default_sampling_params_logged = True
 
         # Check if the model is a GPT-OSS model
         self.is_gpt_oss = (
