@@ -2,6 +2,10 @@
 
 The SGLang diffusion HTTP server implements an OpenAI-compatible API for image and video generation, as well as LoRA adapter management.
 
+## Prerequisites
+
+- Python 3.11+ if you plan to use the OpenAI Python SDK.
+
 ## Serve
 
 Launch the server using the `sglang serve` command.
@@ -25,7 +29,7 @@ sglang serve "${SERVER_ARGS[@]}"
 - **--model-path**: Path to the model or model ID.
 - **--port**: HTTP port to listen on (default: `30000`).
 
-#### Get Model Information
+**Get Model Information**
 
 **Endpoint:** `GET /models`
 
@@ -59,7 +63,7 @@ curl -sS -X GET "http://localhost:30010/models"
 
 The server implements an OpenAI-compatible Images API under the `/v1/images` namespace.
 
-#### Create an image
+**Create an image**
 
 **Endpoint:** `POST /v1/images/generations`
 
@@ -100,7 +104,7 @@ curl -sS -X POST "http://localhost:30010/v1/images/generations" \
 > **Note**
 > The `response_format=url` option is not supported for `POST /v1/images/generations` and will return a `400` error.
 
-#### Edit an image
+**Edit an image**
 
 **Endpoint:** `POST /v1/images/edits`
 
@@ -130,7 +134,7 @@ curl -sS -X POST "http://localhost:30010/v1/images/edits" \
   -F "response_format=url"
 ```
 
-#### Download image content
+**Download image content**
 
 When `response_format=url` is used with `POST /v1/images/edits`, the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
 
@@ -148,7 +152,7 @@ curl -sS -L "http://localhost:30010/v1/images/<IMAGE_ID>/content" \
 
 The server implements a subset of the OpenAI Videos API under the `/v1/videos` namespace.
 
-#### Create a video
+**Create a video**
 
 **Endpoint:** `POST /v1/videos`
 
@@ -178,7 +182,7 @@ curl -sS -X POST "http://localhost:30010/v1/videos" \
       }'
 ```
 
-#### List videos
+**List videos**
 
 **Endpoint:** `GET /v1/videos`
 
@@ -197,7 +201,7 @@ curl -sS -X GET "http://localhost:30010/v1/videos" \
   -H "Authorization: Bearer sk-proj-1234567890"
 ```
 
-#### Download video content
+**Download video content**
 
 **Endpoint:** `GET /v1/videos/{video_id}/content`
 
@@ -239,7 +243,7 @@ The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 - Switching: To switch LoRAs, you must first `unmerge` the current one, then `set` the new one
 - Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
 
-#### Set LoRA Adapter
+**Set LoRA Adapter**
 
 Loads one or more LoRA adapters and merges their weights into the model. Supports both single LoRA (backward compatible) and multiple LoRA adapters.
 
@@ -301,7 +305,7 @@ curl -X POST http://localhost:30010/v1/set_lora \
 > - Multiple LoRAs applied to the same target will be merged in order
 
 
-#### Merge LoRA Weights
+**Merge LoRA Weights**
 
 Manually merges the currently set LoRA weights into the base model.
 
@@ -323,7 +327,7 @@ curl -X POST http://localhost:30010/v1/merge_lora_weights \
 ```
 
 
-#### Unmerge LoRA Weights
+**Unmerge LoRA Weights**
 
 Unmerges the currently active LoRA weights from the base model, restoring it to its original state. This **must** be called before setting a different LoRA.
 
@@ -336,7 +340,7 @@ curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
   -H "Content-Type: application/json"
 ```
 
-#### List LoRA Adapters
+**List LoRA Adapters**
 
 Returns loaded LoRA adapters and current application status per module.
 
