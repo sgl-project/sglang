@@ -134,7 +134,7 @@ def halo_exchange(
     recv_top_buf = _ensure_recv_buf(recv_top_buf, top_row)
     recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_row)
 
-    # Use batched P2P operations to avoid serialization warning and improve performance
+    # use batched P2P operations
     p2p_ops = []
 
     if rank > 0:
@@ -153,7 +153,6 @@ def halo_exchange(
     if rank == world_size - 1:
         recv_bottom_buf.zero_()
 
-    # Execute all P2P operations as a batch to avoid serialization
     if p2p_ops:
         reqs = dist.batch_isend_irecv(p2p_ops)
         for req in reqs:
