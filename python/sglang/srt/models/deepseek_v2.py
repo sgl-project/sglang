@@ -540,7 +540,7 @@ class DeepseekV2MoE(nn.Module):
 
     def get_moe_weights(self):
         return [
-            x.data
+            [i for i in x.data]
             for name, x in self.experts.named_parameters()
             if name not in ["correction_bias"]
             and filter_moe_weight_param_global_expert(
