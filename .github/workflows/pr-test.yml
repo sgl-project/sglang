@@ -66,6 +66,7 @@ env:
 permissions:
   actions: write
   contents: read
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -198,6 +199,8 @@ jobs:
 
       - name: Set max-parallel based on run type
         id: set-parallel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Scheduled runs and high-priority PRs get full parallelism
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -206,6 +209,27 @@ jobs:
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
             echo "max_parallel=14" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 14"
+          elif [[ -n "${{ inputs.target_stage }}" ]]; then
+            # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
+            # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
+            LABELS=""
+            PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
+            if [[ -n "$PR_HEAD_SHA" ]]; then
+              LABELS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
+                --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            if [[ -z "$LABELS" ]]; then
+              LABELS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+                --json labels --jq '.[0].labels[].name' 2>/dev/null || true)
+            fi
+            echo "PR labels: ${LABELS:-"(none)"}"
+            if echo "$LABELS" | grep -Fxq "high priority"; then
+              echo "max_parallel=14" >> $GITHUB_OUTPUT
+              echo "High priority PR detected via API (/rerun-stage), setting max_parallel to 14"
+            else
+              echo "max_parallel=3" >> $GITHUB_OUTPUT
+              echo "Using default max_parallel of 3 (/rerun-stage, no high priority label)"
+            fi
           else
             echo "max_parallel=3" >> $GITHUB_OUTPUT
             echo "Using default max_parallel of 3"
@@ -937,7 +961,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install -e .
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30
@@ -1041,7 +1065,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
           git clone https://github.com/merrymercy/human-eval.git
           cd human-eval
-          pip install -e .
+          pip install -e . --no-build-isolation
 
       - name: Run test
         timeout-minutes: 30

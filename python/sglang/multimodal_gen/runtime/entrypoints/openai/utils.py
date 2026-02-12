@@ -47,6 +47,11 @@ class ListLorasReq:
     pass
 
 
+@dataclasses.dataclass
+class ShutdownReq:
+    pass
+
+
 def format_lora_message(
     lora_nickname: Union[str, List[str]],
     target: Union[str, List[str]],
