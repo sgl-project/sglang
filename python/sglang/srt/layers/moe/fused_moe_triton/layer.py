@@ -422,7 +422,7 @@ class FusedMoE(torch.nn.Module):
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
         # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
+        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe or _use_aiter
         if use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
@@ -496,7 +496,7 @@ class FusedMoE(torch.nn.Module):
         # 1. CPU (always)
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
         # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
+        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe or _use_aiter
         if use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
