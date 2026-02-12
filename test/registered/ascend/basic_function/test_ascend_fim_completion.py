@@ -1,15 +1,16 @@
 import unittest
 
 import openai
+
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -17,9 +18,10 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 class TestFimCompletion(CustomTestCase):
     """Testcase：Verify set --completion-template, the model's FIM (Fill-in-the-Middle) completion function work correctly.
 
-       [Test Category] Parameter
-       [Test Target] --completion-template
-       """
+    [Test Category] Parameter
+    [Test Target] --completion-template
+    """
+    
     model = "/root/.cache/modelscope/hub/models/deepseek-ai/deepseek-coder-1.3b-base"
     other_args = [
         "--completion-template",
