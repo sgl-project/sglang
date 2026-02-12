@@ -1339,14 +1339,18 @@ class GroupCoordinator:
         recv_cache.pop(cache_key, None)
 
     def _get_send_metadata_cache(self) -> Dict[str, Any]:
-        if not hasattr(self, "_send_metadata_cache"):
+        try:
+            return self._send_metadata_cache
+        except AttributeError:
             self._send_metadata_cache: Dict[str, Any] = {}
-        return self._send_metadata_cache
+            return self._send_metadata_cache
 
     def _get_recv_metadata_cache(self) -> Dict[str, Any]:
-        if not hasattr(self, "_recv_metadata_cache"):
+        try:
+            return self._recv_metadata_cache
+        except AttributeError:
             self._recv_metadata_cache: Dict[str, Any] = {}
-        return self._recv_metadata_cache
+            return self._recv_metadata_cache
 
     def barrier(self):
         """Barrier synchronization among the group.
