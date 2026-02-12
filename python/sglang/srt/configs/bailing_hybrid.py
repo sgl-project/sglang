@@ -177,8 +177,8 @@ class BailingHybridConfig(PretrainedConfig):
 
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
-            intermediate_size=0,  # 使用纯linear_kv, 没有卷积
-            n_groups=0,  # 使用纯linear_kv, 没有分组
+            intermediate_size=0,
+            n_groups=0,
             num_heads=self.num_linear_key_value_heads,
             head_dim=self.head_dim,
             state_size=self.head_dim,

@@ -1307,7 +1307,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             qs = q[_start:_end].transpose(0, 1).contiguous()
             ks = k[_start:_end].transpose(0, 1).contiguous()
             vs = v[_start:_end].transpose(0, 1).contiguous()
-            slice_layer_cache = kv_cache[slot_id, ...]  # 获取现在的kvcache
+            slice_layer_cache = kv_cache[slot_id, ...]
             out_slice = BailingLinearKernel.jit_linear_forward_prefix(
                 qs,
                 ks,
@@ -1404,10 +1404,10 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         if self.kv_cache_dtype_str != "auto" and layer.k_scale is not None:
             q = q.to(self.kv_cache_dtype)
 
-        query_start_loc = self.forward_metadata.query_start_loc  # 确认下shape
-        cache_indices = self.forward_metadata.mamba_cache_indices  # 确认下shape
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        ssm_states = mamba_cache_params.temporal  # 确认下shape
+        ssm_states = mamba_cache_params.temporal
         # logger.warning(
         #     f"---mix {layer.layer_id=}, {query_start_loc=},  {cache_indices=}, {ssm_states.shape=}"
         # )
@@ -1474,10 +1474,10 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             q = q.to(self.kv_cache_dtype)
 
         # Do linear attention
-        query_start_loc = self.forward_metadata.query_start_loc  # 确认下shape
-        cache_indices = self.forward_metadata.mamba_cache_indices  # 确认下shape
+        query_start_loc = self.forward_metadata.query_start_loc
+        cache_indices = self.forward_metadata.mamba_cache_indices
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        ssm_states = mamba_cache_params.temporal  # 确认下shape
+        ssm_states = mamba_cache_params.temporal
         # logger.warning(
         #     f"---mix {layer.layer_id=}, {query_start_loc.shape=},  {cache_indices.shape=}, {ssm_states.shape=}"
         # )
