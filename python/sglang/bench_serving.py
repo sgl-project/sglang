@@ -1613,6 +1613,14 @@ def sample_random_requests(
             ]
             if return_text:
                 input_content = tokenizer.decode(input_content)
+                # Re-encode and adjust to ensure correct token length
+                encoded = tokenizer.encode(input_content)
+                ratio = max(
+                    1, (input_lens[i] + len(encoded) - 1) // max(1, len(encoded))
+                )
+                input_content = tokenizer.decode(
+                    tokenizer.encode(input_content * ratio)[: input_lens[i]]
+                )
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
