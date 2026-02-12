@@ -9,12 +9,12 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 use once_cell::sync::Lazy;
 
-use sgl_model_gateway::tokenizer::traits::Tokenizer;
-use sgl_model_gateway::tokenizer::stream::DecodeStream;
-use sgl_model_gateway::tool_parser::ToolParser;
-use sgl_model_gateway::protocols::common::{Tool, ToolChoice, ToolChoiceValue, ToolCallDelta, FunctionCallDelta, Usage, StringOrArray};
-use sgl_model_gateway::tokenizer::stop::StopSequenceDecoder;
-use sgl_model_gateway::grpc_client::sglang_proto as proto;
+use smg::tokenizer::traits::Tokenizer;
+use smg::tokenizer::stream::DecodeStream;
+use smg::tool_parser::ToolParser;
+use smg::protocols::common::{Tool, ToolChoice, ToolChoiceValue, ToolCallDelta, FunctionCallDelta, Usage, StringOrArray};
+use smg::tokenizer::stop::StopSequenceDecoder;
+use smg::grpc_client::sglang_proto as proto;
 
 use super::error::{SglErrorCode, set_error_message, clear_error_message};
 use super::tokenizer::TokenizerHandle;
@@ -22,9 +22,9 @@ use super::utils::generate_tool_call_id;
 
 /// Global parser factory (initialized once)
 // Use the re-exported ParserFactory from tool_parser module
-static PARSER_FACTORY: Lazy<sgl_model_gateway::tool_parser::ParserFactory> = Lazy::new(|| {
+static PARSER_FACTORY: Lazy<smg::tool_parser::ParserFactory> = Lazy::new(|| {
     // ParserFactory is re-exported from tool_parser::factory, so we can use it directly
-    sgl_model_gateway::tool_parser::ParserFactory::default()
+    smg::tool_parser::ParserFactory::default()
 });
 
 /// Global tokio runtime for async operations
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
     // Create stop decoder if needed
     let stop_decoder = if stop.is_some() || stop_token_ids.is_some() {
         Some(Arc::new(tokio::sync::Mutex::new(
-            sgl_model_gateway::routers::grpc::utils::create_stop_decoder(
+            smg::routers::grpc::utils::create_stop_decoder(
                 &tokenizer,
                 stop.as_ref(),
                 stop_token_ids.as_ref(),
@@ -389,9 +389,9 @@ pub(crate) async fn convert_proto_chunk_to_openai(
     request_id: &str,
     created: u64,
     system_fingerprint: Option<&str>,
-) -> Result<Option<sgl_model_gateway::protocols::chat::ChatCompletionStreamResponse>, String> {
-    use sgl_model_gateway::grpc_client::sglang_proto::generate_response::Response::*;
-    use sgl_model_gateway::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
+) -> Result<Option<smg::protocols::chat::ChatCompletionStreamResponse>, String> {
+    use smg::grpc_client::sglang_proto::generate_response::Response::*;
+    use smg::protocols::chat::{ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice};
 
     match proto_response.response {
         Some(Chunk(chunk)) => {
@@ -427,19 +427,19 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                 let mut text = String::new();
                 for &token_id in &chunk.token_ids {
                     match decoder_guard.process_token(token_id).unwrap_or_else(|_| {
-                        sgl_model_gateway::tokenizer::stop::SequenceDecoderOutput::Held
+                        smg::tokenizer::stop::SequenceDecoderOutput::Held
                     }) {
-                        sgl_model_gateway::tokenizer::stop::SequenceDecoderOutput::Text(t) => {
+                        smg::tokenizer::stop::SequenceDecoderOutput::Text(t) => {
                             text.push_str(&t);
                         }
-                        sgl_model_gateway::tokenizer::stop::SequenceDecoderOutput::StoppedWithText(t) => {
+                        smg::tokenizer::stop::SequenceDecoderOutput::StoppedWithText(t) => {
                             text.push_str(&t);
                             break;
                         }
-                        sgl_model_gateway::tokenizer::stop::SequenceDecoderOutput::Stopped => {
+                        smg::tokenizer::stop::SequenceDecoderOutput::Stopped => {
                             break;
                         }
-                        sgl_model_gateway::tokenizer::stop::SequenceDecoderOutput::Held => {}
+                        smg::tokenizer::stop::SequenceDecoderOutput::Held => {}
                     }
                 }
                 text
