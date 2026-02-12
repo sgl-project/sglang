@@ -31,9 +31,16 @@ from typing import (
 import torch
 
 try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+    from sglang.srt.layers.moe.triton_kernels_compat import (
+        GatherIndx,
+        RoutingData,
+        ScatterIndx,
+        routing,
+    )
 except ImportError:
     pass
+
+
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
