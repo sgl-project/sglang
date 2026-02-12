@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import os
 from enum import Enum
 from typing import List, Optional, Tuple
 
@@ -530,10 +531,17 @@ class FusedMoE(torch.nn.Module):
         #
         # So, when Waterfill is enabled, we must map checkpoint expert_id using the
         # ORIGINAL experts_per_rank (old_epr), not the expanded one.
+        _waterfill_v2 = os.environ.get("SGLANG_WATERFILL_V2", "") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
         if (
             get_global_server_args().enable_deepep_waterfill
             and get_moe_a2a_backend().is_deepep()
             and self.num_fused_shared_experts == 0
+            and not _waterfill_v2
         ):
             old_num_global_routed_experts = num_global_routed_experts - self.moe_ep_size
             if (

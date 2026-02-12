@@ -2,6 +2,8 @@
 
 This skill defines the end-to-end benchmark procedure for the **waterfill** optimization on DeepSeek-V3, covering **performance testing**, **torch profile tracing**, and **accuracy testing**.
 
+> **See also**: `SKILL_BENCHMARK_WATERFILL_EP16_H20.md` — EP16 benchmark on the new H20 cluster (10.6.131.5/6, shared Lustre, `sglang_lb` container).
+
 ---
 
 ## Environment
@@ -76,6 +78,8 @@ Uses `bench_one_batch_server` to compare throughput between baseline and optimiz
 | `--output-len` | 1 |
 | `--disable-radix-cache` | Yes |
 | CUDA Graph | Enabled (default; do NOT pass `--disable-cuda-graph`) |
+
+> **Important**: Use `--output-len 1` for waterfill benchmarking. Waterfill optimizes the MoE dispatch path which primarily affects the prefill (EXTEND) phase. Using `output_len=1` isolates prefill throughput as the metric. The key metric to compare is `input_throughput` (tok/s), not `output_throughput`.
 
 ### Server Launch (for each mode)
 
@@ -396,16 +400,41 @@ python3 benchmark/deepseek_v3/run_deepep_waterfill_e2e_test.py \
 
 Uses sglang's MMLU evaluation script to verify correctness of the optimized code vs. baseline.
 
-### Method 1: `run_eval.py` (Recommended, simpler)
+### Accuracy Test Configuration
 
-This downloads MMLU data automatically and runs against a running server:
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `--num-examples` | **2000** (default in bench script) | Sufficient for statistical significance; full MMLU is ~14042 |
+| Seed | **0** (hardcoded in `MMLUEval`) | `random.Random(0).sample()` — deterministic across runs |
+| `--num-threads` | 512 | Parallel eval threads |
+
+> **Important**: MMLU seed is fixed to 0 in `simple_eval_mmlu.py:MMLUEval.__init__()`, so the same 2000 questions are always selected regardless of which mode runs. This guarantees apple-to-apple comparison across baseline/waterfill/eplb/eplb_waterfill.
+
+### Method 1: Automated via `bench_waterfill_multinode.py` (Recommended)
+
+The multi-node bench script supports integrated accuracy testing:
+
+```bash
+# EP8 accuracy only (all 4 modes, 2000 examples by default)
+python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 8 \
+    --modes baseline,waterfill,eplb,eplb_waterfill \
+    --accuracy-only \
+    --baseline-sglang-dir /lustre/.../sglang_baseline_98a107d \
+    --init-expert-location /lustre/.../ep8_logical_count.pt
+
+# Override num-examples if needed
+python3 benchmark/deepseek_v3/bench_waterfill_multinode.py --ep 8 \
+    --modes baseline,waterfill --accuracy-only --num-examples 500
+```
+
+### Method 2: `run_eval.py` (Manual, against running server)
 
 ```bash
 # Launch server first (baseline or optimized, as shown above), then:
 python3 -m sglang.test.run_eval \
     --base-url http://127.0.0.1:30000 \
     --eval-name mmlu \
-    --num-examples 64 \
+    --num-examples 2000 \
     --num-threads 512
 ```
 
@@ -414,7 +443,18 @@ Output:
 - HTML report: `/tmp/mmlu_*.html`
 - JSON results: `/tmp/mmlu_*.json`
 
-Expected score for DeepSeek-V3: ~0.90+ (baseline and optimized should be very close).
+Expected score for DeepSeek-V3: ~0.88+ (baseline and optimized should be within 0.002).
+
+### EP8 Accuracy Results (2026-02-10, full MMLU 14042 examples)
+
+| Mode | MMLU Score |
+|------|-----------|
+| baseline | 0.8820 |
+| waterfill | 0.8820 |
+| eplb | 0.8840 |
+| eplb_waterfill | 0.8830 |
+
+**Conclusion**: Waterfill does not impact accuracy. All modes within 0.002 of each other.
 
 ### Method 2: `bench_sglang.py` (Legacy, more detailed per-subject)
 
@@ -516,6 +556,24 @@ The script handles `pip install` and server start/stop for each directory automa
 
 ---
 
+## Known Issues
+
+### DeepGEMM JIT Cache Bias in Sequential Benchmarks
+
+**CRITICAL**: DeepGEMM uses JIT compilation for GEMM kernels. The compiled kernels are cached on disk at `/root/.cache/deep_gemm/cache/` (~385 kernels for DeepSeek-V3). When running multiple modes sequentially (e.g., baseline then waterfill), the **first mode** bears all JIT compilation overhead, while the **second mode** reuses the disk cache. This can make the second mode appear **2x faster** — a completely misleading result.
+
+**Symptom**: If the first mode shows latency ~2x of the second mode for the same workload, JIT cache bias is the likely cause. Swap the mode order to verify.
+
+**Fix**: Pre-warm the JIT cache before running any benchmark modes. Launch a server, run one warmup request to populate `/root/.cache/deep_gemm/cache/` on all nodes, then kill the server. After this, both modes will use cached kernels and produce fair, comparable numbers.
+
+**Important**: Do NOT set `SGLANG_JIT_DEEPGEMM_PRECOMPILE=0`. The default (1) is correct and required for multi-node NVSHMEM stability. See `SKILL_BENCHMARK_WATERFILL_EP16_H20.md` issue #6 for details.
+
+### EP8 Waterfill+EPLB is Structurally Unviable
+
+Waterfill cannot produce positive throughput gain on EP8+EPLB. The fixed overhead (~5-6%: lost alt_stream overlap + extra AllReduce) exceeds the benefit (~1.3% from reducing imbalance 1.112→1.091). This is unfixable without eliminating the AllReduce or finding a way to overlap it. See `SKILL_BENCHMARK_WATERFILL_EP16_H20.md` issue #11 for full analysis.
+
+---
+
 ## Key Files Reference
 
 | File | Purpose |
@@ -528,7 +586,7 @@ The script handles `pip install` and server start/stop for each directory automa
 | `python/sglang/test/simple_eval_mmlu.py` | MMLU evaluation class |
 | `benchmark/mmlu/bench_sglang.py` | Legacy MMLU benchmark (per-subject) |
 | `benchmark/deepseek_v3/run_deepep_waterfill_e2e_test.py` | Full e2e regression test script |
-| `benchmark/deepseek_v3/bench_waterfill_multinode.py` | Multi-node EP16/EP32 waterfill benchmark (H20 cluster) |
+| `benchmark/deepseek_v3/bench_waterfill_multinode.py` | Multi-node EP16 waterfill benchmark |
 
 ---
 
@@ -552,262 +610,6 @@ decode_pattern = r"Decode batch.*?#running-req:\s*(\d+).*?#token:\s*(\d+).*?cuda
 
 ---
 
-## Part 4: Multi-Node EP16/EP32 Benchmark (H20 Cluster)
+## Part 4: Multi-Node EP16 Benchmark
 
-Automated multi-node benchmark using `bench_waterfill_multinode.py`. Supports four modes: **baseline**, **waterfill**, **eplb**, **eplb_waterfill**.
-
-### Cluster Environment
-
-| Item | Value |
-|------|-------|
-| Cluster | 6x H20-GPU nodes (8x H20 per node), NVLink NV18, 9x 400Gbps RoCE |
-| Container | `sglang_eplb` (`lmsysorg/sglang:v0.5.5.post3`) |
-| Model | `/raid/model/DeepSeek-R1` (local on each node) |
-| Code | `/root/xutingz/gitsrc/sglang` (branch `feat/deepep-waterfill-eplb-balance`, editable install) |
-| Storage | **Not shared** — must rsync code to all nodes before running |
-| Dataset | `/root/xutingz/data/ShareGPT_V3_unfiltered_cleaned_split.json` |
-
-### EP Configuration
-
-| EP | Nodes | Node IPs | actual_tp | actual_dp | nnodes |
-|----|-------|----------|-----------|-----------|--------|
-| 16 | 2 | 10.6.131.20, .21 | 16 | 16 | 2 |
-| 32 | 4 | 10.6.131.20, .21, .22, .23 | 16 | 2 | 4 |
-
-### Benchmark Modes
-
-| Mode | Waterfill | EPLB | Description |
-|------|-----------|------|-------------|
-| `baseline` | No | No | Vanilla DeepEP, trivial expert placement |
-| `waterfill` | Yes | No | Waterfill shared expert dispatch, trivial placement |
-| `eplb` | No | Yes | Static EPLB expert placement, no waterfill |
-| `eplb_waterfill` | Yes | Yes | EPLB placement + waterfill shared dispatch |
-
-### Benchmark Cases
-
-All cases use `output_len=1` and `deepep_mode=normal`. Batch size is **per DP rank** (local); the script automatically scales to global batch size (local_bs * dp_size).
-
-| Name | local_bs (per rank) | input_len | output_len |
-|------|---------------------|-----------|------------|
-| bs128_il512 | 128 | 512 | 1 |
-| bs64_il1024 | 64 | 1024 | 1 |
-| bs32_il2048 | 32 | 2048 | 1 |
-| bs16_il4096 | 16 | 4096 | 1 |
-
-### Required Environment Variables
-
-```bash
-export SGLANG_LOG_MS=1
-export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-export NVSHMEM_IB_GID_INDEX=3
-export NVSHMEM_HCA_LIST="mlx5_3:1,mlx5_2:1,mlx5_1:1,mlx5_0:1,mlx5_5:1,mlx5_4:1,mlx5_7:1,mlx5_6:1"
-```
-
-### EPLB Distribution Files
-
-| EP | Path | How to generate |
-|----|------|-----------------|
-| 16 | `/root/xutingz/output/eplb/ep16_logical_count.pt` | Already exists |
-| 32 | `/root/xutingz/output/eplb/ep32_logical_count.pt` | See "Generating EP32 EPLB" below |
-
-### Prerequisites
-
-1. **Sync code to all nodes** (storage is not shared):
-   ```bash
-   for ip in 10.6.131.21 10.6.131.22 10.6.131.23; do
-     rsync -az /root/xutingz/gitsrc/sglang/ root@$ip:/root/xutingz/gitsrc/sglang/ &
-   done
-   wait
-   ```
-
-2. **Verify sglang install** on all nodes:
-   ```bash
-   for ip in 10.6.131.20 10.6.131.21 10.6.131.22 10.6.131.23; do
-     echo "=== $ip ==="
-     ssh root@$ip "docker exec sglang_eplb python3 -c 'import sglang; print(sglang.__version__)'"
-   done
-   ```
-
-3. **Clean stale processes**:
-   ```bash
-   for ip in 10.6.131.20 10.6.131.21 10.6.131.22 10.6.131.23; do
-     ssh root@$ip "docker exec sglang_eplb bash -c 'pkill -9 -f sglang 2>/dev/null; rm -f /dev/shm/nccl* /dev/shm/nvshmem* 2>/dev/null'"
-   done
-   ```
-
-### Running the Benchmark
-
-All commands run **inside** the `sglang_eplb` container on node 0 (10.6.131.20). The script automatically SSH's to worker nodes to launch/kill remote server processes.
-
-#### EP16: EPLB vs EPLB+Waterfill (recommended comparison)
-
-```bash
-docker exec sglang_eplb bash -c '
-  export SGLANG_LOG_MS=1
-  export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-  export NVSHMEM_IB_GID_INDEX=3
-  export NVSHMEM_HCA_LIST="mlx5_3:1,mlx5_2:1,mlx5_1:1,mlx5_0:1,mlx5_5:1,mlx5_4:1,mlx5_7:1,mlx5_6:1"
-  python3 /root/xutingz/gitsrc/sglang/benchmark/deepseek_v3/bench_waterfill_multinode.py \
-    --ep 16 \
-    --modes eplb,eplb_waterfill \
-    --init-expert-location /root/xutingz/output/eplb/ep16_logical_count.pt
-'
-```
-
-#### EP16: All 4 modes
-
-```bash
-docker exec sglang_eplb bash -c '
-  export SGLANG_LOG_MS=1
-  export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-  export NVSHMEM_IB_GID_INDEX=3
-  export NVSHMEM_HCA_LIST="mlx5_3:1,mlx5_2:1,mlx5_1:1,mlx5_0:1,mlx5_5:1,mlx5_4:1,mlx5_7:1,mlx5_6:1"
-  python3 /root/xutingz/gitsrc/sglang/benchmark/deepseek_v3/bench_waterfill_multinode.py \
-    --ep 16 \
-    --modes baseline,waterfill,eplb,eplb_waterfill \
-    --init-expert-location /root/xutingz/output/eplb/ep16_logical_count.pt
-'
-```
-
-#### EP32: EPLB vs EPLB+Waterfill
-
-```bash
-docker exec sglang_eplb bash -c '
-  export SGLANG_LOG_MS=1
-  export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-  export NVSHMEM_IB_GID_INDEX=3
-  export NVSHMEM_HCA_LIST="mlx5_3:1,mlx5_2:1,mlx5_1:1,mlx5_0:1,mlx5_5:1,mlx5_4:1,mlx5_7:1,mlx5_6:1"
-  python3 /root/xutingz/gitsrc/sglang/benchmark/deepseek_v3/bench_waterfill_multinode.py \
-    --ep 32 \
-    --modes eplb,eplb_waterfill \
-    --init-expert-location /root/xutingz/output/eplb/ep32_logical_count.pt
-'
-```
-
-#### Background execution (recommended for long runs)
-
-The benchmark takes ~20 min per mode (model load + bench cases). Use nohup from the host:
-
-```bash
-ssh root@10.6.131.20 "nohup docker exec sglang_eplb bash -c '
-  export SGLANG_LOG_MS=1 &&
-  export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 &&
-  export NVSHMEM_IB_GID_INDEX=3 &&
-  export NVSHMEM_HCA_LIST=\"mlx5_3:1,mlx5_2:1,mlx5_1:1,mlx5_0:1,mlx5_5:1,mlx5_4:1,mlx5_7:1,mlx5_6:1\" &&
-  python3 /root/xutingz/gitsrc/sglang/benchmark/deepseek_v3/bench_waterfill_multinode.py \
-    --ep 16 \
-    --modes eplb,eplb_waterfill \
-    --init-expert-location /root/xutingz/output/eplb/ep16_logical_count.pt
-' > /root/xutingz/output/waterfill_bench/ep16_run.log 2>&1 &"
-
-# Monitor progress:
-ssh root@10.6.131.20 "tail -f /root/xutingz/output/waterfill_bench/ep16_run.log"
-```
-
-### Output
-
-Results are saved to `/root/xutingz/output/waterfill_bench/ep{16,32}/`:
-
-```
-ep16/
-  eplb/
-    logs/server_node0.log, server_node1.log
-    result_bs128_il512.jsonl
-    result_bs128_il1024.jsonl
-    ...
-  eplb_waterfill/
-    logs/server_node0.log, server_node1.log
-    result_bs128_il512.jsonl
-    ...
-  summary.json          # All results + comparison table
-```
-
-The script prints a comparison table at the end. The `gain` column compares the first mode vs the last mode.
-
-### Generating EP32 EPLB Distribution File
-
-If `/root/xutingz/output/eplb/ep32_logical_count.pt` does not exist, generate it:
-
-1. **Launch EP32 server with expert distribution recorder** (4 nodes, `--deepep-mode normal`):
-
-   ```bash
-   # On each node (rank 0-3), inside sglang_eplb container:
-   export SGLANG_LOG_MS=1
-   export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
-   export NVSHMEM_IB_GID_INDEX=3
-   export NVSHMEM_HCA_LIST="mlx5_3:1,mlx5_2:1,mlx5_1:1,mlx5_0:1,mlx5_5:1,mlx5_4:1,mlx5_7:1,mlx5_6:1"
-   export SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR=/root/xutingz/output/eplb
-
-   python3 -m sglang.launch_server \
-     --model-path /raid/model/DeepSeek-R1 --trust-remote-code \
-     --host 0.0.0.0 --port 30000 \
-     --tp 16 --dp-size 2 --enable-dp-attention \
-     --moe-a2a-backend deepep --deepep-mode normal \
-     --chunked-prefill-size -1 --disable-radix-cache \
-     --max-prefill-tokens 8192 --max-running-requests 128 \
-     --load-balance-method round_robin \
-     --expert-distribution-recorder-mode stat \
-     --expert-distribution-recorder-buffer-size 1000 \
-     --dist-init-addr 10.6.131.20:20005 --nnodes 4 \
-     --log-level info --watchdog-timeout 600 \
-     --disable-cuda-graph --skip-server-warmup \
-     --node-rank <0|1|2|3>
-   ```
-
-2. **Record expert distribution** (from node 0):
-
-   ```bash
-   # Start recording
-   curl -X POST http://127.0.0.1:30000/start_expert_distribution_record
-
-   # Generate load
-   python3 -m sglang.bench_one_batch_server \
-     --model None --base-url http://127.0.0.1:30000 \
-     --batch-size 128 --input-len 1024 --output-len 10 \
-     --dataset-name random \
-     --dataset-path /root/xutingz/data/ShareGPT_V3_unfiltered_cleaned_split.json \
-     --skip-warmup
-
-   # Stop and dump
-   curl -X POST http://127.0.0.1:30000/stop_expert_distribution_record
-   curl -X POST http://127.0.0.1:30000/dump_expert_distribution_record
-   ```
-
-3. **Rename and distribute**:
-
-   ```bash
-   mv /root/xutingz/output/eplb/expert_distribution_recorder_*.pt \
-      /root/xutingz/output/eplb/ep32_logical_count.pt
-
-   for ip in 10.6.131.21 10.6.131.22 10.6.131.23; do
-     scp /root/xutingz/output/eplb/ep32_logical_count.pt root@$ip:/root/xutingz/output/eplb/
-   done
-   ```
-
-4. **Kill server**: `pkill -9 -f sglang.launch_server` on all nodes.
-
-Alternatively, use the automated script:
-```bash
-python3 /root/xutingz/eplb_profile/run_ep32_e2e.py \
-  --node-rank 0 \
-  --init-expert-location /root/xutingz/output/eplb/ep32_logical_count.pt
-```
-This generates the EPLB file if it doesn't exist, then proceeds to profiling.
-
-### Known Issues and Workarounds
-
-1. **CUDA graph disabled for all modes**: Waterfill mode cannot use CUDA graph (DeepEP `Buffer.sync()` fails during graph capture). For fair comparison, the script disables CUDA graph for all modes.
-
-2. **Waterfill deadlock fix**: `forward_deepep_waterfill` had a conditional `all_reduce` that caused deadlock when some DP ranks had zero tokens. Fixed by adding a dummy `all_reduce` in the zero-token path (`deepseek_v2.py`, commit `00c93fb00`).
-
-3. **First forward pass is slow (~40s)**: DeepEP buffer initialization (NVSHMEM bootstrap, RDMA setup) happens on the first forward pass. The health check may return 503 during this time. The script's `wait_server()` handles this with a 1800s timeout.
-
-4. **EP32 NVSHMEM instability**: 4-node DeepEP sometimes hits `invalid resource handle` during `Buffer.sync()`. Retry if it happens. Using `--skip-server-warmup` and `--disable-cuda-graph` helps.
-
-5. **Stale NCCL/NVSHMEM shared memory**: After killing a server, clean up with `rm -f /dev/shm/nccl* /dev/shm/nvshmem*` on all nodes. The script's `kill_servers()` does this automatically.
-
-6. **`pkill -f sglang` kills the benchmark script**: The benchmark script path contains "sglang". The `kill_servers()` function uses specific patterns (`sglang.launch_server`, `sglang::scheduler`, etc.) to avoid self-kill.
-
-7. **sgl-kernel version**: Must use 0.3.17.post1. Newer versions have ABI incompatibility with PyTorch 2.8.0+cu129. The `engine.py` check is patched to accept 0.3.17+.
-
-8. **bench_one_batch_server dp_size fix**: Token capacity threshold must be scaled by `dp_size` to avoid skipping large batch cases under DP attention. Patched in `bench_one_batch_server.py`.
+For multi-node EP16 benchmark, see **SKILL_BENCHMARK_WATERFILL_EP16_H20.md** (H20 cluster at 10.6.131.5/6 with shared Lustre storage).
