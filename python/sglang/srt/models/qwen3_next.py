@@ -1169,7 +1169,7 @@ def gdn_with_output(
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
 
-    ret = attention_layer.forward(hidden_states, forward_batch)
+    ret = attention_layer._forward(hidden_states, forward_batch)
 
     assert (
         output.numel() == ret.numel()
