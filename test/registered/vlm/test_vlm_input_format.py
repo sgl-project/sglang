@@ -35,11 +35,14 @@ if not hasattr(_hf_activations, "PytorchGELUTanh"):
 from sglang import Engine
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.utils.common import is_cuda, is_xpu
 
 register_cuda_ci(est_time=447, suite="stage-b-test-large-1-gpu")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"
+_is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 
 class VLMInputTestBase:
@@ -53,7 +56,13 @@ class VLMInputTestBase:
         assert cls.model_path is not None, "Set model_path in subclass"
         assert cls.chat_template is not None, "Set chat_template in subclass"
         cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
-        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if _is_cuda:
+            cls.device = torch.device("cuda")
+        elif _is_xpu:
+            cls.device = torch.device("xpu")
+        else:
+            cls.device = torch.device("cpu")
+
         cls.main_image = []
         for image_url in cls.image_urls:
             response = requests.get(image_url)
