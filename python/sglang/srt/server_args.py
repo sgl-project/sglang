@@ -1363,12 +1363,7 @@ class ServerArgs:
                 self.dtype = "bfloat16"
 
             if self.moe_runner_backend == "auto":
-                if self.enable_piecewise_cuda_graph:
-                    self.moe_runner_backend = "auto"
-                    logger.warning(
-                        "Enable piecewise CUDA graph, enabling auto MOE kernel."
-                    )
-                elif is_blackwell_supported() and is_mxfp4_quant_format:
+                if is_blackwell_supported() and is_mxfp4_quant_format:
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."

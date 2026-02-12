@@ -66,6 +66,7 @@ env:
 permissions:
   actions: write
   contents: read
+  pull-requests: read
 
 jobs:
   # =============================================== check changes ====================================================
@@ -198,6 +199,8 @@ jobs:
 
       - name: Set max-parallel based on run type
         id: set-parallel
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Scheduled runs and high-priority PRs get full parallelism
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
@@ -206,6 +209,17 @@ jobs:
           elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
             echo "max_parallel=14" >> $GITHUB_OUTPUT
             echo "High priority PR detected, setting max_parallel to 14"
+          elif [[ -n "${{ inputs.pr_head_sha }}" ]]; then
+            # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
+            LABELS=$(gh api "repos/${{ github.repository }}/commits/${{ inputs.pr_head_sha }}/pulls" \
+              --jq '.[0].labels[].name' 2>/dev/null || true)
+            if echo "$LABELS" | grep -Fxq "high priority"; then
+              echo "max_parallel=14" >> $GITHUB_OUTPUT
+              echo "High priority PR detected via API (/rerun-stage), setting max_parallel to 14"
+            else
+              echo "max_parallel=3" >> $GITHUB_OUTPUT
+              echo "Using default max_parallel of 3 (/rerun-stage, no high priority label)"
+            fi
           else
             echo "max_parallel=3" >> $GITHUB_OUTPUT
             echo "Using default max_parallel of 3"
