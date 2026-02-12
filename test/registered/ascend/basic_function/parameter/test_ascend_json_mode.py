@@ -1,12 +1,12 @@
 import json
-import unittest
 import logging
+import unittest
 
 import openai
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,8 +16,8 @@ from sglang.test.test_utils import (
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -81,7 +81,11 @@ class TestJSONModeMixin:
                 chunks.append(chunk.choices[0].delta.content)
         full_response = "".join(chunks)
 
-        logger.info("Concatenated streamed JSON response (%d characters): %s", len(full_response), full_response)
+        logger.info(
+            "Concatenated streamed JSON response (%d characters): %s",
+            len(full_response),
+            full_response,
+        )
 
         # Verify the combined response is valid JSON
         try:
@@ -134,6 +138,7 @@ class TestJSONModeXGrammar(ServerWithGrammarBackend, TestJSONModeMixin):
     [Test Category] Parameter
     [Test Target] --grammar-backend
     """
+
     backend = "xgrammar"
 
 
