@@ -12,6 +12,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -137,6 +138,13 @@ class SchedulerUpdateWeightsMixin:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
 
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if hasattr(self, "disagg_decode_prealloc_queue"):
+                    self.disagg_decode_prealloc_queue.release_memory_occupation()
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if hasattr(self, "disagg_prefill_bootstrap_queue"):
+                    self.disagg_prefill_bootstrap_queue.release_memory_occupation()
+
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
@@ -176,6 +184,13 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                if hasattr(self, "disagg_decode_prealloc_queue"):
+                    self.disagg_decode_prealloc_queue.resume_memory_occupation()
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                if hasattr(self, "disagg_prefill_bootstrap_queue"):
+                    self.disagg_prefill_bootstrap_queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 

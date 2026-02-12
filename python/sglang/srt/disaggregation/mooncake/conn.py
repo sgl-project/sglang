@@ -1147,6 +1147,30 @@ class MooncakeKVManager(CommonKVManager):
             f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
         )
 
+    def close(self):
+        # Batch deregister KV data buffers
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        # Batch deregister auxiliary data buffers
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        # Batch deregister state/extra pool data buffers
+        if self.kv_args.state_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.state_data_ptrs)
+
+        # Clear connection pool and related tables
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            with self.connection_lock:
+                self.connection_pool.clear()
+                self.prefill_attn_tp_size_table.clear()
+                self.prefill_dp_size_table.clear()
+                self.prefill_pp_size_table.clear()
+                self.addr_to_rooms_tracker.clear()
+            with self.session_pool_lock:
+                self.session_pool.clear()
+
 
 class MooncakeKVSender(CommonKVSender):
 
