@@ -148,6 +148,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    configure_ipv6,
     cpu_has_amx_support,
     dynamic_import,
     enable_show_time_cost,
@@ -758,10 +759,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
 
-        if self.server_args.dist_init_addr:
-            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
-        else:
+        if self.server_args.nnodes == 1:
+            # Single node: all processes on the same machine, use loopback
             dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+        elif self.tp_rank == 0:
+            # Multi-node, master (tp_rank=0): bind to all interfaces
+            # This allows connections from both local and remote processes
+            dist_init_method = f"tcp://0.0.0.0:{self.dist_port}"
+        else:
+            # Multi-node, non-master: connect to the master node
+            # Calculate if we're on the same node as the master (tp_rank=0)
+            nnodes_per_dp_group = max(
+                self.server_args.nnodes // self.server_args.dp_size, 1
+            )
+            tp_size_per_node = self.tp_size // nnodes_per_dp_group
+
+            # tp_rank 0 to tp_size_per_node-1 are on the first node of each DP group
+            master_on_same_node = self.tp_rank < tp_size_per_node
+
+            if master_on_same_node:
+                # Master is on the same node, use loopback
+                dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
+            elif self.server_args.dist_init_addr:
+                # Master is on a different node, use dist_init_addr
+                if self.server_args.dist_init_addr.startswith("["):  # IPv6
+                    _, host = configure_ipv6(self.server_args.dist_init_addr)
+                else:  # IPv4 address
+                    host = self.server_args.dist_init_addr.split(":")[0]
+                dist_init_method = f"tcp://{host}:{self.dist_port}"
+            else:
+                # Fallback for edge cases
+                dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
