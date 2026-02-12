@@ -1,5 +1,7 @@
-import multiprocessing as mp
 import os
+
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+import multiprocessing as mp
 import unittest
 
 import torch
@@ -35,7 +37,6 @@ class TestInternlm2(CustomTestCase):
     [Test Target] Shanghai_AI_Laboratory/internlm2-7b-reward
     """
 
-    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
     model_path = INTERNLM2_7B_REWARD_WEIGHTS_PATH
     torch_dtype = torch.float16
 
