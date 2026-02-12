@@ -64,6 +64,7 @@ def _build_sampling_params_from_request(
     enable_teacache: Optional[bool] = None,
     num_frames: int = 1,
     rollout: Optional[bool] = None,
+    rollout_sde_type: Optional[str] = None,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -92,6 +93,11 @@ def _build_sampling_params_from_request(
         **({"negative_prompt": negative_prompt} if negative_prompt is not None else {}),
         **({"true_cfg_scale": true_cfg_scale} if true_cfg_scale is not None else {}),
         **({"rollout": rollout} if rollout is not None else {}),
+        **(
+            {"rollout_sde_type": rollout_sde_type}
+            if rollout_sde_type is not None
+            else {}
+        ),
     )
 
     if num_inference_steps is not None:
@@ -125,6 +131,7 @@ async def generations(
         negative_prompt=request.negative_prompt,
         enable_teacache=request.enable_teacache,
         rollout=request.rollout,
+        rollout_sde_type=request.rollout_sde_type,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),

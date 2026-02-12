@@ -1006,10 +1006,34 @@ class DenoisingStage(PipelineStage):
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
         trajectory_log_probs: list[torch.Tensor] = []
-        rollout_enabled = bool(
-            getattr(batch, "rollout", False)
-            or (isinstance(batch.extra, dict) and batch.extra.get("rollout", False))
-        )
+        rollout_enabled = bool(getattr(batch, "rollout", False))
+        rollout_sde_type = "sde"
+        batch_rollout_sde_type = getattr(batch, "rollout_sde_type", None)
+        if isinstance(batch_rollout_sde_type, str):
+            rollout_sde_type = batch_rollout_sde_type.lower().strip()
+
+        rollout_cfg = batch.extra.get("rollout") if isinstance(batch.extra, dict) else None
+        if isinstance(rollout_cfg, bool):
+            rollout_enabled = rollout_cfg
+        if isinstance(rollout_cfg, dict):
+            if "enabled" in rollout_cfg:
+                rollout_enabled = bool(rollout_cfg.get("enabled"))
+            cfg_sde_type = rollout_cfg.get("sde_type")
+            if isinstance(cfg_sde_type, str):
+                cfg_sde_type = cfg_sde_type.lower().strip()
+                if cfg_sde_type in ("sde", "cps"):
+                    rollout_sde_type = cfg_sde_type
+                else:
+                    logger.warning(
+                        "Unknown rollout sde_type '%s', using default 'sde'.",
+                        cfg_sde_type,
+                    )
+        if rollout_sde_type not in ("sde", "cps"):
+            logger.warning(
+                "Unknown rollout_sde_type '%s', using default 'sde'.",
+                rollout_sde_type,
+            )
+            rollout_sde_type = "sde"
         capture_trajectory = bool(batch.return_trajectory_latents or rollout_enabled)
         use_rollout_sde = bool(
             rollout_enabled
@@ -1110,6 +1134,7 @@ class DenoisingStage(PipelineStage):
                                 t_device,
                                 latents,
                                 generator=batch.generator,
+                                sde_type=rollout_sde_type,
                             )
                             trajectory_log_probs.append(step_log_prob)
                         else:

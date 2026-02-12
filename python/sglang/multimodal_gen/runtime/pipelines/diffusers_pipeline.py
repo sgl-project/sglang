@@ -32,9 +32,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
     SyncExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines.patches.sd3_pipeline_with_logprob import (
-    pipeline_with_logprob,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -65,87 +62,21 @@ class DiffusersExecutionStage(PipelineStage):
 
         with torch.no_grad(), warnings.catch_warnings(record=True):
             warnings.simplefilter("always")
-            if self._is_rollout_enabled(batch):
-                if self._is_sd3_pipeline():
-                    rollout_kwargs = self._get_rollout_kwargs(batch)
-                    output, traj_latents, traj_log_probs, traj_timesteps = (
-                        pipeline_with_logprob(
-                            self.diffusers_pipe, **kwargs, **rollout_kwargs
-                        )
-                    )
-                    batch.trajectory_latents = traj_latents
-                    batch.trajectory_log_probs = traj_log_probs
-                    batch.trajectory_timesteps = traj_timesteps
+            try:
+                output = self.diffusers_pipe(**kwargs)
+            except TypeError as e:
+                # Some pipelines don't support output_type="pt"
+                if "output_type" in str(e):
+                    kwargs.pop("output_type", None)
+                    output = self.diffusers_pipe(**kwargs)
                 else:
-                    logger.warning(
-                        "Rollout is enabled, but model '%s' is not SD3. Falling back to normal diffusers __call__.",
-                        type(self.diffusers_pipe).__name__,
-                    )
-                    output = self._run_pipeline_call(kwargs)
-            else:
-                output = self._run_pipeline_call(kwargs)
+                    raise
 
         batch.output = self._extract_output(output)
         if batch.output is not None:
             batch.output = self._postprocess_output(batch.output)
 
         return batch
-
-    def _is_rollout_enabled(self, batch: Req) -> bool:
-        extra = getattr(batch, "extra", None)
-        if isinstance(extra, dict) and "rollout" in extra:
-            rollout_cfg = extra.get("rollout")
-            if isinstance(rollout_cfg, dict):
-                return bool(rollout_cfg.get("enabled", True))
-            return bool(rollout_cfg)
-        return bool(getattr(batch, "rollout", False))
-
-    def _get_rollout_kwargs(self, batch: Req) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {}
-        extra = getattr(batch, "extra", None)
-        if not isinstance(extra, dict):
-            return kwargs
-
-        rollout_cfg = extra.get("rollout")
-        if not isinstance(rollout_cfg, dict):
-            return kwargs
-
-        sde_type = rollout_cfg.get("sde_type")
-        if isinstance(sde_type, str):
-            sde_type = sde_type.lower()
-            if sde_type in ("sde", "cps"):
-                kwargs["sde_type"] = sde_type
-            else:
-                logger.warning(
-                    "Unknown rollout sde_type '%s', using default 'sde'.", sde_type
-                )
-
-        noise_level = rollout_cfg.get("noise_level")
-        if noise_level is not None:
-            try:
-                kwargs["noise_level"] = float(noise_level)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "Invalid rollout noise_level '%s', using default value.", noise_level
-                )
-
-        return kwargs
-
-    def _is_sd3_pipeline(self) -> bool:
-        cls_name = type(self.diffusers_pipe).__name__.lower()
-        cls_mod = type(self.diffusers_pipe).__module__.lower()
-        return "stablediffusion3" in cls_name or "stable_diffusion_3" in cls_mod
-
-    def _run_pipeline_call(self, kwargs: dict) -> Any:
-        try:
-            return self.diffusers_pipe(**kwargs)
-        except TypeError as e:
-            # Some pipelines don't support output_type="pt"
-            if "output_type" in str(e):
-                kwargs = dict(kwargs)
-                kwargs.pop("output_type", None)
-                return self.diffusers_pipe(**kwargs)
-            raise
 
     def _filter_pipeline_kwargs(
         self, kwargs: dict, *, strict: bool = False
