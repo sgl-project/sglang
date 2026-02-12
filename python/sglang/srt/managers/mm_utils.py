@@ -70,7 +70,7 @@ def is_feature_buffer_initialized():
     return _GPU_FEATURE_BUFFER is not None
 
 
-def try_add_to_buffer(tensor: torch.Tensor) -> torch.Tensor | None:
+def try_add_to_buffer(tensor: torch.Tensor) -> torch.Tensor:
     global _BUFFER_OFFSET
 
     if _GPU_FEATURE_BUFFER is None:
@@ -163,7 +163,7 @@ class MultiModalityDataPaddingPatternTokenPairs(MultiModalityDataPaddingPattern)
 
             if input_ids[start_idx] in self.data_start_token_ids:
                 data_idx += 1
-                mm_inputs.data_offsets += [start_idx]
+                mm_inputs.data_offsets.append(start_idx)
 
             if data_idx >= len(pad_values):
                 data_idx = len(pad_values) - 1
@@ -280,12 +280,12 @@ def get_embedding_chunk(
     extend_end_index = extend_prefix_len + extend_seq_len - 1
 
     for start, end in items_offset:
-        if extend_start_index >= start and extend_start_index <= end:
+        if start <= extend_start_index <= end:
             start_index += extend_start_index - start
         elif extend_start_index > end:
             start_index += end - start + 1
 
-        if extend_end_index >= start and extend_end_index <= end:
+        if start <= extend_end_index <= end:
             end_index += extend_end_index - start + 1
         elif extend_end_index > end:
             end_index += end - start + 1
@@ -420,7 +420,7 @@ def _get_chunked_prefill_embedding(
             items_offset=items_offset,
         )
         embedding_list.append(embedding_per_req_chunk)
-    if len(embedding_list) == 0:
+    if not embedding_list:
         return None, input_ids
     return torch.concat(embedding_list, dim=0), input_ids
 
@@ -523,10 +523,9 @@ def embed_mm_inputs(
     input_ids: torch.Tensor,
     input_embedding: nn.Embedding,
     multimodal_model: nn.Module = None,
-    data_embedding_func_mapping: dict[Modality, DataEmbeddingFunc] = None,
-    placeholder_tokens: dict[Modality, list[int]] = None,
-    use_deepstack: dict[Modality, bool] = {},
-) -> torch.Tensor | None:
+    data_embedding_func_mapping: dict[Modality, DataEmbeddingFunc] | None = None,
+    use_deepstack: dict[Modality, bool] | None = None,
+) -> tuple[torch.Tensor, dict] | None:
     """
     Embed multimodal inputs and integrate them with text token embeddings.
 
@@ -536,11 +535,12 @@ def embed_mm_inputs(
         extend_seq_lens: Sequence lengths for each request
         input_ids: Input token IDs tensor
         input_embedding: Embedding layer for text tokens
-        placeholder_tokens: Token IDs for multimodal placeholders (uses pad_values if None)
 
     Returns:
-        Combined embedding tensor with multimodal content integrated
+        Tuple of (combined embedding tensor, extra info dict), or None
     """
+    if use_deepstack is None:
+        use_deepstack = {}
     other_info = {}
     if mm_inputs_list is None:
         return None
@@ -549,7 +549,9 @@ def embed_mm_inputs(
     # we assume that multimodal data are represented with its pad_values in input_ids
     item_flatten_list = []
     for mm_inputs in mm_inputs_list:
-        item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
+        item_flatten_list.extend(
+            item for item in mm_inputs.mm_items if item is not None
+        )
 
     # deepstack_embeddings: per-modality
     modalities, embeddings, masks, deepstack_embeddings = [], [], [], []
@@ -605,10 +607,10 @@ def embed_mm_inputs(
                 embedding, deepstack_embedding = (
                     multimodal_model.separate_deepstack_embeds(embedding)
                 )
-                deepstack_embeddings += [deepstack_embedding]
-            modalities += [modality]
-            embeddings += [embedding]
-            masks += [mask]
+                deepstack_embeddings.append(deepstack_embedding)
+            modalities.append(modality)
+            embeddings.append(embedding)
+            masks.append(mask)
 
     # 3. Get input embeddings
     vocab_size = input_embedding.num_embeddings
@@ -636,9 +638,7 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    for i, modality, embedding, mask in zip(
-        range(len(embeddings)), modalities, embeddings, masks
-    ):
+    for i, (modality, embedding, mask) in enumerate(zip(modalities, embeddings, masks)):
         if embedding is None or mask is None:
             continue
         # in-place update
@@ -652,14 +652,22 @@ def embed_mm_inputs(
     return input_embeds, other_info
 
 
+def _offload_mm_features_to_cpu(mm_inputs_list: list):
+    """Move GPU tensor features to CPU for chunked-prefill memory efficiency."""
+    for mm_input_obj in mm_inputs_list:
+        for mm_item in mm_input_obj.mm_items:
+            feature = getattr(mm_item, "feature", None)
+            if isinstance(feature, torch.Tensor) and feature.is_cuda:
+                mm_item.feature = feature.to("cpu", non_blocking=True)
+
+
 def general_mm_embed_routine(
     input_ids: torch.Tensor,
     forward_batch: ForwardBatch,
     language_model: nn.Module,
     multimodal_model: nn.Module | None = None,
-    data_embedding_funcs: dict[Modality, DataEmbeddingFunc] = None,
-    placeholder_tokens: dict[Modality, list[int]] | None = None,
-    use_deepstack: dict[Modality, bool] = {},
+    data_embedding_funcs: dict[Modality, DataEmbeddingFunc] | None = None,
+    use_deepstack: dict[Modality, bool] | None = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -670,7 +678,6 @@ def general_mm_embed_routine(
         forward_batch: Batch information for model forward pass
         language_model: Base language model to use
         data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
-        placeholder_tokens: Token IDs for multimodal placeholders
         use_deepstack: Whether to use deepstack embeddings for each modality, default False
         **kwargs: Additional arguments passed to language model
 
@@ -679,72 +686,64 @@ def general_mm_embed_routine(
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
-    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
-        ):
-            mm_inputs_list = [
-                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-            ]
-            extend_prefix_lens = [
-                prefix_len
-                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            extend_seq_lens = [
-                seq_len
-                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            input_embeds, other_info = embed_mm_inputs(
-                mm_inputs_list=mm_inputs_list,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_seq_lens=extend_seq_lens,
-                input_ids=input_ids,
-                multimodal_model=multimodal_model,
-                input_embedding=embed_tokens,
-                data_embedding_func_mapping=data_embedding_funcs,
-                placeholder_tokens=placeholder_tokens,
-                use_deepstack=use_deepstack,
-            )
-            # add for qwen3_vl deepstack
-            if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # Offload GPU features to CPU instead of discarding them to balance memory
-            # efficiency and data persistence.
-            # In chunked-prefill, a request is processed across multiple batches, and
-            # the original multimodal data must remain accessible until the entire
-            # prefill phase is complete. Since the multimodal embedding cache is
-            # best-effort, offloading to CPU ensures we have a reliable fallback
-            # if a cache miss occurs in subsequent chunks, while still freeing up
-            # critical GPU memory.
-            if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
-                    if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
-                        for mm_item in mm_input_obj.mm_items:
-                            feature = getattr(mm_item, "feature", None)
-                            if isinstance(feature, torch.Tensor) and feature.is_cuda:
-                                mm_item.feature = feature.to("cpu", non_blocking=True)
-            forward_batch.mm_inputs = None
-            forward_batch.mm_input_embeds = input_embeds
-        else:
-            input_embeds = embed_tokens(input_ids)
-        # Copy to pre-allocated buffer if available (for CUDA graph address stability)
-        if forward_batch.input_embeds is not None:
-            forward_batch.input_embeds.copy_(input_embeds)
-            input_embeds = forward_batch.input_embeds
-    else:
-        input_embeds = None
 
-    hidden_states = language_model(
+    # Non-first PP rank: skip embedding entirely
+    if (
+        hasattr(language_model, "pp_group")
+        and not language_model.pp_group.is_first_rank
+    ):
+        return language_model(
+            input_ids=None, forward_batch=forward_batch, input_embeds=None, **kwargs
+        )
+
+    # Compute embeddings (multimodal or text-only)
+    if (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    ):
+        mm_inputs_list = [
+            mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
+        ]
+        extend_prefix_lens = [
+            prefix_len
+            for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        extend_seq_lens = [
+            seq_len
+            for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.mm_inputs[i] is not None
+        ]
+        input_embeds, other_info = embed_mm_inputs(
+            mm_inputs_list=mm_inputs_list,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens,
+            input_ids=input_ids,
+            multimodal_model=multimodal_model,
+            input_embedding=embed_tokens,
+            data_embedding_func_mapping=data_embedding_funcs,
+            use_deepstack=use_deepstack,
+        )
+        if use_deepstack:
+            kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
+        _offload_mm_features_to_cpu(mm_inputs_list)
+        forward_batch.mm_inputs = None
+        forward_batch.mm_input_embeds = input_embeds
+    else:
+        input_embeds = embed_tokens(input_ids)
+
+    # Copy to pre-allocated buffer if available (for CUDA graph address stability)
+    if forward_batch.input_embeds is not None:
+        forward_batch.input_embeds.copy_(input_embeds)
+        input_embeds = forward_batch.input_embeds
+
+    return language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
     )
-    return hidden_states
 
 
 def data_hash(data) -> int:
@@ -850,13 +849,7 @@ def _get_length(value):
 
 
 def _slice_value(value, start, end):
-    if isinstance(value, torch.Tensor):
-        return value[start:end]
-    if isinstance(value, np.ndarray):
-        return value[start:end]
-    if isinstance(value, list):
-        return value[start:end]
-    if isinstance(value, tuple):
+    if isinstance(value, (torch.Tensor, np.ndarray, list, tuple)):
         return value[start:end]
     try:
         return value[start:end]
@@ -1051,15 +1044,15 @@ class ShmPointerMMData:
         self.cpu_tensor = tensor.cpu().contiguous()
         self.shape = self.cpu_tensor.shape
         self.dtype = self.cpu_tensor.dtype
+        self._write_tensor_to_shm(self.cpu_tensor)
 
-        nbytes = self.cpu_tensor.numel() * self.cpu_tensor.element_size()
-
+    def _write_tensor_to_shm(self, cpu_tensor: torch.Tensor):
+        """Create shared memory and write tensor data into it."""
+        nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
         self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
-
         try:
             shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
-
-            shm_view[:] = self.cpu_tensor.view(torch.uint8).numpy().flatten()
+            shm_view[:] = cpu_tensor.view(torch.uint8).numpy().flatten()
         finally:
             self.shm.close()
 
@@ -1076,14 +1069,7 @@ class ShmPointerMMData:
             cpu_tensor = tensor.cpu().contiguous()
             self.shape = cpu_tensor.shape
             self.dtype = cpu_tensor.dtype
-
-            nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
-            self.shm = shared_memory.SharedMemory(create=True, size=nbytes)
-            try:
-                shm_view = np.ndarray((nbytes,), dtype=np.uint8, buffer=self.shm.buf)
-                shm_view[:] = cpu_tensor.view(torch.uint8).numpy().flatten()
-            finally:
-                self.shm.close()
+            self._write_tensor_to_shm(cpu_tensor)
 
         return {
             "shm_name": self.shm.name,
