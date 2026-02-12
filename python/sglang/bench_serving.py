@@ -2024,6 +2024,7 @@ async def get_request(
     request_rate: float,
     use_trace_timestamps: bool = False,
     slowdown_factor: float = 1.0,
+    burstiness: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
         print(
@@ -2045,6 +2046,11 @@ async def get_request(
 
             yield request
     else:
+        # Calculate scale parameter theta to maintain the desired request_rate.
+        assert (
+            burstiness > 0
+        ), f"A positive burstiness factor is expected, but given {burstiness}."
+        theta = 1.0 / (request_rate * burstiness)
         input_requests_iter = iter(input_requests)
         for request in input_requests_iter:
             yield request
@@ -2053,8 +2059,9 @@ async def get_request(
                 # If the request rate is infinity, then we don't need to wait.
                 continue
 
-            # Sample the request interval from the exponential distribution.
-            interval = np.random.exponential(1.0 / request_rate)
+            # Sample the request interval from the gamma distribution.
+            # If burstiness is 1, it follows exponential distribution.
+            interval = np.random.gamma(shape=burstiness, scale=theta)
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
 
@@ -2435,7 +2442,9 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(
+            input_requests, request_rate, burstiness=args.burstiness
+        )
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
@@ -3109,6 +3118,18 @@ if __name__ == "__main__":
         default=float("inf"),
         help="Number of requests per second. If this is inf, then all the requests are sent at time 0. "
         "Otherwise, we use Poisson process to synthesize the request arrival times. Default is inf.",
+    )
+    parser.add_argument(
+        "--burstiness",
+        type=float,
+        default=1.0,
+        help="Burstiness factor of the request generation. "
+        "Only take effect when request_rate is not inf. "
+        "Default value is 1, which follows Poisson process. "
+        "Otherwise, the request intervals follow a gamma distribution. "
+        "A lower burstiness value (0 < burstiness < 1) results in more "
+        "bursty requests. A higher burstiness value (burstiness > 1) "
+        "results in a more uniform arrival of requests.",
     )
     parser.add_argument(
         "--use-trace-timestamps",
