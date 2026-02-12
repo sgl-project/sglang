@@ -196,14 +196,13 @@ class AiterAttnBackend(AttentionBackend):
             global _use_mla_ps_kernel, fast_mode, intra_batch_mode
 
             if self.num_head == 32:
-                assert self.kv_cache_dtype is fp8_dtype
                 fast_mode = True
                 intra_batch_mode = False
             # current persist a16w16 mla_decode kernel does not support head_num = 128
             # need to fall back to non-persist
             # only use mla_ps_kernel when fp8 kv_cache
             # for non-fp8 kv_cache, use non-persist kernel to avoid performance degradation
-            if self.kv_cache_dtype is not fp8_dtype:
+            elif self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
