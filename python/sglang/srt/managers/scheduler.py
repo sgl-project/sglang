@@ -195,6 +195,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    get_numa_node,
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -3020,10 +3021,14 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    if (
-        numa_node := server_args.numa_node
-    ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
-        numa_bind_to_node(numa_node[gpu_id])
+    numa_node = None
+    if (numa_nodes := server_args.numa_node) is not None:
+        numa_node = numa_nodes[gpu_id]
+    elif envs.SGLANG_AUTO_NUMA_BIND.get():
+        numa_node = get_numa_node(gpu_id)
+        logger.info(f"auto get NUMA node {numa_node} for GPU {gpu_id}")
+    if numa_node is not None and not envs.SGLANG_NUMA_BIND_V2.get():
+        numa_bind_to_node(numa_node)
 
     # Set up tracing
     if server_args.enable_trace:
