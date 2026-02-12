@@ -654,8 +654,17 @@ def seg_la_sum_kernel(T, O, DIM: tl.constexpr, NUM_BLOCK: tl.constexpr):
 
 
 def seg_la_fwd(
-    q, k, v, s, decay_scales, meta, caches=None, cache_indices=None, softmax_scale=None, decouple=False
-):
+    q,
+    k,
+    v,
+    s,
+    decay_scales,
+    meta,
+    caches=None,
+    cache_indices=None,
+    softmax_scale=None,
+    decouple=False,
+ ):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
     bs = meta.batch_size
