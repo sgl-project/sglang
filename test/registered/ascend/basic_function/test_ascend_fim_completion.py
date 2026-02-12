@@ -21,7 +21,7 @@ class TestFimCompletion(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --completion-template
     """
-    
+
     model = "/root/.cache/modelscope/hub/models/deepseek-ai/deepseek-coder-1.3b-base"
     other_args = [
         "--completion-template",
