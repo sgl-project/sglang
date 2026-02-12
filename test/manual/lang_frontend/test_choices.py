@@ -13,7 +13,7 @@ MOCK_CHOICES_INPUT_DATA = {
     "choices": [
         "organ",  # ["organ"]
         "organism",  # ["organ", "ism"]
-        "antidisestablishmentarianism",  # ["ant", "id", "is", "est", "ablish", "ment", "arian", "ism"]
+        "antidisestablishmentarianism",  # ["ant", "id", "is", "est", "ablish", "ment", "arian", "ism"] # codespell:ignore ment
     ],
     "normalized_prompt_logprobs": [-0.1, -0.2, -0.05],
     "input_token_logprobs": [
