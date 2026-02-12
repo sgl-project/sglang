@@ -260,6 +260,19 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
             )
 
+    def deregister_buffer_to_engine(self):
+        # Batch deregister KV data buffers
+        if self.kv_args.kv_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
+
+        # Batch deregister auxiliary data buffers
+        if self.kv_args.aux_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
+
+        # Batch deregister state/extra pool data buffers
+        if self.kv_args.state_data_ptrs:
+            self.engine.batch_deregister(self.kv_args.state_data_ptrs)
+
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
             return 0
