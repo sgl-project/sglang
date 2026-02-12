@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SD3 rollout step utilities for log-prob computation."""
+"""Flow-matching rollout step utilities for log-prob computation."""
 
 import math
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
-from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
-    FlowMatchEulerDiscreteScheduler,
-)
 from diffusers.utils.torch_utils import randn_tensor
 
 
@@ -32,7 +29,7 @@ def _as_timestep_tensor(
 
 
 def sde_step_with_logprob(
-    self: FlowMatchEulerDiscreteScheduler,
+    self: Any,
     model_output: torch.FloatTensor,
     timestep: Union[float, torch.FloatTensor],
     sample: torch.FloatTensor,

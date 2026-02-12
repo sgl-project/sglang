@@ -221,18 +221,6 @@ def prepare_request(
         diffusers_kwargs = None
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
-    if getattr(sampling_params, "rollout", False):
-        rollout_sde_type = str(
-            getattr(sampling_params, "rollout_sde_type", "sde")
-        ).lower()
-        if rollout_sde_type not in ("sde", "cps"):
-            raise ValueError(
-                f"rollout_sde_type must be one of ['sde', 'cps'], got: {rollout_sde_type}"
-            )
-        req.extra["rollout"] = {
-            "enabled": True,
-            "sde_type": rollout_sde_type,
-        }
 
     req.adjust_size(server_args)
 

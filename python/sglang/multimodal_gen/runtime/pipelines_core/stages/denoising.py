@@ -63,7 +63,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
 try:
-    from sglang.multimodal_gen.runtime.pipelines.patches.sd3_sde_with_logprob import (
+    from sglang.multimodal_gen.runtime.pipelines.patches.flow_matching_sde_with_logprob import (
         sde_step_with_logprob,
     )
 except Exception:  # pragma: no cover
@@ -114,6 +114,13 @@ class DenoisingStage(PipelineStage):
             self._maybe_enable_torch_compile(transformer)
 
         self.scheduler = scheduler
+        if (
+            sde_step_with_logprob is not None
+            and not hasattr(self.scheduler, "sde_step_with_logprob")
+        ):
+            self.scheduler.sde_step_with_logprob = sde_step_with_logprob.__get__(
+                self.scheduler, type(self.scheduler)
+            )
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
@@ -1006,28 +1013,16 @@ class DenoisingStage(PipelineStage):
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
         trajectory_log_probs: list[torch.Tensor] = []
-        rollout_enabled = bool(getattr(batch, "rollout", False))
-        rollout_sde_type = "sde"
-        batch_rollout_sde_type = getattr(batch, "rollout_sde_type", None)
-        if isinstance(batch_rollout_sde_type, str):
-            rollout_sde_type = batch_rollout_sde_type.lower().strip()
-
-        rollout_cfg = batch.extra.get("rollout") if isinstance(batch.extra, dict) else None
-        if isinstance(rollout_cfg, bool):
-            rollout_enabled = rollout_cfg
-        if isinstance(rollout_cfg, dict):
-            if "enabled" in rollout_cfg:
-                rollout_enabled = bool(rollout_cfg.get("enabled"))
-            cfg_sde_type = rollout_cfg.get("sde_type")
-            if isinstance(cfg_sde_type, str):
-                cfg_sde_type = cfg_sde_type.lower().strip()
-                if cfg_sde_type in ("sde", "cps"):
-                    rollout_sde_type = cfg_sde_type
-                else:
-                    logger.warning(
-                        "Unknown rollout sde_type '%s', using default 'sde'.",
-                        cfg_sde_type,
-                    )
+        rollout_enabled = bool(batch.rollout)
+        rollout_sde_type = getattr(batch, "rollout_sde_type", None)
+        if rollout_sde_type is None or str(rollout_sde_type).strip() == "":
+            if rollout_enabled:
+                logger.warning(
+                    "rollout_sde_type is not set, defaulting to 'sde'."
+                )
+            rollout_sde_type = "sde"
+        else:
+            rollout_sde_type = str(rollout_sde_type).strip().lower()
         if rollout_sde_type not in ("sde", "cps"):
             logger.warning(
                 "Unknown rollout_sde_type '%s', using default 'sde'.",
@@ -1035,16 +1030,10 @@ class DenoisingStage(PipelineStage):
             )
             rollout_sde_type = "sde"
         capture_trajectory = bool(batch.return_trajectory_latents or rollout_enabled)
-        use_rollout_sde = bool(
-            rollout_enabled
-            and sde_step_with_logprob is not None
-            and hasattr(self.scheduler, "index_for_timestep")
-            and hasattr(self.scheduler, "sigmas")
-        )
-        if rollout_enabled and not use_rollout_sde:
-            logger.warning(
-                "Rollout is enabled, but scheduler '%s' does not support sde_step_with_logprob. Falling back to scheduler.step.",
-                type(self.scheduler).__name__,
+        if rollout_enabled and not hasattr(self.scheduler, "sde_step_with_logprob"):
+            raise RuntimeError(
+                f"Rollout is enabled, but scheduler '{type(self.scheduler).__name__}' "
+                "does not provide sde_step_with_logprob."
             )
 
         # Run denoising loop
@@ -1127,14 +1116,15 @@ class DenoisingStage(PipelineStage):
                             batch.noise_pred = noise_pred
 
                         # Compute the previous noisy sample
-                        if use_rollout_sde:
-                            latents, step_log_prob, _, _ = sde_step_with_logprob(
-                                self.scheduler,
-                                noise_pred,
-                                t_device,
-                                latents,
-                                generator=batch.generator,
-                                sde_type=rollout_sde_type,
+                        if rollout_enabled:
+                            latents, step_log_prob, _, _ = (
+                                self.scheduler.sde_step_with_logprob(
+                                    model_output=noise_pred,
+                                    timestep=t_device,
+                                    sample=latents,
+                                    generator=batch.generator,
+                                    sde_type=rollout_sde_type,
+                                )
                             )
                             trajectory_log_probs.append(step_log_prob)
                         else:

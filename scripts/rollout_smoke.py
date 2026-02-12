@@ -46,7 +46,13 @@ def _tensor_to_pil_image(sample: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr)
 
 
-def _build_request(generator: DiffGenerator, args: argparse.Namespace):
+def _build_request(
+    generator: DiffGenerator,
+    args: argparse.Namespace,
+    *,
+    rollout: bool,
+    rollout_sde_type: str | None = None,
+):
     sampling_kwargs: dict[str, Any] = {
         "prompt": args.prompt,
         "seed": args.seed,
@@ -55,11 +61,12 @@ def _build_request(generator: DiffGenerator, args: argparse.Namespace):
         "width": args.width,
         "num_frames": args.num_frames,
         "guidance_scale": args.guidance_scale,
-        "rollout": True,
-        "rollout_sde_type": args.rollout_sde_type,
+        "rollout": rollout,
         "save_output": False,
         "return_frames": False,
     }
+    if rollout and rollout_sde_type is not None:
+        sampling_kwargs["rollout_sde_type"] = rollout_sde_type
     if args.negative_prompt is not None:
         sampling_kwargs["negative_prompt"] = args.negative_prompt
 
@@ -77,8 +84,16 @@ def _run_once(
     args: argparse.Namespace,
     run_name: str,
     output_dir: Path,
-) -> dict[str, Any]:
-    req = _build_request(generator=generator, args=args)
+    *,
+    rollout: bool,
+    rollout_sde_type: str | None = None,
+) -> Path:
+    req = _build_request(
+        generator=generator,
+        args=args,
+        rollout=rollout,
+        rollout_sde_type=rollout_sde_type,
+    )
     output_batch = generator._send_to_scheduler_and_wait_for_response([req])
 
     if output_batch.error:
@@ -90,100 +105,13 @@ def _run_once(
     image = _tensor_to_pil_image(sample)
     image_path = output_dir / f"rollout_{run_name}.png"
     image.save(image_path)
-
-    log_probs = output_batch.trajectory_log_probs
-    if log_probs is None:
-        raise RuntimeError(f"{run_name} run returned no trajectory_log_probs.")
-
-    if not isinstance(log_probs, torch.Tensor):
-        log_probs = torch.as_tensor(log_probs)
-    log_probs = log_probs.detach().cpu()
-
-    if log_probs.numel() == 0:
-        raise RuntimeError(f"{run_name} trajectory_log_probs is empty.")
-    if log_probs.ndim < 2:
-        raise RuntimeError(
-            f"{run_name} trajectory_log_probs should be [B, T], got {tuple(log_probs.shape)}"
-        )
-    if int(log_probs.shape[-1]) != args.num_inference_steps:
-        raise RuntimeError(
-            f"{run_name} steps mismatch: expected {args.num_inference_steps}, "
-            f"got {int(log_probs.shape[-1])} (shape={tuple(log_probs.shape)})"
-        )
-    if not torch.isfinite(log_probs).all():
-        raise RuntimeError(f"{run_name} trajectory_log_probs contains NaN/Inf.")
-
-    logprob_path = output_dir / f"trajectory_log_probs_{run_name}.pt"
-    torch.save(log_probs, logprob_path)
-
-    latents = output_batch.trajectory_latents
-    if latents is None:
-        raise RuntimeError(f"{run_name} run returned no trajectory_latents.")
-    if not isinstance(latents, torch.Tensor):
-        latents = torch.as_tensor(latents)
-    latents = latents.detach().cpu()
-
-    if latents.numel() == 0:
-        raise RuntimeError(f"{run_name} trajectory_latents is empty.")
-    if latents.ndim < 3:
-        raise RuntimeError(
-            f"{run_name} trajectory_latents should be [B, T, ...], got {tuple(latents.shape)}"
-        )
-    if int(latents.shape[1]) != args.num_inference_steps:
-        raise RuntimeError(
-            f"{run_name} latent steps mismatch: expected {args.num_inference_steps}, "
-            f"got {int(latents.shape[1])} (shape={tuple(latents.shape)})"
-        )
-    if not torch.isfinite(latents).all():
-        raise RuntimeError(f"{run_name} trajectory_latents contains NaN/Inf.")
-
-    latents_path = output_dir / f"trajectory_latents_{run_name}.pt"
-    torch.save(latents, latents_path)
-
     print(f"[{run_name}] image: {image_path}")
-    print(f"[{run_name}] log_probs: {logprob_path}")
-    print(f"[{run_name}] latents: {latents_path}")
-    print(f"[{run_name}] log_probs.shape={tuple(log_probs.shape)}")
-    print(f"[{run_name}] latents.shape={tuple(latents.shape)}")
-    print(f"[{run_name}] log_probs.mean={log_probs.float().mean().item():.6f}")
-
-    return {
-        "image_path": image_path,
-        "log_probs_path": logprob_path,
-        "log_probs": log_probs,
-        "latents_path": latents_path,
-        "latents": latents,
-    }
-
-
-def _assert_exact_match(
-    *,
-    metric_name: str,
-    first: torch.Tensor,
-    second: torch.Tensor,
-) -> None:
-    if first.shape != second.shape:
-        raise RuntimeError(
-            f"[determinism] {metric_name} shape mismatch: "
-            f"{tuple(first.shape)} vs {tuple(second.shape)}"
-        )
-    if first.dtype != second.dtype:
-        raise RuntimeError(
-            f"[determinism] {metric_name} dtype mismatch: "
-            f"{first.dtype} vs {second.dtype}"
-        )
-    if torch.equal(first, second):
-        return
-
-    max_abs_diff = (first.float() - second.float()).abs().max().item()
-    raise RuntimeError(
-        f"[determinism] {metric_name} mismatch with same seed. "
-        f"max_abs_diff={max_abs_diff:.6e}"
-    )
-
+    return image_path
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Native rollout log_prob smoke test")
+    parser = argparse.ArgumentParser(
+        description="Native rollout smoke test (no rollout / sde / cps)."
+    )
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--pipeline-class-name", type=str, default=None)
     parser.add_argument(
@@ -203,13 +131,6 @@ def main() -> int:
     parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument(
-        "--rollout-sde-type",
-        type=str,
-        default="sde",
-        choices=["sde", "cps"],
-        help="Rollout step objective for native denoising.",
-    )
-    parser.add_argument(
         "--backend",
         type=str,
         default="sglang",
@@ -221,13 +142,7 @@ def main() -> int:
         "--output-dir",
         type=str,
         default="outputs/rollout_smoke_native",
-        help="Directory to save generated images and rollout tensors.",
-    )
-    parser.add_argument(
-        "--test-determinism",
-        action="store_true",
-        default=False,
-        help="Run twice with the same seed and require identical log_probs/latents.",
+        help="Directory to save generated images.",
     )
     args = parser.parse_args()
     if args.num_inference_steps < 2:
@@ -289,36 +204,33 @@ def main() -> int:
             f"Failed to initialize generator for model_path='{args.model_path}': {last_error}"
         )
     try:
-        first = _run_once(
+        _run_once(
             generator=generator,
             args=args,
-            run_name="native",
+            run_name="native_no_rollout",
             output_dir=output_dir,
+            rollout=False,
         )
-
-        if args.test_determinism:
-            print("[determinism] running repeat pass with identical seed...")
-            second = _run_once(
-                generator=generator,
-                args=args,
-                run_name="native_repeat",
-                output_dir=output_dir,
-            )
-            _assert_exact_match(
-                metric_name="trajectory_log_probs",
-                first=first["log_probs"],
-                second=second["log_probs"],
-            )
-            _assert_exact_match(
-                metric_name="trajectory_latents",
-                first=first["latents"],
-                second=second["latents"],
-            )
-            print("[determinism] passed")
+        _run_once(
+            generator=generator,
+            args=args,
+            run_name="native_rollout_sde",
+            output_dir=output_dir,
+            rollout=True,
+            rollout_sde_type="sde",
+        )
+        _run_once(
+            generator=generator,
+            args=args,
+            run_name="native_rollout_cps",
+            output_dir=output_dir,
+            rollout=True,
+            rollout_sde_type="cps",
+        )
     finally:
         generator.shutdown()
 
-    print(f"native rollout smoke test passed (saved under {output_dir})")
+    print(f"native rollout smoke test passed (saved 3 images under {output_dir})")
     return 0
 
 
