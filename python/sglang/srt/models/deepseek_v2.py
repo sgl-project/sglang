@@ -2708,7 +2708,15 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                    if nsa_use_prefill_cp(forward_batch):
+                        aux_hidden_state = cp_all_gather_rerange_output(
+                            hidden_states + residual,
+                            self.cp_size,
+                            forward_batch,
+                            torch.cuda.current_stream(),
+                        )
+                        aux_hidden_states.append(aux_hidden_state)
+                    elif self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = tensor_model_parallel_all_gather(
                             hidden_states + residual, dim=0
                         )
