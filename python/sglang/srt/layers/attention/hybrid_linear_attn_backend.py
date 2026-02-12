@@ -970,7 +970,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self._warmup_mtp_kernel()
             self._warmup_decode_kernel()
 
-        # Warn if K-last is enabled without speculative decoding
+        # Warn once if K-last is enabled (about decode fallback and/or prefix caching)
         if self.ssm_k_last and not GDNAttnBackend._k_last_decode_warning_shown:
             server_args = get_global_server_args()
             if server_args.speculative_algorithm is None:
@@ -978,7 +978,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "K-last SSM layout (--mamba-ssm-k-last) is enabled without speculative decoding. "
                     "Using FlashInfer GDN decode kernel for K-last decode."
                 )
-                GDNAttnBackend._k_last_decode_warning_shown = True
             if not server_args.disable_radix_cache:
                 logger.warning(
                     "K-last SSM layout (--mamba-ssm-k-last) does not support prefix caching "
@@ -986,6 +985,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "which may cause incorrect outputs for cached prefixes. "
                     "Consider using --disable-radix-cache or disabling --mamba-ssm-k-last."
                 )
+            GDNAttnBackend._k_last_decode_warning_shown = True
 
     def _warmup_mtp_kernel(self):
         """Warmup FlashInfer MTP kernel to avoid JIT compilation overhead during serving.
