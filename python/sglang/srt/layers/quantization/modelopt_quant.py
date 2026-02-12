@@ -299,7 +299,7 @@ class ModelOptQuantConfig(QuantizationConfig):
             # Check if MoE layer should be excluded from quantization
             # (e.g., MTP layers that have no quantization scales in checkpoint)
             if self.is_layer_excluded(prefix):
-                # Falls back to default unquantized MoEx
+                # Falls back to default unquantized MoE
                 return None
             return Moe(self)
         return None
