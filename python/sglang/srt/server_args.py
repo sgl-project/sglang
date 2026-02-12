@@ -211,7 +211,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "flashinfer_trtllm",
 ]
 
-MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
+MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
