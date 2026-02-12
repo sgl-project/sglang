@@ -2,7 +2,7 @@
 
 This guide outlines the requirements for contributing to the SGLang Diffusion module (`sglang.multimodal_gen`).
 
-## 1. Commit Message Convention
+## Commit Message Convention
 
 We follow a structured commit message format to maintain a clean history.
 
@@ -21,7 +21,7 @@ We follow a structured commit message format to maintain a clean history.
 - **Scope** (Optional): `cli`, `scheduler`, `model`, `pipeline`, `docs`, etc.
 - **Subject**: Imperative mood, short and clear (e.g., "add feature" not "added feature").
 
-## 2. Performance Reporting
+## Performance Reporting
 
 For PRs that impact **latency**, **throughput**, or **memory usage**, you **should** provide a performance comparison report.
 
@@ -45,7 +45,7 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
     ```
 4. **Paste**: paste the table into the PR description
 
-## 3. CI-Based Change Protection
+## CI-Based Change Protection
 
 Consider adding tests to the `pr-test` or `nightly-test` suites to safeguard your changes, especially for PRs that:
 

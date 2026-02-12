@@ -846,6 +846,10 @@ class DenoisingStage(PipelineStage):
         if not server_args.dit_cpu_offload:
             return
 
+        # FSDP manages offloading internally
+        if server_args.use_fsdp_inference:
+            return
+
         # Offload the unused model if it's on CUDA
         if (
             model_to_offload is not None

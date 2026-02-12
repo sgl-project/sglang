@@ -513,7 +513,7 @@ class ServerArgs:
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
-    mamba_ssm_dtype: str = "float32"
+    mamba_ssm_dtype: Optional[str] = None
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
@@ -628,7 +628,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
-    nsa_prefill_cp_mode: str = "in-seq-split"
+    nsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
 
@@ -2600,7 +2600,8 @@ class ServerArgs:
 
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
-        envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
+        if self.mamba_ssm_dtype is not None:
+            envs.SGLANG_MAMBA_SSM_DTYPE.set(self.mamba_ssm_dtype)
         envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
             "1" if self.disable_outlines_disk_cache else "0"
         )
@@ -2757,6 +2758,24 @@ class ServerArgs:
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
             self.pp_size = 1
+
+        if self.enable_lora:
+            logger.warning(
+                "Currently LoRA is not supported by diffusion LLM inference."
+            )
+            self.enable_lora = False
+
+        if self.disaggregation_mode != "null":
+            logger.warning(
+                "Currently disaggregation is not supported by diffusion LLM inference."
+            )
+            self.disaggregation_mode = "null"
+
+        if self.enable_mixed_chunk:
+            logger.warning(
+                "Mixed chunked prefill is disabled because of using diffusion LLM inference."
+            )
+            self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -4112,9 +4131,10 @@ class ServerArgs:
         parser.add_argument(
             "--mamba-ssm-dtype",
             type=str,
-            default=ServerArgs.mamba_ssm_dtype,
+            default=None,
             choices=MAMBA_SSM_DTYPE_CHOICES,
-            help="The data type of the SSM states in mamba cache.",
+            help="The data type of the SSM states in mamba cache. "
+            "If not set, will be read from model config (mamba_ssm_dtype).",
         )
         parser.add_argument(
             "--mamba-full-memory-ratio",
@@ -4664,7 +4684,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.nsa_prefill_cp_mode,
             choices=NSA_PREFILL_CP_SPLIT_CHOICES,
-            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'in-seq-split' (default), 'round-robin-split'. "
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
         parser.add_argument(
