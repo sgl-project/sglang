@@ -1311,14 +1311,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     def get_model_config_for_expert_location(cls, config):
         if hasattr(config, "text_config"):
             text_config = config.text_config
-            return ModelConfigForExpertLocation(
-                num_layers=text_config.num_hidden_layers,
-                num_logical_experts=text_config.num_experts,
-                num_groups=None,
-            )
+        else:
+            text_config = config
         return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
             num_groups=None,
         )
 
