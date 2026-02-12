@@ -420,7 +420,6 @@ class RMSNorm(torch.nn.Module):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
         if _use_cpu:
             assert (
-                self.norm_before_gate and self.group_size is None and self.activation == "swish"
                 self.norm_before_gate
                 and self.group_size is None
                 and self.activation == "swish"
