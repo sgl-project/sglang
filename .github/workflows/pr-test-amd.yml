@@ -104,6 +104,7 @@ jobs:
               - "python/sglang/cli/**"
               - "python/pyproject_rocm.toml"
               - "python/pyproject_other.toml"
+              - ".github/workflows/pr-test-amd.yml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
@@ -236,7 +237,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-amd
 
   stage-b-test-small-1-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -290,7 +291,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-1]
+        runner: [linux-mi35x-gpu-1.test]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -315,7 +316,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-small-1-gpu-amd-mi35x
 
   stage-b-test-large-1-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -355,7 +356,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-1-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800
 
   stage-b-test-large-2-gpu-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
@@ -652,7 +653,7 @@ jobs:
 
 
   stage-c-test-large-8-gpu-amd:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -700,7 +701,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600
 
   stage-c-test-large-8-gpu-amd-mi35x:
-    needs: [check-changes, call-gate, stage-b-test-small-1-gpu-amd, stage-b-test-large-2-gpu-amd]
+    needs: [check-changes, call-gate]
     if: |
       always() &&
       (
@@ -714,7 +715,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi35x-gpu-8]
+        runner: [linux-mi35x-gpu-8.test]
         part: [0]
     runs-on: ${{matrix.runner}}
     steps:
@@ -741,7 +742,7 @@ jobs:
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-35x-disaggregation-amd:
-    needs: [check-changes, stage-a-test-1-amd]
+    needs: [check-changes]
     if: |
       always() &&
       (
