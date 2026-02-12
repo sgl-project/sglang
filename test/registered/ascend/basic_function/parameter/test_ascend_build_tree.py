@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
 
@@ -198,9 +198,9 @@ def build_tree_kernel_efficient(
     if avg_native_time > 1e-9:  # Avoid division by zero
         speedup_ratio = (avg_native_time - avg_kernel_time) / avg_native_time
         logger.info(
-            f'Average native tree time: {avg_native_time}, Average kernel tree time: {avg_kernel_time}'
+            f"Average native tree time: {avg_native_time}, Average kernel tree time: {avg_kernel_time}"
         )
-        logger.info(f'Performance speedup ratio: {speedup_ratio}')
+        logger.info(f"Performance speedup ratio: {speedup_ratio}")
 
         # Assert the speedup meets the requirement
         assert (
