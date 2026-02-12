@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.srt.utils.common import torch_release
 
 _cp_options.enable_load_balance = False
@@ -161,6 +162,132 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x_c.permute(tuple(new_order)).contiguous()
 
 
+def _usp_input_all_to_all_async(x: torch.Tensor, head_dim: int = 1):
+    """
+    Perform async Ulysses-style input all-to-all over the head dimension, enabling overlapping communication (V, Q) with computation (K, Q).
+
+    Returns:
+        An AsyncCollectiveTensor that can be waited on later
+        Shape metadata for reshaping later
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    seq_dim = 1 if head_dim == 2 else 2
+
+    # -> [b, h, s, d]
+    if head_dim == 1 and seq_dim == 2:
+        x_c = x
+    else:
+        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+
+    b, h, s, d = x_c.shape
+    assert (
+        h % world_size == 0
+    ), f"h ({h}) must be divisible by world_size ({world_size})"
+
+    # [b, h, s_local, d] -> [h, b, s_local, d]
+    x_c = x_c.permute(1, 0, 2, 3).contiguous()
+
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+
+    # perform async all-to-all
+    x_c = x_c.flatten()
+    x_async = ft_c.all_to_all_single(
+        x_c, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
+    )
+
+    return x_async, (b, h, s, d, world_size, head_dim, seq_dim)
+
+
+def _usp_input_all_to_all_async_wait(
+    x_async_tuple: tuple,
+) -> torch.Tensor:
+    """
+    Wait for async all-to-all to complete and reshape the result.
+    
+    Args:
+        x_async_tuple: (AsyncCollectiveTensor, metadata), returned result from _usp_input_all_to_all_async
+    """
+    x_async, (b, h, s, d, world_size, head_dim, seq_dim) = x_async_tuple
+
+    x_c = _maybe_wait(x_async)
+
+    x_c = x_c.reshape(h, b, s, d)
+    x_c = (
+        x_c.reshape(world_size, h // world_size, b, -1, d)
+        .permute(2, 1, 0, 3, 4)
+        .reshape(b, h // world_size, -1, d)
+    )
+
+    if head_dim == 1 and seq_dim == 2:
+        return x_c
+
+    # map back to original ordering
+    new_order = [0, None, None, 3]
+    new_order[head_dim] = 1
+    new_order[seq_dim] = 2
+    return x_c.permute(tuple(new_order)).contiguous()
+
+
+def ulysses_attn_with_async_qkv_proj(
+    qkv_proj_fn: callable,
+    attn_impl: "AttentionImpl",
+    head_dim: int = 2,
+    qkv_proj_kwargs: dict | None = dict(),
+) -> torch.Tensor:
+    """
+    Ulysses Attention with Async QKV Projection optimization.
+    
+    This function implements the async QKV projection optimization inspired by
+    ByteDance-Seed/VeOmni and cache-dit.
+
+    It enables partial overlap of communication and computation
+
+    Args:
+        qkv_proj_fn: Function that takes hidden_states and returns (q, k, v, *extra)
+                     The function should compute projections in V, Q, K (or V, K, Q) order internally
+                     to maximize overlap opportunity
+    Returns:
+        [B, S_local, H, D]
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        qkv_result = qkv_proj_fn(**qkv_proj_kwargs)
+
+        query, key, value = qkv_result
+
+        ctx_attn_metadata = get_forward_context().attn_metadata
+        return attn_impl.forward(query, key, value, ctx_attn_metadata)
+
+    # 1. performs q, k, v projection
+    qkv_result = qkv_proj_fn(**qkv_proj_kwargs)
+    query, key, value = qkv_result
+
+    # 2. start async all-to-all for V, Q, K by launching async comms
+    v_async = _usp_input_all_to_all_async(value, head_dim=head_dim)
+    q_async = _usp_input_all_to_all_async(query, head_dim=head_dim)
+    k_async = _usp_input_all_to_all_async(key, head_dim=head_dim)
+
+    # 3. wait for all communications to complete and reshape
+    value_gathered = _usp_input_all_to_all_async_wait(v_async)
+    query_gathered = _usp_input_all_to_all_async_wait(q_async)
+    key_gathered = _usp_input_all_to_all_async_wait(k_async)
+
+    # 4. perform attention on gathered tensors [B, S_global, H_local, D]
+    ctx_attn_metadata = get_forward_context().attn_metadata
+    out = attn_impl.forward(query_gathered, key_gathered, value_gathered, ctx_attn_metadata)
+
+    # 5. all-to-all to restore original sharding [B, S_local, H_global, D]
+    out = _usp_output_all_to_all(out, head_dim=head_dim)
+
+    return out
+
+
 def ring_attn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -235,7 +362,8 @@ def ring_attn(
         query=query,
         key=key,
         value=value,
-        group=ring_pg,  # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
+        group=ring_pg,
+        # https://github.com/pytorch/pytorch/blob/c907c778f42ba2fdaf25b733dd25baf9779c6a12/torch/distributed/tensor/experimental/_context_parallel/_attention.py#L309
     )
 
     if use_segment_id:
@@ -253,3 +381,9 @@ def ring_attn(
     # Permute the output back to [B, S, H, D] layout.
     output = torch.permute(out, [0, 2, 1, 3])
     return output
+
+
+__all__ = [
+    "ring_attn",
+    "ulysses_attn_with_async_qkv_proj",
+]

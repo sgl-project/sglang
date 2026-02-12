@@ -321,7 +321,7 @@ class USPAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
-        self.attn_impl = impl_cls(
+        self.attn_impl: AttentionImpl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
             causal=causal,

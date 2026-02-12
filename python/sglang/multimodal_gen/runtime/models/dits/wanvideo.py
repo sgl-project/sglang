@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.layers.usp import (
+    ulysses_attn_with_async_qkv_proj,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
     PatchEmbed,
@@ -167,9 +170,6 @@ class WanSelfAttention(nn.Module):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
         pass
 
@@ -387,7 +387,56 @@ class WanTransformerBlock(nn.Module):
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
         self.mlp_residual = MulAdd()
 
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+
+    def compute_qkv_selfattn(self,
+                             norm_hidden_states: torch.Tensor,
+                             freqs_cis: tuple[torch.Tensor, torch.Tensor], ):
+        """
+        Compute QKV for self-attention in optimal order: V → (Q, K with norm) → rope.
+
+        V is computed first so its async all-to-all can overlap with the subsequent Q/K computation.
+        """
+        # 1. V
+        value, _ = self.to_v(norm_hidden_states)
+        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+
+        # 2. Q with norm
+        query, _ = self.to_q(norm_hidden_states)
+        if self.norm_q is not None:
+            if self.tp_rmsnorm:
+                query = tensor_parallel_rms_norm(query, self.norm_q)
+            else:
+                query = self.norm_q(query)
+        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+
+        # 3. K with norm
+        key, _ = self.to_k(norm_hidden_states)
+        if self.norm_k is not None:
+            if self.tp_rmsnorm:
+                key = tensor_parallel_rms_norm(key, self.norm_k)
+            else:
+                key = self.norm_k(key)
+        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+
+        # 4. apply rotary embeddings to Q and K together
+        cos, sin = freqs_cis
+        if _is_cuda and query.shape == key.shape:
+            cos_sin_cache = torch.cat(
+                [
+                    cos.to(dtype=torch.float32).contiguous(),
+                    sin.to(dtype=torch.float32).contiguous(),
+                ],
+                dim=-1,
+            )
+            query, key = apply_flashinfer_rope_qk_inplace(
+                query, key, cos_sin_cache, is_neox=False
+            )
+        else:
+            query = _apply_rotary_emb(query, cos, sin, is_neox_style=False)
+            key = _apply_rotary_emb(key, cos, sin, is_neox_style=False)
+
+        return query, key, value
 
     def forward(
         self,
@@ -423,42 +472,14 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = self.norm1(hidden_states, shift_msa, scale_msa)
-        query, _ = self.to_q(norm_hidden_states)
-        key, _ = self.to_k(norm_hidden_states)
-        value, _ = self.to_v(norm_hidden_states)
 
-        if self.norm_q is not None:
-            if self.tp_rmsnorm:
-                query = tensor_parallel_rms_norm(query, self.norm_q)
-            else:
-                query = self.norm_q(query)
-        if self.norm_k is not None:
-            if self.tp_rmsnorm:
-                key = tensor_parallel_rms_norm(key, self.norm_k)
-            else:
-                key = self.norm_k(key)
-        query = query.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        key = key.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
-        value = value.squeeze(1).unflatten(2, (self.local_num_heads, self.dim_head))
+        attn_output = ulysses_attn_with_async_qkv_proj(
+            qkv_proj_fn=self.compute_qkv_selfattn,
+            qkv_proj_kwargs=dict(norm_hidden_states=norm_hidden_states, freqs_cis=freqs_cis),
+            attn_impl=self.attn1.attn_impl,
+            head_dim=2,
+        )
 
-        # Apply rotary embeddings
-        cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        else:
-            query, key = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False
-            ), _apply_rotary_emb(key, cos, sin, is_neox_style=False)
-        attn_output = self.attn1(query, key, value)
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
@@ -583,7 +604,7 @@ class WanTransformerBlock_VSA(nn.Module):
         self.ffn = MLP(dim, ffn_dim, act_type="gelu_pytorch_tanh")
         self.mlp_residual = MulAdd()
 
-        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
 
     def forward(
         self,
@@ -749,7 +770,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             gather_output=True,
         )
         self.scale_shift_table = nn.Parameter(
-            torch.randn(1, 2, inner_dim) / inner_dim**0.5
+            torch.randn(1, 2, inner_dim) / inner_dim ** 0.5
         )
 
         # For type checking
