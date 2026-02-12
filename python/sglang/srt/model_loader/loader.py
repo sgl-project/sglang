@@ -71,11 +71,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    trigger_transferring_weights_request,
-)
+from sglang.srt.model_loader.auto_weights_loader import AutoWeightsLoader
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
@@ -683,7 +679,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
-        model.load_weights(weights)
+        load_fn = getattr(model, "load_weights", None)
+        if callable(load_fn):
+            load_fn(weights)
+        else:
+            AutoWeightsLoader(model).load_weights(weights)
 
         for _, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
