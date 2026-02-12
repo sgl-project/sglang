@@ -497,7 +497,13 @@ class _NormTanhMulAdd(CustomOp):
         weight = _ensure_contiguous(getattr(self.norm, "weight", None))
         bias = _ensure_contiguous(getattr(self.norm, "bias", None))
         return fused_norm_tanh_mul_add(
-            x, weight, bias, scale, shift, self.norm_type, self.eps,
+            x,
+            weight,
+            bias,
+            scale,
+            shift,
+            self.norm_type,
+            self.eps,
         )
 
     def forward_hip(self, *args, **kwargs):
@@ -629,6 +635,34 @@ def apply_qk_norm(
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
+
+
+def apply_rmsnorm_tanh_mul_add(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: "RMSNorm",
+) -> torch.Tensor:
+    """Compute residual + tanh(gate) * rmsnorm(x), with a fused CUDA fast path."""
+    if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
+        return residual + torch.tanh(gate) * norm(x)
+
+    if _is_cuda and x.is_cuda and x.shape[-1] % 256 == 0 and x.shape[-1] <= 8192:
+        from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+            fused_norm_tanh_mul_add,
+        )
+
+        return fused_norm_tanh_mul_add(
+            x.contiguous(),
+            norm.weight.data.contiguous(),
+            None,
+            gate.contiguous(),
+            residual.contiguous(),
+            "rms",
+            norm.variance_epsilon,
+        )
+
+    return residual + torch.tanh(gate) * norm(x)
 
 
 def tensor_parallel_rms_norm(x: torch.Tensor, norm: "RMSNorm") -> torch.Tensor:
