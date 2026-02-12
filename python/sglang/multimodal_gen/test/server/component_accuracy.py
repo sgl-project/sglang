@@ -142,6 +142,7 @@ def _is_text_encoder_config(path: str) -> bool:
     if not os.path.exists(cfg_path):
         return True
     cfg = _read_json(cfg_path)
+    # 5120 is the known i2v text-encoder hidden size used by WAN video models.
     if cfg.get("model_type") == "i2v" or cfg.get("dim") == 5120:
         return False
     return True

@@ -55,6 +55,10 @@ def extract_output_tensor(output: Any) -> torch.Tensor:
         return output.pooler_output
     if getattr(output, "logits", None) is not None:
         return output.logits
-    if isinstance(output, (list, tuple)) and output:
+    if (
+        isinstance(output, (list, tuple))
+        and output
+        and isinstance(output[0], torch.Tensor)
+    ):
         return output[0]
-    return output
+    raise ValueError(f"Could not extract tensor from output of type {type(output)}")
