@@ -34,6 +34,7 @@ from sglang.srt.configs.qwen3_5 import (
 # Distributed
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 # Layers - Attention
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -328,7 +329,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -339,7 +340,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
+                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
             is_layer_sparse = False
             is_previous_layer_sparse = False
@@ -1317,6 +1318,15 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.add(name)
 
         return loaded_params
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        text_config = getattr(config, "text_config", config)
+        return ModelConfigForExpertLocation(
+            num_layers=text_config.num_hidden_layers,
+            num_logical_experts=text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
