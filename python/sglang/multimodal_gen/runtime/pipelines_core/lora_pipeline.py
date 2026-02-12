@@ -423,12 +423,10 @@ class LoRAPipeline(ComposedPipelineBase):
                 f"but strengths has {len(strengths)} items"
             )
 
+        lora_triples = list(zip(lora_nicknames, lora_paths, strengths))
         adapted_count = 0
         for name, layer in lora_layers.items():
-            # Apply all LoRA adapters in order
-            for idx, (nickname, path, lora_strength) in enumerate(
-                zip(lora_nicknames, lora_paths, strengths)
-            ):
+            for idx, (nickname, path, lora_strength) in enumerate(lora_triples):
                 lora_A_name = name + ".lora_A"
                 lora_B_name = name + ".lora_B"
                 if (
@@ -479,8 +477,7 @@ class LoRAPipeline(ComposedPipelineBase):
                             path,
                             name,
                         )
-                    # Only disable if no LoRA was applied at all
-                    if idx == len(lora_nicknames) - 1:
+                    if idx == len(lora_triples) - 1:
                         has_any_lora = any(
                             name + ".lora_A" in self.lora_adapters[n]
                             and name + ".lora_B" in self.lora_adapters[n]
