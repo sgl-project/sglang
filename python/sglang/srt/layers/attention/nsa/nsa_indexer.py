@@ -380,8 +380,11 @@ class Indexer(MultiPlatformOp):
                     seqlens_32, blocksize, self.sm_count
                 )
 
-        assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
+        # Reshape 3D [total_tokens, heads, dim] -> 4D [batch, nextn, heads, dim] for DeepGEMM
+        num_tokens, num_heads, head_dim = q_fp8.shape
+        batch_size = block_tables.shape[0]
+        assert num_tokens % batch_size == 0
+        q_fp8 = q_fp8.view(batch_size, -1, num_heads, head_dim)
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 1 if _is_hip else 64
         num_heads_kv = 1
