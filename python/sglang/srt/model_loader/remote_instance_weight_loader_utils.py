@@ -121,7 +121,11 @@ def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_in
 
 
 def register_memory_region(model, transfer_engine):
-    if importlib.util.find_spec("torch") is None:
+    if (
+        importlib.util.find_spec("torch") is None
+        or importlib.util.find_spec("torch.cuda") is None
+        or importlib.util.find_spec("torch.cuda.memory") is None
+    ):
         return register_memory_region_v1(model, transfer_engine)
     else:
         return register_memory_region_v2(model, transfer_engine)
