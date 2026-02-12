@@ -373,6 +373,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--kt-max-deferred-experts-per-token` | [ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0. | `None` | Type: int |
 
 ## Diffusion LLM
+
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
 | `--dllm-algorithm` | The diffusion LLM algorithm, such as LowConfidence. | `None` | Type: str |
