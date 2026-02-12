@@ -1177,7 +1177,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             total_num_heads, num_hidden_layers, self.device
         )
         self.linear_backend = getattr(
-            model_runner.model_config.hf_config, "linear_backend", "minimax"
+            model_runner.model_config.hf_config, "linear_backend", "seg_la"
         )
         logger.info(
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
