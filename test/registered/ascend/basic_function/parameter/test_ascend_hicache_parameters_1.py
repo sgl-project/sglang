@@ -56,7 +56,6 @@ class BaseQwenHiCacheTest(CustomTestCase):
         other_args = BASE_OTHER_ARGS.copy()
         other_args.extend(
             [
-            
                 "--radix-eviction-policy",
                 eviction_policy,
                 "--hicache-io-backend",
@@ -89,6 +88,7 @@ class BaseQwenHiCacheTest(CustomTestCase):
             metrics["accuracy"],
             self.accuracy,
         )
+
 
 # Dynamically generate a test class for each HiCache configuration
 for eviction_policy, io_backend, mem_layout, scenario in HICACHE_CONFIGS:
