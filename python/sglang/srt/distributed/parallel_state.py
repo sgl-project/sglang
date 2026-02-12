@@ -226,7 +226,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         pynccl_use_current_stream: bool = False,
-        gloo_timeout: timedelta = timedelta(seconds=120 * 60),
+        dist_timeout: Optional[int] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -239,6 +239,11 @@ class GroupCoordinator:
         self.device_group = None
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
+
+        # Convert timeout to timedelta
+        dist_timeout_td = (
+            timedelta(seconds=dist_timeout) if dist_timeout is not None else None
+        )
 
         if is_cuda_alike():
             device_id = (
@@ -272,8 +277,20 @@ class GroupCoordinator:
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
                 )
             else:
+                # gloo defaults to 2 hours timeout
+                gloo_timeout = (
+                    dist_timeout_td
+                    if dist_timeout_td is not None
+                    else timedelta(seconds=120 * 60)
+                )
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend
+                    ranks,
+                    backend=torch_distributed_backend,
+                    **(
+                        {"timeout": dist_timeout_td}
+                        if dist_timeout_td is not None
+                        else {}
+                    ),
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -1330,7 +1347,10 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: List[int],
+    local_rank: int,
+    backend: str,
+    dist_timeout: Optional[int] = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1344,6 +1364,7 @@ def init_world_group(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="world",
+        dist_timeout=dist_timeout,
     )
 
 
@@ -1357,6 +1378,7 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     pynccl_use_current_stream: bool = True,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
+    dist_timeout: Optional[int] = None,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
@@ -1378,6 +1400,7 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         pynccl_use_current_stream=pynccl_use_current_stream,
+        dist_timeout=dist_timeout,
     )
 
 
@@ -1520,10 +1543,11 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment"
         )
+        timeout_td = None
         if timeout is not None:
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
-            timeout = timedelta(seconds=timeout)
+            timeout_td = timedelta(seconds=timeout)
 
         # this backend is used for WORLD
         torch.distributed.init_process_group(
@@ -1531,7 +1555,7 @@ def init_distributed_environment(
             init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
-            timeout=timeout,
+            timeout=timeout_td,
         )
 
     # set the local rank
@@ -1547,7 +1571,7 @@ def init_distributed_environment(
     global _WORLD
     if _WORLD is None:
         ranks = list(range(torch.distributed.get_world_size()))
-        _WORLD = init_world_group(ranks, local_rank, backend)
+        _WORLD = init_world_group(ranks, local_rank, backend, dist_timeout=timeout)
     else:
         assert (
             _WORLD.world_size == torch.distributed.get_world_size()
@@ -1560,6 +1584,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    dist_timeout: Optional[int] = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1616,6 +1641,7 @@ def initialize_model_parallel(
         ),
         group_name="tp",
         pynccl_use_current_stream=duplicate_tp_group,
+        dist_timeout=dist_timeout,
     )
 
     if duplicate_tp_group:
@@ -1632,6 +1658,7 @@ def initialize_model_parallel(
             ),
             group_name="pdmux_prefill_tp",
             pynccl_use_current_stream=True,
+            dist_timeout=dist_timeout,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
@@ -1658,6 +1685,7 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="moe_ep",
+            dist_timeout=dist_timeout,
         )
 
     global _MOE_TP
@@ -1678,6 +1706,7 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             group_name="moe_tp",
+            dist_timeout=dist_timeout,
         )
 
     # Build the pipeline model-parallel groups.
@@ -1695,6 +1724,7 @@ def initialize_model_parallel(
         backend,
         use_custom_allreduce=False,
         group_name="pp",
+        dist_timeout=dist_timeout,
     )
 
 

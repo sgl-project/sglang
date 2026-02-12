@@ -308,6 +308,7 @@ def initialize_dp_attention(
         use_xpu_communicator=False,
         use_npu_communicator=False,
         group_name="attention_tp",
+        dist_timeout=server_args.dist_timeout,
     )
 
     _DpGatheredBufferWrapper.set_metadata(
