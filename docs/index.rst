@@ -35,6 +35,8 @@ Its core features include:
    basic_usage/native_api.ipynb
    basic_usage/sampling_params.md
    basic_usage/popular_model_usage.rst
+   basic_usage/diffusion_llms.md
+   basic_usage/diffusion.md
 
 .. toctree::
    :maxdepth: 1
@@ -51,6 +53,7 @@ Its core features include:
    advanced_features/quantization.md
    advanced_features/quantized_kv_cache.md
    advanced_features/expert_parallelism.md
+   advanced_features/dp_dpa_smg_guide.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
    advanced_features/epd_disaggregation.md
@@ -67,21 +70,33 @@ Its core features include:
    advanced_features/sglang_for_rl.md
 
 .. toctree::
-   :maxdepth: 1
+   :maxdepth: 2
    :caption: Supported Models
 
-   supported_models/generative_models.md
-   supported_models/multimodal_language_models.md
-   supported_models/diffusion_language_models.md
-   supported_models/diffusion_models.md
-   supported_models/embedding_models.md
-   supported_models/reward_models.md
-   supported_models/rerank_models.md
-   supported_models/classify_models.md
-   supported_models/support_new_models.md
-   supported_models/transformers_fallback.md
-   supported_models/modelscope.md
-   supported_models/mindspore_models.md
+   supported_models/text_generation/index
+   supported_models/retrieval_ranking/index
+   supported_models/specialized/index
+   supported_models/extending/index
+
+.. toctree::
+   :maxdepth: 2
+   :caption: SGLang Diffusion
+
+   diffusion/index
+   diffusion/installation
+   diffusion/compatibility_matrix
+   diffusion/api/cli
+   diffusion/api/openai_api
+   diffusion/performance/index
+   diffusion/performance/attention_backends
+   diffusion/performance/profiling
+   diffusion/performance/cache/index
+   diffusion/performance/cache/cache_dit
+   diffusion/performance/cache/teacache
+   diffusion/support_new_models
+   diffusion/contributing
+   diffusion/ci_perf
+   diffusion/environment_variables
 
 .. toctree::
    :maxdepth: 1

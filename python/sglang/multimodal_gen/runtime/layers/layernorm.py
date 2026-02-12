@@ -12,8 +12,12 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
+_is_npu = current_platform.is_npu()
 if _is_cuda:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
+
+if _is_npu:
+    import torch_npu
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -28,10 +32,7 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     rms_norm_fn,
     triton_one_pass_rms_norm,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-
-_is_cuda = current_platform.is_cuda()
 
 
 # Copied and adapted from sglang
@@ -51,7 +52,7 @@ class RMSNorm(CustomOp):
         var_hidden_size: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
+        self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
         self.hidden_size = hidden_size
         self.variance_size_override = (
@@ -80,6 +81,10 @@ class RMSNorm(CustomOp):
         if x.dtype == torch.float:
             # fp32
             out = self.forward_triton(x, residual)
+            if residual is not None:
+                return out[0].view(shape), out[1].view(residual_shape)
+            out = out.view(shape)
+            return out
         elif self.variance_size_override is not None:
             return self.forward_native(x, residual)
         elif residual is not None:
@@ -93,6 +98,7 @@ class RMSNorm(CustomOp):
             else:
                 out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
+
         return out
 
     def forward_native(
@@ -140,6 +146,18 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self.forward_native(x, residual)
+
+    def forward_npu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            out, _, residual_out = torch_npu.npu_add_rms_norm(
+                residual, x, self.weight.data, self.variance_epsilon
+            )
+            return out, residual_out
+        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_hip(
         self,
@@ -214,7 +232,7 @@ class LayerNorm(CustomOp):
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
 
-    @torch.compile(backend="inductor")
+    @torch.compile(backend="inductor", disable=current_platform.is_npu())
     def forward_native(
         self,
         x: torch.Tensor,
@@ -318,6 +336,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
             fused_scale_residual_norm_scale_shift,
         )
+
+        if isinstance(gate, int) and gate != 1:
+            raise ValueError(
+                f"Only gate value of 1 is supported for int type, but got {gate}"
+            )
 
         return fused_scale_residual_norm_scale_shift(
             residual.contiguous(),

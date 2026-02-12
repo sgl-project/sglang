@@ -182,6 +182,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         else:
             launch_http_server_only(server_args)
 
+    return processes
+
 
 def launch_http_server_only(server_args):
     # set for endpoints to access global_server_args
