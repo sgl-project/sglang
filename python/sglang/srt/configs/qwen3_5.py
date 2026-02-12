@@ -17,9 +17,18 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
         self,
         **kwargs,
     ):
+        # HF Qwen3.5 checkpoints may provide RoPE settings under rope_parameters.
+        # Normalize it before parent init so downstream code sees the expected values.
+        rope_parameters = kwargs.pop("rope_parameters", None)
+        if kwargs.get("rope_scaling") is None and rope_parameters is not None:
+            kwargs["rope_scaling"] = rope_parameters
+
         super().__init__(**kwargs)
         if self.rope_scaling is None:
-            self.rope_scaling = {}
+            self.rope_scaling = rope_parameters or {}
+
+        # Keep both names for compatibility with model code paths that read either.
+        self.rope_parameters = rope_parameters or self.rope_scaling
 
 
 class Qwen3_5Config(PretrainedConfig):
