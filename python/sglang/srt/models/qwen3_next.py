@@ -385,9 +385,9 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         seq_len, _ = hidden_states.shape
         if (
-            seq_len < DUAL_STREAM_TOKEN_THRESHOLD
-            and self.alt_stream is not None
+            self.alt_stream is not None
             and get_is_capture_mode()
+            and seq_len < DUAL_STREAM_TOKEN_THRESHOLD
         ):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
