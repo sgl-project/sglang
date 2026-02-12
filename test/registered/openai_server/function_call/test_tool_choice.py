@@ -883,6 +883,7 @@ class TestToolChoiceLfm2(TestToolChoiceLlama32):
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
 
+
 @unittest.skipIf(
     is_hip(), "Disabled for AMD: aiter backend does not support hybrid Mamba2 models"
 )
