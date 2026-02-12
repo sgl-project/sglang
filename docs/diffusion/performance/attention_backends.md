@@ -47,7 +47,7 @@ Some backends require additional configuration. You can pass these parameters vi
 
 ### Supported Configuration Parameters
 
-#### Sliding Tile Attention (`sliding_tile_attn`)
+**Sliding Tile Attention (`sliding_tile_attn`)**
 
 | Parameter | Type | Description | Default |
 | :--- | :--- | :--- | :--- |
@@ -55,13 +55,13 @@ Some backends require additional configuration. You can pass these parameters vi
 | `sta_mode` | `str` | Mode of STA. | `STA_inference` |
 | `skip_time_steps` | `int` | Number of steps to use full attention before switching to sparse attention. | `15` |
 
-#### Video Sparse Attention (`video_sparse_attn`)
+**Video Sparse Attention (`video_sparse_attn`)**
 
 | Parameter | Type | Description | Default |
 | :--- | :--- | :--- | :--- |
 | `sparsity` | `float` | Validation sparsity (0.0 - 1.0). | `0.0` |
 
-#### V-MoBA (`vmoba_attn`)
+**V-MoBA (`vmoba_attn`)**
 
 | Parameter | Type | Description | Default |
 | :--- | :--- | :--- | :--- |
