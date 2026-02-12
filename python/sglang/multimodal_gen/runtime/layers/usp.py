@@ -233,7 +233,8 @@ def _usp_input_all_to_all_async_wait(
     new_order[seq_dim] = 2
     return x_c.permute(tuple(new_order)).contiguous()
 
-
+# Copied and adapted from:
+# https://github.com/vipshop/cache-dit/blob/4e73b43ae8a9198f170f52ac76693ef20e62a778/src/cache_dit/parallelism/transformers/context_parallelism/cp_plan_flux.py#L113 by @DefTruth
 def ulysses_attn_with_async_qkv_proj(
     qkv_proj_fn: callable,
     attn_impl: "AttentionImpl",
