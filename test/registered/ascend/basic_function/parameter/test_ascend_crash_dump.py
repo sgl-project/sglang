@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=40, suite="nightly-1-gpu", nightly=True)
+register_cuda_ci(est_time=40, suite="nightly-1-npu", nightly=True)
 
 
 class TestCrashDump(CustomTestCase):
