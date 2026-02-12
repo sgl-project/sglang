@@ -35,7 +35,7 @@ class TestRetractDecode(CustomTestCase):
             "ascend",
             "--disable-cuda-graph",
             "--mem-fraction-static",
-            0.8,   
+            0.8,
         ]
 
         cls.process = popen_launch_server(
