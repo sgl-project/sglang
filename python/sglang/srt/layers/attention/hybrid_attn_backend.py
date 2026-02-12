@@ -145,3 +145,25 @@ class HybridAttnBackend(AttentionBackend):
     ) -> Optional[BaseIndexerMetadata]:
         backend = self._select_backend(forward_batch.forward_mode)
         return backend.get_indexer_metadata(layer_id, forward_batch)
+
+    def forward(
+        self,
+        q: torch.Tensor = None,
+        k: torch.Tensor = None,
+        v: torch.Tensor = None,
+        layer: RadixAttention = None,
+        forward_batch: ForwardBatch = None,
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        """Delegate forward to the appropriate backend based on forward mode."""
+        backend = self._select_backend(forward_batch.forward_mode)
+        return backend.forward(
+            q=q,
+            k=k,
+            v=v,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
