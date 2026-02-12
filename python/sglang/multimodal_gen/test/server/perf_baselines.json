@@ -525,7 +525,7 @@
             "stages_ms": {
                 "ConditioningStage": 0.01,
                 "DecodingStage": 33.93,
-                "TextEncodingStage": 104.21,
+                "TextEncodingStage": 409.74,
                 "InputValidationStage": 0.03,
                 "DenoisingStage": 808.69,
                 "LatentPreparationStage": 0.14,
@@ -542,14 +542,14 @@
                 "7": 99.3,
                 "8": 100.83
             },
-            "expected_e2e_ms": 952.09,
+            "expected_e2e_ms": 1461.08,
             "expected_avg_denoise_ms": 89.36,
             "expected_median_denoise_ms": 99.67
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {
                 "InputValidationStage": 0.04,
-                "TextEncodingStage": 103.81,
+                "TextEncodingStage": 413.69,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.3,
                 "LatentPreparationStage": 0.11,
@@ -567,14 +567,14 @@
                 "7": 100.86,
                 "8": 103.87
             },
-            "expected_e2e_ms": 955.14,
+            "expected_e2e_ms": 1464.31,
             "expected_avg_denoise_ms": 89.96,
             "expected_median_denoise_ms": 99.72
         },
         "zimage_image_t2i_2_gpus": {
             "stages_ms": {
                 "InputValidationStage": 0.08,
-                "TextEncodingStage": 118.66,
+                "TextEncodingStage": 420.74,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.5,
                 "LatentPreparationStage": 0.12,
@@ -599,7 +599,7 @@
         "zimage_image_t2i_warmup": {
             "stages_ms": {
                 "InputValidationStage": 0.02,
-                "TextEncodingStage": 100.65,
+                "TextEncodingStage": 456.16,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 0.98,
                 "LatentPreparationStage": 0.06,
@@ -617,7 +617,7 @@
                 "7": 110.54,
                 "8": 115.24
             },
-            "expected_e2e_ms": 1029.96,
+            "expected_e2e_ms": 1184.45,
             "expected_avg_denoise_ms": 98.46,
             "expected_median_denoise_ms": 109.65
         },
@@ -2001,7 +2001,7 @@
         "fsdp-inference": {
             "stages_ms": {
                 "InputValidationStage": 0.04,
-                "TextEncodingStage": 128.3,
+                "TextEncodingStage": 411.12,
                 "ConditioningStage": 0.01,
                 "TimestepPreparationStage": 1.44,
                 "LatentPreparationStage": 0.1,
@@ -2019,7 +2019,7 @@
                 "7": 178.53,
                 "8": 178.08
             },
-            "expected_e2e_ms": 1742.7,
+            "expected_e2e_ms": 2103.05,
             "expected_avg_denoise_ms": 173.83,
             "expected_median_denoise_ms": 178.08
         }
