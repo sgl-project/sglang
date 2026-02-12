@@ -1211,9 +1211,7 @@ class GroupCoordinator:
 
             # Send signal via NCCL (device group) — negligible cost
             signal_val = 0 if cache_hit else 1
-            signal = torch.tensor(
-                [signal_val], dtype=torch.int8, device=self.device
-            )
+            signal = torch.tensor([signal_val], dtype=torch.int8, device=self.device)
             signal_work = send_func(signal, self.ranks[dst], group=group)
             if async_send:
                 p2p_works.append(P2PWork(signal_work, signal))
@@ -1275,9 +1273,7 @@ class GroupCoordinator:
         if metadata_cache_key is not None:
             # Receive NCCL signal
             signal = torch.empty(1, dtype=torch.int8, device=self.device)
-            work = torch.distributed.irecv(
-                signal, src=self.ranks[src], group=group
-            )
+            work = torch.distributed.irecv(signal, src=self.ranks[src], group=group)
             work.wait()
             signal_val = signal.item()
 

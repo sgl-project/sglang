@@ -86,9 +86,9 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
-                
+
                 # Check if we expect to send tensors this step (Busy)
-                is_busy_step = (self.mbs[mb_id] is not None)
+                is_busy_step = self.mbs[mb_id] is not None
                 recv_reqs = []
 
                 # RANK 0: Always receive from tokenizer, decide how to forward
@@ -209,9 +209,7 @@ class SchedulerPPMixin:
                             # metadata transfer).
                             extra_data = {}
                             if self.buffered_recv_reqs:
-                                extra_data["__bundled_reqs__"] = (
-                                    self.buffered_recv_reqs
-                                )
+                                extra_data["__bundled_reqs__"] = self.buffered_recv_reqs
                                 self.buffered_recv_reqs = []
 
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
