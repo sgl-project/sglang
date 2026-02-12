@@ -176,6 +176,20 @@ def maybe_executor_submit(
     if func_kwargs is None:
         func_kwargs = {}
     if use_async:
-        futures.append(executor.submit(func, *func_args, **func_kwargs))
+        # CRITICAL: Capture current CUDA device and restore it in worker thread.
+        # torch.cuda.current_device() is thread-local and is NOT correctly passed to threads.
+        # This may result in errors in case the `func` relies on torch current device to be already correctly specified.
+        # See details in https://github.com/pytorch/pytorch/issues/56588.
+        current_device = (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        )
+
+        def device_aware_wrapper(*args, **kwargs):
+            # Set CUDA device in worker thread to match parent thread
+            if current_device is not None:
+                torch.cuda.set_device(current_device)
+            return func(*args, **kwargs)
+
+        futures.append(executor.submit(device_aware_wrapper, *func_args, **func_kwargs))
     else:
         func(*func_args, **func_kwargs)
