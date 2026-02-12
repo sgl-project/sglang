@@ -2082,6 +2082,12 @@ class ServerArgs:
                     "Currently DFLASH speculative decoding only supports pp_size == 1."
                 )
 
+            if self.page_size != 1:
+                raise ValueError(
+                    "Currently DFLASH speculative decoding requires page_size == 1. "
+                    f"Got page_size={self.page_size}."
+                )
+
             if self.speculative_draft_model_path is None:
                 raise ValueError(
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
@@ -2130,65 +2136,61 @@ class ServerArgs:
                 )
 
             if self.speculative_num_draft_tokens is None:
+                from sglang.srt.speculative.dflash_utils import (
+                    resolve_dflash_block_size,
+                )
+
+                model_override_args = json.loads(self.json_model_override_args)
                 inferred_block_size = None
                 try:
-                    top_level_block_size = None
-                    dflash_block_size = None
-                    if os.path.isdir(self.speculative_draft_model_path):
-                        draft_config_path = os.path.join(
-                            self.speculative_draft_model_path, "config.json"
-                        )
-                        if os.path.isfile(draft_config_path):
-                            with open(draft_config_path, "r") as f:
-                                draft_config_json = json.load(f)
-                            top_level_block_size = draft_config_json.get("block_size")
-                            dflash_cfg = draft_config_json.get("dflash_config", None)
-                            dflash_block_size = (
-                                dflash_cfg.get("block_size")
-                                if isinstance(dflash_cfg, dict)
-                                else None
-                            )
+                    from sglang.srt.utils.hf_transformers_utils import download_from_hf
 
-                    if top_level_block_size is None and dflash_block_size is None:
+                    config_root = (
+                        self.speculative_draft_model_path
+                        if os.path.isdir(self.speculative_draft_model_path)
+                        else download_from_hf(
+                            self.speculative_draft_model_path,
+                            allow_patterns=["config.json"],
+                            revision=self.speculative_draft_model_revision,
+                        )
+                    )
+                    draft_config_path = os.path.join(config_root, "config.json")
+                    if os.path.isfile(draft_config_path):
+                        with open(draft_config_path, "r") as f:
+                            draft_config_json = json.load(f)
+                        if model_override_args:
+                            draft_config_json.update(model_override_args)
+                        inferred_block_size = resolve_dflash_block_size(
+                            draft_hf_config=draft_config_json,
+                            default=None,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFLASH block_size from draft config.json; "
+                        "falling back to transformers config loader. Error: %s",
+                        e,
+                    )
+
+                if inferred_block_size is None:
+                    try:
                         from sglang.srt.utils.hf_transformers_utils import get_config
 
                         draft_hf_config = get_config(
                             self.speculative_draft_model_path,
                             trust_remote_code=self.trust_remote_code,
                             revision=self.speculative_draft_model_revision,
-                            model_override_args=json.loads(
-                                self.json_model_override_args
-                            ),
+                            model_override_args=model_override_args,
                         )
-                        top_level_block_size = getattr(
-                            draft_hf_config, "block_size", None
+                        inferred_block_size = resolve_dflash_block_size(
+                            draft_hf_config=draft_hf_config,
+                            default=None,
                         )
-                        dflash_cfg = getattr(draft_hf_config, "dflash_config", None)
-                        dflash_block_size = (
-                            dflash_cfg.get("block_size")
-                            if isinstance(dflash_cfg, dict)
-                            else None
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to infer DFLASH block_size from transformers config loader; "
+                            "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                            e,
                         )
-
-                    if dflash_block_size is not None:
-                        inferred_block_size = dflash_block_size
-                        if top_level_block_size is not None and int(
-                            dflash_block_size
-                        ) != int(top_level_block_size):
-                            logger.warning(
-                                "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; "
-                                "using dflash_config.block_size for speculative_num_draft_tokens inference.",
-                                top_level_block_size,
-                                dflash_block_size,
-                            )
-                    else:
-                        inferred_block_size = top_level_block_size
-                except Exception as e:
-                    logger.warning(
-                        "Failed to infer DFLASH block_size from draft config; "
-                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                        e,
-                    )
 
                 if inferred_block_size is None:
                     inferred_block_size = 16
@@ -2196,7 +2198,7 @@ class ServerArgs:
                         "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
                         inferred_block_size,
                     )
-                self.speculative_num_draft_tokens = int(inferred_block_size)
+                self.speculative_num_draft_tokens = inferred_block_size
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48

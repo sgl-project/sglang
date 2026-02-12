@@ -1479,6 +1479,26 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_dflash() and req.return_logprob:
+            req.set_finish_with_abort(
+                "DFLASH speculative decoding does not support return_logprob yet."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+        if self.spec_algorithm.is_dflash() and (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
+        ):
+            req.set_finish_with_abort(
+                "DFLASH speculative decoding does not support grammar-constrained decoding yet."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)

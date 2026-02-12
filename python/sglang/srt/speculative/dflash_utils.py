@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
@@ -8,6 +9,7 @@ import torch
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+logger = logging.getLogger(__name__)
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
@@ -54,7 +56,10 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
 
 
 def get_dflash_config(config: Any) -> dict:
-    cfg = getattr(config, "dflash_config", None)
+    if isinstance(config, dict):
+        cfg = config.get("dflash_config", None)
+    else:
+        cfg = getattr(config, "dflash_config", None)
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
@@ -64,6 +69,67 @@ def get_dflash_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def resolve_dflash_block_size(
+    *,
+    draft_hf_config: Any,
+    default: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve DFLASH block size from draft config.
+
+    Precedence:
+      1) `dflash_config.block_size`
+      2) top-level `block_size`
+      3) `default`
+    """
+    dflash_cfg = get_dflash_config(draft_hf_config)
+    dflash_block_size = dflash_cfg.get("block_size", None)
+    if isinstance(draft_hf_config, dict):
+        top_level_block_size = draft_hf_config.get("block_size", None)
+    else:
+        top_level_block_size = getattr(draft_hf_config, "block_size", None)
+
+    parsed_dflash_block_size = None
+    if dflash_block_size is not None:
+        try:
+            parsed_dflash_block_size = int(dflash_block_size)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid DFLASH dflash_config.block_size={dflash_block_size!r}."
+            ) from e
+
+    parsed_top_level_block_size = None
+    if top_level_block_size is not None:
+        try:
+            parsed_top_level_block_size = int(top_level_block_size)
+        except Exception as e:
+            raise ValueError(
+                f"Invalid DFLASH block_size={top_level_block_size!r}."
+            ) from e
+
+    if (
+        parsed_dflash_block_size is not None
+        and parsed_top_level_block_size is not None
+        and parsed_dflash_block_size != parsed_top_level_block_size
+    ):
+        logger.warning(
+            "DFLASH draft config has both block_size=%s and dflash_config.block_size=%s; using dflash_config.block_size.",
+            top_level_block_size,
+            dflash_block_size,
+        )
+
+    block_size = (
+        parsed_dflash_block_size
+        if parsed_dflash_block_size is not None
+        else parsed_top_level_block_size
+    )
+    if block_size is None:
+        return default
+
+    if block_size <= 0:
+        raise ValueError(f"DFLASH block_size must be positive, got {block_size}.")
+    return block_size
 
 
 def resolve_dflash_target_layer_ids(
