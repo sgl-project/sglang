@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import concurrent.futures
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, List, Optional
@@ -188,6 +189,14 @@ class HiCacheFile(HiCacheStorage):
     ):
         self.file_path = os.getenv("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", file_path)
 
+        extra_config = storage_config.extra_config or {}
+        self._enable_batch_get_multithread = bool(extra_config.get("file_batch_get_multithread", False))
+        self._batch_get_num_threads = int(extra_config.get("file_batch_get_num_threads", 32))
+        if self._batch_get_num_threads <= 0:
+            raise ValueError(
+                f"file_batch_get_num_threads must be > 0, got {self._batch_get_num_threads}"
+            )
+
         tp_rank, tp_size, model_name, is_mla_model = (
             storage_config.tp_rank,
             storage_config.tp_size,
@@ -206,6 +215,10 @@ class HiCacheFile(HiCacheStorage):
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def _batch_get_single(self, args):
+        key, target_location = args
+        return self.get(key, target_location)
 
     def get(
         self,
@@ -232,12 +245,18 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
-        return [
-            self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
-            )
-        ]
+        if not self._enable_batch_get_multithread:
+            return [
+                self.get(key, target_location)
+                for key, target_location in zip(
+                    keys, target_locations or [None] * len(keys)
+                )
+            ]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._batch_get_num_threads
+            ) as executor:
+                return list(executor.map(self._batch_get_single, zip(keys, target_locations or [None] * len(keys))))
 
     def set(
         self,
