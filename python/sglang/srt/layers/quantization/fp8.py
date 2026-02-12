@@ -120,6 +120,7 @@ class Fp8Config(QuantizationConfig):
         activation_scheme: str = "dynamic",
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
     ) -> None:
         super().__init__()
@@ -130,6 +131,7 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
+        self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
@@ -171,8 +173,8 @@ class Fp8Config(QuantizationConfig):
         use_mxfp8 = "mxfp8" in quant_method
         is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        packed_modules_mapping = cls.get_from_keys_or(
-            config, ["packed_modules_mapping"], {}
+        packed_modules_mapping = (
+            cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
         )
         ignored_layers = cls.get_from_keys_or(
             config, ["ignored_layers", "modules_to_not_convert"], None
@@ -190,15 +192,14 @@ class Fp8Config(QuantizationConfig):
                 "MXFP8 ignoring incoming weight_block_size in config.json; it is fixed to [1, 32]."
             )
             weight_block_size = [1, 32]
-        quant_config = cls(
+        return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
+            packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=use_mxfp8,
         )
-        quant_config.packed_modules_mapping = packed_modules_mapping or {}
-        return quant_config
 
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
@@ -214,11 +215,12 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            # FusedMoE prefixes include ".experts", where layer-prefix rules
-            # (e.g., "model.layers.{i}.") should also force BF16 fallback.
-            if is_layer_skipped(
+            # FusedMoE prefixes include ".experts"; allow coarse layer-prefix
+            # rules (e.g., "model.layers.{i}.") to force BF16 fallback.
+            should_skip = is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
-            ) or any(ignored in prefix for ignored in self.ignored_layers):
+            ) or any(ignored in prefix for ignored in self.ignored_layers)
+            if should_skip:
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
