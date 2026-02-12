@@ -106,9 +106,7 @@ class FeedForward(nn.Module):
         dim: int,
         dim_out: Optional[int] = None,
         mult: int = 4,
-        dropout: float = 0.0,
         activation_fn: str = "geglu",
-        final_dropout: bool = False,
         inner_dim=None,
         bias: bool = True,
     ):
@@ -127,18 +125,11 @@ class FeedForward(nn.Module):
             )
 
         self.net = nn.ModuleList([])
-        # project in
         self.net.append(act_fn)
-        # project dropout
-        self.net.append(nn.Dropout(dropout))
-        # project out
+        self.net.append(nn.Identity())
         self.net.append(
             RowParallelLinear(inner_dim, dim_out, bias=True, input_is_parallel=True)
         )
-        # RowParallelLinear(inner_dim, dim_out, bias=True, gather_output=True)
-        # FF as used in Vision Transformer, MLP-Mixer, etc. have a final dropout
-        if final_dropout:
-            self.net.append(nn.Dropout(dropout))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         for module in self.net:
