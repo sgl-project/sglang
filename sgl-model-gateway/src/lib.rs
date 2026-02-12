@@ -3,7 +3,7 @@ pub use smg_auth as auth;
 pub mod config;
 pub mod core;
 pub use data_connector;
-pub mod grpc_client;
+pub use smg_grpc_client as grpc_client;
 pub use smg_mcp as mcp;
 pub use smg_mesh as mesh;
 pub mod middleware;
