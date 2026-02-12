@@ -545,11 +545,9 @@ class K2VLMultiModalProjector(nn.Module):
     def __init__(
         self,
         config: KimiK25VisionConfig,
-        use_data_parallel: bool = False,
         prefix: str = "",
     ):
         super().__init__()
-        self.use_data_parallel = use_data_parallel
 
         # Hidden size after patch merging
         merge_h, merge_w = config.merge_kernel_size
@@ -673,9 +671,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
             config.vision_config, use_data_parallel=self.use_data_parallel
         )
         # Create mm projector
-        self.mm_projector = K2VLMultiModalProjector(
-            config.vision_config, use_data_parallel=self.use_data_parallel
-        )
+        self.mm_projector = K2VLMultiModalProjector(config.vision_config)
 
         self.language_model = DeepseekV3ForCausalLM(config.text_config, quant_config)
 
