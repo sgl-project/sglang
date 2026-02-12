@@ -32,16 +32,22 @@ class AnthropicUsage(BaseModel):
 class AnthropicContentBlock(BaseModel):
     """Content block in message"""
 
-    type: Literal["text", "image", "tool_use", "tool_result"]
+    type: Literal[
+        "text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"
+    ]
     text: Optional[str] = None
     # For image content
     source: Optional[dict[str, Any]] = None
     # For tool use/result
     id: Optional[str] = None
+    tool_use_id: Optional[str] = None
     name: Optional[str] = None
     input: Optional[dict[str, Any]] = None
     content: Optional[str | list[dict[str, Any]]] = None
     is_error: Optional[bool] = None
+    # For thinking content
+    thinking: Optional[str] = None
+    signature: Optional[str] = None
 
 
 class AnthropicMessage(BaseModel):
@@ -71,7 +77,7 @@ class AnthropicTool(BaseModel):
 class AnthropicToolChoice(BaseModel):
     """Tool Choice definition"""
 
-    type: Literal["auto", "any", "tool"]
+    type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
 
 

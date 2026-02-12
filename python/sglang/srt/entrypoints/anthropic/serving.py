@@ -99,10 +99,11 @@ class AnthropicServing:
                     {"role": "system", "content": anthropic_request.system}
                 )
             else:
-                system_text = ""
+                system_parts = []
                 for block in anthropic_request.system:
                     if block.type == "text" and block.text:
-                        system_text += block.text
+                        system_parts.append(block.text)
+                system_text = "\n".join(system_parts)
                 openai_messages.append({"role": "system", "content": system_text})
 
         # Convert messages
@@ -121,11 +122,13 @@ class AnthropicServing:
                     content_parts.append({"type": "text", "text": block.text})
 
                 elif block.type == "image" and block.source:
+                    media_type = block.source.get("media_type", "image/png")
+                    data = block.source.get("data", "")
                     content_parts.append(
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": block.source.get("data", ""),
+                                "url": f"data:{media_type};base64,{data}",
                             },
                         }
                     )
@@ -142,22 +145,33 @@ class AnthropicServing:
                     tool_calls.append(tool_call)
 
                 elif block.type == "tool_result":
+                    # Extract text content from list or string
+                    if isinstance(block.content, list):
+                        tool_content = "\n".join(
+                            item.get("text", "")
+                            for item in block.content
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        )
+                    else:
+                        tool_content = str(block.content) if block.content else ""
+
+                    # Use tool_use_id (per spec) with fallback to id
+                    tool_call_id = block.tool_use_id or block.id or ""
+
                     # Tool results from user become separate tool messages
                     if msg.role == "user":
-                        tool_content = str(block.content) if block.content else ""
                         openai_messages.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": block.id or "",
+                                "tool_call_id": tool_call_id,
                                 "content": tool_content,
                             }
                         )
                     else:
-                        tool_result_text = str(block.content) if block.content else ""
                         content_parts.append(
                             {
                                 "type": "text",
-                                "text": f"Tool result: {tool_result_text}",
+                                "text": f"Tool result: {tool_content}",
                             }
                         )
 
@@ -217,7 +231,9 @@ class AnthropicServing:
 
         # Convert tool choice
         if anthropic_request.tool_choice is not None:
-            if anthropic_request.tool_choice.type == "auto":
+            if anthropic_request.tool_choice.type == "none":
+                chat_request.tool_choice = "none"
+            elif anthropic_request.tool_choice.type == "auto":
                 chat_request.tool_choice = "auto"
             elif anthropic_request.tool_choice.type == "any":
                 chat_request.tool_choice = "required"
@@ -274,7 +290,7 @@ class AnthropicServing:
             return self._error_response(
                 status_code=500,
                 error_type="internal_error",
-                message=str(e),
+                message="Internal server error",
             )
 
         # Check for error responses from OpenAI handler
@@ -324,7 +340,7 @@ class AnthropicServing:
             return self._error_response(
                 status_code=500,
                 error_type="internal_error",
-                message=str(e),
+                message="Internal server error",
             )
 
         return StreamingResponse(
@@ -411,12 +427,20 @@ class AnthropicServing:
                 chunk = ChatCompletionStreamResponse.model_validate_json(data_str)
             except Exception:
                 logger.debug("Failed to parse stream chunk: %s", data_str)
+                error_event = AnthropicStreamEvent(
+                    type="error",
+                    error=AnthropicError(
+                        type="api_error", message="Stream processing error"
+                    ),
+                )
+                yield _wrap_sse_event(
+                    error_event.model_dump_json(exclude_none=True), "error"
+                )
                 continue
 
             # First chunk: emit message_start
             if first_chunk:
                 first_chunk = False
-                message_id = chunk.id or message_id
 
                 start_event = AnthropicStreamEvent(
                     type="message_start",
@@ -561,6 +585,14 @@ class AnthropicServing:
         self, response: ChatCompletionResponse
     ) -> AnthropicMessagesResponse:
         """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
+        if not response.choices:
+            return AnthropicMessagesResponse(
+                content=[AnthropicContentBlock(type="text", text="")],
+                model=response.model,
+                stop_reason="end_turn",
+                usage=AnthropicUsage(input_tokens=0, output_tokens=0),
+            )
+
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
@@ -591,7 +623,7 @@ class AnthropicServing:
         stop_reason = STOP_REASON_MAP.get(choice.finish_reason or "stop", "end_turn")
 
         return AnthropicMessagesResponse(
-            id=response.id,
+            id=f"msg_{uuid.uuid4().hex}",
             content=content,
             model=response.model,
             stop_reason=stop_reason,
@@ -670,5 +702,5 @@ class AnthropicServing:
             return self._error_response(
                 status_code=500,
                 error_type="internal_error",
-                message=str(e),
+                message="Internal server error",
             )

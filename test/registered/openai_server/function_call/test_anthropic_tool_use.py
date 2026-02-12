@@ -101,7 +101,6 @@ class TestAnthropicToolUse(CustomTestCase):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
         }
         return requests.post(
             self.messages_url,
@@ -344,6 +343,7 @@ class TestAnthropicToolUse(CustomTestCase):
                 },
             ],
             "tools": [WEATHER_TOOL],
+            "tool_choice": {"type": "any"},
         }
         resp = self._make_request(payload, stream=True)
         self.assertEqual(resp.status_code, 200)
@@ -363,35 +363,39 @@ class TestAnthropicToolUse(CustomTestCase):
             if e.get("content_block", {}).get("type") == "tool_use"
         ]
 
-        if len(tool_use_starts) > 0:
-            # Verify tool_use content_block_start has proper structure
-            tool_start = tool_use_starts[0]
-            self.assertIn("content_block", tool_start)
-            self.assertEqual(tool_start["content_block"]["type"], "tool_use")
-            self.assertIn("id", tool_start["content_block"])
-            self.assertIn("name", tool_start["content_block"])
+        self.assertTrue(
+            len(tool_use_starts) > 0,
+            "Expected tool_use content_block_start events with tool_choice=any",
+        )
 
-            # Check for input_json_delta events
-            input_deltas = [
-                e
-                for e in events
-                if e["type"] == "content_block_delta"
-                and e.get("delta", {}).get("type") == "input_json_delta"
-            ]
-            # Tool calls should have at least some argument deltas
-            self.assertTrue(
-                len(input_deltas) > 0,
-                "Expected input_json_delta events for tool call",
-            )
+        # Verify tool_use content_block_start has proper structure
+        tool_start = tool_use_starts[0]
+        self.assertIn("content_block", tool_start)
+        self.assertEqual(tool_start["content_block"]["type"], "tool_use")
+        self.assertIn("id", tool_start["content_block"])
+        self.assertIn("name", tool_start["content_block"])
 
-            # Verify message_delta has stop_reason=tool_use
-            message_deltas = [e for e in events if e["type"] == "message_delta"]
-            self.assertTrue(len(message_deltas) > 0)
-            self.assertEqual(
-                message_deltas[-1]["delta"]["stop_reason"],
-                "tool_use",
-                "Expected stop_reason 'tool_use' in streaming",
-            )
+        # Check for input_json_delta events
+        input_deltas = [
+            e
+            for e in events
+            if e["type"] == "content_block_delta"
+            and e.get("delta", {}).get("type") == "input_json_delta"
+        ]
+        # Tool calls should have at least some argument deltas
+        self.assertTrue(
+            len(input_deltas) > 0,
+            "Expected input_json_delta events for tool call",
+        )
+
+        # Verify message_delta has stop_reason=tool_use
+        message_deltas = [e for e in events if e["type"] == "message_delta"]
+        self.assertTrue(len(message_deltas) > 0)
+        self.assertEqual(
+            message_deltas[-1]["delta"]["stop_reason"],
+            "tool_use",
+            "Expected stop_reason 'tool_use' in streaming",
+        )
 
     def test_tool_use_streaming_args_parsing(self):
         """Test that streaming tool call arguments can be concatenated into valid JSON."""

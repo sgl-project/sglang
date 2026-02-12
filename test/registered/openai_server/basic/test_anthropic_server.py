@@ -55,7 +55,6 @@ class TestAnthropicServer(CustomTestCase):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
         }
         return requests.post(
             self.messages_url,
@@ -107,9 +106,13 @@ class TestAnthropicServer(CustomTestCase):
         self.assertGreater(body["usage"]["input_tokens"], 0)
         self.assertGreater(body["usage"]["output_tokens"], 0)
 
-        # Verify id and model
+        # Verify id format (must be msg_*) and model
         self.assertIn("id", body)
         self.assertIsInstance(body["id"], str)
+        self.assertTrue(
+            body["id"].startswith("msg_"),
+            f"ID should start with 'msg_', got: {body['id']}",
+        )
         self.assertIn("model", body)
 
     def test_multi_turn_messages(self):
@@ -403,7 +406,6 @@ class TestAnthropicServer(CustomTestCase):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
         }
         payload = {
             "model": self.model,
@@ -428,7 +430,6 @@ class TestAnthropicServer(CustomTestCase):
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
         }
         payload_no_system = {
             "model": self.model,
