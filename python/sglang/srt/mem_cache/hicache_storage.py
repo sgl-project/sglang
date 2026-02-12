@@ -11,22 +11,8 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
 logger = logging.getLogger(__name__)
 
-_USE_XXH3 = os.environ.get("SGLANG_USE_XXH3_HASH", "0") == "1"
-_XXH3_SEED = 1337
-
-if _USE_XXH3:
-    import xxhash
-
-    logger.info("Using XXH3-64 (seed=%d) for block hashing", _XXH3_SEED)
-
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
-    if _USE_XXH3:
-        return _get_hash_str_xxh3(token_ids, prior_hash)
-    return _get_hash_str_sha256(token_ids, prior_hash)
-
-
-def _get_hash_str_sha256(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
@@ -34,47 +20,24 @@ def _get_hash_str_sha256(token_ids: List[int], prior_hash: str = None) -> str:
 
     for t in token_ids:
         if isinstance(t, tuple):
+            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
             for elem in t:
                 hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
         else:
+            # Regular mode: single integer token
             hasher.update(t.to_bytes(4, byteorder="little", signed=False))
 
     return hasher.hexdigest()
 
 
-def _get_hash_str_xxh3(token_ids: List[int], prior_hash: str = None) -> str:
-    """XXH3-64 block hashing with seed 1337 (Dynamo standard).
-
-    Chaining: prior_hash bytes are prepended to the input so the hash
-    is position-aware (same tokens at different tree depths produce
-    different hashes).  Output is a 16-char hex string (64-bit).
-    """
-    import struct
-
-    # Build token bytes in one shot via struct.pack
-    has_tuples = any(isinstance(t, tuple) for t in token_ids)
-    if has_tuples:
-        parts = []
-        if prior_hash:
-            parts.append(bytes.fromhex(prior_hash))
-        for t in token_ids:
-            if isinstance(t, tuple):
-                parts.append(struct.pack(f"<{len(t)}I", *t))
-            else:
-                parts.append(struct.pack("<I", t))
-        buf = b"".join(parts)
-    else:
-        prefix = bytes.fromhex(prior_hash) if prior_hash else b""
-        token_bytes = struct.pack(f"<{len(token_ids)}I", *token_ids)
-        buf = prefix + token_bytes
-
-    digest = xxhash.xxh3_64_intdigest(buf, seed=_XXH3_SEED)
-    return format(digest, "016x")
-
-
 def hash_str_to_int64(hash_str: str) -> int:
-    """Convert hex hash string to signed 64-bit integer for events."""
+    """Convert SHA256 hex string to signed 64-bit integer for events.
+
+    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
+    """
+    # Take first 16 hex chars to get 64-bit value
     uint64_val = int(hash_str[:16], 16)
+    # Convert to signed int64 range [-2^63, 2^63-1]
     if uint64_val >= 2**63:
         return uint64_val - 2**64
     return uint64_val

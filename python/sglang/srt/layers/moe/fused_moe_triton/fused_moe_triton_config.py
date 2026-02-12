@@ -161,7 +161,7 @@ def get_default_config(
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 32,
                 "num_warps": 8,
-                "num_stages": 2 if _is_hip else int(os.environ.get("SGLANG_MOE_NUM_STAGES", 4)),
+                "num_stages": 2 if _is_hip else 4,
             }
             if M <= E:
                 config = {
@@ -170,7 +170,7 @@ def get_default_config(
                     "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": 1,
                     "num_warps": 4,
-                    "num_stages": 2 if _is_hip else int(os.environ.get("SGLANG_MOE_NUM_STAGES", 4)),
+                    "num_stages": 2 if _is_hip else 4,
                 }
         else:
             # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]
