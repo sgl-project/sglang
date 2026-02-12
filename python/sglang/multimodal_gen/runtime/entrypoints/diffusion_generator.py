@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
+    ShutdownReq,
     UnmergeLoraWeightsReq,
     format_lora_message,
 )
@@ -483,8 +484,13 @@ class DiffGenerator:
         If in local mode, it also shuts down the scheduler server.
         """
         # sends the shutdown command to the server
+        if self.local_scheduler_process and self.owns_scheduler_client:
+            try:
+                sync_scheduler_client.forward(ShutdownReq())
+            except Exception:
+                pass
+
         if self.local_scheduler_process:
-            logger.info("Waiting for local worker processes to terminate...")
             for process in self.local_scheduler_process:
                 process.join(timeout=10)
                 if process.is_alive():
