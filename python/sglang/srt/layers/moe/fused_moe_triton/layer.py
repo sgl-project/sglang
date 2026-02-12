@@ -121,6 +121,19 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
         )
+    elif a2a_backend.is_mori():
+        from sglang.srt.layers.moe.token_dispatcher import MoriEPDispatcher
+
+        return MoriEPDispatcher(
+            group=get_tp_group(),
+            router_topk=moe_runner_config.top_k,
+            permute_fusion=True,
+            num_experts=moe_runner_config.num_experts,
+            num_local_experts=moe_runner_config.num_local_experts,
+            hidden_size=moe_runner_config.hidden_size,
+            params_dtype=moe_runner_config.params_dtype,
+            deepep_mode=get_deepep_mode(),
+        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -679,6 +692,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MarlinMoEMethod",
                     "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16TritonMoEMethod",
                 ]
             )
             else loaded_weight
@@ -892,7 +906,10 @@ class FusedMoE(torch.nn.Module):
             loaded_weight.t().contiguous()
             if (
                 self.quant_method.__class__.__name__
-                == "CompressedTensorsWNA16MoEMethod"
+                in [
+                    "CompressedTensorsWNA16MoEMethod",
+                    "CompressedTensorsWNA16TritonMoEMethod",
+                ]
             )
             else loaded_weight
         )
@@ -940,16 +957,17 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                # Make sure there is torch lib op registration for the whole moe layer
+                return self.forward_impl(hidden_states, topk_output)
+            else:
+                return moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
         else:
             return self.forward_impl(hidden_states, topk_output)
 
@@ -1112,16 +1130,17 @@ class FlashInferFusedMoE(FusedMoE):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert TopKOutputChecker.format_is_standard(
-                topk_output
-            ), "Only standard topk output is supported for piecewise cuda graph"
-            return moe_forward_piecewise_cuda_graph_impl(
-                hidden_states,
-                topk_output.topk_weights,
-                topk_output.topk_ids,
-                topk_output.router_logits,
-                self.layer_id,
-            )
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                # Make sure there is torch lib op registration for the whole moe layer
+                return self.forward_impl(hidden_states, topk_output)
+            else:
+                return moe_forward_piecewise_cuda_graph_impl(
+                    hidden_states,
+                    topk_output.topk_weights,
+                    topk_output.topk_ids,
+                    topk_output.router_logits,
+                    self.layer_id,
+                )
         else:
             return self.forward_impl(hidden_states, topk_output)
 
@@ -1310,7 +1329,7 @@ class FlashInferFP4MoE(FusedMoE):
             routing_logits=router_logits,
             routing_bias=correction_bias,
             hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).flatten(),
+            hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn),
             gemm1_weights=self.gemm1_weights_fp4_shuffled.data,
             gemm1_weights_scale=self.gemm1_scales_fp4_shuffled.data.view(
                 torch.float8_e4m3fn
