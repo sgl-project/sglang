@@ -302,6 +302,9 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_config_filenames(cls) -> List[str]:
         return ["hf_quant_config.json"]
 
+    def get_cache_scale(self, name: str) -> Optional[str]:
+        return None
+
     def get_scaled_act_names(self) -> List[str]:
         return []
 
