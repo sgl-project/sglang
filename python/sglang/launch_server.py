@@ -3,7 +3,10 @@
 import asyncio
 import os
 import sys
-
+root = os.getcwd() 
+sys.path.insert(0, root)               
+src  = os.path.join(root, "python")
+sys.path.insert(0, src)
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings

@@ -545,6 +545,8 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        input_ids_list: Optional[List[List[int]]] = None,
+        chunk_status: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -555,6 +557,8 @@ class Req(ReqDllmMixin):
             else origin_input_ids  # Before image padding
         )
         self.origin_input_ids = origin_input_ids
+        self.input_ids_list = input_ids_list
+        self.chunk_status = chunk_status
         # Each decode stage's output ids
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
@@ -914,12 +918,14 @@ class Req(ReqDllmMixin):
                 self.last_host_node,
                 self.host_hit_length,
                 self.mamba_branching_seqlen,
+                
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
                 match_result.host_hit_length,
                 match_result.mamba_branching_seqlen,
+                
             )
             self.cache_protected_len = len(self.prefix_indices)
 

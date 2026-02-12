@@ -174,6 +174,8 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
+    # The token ids for text chunk
+    input_ids_list: Optional[List[List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -770,6 +772,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_image: bool = False
     num_items_assigned: Optional[List] = None
+
+    input_ids_list: Optional[List[List[int]]] = None
 
 
 @dataclass
