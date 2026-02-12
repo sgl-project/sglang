@@ -184,7 +184,7 @@ class TestDisaggregationPrefillWithHiCache(DisaggregationHiCacheBase):
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
-            port=21000,
+            port=self.lb_port,
         )
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["accuracy"], 0.86)
