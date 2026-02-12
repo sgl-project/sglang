@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
 
+try:
+    import deep_gemm
+except ImportError:
+    deep_gemm = None
 
 # =========================================================================================
 # Combined CUDA Source for All Operators
@@ -671,7 +675,7 @@ __global__ void cast_and_row_l2norm_kernel(
     }
 }
 
-std::tuple<torch::Tensor, torch::Tensor> norm_linear_cuda(
+std::tuple<torch::Tensor, torch::Tensor> norm_linear_fp32_cuda(
     torch::Tensor x, torch::Tensor weight
 ) {
     TORCH_CHECK(x.is_cuda() && weight.is_cuda(), "tensors must be CUDA");
@@ -938,13 +942,56 @@ std::vector<torch::Tensor> norm_linear_bf16_cuda(
     return {r, proj};
 }
 
+// ============ Reduce Finalize Operator ============
+__global__ void reduce_finalize_kernel(
+    const float* __restrict__ sum_sq_x_split,
+    float* __restrict__ r_out,
+    int M, int num_splits, float K_val, float eps
+) {
+    int m_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m_idx >= M) return;
+
+    float sum_sq = 0.0f;
+    // sum_sq_x_split is [num_splits, M]
+    for (int s = 0; s < num_splits; ++s) {
+        sum_sq += sum_sq_x_split[s * M + m_idx];
+    }
+    
+    r_out[m_idx] = sqrtf(sum_sq / K_val + eps);
+}
+
+void reduce_finalize_cuda(
+    torch::Tensor sum_sq_x_split,
+    torch::Tensor r_out,
+    float K_val,
+    float eps
+) {
+    TORCH_CHECK(sum_sq_x_split.is_cuda(), "sum_sq_x_split must be CUDA");
+    TORCH_CHECK(r_out.is_cuda(), "r_out must be CUDA");
+    
+    int64_t num_splits = sum_sq_x_split.size(0);
+    int64_t M = sum_sq_x_split.size(1);
+    
+    const int block_size = 256;
+    const int grid_size = (M + block_size - 1) / block_size;
+    
+    auto stream = at::cuda::getCurrentCUDAStream();
+    
+    reduce_finalize_kernel<<<grid_size, block_size, 0, stream>>>(
+        sum_sq_x_split.data_ptr<float>(),
+        r_out.data_ptr<float>(),
+        static_cast<int>(M), static_cast<int>(num_splits), K_val, eps
+    );
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("aggregate_cuda", &aggregate_cuda, "Aggregate Op");
     m.def("sinkhorn_cuda", &sinkhorn_cuda, "Sinkhorn Op");
     m.def("expand_merge_cuda", &expand_merge_cuda, "ExpandMerge Op");
     m.def("map_sigmoid_cuda", &map_sigmoid_cuda, "MapSigmoid Op");
-    m.def("norm_linear_cuda", &norm_linear_cuda, "NormLinear Op");
+    m.def("norm_linear_fp32_cuda", &norm_linear_fp32_cuda, "NormLinear FP32 Op");
     m.def("norm_linear_bf16_cuda", &norm_linear_bf16_cuda, "NormLinear BF16 Op");
+    m.def("reduce_finalize_cuda", &reduce_finalize_cuda, "Reduce Finalize Op");
 }
 """
 
@@ -1002,6 +1049,10 @@ class MHCCudaOps(nn.Module):
             out: [M, D], bf16
         """
         residuals, h_pre = self._ensure_contiguous(residuals, h_pre)
+
+        if residuals.size(0) == 0:
+            return torch.empty((0, residuals.size(2)), dtype=residuals.dtype, device=residuals.device)
+
         self._check_tensor("aggregate_input_residuals", residuals)
         self._check_tensor("aggregate_input_h_pre", h_pre)
         
@@ -1021,6 +1072,10 @@ class MHCCudaOps(nn.Module):
             matrix: [M, n_streams, n_streams], fp32
         """
         (logits,) = self._ensure_contiguous(logits)
+
+        if logits.size(0) == 0:
+            return torch.empty_like(logits)
+
         self._check_tensor("sinkhorn_input_logits", logits)
 
         out = self._module.sinkhorn_cuda(logits, n_iters)
@@ -1044,6 +1099,9 @@ class MHCCudaOps(nn.Module):
             residuals, layer_output, h_res, h_post
         )
         
+        if residuals.size(0) == 0:
+            return torch.empty_like(residuals)
+
         self._check_tensor("expand_merge_input_residuals", residuals)
         self._check_tensor("expand_merge_input_layer_output", layer_output)
         self._check_tensor("expand_merge_input_h_res", h_res)
@@ -1079,11 +1137,6 @@ class MHCCudaOps(nn.Module):
         ], dim=-1).contiguous()
         
         r, proj, bias, alpha = self._ensure_contiguous(r, proj, bias, alpha)
-        
-        self._check_tensor("map_sigmoid_input_r", r)
-        self._check_tensor("map_sigmoid_input_proj", proj)
-        self._check_tensor("map_sigmoid_input_bias", bias)
-        self._check_tensor("map_sigmoid_input_alpha", alpha)
 
         M = r.size(0)
         
@@ -1092,6 +1145,14 @@ class MHCCudaOps(nn.Module):
         out_pre = torch.empty((M, n_streams), device=r.device, dtype=torch.float32)
         out_post = torch.empty((M, n_streams), device=r.device, dtype=torch.float32)
         out_res = torch.empty((M, n_streams, n_streams), device=r.device, dtype=torch.float32)
+        
+        if M == 0:
+            return out_pre, out_post, out_res
+        
+        self._check_tensor("map_sigmoid_input_r", r)
+        self._check_tensor("map_sigmoid_input_proj", proj)
+        self._check_tensor("map_sigmoid_input_bias", bias)
+        self._check_tensor("map_sigmoid_input_alpha", alpha)
 
         self._module.map_sigmoid_cuda(
             r, proj, bias, alpha,
@@ -1105,7 +1166,7 @@ class MHCCudaOps(nn.Module):
 
         return out_pre, out_post, out_res
     
-    def norm_linear(self, x, weight):
+    def norm_linear_fp32(self, x, weight):
         """
         Perform fused Norm and Linear operation.
         
@@ -1117,14 +1178,23 @@ class MHCCudaOps(nn.Module):
             proj: [M, 2 * n_streams + n_streams * n_streams], fp32
         """
         x, weight = self._ensure_contiguous(x, weight)
-        self._check_tensor("norm_linear_input_x", x)
-        self._check_tensor("norm_linear_input_weight", weight)
 
         x_flat = x.flatten(1)
-        r, proj = self._module.norm_linear_cuda(x_flat, weight)
+        M = x_flat.size(0)
+        N = weight.size(0)
         
-        self._check_tensor("norm_linear_output_r", r)
-        self._check_tensor("norm_linear_output_proj", proj)
+        if M == 0:
+             r = torch.empty((0, 1), device=x.device, dtype=torch.float32)
+             proj = torch.empty((0, N), device=x.device, dtype=torch.float32)
+             return r, proj
+
+        self._check_tensor("norm_linear_fp32_input_x", x)
+        self._check_tensor("norm_linear_fp32_input_weight", weight)
+
+        r, proj = self._module.norm_linear_fp32_cuda(x_flat, weight)
+        
+        self._check_tensor("norm_linear_fp32_output_r", r)
+        self._check_tensor("norm_linear_fp32_output_proj", proj)
         return r, proj
     
     def norm_linear_bf16(self, x, weight):
@@ -1136,14 +1206,24 @@ class MHCCudaOps(nn.Module):
         
         Args:
             x: [M, n_streams, D], bf16
-            weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32 or bf16
+            weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32
         Returns:
             r: [M, 1], fp32
             proj: [M, 2 * n_streams + n_streams * n_streams], fp32
         """
-        self._check_tensor("norm_linear_bf16_input_x", x)
         x = x.contiguous()
         x_flat = x.flatten(1)
+        
+        M = x_flat.size(0)
+        N = weight.size(0)
+        
+        if M == 0:
+             r = torch.empty((0, 1), device=x.device, dtype=torch.float32)
+             proj = torch.empty((0, N), device=x.device, dtype=torch.float32)
+             return r, proj
+
+        self._check_tensor("norm_linear_bf16_input_x", x)
+
         weight = weight.to(dtype=torch.bfloat16, memory_format=torch.contiguous_format)
 
         results = self._module.norm_linear_bf16_cuda(x_flat, weight)
@@ -1153,6 +1233,73 @@ class MHCCudaOps(nn.Module):
         self._check_tensor("norm_linear_bf16_output_proj", proj)
         return r, proj
     
+    def norm_linear_tf32(self, x, weight):
+        """
+        DeepGEMM accelerated RMS normalization and linear projection operation using CUDA.
+        Args:
+            x: [M, n_streams, D], bf16
+            weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32
+        Returns:
+            r: [M, 1], fp32
+            proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+        """
+        if deep_gemm is None or not hasattr(deep_gemm, "tf32_hc_prenorm_gemm"):
+            return self.norm_linear_bf16(x, weight)
+
+        x, weight = self._ensure_contiguous(x, weight)
+
+        x_in = x.flatten(1)
+        M, K = x_in.shape
+        N, K_w = weight.shape
+
+        out_y = torch.empty((M, N), dtype=torch.float32, device=x.device)
+        out_r = torch.empty((M, 1), dtype=torch.float32, device=x.device)
+        
+        if M == 0:
+            return out_r, out_y
+
+        self._check_tensor("norm_linear_tf32_input_x", x)
+        self._check_tensor("norm_linear_tf32_input_weight", weight)
+        assert K == K_w, f"Shape mismatch"
+
+        # Split-K logic from DeepGEMM
+        num_splits = 16
+        sum_sq_x_split = torch.empty((num_splits, M), device=x.device, dtype=torch.float32)
+        proj_out_split = torch.empty((num_splits, M, N), device=x.device, dtype=torch.float32)
+        
+        # DeepGEMM optimization: Fused GEMM + Pre-Norm Stats
+        deep_gemm.tf32_hc_prenorm_gemm(x_in, weight, proj_out_split, sum_sq_x_split, num_splits)
+        
+        # Reduce Split-K results
+        # Optimization: Use out= parameter to avoid intermediate buffer allocation and copy
+        torch.sum(proj_out_split, dim=0, out=out_y)
+
+        # Compute r from sum_sq_x using CUDA kernel
+        eps = 1e-6
+        self._module.reduce_finalize_cuda(sum_sq_x_split, out_r, float(K), eps)
+        
+        self._check_tensor("norm_linear_tf32_output_r", out_r)
+        self._check_tensor("norm_linear_tf32_output_proj", out_y)
+        return out_r, out_y
+
+    def norm_linear(self, x, weight):
+        """
+        Unified NormLinear operator that automatically selects the best implementation.
+        
+        Uses tf32_hc_prenorm_gemm (DeepGEMM) if available, otherwise falls back to bf16 implementation.
+        
+        Args:
+            x: [M, n_streams, D], bf16
+            weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32 or bf16
+        Returns:
+            r: [M, 1], fp32
+            proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+        """
+        if deep_gemm is not None and hasattr(deep_gemm, "tf32_hc_prenorm_gemm"):
+            return self.norm_linear_tf32(x, weight)
+        else:
+            return self.norm_linear_bf16(x, weight)
+
     def forward(self, *args, **kwargs):
         """
         Forward pass - not used directly, call specific methods instead.
@@ -1196,11 +1343,32 @@ def mhc_cuda_map_sigmoid(r, proj, bias, alpha_pre, alpha_post, alpha_res, n_stre
     return _get_ops().map_sigmoid(r, proj, bias, alpha_pre, alpha_post, alpha_res, n_streams)
 
 
-def mhc_cuda_norm_linear(x, weight):
+def mhc_cuda_norm_linear_fp32(x, weight):
     """compatible function."""
-    return _get_ops().norm_linear(x, weight)
+    return _get_ops().norm_linear_fp32(x, weight)
 
 
 def mhc_cuda_norm_linear_bf16(x, weight):
     """BF16 optimized compatible function."""
     return _get_ops().norm_linear_bf16(x, weight)
+
+
+def mhc_cuda_norm_linear_tf32(x, weight):
+    """DeepGEMM compatible function."""
+    return _get_ops().norm_linear_tf32(x, weight)
+
+
+def mhc_cuda_norm_linear(x, weight):
+    """
+    Unified NormLinear function that automatically selects the best implementation.
+    
+    Uses tf32_hc_prenorm_gemm (DeepGEMM) if available, otherwise falls back to bf16 implementation.
+    
+    Args:
+        x: [M, n_streams, D], bf16
+        weight: [2 * n_streams + n_streams * n_streams, n_streams * D], fp32
+    Returns:
+        r: [M, 1], fp32
+        proj: [M, 2 * n_streams + n_streams * n_streams], fp32
+    """
+    return _get_ops().norm_linear(x, weight)

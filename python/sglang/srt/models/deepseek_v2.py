@@ -2411,12 +2411,21 @@ class DeepseekV2DecoderLayer(nn.Module):
                 zero_allocator=zero_allocator,
                 llama_4_scaling=llama_4_scaling,
             )
-            if (
+            
+            should_reduce = (
                 (not self.self_attn.o_proj.reduce_results)
-                and (get_tensor_model_parallel_world_size() > 1)
+                and (get_attention_tp_size() > 1)  # Use attn_tp_size instead of global tp_size
                 and (not self.nsa_enable_prefill_cp)
-            ):
-                attn_out = tensor_model_parallel_all_reduce(attn_out)
+            )
+            
+            if should_reduce:
+                if get_attn_tp_context().input_scattered:
+                    # DP Attention / SP mode: input is scattered, so we must reduce-scatter to keep output scattered
+                    # matching the shape of residual.
+                    attn_out, _ = self.layer_communicator._tp_reduce_scatter(attn_out, None)
+                else:
+                    # Pure TP mode (within attn_tp_group): input is replicated, so we all-reduce to keep output replicated.
+                    attn_out = tensor_model_parallel_all_reduce(attn_out)
                 
             # 4. Update residual
             residual = self.self_attention_hyper_connection.forward_out(residual, attn_out, attn_h_post, attn_h_res)
@@ -2425,21 +2434,66 @@ class DeepseekV2DecoderLayer(nn.Module):
             # 1. Aggregate input
             x_in, mlp_h_post, mlp_h_res = self.mlp_hyper_connection.forward_in(residual)
             
-            # 2. Norm
-            x_norm = self.post_attention_layernorm(x_in)
+            # 2. Handle DP Attention: gather tokens before MoE, scatter after
+            # In DP Attention mode, MoE needs all tokens from all DP ranks.
+            # We need to mimic what prepare_mlp and postprocess_layer do.
+            _dp_attention_enabled = is_dp_attention_enabled()
             
-            if isinstance(self.mlp, DeepseekV2MLP):
-                gemm_output_zero_allocator = None
+            if _dp_attention_enabled:
+                from sglang.srt.layers.dp_attention import (
+                    dp_gather_partial,
+                    dp_scatter,
+                    get_global_dp_buffer,
+                    get_local_dp_buffer,
+                    get_attention_dp_size,
+                )
+                _attn_dp_size = get_attention_dp_size()
+            else:
+                _attn_dp_size = 1
             
-            # 3. FFN
-            # We don't use allreduce fusion or reduce scatter for now in mHC path
-            mlp_out = self.mlp(
-                x_norm,
-                forward_batch=forward_batch,
-                should_allreduce_fusion=False,
-                use_reduce_scatter=False,
-                gemm_output_zero_allocator=gemm_output_zero_allocator,
-            )
+            if _dp_attention_enabled and _attn_dp_size > 1:
+                # Save x_in for residual computation after MoE
+                x_in_local = x_in
+                
+                # Gather tokens from all DP ranks
+                global_x_in = get_global_dp_buffer()
+                dp_gather_partial(global_x_in, x_in, forward_batch)
+                
+                # Apply LayerNorm on gathered data
+                x_norm = self.post_attention_layernorm(global_x_in)
+                
+                if isinstance(self.mlp, DeepseekV2MLP):
+                    gemm_output_zero_allocator = None
+                
+                # 3. FFN on global data
+                mlp_out = self.mlp(
+                    x_norm,
+                    forward_batch=forward_batch,
+                    should_allreduce_fusion=False,
+                    use_reduce_scatter=False,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                )
+                
+                # Scatter back to local
+                local_mlp_out = get_local_dp_buffer()
+                dp_scatter(local_mlp_out, mlp_out, forward_batch)
+                mlp_out = local_mlp_out[:x_in_local.shape[0]]
+            else:
+                # Non-DP or DP with dp_size=1: standard path
+                # 2. Norm
+                x_norm = self.post_attention_layernorm(x_in)
+                
+                if isinstance(self.mlp, DeepseekV2MLP):
+                    gemm_output_zero_allocator = None
+                
+                # 3. FFN
+                mlp_out = self.mlp(
+                    x_norm,
+                    forward_batch=forward_batch,
+                    should_allreduce_fusion=False,
+                    use_reduce_scatter=False,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
+                )
             
             # 4. Update residual
             residual = self.mlp_hyper_connection.forward_out(residual, mlp_out, mlp_h_post, mlp_h_res)

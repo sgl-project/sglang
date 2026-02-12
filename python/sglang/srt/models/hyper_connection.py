@@ -39,12 +39,11 @@ class HyperConnectionModule(nn.Module):
 
         # Initialize unified CUDA ops module (compiled once, cached tensors)
         self.cuda_ops = MHCCudaOps()
-        self.norm_linear_func = self.cuda_ops.norm_linear_bf16
+        self.norm_linear_func = self.cuda_ops.norm_linear
         self.map_sigmoid_func = self.cuda_ops.map_sigmoid
         self.sinkhorn_func = self.cuda_ops.sinkhorn
         self.aggregate_func = self.cuda_ops.aggregate
         self.expand_merge_func = self.cuda_ops.expand_merge
-
 
     def compute_mappings(
         self, 
