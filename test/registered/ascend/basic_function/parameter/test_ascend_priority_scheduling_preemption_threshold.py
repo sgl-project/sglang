@@ -40,12 +40,12 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args = [
+            other_args=[
                 "--max-running-requests",
                 "1",  # Limit concurrent running requests to 1
                 "--max-queued-requests",
                 "10",
-                "--enable-priority-scheduling", # Enable priority scheduling (required for preemption)
+                "--enable-priority-scheduling",  # Enable priority scheduling (required for preemption)
                 "--priority-scheduling-preemption-threshold",
                 "5",
                 "--disable-cuda-graph",
@@ -130,7 +130,7 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
 
         loop.close()
 
-        expected_status = [(200, None)] * 3  
+        expected_status = [(200, None)] * 3
         e2e_latencies = []
         _verify_generate_responses(all_responses, expected_status, e2e_latencies)
 
@@ -138,8 +138,9 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
         latency_c = e2e_latencies[1]
         latency_b = e2e_latencies[2]
 
-        assert latency_c < latency_b < latency_a, \
-            f"expected C<B<A，actually：C={latency_c}, A={latency_a}, B={latency_b}"
+        assert (
+            latency_c < latency_b < latency_a
+        ), f"expected C<B<A，actually：C={latency_c}, A={latency_a}, B={latency_b}"
 
     def test_preemption_threshold_execution_order_exa(self):
         """Test extended preemption threshold logic (same low priority → FIFO execution order)
@@ -170,9 +171,9 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
         loop.run_until_complete(asyncio.sleep(0.5))
 
         request_c = {
-            "text":"repeat the words France",
+            "text": "repeat the words France",
             "priority": 10,
-            "sampling_params": {"max_new_tokens": 100}  
+            "sampling_params": {"max_new_tokens": 100},
         }
         responses_c = loop.run_until_complete(
             send_concurrent_generate_requests_with_custom_params(
@@ -197,7 +198,7 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
 
         loop.close()
 
-        expected_status = [(200, None)] * 3 
+        expected_status = [(200, None)] * 3
         e2e_latencies = []
         _verify_generate_responses(all_responses, expected_status, e2e_latencies)
 
@@ -205,8 +206,9 @@ class TestPrioritySchedulingPreemptionThreshold(CustomTestCase):
         latency_c = e2e_latencies[1]
         latency_b = e2e_latencies[2]
 
-        assert latency_c < latency_a < latency_b, \
-            f"expected C<A<B，accurate：C={latency_c}, A={latency_a}, B={latency_b}"
+        assert (
+            latency_c < latency_a < latency_b
+        ), f"expected C<A<B，accurate：C={latency_c}, A={latency_a}, B={latency_b}"
 
 
 def _verify_generate_responses(
@@ -215,11 +217,11 @@ def _verify_generate_responses(
     e2e_latencies: List[Optional[float]],
 ):
     # Verify generate request responses match expected status codes and extract valid e2e latencies (fix syntax/logic errors)
-    e2e_latencies.clear() 
+    e2e_latencies.clear()
     for got, expected in zip(responses, expected_code_and_error):
         got_status, got_json = got
         expected_status, expected_err = expected
-        
+
         assert (
             got_status == expected_status
         ), f"expected_status:{expected_status}，actually{got_status}，response：{got_json}"
@@ -256,14 +258,14 @@ def _verify_running_queued_requests(
                 running_req_count = int(rr_match.group(1))
                 assert (
                     running_req_count <= max_running_requests
-                ),f"running_req_count：{running_req_count} > {max_running_requests}"
+                ), f"running_req_count：{running_req_count} > {max_running_requests}"
 
             qr_match = qr_pattern.search(line)
             if qr_match:
                 queued_req_count = int(qr_match.group(1))
                 assert (
                     queued_req_count <= max_queued_requests
-                ),f"queued_req_count：{queued_req_count} > {max_queued_requests}"
+                ), f"queued_req_count：{queued_req_count} > {max_queued_requests}"
 
 
 if __name__ == "__main__":
