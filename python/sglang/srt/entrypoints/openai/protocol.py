@@ -897,6 +897,8 @@ class EmbeddingRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # Priority for the request
     priority: Optional[int] = None
+    # LoRA adapter path(s)
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
 
 class EmbeddingObject(BaseModel):

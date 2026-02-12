@@ -41,6 +41,7 @@ if _is_cuda or _is_hip:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
     if _is_hip:
+        _has_vllm = False
         if _use_aiter:
             try:
                 from aiter import moe_sum
@@ -49,7 +50,13 @@ if _is_cuda or _is_hip:
                     "aiter is required when SGLANG_USE_AITER is set to True"
                 )
         else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
+            try:
+                from vllm import _custom_ops as vllm_ops  # moe_sum
+
+                _has_vllm = True
+            except ImportError:
+                # Fallback: vllm not available, will use triton moe_sum
+                _has_vllm = False
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_xpu:
@@ -314,10 +321,17 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
-            else:
+            elif _has_vllm:
                 vllm_ops.moe_sum(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
+                )
+            else:
+                # Fallback: use triton moe_sum when vllm is not available
+                moe_sum_reduce_triton(
+                    intermediate_cache3.view(*intermediate_cache3.shape),
+                    out_hidden_states,
+                    routed_scaling_factor,
                 )
         elif _is_xpu:
             moe_sum_reduce(
