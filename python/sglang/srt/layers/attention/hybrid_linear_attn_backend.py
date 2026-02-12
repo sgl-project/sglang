@@ -1072,7 +1072,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         except Exception as e:
             logger.warning(f"FlashInfer GDN MTP kernel warmup failed: {e}")
-            self._flashinfer_gated_delta_rule_mtp = None
 
     def _warmup_decode_kernel(self):
         """Warmup FlashInfer decode kernel to avoid JIT compilation overhead during serving.
@@ -1140,7 +1139,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         except Exception as e:
             logger.warning(f"FlashInfer GDN decode kernel warmup failed: {e}")
-            self._flashinfer_gated_delta_rule_decode = None
 
     def forward_decode(
         self,
