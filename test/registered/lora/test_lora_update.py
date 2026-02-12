@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=451, suite="stage-b-test-small-1-gpu")
+register_cuda_ci(est_time=487, suite="stage-b-test-large-1-gpu")
 
 PROMPTS = [
     "SGL is a",
@@ -221,17 +221,7 @@ BASIC_TESTS = [
         base="meta-llama/Llama-3.1-8B-Instruct",
         enable_lora=True,
         max_lora_rank=256,
-        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-        # lora_target_modules=["all"],
-        lora_target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        lora_target_modules=["all"],
         max_loras_per_batch=4,
         all_adapters=[
             "philschmid/code-llama-3-1-8b-text-to-sql-lora",
@@ -350,17 +340,7 @@ TARGET_MODULE_TESTS = [
         description="Test explicitly specified lora-target-modules.",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=3,
-        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-        # lora_target_modules=["all"],
-        lora_target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        lora_target_modules=["all"],
         max_lora_rank=64,
         all_adapters=[
             "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16",  # target_modules = q, k, v, o, gate, up, down
@@ -766,17 +746,7 @@ EVICTION_TESTS = [
         ],
         enable_lora=True,
         max_lora_rank=256,
-        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-        # lora_target_modules=["all"],
-        lora_target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        lora_target_modules=["all"],
         op_sequence=[
             Operation(
                 type=OperationType.LOAD,
@@ -1528,17 +1498,7 @@ class TestLoRADynamicUpdate(CustomTestCase):
             lora_paths=[],
             max_loras_per_batch=2,
             max_lora_rank=256,
-            # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
-            # lora_target_modules=["all"],
-            lora_target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            lora_target_modules=["all"],
             enable_lora=True,
         ) as session:
             # Test with no adapters loaded

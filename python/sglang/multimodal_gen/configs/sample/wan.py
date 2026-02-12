@@ -273,6 +273,14 @@ class Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
     )
 
 
+@dataclass
+class Turbo_Wan2_2_I2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
+    guidance_scale: float = 3.5  # high_noise
+    guidance_scale_2: float = 3.5  # low_noise
+    num_inference_steps: int = 4
+    fps: int = 16
+
+
 # =============================================
 # ============= Causal Self-Forcing =============
 # =============================================

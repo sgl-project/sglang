@@ -4,6 +4,7 @@
 pub mod mock_mcp_server;
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod redis_test_server;
 pub mod streaming_helpers;
 pub mod test_app;
 pub mod test_certs;
@@ -17,6 +18,9 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+use data_connector::{
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+};
 use mock_worker::{MockWorker, MockWorkerConfig};
 use serde_json::json;
 use smg::{
@@ -25,9 +29,6 @@ use smg::{
     core::{
         BasicWorkerBuilder, Job, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry,
         WorkerType,
-    },
-    data_connector::{
-        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
     middleware::TokenBucket,
     policies::PolicyRegistry,
@@ -322,9 +323,9 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
 
     let app_context = Arc::new(
@@ -342,7 +343,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
@@ -356,22 +357,13 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize WorkflowEngine and register workflows
-    use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
-        workflow::WorkflowEngine,
-    };
-    let engine = Arc::new(WorkflowEngine::new());
-    engine
-        .register_workflow(create_worker_registration_workflow(&config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
+    // Initialize typed workflow engines
+    use smg::core::steps::WorkflowEngines;
+    let engines = WorkflowEngines::new(&config);
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
 
     // Register external workers for OpenAI mode
     if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
@@ -394,7 +386,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
     }
 
     // Initialize MCP manager with empty config
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -451,9 +443,9 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
 
     // Initialize parser factories
@@ -475,7 +467,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
@@ -489,22 +481,13 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize WorkflowEngine and register workflows
-    use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
-        workflow::WorkflowEngine,
-    };
-    let engine = Arc::new(WorkflowEngine::new());
-    engine
-        .register_workflow(create_worker_registration_workflow(&config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
+    // Initialize typed workflow engines
+    use smg::core::steps::WorkflowEngines;
+    let engines = WorkflowEngines::new(&config);
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
 
     // Register external workers for OpenAI mode
     if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
@@ -527,7 +510,7 @@ pub async fn create_test_context_with_parsers(config: RouterConfig) -> Arc<AppCo
     }
 
     // Initialize MCP manager with empty config
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -552,7 +535,7 @@ pub async fn create_test_context_with_mcp_config(
     config: RouterConfig,
     mcp_config_path: &str,
 ) -> Arc<AppContext> {
-    use smg::mcp::{McpConfig, McpManager};
+    use smg_mcp::{McpConfig, McpManager};
 
     let client = reqwest::Client::new();
 
@@ -588,9 +571,9 @@ pub async fn create_test_context_with_mcp_config(
         config.worker_startup_check_interval_secs,
     )));
 
-    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    // Create empty OnceLock for worker job queue, workflow engines, and mcp manager
     let worker_job_queue = Arc::new(OnceLock::new());
-    let workflow_engine = Arc::new(OnceLock::new());
+    let workflow_engines = Arc::new(OnceLock::new());
     let mcp_manager_lock = Arc::new(OnceLock::new());
 
     let app_context = Arc::new(
@@ -608,7 +591,7 @@ pub async fn create_test_context_with_mcp_config(
             .conversation_item_storage(conversation_item_storage)
             .load_monitor(load_monitor)
             .worker_job_queue(worker_job_queue)
-            .workflow_engine(workflow_engine)
+            .workflow_engines(workflow_engines)
             .mcp_manager(mcp_manager_lock)
             .build()
             .unwrap(),
@@ -622,22 +605,13 @@ pub async fn create_test_context_with_mcp_config(
         .set(job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize WorkflowEngine and register workflows
-    use smg::{
-        core::steps::{create_worker_registration_workflow, create_worker_removal_workflow},
-        workflow::WorkflowEngine,
-    };
-    let engine = Arc::new(WorkflowEngine::new());
-    engine
-        .register_workflow(create_worker_registration_workflow(&config))
-        .expect("worker_registration workflow should be valid");
-    engine
-        .register_workflow(create_worker_removal_workflow())
-        .expect("worker_removal workflow should be valid");
+    // Initialize typed workflow engines
+    use smg::core::steps::WorkflowEngines;
+    let engines = WorkflowEngines::new(&config);
     app_context
-        .workflow_engine
-        .set(engine)
-        .expect("WorkflowEngine should only be initialized once");
+        .workflow_engines
+        .set(engines)
+        .expect("WorkflowEngines should only be initialized once");
 
     // Register external workers for OpenAI mode
     if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
