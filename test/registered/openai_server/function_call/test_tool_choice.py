@@ -883,7 +883,7 @@ class TestToolChoiceLfm2(TestToolChoiceLlama32):
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(cls.model)
 
-
+@unittest.skipIf(is_hip(), "Disabled for AMD: aiter backend does not support hybrid Mamba2 models")
 class TestToolChoiceLfm2Moe(TestToolChoiceLlama32):
     """Test tool_choice functionality with LiquidAI LFM2-MoE model"""
 
