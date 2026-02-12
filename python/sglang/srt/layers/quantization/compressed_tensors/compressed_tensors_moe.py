@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
@@ -131,8 +132,35 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         # TODO: @dsikka: refactor this to use schemes as other kernels
         # are supported + check if the layer is being ignored.
 
-        weight_quant = quant_config.target_scheme_map["Linear"].get("weights")
-        input_quant = quant_config.target_scheme_map["Linear"].get("input_activations")
+        # FusedMoE was made by combining multiple Linears so need to
+        # make sure quantization config for Linear can target it
+        quant_config._add_fused_moe_to_target_scheme_map()
+        unfused_names = [
+            prefix + proj_name
+            for proj_name in [".0.gate_proj", ".0.up_proj", ".0.down_proj"]
+        ]
+        # TODO: refactor this to use expert_mapping and check all layer numbers
+        all_scheme_dicts = [
+            quant_config.get_scheme_dict(layer, name) for name in unfused_names
+        ]
+        scheme_dict = all_scheme_dicts[0] if all_scheme_dicts else None
+
+        # multiple schemes found
+        if not all(d == scheme_dict for d in all_scheme_dicts):
+            raise ValueError(
+                "All MoE projections need to have same "
+                "quantization scheme but found multiple"
+            )
+
+        use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
+        if scheme_dict is None:  # ignored layer
+            return UnquantizedFusedMoEMethod(
+                use_triton_kernels, use_flashinfer_trtllm_moe
+            )
+
+        weight_quant = scheme_dict.get("weights")
+        input_quant = scheme_dict.get("input_activations")
 
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             if not _is_npu:
