@@ -7,8 +7,8 @@ Freda Shi, Mirac Suzgun, Markus Freitag, Xuezhi Wang, Suraj Srivats, Soroush Vos
 https://arxiv.org/abs/2210.03057 reference: https://github.com/google-research/url-nlp
 """
 
+import os
 import re
-import urllib
 from typing import Optional
 
 from sglang.test import simple_eval_common as common
@@ -24,18 +24,9 @@ ALL_LANGUAGES = ["bn", "de", "en", "es", "fr", "ja", "ru", "sw", "te", "th", "zh
 LATIN_LANGUAGES = ["de", "en", "es", "fr", "sw"]
 NON_LATIN_LANGUAGES = ["bn", "ja", "ru", "te", "th", "zh"]
 
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 LANG_TO_FPATH = {
-    "bn": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_bn.tsv",
-    "de": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_de.tsv",
-    "en": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_en.tsv",
-    "es": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_es.tsv",
-    "fr": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_fr.tsv",
-    "ja": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ja.tsv",
-    "ru": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_ru.tsv",
-    "sw": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_sw.tsv",
-    "te": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_te.tsv",
-    "th": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_th.tsv",
-    "zh": "https://openaipublic.blob.core.windows.net/simple-evals/mgsm_zh.tsv",
+    lang: os.path.join(_DATA_DIR, f"mgsm_{lang}.tsv") for lang in ALL_LANGUAGES
 }
 LANG_TO_INSTRUCTIONS = {
     "en": """Solve this math problem. Give the reasoning steps before giving the final answer on the last line by itself in the format of "Answer:". Do not add anything other than the integer answer after "Answer:".
@@ -115,8 +106,8 @@ def score_mgsm(target: str, prediction: str) -> bool:
 def get_lang_examples(lang: str) -> list[dict[str, str]]:
     fpath = LANG_TO_FPATH[lang]
     examples = []
-    with urllib.request.urlopen(fpath) as f:
-        for line in f.read().decode("utf-8").splitlines():
+    with open(fpath, "r", encoding="utf-8") as f:
+        for line in f.read().splitlines():
             inputs, targets = line.strip().split("\t")
             if "." in targets:
                 raise ValueError(f"targets {targets} contains a decimal point.")

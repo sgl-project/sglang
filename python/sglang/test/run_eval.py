@@ -15,6 +15,8 @@ from sglang.test.simple_eval_common import (
     set_ulimit,
 )
 
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
 
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
@@ -74,16 +76,14 @@ def run_eval(args):
     if args.eval_name == "mmlu":
         from sglang.test.simple_eval_mmlu import MMLUEval
 
-        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        filename = os.path.join(_DATA_DIR, "mmlu.csv")
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from sglang.test.simple_eval_math import MathEval
 
         equality_checker = ChatCompletionSampler(model="gpt-4-turbo")
 
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/math_test.csv"
-        )
+        filename = os.path.join(_DATA_DIR, "math_test.csv")
         eval_obj = MathEval(
             filename, equality_checker, args.num_examples, args.num_threads
         )
@@ -98,9 +98,7 @@ def run_eval(args):
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
-        filename = (
-            "https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv"
-        )
+        filename = os.path.join(_DATA_DIR, "gpqa_diamond.csv")
         eval_obj = GPQAEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "humaneval":
         from sglang.test.simple_eval_humaneval import HumanEval
