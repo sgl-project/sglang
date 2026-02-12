@@ -53,11 +53,11 @@ jobs:
           make markdown
           python3 wrap_run_llm.py
 
-          # Copy tag lookup tool
-          mkdir -p _build/html/tag_lookup
-          cp tag_lookup/index.html _build/html/tag_lookup/
-          cp tag_lookup/tag_index.json _build/html/tag_lookup/
-          cp tag_lookup/example_index.json _build/html/tag_lookup/
+          # Copy release lookup tool
+          mkdir -p _build/html/release_lookup
+          cp release_lookup/index.html _build/html/release_lookup/
+          cp release_lookup/release_index.json _build/html/release_lookup/
+          cp release_lookup/example_index.json _build/html/release_lookup/
 
           cd _build/html
 

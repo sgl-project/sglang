@@ -1,4 +1,4 @@
-name: Update Tag Lookup Index
+name: Update Release Lookup Index
 
 on:
   release:
@@ -26,16 +26,16 @@ jobs:
 
       - name: Generate Index
         run: |
-          python3 docs/tag_lookup/generate_index.py --output docs/tag_lookup/tag_index.json
+          python3 docs/release_lookup/generate_index.py --output docs/release_lookup/release_index.json
 
       - name: Commit and Push
         run: |
           git config user.name "sglang-bot"
           git config user.email "sglang-bot@users.noreply.github.com"
 
-          if [[ -n $(git status -s docs/tag_lookup/tag_index.json) ]]; then
-            git add docs/tag_lookup/tag_index.json
-            git commit -m "[bot] Update tag lookup index"
+          if [[ -n $(git status -s docs/release_lookup/release_index.json) ]]; then
+            git add docs/release_lookup/release_index.json
+            git commit -m "[bot] Update release lookup index"
             git push origin main
           else
             echo "No changes to index."

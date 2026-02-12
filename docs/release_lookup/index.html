@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SGLang Tag Lookup</title>
+    <title>SGLang Release Lookup</title>
     <style>
         :root {
             --primary: #3b82f6;
@@ -236,7 +236,7 @@
     let tagIndex = null;
     let tagsArray = null;  // Compact format: array of [name, date, type]
     let sortedCommitKeys = null;  // Sorted keys for binary prefix search
-    const INDEX_FILE = 'tag_index.json';
+    const INDEX_FILE = 'release_index.json';
     const EXAMPLE_FILE = 'example_index.json';
     const SHORT_HASH_LEN = 8;
 
@@ -467,7 +467,7 @@
             msgDiv.append(
                 `The ${queryType} `,
                 strongEl,
-                ' has not been included in any release tag yet, or is not in the index.'
+                ' has not been included in any release yet, or is not in the index.'
             );
 
             container.appendChild(statusRow);

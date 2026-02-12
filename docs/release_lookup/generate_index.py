@@ -128,9 +128,9 @@ def process_tag_line(tags, commit_map, pr_map, tag_type, tag_to_idx):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate lookup index for sglang tags"
+        description="Generate lookup index for sglang releases"
     )
-    parser.add_argument("--output", default="tag_index.json", help="Output JSON file")
+    parser.add_argument("--output", default="release_index.json", help="Output JSON file")
     args = parser.parse_args()
 
     tags = get_tags()
