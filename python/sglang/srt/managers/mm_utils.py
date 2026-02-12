@@ -3,7 +3,6 @@ Multi-modality utils
 """
 
 import copy
-import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -27,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils.hashing import hash_bytes_to_int64
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -1200,14 +1200,17 @@ def get_multimodal_data_bounds(
     return valid_pairs_tensor
 
 
-def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+def data_hash(data, algorithm: str = "sha256") -> int:
+    """Hash raw bytes with configurable algorithm."""
+    return hash_bytes_to_int64(data, algorithm=algorithm)
 
 
-def tensor_hash(tensor_list) -> int:
+def tensor_hash(tensor_list, algorithm: str = "sha256") -> int:
     """
-    hash a tensor or a tensor list
+    Hash a tensor or a tensor list using the specified algorithm.
+
+    For CUDA tensors with SHA-256, uses fast GPU hash (gpu_tensor_hash).
+    For other algorithms or CPU tensors, converts to bytes and uses configurable hash.
     """
     tensor = tensor_list
     if isinstance(tensor_list, list):
@@ -1216,6 +1219,8 @@ def tensor_hash(tensor_list) -> int:
             x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
         ]
         tensor = torch.concat(tensor_list)
+
+    # keep original hash method for cuda tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
@@ -1228,24 +1233,33 @@ def tensor_hash(tensor_list) -> int:
     tensor_cpu = tensor.cpu()
 
     mv = memoryview(tensor_cpu.numpy())
-    return data_hash(mv.tobytes())
+    return data_hash(mv.tobytes(), algorithm=algorithm)
 
 
-def hash_feature(f):
+def hash_feature(f, algorithm: str = "sha256"):
+    """Hash feature using the specified hash algorithm.
+
+    Args:
+        f: The feature to hash
+        algorithm: The hash algorithm to use, default is "sha256"
+
+    Returns:
+        The hash of the feature
+    """
     if isinstance(f, list):
         if isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
+            return tensor_hash(f, algorithm=algorithm)
+        return data_hash(tuple(flatten_nested_list(f)), algorithm=algorithm)
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
         arr_bytes = arr.tobytes()
-        return data_hash(arr_bytes)
+        return data_hash(arr_bytes, algorithm=algorithm)
     elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
+        return tensor_hash([f], algorithm=algorithm)
     elif isinstance(f, CudaIpcTensorTransportProxy):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    return data_hash(f)
+        return tensor_hash([reconstruct_t], algorithm=algorithm)
+    return data_hash(f, algorithm=algorithm)
 
 
 def extend_mrope_positions_for_retracted_request(

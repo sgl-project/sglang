@@ -286,11 +286,17 @@ class MultimodalDataItem:
             self.pad_value = _compute_pad_value(self.hash)
             return
         if self.hash is None:
+            from sglang.srt.server_args import get_global_server_args
+
             if self.feature is not None:
                 hashed_feature = self.feature
             else:
                 hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
+
+            server_args = get_global_server_args()
+            self.hash = hash_feature(
+                hashed_feature, algorithm=server_args.multimodal_hash_algo
+            )
         assert self.hash is not None
         self.pad_value = _compute_pad_value(self.hash)
 
