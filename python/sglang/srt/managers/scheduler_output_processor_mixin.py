@@ -343,10 +343,7 @@ class SchedulerOutputProcessorMixin:
         if self.current_scheduler_metrics_enabled:
             can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
             self.log_prefill_stats(
-                adder=self.adder,
-                can_run_list=self.can_run_list,
-                running_bs=self.running_bs,
-                running_bs_offline_batch=0,
+                prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -422,10 +419,7 @@ class SchedulerOutputProcessorMixin:
         if self.current_scheduler_metrics_enabled:
             can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
             self.log_prefill_stats(
-                adder=self.adder,
-                can_run_list=self.can_run_list,
-                running_bs=self.running_bs,
-                running_bs_offline_batch=0,
+                prefill_stats=batch.prefill_stats,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 

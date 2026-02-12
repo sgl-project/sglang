@@ -23,7 +23,7 @@ To add support for a new diffusion model, you will primarily need to define or c
 
 3.  **`ComposedPipeline` (not a config)**: This is the central class where you define the structure of your model's generation pipeline. You will create a new class that inherits from `ComposedPipelineBase` and, within it, instantiate and chain together the necessary `PipelineStage`s in the correct order. See `ComposedPipelineBase` and `PipelineStage` base definitions:
     - [`ComposedPipelineBase`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/composed_pipeline_base.py)
-    - [`PipelineStage`]( https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/stages/base.py)
+    - [`PipelineStage`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/stages/base.py)
     - [Central registry (models/config mapping)](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/registry.py)
 
 4.  **Modules (components referenced by the pipeline)**: Each pipeline references a set of modules that are loaded from the model repository (e.g., Diffusers `model_index.json`) and assembled via the registry/loader. Common modules include:
@@ -37,7 +37,7 @@ To add support for a new diffusion model, you will primarily need to define or c
 
 ## Available Pipeline Stages
 
-You can build your custom `ComposedPipeline` by combining the following available stages as your will. Each stage is responsible for a specific part of the generation process.
+You can build your custom `ComposedPipeline` by combining the following available stages as needed. Each stage is responsible for a specific part of the generation process.
 
 | Stage Class                      | Description                                                                                             |
 | -------------------------------- | ------------------------------------------------------------------------------------------------------- |
