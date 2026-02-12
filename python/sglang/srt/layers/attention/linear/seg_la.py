@@ -664,7 +664,7 @@ def seg_la_fwd(
     cache_indices=None,
     softmax_scale=None,
     decouple=False,
- ):
+):
     length, qo_heads, HEAD_DIM = q.shape
     _, kv_heads, _ = k.shape
     bs = meta.batch_size
