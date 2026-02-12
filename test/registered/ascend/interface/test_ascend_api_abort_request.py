@@ -1,8 +1,7 @@
-import json
 import threading
-import requests
-import unittest
 import time
+import unittest
+
 import requests
 
 from sglang.srt.utils import kill_process_tree
@@ -15,9 +14,12 @@ from sglang.test.test_utils import (
 )
 
 responses = []
+
+
 def send_requests(url, **kwargs):
     response = requests.post(DEFAULT_URL_FOR_TEST + url, json=kwargs)
     responses.append(response)
+
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -28,15 +30,16 @@ class TestAscendApi(CustomTestCase):
     [Test Category] Interface
     [Test Target] /abort_request
     """
+
     @classmethod
     def setUpClass(cls):
-        cls.model = "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
-        other_args = (
-            [
-                "--attention-backend",
-                "ascend",
-            ]
+        cls.model = (
+            "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
         )
+        other_args = [
+            "--attention-backend",
+            "ascend",
+        ]
         cls.process = popen_launch_server(
             cls.model,
             DEFAULT_URL_FOR_TEST,
@@ -50,9 +53,19 @@ class TestAscendApi(CustomTestCase):
 
     def test_api_abort_request(self):
         # Create thread 1: Send a long-running /generate request with rid=10086
-        thread1 = threading.Thread(target=send_requests, args=('/generate',), kwargs={'rid': '10086', 'text': 'who are you?', 'sampling_params': {'temperature': 0.0, 'max_new_tokens': 1024}})
+        thread1 = threading.Thread(
+            target=send_requests,
+            args=('/generate',),
+            kwargs={
+                'rid': '10086',
+                'text': 'who are you?',
+                'sampling_params': {'temperature': 0.0, 'max_new_tokens': 1024},
+            },
+        )
         # Create thread 2: Send an /abort_request to terminate the request with rid=10086
-        thread2 = threading.Thread(target=send_requests, args=('/abort_request',), kwargs={'rid': "10086"})
+        thread2 = threading.Thread(
+            target=send_requests, args=("/abort_request",), kwargs={"rid": "10086"}
+        )
         thread1.start()
         time.sleep(0.5)
         thread2.start()

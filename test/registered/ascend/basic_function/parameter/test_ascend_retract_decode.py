@@ -3,9 +3,9 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,6 +22,7 @@ class TestRetractDecode(CustomTestCase):
     [Test Category] Parameter
     [Test Target] SGLANG_TEST_RETRACT
     """
+
     @classmethod
     def setUpClass(cls):
         # Enable retract decode feature for test
@@ -29,15 +30,13 @@ class TestRetractDecode(CustomTestCase):
 
         cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = (
-            [
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--mem-fraction-static",
-                0.8,
-            ]
-        )
+        other_args = [
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--mem-fraction-static",
+            0.8,
+        ]
 
         cls.process = popen_launch_server(
             cls.model,
@@ -61,7 +60,6 @@ class TestRetractDecode(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
-
 
 
 if __name__ == "__main__":

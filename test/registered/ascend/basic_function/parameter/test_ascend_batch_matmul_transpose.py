@@ -1,18 +1,21 @@
+import logging
 import random
 import time
 import unittest
-import logging
 
 import sgl_kernel_npu
 import torch
 import torch_npu
 from sglang.test.ci.ci_register import register_npu_ci
 
+assert sgl_kernel_npu is not None
+assert torch_npu is not None
+
 # Configure logging module to replace direct print statements
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ class TestMatrixMultiplication(unittest.TestCase):
         torch.bmm(a.transpose(0, 1), b, out=res1.view(-1, m, n).transpose(0, 1))
 
     def assert_tensors_basic_format(self, actual, expected):
-        """Check if two tensors are legal """
+        """Check if two tensors are legal"""
         self.assertEqual(actual.shape, expected.shape, "Shape mismatch")
 
         # Check for NaN
@@ -49,8 +52,6 @@ class TestMatrixMultiplication(unittest.TestCase):
         # Check for Inf
         self.assertFalse(torch.isinf(actual).any(), "Actual result contains Inf")
         self.assertFalse(torch.isinf(expected).any(), "Expected result contains Inf")
-
-
 
     def test_boundary_conditions(self):
         """Test boundary conditions"""
@@ -117,7 +118,9 @@ class TestMatrixMultiplication(unittest.TestCase):
                 k = random.randint(1, 500)
                 n = random.randint(1, 500)
 
-                with self.subTest(dtype=dtype, test_idx=test_idx, shape=f"Random ({b}, {m}, {k}, {n})"):
+                with self.subTest(
+                    dtype=dtype, test_idx=test_idx, shape=f"Random ({b}, {m}, {k}, {n})"
+                ):
                     a = torch.randn(b, m, k, dtype=dtype, device="npu")
                     b_tensor = torch.randn(m, k, n, dtype=dtype, device="npu")
                     res1 = torch.empty((b, m * n), dtype=dtype, device="npu")
@@ -150,7 +153,6 @@ class TestMatrixMultiplication(unittest.TestCase):
                             f"[Random], Shape: Random ({b}, {m}, {k}, {n}), dtype: {dtype}, "
                             f"Golden time: {golden_time:.6f}s, Fused time: {fused_time:.6f}s (Valid, collected)"
                         )
-
 
     def test_zero_values(self):
         """Test zero input values"""
@@ -195,16 +197,24 @@ class TestMatrixMultiplication(unittest.TestCase):
         """Final global performance assertion (only execute once for all test cases)"""
         # Check if global timing lists are valid
         if not self.global_all_golden_times or not self.global_all_fused_times:
-            logger.warning("No valid global timing results collected for performance assertion")
+            logger.warning(
+                "No valid global timing results collected for performance assertion"
+            )
             return
 
         # Calculate GLOBAL average time across all test methods and cases
-        global_avg_golden_time = sum(self.global_all_golden_times) / len(self.global_all_golden_times)
-        global_avg_fused_time = sum(self.global_all_fused_times) / len(self.global_all_fused_times)
+        global_avg_golden_time = sum(self.global_all_golden_times) / len(
+            self.global_all_golden_times
+        )
+        global_avg_fused_time = sum(self.global_all_fused_times) / len(
+            self.global_all_fused_times
+        )
 
         # Calculate overall speedup ratio and assert (avoid division by zero)
         if global_avg_golden_time > 1e-9:
-            global_overall_speedup_ratio = (global_avg_golden_time - global_avg_fused_time) / global_avg_golden_time
+            global_overall_speedup_ratio = (
+                global_avg_golden_time - global_avg_fused_time
+            ) / global_avg_golden_time
             logger.info(
                 f"\n===== GLOBAL Overall Performance Result ====="
                 f"\nGlobal Average Golden time (all valid test cases): {global_avg_golden_time:.6f}s"
@@ -217,10 +227,12 @@ class TestMatrixMultiplication(unittest.TestCase):
             self.assertGreaterEqual(
                 global_overall_speedup_ratio,
                 self.GLOBAL_PERFORMANCE_SPEEDUP_THRESHOLD,
-                f"Global overall performance optimization not meet requirement! Global speedup ratio: {global_overall_speedup_ratio:.4f} < {self.GLOBAL_PERFORMANCE_SPEEDUP_THRESHOLD}"
+                f"Global overall performance optimization not meet requirement! Global speedup ratio: {global_overall_speedup_ratio:.4f} < {self.GLOBAL_PERFORMANCE_SPEEDUP_THRESHOLD}",
             )
         else:
-            logger.warning("Global golden average time is too small to calculate valid speedup ratio")
+            logger.warning(
+                "Global golden average time is too small to calculate valid speedup ratio"
+            )
 
 
 if __name__ == "__main__":

@@ -13,14 +13,17 @@ Usage:
     python3 -m unittest openai_server.features.test_lora_openai_compatible.TestLoRADisabledError.test_lora_disabled_error
 """
 
+import logging
 import unittest
-import logging  # 导入logging模块
 
 import openai
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import (
+    LLAMA_3_2_1B_INSTRUCT_TOOL_CALLING_LORA_WEIGHTS_PATH,
+    LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
+)
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH, LLAMA_3_2_1B_INSTRUCT_TOOL_CALLING_LORA_WEIGHTS_PATH
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -32,11 +35,11 @@ log_format = "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
 logging.basicConfig(
     level=logging.INFO,
     format=log_format,
-    datefmt="%Y-%m-%d %H:%M:%S",  
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
         logging.FileHandler("lora_openai_test_logs.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger("TestLoRAOpenAICompatible")
 
@@ -111,7 +114,9 @@ class TestLoRAOpenAICompatible(CustomTestCase):
 
         self.assertIsNotNone(response.choices[0].message.content)
         self.assertGreater(len(response.choices[0].message.content), 0)
-        self.logger.info(f"Model adapter syntax response: {response.choices[0].message.content}")
+        self.logger.info(
+            f"Model adapter syntax response: {response.choices[0].message.content}"
+        )
 
     def test_explicit_lora_path(self):
         """Test backward compatibility with explicit lora_path via extra_body."""
@@ -126,7 +131,9 @@ class TestLoRAOpenAICompatible(CustomTestCase):
 
         self.assertIsNotNone(response.choices[0].message.content)
         self.assertGreater(len(response.choices[0].message.content), 0)
-        self.logger.info(f"Explicit lora_path response: {response.choices[0].message.content}")
+        self.logger.info(
+            f"Explicit lora_path response: {response.choices[0].message.content}"
+        )
 
     def test_priority_model_over_explicit(self):
         """Test that model:adapter syntax takes precedence over explicit lora_path."""
@@ -144,8 +151,9 @@ class TestLoRAOpenAICompatible(CustomTestCase):
         # Should use tool_calling adapter (model parameter takes precedence)
         self.assertIsNotNone(response.choices[0].message.content)
         self.assertGreater(len(response.choices[0].message.content), 0)
-        # 替换print为logging.info
-        self.logger.info(f"Priority test response: {response.choices[0].message.content}")
+        self.logger.info(
+            f"Priority test response: {response.choices[0].message.content}"
+        )
 
     def test_base_model_no_adapter(self):
         """Test using base model without any adapter."""
@@ -211,8 +219,12 @@ class TestLoRAOpenAICompatible(CustomTestCase):
 
         self.assertIsNotNone(tool_response.choices[0].message.content)
         self.assertIsNotNone(base_response.choices[0].message.content)
-        self.logger.info(f"Tool calling adapter response: {tool_response.choices[0].message.content}")
-        self.logger.info(f"Base model response: {base_response.choices[0].message.content}")
+        self.logger.info(
+            f"Tool calling adapter response: {tool_response.choices[0].message.content}"
+        )
+        self.logger.info(
+            f"Base model response: {base_response.choices[0].message.content}"
+        )
 
 
 class TestLoRADisabledError(CustomTestCase):
@@ -276,7 +288,9 @@ class TestLoRAEdgeCases(CustomTestCase):
 
         # Should work as base model (no adapter)
         self.assertIsNotNone(response.choices[0].message.content)
-        self.logger.info(f"Model with colon response: {response.choices[0].message.content}")
+        self.logger.info(
+            f"Model with colon response: {response.choices[0].message.content}"
+        )
 
     def test_explicit_lora_path_none(self):
         """Test explicit lora_path set to None."""
@@ -290,7 +304,9 @@ class TestLoRAEdgeCases(CustomTestCase):
 
         # Should work as base model
         self.assertIsNotNone(response.choices[0].message.content)
-        self.logger.info(f"Explicit None lora_path response: {response.choices[0].message.content}")
+        self.logger.info(
+            f"Explicit None lora_path response: {response.choices[0].message.content}"
+        )
 
     def test_invalid_adapter_name(self):
         """Test using non-existent adapter name."""

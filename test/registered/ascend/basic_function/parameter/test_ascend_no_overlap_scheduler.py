@@ -2,16 +2,15 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
-from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
 
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
@@ -23,6 +22,7 @@ class BaseTestRadixCacheChunkedPrefill(CustomTestCase):
     [Test Category] Parameter
     [Test Target] --disable-radix-cache;--disable-overlap
     """
+
     disable_radix_cache = False
     chunked_prefill_size = "128"
 
@@ -49,7 +49,6 @@ class BaseTestRadixCacheChunkedPrefill(CustomTestCase):
             other_args=other_args,
         )
 
-
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
@@ -65,6 +64,7 @@ class BaseTestRadixCacheChunkedPrefill(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreaterEqual(metrics["score"], 0.65)
+
 
 class TestRadixCacheFalseChunkMinus1(BaseTestRadixCacheChunkedPrefill):
     disable_radix_cache = False

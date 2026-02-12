@@ -1,12 +1,12 @@
+import logging
 import os
 import unittest
-import logging
 
 import requests
 
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase
+from sglang.test.ascend.test_ascend_utils import LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -15,13 +15,13 @@ from sglang.test.test_utils import (
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
 base_port = int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0])
-BASE_PORT_FOR_ASCEND_MF = 20000 + base_port * 1000 +66
+BASE_PORT_FOR_ASCEND_MF = 20000 + base_port * 1000 + 66
 os.environ["ASCEND_MF_STORE_URL"] = f"tcp://127.0.0.1:{BASE_PORT_FOR_ASCEND_MF}"
 
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
@@ -54,21 +54,19 @@ class TestDisaggregationDecodeDp(TestDisaggregationBase):
     @classmethod
     def start_prefill(cls):
         # Launch the Prefill service with disaggregation-decode-dp=2 configuration for Ascend NPU
-        prefill_args = (
-            [
-                "--disaggregation-mode",
-                "prefill",
-                "--disaggregation-decode-dp",
-                "2",
-                "--disaggregation-transfer-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--attention-backend",
-                "ascend",
-                "--mem-fraction-static",
-                0.8,
-            ]
-        )
+        prefill_args = [
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-decode-dp",
+            "2",
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--attention-backend",
+            "ascend",
+            "--mem-fraction-static",
+            0.8,
+        ]
 
         env = os.environ.copy()
 
@@ -85,22 +83,22 @@ class TestDisaggregationDecodeDp(TestDisaggregationBase):
         # Launch the Decode service with specified configuration for Ascend NPU (disaggregated architecture)
         ascend_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ascend_devices
-        base_gpu_id = ascend_devices.split(",")[2] if len(ascend_devices.split(",")) >= 3 else "2"
-        decode_args = (
-            [
-                "--disaggregation-mode",
-                "decode",
-                "--base-gpu-id",
-                base_gpu_id,
-                "--disaggregation-transfer-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--attention-backend",
-                "ascend",
-                "--mem-fraction-static",
-                0.8,
-            ]
+        base_gpu_id = (
+            ascend_devices.split(",")[2] if len(ascend_devices.split(",")) >= 3 else "2"
         )
+        decode_args = [
+            "--disaggregation-mode",
+            "decode",
+            "--base-gpu-id",
+            base_gpu_id,
+            "--disaggregation-transfer-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--attention-backend",
+            "ascend",
+            "--mem-fraction-static",
+            0.8,
+        ]
 
         env = os.environ.copy()
 
