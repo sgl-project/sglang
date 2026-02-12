@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
@@ -131,6 +132,8 @@ class GeluAndMul(MultiPlatformOp):
         return self._forward_impl(x)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        if envs.SGLANG_NPU_FORWARD_NATIVE_GELUTANH.get():
+            return self.forward_native(x)
         y_npu, gelu_npu = torch_npu.npu_geglu(
             x,
             dim=-1,
