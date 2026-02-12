@@ -99,6 +99,7 @@ class MistralAttention(nn.Module):
             causal=False,
             supported_attention_backends={
                 AttentionBackendEnum.FA,
+                AttentionBackendEnum.FA2,
                 AttentionBackendEnum.TORCH_SDPA,
             },
         )
