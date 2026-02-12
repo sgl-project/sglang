@@ -35,7 +35,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
-if not is_cpu():
+if not is_cpu() and not is_npu():
     # fix import error on CPU device, no impacts when non-CPU path
     from sglang.jit_kernel.cutedsl_gdn import (
         cutedsl_fused_sigmoid_gating_delta_rule_update,
@@ -535,7 +535,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_decode_query_start_loc[: bs - num_padding]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
+                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     bs - num_padding
                 )
         elif forward_mode.is_target_verify():
@@ -547,7 +547,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 self.query_start_loc_list[bs - 1][: bs - num_padding].copy_(
                     self.cached_cuda_graph_verify_query_start_loc[: bs - num_padding]
                 )
-                self.query_start_loc_list[bs - 1][bs - num_padding :].copy_(
+                self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
                     (bs - num_padding) * spec_info.draft_token_num
                 )
         else:
@@ -814,7 +814,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
-        if not is_cpu():
+        if not is_cpu() and not is_npu():
             assert (
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
