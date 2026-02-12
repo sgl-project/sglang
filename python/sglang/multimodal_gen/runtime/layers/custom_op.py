@@ -54,10 +54,8 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def forward_musa(self, *args, **kwargs) -> Any:
-        # XXX (MUSA): MUSA kernels follow the CUDA path by default.
-        # At this stage, sgl-kernel support for MUSA is still under active
-        # development, so we fall back to the PyTorch-native implementation.
-        return self.forward_native(*args, **kwargs)
+        # MUSA kernels follow the CUDA path by default.
+        return self.forward_cuda(*args, **kwargs)
 
     def forward_oot(self, *args, **kwargs) -> Any:
         # By default, we assume that OOT ops are compatible with the
