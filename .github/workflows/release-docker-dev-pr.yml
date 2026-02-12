@@ -39,7 +39,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/merge
+          ref: refs/pull/${{ inputs.pr_number }}/head
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main

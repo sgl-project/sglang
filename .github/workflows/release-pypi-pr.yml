@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/merge
+          ref: refs/pull/${{ inputs.pr_number }}/head
           fetch-depth: 0  # Need full history for version generation
 
       - name: Set up Python
