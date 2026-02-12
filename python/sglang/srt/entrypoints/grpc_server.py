@@ -325,7 +325,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 token_ids_logprob=None,
             )
             # Set disaggregation params if needed
-            if self.server_args.disaggregation_mode != DisaggregationMode.NULL:
+            if self.server_args.disaggregation_mode != DisaggregationMode.NULL.value:
                 health_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
                 health_req.bootstrap_room = 0
         else:
@@ -1087,7 +1087,7 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
             }
 
             # Set disaggregation params if needed
-            if server_args.disaggregation_mode != DisaggregationMode.NULL:
+            if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
                 warmup_request_kwargs["disaggregated_params"] = (
                     sglang_scheduler_pb2.DisaggregatedParams(
                         bootstrap_host=FAKE_BOOTSTRAP_HOST,
