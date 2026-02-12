@@ -1517,9 +1517,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                                 [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
                             )
                             param_name = (
-                                name.replace(
-                                    "q_a_proj", "fused_qkv_a_proj_with_mqa"
-                                )
+                                name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
                                 else name.replace(
                                     "kv_a_proj_with_mqa",
@@ -1547,9 +1545,7 @@ class BailingMoELinearForCausalLM(nn.Module):
                         if (
                             "attention" in name
                             and "slope" not in name
-                            and is_linear_layer(
-                                layer_idx, self.model.layer_group_size
-                            )
+                            and is_linear_layer(layer_idx, self.model.layer_group_size)
                         ):
                             load_linear_attn_weight(name, loaded_weight, self)
                             loaded_params.add(name)
