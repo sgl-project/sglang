@@ -29,9 +29,8 @@ import torch
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
-from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, has_valid_data
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
