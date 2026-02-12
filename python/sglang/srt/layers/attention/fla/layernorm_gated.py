@@ -421,6 +421,9 @@ class RMSNorm(torch.nn.Module):
         if _use_cpu:
             assert (
                 self.norm_before_gate and self.group_size is None and self.activation == "swish"
+                self.norm_before_gate
+                and self.group_size is None
+                and self.activation == "swish"
             ), "CPU rmsnorm_gated currently only supports norm before gate without group size or activation other than swish"
             return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
                 x, self.weight, z, self.eps
