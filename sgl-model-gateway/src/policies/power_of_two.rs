@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use async_trait::async_trait;
 use rand::Rng;
 use tracing::debug;
 
@@ -29,11 +30,12 @@ impl PowerOfTwoPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
-    fn select_worker(
+    async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo,
+        _info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -130,8 +132,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_power_of_two_selection() {
+    #[tokio::test]
+    async fn test_power_of_two_selection() {
         let policy = PowerOfTwoPolicy::new();
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
             .worker_type(WorkerType::Regular)
@@ -159,7 +161,7 @@ mod tests {
         let mut selected_counts = [0; 3];
         let info = SelectWorkerInfo::default();
         for _ in 0..100 {
-            if let Some(idx) = policy.select_worker(&workers, &info) {
+            if let Some(idx) = policy.select_worker(&workers, &info).await {
                 selected_counts[idx] += 1;
             }
         }
@@ -169,8 +171,8 @@ mod tests {
         assert!(selected_counts[1] > selected_counts[0]);
     }
 
-    #[test]
-    fn test_power_of_two_with_cached_loads() {
+    #[tokio::test]
+    async fn test_power_of_two_with_cached_loads() {
         let policy = PowerOfTwoPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -195,7 +197,7 @@ mod tests {
         let mut w2_selected = 0;
         let info = SelectWorkerInfo::default();
         for _ in 0..50 {
-            if let Some(idx) = policy.select_worker(&workers, &info) {
+            if let Some(idx) = policy.select_worker(&workers, &info).await {
                 if idx == 1 {
                     w2_selected += 1;
                 }
@@ -206,8 +208,8 @@ mod tests {
         assert!(w2_selected > 35); // Should win most of the time
     }
 
-    #[test]
-    fn test_power_of_two_single_worker() {
+    #[tokio::test]
+    async fn test_power_of_two_single_worker() {
         let policy = PowerOfTwoPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
@@ -217,13 +219,15 @@ mod tests {
 
         // With single worker, should always select it
         assert_eq!(
-            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await,
             Some(0)
         );
     }
 
-    #[test]
-    fn test_reproduce_incompatible_metric_bug() {
+    #[tokio::test]
+    async fn test_reproduce_incompatible_metric_bug() {
         use std::{collections::HashMap, sync::Arc};
 
         use crate::core::{BasicWorkerBuilder, WorkerType};
@@ -257,6 +261,7 @@ mod tests {
         // 5. Run selection
         let selected_idx = policy
             .select_worker(&workers, &SelectWorkerInfo::default())
+            .await
             .expect("Should select a worker");
 
         // 6. Verify the Fix
@@ -280,8 +285,8 @@ mod tests {
             "The policy failed to handle incompatible metrics. Should select idle Worker A."
         );
     }
-    #[test]
-    fn test_power_of_two_edge_cases() {
+    #[tokio::test]
+    async fn test_power_of_two_edge_cases() {
         use std::{collections::HashMap, sync::Arc};
 
         use crate::core::{BasicWorkerBuilder, WorkerType};
@@ -314,6 +319,7 @@ mod tests {
 
         let idx_1 = policy
             .select_worker(&workers_1, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(
             idx_1, 0,
@@ -335,6 +341,7 @@ mod tests {
 
         let idx_2 = policy
             .select_worker(&workers_2, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(idx_2, 1, "Partial Fail 1 Failed: Should fallback to requests and select Worker B (fewer requests)");
 
@@ -353,6 +360,7 @@ mod tests {
 
         let idx_3 = policy
             .select_worker(&workers_3, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(idx_3, 0, "Partial Fail 2 Failed: Should fallback to requests and select Worker A (fewer requests)");
 
@@ -369,6 +377,7 @@ mod tests {
 
         let idx_4 = policy
             .select_worker(&workers_4, &SelectWorkerInfo::default())
+            .await
             .unwrap();
         assert_eq!(
             idx_4, 1,

@@ -89,16 +89,18 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 # Handle multimodal embedding inputs
                 texts = []
                 images = []
+                videos = []
                 for item in prompt:
                     # Use padding for text if None - this could be improved
                     texts.append(item.text if item.text is not None else "padding")
                     images.append(item.image if item.image is not None else None)
+                    videos.append(item.video if item.video is not None else None)
 
                 generate_prompts = []
                 # Check if we have a chat template for multimodal embeddings
                 if self.template_manager.chat_template_name is not None:
                     convs = generate_embedding_convs(
-                        texts, images, self.template_manager.chat_template_name
+                        texts, images, videos, self.template_manager.chat_template_name
                     )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
@@ -109,11 +111,13 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     prompt_kwargs = {
                         "text": generate_prompts[0],
                         "image_data": images[0],
+                        "video_data": videos[0],
                     }
                 else:
                     prompt_kwargs = {
                         "text": generate_prompts,
                         "image_data": images,
+                        "video_data": videos,
                     }
             else:
                 # List of integers (token IDs) or empty list
@@ -122,11 +126,24 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             # Other types (should not happen but handle gracefully)
             prompt_kwargs = {"input_ids": prompt}
 
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        if lora_path:
+            first_adapter = (
+                lora_path
+                if isinstance(lora_path, str)
+                else next((a for a in lora_path if a), None)
+            )
+            if first_adapter:
+                self._validate_lora_enabled(first_adapter)
+
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
             priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
             dimensions=request.dimensions,
+            lora_path=lora_path,
         )
 
         return adapted_request, request

@@ -27,7 +27,7 @@
 """Rotary Positional Embeddings."""
 import functools
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -37,6 +37,88 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embeddi
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def apply_flashinfer_rope_qk_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    head_size: Optional[int] = None,
+    is_neox: bool = False,
+    positions: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if q.dim() != 4 or k.dim() != 4:
+        raise ValueError(
+            f"Expected q/k to be 4D [bsz, seqlen, nheads, head_size], "
+            f"got q:{tuple(q.shape)} k:{tuple(k.shape)}"
+        )
+    if q.shape != k.shape:
+        raise ValueError(
+            f"q and k must have the same shape, got {q.shape} vs {k.shape}"
+        )
+
+    if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
+        raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
+
+    bsz, seqlen, nheads, d = q.shape
+    if head_size is None:
+        head_size = d
+    if head_size != d:
+        raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
+
+    try:
+        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+    except ImportError:
+        # Triton fallback for AMD/ROCm where FlashInfer is not available
+        import warnings
+
+        warnings.warn(
+            "FlashInfer not available, using Triton fallback for RoPE",
+            stacklevel=2,
+        )
+        half_size = cos_sin_cache.shape[-1] // 2
+        if positions is None:
+            cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
+            sin = cos_sin_cache[:seqlen, half_size:].to(q.dtype)
+            cos = cos.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+            sin = sin.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+        else:
+            positions = positions.to(cos_sin_cache.device).view(-1)
+            cos = cos_sin_cache[positions, :half_size].to(q.dtype)
+            sin = cos_sin_cache[positions, half_size:].to(q.dtype)
+        q_flat = q.reshape(bsz * seqlen, nheads, d)
+        k_flat = k.reshape(bsz * seqlen, nheads, d)
+        q_rot = apply_rotary_embedding(q_flat, cos, sin, interleaved=not is_neox)
+        k_rot = apply_rotary_embedding(k_flat, cos, sin, interleaved=not is_neox)
+        return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
+
+    if positions is None:
+        pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
+        positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+    else:
+        if not (
+            isinstance(positions, torch.Tensor)
+            and positions.dtype == torch.long
+            and positions.dim() == 1
+        ):
+            raise ValueError("positions must be a 1D torch.long Tensor")
+        if positions.numel() != bsz * seqlen:
+            raise ValueError(
+                f"positions length must be bsz*seqlen={bsz*seqlen}, got {positions.numel()}"
+            )
+
+    q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
+    k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
+    apply_rope_with_cos_sin_cache_inplace(
+        positions=positions,
+        query=q_flat,
+        key=k_flat,
+        head_size=d,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+    )
+    return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -173,6 +255,38 @@ class RotaryEmbedding(CustomOp):
         s += f", max_position_embeddings={self.max_position_embeddings}"
         s += f", base={self.base}, is_neox_style={self.is_neox_style}"
         return s
+
+
+class LinearScalingRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int | float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_factor: float,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+        )
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+        t = t / self.scaling_factor
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
 
 class OneDRotaryEmbedding(torch.nn.Module):
@@ -867,10 +981,23 @@ def get_rope(
         rope_scaling_args = None
     if partial_rotary_factor < 1.0:
         rotary_dim = int(rotary_dim * partial_rotary_factor)
+    max_position_embeddings = max_position
+    rope_type = None
+    if rope_scaling is not None:
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", None))
+        if rope_type in (None, "default"):
+            rope_scaling = None
+        elif rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            original_max = rope_scaling.get("original_max_position_embeddings", None)
+            if original_max is not None:
+                max_position_embeddings = max(
+                    max_position_embeddings, int(float(original_max) * factor)
+                )
     key = (
         head_size,
         rotary_dim,
-        max_position,
+        max_position_embeddings,
         base,
         is_neox_style,
         rope_scaling_args,
@@ -881,9 +1008,21 @@ def get_rope(
 
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
     else:
-        raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
+        if rope_type == "linear":
+            factor = float(rope_scaling.get("factor", 1.0))
+            rotary_emb = LinearScalingRotaryEmbedding(
+                head_size=head_size,
+                rotary_dim=rotary_dim,
+                max_position_embeddings=max_position_embeddings,
+                base=base,
+                is_neox_style=is_neox_style,
+                dtype=dtype,
+                scaling_factor=factor,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling {rope_scaling}")
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
