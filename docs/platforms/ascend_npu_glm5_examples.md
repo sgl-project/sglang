@@ -54,6 +54,12 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 quay.io/ascend/sglang:${TAG}
 ```
 
+Note: Using this image, you need to update transformers to main branch
+``` shell
+# reinstall transformers
+pip install git+https://github.com/huggingface/transformers.git
+```
+
 ## Deployment
 
 ### Single-node Deployment
