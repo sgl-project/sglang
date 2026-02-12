@@ -1762,6 +1762,7 @@ class Scheduler(
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
+            lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
         )
         req.tokenizer = self.tokenizer
