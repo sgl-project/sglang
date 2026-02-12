@@ -19,7 +19,6 @@ import re
 from functools import lru_cache, partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -397,130 +396,71 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return cos_combined, sin_combined
 
-    def _get_interpolation_indices(self, dim_size: int) -> torch.Tensor:
-        """
-        Compute continuous interpolation indices for a single dimension.
+    def fast_pos_embed_interpolate(self, grid_thw):
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+        num_grid_per_side = int(self.num_position_embeddings**0.5)
+        device = self.pos_embed.weight.device
 
-        Returns continuous indices.
-        """
-        if self.align_corners:
-            indices = np.linspace(
-                0, self.num_grid_per_side - 1, dim_size, dtype=np.float32
-            )
-        else:
-            indices = (np.arange(dim_size, dtype=np.float32) + 0.5) * (
-                self.num_grid_per_side / dim_size
-            ) - 0.5
-            indices = np.clip(indices, 0, self.num_grid_per_side - 1)
-        return indices
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
 
-    def _calculate_indices_and_weights(self, h_idxs, w_idxs):
-        """
-        Compute bilinear interpolation indices and weights.
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w)
 
-        Returns tuple of (indices, weights), each as 4 numpy arrays for the 4 corner points.
-        """
-        h_f = np.floor(h_idxs).astype(np.int64)
-        h_c = np.clip(h_f + 1, 0, self.num_grid_per_side - 1)
-        dh = h_idxs - h_f
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=num_grid_per_side - 1)
 
-        w_f = np.floor(w_idxs).astype(np.int64)
-        w_c = np.clip(w_f + 1, 0, self.num_grid_per_side - 1)
-        dw = w_idxs - w_f
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
 
-        side = self.num_grid_per_side
+            base_h = h_idxs_floor * num_grid_per_side
+            base_h_ceil = h_idxs_ceil * num_grid_per_side
 
-        indices = [
-            (h_f[:, None] * side + w_f).flatten(),
-            (h_f[:, None] * side + w_c).flatten(),
-            (h_c[:, None] * side + w_f).flatten(),
-            (h_c[:, None] * side + w_c).flatten(),
-        ]
-        weights = [
-            ((1 - dh)[:, None] * (1 - dw)).flatten(),
-            ((1 - dh)[:, None] * dw).flatten(),
-            (dh[:, None] * (1 - dw)).flatten(),
-            (dh[:, None] * dw).flatten(),
-        ]
-        return indices, weights
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
 
-    def _get_position_embedding(self, patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-        """
-        Tile and reorganize position embeddings to align with the token sequence.
-        """
-        result_parts = []
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+        weight_tensor = torch.tensor(
+            weight_list, dtype=self.pos_embed.weight.dtype, device=device
+        )
+        pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        patch_pos_embeds = patch_pos_embeds.split(
+            [h * w for h, w in zip(grid_hs, grid_ws)]
+        )
+
+        patch_pos_embeds_permute = []
         merge_size = self.spatial_merge_size
-
         for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
             pos_embed = pos_embed.repeat(t, 1)
-
-            h_merge = h // merge_size
-            w_merge = w // merge_size
-
             pos_embed = (
-                pos_embed.view(t, h_merge, merge_size, w_merge, merge_size, -1)
+                pos_embed.view(
+                    t, h // merge_size, merge_size, w // merge_size, merge_size, -1
+                )
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
-
-            result_parts.append(pos_embed)
-
-        return torch.cat(result_parts, dim=0)
-
-    def fast_pos_embed_interpolate(self, grid_thw):
-        """Interpolate position embeddings for (batch, 3) size input dimensions.
-
-        Performs bilinear interpolation on spatial dimensions (height, width) and replicates
-        along temporal dimension. The result is reorganized according to spatial_merge_size.
-
-        Args:
-            grid_thw: Tensor of shape [batch_size, 3] with (temporal, height, width) dimensions
-                     in patches for each sample.
-
-        Returns:
-            Interpolated position embeddings tensor.
-        """
-        grid_thw_cpu = grid_thw.cpu().numpy()
-
-        # transfer data to CPU before loop
-        temporal_dims = grid_thw_cpu[:, 0].tolist()
-        height_dims = grid_thw_cpu[:, 1].tolist()
-        width_dims = grid_thw_cpu[:, 2].tolist()
-
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
-
-        patches_size = [h * w for h, w in zip(height_dims, width_dims)]
-        total_patches = sum(patches_size)
-        all_indices_np = np.zeros((4, total_patches), dtype=np.int64)
-        all_weights_np = np.zeros((4, total_patches), dtype=np.float32)
-
-        current_idx = 0
-
-        # calculate indices and weights on CPU
-        for t, h, w in zip(temporal_dims, height_dims, width_dims):
-            h_idxs = self._get_interpolation_indices(h)
-            w_idxs = self._get_interpolation_indices(w)
-
-            indices, weights = self._calculate_indices_and_weights(h_idxs, w_idxs)
-
-            end_idx = current_idx + h * w
-            for i in range(4):
-                all_indices_np[i, current_idx:end_idx] = indices[i]
-                all_weights_np[i, current_idx:end_idx] = weights[i]
-            current_idx = end_idx
-
-        idx_tensor = torch.from_numpy(all_indices_np).to(device)
-        weight_tensor = torch.from_numpy(all_weights_np).to(dtype=dtype, device=device)
-
-        # calculate interpolation
-        pos_embeds = self.pos_embed(idx_tensor.view(-1))
-        pos_embeds = pos_embeds.view(4, total_patches, -1)
-        patch_pos_embeds = (pos_embeds * weight_tensor.unsqueeze(-1)).sum(dim=0)
-        patch_pos_embeds = patch_pos_embeds.split(patches_size)
-        return self._get_position_embedding(
-            patch_pos_embeds, temporal_dims, height_dims, width_dims
-        )
+            patch_pos_embeds_permute.append(pos_embed)
+        return torch.cat(patch_pos_embeds_permute)
 
     def forward(
         self,
@@ -710,14 +650,19 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
+            deepstack_embeds = None
+            if input_deepstack_embeds is not None:
+                prev_layer_idx = layer_idx - 1
+                if prev_layer_idx in self.deepstack_embed_to_decoder_layer:
+                    sep = self.hidden_size * prev_layer_idx
+                    deepstack_embeds = input_deepstack_embeds[
+                        :, sep : sep + self.hidden_size
+                    ]
+
             # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
             # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
             # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
             # The order matters because addition with different tensors is not associative in practice.
-            # Deepstack for prev_layer is applied at the start of current layer via post_residual_addition.
-            deepstack_embeds = self.get_deepstack_embeds(
-                layer_idx - 1, input_deepstack_embeds
-            )
             hidden_states, residual = layer(
                 positions,
                 hidden_states,

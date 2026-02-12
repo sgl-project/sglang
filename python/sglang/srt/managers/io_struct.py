@@ -1408,6 +1408,20 @@ class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
 
 
 @dataclass
+class PostProcessWeightsReqInput(BaseReq):
+    # Whether to restore weights before loading new weights
+    restore_weights_before_load: bool = False
+    # Whether to enable quantization post-processing
+    post_process_quantization: bool = False
+
+
+@dataclass
+class PostProcessWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class SendWeightsToRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str
