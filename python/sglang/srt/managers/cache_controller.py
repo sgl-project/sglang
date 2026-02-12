@@ -566,6 +566,8 @@ class HiCacheController:
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
+        self.prefetch_occupancy_ratio = 0.0
+
     def _generate_storage_config(
         self,
         model_name: Optional[str] = None,
@@ -869,8 +871,15 @@ class HiCacheController:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
+        # metrics collection
+        self.prefetch_occupancy_ratio = (
+            self.prefetch_tokens_occupied / self.prefetch_capacity_limit
+        )
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            logger.warning(
+                f"Prefetching rate limited, Perhaps increasing the hicache ratio or size can optimize it."
+            )
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False

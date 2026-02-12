@@ -1398,6 +1398,7 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    prefetch_occupancy_ratio: List[float] = field(default_factory=list)
 
 
 class StorageMetricsCollector:
@@ -1405,7 +1406,7 @@ class StorageMetricsCollector:
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
 
@@ -1466,6 +1467,11 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
+        self.gauge_prefetch_occupancy_ratio = Gauge(
+            name="sglang:prefetch_occupancy_ratio",
+            documentation="Current prefetch occupied ratio (0-1, >1 means rate limited).",
+            labelnames=labels.keys(),
+        )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
@@ -1477,6 +1483,10 @@ class StorageMetricsCollector:
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
+
+    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
+        # Convenience function for logging to gauge.
+        gauge.labels(**self.labels).set(data)
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:
@@ -1492,6 +1502,11 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+        self._log_gauge(
+            self.gauge_prefetch_occupancy_ratio,
+            storage_metrics.prefetch_occupancy_ratio,
+        )
 
 
 class ExpertDispatchCollector:
