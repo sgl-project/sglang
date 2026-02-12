@@ -219,6 +219,21 @@ class QuarkW4A4MXFp4MoEMethod(QuarkMoEMethod):
                 torch.float32
             )  # aiter's moe_sorting requires topk_weights to be FP32
 
+        # Padding
+        ALIGN_K = 128
+        align_k = lambda n: (n + ALIGN_K - 1) // ALIGN_K * ALIGN_K
+        if layer.w2_weight.shape[-1] % ALIGN_K:
+            import torch.nn.functional as F
+            align_w13 = align_k(layer.w13_weight.shape[1])
+            align_w2 = align_k(layer.w2_weight.shape[-1])
+
+            # fp4 packing: 2x, up proj + w1 fusion: 2x
+            pad_w13 = align_w2 * 2 * 2 - layer.w13_weight.shape[1]
+            pad_w2 = align_w2 - layer.w2_weight.shape[-1]
+            layer.w13_weight.data = F.pad(layer.w13_weight, (0, 0, 0, pad_w13), "constant", 0)
+            layer.w2_weight.data = F.pad(layer.w2_weight, (0, pad_w2), "constant", 0)
+            layer.w13_weight_scale.data = F.pad(layer.w13_weight_scale, (0, 0, 0, pad_w13), "constant", 0)
+
         if hasattr(torch, "float4_e2m1fn_x2"):
             w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
             w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
