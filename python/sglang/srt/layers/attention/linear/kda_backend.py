@@ -4,7 +4,7 @@ import torch
 from einops import rearrange
 
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.kernels.triton_kda import TritonKDAKernel
+from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,

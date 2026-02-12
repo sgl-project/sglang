@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
-from sglang.srt.layers.attention.linear.kernels.triton_gdn import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     get_linear_attn_decode_backend,
@@ -63,7 +63,7 @@ class GDNKernelDispatcher:
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("CuTe DSL backend requires CUDA")
-            from sglang.srt.layers.attention.linear.kernels.cutedsl_gdn import (
+            from sglang.srt.layers.attention.linear.kernels.gdn_cutedsl import (
                 CuteDSLGDNKernel,
             )
 
