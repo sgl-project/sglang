@@ -658,11 +658,12 @@ async def benchmark(args):
             config_path = os.path.join(args.model, "config.json")
             if os.path.exists(config_path):
                 import json
+
                 with open(config_path, "r") as f:
                     config = json.load(f)
                 task_name = config.get("pipeline_tag", "text-to-image")
             else:
-                task_name = "text-to-image" # fallback
+                task_name = "text-to-image"  # fallback
     else:
         task_name = model_info(args.model).pipeline_tag
 
