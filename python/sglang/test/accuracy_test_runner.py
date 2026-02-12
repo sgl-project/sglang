@@ -95,6 +95,7 @@ def _run_simple_eval(
             base_url,
             other_args=model.extra_args,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
         )
 
         args = SimpleNamespace(
@@ -160,6 +161,7 @@ def _run_few_shot_eval(
             base_url,
             other_args=model.extra_args,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=model.env,
         )
 
         args = SimpleNamespace(

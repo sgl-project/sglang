@@ -54,6 +54,7 @@ class TestDeepseekV31(unittest.TestCase):
                 DEEPSEEK_V31_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
         ]

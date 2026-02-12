@@ -229,6 +229,7 @@ class NightlyBenchmarkRunner:
         extra_bench_args: Optional[List[str]] = None,
         enable_profile: bool = True,
         timeout: Optional[int] = None,
+        env: Optional[dict] = None,
     ) -> Tuple[List[BenchmarkResult], bool, Optional[float]]:
         """Run a complete benchmark for a single model with server management.
 
@@ -249,6 +250,7 @@ class NightlyBenchmarkRunner:
             extra_bench_args: Extra arguments for the benchmark command
             enable_profile: Whether to enable profiling (default True for NVIDIA)
             timeout: Optional timeout for server launch (defaults to DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
+            env: Environment dict for subprocess
 
         Returns:
             Tuple of (list of BenchmarkResult objects, success_bool, avg_spec_accept_length or None)
@@ -265,6 +267,7 @@ class NightlyBenchmarkRunner:
             timeout=(
                 timeout if timeout is not None else DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
             ),
+            env=env,
         )
 
         try:

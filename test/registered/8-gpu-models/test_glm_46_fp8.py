@@ -45,6 +45,7 @@ class TestGLM46FP8(unittest.TestCase):
                 GLM_4_6_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + mtp_args,
+                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
         ]
