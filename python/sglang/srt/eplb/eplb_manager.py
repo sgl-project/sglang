@@ -78,7 +78,7 @@ class EPLBManager:
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
             if len(update_layer_ids_chunks) > 1:
                 yield
-            self._model_runner.update_expert_location(
+            yield self._model_runner.update_expert_location(
                 expert_location_metadata,
                 update_layer_ids=update_layer_ids,
             )
