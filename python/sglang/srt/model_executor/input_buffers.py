@@ -147,10 +147,9 @@ class GraphInputBuffers:
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
-            # Zero padded positions so the fused RoPE+KV-append kernel applies
-            # identity RoPE to padded tokens (pos_ids=0 → no rotation).
-            # Without this, stale pos_ids cause incorrect RoPE on padded tokens'
-            # k_rope, corrupting KPE cache at page 0.
+            # Zero padded positions so padded tokens use pos_ids=0 in replay
+            # (identity RoPE). This avoids stale pos_ids from a previous larger
+            # batch and prevents padded-slot cache corruption at page 0.
             self.positions.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()

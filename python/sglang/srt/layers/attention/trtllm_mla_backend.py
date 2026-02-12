@@ -335,30 +335,24 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Initialize paged KV metadata for the fused RoPE+quantize+append kernel.
 
         For MLA, each token is its own "batch" element in the paged KV structure:
-          - kv_indptr = arange(nnz+1): one-element segment per token (MLA "batch")
-          - batch_indices = arange(nnz): token i belongs to "request" i
+          - kv_indptr = arange(nnz+1): one segment per token
+          - batch_indices = arange(nnz): token i -> "request" i
           - kv_indices[i] = page index for token i (derived from out_cache_loc)
-          - positions[i] = offset within that page (derived from out_cache_loc)
+          - positions[i] = offset within that page
 
         Args:
             metadata: Decode metadata to populate.
             out_cache_loc: Flat cache slot indices, shape (nnz,).
             update_inplace: If True, write into pre-allocated buffers (CUDA graph
                 replay). If False, allocate new tensors (eager / graph capture).
-
-        CUDA Graph Replay (update_inplace=True):
-            Metadata buffers were pre-allocated at the captured num_tokens size.
-            Only the first nnz entries (the real batch) are updated; the tail
-            [nnz:num_tokens] is zeroed so padded tokens write harmlessly to
-            page 0.  batch_indices is NOT zeroed — it must stay as arange so
-            each padded token resolves to its own (zeroed) kv_indices entry
-            rather than redirecting to request 0's valid page.
         """
         nnz = out_cache_loc.shape[0]
         device = out_cache_loc.device
 
         if update_inplace:
-            # In-place update: write directly to pre-allocated buffers (CUDA graph replay)
+            # CUDA graph replay: update pre-allocated buffers in-place.
+            # Only [0:nnz) (real batch) is refreshed; tail [nnz:num_tokens]
+            # is zeroed so padded tokens write harmlessly to page 0.
             torch.div(
                 out_cache_loc,
                 self.page_size,
@@ -372,14 +366,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             total_tokens = metadata.kv_indices.shape[0]
             if nnz < total_tokens:
-                # Zero padded tail so padded tokens write harmlessly to page 0.
                 metadata.kv_indices[nnz:total_tokens].zero_()
                 metadata.positions[nnz:total_tokens].zero_()
-                # NOTE: Do NOT zero batch_indices — it must stay as arange.
-                # With kv_indptr=arange, batch_indices[i]=0 would redirect
-                # padded token i to request 0's page (a valid page), corrupting
-                # it. With batch_indices[i]=i (arange), each padded token uses
-                # its own kv_indices[i]=0 (zeroed), writing to page 0.
+                # Do NOT zero batch_indices — keep it as arange so each padded
+                # token resolves to its own zeroed kv_indices entry.
+                # With kv_indptr=arange, zeroing batch_indices would redirect
+                # padded tokens to request 0's valid page.
         else:
             # Fresh allocation (normal mode or CUDA graph capture)
             metadata.kv_indices = (out_cache_loc // self.page_size).to(torch.int32)
@@ -493,13 +485,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        # Pre-allocate fused kernel buffers for CUDA graph.
-        # Lifecycle:
-        #   1. Allocated here at max_num_tokens (init_cuda_graph_state)
-        #   2. Sliced to num_tokens and assigned to metadata (capture)
-        #   3. Updated in-place each replay (_init_forward_metadata_for_rope_fusion)
-        # kv_indptr and batch_indices are static (arange), never modified after init.
-        # kv_indices and positions are dynamic, refreshed each replay.
+        # CUDA-graph fused metadata buffers:
+        #   1) Allocate once at max_num_tokens (here)
+        #   2) Slice to num_tokens during capture
+        #   3) Refresh kv_indices/positions in replay
+        # kv_indptr and batch_indices stay static (arange).
         if self.data_type == torch.float8_e4m3fn:
             self._cuda_graph_fused_kv_indices = torch.zeros(
                 max_num_tokens, dtype=torch.int32, device=self.device
@@ -596,9 +586,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
 
-        # Set pre-allocated fused kernel buffers (sliced to num_tokens)
-        # NOTE: Values are initialized during replay via _init_forward_metadata_for_rope_fusion.
-        # During capture, only tensor shapes/references matter for CUDA graph recording.
+        # Bind pre-allocated fused metadata slices for capture (num_tokens view).
+        # Values are refreshed on replay via _init_forward_metadata_for_rope_fusion;
+        # capture records shapes/references.
         if self.data_type == torch.float8_e4m3fn:
             metadata.kv_indices = self._cuda_graph_fused_kv_indices[:num_tokens]
             metadata.kv_indptr = self._cuda_graph_fused_kv_indptr[:num_tokens + 1]
@@ -874,16 +864,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         is_neox: bool,
         save_kv_cache: bool,
     ) -> torch.Tensor:
-        """Apply FP8 RoPE + quantize, and optionally save KV cache.
+        """Apply FP8 RoPE+quantize and optionally write KV cache.
 
-        When save_kv_cache is True, the fused kernel performs RoPE application,
-        FP8 quantization, and paged KV cache write in a single kernel call.
-        When save_kv_cache is False (e.g. CUDA graph decode where the cache is
-        already populated), only RoPE + FP8 quantize is performed via the
-        separated kernel.
+        - save_kv_cache=True: use fused RoPE+quantize+append kernel.
+        - save_kv_cache=False: use separated RoPE+quantize kernel only.
+          (Common in CUDA-graph decode when cache is already populated.)
 
         Returns:
-            merged_q: merged query tensor [nnz, num_heads, kv_lora_rank + qk_rope_head_dim]
+            merged_q: [nnz, num_heads, kv_lora_rank + qk_rope_head_dim]
         """
         k_squeezed = k.squeeze(1)
         k_rope_squeezed = k_rope.squeeze(1)
@@ -924,14 +912,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
     ) -> torch.Tensor:
-        """Fused RoPE application, FP8 quantization, and KV cache append.
+        """Fused RoPE + FP8 quantize + paged KV cache append in a single kernel call.
 
-        This combines RoPE application, FP8 quantization, and paged KV cache append
-        into a single fused kernel call using flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache.
-
-        Note: self.forward_decode_metadata must be initialized (via init_forward_metadata
-        or init_forward_metadata_replay_cuda_graph) before calling this function.
-        Note: MLA uses (ckv_cache, kpe_cache) and requires v=None in the fused call.
+        Wraps flashinfer.rope.rope_quantize_fp8_append_paged_kv_cache for MLA
+        (v=None, paged_kv_cache=(ckv_cache, kpe_cache)).
+        Requires initialized decode metadata (kv_indices/kv_indptr/batch_indices/positions).
 
         Args:
             q_nope: Query no-position-encoding component [nnz, num_heads, kv_lora_rank]
@@ -939,10 +924,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             k_nope: Key no-position-encoding component [nnz, kv_lora_rank]
             k_rope: Key RoPE component [nnz, qk_rope_head_dim]
             layer: The attention layer (used to get layer_id for KV cache)
-            forward_batch: Forward batch containing positions (RoPE position IDs,
-                used for cos/sin rotation) and token_to_kv_pool
-            cos_sin_cache: Precomputed cosine/sine cache for RoPE, dtype=float32.
-                Shape: (max_seq_len, rotary_dim).
+            forward_batch: Forward batch (provides RoPE pos_ids and token_to_kv_pool)
+            cos_sin_cache: Precomputed cosine/sine cache for RoPE
             is_neox: Whether to use NeoX-style RoPE (True) or GPT-J style (False)
 
         Returns:
