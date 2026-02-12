@@ -291,7 +291,11 @@ class EAGLEWorker(TpModelWorker):
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.forward_draft_extend(
-                    batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    logits_output.mm_input_embeds,
                 )
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -374,9 +378,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
-        if batch.tree_cache.supports_swa() and batch.tree_cache.is_chunk_cache():
-            for req in batch.reqs:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
 
         # Parse args
         num_seqs = batch.batch_size()
@@ -394,10 +398,11 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
+            alloc_len_per_decode = self.speculative_num_steps * self.topk
             # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
-                num_seqs * self.speculative_num_steps * self.topk,
+                num_seqs * alloc_len_per_decode,
                 backup_state=True,
             )
         else:
@@ -531,8 +536,8 @@ class EAGLEWorker(TpModelWorker):
         assert isinstance(spec_info, EagleDraftInput)
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        spec_info.num_tokens_per_batch = self.topk
-        spec_info.num_tokens_for_logprob_per_batch = self.topk
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
         batch.return_hidden_states = False
 
         # Get forward batch
@@ -682,7 +687,7 @@ class EAGLEWorker(TpModelWorker):
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
-        spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -855,6 +860,7 @@ class EAGLEWorker(TpModelWorker):
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
+        mm_input_embeds: Optional[torch.Tensor] = None,
     ):
         """Run draft model extend. This API modifies the states of the batch.
 
@@ -866,8 +872,8 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
-            num_tokens_per_batch=1,
-            num_tokens_for_logprob_per_batch=1,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
         )
         batch.return_hidden_states = False
         batch.spec_info.prepare_for_extend(batch)
@@ -879,6 +885,8 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         forward_batch.return_logprob = False
+        if mm_input_embeds is not None:
+            forward_batch.mm_input_embeds = mm_input_embeds
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         if self.enable_nan_detection:
             detect_nan(logits_output)
@@ -914,8 +922,8 @@ class EAGLEWorker(TpModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,

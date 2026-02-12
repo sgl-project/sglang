@@ -1,64 +1,65 @@
 # Best Practice on Ascend NPU
 
-This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend Npu. If
+This section describes the best practice data of mainstream LLM models such as DeepSeek and Qwen on the Ascend NPU. If
 you encounter issues or have any questions, please [open an issue](https://github.com/sgl-project/sglang/issues).
 
 ## DeepSeek Series Models
 
 ### Low Latency
 
-| Model         | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | Configuration                                            |
-|---------------|---------------|---------|---------------|-----------|--------------|----------------------------------------------------------|
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 6K-1.6K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-1) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.9K-1K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-2) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-3) |
-| Deepseek-R1   | Atlas 800I A3 | 32      | PD Separation | 3.5K-1K   | W8A8         | [Optimal Configuration](#deepseek-r1-low-latency-20ms-4) |
-| Deepseek-V3.2 | Atlas 800I A3 | 32      | PD Separation | 64K-1K    | W8A8         | [Optimal Configuration](#deepseek-v32-low-latency-30ms)  |
+| Model             | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                                         |
+|-------------------|---------------|-------|---------------|-----------|------|--------------|---------------------------------------------------------------------------------------|
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 6K+1.6K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)     |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.9K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_9k-1k-20ms-on-a3-32-cards-separation-mode)     |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-20ms-on-a3-32-cards-separation-mode)   |
+| Deepseek-R1       | Atlas 800I A3 | 32    | PD Separation | 3.5K+1K   | 20ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1k-20ms-on-a3-32-cards-separation-mode)     |
+| DeepSeek-V3.2-Exp | Atlas 800I A3 | 32    | PD Separation | 64K+3K    | 30ms | W8A8 INT8    | [Optimal Configuration](#deepseek-v32-exp-64k-3k-30ms-on-a3-32-cards-separation-mode) |
 
 ### High Throughput
 
-| Model       | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | Configuration                                                 |
-|-------------|---------------|---------|---------------|-----------|--------------|---------------------------------------------------------------|
-| Deepseek-R1 | Atlas 800I A3 | 32      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-1) |
-| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-2) |
-| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 2K-2K     | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-3) |
-| Deepseek-R1 | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-4) |
-| Deepseek-R1 | Atlas 800I A3 | 16      | PD Separation | 3.5K-1.5K | W4A8         | [Optimal Configuration](#deepseek-r1-high-performance-50ms-5) |
+| Model       | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT | Quantization | Configuration                                                                       |
+|-------------|---------------|-------|---------------|-----------|------|--------------|-------------------------------------------------------------------------------------|
+| Deepseek-R1 | Atlas 800I A3 | 32    | PD Separation | 3.5K+1.5K | 50ms | W8A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-32-cards-separation-mode) |
+| Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed      | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-8-cards-mixed-mode)           |
+| Deepseek-R1 | Atlas 800I A3 | 16    | PD Separation | 2K+2K     | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-2k-2k-50ms-on-a3-16-cards-separation-mode)     |
+| Deepseek-R1 | Atlas 800I A3 | 8     | PD Mixed      | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)       |
+| Deepseek-R1 | Atlas 800I A3 | 16    | PD Separation | 3.5K+1.5K | 50ms | W4A8 INT8    | [Optimal Configuration](#deepseek-r1-3_5k-1_5k-50ms-on-a3-16-cards-separation-mode) |
 
 ## Qwen Series Models
 
 ### Low Latency
 
-| Model      | Hardware      | CardNum | Deploy Mode | Dataset | Quantization | Configuration                                           |
-|------------|---------------|---------|-------------|---------|--------------|---------------------------------------------------------|
-| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed    | 11K-1K  | BF16         | [Optimal Configuration](#qwen3-235b-low-latency-10ms)   |
-| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 6K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-low-latency-18ms)    |
-| Qwen3-32B  | Atlas 800I A3 | 4       | PD Mixed    | 4K-1.5K | BF16         | [Optimal Configuration](#qwen3-32b-low-latency-11ms)    |
-| Qwen3-32B  | Atlas 800I A3 | 8       | PD Mixed    | 18K-4K  | BF16         | [Optimal Configuration](#qwen3-32b-low-latency-12ms)    |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 6K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-a2-low-latency-18ms) |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed    | 4K-1.5K | BF16         | [Optimal Configuration](#qwen3-32b-a2-low-latency-11ms) |
+| Model           | Hardware      | Cards | Deploy Mode | Dataset | TPOT | Quantization | Configuration                                                                  |
+|-----------------|---------------|-------|-------------|---------|------|--------------|--------------------------------------------------------------------------------|
+| Qwen3-235B-A22B | Atlas 800I A3 | 8     | PD Mixed    | 11K+1K  | 10ms | BF16         | [Optimal Configuration](#qwen3-235b-a22b-11k-1k-10ms-on-a3-8-cards-mixed-mode) |
+| Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 6K+1.5K | 18ms | BF16         | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a3-4-cards-mixed-mode)      |
+| Qwen3-32B       | Atlas 800I A3 | 4     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a3-4-cards-mixed-mode)      |
+| Qwen3-32B       | Atlas 800I A3 | 8     | PD Mixed    | 18K+4K  | 12ms | BF16         | [Optimal Configuration](#qwen3-32b-18k-4k-12ms-on-a3-8-cards-mixed-mode)       |
+| Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 6K+1.5K | 18ms | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-6k-1_5k-18ms-on-a2-8-cards-mixed-mode)      |
+| Qwen3-32B       | Atlas 800I A2 | 8     | PD Mixed    | 4K+1.5K | 11ms | BF16         | [Optimal Configuration](#qwen3-32b-4k-1_5k-11ms-on-a2-8-cards-mixed-mode)      |
 
 ### High Throughput
 
-| Model      | Hardware      | CardNum | Deploy Mode   | Dataset   | Quantization | Configuration                                                 |
-|------------|---------------|---------|---------------|-----------|--------------|---------------------------------------------------------------|
-| Qwen3-235B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-1)   |
-| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-2)   |
-| Qwen3-235B | Atlas 800I A3 | 8       | PD Mixed      | 2K-2K     | W8A8         | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-3)   |
-| Qwen3-235B | Atlas 800I A3 | 16      | PD Mixed      | 2K-2K     | W8A8         | [Optimal Configuration](#qwen3-235b-high-throughput-50ms-4)   |
-| Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-1)    |
-| Qwen3-32B  | Atlas 800I A3 | 2       | PD Mixed      | 2K-2K     | W8A8         | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-2)    |
-| Qwen3-30B  | Atlas 800I A3 | 1       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-high-throughput-50ms-3)    |
-| Qwen3-480B | Atlas 800I A3 | 24      | PD Separation | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-1)   |
-| Qwen3-480B | Atlas 800I A3 | 16      | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-2)   |
-| Qwen3-480B | Atlas 800I A3 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-480b-high-throughput-50ms-3)   |
-| Qwen3-Next | Atlas 800I A3 | 2       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-next-high-throughput-50ms)     |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed      | 3.5K-1.5K | W8A8         | [Optimal Configuration](#qwen3-32b-a2-high-throughput-50ms-1) |
-| Qwen3-32B  | Atlas 800I A2 | 8       | PD Mixed      | 2K-2K     | W8A8         | [Optimal Configuration](#qwen3-32b-a2-high-throughput-50ms-2) |
+| Model                          | Hardware      | Cards | Deploy Mode   | Dataset   | TPOT  | Quantization | Configuration                                                                                          |
+|--------------------------------|---------------|-------|---------------|-----------|-------|--------------|--------------------------------------------------------------------------------------------------------|
+| Qwen3-235B-A22B                | Atlas 800I A3 | 24    | PD Separation | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-24-cards-separation-mode)                |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)                      |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed      | 2K+2K     | 100ms | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-100ms-on-a3-8-cards-mixed-mode)                         |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 8     | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-50ms-on-a3-8-cards-mixed-mode)                          |
+| Qwen3-235B-A22B                | Atlas 800I A3 | 16    | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-235b-a22b-2k-2k-50ms-on-a3-16-cards-mixed-mode)                         |
+| Qwen3-32B                      | Atlas 800I A3 | 2     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a3-2-cards-mixed-mode)                            |
+| Qwen3-32B                      | Atlas 800I A3 | 2     | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a3-2-cards-mixed-mode)                                |
+| Qwen3-30B-A3B                  | Atlas 800I A3 | 1     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-30b-a3b-3_5k-1_5k-50ms-on-a3-1-card-mixed-mode)                         |
+| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 24    | PD Separation | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-24-cards-separation-mode) |
+| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 16    | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-16-cards-mixed-mode)      |
+| Qwen3-Coder-480B-A35B-Instruct | Atlas 800I A3 | 8     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-coder-480b-a35b-instruct-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode)       |
+| Qwen3-Next-80B-A3B-Instruct    | Atlas 800I A3 | 2     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-next-80B-a3b-instruct-3_5k-1_5k-50ms-on-a3-2-cards-mixed-mode)          |
+| Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed      | 3.5K+1.5K | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-3_5k-1_5k-50ms-on-a2-8-cards-mixed-mode)                            |
+| Qwen3-32B                      | Atlas 800I A2 | 8     | PD Mixed      | 2K+2K     | 50ms  | W8A8 INT8    | [Optimal Configuration](#qwen3-32b-2k-2k-50ms-on-a2-8-cards-mixed-mode)                                |
 
 ## Optimal Configuration
 
-### DeepSeek R1 High Performance 50ms 1
+### DeepSeek-R1 3_5K-1_5K 50ms on A3 32 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -66,7 +67,9 @@ Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -135,7 +138,7 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=78
-        export TASK_QUEUE_ENABLE=0
+        export TASK_QUEUE_ENABLE=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
@@ -169,11 +172,13 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 832  --random-input-len 3500 --random-output-len 1500 --num-prompts 3328 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek R1 Low Latency 20ms 1
+### DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -181,7 +186,9 @@ Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 6K1.6K
+Dataset: random
+
+Input Output Length: 6K+1.6K
 
 TPOT: 20ms
 
@@ -247,13 +254,13 @@ do
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=650
-        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=4
-        export TASK_QUEUE_ENABLE=0
+        export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=12
+        export TASK_QUEUE_ENABLE=1
         export SGLANG_SCHEDULER_SKIP_ALL_GATHER=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
-        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 8 \
+        --port 8001 --trust-remote-code --dist-init-addr DIP1:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 16 \
         --mem-fraction-static 0.75 --max-running-requests 32 --attention-backend ascend --device npu --quantization modelslim \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 2 4 6 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
@@ -282,11 +289,13 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 6000 --random-output-len 1600 --num-prompts 32 --random-range-ratio 1
 ```
 
-### DeepSeek R1 Low Latency 20ms 2
+### DeepSeek-R1 3_9K-1K 20ms on A3 32 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -294,21 +303,25 @@ Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 3.9K1K
+Dataset: random
+
+Input Output Length: 3.9K+1K
 
 TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
+Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)
 
 #### Benchmark
 
-```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 3900 --random-output-len 1000 --num-prompts 32 --random-range-ratio 1
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3900 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek R1 Low Latency 20ms 3
+### DeepSeek-R1 3_5K-1_5K 20ms on A3 32 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -316,21 +329,25 @@ Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
+Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 3500 --random-output-len 1500 --num-prompts 32 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek R1 Low Latency 20ms 4
+### DeepSeek-R1 3_5K-1K 20ms on A3 32 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -338,21 +355,25 @@ Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 3.5K1K
+Dataset: random
+
+Input Output Length: 3.5K+1K
 
 TPOT: 20ms
 
 #### Model Deployment
 
-Please Turn to [DeepSeek R1 Low Latency 20ms](#deepSeek-r1-low-latency-20ms-1)
+Please Turn to [DeepSeek-R1 6K-1_6K 20ms on A3 32 Cards Separation Mode](#deepseek-r1-6k-1_6k-20ms-on-a3-32-cards-separation-mode)
 
 #### Benchmark
 
-```bash
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 3500 --random-output-len 1000 --num-prompts 32 --random-range-ratio 1
+We tested it based on the `RANDOM` dataset.
+
+```shell
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1000 --num-prompts 768 --random-range-ratio 1 --request-rate 16
 ```
 
-### DeepSeek R1 High Performance 50ms 2
+### DeepSeek-R1 2K-2K 50ms on A3 8 Cards Mixed Mode
 
 Model: Deepseek R1
 
@@ -360,7 +381,9 @@ Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 50ms
 
@@ -424,11 +447,13 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 256  --random-input-len 2048 --random-output-len 2048 --num-prompts 1024 --random-range-ratio 1
 ```
 
-### DeepSeek R1 High Performance 50ms 3
+### DeepSeek-R1 2K-2K 50ms on A3 16 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -436,7 +461,9 @@ Hardware: Atlas 800I A3 16Card
 
 DeployMode: PD Separation
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 50ms
 
@@ -513,7 +540,7 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=720
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
-        export TASK_QUEUE_ENABLE=0
+        export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
@@ -545,11 +572,13 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 400  --random-input-len 2048 --random-output-len 2048 --num-prompts 3200 --random-range-ratio 1 --request-rate 8
 ```
 
-### DeepSeek R1 High Performance 50ms 4
+### DeepSeek-R1 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
 
 Model: Deepseek R1
 
@@ -557,7 +586,9 @@ Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -618,11 +649,13 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 144  --random-input-len 3500 --random-output-len 1500 --num-prompts 576 --random-range-ratio 1
 ```
 
-### DeepSeek R1 High Performance 50ms 5
+### DeepSeek-R1 3_5K-1_5K 50ms on A3 16 Cards Separation Mode
 
 Model: Deepseek R1
 
@@ -630,7 +663,9 @@ Hardware: Atlas 800I A3 16Card
 
 DeployMode: PD Separation
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -706,7 +741,7 @@ do
         export SGLANG_ENABLE_SPEC_V2=1
         export HCCL_BUFFSIZE=720
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=96
-        export TASK_QUEUE_ENABLE=0
+        export TASK_QUEUE_ENABLE=1
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
@@ -738,19 +773,23 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 384  --random-input-len 3500 --random-output-len 1500 --num-prompts 1536 --random-range-ratio 1
 ```
 
-### Deepseek V32 Low Latency 30ms
+### DeepSeek-V3.2-Exp 64K-3K 30ms on A3 32 Cards Separation Mode
 
-Model: Deepseek V3.2
+Model: DeepSeek-V3.2-Exp-W8A8
 
 Hardware: Atlas 800I A3 32Card
 
 DeployMode: PD Separation
 
-DataSets: 64K1K
+Dataset: random
+
+Input Output Length: 64K+3K
 
 TPOT: 30ms
 
@@ -936,8 +975,7 @@ export SGLANG_DP_ROUND_ROBIN=1
 python -m sglang_router.launch_router \
     --pd-disaggregation \
     --policy cache_aware \
-    --prefill http://PIP1:8000 8998 \
-    --prefill http://PIP2:8000 8999 \
+    --prefill http://PIP1:8000 8995 \
     --decode http://DIP1:8001 \
     --host 127.0.0.1 \
     --port 6688 \
@@ -946,19 +984,23 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 64000 --random-output-len 1000 --num-prompts 64 --random-range-ratio 1 --request-rate 0.25
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 32  --random-input-len 64000 --random-output-len 3000 --num-prompts 64 --random-range-ratio 1
 ```
 
-### Qwen3 235B High Throughput 50ms 1
+### Qwen3-235B-A22B 3_5K-1_5K 50ms on A3 24 Cards Separation Mode
 
-Model: Qwen3 235B
+Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 24Card
 
 DeployMode: PD Separation
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -1019,7 +1061,6 @@ do
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
         --nnodes 1 --node-rank $i --tp-size 16 --dp-size 16 --mem-fraction-static 0.6 \
         --disable-radix-cache \
-        --ep-dispatch-algorithm static --init-expert-location /path/to/expert_distribution_recorder.pt \
         --attention-backend ascend --device npu --quantization modelslim --disaggregation-transfer-backend ascend \
         --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
@@ -1079,19 +1120,23 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 768 --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang-oai --host 127.0.0.1 --port 7239 --max-concurrency 860 --random-input-len 3500 --random-output-len 1500 --num-prompts 3440 --random-range-ratio 1
 ```
 
-### Qwen3 235B High Throughput 50ms 2
+### Qwen3-235B-A22B 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
 
-Model: Qwen3 235B
+Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -1132,7 +1177,7 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
+export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=2
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
@@ -1148,19 +1193,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 288 --random-input-len 3500 --random-output-len 1500 --num-prompts 1088 --random-range-ratio 1
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 272 --random-input-len 3500 --random-output-len 1500 --num-prompts 1088 --random-range-ratio 1
 ```
 
-### Qwen3-235B Atlas 800I A3-8Card PD Mixed 2K-2K 100ms
+### Qwen3-235B-A22B 2K-2K 100ms on A3 8 Cards Mixed Mode
 
-Model: Qwen3 235B
+Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 100ms
 
@@ -1216,19 +1265,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 576 --random-input-len 2000 --random-output-len 2000 --num-prompts 576 --random-range-ratio 1
 ```
 
-### Qwen3 235B High Throughput 50ms 3
+### Qwen3-235B-A22B 2K-2K 50ms on A3 8 Cards Mixed Mode
 
-Model: Qwen3 235B
+Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 50ms
 
@@ -1270,7 +1323,6 @@ export GLOO_SOCKET_IFNAME=xxx
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
@@ -1285,19 +1337,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 480 --random-input-len 2048 --random-output-len 2048 --num-prompts 480 --random-range-ratio 1
 ```
 
-### Qwen3 235B High Throughput 50ms 4
+### Qwen3-235B-A22B 2K-2K 50ms on A3 16 Cards Mixed Mode
 
-Model: Qwen3 235B
+Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 16Card
 
 DeployMode: PD Mixed
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 50ms
 
@@ -1321,8 +1377,6 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
 
 MODEL_PATH=xxx
 
@@ -1348,17 +1402,16 @@ do
         echo "${MIX_IP[$i]}"
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
-        export SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} \
         --host 127.0.0.1 --port 7439 --trust-remote-code \
         --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 --mem-fraction-static 0.8 --max-running-requests 768 \
         --attention-backend ascend --device npu --quantization modelslim --enable-dp-attention \
         --moe-a2a-backend deepep --deepep-mode auto --cuda-graph-bs 6 8 10 12 18 24 \
-        --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 32768 --max-prefill-tokens 458880 \
-        --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
+        --dist-init-addr ${MIX_IP[0]}:5000 --chunked-prefill-size 131072 --max-prefill-tokens 458880 \
+        --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx --speculative-draft-model-quantization= unquant \
         --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-        --watchdog-timeout 9000 --context-length 8192 \
+        --context-length 8192 --disable-radix-cache \
         --enable-dp-lm-head --dtype bfloat16
         NODE_RANK=$i
         break
@@ -1369,19 +1422,23 @@ done
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 768 --random-input-len 2000 --random-output-len 2000 --num-prompts 768 --random-range-ratio 1
 ```
 
-### Qwen3 235B Low Latency 10ms
+### Qwen3-235B-A22B 11K-1K 10ms on A3 8 Cards Mixed Mode
 
-Model: Qwen3 235B
+Model: Qwen3-235B-A22B-W8A8
 
 Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 11K1K
+Dataset: random
+
+Input Output Length: 11K+1K
 
 TPOT: 10ms
 
@@ -1438,19 +1495,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 1 --random-input-len 11000 --random-output-len 1000 --num-prompts 1 --random-range-ratio 1
 ```
 
-### Qwen3 32B Low Latency 18ms
+### Qwen3-32B 6K-1_5K 18ms on A3 4 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A3 4Card
 
 DeployMode: PD Mixed
 
-DataSets: 6K1.5K
+Dataset: random
+
+Input Output Length: 6K+1.5K
 
 TPOT: 18ms
 
@@ -1493,10 +1554,10 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu  --quantization modelslim  \
+    --attention-backend ascend --device npu \
     --max-running-requests 32 \
     --disable-radix-cache \
-    --chunked-prefill-size 32768 --max-prefill-tokens 65536 --speculative-draft-model-quantization unquant \
+    --chunked-prefill-size 24576 --max-prefill-tokens 65536 \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --tp-size 8 --mem-fraction-static 0.72 --cuda-graph-bs 8 16 24 32  --dtype bfloat16
@@ -1505,21 +1566,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
-We tested it based on the GSM8K dataset.
+We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 32 --random-output-len 1500 --random-input-len 6000 --num-prompts 32 --random-range-ratio 1
 ```
 
-### Qwen3 32B Low Latency 11ms
+### Qwen3-32B 4K-1_5K 11ms on A3 4 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A3 4Card
 
 DeployMode: PD Mixed
 
-DataSets: 4K1.5K
+Dataset: random
+
+Input Output Length: 4K+1.5K
 
 TPOT: 11ms
 
@@ -1573,19 +1636,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 4096 --num-prompts 4
 ```
 
-### Qwen3 32B Low Latency 12ms
+### Qwen3-32B 18K-4K 12ms on A3 8 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 18K4K
+Dataset: random
+
+Input Output Length: 18K+4K
 
 TPOT: 12ms
 
@@ -1624,13 +1691,12 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu   \
     --max-running-requests 1 \
-    --disable-radix-cache \
+    --disable-radix-cache --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
@@ -1639,19 +1705,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7339 --random-range-ratio 1 --max-concurrency 1 --random-output-len 18000 --random-input-len 4000 --num-prompts 1
 ```
 
-### Qwen3 32B High Throughput 50ms 1
+### Qwen3-32B 3_5K-1_5K 50ms on A3 2 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A3 2Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -1697,29 +1767,31 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --attention-backend ascend --device npu  --quantization modelslim  \
     --max-running-requests 78 \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
-    --chunked-prefill-size 65536 --max-prefill-tokens 65536  \
+    --chunked-prefill-size -1 --max-prefill-tokens 49152  \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --tp-size 4  --mem-fraction-static 0.7 --cuda-graph-bs 16 32 64 68 72 78 --dtype bfloat16
+    --tp-size 4  --mem-fraction-static 0.72 --cuda-graph-bs 16 32 64 68 72 78 --dtype bfloat16
 ```
 
 #### Benchmark
 
-We tested it based on the GSM8K dataset.
+We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 78 --random-output-len 1500 --random-input-len 3500 --num-prompts 312 --random-range-ratio 1
 ```
 
-### Qwen3 32B High Throughput 50ms 2
+### Qwen3-32B 2K-2K 50ms on A3 2 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A3 2Card
 
 DeployMode: PD Mixed
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 50ms
 
@@ -1766,28 +1838,30 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --chunked-prefill-size 65536 --max-prefill-tokens 49152 \
+    --chunked-prefill-size -1 --max-prefill-tokens 49152 \
     --tp-size 4 --mem-fraction-static 0.7 --cuda-graph-bs 54 60 66 72 78 84 90 108 114 120 --dtype bfloat16
 
 ```
 
 #### Benchmark
 
-We tested it based on the GSM8K dataset.
+We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 120 --random-output-len 2000 --random-input-len 2000 --num-prompts 480 --random-range-ratio 1
 ```
 
-### Qwen3 32B High Throughput 50ms 3
+### Qwen3-30B-A3B 3_5K-1_5K 50ms on A3 1 Card Mixed Mode
 
-Model: Qwen3 30B
+Model: Qwen3-30B-A3B-Instruct-2507
 
 Hardware: Atlas 800I A3 1Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -1826,13 +1900,13 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu  --quantization modelslim  \
     --max-running-requests 192 \
     --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
     --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
     --chunked-prefill-size -1 --max-prefill-tokens 32768 \
@@ -1841,19 +1915,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 156 --random-input-len 3500 --random-output-len 1500 --num-prompts 624 --random-range-ratio 1
 ```
 
-### Qwen3 480B High Throughput 50ms 1
+### Qwen3-Coder-480B-A35B-Instruct 3_5K-1_5K 50ms on A3 24 Cards Separation Mode
 
-Model: Qwen3 480B
+Model: Qwen3-Coder-480B-A35B-Instruct
 
 Hardware: Atlas 800I A3 24Card
 
 DeployMode: PD Separation
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -1961,19 +2039,23 @@ python -m sglang_router.launch_router \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 410 --random-input-len 3500 --random-output-len 1500 --num-prompts 1640 --random-range-ratio 1 --request-rate 8
 ```
 
-### Qwen3 480B High Throughput 50ms 2
+### Qwen3-Coder-480B-A35B-Instruct 3_5K-1_5K 50ms on A3 16 Cards Mixed Mode
 
-Model: Qwen3 480B
+Model: Qwen3-Coder-480B-A35B-Instruct
 
 Hardware: Atlas 800I A3 16Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -2040,19 +2122,23 @@ done
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 288 --random-input-len 3500 --random-output-len 1500 --num-prompts 1152 --random-range-ratio 1 --request-rate 20
 ```
 
-### Qwen3 480B High Throughput 50ms 3
+### Qwen3-Coder-480B-A35B-Instruct 3_5K-1_5K 50ms on A3 8 Cards Mixed Mode
 
-Model: Qwen3 480B
+Model: Qwen3-Coder-480B-A35B-Instruct
 
 Hardware: Atlas 800I A3 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -2104,19 +2190,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 80 --random-input-len 3500 --random-output-len 1500 --num-prompts 320 --random-range-ratio 1 --request-rate 8
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 80 --random-input-len 3500 --random-output-len 1500 --num-prompts 320 --random-range-ratio 1
 ```
 
-### Qwen3 Next High Throughput 50ms
+### Qwen3-Next-80B-A3B-Instruct 3_5K-1_5K 50ms on A3 2 Cards Mixed Mode
 
-Model: Qwen3 Next
+Model: Qwen3-Next-80B-A3B-Instruct
 
 Hardware: Atlas 800I A3 2Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -2150,7 +2240,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=20
 export HCCL_BUFFSIZE=2000
 
 python -m sglang.launch_server \
-        --model-path /mnt/share/weight/Qwen3-Next-80B-A3B-Instruct-W8A8-3 \
+        --model-path /path/to/Qwen3-Next-80B-A3B-Instruct-W8A8-3 \
         --host 127.0.0.1 \
         --port 6699 \
         --tp-size 4 \
@@ -2169,19 +2259,23 @@ python -m sglang.launch_server \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6699 --max-concurrency 80 --random-output-len 1536 --random-input-len 3584 --num-prompts 160 --random-range-ratio 1
 ```
 
-### Qwen3 32B A2 Low Latency 18ms
+### Qwen3-32B 6K-1_5K 18ms on A2 8 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A2 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 6K1.5K
+Dataset: random
+
+Input Output Length: 6K+1.5K
 
 TPOT: 18ms
 
@@ -2234,21 +2328,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
-We tested it based on the GSM8K dataset.
+We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 32 --random-output-len 1500 --random-input-len 6000 --num-prompts 32 --random-range-ratio 1
 ```
 
-### Qwen3 32B A2 Low Latency 11ms
+### Qwen3-32B 4K-1_5K 11ms on A2 8 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A2 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 4K1.5K
+Dataset: random
+
+Input Output Length: 4K+1.5K
 
 TPOT: 11ms
 
@@ -2290,13 +2386,13 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
     --attention-backend ascend --device npu   \
     --max-running-requests 32 \
     --disable-radix-cache \
+    --speculative-draft-model-quantization unquant \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx  \
     --speculative-num-steps 4 --speculative-eagle-topk 1 --speculative-num-draft-tokens 5 \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
@@ -2305,19 +2401,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
+We tested it based on the `RANDOM` dataset.
+
 ```shell
 python3 -m sglang.bench_serving  --dataset-name random --backend sglang --host 127.0.0.1 --port 7339 --random-range-ratio 1 --max-concurrency 1 --random-output-len 1500 --random-input-len 4096 --num-prompts 4
 ```
 
-### Qwen3 32B A2 High Throughput 50ms 1
+### Qwen3-32B 3_5K-1_5K 50ms on A2 8 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A2 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 3.5K1.5K
+Dataset: random
+
+Input Output Length: 3.5K+1.5K
 
 TPOT: 50ms
 
@@ -2371,21 +2471,23 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
-We tested it based on the GSM8K dataset.
+We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 78 --random-output-len 1500 --random-input-len 3500 --num-prompts 312 --random-range-ratio 1
 ```
 
-### Qwen3 32B A2 High Throughput 50ms 2
+### Qwen3-32B 2K-2K 50ms on A2 8 Cards Mixed Mode
 
-Model: Qwen3 32B
+Model: Qwen3-32B
 
 Hardware: Atlas 800I A2 8Card
 
 DeployMode: PD Mixed
 
-DataSets: 2K2K
+Dataset: random
+
+Input Output Length: 2K+2K
 
 TPOT: 50ms
 
@@ -2424,7 +2526,6 @@ export GLOO_SOCKET_IFNAME=lo
 export HCCL_OP_EXPANSION_MODE="AIV"
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_ENABLE_SPEC_V2=1
-export DISABLE_EAGLE3_QUANT=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
@@ -2439,7 +2540,7 @@ python -m sglang.launch_server --model-path $MODEL_PATH \
 
 #### Benchmark
 
-We tested it based on the GSM8K dataset.
+We tested it based on the `RANDOM` dataset.
 
 ```shell
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 120 --random-output-len 2000 --random-input-len 2000 --num-prompts 120 --random-range-ratio 1
