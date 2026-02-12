@@ -178,11 +178,26 @@ class Fp8Config(QuantizationConfig):
             config, ["ignored_layers", "modules_to_not_convert"], None
         )
         if ignored_layers:
-            if "mistral3" in config.get("model_type", ""):
-                # hack for ministral
-                ignored_layers = [
-                    layer.replace("model.", "") for layer in ignored_layers
-                ]
+            # Keep both "model." and non-"model." variants for robust prefix matching.
+            normalized: List[str] = []
+            seen: set[str] = set()
+            for layer in ignored_layers:
+                candidates = [layer]
+                if layer.startswith("model."):
+                    candidates.append(layer[len("model.") :])
+                else:
+                    candidates.append(f"model.{layer}")
+                for candidate in candidates:
+                    if candidate not in seen:
+                        normalized.append(candidate)
+                        seen.add(candidate)
+            if len(normalized) != len(ignored_layers):
+                log_info_on_rank0(
+                    logger,
+                    "Fp8Config expanded ignored_layers to include both "
+                    "'model.' and non-'model.' variants for matching.",
+                )
+            ignored_layers = normalized
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         if use_mxfp8 and weight_block_size is not None:
             logger.warning(
