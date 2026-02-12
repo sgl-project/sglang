@@ -835,7 +835,9 @@ class PrefillAdder:
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
         valid_running_reqs = (
-            r for r in self.running_batch.reqs if r not in self.preempt_list
+            r
+            for r in self.running_batch.reqs
+            if r not in self.preempt_list and not r.finished()
         )
 
         sorted_valid_running_reqs = sorted(
