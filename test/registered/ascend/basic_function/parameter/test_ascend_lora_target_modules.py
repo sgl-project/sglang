@@ -4,8 +4,8 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import (
-    LLAMA_3_2_1B_WEIGHTS_PATH,
     LLAMA_3_2_1B_INSTRUCT_TOOL_CALLING_LORA_WEIGHTS_PATH,
+    LLAMA_3_2_1B_WEIGHTS_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -76,15 +76,15 @@ class TestLoraTargetModulesAll(CustomTestCase):
         response = requests.get(DEFAULT_URL_FOR_TEST + "/get_server_info")
         self.assertEqual(response.status_code, 200)
         expected_modules = [
-            'k_proj',
-            'down_proj',
-            'gate_up_proj',
-            'o_proj',
-            'qkv_proj',
-            'gate_proj',
-            'v_proj',
-            'q_proj',
-            'up_proj'
+            "k_proj",
+            "down_proj",
+            "gate_up_proj",
+            "o_proj",
+            "qkv_proj",
+            "gate_proj",
+            "v_proj",
+            "q_proj",
+            "up_proj",
         ]
         actual_modules = response.json()["lora_target_modules"]
 
