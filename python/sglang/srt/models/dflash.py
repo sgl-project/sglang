@@ -20,13 +20,13 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
+    can_dflash_slice_qkv_weight,
     get_dflash_config,
     resolve_dflash_target_layer_ids,
 )
@@ -135,9 +135,8 @@ class DFlashAttention(nn.Module):
         we only need K/V for the cached tokens; Q is never consumed.
         """
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
-        if isinstance(
-            getattr(self.qkv_proj, "quant_method", None), UnquantizedLinearMethod
-        ):
+        can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
+        if can_slice_qkv_weight:
             kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
             weight = self.qkv_proj.weight[kv_slice]
             bias = (

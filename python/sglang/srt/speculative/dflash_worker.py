@@ -1,4 +1,5 @@
 import logging
+import math
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -16,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
+    can_dflash_use_fused_qkv_proj,
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
 )
@@ -191,15 +193,46 @@ class DFlashWorker:
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
         try:
-            FusedKVMaterializeHelper = _get_fused_kv_materialize_helper()
             layers = self.draft_model.layers
+            fused_disable_reason: Optional[str] = None
+
             if len(layers) == 0:
-                logger.warning(
-                    "DFLASH fused KV: no layers found, disabling fused path."
-                )
+                fused_disable_reason = "no layers found"
+
+            for layer_idx, layer in enumerate(layers):
+                attn = layer.self_attn
+                eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
+                if not eligible:
+                    fused_disable_reason = f"{reason}: layer={layer_idx}"
+                    break
+
+                # Keep semantics aligned with set_kv_buffer scaling behavior.
+                k_scale = getattr(attn.attn, "k_scale", None)
+                v_scale = getattr(attn.attn, "v_scale", None)
+                if k_scale is not None and not math.isclose(float(k_scale), 1.0):
+                    fused_disable_reason = (
+                        "non-unit k_scale is not supported for fused KV path: "
+                        f"layer={layer_idx}, k_scale={k_scale}"
+                    )
+                    break
+                if v_scale is not None and not math.isclose(float(v_scale), 1.0):
+                    fused_disable_reason = (
+                        "non-unit v_scale is not supported for fused KV path: "
+                        f"layer={layer_idx}, v_scale={v_scale}"
+                    )
+                    break
+
+            if fused_disable_reason is not None:
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH fused KV materialization disabled: %s",
+                        fused_disable_reason,
+                    )
                 self._use_fused_kv_materialize = False
+                self._fused_kv_helper = None
                 return
 
+            FusedKVMaterializeHelper = _get_fused_kv_materialize_helper()
             first_attn = layers[0].self_attn
             rotary_emb = first_attn.rotary_emb
 
@@ -773,9 +806,20 @@ class DFlashWorker:
                 )
 
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
-                self._append_target_hidden_fused(
-                    ctx_hidden, ctx_positions, ctx_cache_loc
-                )
+                try:
+                    self._append_target_hidden_fused(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused KV append failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                    self._append_target_hidden_sequential(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
             else:
                 self._append_target_hidden_sequential(
                     ctx_hidden, ctx_positions, ctx_cache_loc
@@ -815,20 +859,25 @@ class DFlashWorker:
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
-        k_cache_buffers = []
-        v_cache_buffers = []
-        for layer in self.draft_model.layers:
-            layer_id = layer.self_attn.attn.layer_id
-            k_buf, v_buf = token_to_kv_pool.get_kv_buffer(layer_id)
-            k_cache_buffers.append(k_buf)
-            v_cache_buffers.append(v_buf)
+        layers = self.draft_model.layers
+
+        def _write_layer_kv(
+            layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+        ) -> None:
+            attn = layers[layer_idx].self_attn.attn
+            token_to_kv_pool.set_kv_buffer(
+                attn,
+                ctx_cache_loc,
+                cache_k,
+                cache_v,
+                attn.k_scale,
+                attn.v_scale,
+            )
 
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
-            cache_locs=ctx_cache_loc,
-            k_cache_buffers=k_cache_buffers,
-            v_cache_buffers=v_cache_buffers,
+            write_layer_kv=_write_layer_kv,
         )
 
     def forward_batch_generation(

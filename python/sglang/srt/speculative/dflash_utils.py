@@ -5,6 +5,8 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 
@@ -142,6 +144,30 @@ def resolve_dflash_mask_token_id(*, draft_hf_config: Any) -> Optional[int]:
             f"got {mask_token_id}."
         )
     return mask_token_id
+
+
+def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
+    """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
+    quant_method = getattr(qkv_proj, "quant_method", None)
+    if not isinstance(quant_method, UnquantizedLinearMethod):
+        return (
+            False,
+            "quantized qkv_proj is not supported for this path "
+            f"(quant_method={type(quant_method).__name__})",
+        )
+    if not hasattr(qkv_proj, "weight"):
+        return False, "qkv weight tensor is missing"
+    return True, ""
+
+
+def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
+    """Validate whether a QKV layer is eligible for DFlash fused KV materialization."""
+    eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
+    if not eligible:
+        return False, reason
+    if getattr(qkv_proj, "bias", None) is not None:
+        return False, "qkv bias is not supported for fused KV path"
+    return True, ""
 
 
 def compute_dflash_accept_len_and_bonus(

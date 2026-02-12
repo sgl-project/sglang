@@ -381,8 +381,18 @@ class DFlashVerifyInput(SpecInput):
                     if req.grammar is not None:
                         req.grammar.accept_token(int(tok))
 
+            if req.output_ids:
+                new_verified_token = int(req.output_ids[-1])
+            elif req.origin_input_ids:
+                # If no token was appended in this verify step, keep the current token unchanged.
+                new_verified_token = int(req.origin_input_ids[-1])
+            else:
+                raise RuntimeError(
+                    "DFLASH verify cannot determine current token: both output_ids and origin_input_ids are empty."
+                )
+
             commit_lens_cpu.append(appended)
-            new_verified_list.append(req.output_ids[-1])
+            new_verified_list.append(new_verified_token)
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
