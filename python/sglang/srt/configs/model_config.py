@@ -61,6 +61,7 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
+            "GlmMoeDsaForCausalLM",
         ]
         and getattr(config, "index_topk", None) is not None
     )
@@ -271,10 +272,10 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "DeepseekV3ForCausalLM"
-        ):
+        if is_draft_model and self.hf_config.architectures[0] in [
+            "DeepseekV3ForCausalLM",
+            "GlmMoeDsaForCausalLM",
+        ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
         if is_draft_model and self.hf_config.architectures[0] in [
@@ -411,7 +412,6 @@ class ModelConfig:
             "swa_v_head_dim",
             self.v_head_dim,
         )
-
         # FIXME: temporary special judge for MLA architecture
         if (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
@@ -419,6 +419,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
+            or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -625,6 +626,17 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is not None and not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
+        if quant_cfg is not None:
+            # Identify modelopt quantization
+            if "quant_method" not in quant_cfg:
+                parsed_cfg = self._parse_modelopt_quant_config(
+                    {"quantization": quant_cfg}
+                )
+                if parsed_cfg:
+                    quant_cfg.update(parsed_cfg)
+
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
@@ -735,6 +747,12 @@ class ModelConfig:
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
+        # Check for quantization in hf_config (config.json)
+        if getattr(self.hf_config, "quantization_config", None) or getattr(
+            self.hf_config, "compression_config", None
+        ):
+            return True
+
         # Check for HuggingFace quantization config
         from sglang.srt.utils import has_hf_quant_config
 
@@ -1162,6 +1180,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
         or "XLMRobertaForSequenceClassification" in model_architectures
+        or "Gemma2ForSequenceClassification" in model_architectures
     ):
         return False
     else:
