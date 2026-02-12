@@ -267,7 +267,7 @@ class BaseLoRABackend:
             seg_lens=seg_lens,
             seg_indptr=seg_indptr,
             weight_indices=wi_tensor,
-            lora_ranks=self.batch_info.lora_ranks,   # shared reference
-            scalings=self.batch_info.scalings,        # shared reference
+            lora_ranks=self.batch_info.lora_ranks,  # shared reference
+            scalings=self.batch_info.scalings,  # shared reference
             permutation=None,
         )
