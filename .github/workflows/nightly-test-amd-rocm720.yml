@@ -82,11 +82,11 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 
       - name: Nightly Unit Test ROCm 7.2 (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 600 --continue-on-error || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu --nightly --timeout-per-file 900 --continue-on-error || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -516,11 +516,11 @@ jobs:
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build
 
       - name: Nightly Test MI35x ROCm 7.2 (1-GPU)
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu-mi35x --nightly --timeout-per-file 600 --continue-on-error || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-1-gpu-mi35x --nightly --timeout-per-file 900 --continue-on-error || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 

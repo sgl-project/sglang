@@ -72,6 +72,8 @@ NIGHTLY_SUITES = {
     ],
     HWBackend.AMD: [
         "nightly-amd",
+        "nightly-amd-1-gpu",
+        "nightly-amd-1-gpu-mi35x",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
