@@ -22,7 +22,18 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
-from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.flash_attn import flash_attn_varlen_func as flash_attn_varlen_func_fa3
+from sgl_kernel.flash_attn import flash_attn_with_kvcache as flash_attn_with_kvcache_fa3
+
+flash_attn_varlen_func = flash_attn_varlen_func_fa3
+flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
+
+from sglang.jit_kernel.flash_attention_v4 import (
+    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+)
+from sglang.jit_kernel.flash_attention_v4 import (
+    flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+)
 
 
 @dataclass
@@ -803,10 +814,21 @@ class FlashAttentionBackend(AttentionBackend):
             and not is_swa_layer
         )
 
-        # For fa3 interface version compatibility, we put new fields into conditional keyword args
+        flash_attn_varlen_func_base = flash_attn_varlen_func_fa3
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
+
+        flash_attn_varlen_func = (
+            flash_attn_varlen_func_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_varlen_func_base
+        )
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
+
         kwargs = {}
-        if self.fa_impl_ver != 3:
-            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -1110,10 +1132,7 @@ class FlashAttentionBackend(AttentionBackend):
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
 
-        # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
-        if self.fa_impl_ver != 3:
-            kwargs["ver"] = self.fa_impl_ver
         if sinks is not None:
             kwargs["sinks"] = sinks
 
@@ -2117,7 +2136,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 default_extend = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
                 extend_seq_lens = torch.full(
                     (bs,), default_extend, dtype=torch.int32, device=device
@@ -2128,7 +2147,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
                 metadata.max_seq_len_q = getattr(
-                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                    spec_info, "num_tokens_per_req", self.speculative_num_steps + 1
                 )
 
             metadata.cu_seqlens_q[1:].copy_(

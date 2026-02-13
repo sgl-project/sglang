@@ -126,6 +126,7 @@ class SamplingParams:
     guidance_scale_2: float = None
     true_cfg_scale: float = None  # for CFG vs guidance distillation (e.g., QwenImage)
     guidance_rescale: float = 0.0
+    cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
 
     # TeaCache parameters
@@ -149,6 +150,11 @@ class SamplingParams:
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
+    # if True, suppress verbose logging for this request
+    suppress_logs: bool = False
+
+    return_file_paths_only: bool = True
+    enable_sequence_shard: bool = False
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -273,6 +279,11 @@ class SamplingParams:
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
 
+        if self.cfg_normalization is None:
+            self.cfg_normalization = 0.0
+        elif isinstance(self.cfg_normalization, bool):
+            self.cfg_normalization = 1.0 if self.cfg_normalization else 0.0
+
         if self.boundary_ratio is not None:
             if isinstance(self.boundary_ratio, bool) or not isinstance(
                 self.boundary_ratio, (int, float)
@@ -357,6 +368,12 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
+        if self.enable_sequence_shard:
+            self.adjust_frames = False
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
+
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
             if not server_args.pipeline_config.allow_set_num_frames():
@@ -417,14 +434,17 @@ class SamplingParams:
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
         from sglang.multimodal_gen.registry import get_model_info
 
-        model_info = get_model_info(model_path)
+        backend = kwargs.pop("backend", None)
+        model_info = get_model_info(model_path, backend=backend)
         sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
     def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
         try:
-            sampling_params = SamplingParams.from_pretrained(model_path)
+            sampling_params = SamplingParams.from_pretrained(
+                model_path, backend=server_args.backend
+            )
         except (AttributeError, ValueError) as e:
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
@@ -463,7 +483,9 @@ class SamplingParams:
                 # Re-raise if it's not a safetensors file issue
                 raise
 
-        user_sampling_params = SamplingParams(*args, **kwargs)
+        user_kwargs = dict(kwargs)
+        user_kwargs.pop("diffusers_kwargs", None)
+        user_sampling_params = SamplingParams(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params._adjust(server_args)
@@ -640,6 +662,13 @@ class SamplingParams:
             help="Guidance rescale factor",
         )
         parser.add_argument(
+            "--cfg-normalization",
+            type=float,
+            default=SamplingParams.cfg_normalization,  # type: ignore[arg-type]
+            dest="cfg_normalization",
+            help=("CFG renormalization factor (for Z-Image). "),
+        )
+        parser.add_argument(
             "--boundary-ratio",
             type=float,
             default=SamplingParams.boundary_ratio,
@@ -718,6 +747,18 @@ class SamplingParams:
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
+        parser.add_argument(
+            "--return-file-paths-only",
+            action=StoreBoolean,
+            default=SamplingParams.return_file_paths_only,
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action=StoreBoolean,
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
+        )
         return parser
 
     @classmethod
@@ -786,9 +827,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass
