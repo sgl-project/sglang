@@ -33,12 +33,6 @@ from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
 
-def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
-    for prefix, new_prefix in prefix_mapping.items():
-        if key.startswith(prefix):
-            key = key.replace(prefix, new_prefix, 1)
-    return key
-
 
 def find_quant_modelslim_config(model_config):
     quant_config_file = Path(model_config["model_path"], "quant_model_description.json")
