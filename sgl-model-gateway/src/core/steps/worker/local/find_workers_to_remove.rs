@@ -4,12 +4,10 @@ use std::collections::HashSet;
 
 use async_trait::async_trait;
 use tracing::debug;
+use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use super::find_workers_by_url;
-use crate::{
-    core::steps::workflow_data::{WorkerList, WorkerRemovalWorkflowData},
-    workflow::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
-};
+use crate::core::steps::workflow_data::{WorkerList, WorkerRemovalWorkflowData};
 
 /// Request structure for worker removal.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
