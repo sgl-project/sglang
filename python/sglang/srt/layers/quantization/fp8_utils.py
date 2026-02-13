@@ -40,7 +40,6 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_sm90_supported,
-    is_sm100_supported,
     offloader,
 )
 
@@ -662,8 +661,8 @@ def triton_mxfp8_blockscaled_linear(
     bias: Optional[torch.Tensor] = None,
     output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    if not (_is_cuda and is_sm100_supported()):
-        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100+).")
+    if not (_is_cuda and is_blackwell_supported()):
+        raise RuntimeError("MXFP8 dense linear requires Blackwell GPUs (SM100/SM12x).")
 
     input_2d = input.view(-1, input.shape[-1]).contiguous()
     output_shape = [*input.shape[:-1], weight.shape[0]]
