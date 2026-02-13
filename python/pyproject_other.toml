@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel", "grpcio-tools==1.75.1"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -63,9 +63,9 @@ runtime_common = [
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
-  "grpcio==1.75.1", # keep it align with compile_proto.py
-  "grpcio-tools==1.75.1", # keep it align with compile_proto.py
-  "grpcio-reflection==1.75.1", # required by srt/entrypoints/grpc_server.py
+  "smg-grpc-proto>=0.3.3",
+  "grpcio>=1.78.0",
+  "grpcio-reflection>=1.78.0",
 ]
 
 tracing = [
@@ -96,7 +96,8 @@ diffusion_hip = [
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
-  "cache-dit==1.1.8"
+  "cache-dit==1.1.8",
+  "addict"
 ]
 
 # For Intel Gaudi(device : hpu) follow the installation guide
@@ -125,7 +126,8 @@ diffusion_musa = [
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
-  "cache-dit==1.1.8"
+  "cache-dit==1.1.8",
+  "addict"
 ]
 
 test = [
