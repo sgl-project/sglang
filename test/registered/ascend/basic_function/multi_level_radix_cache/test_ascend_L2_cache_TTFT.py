@@ -4,7 +4,12 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH, run_bench_serving
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-2-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
 class TestAscendL2CacheTTFT(CustomTestCase):

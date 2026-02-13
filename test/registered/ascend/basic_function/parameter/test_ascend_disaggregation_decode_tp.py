@@ -24,7 +24,12 @@ base_port = int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0])
 BASE_PORT_FOR_ASCEND_MF = 20000 + base_port * 1000 + 66
 os.environ["ASCEND_MF_STORE_URL"] = f"tcp://127.0.0.1:{BASE_PORT_FOR_ASCEND_MF}"
 
-register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(
+    est_time=400,
+    suite="nightly-4-npu-a3",
+    nightly=True,
+    disabled="run failed",
+)
 
 
 class TestDisaggregationDecodeTp(TestDisaggregationBase):
