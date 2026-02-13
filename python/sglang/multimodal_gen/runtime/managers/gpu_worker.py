@@ -227,6 +227,7 @@ class GPUWorker:
                     lambda idx: req.output_file_path(len(output_batch.output), idx),
                     audio=output_batch.audio,
                     audio_sample_rate=output_batch.audio_sample_rate,
+                    output_compression=req.output_compression,
                 )
                 output_batch.output_file_paths = output_paths
                 output_batch.output = None
