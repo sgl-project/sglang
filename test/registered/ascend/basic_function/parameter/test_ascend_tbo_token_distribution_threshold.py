@@ -229,8 +229,8 @@ class TestTboDisabled(CustomTestCase):
         self.assertAlmostEqual(
             tbo_08_avg,
             tbo_0_avg,
-            1,
-            f"Assertion Failed: Average elapsed time - TBO 0 ({tbo_0_avg}s) is not close to TBO 0.8 ({tbo_08_avg}s)",
+            delta=1,
+            msg=f"Assertion Failed: Average elapsed time - TBO 0 ({tbo_0_avg}s) is not close to TBO 0.8 ({tbo_08_avg}s)",
         )
 
 
