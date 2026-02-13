@@ -102,7 +102,7 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
         else:
             ssm_dtype = dtype_map[env_ssm_dtype]
 
-    logger.info(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+    logger.debug(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
 
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 

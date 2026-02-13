@@ -218,7 +218,7 @@ class GPUWorker:
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only:
+            if req.save_output and req.return_file_paths_only and self.rank == 0:
                 output_paths = save_outputs(
                     output_batch.output,
                     req.data_type,
