@@ -5,7 +5,9 @@ use std::sync::{
     Arc,
 };
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use async_trait::async_trait;
+
+use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
 /// Round-robin selection policy
@@ -24,11 +26,12 @@ impl RoundRobinPolicy {
     }
 }
 
+#[async_trait]
 impl LoadBalancingPolicy for RoundRobinPolicy {
-    fn select_worker(
+    async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
-        _request_text: Option<&str>,
+        _info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
 
@@ -61,8 +64,8 @@ mod tests {
     use super::*;
     use crate::core::{BasicWorkerBuilder, WorkerType};
 
-    #[test]
-    fn test_round_robin_selection() {
+    #[tokio::test]
+    async fn test_round_robin_selection() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -82,16 +85,16 @@ mod tests {
             ),
         ];
 
-        // Should select workers in order: 0, 1, 2, 0, 1, 2, ...
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
     }
 
-    #[test]
-    fn test_round_robin_with_unhealthy_workers() {
+    #[tokio::test]
+    async fn test_round_robin_with_unhealthy_workers() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -111,18 +114,17 @@ mod tests {
             ),
         ];
 
-        // Mark middle worker as unhealthy
         workers[1].set_healthy(false);
 
-        // Should skip unhealthy worker: 0, 2, 0, 2, ...
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(2));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(2));
     }
 
-    #[test]
-    fn test_round_robin_reset() {
+    #[tokio::test]
+    async fn test_round_robin_reset() {
         let policy = RoundRobinPolicy::new();
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
@@ -137,12 +139,11 @@ mod tests {
             ),
         ];
 
-        // Advance the counter
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
-        assert_eq!(policy.select_worker(&workers, None), Some(1));
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(1));
 
-        // Reset should start from beginning
         policy.reset();
-        assert_eq!(policy.select_worker(&workers, None), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info).await, Some(0));
     }
 }

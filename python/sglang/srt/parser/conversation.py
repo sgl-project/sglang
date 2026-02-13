@@ -510,11 +510,11 @@ def chat_template_exists(template_name: str) -> bool:
 
 
 def generate_embedding_convs(
-    texts: List[str], images: List[str], template_name: str
+    texts: List[str], images: List[str], videos: List[str], template_name: str
 ) -> List[Conversation]:
     conv_template = chat_templates[template_name].copy()
     convs = []
-    for text, image in zip(texts, images):
+    for text, image, video in zip(texts, images, videos):
         conv = Conversation(
             name=conv_template.name,
             system_template=conv_template.system_template,
@@ -544,6 +544,8 @@ def generate_embedding_convs(
                 else conv.image_token
             )
             real_content += image_token
+        if video is not None:
+            real_content += conv.video_token
         if text is not None:
             real_content += text
         conv.append_message(conv.roles[0], real_content)
@@ -1039,7 +1041,8 @@ MODEL_TYPE_TO_TEMPLATE = {
 
 @register_conv_template_matching_function
 def match_points_v15_chat(model_path: str):
-    if re.search(r"points", model_path, re.IGNORECASE):
+    # reference: https://github.com/sgl-project/sglang/issues/12791
+    if re.search(r"\bpoints\b", model_path, re.IGNORECASE):
         return "points-v15-chat"
 
 

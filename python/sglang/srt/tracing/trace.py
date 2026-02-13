@@ -211,6 +211,7 @@ def process_tracing_init(otlp_endpoint, server_name):
     global tracing_enabled
     global __get_cur_time_ns
     if not opentelemetry_imported:
+        logger.warning(f"Tracing is disabled because the packages cannot be imported.")
         tracing_enabled = False
         return
 
@@ -239,8 +240,9 @@ def process_tracing_init(otlp_endpoint, server_name):
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        logger.error(f": initialize opentelemetry error:{e}")
-        logger.warning("pelease set correct otlp endpoint")
+        logger.error(
+            f"Initialize OpenTelemetry error: {e}. Please set correct otlp endpoint."
+        )
         tracing_enabled = False
         return
 
@@ -463,7 +465,7 @@ def trace_req_start(
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
         external_trace_context = _trace_context_propagator.extract(
-            external_trace_header
+            external_trace_header or {}
         )
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
@@ -534,7 +536,7 @@ def trace_req_finish(
     req_context.root_span.end(end_time=ts)
     if str(req_context.bootstrap_room) in remote_trace_contexts:
         del remote_trace_contexts[str(req_context.bootstrap_room)]
-    else:
+    elif req_context.bootstrap_room_span:
         req_context.bootstrap_room_span.end(end_time=ts)
 
     del reqs_context[rid]
@@ -735,3 +737,25 @@ def trace_event_batch(
 
     for req in reqs:
         trace_event(name, req.rid, ts=ts, attrs=_attrs)
+
+
+class SpanAttributes:
+    # Attribute names copied from here to avoid version conflicts:
+    # https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md
+    GEN_AI_USAGE_COMPLETION_TOKENS = "gen_ai.usage.completion_tokens"
+    GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
+    GEN_AI_USAGE_CACHED_TOKENS = "gen_ai.usage.cached_tokens"
+    GEN_AI_REQUEST_MAX_TOKENS = "gen_ai.request.max_tokens"
+    GEN_AI_REQUEST_TOP_P = "gen_ai.request.top_p"
+    GEN_AI_REQUEST_TOP_K = "gen_ai.request.top_k"
+    GEN_AI_REQUEST_TEMPERATURE = "gen_ai.request.temperature"
+    GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
+    GEN_AI_RESPONSE_FINISH_REASONS = "gen_ai.response.finish_reasons"
+    GEN_AI_REQUEST_ID = "gen_ai.request.id"
+    GEN_AI_REQUEST_N = "gen_ai.request.n"
+    GEN_AI_LATENCY_TIME_IN_QUEUE = "gen_ai.latency.time_in_queue"
+    GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN = "gen_ai.latency.time_to_first_token"
+    GEN_AI_LATENCY_E2E = "gen_ai.latency.e2e"
+    GEN_AI_LATENCY_TIME_IN_MODEL_PREFILL = "gen_ai.latency.time_in_model_prefill"
+    GEN_AI_LATENCY_TIME_IN_MODEL_DECODE = "gen_ai.latency.time_in_model_decode"
+    GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE = "gen_ai.latency.time_in_model_inference"
