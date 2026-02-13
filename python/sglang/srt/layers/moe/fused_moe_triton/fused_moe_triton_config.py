@@ -160,6 +160,7 @@ def get_default_config(
                 "BLOCK_SIZE_N": 256,
                 "BLOCK_SIZE_K": 128,
                 "GROUP_SIZE_M": 32,
+                "SPLIT_K": 1,
                 "num_warps": 8,
                 "num_stages": 2 if _is_hip else 4,
             }
@@ -169,6 +170,7 @@ def get_default_config(
                     "BLOCK_SIZE_N": 128,
                     "BLOCK_SIZE_K": 128,
                     "GROUP_SIZE_M": 1,
+                    "SPLIT_K": 1,
                     "num_warps": 4,
                     "num_stages": 2 if _is_hip else 4,
                 }
@@ -179,6 +181,7 @@ def get_default_config(
                 "BLOCK_SIZE_N": block_shape[0],
                 "BLOCK_SIZE_K": block_shape[1],
                 "GROUP_SIZE_M": 32,
+                "SPLIT_K": 1,
                 "num_warps": 4,
                 "num_stages": 2 if _is_hip else 3,
             }
@@ -188,6 +191,7 @@ def get_default_config(
             "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
+            "SPLIT_K": 2,
         }
         # A heuristic: fused marlin works faster with this config for small M
         if M <= E or (is_marlin and M <= 32):
@@ -196,6 +200,7 @@ def get_default_config(
                 "BLOCK_SIZE_N": 32,
                 "BLOCK_SIZE_K": 64,
                 "GROUP_SIZE_M": 1,
+                "SPLIT_K": 2,
             }
     return config
 
@@ -237,11 +242,13 @@ def try_get_optimal_moe_config(
             # If an optimal configuration map has been found, look up the
             # optimal config
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+            config["SPLIT_K"] = 4
         else:
             # Else use the default config
             config = get_default_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
+            config["SPLIT_K"] = 4
         if return_down_config:
             down_configs = get_moe_configs(
                 E,
