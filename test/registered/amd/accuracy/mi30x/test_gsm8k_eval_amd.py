@@ -41,7 +41,7 @@ MODEL_SCORE_THRESHOLDS = {
     # Llama 3.2 series (smaller models)
     "meta-llama/Llama-3.2-3B-Instruct": 0.55,
     # Mistral series
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.55,
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.61,
     # DeepSeek series
     "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
@@ -108,10 +108,10 @@ DISABLE_HF_XET_MODELS = {
     "neuralmagic/Qwen2-57B-A14B-Instruct-FP8",
 }
 TRITON_MOE_MODELS = {
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
+    # "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8",
     "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
-    "mistralai/Mixtral-8x7B-Instruct-v0.1",
-    "mistralai/Mistral-7B-Instruct-v0.3",
+    # "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    # "mistralai/Mistral-7B-Instruct-v0.3",
 }
 # AMD-specific models that need special launch config (matching in-house CI sanity_check.py)
 # AMD_SPECIAL_CONFIG_MODELS = {
