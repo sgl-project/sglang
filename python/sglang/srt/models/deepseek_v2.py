@@ -1488,20 +1488,20 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         """
         Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
         """
-        return (
-            (
-                self.current_attention_backend == "nsa"
-                and (
-                    get_global_server_args().decode_attention_backend == "trtllm"
-                    or get_global_server_args().prefill_attention_backend == "trtllm"
+        if self.current_attention_backend == "nsa":
+            return (
+                (
+                    get_global_server_args().nsa_decode_backend == "trtllm"
+                    or get_global_server_args().nsa_prefill_backend == "trtllm"
                 )
+                and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
             )
-            or (
-                self.current_attention_backend == "trtllm_mla"
-                and (
-                    forward_batch.forward_mode.is_decode_or_idle()
-                    or forward_batch.forward_mode.is_target_verify()
-                )
+
+        return (
+            self.current_attention_backend == "trtllm_mla"
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
             )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )

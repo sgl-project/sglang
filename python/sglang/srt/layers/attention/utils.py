@@ -320,7 +320,6 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def mla_quantize_and_rope_for_fp8(
-        self,
         q_nope: torch.Tensor,
         q_rope: torch.Tensor,
         k_nope: torch.Tensor,
@@ -328,6 +327,8 @@ def mla_quantize_and_rope_for_fp8(
         pos_ids: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         import flashinfer.rope
 
@@ -351,6 +352,8 @@ def mla_quantize_and_rope_for_fp8(
             cos_sin_cache: Precomputed cosine/sine cache for RoPE
                 - expected dtype: matches q_/k_ input dtype (torch.bfloat16)
             is_neox: Whether to use NeoX-style RoPE (interleaved) or GPT-style (half rotation)
+            kv_lora_rank: Dimension of the no-position-encoding component
+            qk_rope_head_dim: Dimension of the RoPE component
 
         Returns:
             tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
@@ -366,7 +369,7 @@ def mla_quantize_and_rope_for_fp8(
         q_out = q_rope.new_empty(
             q_len,
             num_heads,
-            self.kv_lora_rank + self.qk_rope_head_dim,
+            kv_lora_rank + qk_rope_head_dim,
             dtype=attn_dtype,
         )
 
@@ -389,9 +392,9 @@ def mla_quantize_and_rope_for_fp8(
             is_neox=is_neox,
             quantize_dtype=attn_dtype,
             # Output tensor slicing: q_out contains [nope_part, rope_part]
-            q_rope_out=q_out[..., self.kv_lora_rank :],  # RoPE part goes to end
+            q_rope_out=q_out[..., kv_lora_rank :],  # RoPE part goes to end
             k_rope_out=k_rope_out,
-            q_nope_out=q_out[..., : self.kv_lora_rank],  # Nope part goes to beginning
+            q_nope_out=q_out[..., : kv_lora_rank],  # Nope part goes to beginning
             k_nope_out=k_nope_out,
             # Quantization scales (set to 1.0 for no additional scaling)
             quant_scale_q=1.0,

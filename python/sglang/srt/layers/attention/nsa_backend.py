@@ -1808,6 +1808,8 @@ class NativeSparseAttnBackend(
                 forward_batch.positions,
                 cos_sin_cache,
                 is_neox,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim
             )
             merge_query = False
 
