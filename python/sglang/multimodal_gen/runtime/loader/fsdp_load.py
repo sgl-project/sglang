@@ -231,10 +231,20 @@ def load_model_from_full_model_state_dict(
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
-    for target_param_name, full_tensor in custom_param_sd.items():
+
+    is_fsdp_model = isinstance(model, FSDPModule) or any(
+        hasattr(p, "device_mesh") for p in meta_sd.values()
+    )
+
+    # sort parameter names to ensure all ranks process parameters in the same order
+    sorted_param_names = sorted(custom_param_sd.keys())
+
+    for target_param_name in sorted_param_names:
+        full_tensor = custom_param_sd[target_param_name]
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
-            if strict:
+            # For FSDP models, ensure all ranks process parameters consistently
+            if strict or is_fsdp_model:
                 raise ValueError(
                     f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
                 )
@@ -261,6 +271,18 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = temp_param.data
             else:
                 sharded_tensor = full_tensor
+
+            # Important: `cpu_offload` is intended for FSDP-managed parameter movement.
+            # If a parameter is not sharded into a DTensor (i.e., no `device_mesh`), FSDP
+            # will NOT manage it. Offloading it here would leave CPU parameters that
+            # later participate in GPU kernels (e.g., conv/embedding), causing device/dtype
+            # mismatches like "Input type (CUDABFloat16Type) and weight type (CPUBFloat16Type)".
+            #
+            # Therefore:
+            # - For non-FSDP models, keep the historical behavior (allow CPU offload).
+            # - For FSDP models, do NOT offload non-sharded parameters here.
+            if cpu_offload and not is_fsdp_model:
+                sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             sharded_tensor = distribute_tensor(
@@ -296,6 +318,8 @@ def load_model_from_full_model_state_dict(
             sharded_tensor = torch.zeros_like(
                 meta_sharded_param, device=device, dtype=param_dtype
             )
+            if cpu_offload and not is_fsdp_model:
+                sharded_tensor = sharded_tensor.cpu()
         else:
             # Initialize with zeros and distribute
             full_tensor = torch.zeros_like(

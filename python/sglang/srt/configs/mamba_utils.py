@@ -12,6 +12,7 @@
 # limitations under the License.
 """Common config utils for mamba2 - NemotronH, FalconH1, Qwen3Next, LFM2, etc."""
 
+import logging
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -21,6 +22,8 @@ import torch
 
 from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 
 def extra_groups_for_head_shards(ngroups: int, tp_size: int):
@@ -41,20 +44,72 @@ class Mamba2StateDType:
     temporal: torch.dtype
 
 
-def mamba2_state_dtype() -> Mamba2StateDType:
+def mamba2_state_dtype(config=None) -> Mamba2StateDType:
+    """
+    Get mamba2 state dtype from config or environment variable.
+
+    Priority (from highest to lowest):
+    1. Environment variable SGLANG_MAMBA_SSM_DTYPE
+    2. Config file (config.mamba_ssm_dtype or config.text_config.mamba_ssm_dtype)
+    3. Default "float32"
+
+    Args:
+        config: Optional config object (PretrainedConfig). If provided, will read
+                mamba_ssm_dtype from it. For VL models, reads from text_config.
+
+    Returns:
+        Mamba2StateDType with conv and temporal dtypes
+    """
     dtype_map = {
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
         "float16": torch.float16,
     }
     conv_dtype = dtype_map.get(envs.SGLANG_MAMBA_CONV_DTYPE.get(), torch.bfloat16)
-    ssm_dtype = dtype_map.get(envs.SGLANG_MAMBA_SSM_DTYPE.get(), torch.float32)
+
+    # Get SSM dtype: default -> config -> env var
+    ssm_dtype = torch.float32  # Step 1: Default value
+
+    # Step 2: Try to read from config
+    if config is not None:
+        config_dtype = None
+        if hasattr(config, "text_config") and hasattr(
+            config.text_config, "mamba_ssm_dtype"
+        ):
+            # VL model: read from text_config
+            config_dtype = config.text_config.mamba_ssm_dtype
+        elif hasattr(config, "mamba_ssm_dtype"):
+            # Text model: read from root config
+            config_dtype = config.mamba_ssm_dtype
+
+        if config_dtype is not None:
+            if config_dtype not in dtype_map:
+                logger.warning(
+                    f"Invalid mamba_ssm_dtype '{config_dtype}' in config. "
+                    f"Must be one of {list(dtype_map.keys())}. Using default 'float32'."
+                )
+            else:
+                ssm_dtype = dtype_map[config_dtype]
+
+    # Step 3: Check environment variable, if not None, override
+    env_ssm_dtype = envs.SGLANG_MAMBA_SSM_DTYPE.get()
+    if env_ssm_dtype is not None:
+        if env_ssm_dtype not in dtype_map:
+            logger.warning(
+                f"Invalid mamba_ssm_dtype '{env_ssm_dtype}' from environment variable. "
+                f"Must be one of {list(dtype_map.keys())}. Using default 'float32'."
+            )
+        else:
+            ssm_dtype = dtype_map[env_ssm_dtype]
+
+    logger.info(f"Mamba2 state dtype: conv_dtype={conv_dtype}, ssm_dtype={ssm_dtype}")
+
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 
 @dataclass(kw_only=True, frozen=True)
 class BaseLinearStateParams(ABC):
-    dtype: Mamba2StateDType = field(default_factory=mamba2_state_dtype)
+    dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
     layers: list[int]
 
     @property
