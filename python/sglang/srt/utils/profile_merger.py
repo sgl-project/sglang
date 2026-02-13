@@ -82,7 +82,7 @@ class ProfileMerger:
         return self.merged_trace_path
 
     def _discover_trace_files(self) -> List[str]:
-        """Discover trace files matching profile_id (supports TP/DP/PP/EP formats)."""
+        """Discover trace files matching profile_id (supports TP/DP/PP/EP formats and host)."""
         patterns = [f"{self.profile_id}*.trace.json.gz"]
 
         trace_files = []
@@ -95,24 +95,35 @@ class ProfileMerger:
             for f in trace_files
             if not f.endswith(f"merged-{self.profile_id}.trace.json.gz")
             and not f.endswith("-memory.pickle")
-            and "TP-" in f
+            # Include scheduler traces (with TP-) and host traces
+            and ("TP-" in f or "-host" in f)
         ]
         trace_files = list(set(trace_files))
         return trace_files
 
-    def _extract_rank_info(self, filename: str) -> Dict[str, int]:
-        """Extract rank info (TP/DP/PP/EP) from filename."""
+    def _extract_rank_info(self, filename: str) -> Dict[str, Any]:
+        """Extract rank info (TP/DP/PP/EP) or process type from filename."""
         basename = os.path.basename(filename)
         rank_info = {}
+
+        # Check if this is a host trace
+        if "-host" in basename:
+            rank_info["process_type"] = "host"
+            return rank_info
 
         for rank_type in self.rank_types:
             match = re.search(rf"{rank_type.upper()}-(\d+)", basename)
             if match:
                 rank_info[f"{rank_type}_rank"] = int(match.group(1))
 
+        rank_info["process_type"] = "scheduler"
         return rank_info
 
-    def _create_rank_label(self, rank_info: Dict[str, int]) -> str:
+    def _create_rank_label(self, rank_info: Dict[str, Any]) -> str:
+        # Handle host process
+        if rank_info.get("process_type") == "host":
+            return "[Host]"
+
         parts = []
         for rank_type in self.rank_types:
             rank_key = f"{rank_type}_rank"
@@ -164,11 +175,16 @@ class ProfileMerger:
             sort_index += rank_info.get(rank_type, 0) * multiplier
         return sort_index
 
-    def _get_rank_sort_key(self, path: str) -> Tuple[int, int, int, int]:
+    def _get_rank_sort_key(self, path: str) -> Tuple[int, int, int, int, int]:
         rank_info = self._extract_rank_info(path)
-        return tuple(
-            rank_info.get(f"{rank_type}_rank", 0)
-            for rank_type in ["dp", "ep", "pp", "tp"]
+        # Host traces should appear first (sort key 0), scheduler traces after
+        is_host = 1 if rank_info.get("process_type") == "host" else 0
+        return (
+            is_host,
+            rank_info.get("dp_rank", 0),
+            rank_info.get("ep_rank", 0),
+            rank_info.get("pp_rank", 0),
+            rank_info.get("tp_rank", 0),
         )
 
     def _maybe_cast_int(self, x) -> Optional[int]:
