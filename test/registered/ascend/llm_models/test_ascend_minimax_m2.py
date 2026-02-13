@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -29,4 +30,5 @@ class TestMiniMaxM2(GSM8KAscendMixin, CustomTestCase):
 
 
 if __name__ == "__main__":
+    os.environ["SGLANG_NPU_FORWARD_NATIVE_TOPK"]="1"
     unittest.main()
