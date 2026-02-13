@@ -508,7 +508,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                 )
             elif use_multithread:
-                weights_iterator = multi_thread_safetensors_weights_iterator(
+                weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
                         "num_threads", self.DEFAULT_NUM_THREADS
