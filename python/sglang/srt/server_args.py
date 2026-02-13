@@ -946,7 +946,7 @@ class ServerArgs:
         if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
             self.disable_piecewise_cuda_graph = True
         # 13. Deterministic inference
-        if self.deterministic_inference:
+        if self.enable_deterministic_inference:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_gpu_memory_settings(self, gpu_mem):
