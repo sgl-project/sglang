@@ -207,10 +207,6 @@ jobs:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
-    strategy:
-      fail-fast: true
-      matrix:
-        part: [0, 1]
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.5.0-a3-ubuntu22.04-py3.11
     steps:
@@ -245,12 +241,12 @@ jobs:
           STREAMS_PER_DEVICE: 32
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600
 
   multimodal-gen-test-1-npu-a3:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
-    runs-on: linux-aarch64-a3-16
+    runs-on: linux-aarch64-a3-2
     container:
       image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc2-a3-ubuntu22.04-py3.11
     steps:
