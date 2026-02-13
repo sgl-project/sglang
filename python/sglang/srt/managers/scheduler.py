@@ -1062,20 +1062,20 @@ class Scheduler(
             ]
         )
 
-    def _check_forward_timeout_for_running_batch(self):
+    def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched,
         # as current spec-v1 still filters batch inside verify stage.
-        timeout_ms = envs.SGLANG_FORWARD_TIMEOUT_MS.get()
-        if timeout_ms <= 0:
+        timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
+        if timeout_s <= 0:
             return
         if self.running_batch.is_empty():
             return
 
-        deadline = time.perf_counter() - timeout_ms / 1000.0
+        deadline = time.perf_counter() - timeout_s
         for req in self.running_batch.reqs:
             if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
                 req.to_finish = FINISH_ABORT(
-                    "Forward timeout.", HTTPStatus.SERVICE_UNAVAILABLE
+                    "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
 
     @DynamicGradMode()
@@ -1736,12 +1736,12 @@ class Scheduler(
         )
         return req_to_abort.rid == recv_req.rid
 
-    def _abort_on_queued_timeout(self):
-        if (timeout_ms := envs.SGLANG_QUEUED_TIMEOUT_MS.get()) <= 0:
+    def _abort_on_waiting_timeout(self):
+        if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
         deleted_reqs = set()
-        deadline = time.perf_counter() - (timeout_ms / 1000.0)
+        deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
@@ -1753,7 +1753,7 @@ class Scheduler(
                         finished_reason={
                             "type": "abort",
                             "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                            "message": "Request queue timeout reached.",
+                            "message": "Request waiting timeout reached.",
                         },
                         rid=req.rid,
                     ),
@@ -1838,8 +1838,8 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
-        self._abort_on_queued_timeout()
-        self._check_forward_timeout_for_running_batch()
+        self._abort_on_waiting_timeout()
+        self._abort_on_running_timeout()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
