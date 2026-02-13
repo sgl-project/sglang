@@ -341,7 +341,12 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
 def compute_weights_checksum(
     named_params: Iterable[tuple[str, torch.Tensor]],
 ) -> str:
-    """Compute SHA-256 checksum over (name, tensor) pairs.
+    """Compute a SHA-256 checksum for a set of (name, tensor) pairs.
+
+    Helper function for verifying the correctness of weight refitting
+    (update_weights_from_disk). After a refit, callers can compare the
+    checksum of the in-GPU model weights against the checksum of the
+    on-disk tensors to confirm they match exactly.
 
     Parameters are sorted by name so the digest is deterministic
     regardless of iteration order.  Raw bytes are hashed directly

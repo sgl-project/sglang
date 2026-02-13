@@ -128,6 +128,7 @@ behavior of the diffusion engine only.
 from __future__ import annotations
 
 import os
+import random
 import shutil
 import tempfile
 
@@ -148,19 +149,46 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
 )
-from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port
+from sglang.multimodal_gen.test.test_utils import get_dynamic_server_port, is_in_ci
 
 logger = init_logger(__name__)
 
-# Base model the server starts with
-DEFAULT_DIFFUSION_MODEL = os.environ.get(
-    "SGLANG_TEST_DIFFUSION_MODEL", "black-forest-labs/FLUX.2-klein-base-4B"
-)
+# Model pairs for weight update tests: (default_model, update_model, ci_weight).
+# The server starts with default_model; tests update weights to update_model.
+# ci_weight controls how likely each pair is to be selected in CI runs.
+_ALL_MODEL_PAIRS: list[tuple[str, str, float]] = [
+    (
+        "black-forest-labs/FLUX.2-klein-base-4B",
+        "black-forest-labs/FLUX.2-klein-4B",
+        5.0,
+    ),
+    (
+        "Qwen/Qwen-Image",
+        "Qwen/Qwen-Image-2512",
+        1.0,  # Qwen Image is large; run it less often in CI.
+    ),
+]
 
-# Model used for weight updates (same architecture, different weights)
-UPDATE_DIFFUSION_MODEL = os.environ.get(
-    "SGLANG_TEST_UPDATE_MODEL", "black-forest-labs/FLUX.2-klein-4B"
-)
+
+def _select_model_pairs() -> list[tuple[str, str]]:
+    """Return the (default, update) model pairs to test.
+
+    When SGLANG_TEST_DIFFUSION_MODEL / SGLANG_TEST_UPDATE_MODEL env vars
+    are set, use them as a single explicit pair.  Otherwise, run both
+    pairs locally, or randomly pick one in CI (weighted) to save resources.
+    """
+    default_env = os.environ.get("SGLANG_TEST_DIFFUSION_MODEL")
+    update_env = os.environ.get("SGLANG_TEST_UPDATE_MODEL")
+    if default_env and update_env:
+        return [(default_env, update_env)]
+    pairs = [(d, u) for d, u, _ in _ALL_MODEL_PAIRS]
+    if is_in_ci():
+        weights = [w for _, _, w in _ALL_MODEL_PAIRS]
+        return random.choices(pairs, weights=weights, k=1)
+    return pairs
+
+
+_ACTIVE_MODEL_PAIRS = _select_model_pairs()
 
 
 def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
@@ -179,14 +207,19 @@ def _compute_checksum_from_disk(model_path: str, module_name: str) -> str:
     return compute_weights_checksum(safetensors_weights_iterator(safetensors_files))
 
 
-@pytest.fixture(scope="class")
-def diffusion_server_for_weight_update():
+@pytest.fixture(
+    scope="class",
+    params=_ACTIVE_MODEL_PAIRS,
+    ids=[p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS],
+)
+def diffusion_server_for_weight_update(request):
     """Start a diffusion server for weight update tests."""
+    default_model, update_model = request.param
     port = get_dynamic_server_port()
     wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
 
     manager = ServerManager(
-        model=DEFAULT_DIFFUSION_MODEL,
+        model=default_model,
         port=port,
         wait_deadline=wait_deadline,
         extra_args="--num-gpus 1",
@@ -195,7 +228,7 @@ def diffusion_server_for_weight_update():
     ctx = manager.start()
 
     try:
-        yield ctx
+        yield ctx, default_model, update_model
     finally:
         ctx.cleanup()
 
@@ -250,15 +283,14 @@ class TestUpdateWeightsFromDisk:
         ), f"get_weights_checksum failed: {response.status_code} {response.text}"
         return response.json()
 
-    def test_update_weights_with_flush_cache(
-        self, diffusion_server_for_weight_update: ServerContext
-    ):
+    def test_update_weights_with_flush_cache(self, diffusion_server_for_weight_update):
         """Test updating weights with flush_cache=True."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, _default_model, update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         result, status_code = self._update_weights(
             base_url,
-            UPDATE_DIFFUSION_MODEL,
+            update_model,
             flush_cache=True,
         )
 
@@ -266,25 +298,25 @@ class TestUpdateWeightsFromDisk:
         assert result.get("success", False), f"Update failed: {result.get('message')}"
 
     def test_update_weights_without_flush_cache(
-        self, diffusion_server_for_weight_update: ServerContext
+        self, diffusion_server_for_weight_update
     ):
         """Test updating weights with flush_cache=False."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, _default_model, update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         result, status_code = self._update_weights(
             base_url,
-            UPDATE_DIFFUSION_MODEL,
+            update_model,
             flush_cache=False,
         )
 
         assert status_code == 200
         assert result.get("success", False), f"Update failed: {result.get('message')}"
 
-    def test_update_weights_nonexistent_model(
-        self, diffusion_server_for_weight_update: ServerContext
-    ):
+    def test_update_weights_nonexistent_model(self, diffusion_server_for_weight_update):
         """Test that updating with non-existent model fails gracefully."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, _default_model, _update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         result, status_code = self._update_weights(
             base_url,
@@ -297,10 +329,11 @@ class TestUpdateWeightsFromDisk:
         assert not result.get("success", True), "Should fail for nonexistent model"
 
     def test_update_weights_missing_model_path(
-        self, diffusion_server_for_weight_update: ServerContext
+        self, diffusion_server_for_weight_update
     ):
         """Test that request without model_path returns 400."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, _default_model, _update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         response = requests.post(
             f"{base_url}/update_weights_from_disk",
@@ -311,16 +344,15 @@ class TestUpdateWeightsFromDisk:
         # Should return 400 Bad Request
         assert response.status_code == 400, f"Expected 400, got {response.status_code}"
 
-    def test_update_weights_specific_modules(
-        self, diffusion_server_for_weight_update: ServerContext
-    ):
+    def test_update_weights_specific_modules(self, diffusion_server_for_weight_update):
         """Test updating only specific modules (e.g., transformer only)."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, _default_model, update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         # Try to update only transformer module
         result, status_code = self._update_weights(
             base_url,
-            UPDATE_DIFFUSION_MODEL,
+            update_model,
             target_modules=["transformer"],
         )
         logger.info(f"Update specific modules result: {result}")
@@ -331,14 +363,15 @@ class TestUpdateWeightsFromDisk:
         assert status_code == 200
 
     def test_update_weights_nonexistent_module(
-        self, diffusion_server_for_weight_update: ServerContext
+        self, diffusion_server_for_weight_update
     ):
         """Test that requesting a non-existent module name fails with a clear error."""
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, _default_model, update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         result, status_code = self._update_weights(
             base_url,
-            UPDATE_DIFFUSION_MODEL,
+            update_model,
             target_modules=["nonexistent_module"],
             timeout=60,
         )
@@ -348,9 +381,7 @@ class TestUpdateWeightsFromDisk:
         assert not result.get("success", True), "Should fail for nonexistent module"
         assert "not found in pipeline" in result.get("message", "")
 
-    def test_update_weights_checksum_matches(
-        self, diffusion_server_for_weight_update: ServerContext
-    ):
+    def test_update_weights_checksum_matches(self, diffusion_server_for_weight_update):
         """Verify GPU checksum matches disk after weight update.
 
         1. Fetch the pre-update (base model) checksum from the server.
@@ -358,10 +389,11 @@ class TestUpdateWeightsFromDisk:
         3. Fetch the post-update checksum and compare with disk.
         4. Verify post-update checksum differs from pre-update (different model).
         """
-        base_url = self._get_base_url(diffusion_server_for_weight_update)
+        ctx, default_model, update_model = diffusion_server_for_weight_update
+        base_url = self._get_base_url(ctx)
 
         # Update to base model.
-        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, default_model)
 
         # Checksum before update (base model already loaded by the fixture).
         pre_update_checksum = self._get_weights_checksum(
@@ -369,7 +401,7 @@ class TestUpdateWeightsFromDisk:
         )["transformer"]
 
         # Update to a different model.
-        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, update_model)
         assert status_code == 200 and result.get(
             "success"
         ), f"Update failed: {result.get('message')}"
@@ -378,9 +410,7 @@ class TestUpdateWeightsFromDisk:
         post_update_checksum = self._get_weights_checksum(
             base_url, module_names=["transformer"]
         )["transformer"]
-        update_disk_checksum = _compute_checksum_from_disk(
-            UPDATE_DIFFUSION_MODEL, "transformer"
-        )
+        update_disk_checksum = _compute_checksum_from_disk(update_model, "transformer")
 
         print(f"\n{'='*60}")
         print(f"Checksum test")
@@ -404,14 +434,19 @@ class TestUpdateWeightsFromDisk:
 class TestUpdateWeightsFromDiskWithOffload:
     """Test update_weights_from_disk with layerwise offload enabled."""
 
-    @pytest.fixture(scope="class")
-    def diffusion_server_with_offload(self):
+    @pytest.fixture(
+        scope="class",
+        params=_ACTIVE_MODEL_PAIRS,
+        ids=[p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS],
+    )
+    def diffusion_server_with_offload(self, request):
         """Start a diffusion server with layerwise offload enabled."""
+        default_model, update_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
 
         manager = ServerManager(
-            model=DEFAULT_DIFFUSION_MODEL,
+            model=default_model,
             port=port,
             wait_deadline=wait_deadline,
             extra_args="--num-gpus 1 --dit-layerwise-offload true",
@@ -420,7 +455,7 @@ class TestUpdateWeightsFromDiskWithOffload:
         ctx = manager.start()
 
         try:
-            yield ctx
+            yield ctx, default_model, update_model
         finally:
             ctx.cleanup()
 
@@ -438,15 +473,14 @@ class TestUpdateWeightsFromDiskWithOffload:
         )
         return response.json(), response.status_code
 
-    def test_update_weights_with_offload_enabled(
-        self, diffusion_server_with_offload: ServerContext
-    ):
+    def test_update_weights_with_offload_enabled(self, diffusion_server_with_offload):
         """Test that weight update works correctly when layerwise offload is enabled."""
-        base_url = self._get_base_url(diffusion_server_with_offload)
+        ctx, _default_model, update_model = diffusion_server_with_offload
+        base_url = self._get_base_url(ctx)
 
         logger.info("Testing weight update with offload enabled")
 
-        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, update_model)
         logger.info(f"Update result: {result}")
 
         assert status_code == 200, f"Expected 200, got {status_code}"
@@ -477,9 +511,7 @@ class TestUpdateWeightsFromDiskWithOffload:
         ), f"get_weights_checksum failed: {response.status_code} {response.text}"
         return response.json()
 
-    def test_update_weights_checksum_matches(
-        self, diffusion_server_with_offload: ServerContext
-    ):
+    def test_update_weights_checksum_matches(self, diffusion_server_with_offload):
         """Verify checksum from offloaded CPU buffers matches disk after update.
 
         1. Fetch the pre-update (base model) checksum from the server.
@@ -487,10 +519,11 @@ class TestUpdateWeightsFromDiskWithOffload:
         3. Fetch the post-update checksum and compare with disk.
         4. Verify post-update checksum differs from pre-update (different model).
         """
-        base_url = self._get_base_url(diffusion_server_with_offload)
+        ctx, default_model, update_model = diffusion_server_with_offload
+        base_url = self._get_base_url(ctx)
 
         # Update to base model.
-        result, status_code = self._update_weights(base_url, DEFAULT_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, default_model)
 
         # Checksum before update (base model already loaded by the fixture).
         pre_update_checksum = self._get_weights_checksum(
@@ -498,7 +531,7 @@ class TestUpdateWeightsFromDiskWithOffload:
         )["transformer"]
 
         # Update to a different model.
-        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, update_model)
         assert status_code == 200 and result.get(
             "success"
         ), f"Update failed: {result.get('message')}"
@@ -507,9 +540,7 @@ class TestUpdateWeightsFromDiskWithOffload:
         post_update_checksum = self._get_weights_checksum(
             base_url, module_names=["transformer"]
         )["transformer"]
-        update_disk_checksum = _compute_checksum_from_disk(
-            UPDATE_DIFFUSION_MODEL, "transformer"
-        )
+        update_disk_checksum = _compute_checksum_from_disk(update_model, "transformer")
 
         print(f"\n{'='*60}")
         print(f"Offload checksum test")
@@ -535,84 +566,83 @@ def _prepare_corrupted_model(
 ) -> None:
     """Build a corrupted model directory from src_model.
 
-    The root-level files (model_index.json, config.json, …) are copied so
-    that maybe_download_model recognises dst_model as a valid local
-    model.  Every module sub-directory that contains safetensors is copied
-    verbatim, except corrupt_module whose safetensors are truncated so
-    that safetensors_weights_iterator detects corruption at load time
-    (after earlier modules have already been updated), triggering a rollback.
+    Uses symlinks for everything except the corrupt_module directory to
+    save disk space and time.  Only the corrupt_module's safetensors are
+    physically copied and then truncated so that safetensors_weights_iterator
+    detects corruption at load time, triggering a rollback.
 
     Must be called before every test attempt because the server deletes
     corrupted files on detection.
     """
-    # Copy root-level files (model_index.json, etc.) so the server
-    # recognises the directory as a valid local model.
+    # Symlink root-level files (model_index.json, etc.).
     for fname in os.listdir(src_model):
         src_path = os.path.join(src_model, fname)
-        if os.path.isfile(src_path):
-            shutil.copy2(src_path, os.path.join(dst_model, fname))
+        dst_path = os.path.join(dst_model, fname)
+        if os.path.isfile(src_path) and not os.path.exists(dst_path):
+            os.symlink(src_path, dst_path)
 
-    # Copy module sub-directories; corrupt the designated one.
     for module_dir in sorted(os.listdir(src_model)):
         src_dir = os.path.join(src_model, module_dir)
+        dst_dir = os.path.join(dst_model, module_dir)
         if not os.path.isdir(src_dir):
             continue
-        safetensors = [f for f in os.listdir(src_dir) if f.endswith(".safetensors")]
-        if not safetensors:
-            # Still copy non-safetensors dirs (config.json, tokenizer, etc.)
-            dst_dir = os.path.join(dst_model, module_dir)
+
+        # Non-corrupted modules: symlink the entire directory.
+        if module_dir != corrupt_module:
             if not os.path.exists(dst_dir):
-                shutil.copytree(src_dir, dst_dir)
+                os.symlink(src_dir, dst_dir)
             continue
 
-        dst_dir = os.path.join(dst_model, module_dir)
+        # Corrupted module: create a real directory, symlink non-safetensors
+        # files, and copy + truncate safetensors files.
         os.makedirs(dst_dir, exist_ok=True)
-
-        # Copy config.json and other non-safetensors files in the module dir
-        for f in os.listdir(src_dir):
-            if not f.endswith(".safetensors"):
-                src_f = os.path.join(src_dir, f)
-                if os.path.isfile(src_f):
-                    shutil.copy2(src_f, os.path.join(dst_dir, f))
-
-        for fname in safetensors:
+        for fname in os.listdir(src_dir):
             src_file = os.path.join(src_dir, fname)
             dst_file = os.path.join(dst_dir, fname)
-            shutil.copy2(src_file, dst_file)
+            if not os.path.isfile(src_file):
+                continue
 
-            if module_dir == corrupt_module:
-                # Truncate 1000 bytes from the end to corrupt the tensor data
-                size = os.path.getsize(dst_file)
-                with open(dst_file, "r+b") as f:
-                    f.truncate(size - 1000)
-                logger.info(
-                    "Created corrupted safetensors: %s (%d -> %d bytes)",
-                    dst_file,
-                    size,
-                    size - 1000,
-                )
-            else:
-                logger.info("Copied valid safetensors: %s", dst_file)
+            if not fname.endswith(".safetensors"):
+                if not os.path.exists(dst_file):
+                    os.symlink(src_file, dst_file)
+                continue
+
+            # Copy safetensors then truncate to corrupt it.
+            shutil.copy2(src_file, dst_file)
+            size = os.path.getsize(dst_file)
+            with open(dst_file, "r+b") as f:
+                f.truncate(size - 1000)
+            logger.info(
+                "Created corrupted safetensors: %s (%d -> %d bytes)",
+                dst_file,
+                size,
+                size - 1000,
+            )
 
 
 class TestUpdateWeightsCorruptedRollback:
     """Test that loading corrupted weights triggers rollback to the last good model."""
 
     @pytest.fixture(scope="class")
-    def corrupted_model_dir(self):
-        """Create a temporary directory for the corrupted model."""
+    def corrupted_model_dir(self, diffusion_server_for_rollback):
+        """Create a separate temporary directory per parametrized model pair."""
         tmpdir = tempfile.mkdtemp(prefix="sglang_corrupted_model_")
         yield tmpdir
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    @pytest.fixture(scope="class")
-    def diffusion_server_for_rollback(self):
+    @pytest.fixture(
+        scope="class",
+        params=_ACTIVE_MODEL_PAIRS,
+        ids=[p[0].split("/")[-1] for p in _ACTIVE_MODEL_PAIRS],
+    )
+    def diffusion_server_for_rollback(self, request):
         """Start a diffusion server with the base model."""
+        default_model, update_model = request.param
         port = get_dynamic_server_port()
         wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "600"))
 
         manager = ServerManager(
-            model=DEFAULT_DIFFUSION_MODEL,
+            model=default_model,
             port=port,
             wait_deadline=wait_deadline,
             extra_args="--num-gpus 1",
@@ -620,7 +650,7 @@ class TestUpdateWeightsCorruptedRollback:
 
         ctx = manager.start()
         try:
-            yield ctx
+            yield ctx, default_model, update_model
         finally:
             ctx.cleanup()
 
@@ -671,7 +701,7 @@ class TestUpdateWeightsCorruptedRollback:
 
     def test_corrupted_weights_rollback(
         self,
-        diffusion_server_for_rollback: ServerContext,
+        diffusion_server_for_rollback,
         corrupted_model_dir: str,
     ):
         """Load base → update weights → attempt corrupted → verify rollback.
@@ -679,14 +709,15 @@ class TestUpdateWeightsCorruptedRollback:
         Checksums are verified for ALL modules, not just the transformer,
         to ensure the entire pipeline is consistent after rollback.
         """
-        base_url = self._get_base_url(diffusion_server_for_rollback)
+        ctx, default_model, update_model = diffusion_server_for_rollback
+        base_url = self._get_base_url(ctx)
 
         # --- Step 1: Get base-model checksums for all modules ---
         base_checksums = self._get_weights_checksum(base_url)
         logger.info(f"Base model checksums: {base_checksums}")
 
         # --- Step 2: Update to the update model ---
-        result, status_code = self._update_weights(base_url, UPDATE_DIFFUSION_MODEL)
+        result, status_code = self._update_weights(base_url, update_model)
         assert status_code == 200
         assert result.get(
             "success", False
@@ -705,7 +736,7 @@ class TestUpdateWeightsCorruptedRollback:
         # vae.  With target_modules=["transformer", "vae"], the transformer
         # updates successfully first, then vae fails, giving a meaningful
         # rollback that actually restores the transformer.
-        local_base = maybe_download_model(DEFAULT_DIFFUSION_MODEL)
+        local_base = maybe_download_model(default_model)
         _prepare_corrupted_model(local_base, corrupted_model_dir, corrupt_module="vae")
 
         result, status_code = self._update_weights(

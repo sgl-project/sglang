@@ -20,9 +20,13 @@ Typical usage (from GPUWorker.update_weights_from_disk):
 
 Key design decisions:
 
-- All-or-nothing: if any module fails to load, all previously updated
-  modules are rolled back to the original weights by reloading from
-  pipeline.model_path. No partial updates are left behind.
+- All-or-nothing with rollback: modules are updated sequentially.  If
+  any module fails (shape mismatch, corrupted file, etc.), every module
+  that was already updated is rolled back by reloading its weights from
+  pipeline.model_path (the last successfully-loaded checkpoint).  On
+  success, pipeline.model_path is updated to the new model_path so
+  that future rollbacks target the latest good checkpoint, not the
+  originally-launched model.
 
 - Rollback failures propagate: if rollback itself fails, the exception is
   not caught so the caller knows the model is in an inconsistent state.
