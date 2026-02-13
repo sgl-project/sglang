@@ -1,0 +1,23 @@
+4-GPU PCG Test Failures (after rerun)
+======================================
+Total: 6 tests | Passed: 2 | Failed: 4 (2 PCG bugs, 2 not PCG)
+Suites: stage-c-test-large-4-gpu, nightly-4-gpu
+Repeat: 10 runs each | Timeout: 2400s
+
+PCG BUGS (confirmed)
+Test                                                              Pass Rate    Failure Summary
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+attention/test_local_attn.py                                      0/10         resolve_language_model() AttributeError on Llama4ForConditionalGeneration (no .model attr); rc=5 (no tests collected); same bug class as Gemma3 in test_triton_sliding_window
+core/test_qwen3_next_deterministic.py                             1/10         Non-deterministic output across batch sizes with PCG + triton attention + TP=4; batch sizes 18-20 diverge; flaky (1/10 pass)
+
+NOT PCG (infra/pre-existing)
+Test                                                              Pass Rate    Status
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+vlm/test_encoder_dp.py                                            0/10         [NOT PCG] PCG auto-disabled (disable_piecewise_cuda_graph=True); scheduler watchdog timeout (300s) on Qwen3-VL-32B with corrupted token IDs in Encoder DP; infra bug
+distributed/test_dp_attention_large.py                            0/10*        [NOT PCG] 404 on private CI model lmsys/sglang-ci-dsv3-test; server fails before PCG init; *plan_4gpu.json has data integrity error (shows status=passed but all rc=1)
+
+PASSED
+Test                                                              Pass Rate
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+rl/test_return_routed_experts.py                                  10/10
+spec/eagle/test_eagle_dp_attention.py                             10/10

@@ -1,0 +1,21 @@
+1-GPU PCG Test Failures (after rerun)
+======================================
+Total: 156 tests | Passed: 129 | Failed: 27
+Repeat: 10 runs each | Timeout: 1200s
+
+PCG BUGS (confirmed)
+Test                                                              Pass Rate    Failure Summary
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+scheduler/test_retract_decode.py                                  0/10         CUDA device-side assert (vectorized_gather_kernel OOB) during decode retraction under PCG
+lora/test_lora_backend.py                                         0/10         FusedAddRMSNorm illegal memory access on Llama-2-7b-hf baseline server during PCG warmup; patch_model skips forward_native when compiler=eager
+models/test_generation_models.py                                  0/10         [PASSED] CI only runs 2 models (Llama-3.1-8B, gemma-2-2b) which pass; Qwen2-1.5B 0.0606>0.06 only in local test_all_models; not CI blocker
+quant/test_torchao.py                                             9/10         vectorized_gather_kernel OOB + CUDA device-side assert; same pattern as test_retract_decode; flaky
+core/test_gpt_oss_1gpu.py                                         3/10         CUDA device-side assert under PCG; both bf16 and mxfp4 models affected
+
+NOT PCG (resolved/flaky)
+Test                                                              Pass Rate    Status
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+perf/test_bench_serving_1gpu_part2.py                             9/10         [PASSED] flaky 503 health check race; not PCG
+quant/test_w8a8_quantization.py                                   9/10         borderline accuracy assertion (0.69 not > 0.69); needs investigation
+openai_server/validation/test_large_max_new_tokens.py             4/5 rerun    [PASSED] flaky race condition; baseline also fails; not PCG
+perf/test_bench_serving_1gpu_part1.py                             0/10         [NOT PCG] timeout + leaked server cascade OOM
