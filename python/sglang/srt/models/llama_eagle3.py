@@ -208,6 +208,13 @@ class LlamaModel(nn.Module):
 
         if self.num_hidden_layers > 1:
             for layer in self.additional_layers:
+                # The residual connections here are only internal to the
+                # draft model's multi decoder layers and has nothing to do with Eagle3 architecture
+                #
+                # The complication is that the Eagle3LlamaDecoderLayer for Eagle3 in SGLang derives
+                # from that of a target model, which returns hidden_states and residuals separately.
+                # However, the residuals are always added in Eagle3LlamaDecoderLayer of SpecForge.
+                # Therefore, the special handling of `hidden_states + residual` is necessary.
                 hidden_states, residual = layer(
                     positions,
                     hidden_states + residual,  # compatible with SpecForge
