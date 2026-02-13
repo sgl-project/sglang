@@ -1282,7 +1282,7 @@ class Glm4MoeForCausalLM(nn.Module):
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     def determine_num_fused_shared_experts(self):
-        super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
+        super().determine_num_fused_shared_experts(self.__class__.__name__)
 
 
 EntryClass = [Glm4MoeForCausalLM, GlmMoeDsaForCausalLM]
