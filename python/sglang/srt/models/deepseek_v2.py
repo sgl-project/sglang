@@ -177,7 +177,8 @@ if _use_aiter_gfx95:
     )
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8, dsv3_fused_a_gemm, dsv3_router_gemm
+    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
+    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 
     from sglang.srt.utils.custom_op import register_custom_op
 

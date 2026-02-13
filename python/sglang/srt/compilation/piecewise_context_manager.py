@@ -63,7 +63,7 @@ class ForwardContext:
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
-    
+
     def set_attention_layers(self, layers: List[Any]):
         self.attention_layers = layers
 

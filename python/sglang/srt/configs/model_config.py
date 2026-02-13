@@ -192,8 +192,8 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
-        self.is_piecewise_cuda_graph_disabled_model = is_piecewise_cuda_graph_disabled_model(
-            self.hf_config.architectures
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1270,8 +1270,13 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
     else:
         return True
 
+
 def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
-    return any(arch in piecewise_cuda_graph_disabled_model_archs for arch in model_architectures)
+    return any(
+        arch in piecewise_cuda_graph_disabled_model_archs
+        for arch in model_architectures
+    )
+
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:

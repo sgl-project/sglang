@@ -181,7 +181,9 @@ class PiecewiseCudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
-        self.max_num_tokens = max(self.capture_num_tokens) if self.capture_num_tokens else 8192
+        self.max_num_tokens = (
+            max(self.capture_num_tokens) if self.capture_num_tokens else 8192
+        )
         self.max_bs = model_runner.req_to_token_pool.size
 
         self.is_multimodal = model_runner.is_multimodal

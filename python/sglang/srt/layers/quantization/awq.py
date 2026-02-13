@@ -950,7 +950,7 @@ if _is_cuda:
 
     @register_fake_if_exists("sgl_kernel::awq_dequantize")
     def _(qweight, scales, qzeros):
-        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 8,)                                                                                                                                                                                                              
+        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 8,)
         return qweight.new_empty(out_shape, dtype=scales.dtype)
 
     @register_fake_if_exists("sgl_kernel::awq_marlin_repack")

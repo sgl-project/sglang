@@ -1563,7 +1563,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False
         return True
 
-
     def configure_kv_cache_dtype(self):
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
