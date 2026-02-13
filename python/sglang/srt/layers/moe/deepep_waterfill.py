@@ -558,15 +558,9 @@ if HAS_TRITON:
         ).to(tl.int64)
         total_effective_k = tl.sum(routed_vec)
         total_tokens_global_k = total_effective_k // topk
-        derived_target = (
+        target_total = (
             total_effective_k + total_tokens_global_k + world_size - 1
         ) // world_size
-        # Use precomputed value when provided; otherwise use derived value.
-        target_total = (
-            derived_target
-            if precomputed_target_total <= 0
-            else precomputed_target_total
-        )
 
         # ===== Step 1: Select destination rank for shared expert =====
         # Prefer balanced total load (routed + shared) by sampling destination among
