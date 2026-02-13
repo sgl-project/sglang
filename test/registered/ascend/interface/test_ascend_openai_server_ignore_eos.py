@@ -17,7 +17,7 @@ register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
 
 
 class TestOpenAIServerIgnoreEOS(CustomTestCase):
-    """Testcase: Test 'ignore_eos' is True, the EOS is ignore and continue reasoning
+    """Testcase: Test 'ignore_eos' is True, the EOS is ignored and continue reasoning
 
     [Test Category] Interface
     [Test Target] ignore_eos
@@ -28,7 +28,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
         cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
-        cls.other_args = [
+        cls.other_args =[
             "--attention-backend",
             "ascend",
             "--disable-cuda-graph",

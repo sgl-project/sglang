@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import META_LLAMA_3_1_8B_INSTRUCT
 from sglang.test.ci.ci_register import register_npu_ci

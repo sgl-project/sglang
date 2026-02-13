@@ -34,7 +34,7 @@ class TestMatchedStop(CustomTestCase):
     def setUpClass(cls):
         cls.model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.other_args = [
+        cls.other_args =[
             "--max-running-requests",
             10,
             "--attention-backend",
