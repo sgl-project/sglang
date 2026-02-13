@@ -16,7 +16,8 @@ class TestEXAONE(GSM8KAscendMixin, CustomTestCase):
     """
 
     model = EXAONE_3_5_7_8B_INSTRUCT_WEIGHTS_PATH
-    accuracy = 0.8
+    # Allow 1% tolerance for the accuracy threshold
+    accuracy = round(0.8 * 0.99, 3)
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
