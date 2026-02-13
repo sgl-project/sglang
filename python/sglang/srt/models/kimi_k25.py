@@ -662,6 +662,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         # Create vision tower
         self.vision_tower = MoonViT3dPretrainedModel(config.vision_config)
         # Create mm projector
