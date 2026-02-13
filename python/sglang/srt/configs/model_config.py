@@ -736,10 +736,18 @@ class ModelConfig:
 
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
-        # Check for HuggingFace quantization config
-        from sglang.srt.utils import has_hf_quant_config
+        # Check for quantization in hf_config (config.json)
+        if getattr(self.hf_config, "quantization_config", None) or getattr(
+            self.hf_config, "compression_config", None
+        ):
+            return True
 
-        return has_hf_quant_config(self.model_path)
+        # Check for hf_quant_config.json (e.g., ModelOpt quantized models like
+        # nvidia/DeepSeek-V3-0324-FP4). Use _parse_quant_hf_config() which
+        # properly handles offline mode (HF_HUB_OFFLINE=1) by reading from
+        # the local HF cache, unlike the simpler has_hf_quant_config() utility.
+        quant_cfg = self._parse_quant_hf_config()
+        return quant_cfg is not None
 
     def _get_modelopt_quant_type(self) -> str:
         """Extract ModelOpt quantization type from unified quantization flag."""
