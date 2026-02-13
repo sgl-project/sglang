@@ -5,6 +5,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional
 
+import torch
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -50,6 +52,13 @@ def enable_piecewise_cuda_graph():
         raise
     finally:
         _in_piecewise_cuda_graph = False
+
+@contextmanager
+def set_pcg_capture_stream(stream: torch.cuda.Stream):
+    global _pcg_capture_stream
+    _pcg_capture_stream = stream
+    yield
+    _pcg_capture_stream = None
 
 
 @dataclass
