@@ -1796,10 +1796,7 @@ class ServerArgs:
                     # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
                     # ref: https://github.com/sgl-project/sglang/issues/17411
                     self.attention_backend = "fa3"
-                elif (
-                    is_sm100_supported()
-                    and is_no_spec_infer_or_topk_one(self)
-                ):
+                elif is_sm100_supported() and is_no_spec_infer_or_topk_one(self):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
