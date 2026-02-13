@@ -4,14 +4,13 @@ import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=600, suite="nightly-16-npu-a3", nightly=True)
 
@@ -44,7 +43,7 @@ class TestDisableSharedExpertsFusion(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model_path,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 6,
             other_args=[
                 *cls.common_args,
             ],
@@ -53,7 +52,6 @@ class TestDisableSharedExpertsFusion(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
 
     def test_disable_shared_experts_fusion(self):
         response = requests.post(

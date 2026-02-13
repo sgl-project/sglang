@@ -1,18 +1,18 @@
 import random
 import unittest
 from types import SimpleNamespace
-import requests
+
 from sglang.srt.utils import kill_process_tree
-from sglang.test.run_eval import run_eval
 from sglang.test.ascend.test_ascend_utils import DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    popen_launch_server, is_in_ci,
+    is_in_ci,
+    popen_launch_server,
 )
-
-from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=500, suite="nightly-16-npu-a3", nightly=True)
 
@@ -56,7 +56,8 @@ class TestDPAttentionRoundBinLoadBalance(CustomTestCase):
         cls.process = popen_launch_server(
             cls.model_path,
             cls.base_url,
-            timeout=3*DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=3 * DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+
             other_args=other_args,
         )
 
@@ -81,7 +82,9 @@ class _TestDPAttentionAutoLoadBalance(TestDPAttentionRoundBinLoadBalance):
     mode = "auto"
 
 
-class _TestDPAttentionFollowBootstrapRoomLoadBalance(TestDPAttentionRoundBinLoadBalance):
+class _TestDPAttentionFollowBootstrapRoomLoadBalance(
+    TestDPAttentionRoundBinLoadBalance
+):
     mode = "follow_bootstrap_room"
 
 
