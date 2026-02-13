@@ -86,7 +86,6 @@ class InputValidationStage(PipelineStage):
                 )
             base_seeds = dynamic_batch_seeds
         else:
-            # Keep per-prompt seed streams deterministic and non-overlapping.
             base_seeds = [seed + i * num_videos_per_prompt for i in range(prompt_count)]
 
         seeds = []

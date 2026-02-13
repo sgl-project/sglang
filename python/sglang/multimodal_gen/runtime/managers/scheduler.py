@@ -239,7 +239,6 @@ class Scheduler:
             sp_dict.pop(key, None)
 
         if req.extra:
-            # Only include user-facing knobs that can alter generation behavior.
             diffusers_kwargs = req.extra.get("diffusers_kwargs")
             if diffusers_kwargs:
                 sp_dict["diffusers_kwargs"] = diffusers_kwargs
@@ -256,8 +255,6 @@ class Scheduler:
         ):
             return False
 
-        # Keep image-conditioned requests out of dynamic batching to avoid
-        # ambiguity with list-valued image inputs in existing pipelines.
         if base_req.image_path is not None or candidate_req.image_path is not None:
             return False
 
@@ -281,8 +278,6 @@ class Scheduler:
         merged_req.extra["dynamic_batch_seeds"] = [req.seed for req in reqs]
         merged_req.extra["dynamic_batch_request_ids"] = [req.request_id for req in reqs]
 
-        # We split outputs back per original request in scheduler, so avoid
-        # saving output files inside a merged worker call.
         merged_req.return_file_paths_only = False
         merged_req.request_id = f"dynamic_batch::{merged_req.request_id}"
 
@@ -314,7 +309,6 @@ class Scheduler:
             if len(value) == total_items:
                 sliced = value[start:end]
                 return list(sliced) if isinstance(value, list) else tuple(sliced)
-            # Nested list/tuple (e.g., trajectory per denoising step). Slice recursively.
             sliced_nested = [
                 self._slice_batched_value(v, start, end, total_items) for v in value
             ]
@@ -398,9 +392,19 @@ class Scheduler:
             identity, req, _ = self.waiting_queue.popleft()
             return [(identity, req)]
 
-        batch_len = 0
+        # If the head request itself is not eligible for dynamic batching
+        # (e.g., image-conditioned i2i request), dispatch it immediately.
+        if not self._can_dynamic_batch(req, req):
+            identity, req, _ = self.waiting_queue.popleft()
+            return [(identity, req)]
+
+        batch_len = 1
         hit_incompatible_front = False
-        for _identity, candidate_req, _enqueue_time in self.waiting_queue:
+        for idx, (_identity, candidate_req, _enqueue_time) in enumerate(
+            self.waiting_queue
+        ):
+            if idx == 0:
+                continue
             if batch_len >= self._dynamic_batch_max_size:
                 break
             if not isinstance(candidate_req, Req) or not self._can_dynamic_batch(
@@ -597,7 +601,6 @@ class Scheduler:
             items = self.get_next_batch_to_run()
             if not items:
                 if self.waiting_queue and self._dynamic_batch_delay_s > 0:
-                    # Avoid busy-spin while waiting for max-batch-delay to elapse.
                     time.sleep(min(0.001, self._dynamic_batch_delay_s))
                 continue
 
