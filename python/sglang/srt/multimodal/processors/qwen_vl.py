@@ -1011,7 +1011,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
-        base_output = await self.load_mm_data(
+        base_output = await self.legacy_load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -1180,31 +1180,11 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
-        if (
-            not image_data
-            or request_obj.video_data
-            or request_obj.audio_data
-            or any(self._is_preprocessed_input(item) for item in image_data)
-            or (
-                not self.mm_preprocess_cache.enabled
-                and not self.uses_media_artifacts_without_cache
-            )
-        ):
-            return await self._process_mm_data_uncached(
-                image_data, input_text, request_obj, *args, **kwargs
-            )
-
-        prepare_artifacts = (
-            self.prepare_media_artifacts
-            if self.mm_preprocess_cache.enabled
-            else self.prepare_media_artifacts_without_cache
-        )
-        artifacts = await prepare_artifacts(
-            image_data, content_hashes=getattr(request_obj, "mm_content_hashes", None)
-        )
-        composed = self.compose_image_artifacts(input_text, artifacts)
-        if composed is not None:
-            return composed
+        # The media-artifact pipeline rebuilds the image prompt template from
+        # its own grid bookkeeping, which does not agree with the token layout
+        # RL rollouts replay: build_input_ids then walks off the end of the grid
+        # list. Take the legacy loader for every request, as this processor did
+        # before the artifact pipeline existed.
         return await self._process_mm_data_uncached(
             image_data, input_text, request_obj, *args, **kwargs
         )
