@@ -78,7 +78,7 @@ To illustrate the process, let's look at how `Qwen-Image-Edit` is implemented. T
 
 4.  **Define Pipeline Class**:
     - Under [`sglang/multimodal_gen/runtime/pipelines/`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/) you define pipeline classes that inherit from `ComposedPipelineBase` and orchestrate stages (encoding, denoising, decoding, etc.) for each diffusion model.
-    - For this Qwen-Image model, we use the QwenImageEditPipeline. The [`QwenImageEditPipeline`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/qwen_image.py) class inherits from `ComposedPipelineBase` and orchestrates stages sequentially.
+    - For this Qwen-Image-Edit model, we use the QwenImageEditPipeline. The [`QwenImageEditPipeline`](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/runtime/pipelines/qwen_image.py) class inherits from `ComposedPipelineBase` and orchestrates stages sequentially.
     - Declare required modules via `_required_config_modules` and implement the pipeline stages:
 
     ```python
