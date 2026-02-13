@@ -279,9 +279,34 @@ class TextEncoderLoader(ComponentLoader):
             # if loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
+                # NOTE:
+                # If we silently continue with uninitialized weights, the text encoder can
+                # produce NaNs/garbage embeddings that later fail stage verification in a
+                # hard-to-debug way (e.g., `prompt_embeds` fails the NaN check).
+                #
+                # We allow a small set of known-optional parameters to be missing, but
+                # default to strict behavior for the rest.
+                allowed_missing_patterns = (
+                    getattr(model, "_allowed_missing_weights_patterns", []) or []
+                )
+                unexpected_missing = {
+                    n
+                    for n in weights_not_loaded
+                    if not any(pat in n for pat in allowed_missing_patterns)
+                }
+                if unexpected_missing:
+                    raise ValueError(
+                        "Following text encoder weights were not initialized from checkpoint: "
+                        f"{sorted(unexpected_missing)}. "
+                        "This usually indicates a checkpoint/model-arch mismatch or a broken "
+                        "weight-name mapping. If these are truly optional, set "
+                        "`model._allowed_missing_weights_patterns` to whitelist patterns."
+                    )
                 logger.warning(
-                    "Following model weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
+                    "Following (allowed) text encoder weights were not initialized from "
+                    "checkpoint: %s (allowed patterns: %s)",
+                    sorted(weights_not_loaded),
+                    allowed_missing_patterns,
                 )
 
         return model
